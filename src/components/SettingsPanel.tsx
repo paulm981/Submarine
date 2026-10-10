@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus } from "lucide-react";
+import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, FileEdit } from "lucide-react";
 import {
   MAX_FONT_SIZE, MIN_FONT_SIZE, clampFontSize, fontFamilyCss,
   isFontAvailable, primaryFontName, sanitizeFontFamily,
@@ -8,6 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 import CopyValue from "./CopyValue";
 import FontPicker from "./FontPicker";
 import { loadInstalledFonts } from "../util/systemFonts";
+import { IS_ANDROID } from "../util/platform";
 
 // Where this install keeps its data (see src-tauri/src/portable.rs). `portable`
 // means a `submarine-data` folder next to the executable is in use; `warning`
@@ -16,6 +17,62 @@ interface StorageInfo {
   portable: boolean;
   data_dir: string;
   warning: string | null;
+}
+
+// The editor Live Edit opens remote files in (src-tauri/src/local_open.rs).
+interface LiveEditEditor {
+  chosen: string | null;
+  default_label: string;
+}
+
+// Kept by the backend, not in local storage: the editor is started with files
+// from servers, so it can only be set through the native file dialog.
+function LiveEditSettings() {
+  const [editor, setEditor] = useState<LiveEditEditor | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    invoke<LiveEditEditor>("live_edit_editor_get").then(setEditor).catch(() => setEditor(null));
+  }, []);
+  const run = (cmd: string) => {
+    setError(null);
+    invoke<LiveEditEditor>(cmd).then(setEditor).catch((e) => setError(String(e)));
+  };
+  if (!editor) return null;
+  return (
+    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
+      <p className="text-sm text-zinc-400 leading-relaxed">
+        Double-clicking a remote file opens a copy in this editor and uploads it each time you save.
+        It never runs the file.
+      </p>
+      <div className="space-y-1.5">
+        <span className="text-[11px] font-black text-zinc-500 uppercase tracking-wider">Editor</span>
+        {editor.chosen ? (
+          <CopyValue value={editor.chosen} className="max-w-full text-zinc-300">
+            <span className="font-mono text-[11.5px] break-all select-text">{editor.chosen}</span>
+          </CopyValue>
+        ) : (
+          <div className="text-[12.5px] text-zinc-300">{editor.default_label} (default)</div>
+        )}
+      </div>
+      <div className="flex gap-2">
+        <button
+          onClick={() => run("live_edit_editor_pick")}
+          className="flex-1 px-4 h-9 bg-primary/10 border border-primary/30 text-primary rounded-xl text-xs font-bold uppercase hover:bg-primary hover:text-zinc-950 transition-all"
+        >
+          Choose editor…
+        </button>
+        {editor.chosen && (
+          <button
+            onClick={() => run("live_edit_editor_reset")}
+            className="px-4 h-9 bg-zinc-900 border border-white/5 text-zinc-300 rounded-xl text-xs font-bold uppercase hover:bg-white/5 transition-all"
+          >
+            Use {editor.default_label}
+          </button>
+        )}
+      </div>
+      {error && <p className="text-[11.5px] text-red-400">{error}</p>}
+    </div>
+  );
 }
 
 // Slider covers the everyday range; the number field takes anything 1–99.
@@ -292,6 +349,15 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
           
           <TerminalFontSettings settings={settings} setSettings={setSettings} />
         </section>
+
+        {!IS_ANDROID && (
+          <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
+            <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
+              <FileEdit size={14} /> Live Edit
+            </div>
+            <LiveEditSettings />
+          </section>
+        )}
 
         {/* Activity Section — moved out of the sidebar so the top-level
             navigation stays focused on primary workflows. Logs are diagnostic

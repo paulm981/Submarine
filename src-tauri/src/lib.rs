@@ -26,6 +26,7 @@ mod portable;
 mod fonts;
 mod webkit_sandbox;
 mod sftp_remove;
+mod local_open;
 #[cfg(test)]
 mod ssh_test_server;
 use ssh_manager::SshState;
@@ -10688,6 +10689,8 @@ async fn sftp_download_file(
         .flush()
         .await
         .map_err(|e| { emit_progress(transferred, "error", Some(e.to_string())); format!("flush: {}", e) })?;
+    drop(local_file);
+    local_open::mark_from_internet(std::path::Path::new(&local_path));
     emit_progress(transferred, "done", None);
     Ok(())
 }
@@ -10909,6 +10912,13 @@ async fn sftp_download_dir(
                 Some(format!("unsafe path escaped destination: {}", dest.display())));
             return Err(format!("unsafe path escaped destination: {}", dest.display()));
         }
+        // The destination passed the policy, but the server names the
+        // folders inside it: a home-folder backup downloaded into C:\Users
+        // would put its AppData\…\Startup\x.bat in the real Startup folder.
+        if let Err(e) = check_local_path_policy(dest.clone()) {
+            emit_progress(transferred, total_bytes, "error", Some(e.clone()));
+            return Err(e);
+        }
         if let Some(parent) = dest.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 emit_progress(transferred, total_bytes, "error",
@@ -10967,6 +10977,8 @@ async fn sftp_download_dir(
                     Some(format!("flush {}: {}", dest.display(), e)));
                 format!("flush {}: {}", dest.display(), e)
             })?;
+        drop(local_file);
+        local_open::mark_from_internet(&dest);
     }
 
     emit_progress(transferred, total_bytes, "done", skipped_note);
@@ -11636,10 +11648,12 @@ async fn sftp_open_remote_file(
         let _ = &temp_file_path;
         return Err("Live edit in system editor is not available on Android.".into());
     }
+    // In an editor, never by the file's own default action: on Windows that
+    // runs an .exe / .bat / .lnk / .sh rather than opening it (local_open.rs).
     #[cfg(not(target_os = "android"))]
     {
-        let open_res = open::that(&temp_file_path);
-        if let Err(e) = open_res {
+        local_open::mark_from_internet(&temp_file_path);
+        if let Err(e) = local_open::open_for_editing(&app_handle, &temp_file_path) {
             return Err(format!("Failed to open file: {}", e));
         }
     }
@@ -11847,20 +11861,27 @@ async fn sftp_prepare_drag(
         .map_err(|e| format!("Failed to create drag staging dir: {}", e))?;
     let temp_file_path = session_dir.join(&raw_name);
     std::fs::write(&temp_file_path, &data).map_err(|e| format!("Failed to write temporary file: {}", e))?;
+    local_open::mark_from_internet(&temp_file_path);
 
     Ok(temp_file_path.to_string_lossy().to_string())
 }
 
+/// `run_program`: the user confirmed opening a file Windows would run (a
+/// program, script or shortcut). Without it such a file is refused with
+/// `RUNS:<path>`, and the Local pane asks first.
 #[tauri::command]
-async fn local_open_file(local_path: String) -> Result<(), String> {
+async fn local_open_file(local_path: String, run_program: Option<bool>) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
-        let _ = local_path;
+        let _ = (local_path, run_program);
         return Err("Open-with is not available on Android.".into());
     }
     #[cfg(not(target_os = "android"))]
     {
         let safe = guard_local_path(&local_path, false)?;
+        if run_program != Some(true) && safe.is_file() && local_open::runs_when_opened(&safe) {
+            return Err(format!("RUNS:{}", local_path));
+        }
         open::that(&safe).map_err(|e| format!("Failed to open local file: {}", e))?;
         Ok(())
     }
@@ -14012,6 +14033,7 @@ pub fn run() {
             monitor_get_settings, monitor_set_settings,
             about::app_info, about::check_for_updates, about::open_external_url,
             portable::get_storage_info,
+            local_open::live_edit_editor_get, local_open::live_edit_editor_pick, local_open::live_edit_editor_reset,
             fonts::list_system_fonts,
             clipboard_read_text
         ])
