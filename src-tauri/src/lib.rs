@@ -27,6 +27,7 @@ mod fonts;
 mod webkit_sandbox;
 mod sftp_remove;
 mod local_open;
+mod host_import;
 #[cfg(test)]
 mod ssh_test_server;
 use ssh_manager::SshState;
@@ -12075,7 +12076,7 @@ async fn android_default_local_dir(app: tauri::AppHandle) -> Result<String, Stri
 /// via the existing `add_server` command. A host that named an `IdentityFile`
 /// gets that key registered and linked; everything else lands password-less
 /// for the user to finish.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
 struct ImportedHost {
     /// The alias the user actually types (`ssh <alias>`) — becomes the
     /// server's display name after import.
@@ -12093,9 +12094,55 @@ struct ImportedHost {
     /// reads it, so a host that names a key comes in as a key-authenticated
     /// row rather than one the user has to go back and finish.
     identity_file: Option<String>,
-    /// Resolved `ProxyJump`. Informational only; live proxy config still
-    /// happens in the Server details panel.
+    /// Resolved `ProxyJump`: `[user@]host[:port]`, comma-separated hops.
+    /// The import links a single hop to a saved server (host_import.rs).
     proxy_jump: Option<String>,
+    /// Unique within one parse; the picker keys its rows by it. Empty means
+    /// `host_alias`, which every format but MobaXterm keeps unique.
+    #[serde(default)]
+    key: String,
+    /// Folder path, outermost first (MobaXterm's session folders).
+    #[serde(default)]
+    folder: Vec<String>,
+    /// A MobaXterm saved login (`[name]` as the user name): the host signs in
+    /// with that Login rather than a user of its own.
+    #[serde(default)]
+    credential: Option<String>,
+    /// Typed into the first terminal on connect (MobaXterm's "Execute command").
+    #[serde(default)]
+    run_on_connect: Option<String>,
+    /// The key the jump host signs in with (MobaXterm's jump host key).
+    #[serde(default)]
+    jump_identity_file: Option<String>,
+}
+
+/// What the pasted-import parser found: the hosts, and a line about the
+/// sessions it can't bring in (MobaXterm's RDP, VNC, …).
+#[derive(serde::Serialize)]
+struct ClientImport {
+    hosts: Vec<ImportedHost>,
+    skipped: Option<String>,
+}
+
+/// Save the hosts picked in the import dialog: folders, Logins, jump hosts
+/// and servers in one transaction and one vault save (host_import.rs).
+#[tauri::command]
+async fn import_hosts(
+    state: tauri::State<'_, DbState>,
+    rows: Vec<host_import::ImportRow>,
+) -> Result<host_import::ImportReport, String> {
+    let report = {
+        let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+        let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("[DATABASE] IMPORT_FAILED: {}", e))?;
+        let report = host_import::import_rows(&tx, &rows)?;
+        tx.commit().map_err(|e| format!("[DATABASE] IMPORT_FAILED: {}", e))?;
+        report
+    };
+    save_vault_internal(&state)?;
+    Ok(report)
 }
 
 /// Read the user's OpenSSH client config (default `~/.ssh/config`) and
@@ -12163,6 +12210,7 @@ fn parse_ssh_config(path: Option<String>) -> Result<Vec<ImportedHost>, String> {
                     user: b.user.clone().unwrap_or_default(),
                     identity_file: b.identity_file.clone(),
                     proxy_jump: b.proxy_jump.clone(),
+                    ..Default::default()
                 });
             }
         }
@@ -12275,7 +12323,16 @@ fn parse_ssh_config(path: Option<String>) -> Result<Vec<ImportedHost>, String> {
 /// `Vec` is what we DID find, the message describes what got skipped.
 /// The command is desktop+Android — no filesystem access, just text.
 #[tauri::command]
-fn parse_client_import(text: String) -> Result<Vec<ImportedHost>, String> {
+fn parse_client_import(text: String) -> Result<ClientImport, String> {
+    let skipped = if text.lines().any(|l| l.trim_start().starts_with("[Bookmarks")) {
+        mobaxterm_skipped(&text)
+    } else {
+        None
+    };
+    Ok(ClientImport { hosts: parse_client_hosts(text)?, skipped })
+}
+
+fn parse_client_hosts(text: String) -> Result<Vec<ImportedHost>, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Err("Paste an exported session block first.".into());
@@ -12334,6 +12391,7 @@ fn parse_client_import(text: String) -> Result<Vec<ImportedHost>, String> {
                 user,
                 identity_file,
                 proxy_jump,
+                ..Default::default()
             });
         }
         if out.is_empty() {
@@ -12372,6 +12430,7 @@ fn parse_putty_reg(text: &str) -> Result<Vec<ImportedHost>, String> {
                     user,
                     identity_file: None,
                     proxy_jump: None,
+                    ..Default::default()
                 });
             }
         }
@@ -12478,33 +12537,116 @@ fn strip_reg_dword(val: &str) -> Option<u32> {
 
 /// Parse a MobaXterm `.mxtsessions` export. It's an INI file: each section
 /// (`[Bookmarks]`, `[Bookmarks_1]`, …) is a folder, with `SubRep=` its path
-/// and `ImgNum=` its icon, and every other line is one session:
+/// (`\`-separated) and `ImgNum=` its icon, and every other line is one
+/// session:
 ///
 /// `<name>= #<icon>#<settings>#<terminal settings>#…`
 ///
 /// `<settings>` is `%`-separated and starts with the session type (0 = SSH,
 /// 4 = RDP, 5 = VNC, 7 = SFTP, …). For SSH, field 1 is the host, 2 the port,
-/// 3 the user (`<default>` = none set), 8/9/10 the jump hosts' names, ports
-/// and users (`__PIPE__` between hops) and 14 the key file, with its drive
-/// written as `_CurrentDrive_`. The icon is the user's pick, so it says
-/// nothing about the type. Only SSH sessions are imported.
+/// 3 the user (`<default>` = none set, `[name]` = the saved login `name`),
+/// 7 the command run after login, 8/9/10 the jump hosts' names, ports and
+/// users (`__PIPE__` between hops), 14 the key file and 15 the jump host's
+/// key file. Paths use MobaXterm's placeholders (see
+/// `expand_mobaxterm_path`). The icon is the user's pick, so it says nothing
+/// about the type. Only SSH sessions are imported.
 fn parse_mobaxterm_sessions(text: &str) -> Result<Vec<ImportedHost>, String> {
+    let dirs = directories::UserDirs::new();
+    let home = dirs.as_ref().map(|d| d.home_dir().to_string_lossy().into_owned());
+    let docs = dirs.as_ref().and_then(|d| d.document_dir()).map(|p| p.to_string_lossy().into_owned());
+    parse_mobaxterm_sessions_in(text, home.as_deref(), docs.as_deref())
+}
+
+/// MobaXterm writes the folders that differ between machines as
+/// placeholders. `_CurrentDrive_` is the drive MobaXterm ran from — nearly
+/// always C. A key file that isn't there is skipped by the import, not fatal.
+fn expand_mobaxterm_path(path: &str, profile_dir: Option<&str>, documents: Option<&str>) -> String {
+    let mut out = path.replace("_CurrentDrive_", "C");
+    if let Some(home) = profile_dir {
+        out = out.replace("_ProfileDir_", home);
+    }
+    if let Some(docs) = documents {
+        out = out.replace("_MyDocuments_", docs);
+    }
+    out
+}
+
+/// The sessions a MobaXterm export holds that aren't SSH, as one line for
+/// the import dialog: "Not imported: 8 RDP and 2 VNC sessions …".
+fn mobaxterm_skipped(text: &str) -> Option<String> {
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut in_bookmarks = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') {
+            in_bookmarks = line.starts_with("[Bookmarks");
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else { continue };
+        if !in_bookmarks || matches!(name.trim(), "SubRep" | "ImgNum") {
+            continue;
+        }
+        let Some(settings) = value.split('#').nth(2) else { continue };
+        let kind = match settings.split('%').next().unwrap_or("").trim() {
+            "0" => continue,
+            "1" => "Telnet",
+            "2" => "Rsh",
+            "3" => "XDMCP",
+            "4" => "RDP",
+            "5" => "VNC",
+            "6" => "FTP",
+            "7" => "SFTP",
+            "8" => "serial",
+            "9" => "file",
+            "10" => "local shell",
+            "11" => "browser",
+            "12" => "Mosh",
+            "13" => "S3",
+            "14" => "WSL",
+            _ => "other",
+        };
+        *counts.entry(kind).or_default() += 1;
+    }
+    if counts.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = counts.iter().map(|(k, n)| format!("{} {}", n, k)).collect();
+    let total: usize = counts.values().sum();
+    let list = match parts.len() {
+        1 => parts[0].clone(),
+        _ => format!("{} and {}", parts[..parts.len() - 1].join(", "), parts[parts.len() - 1]),
+    };
+    Some(format!(
+        "Not imported: {} {} — Submarine connects over SSH only.",
+        list,
+        if total == 1 { "session" } else { "sessions" }
+    ))
+}
+
+fn parse_mobaxterm_sessions_in(text: &str, profile_dir: Option<&str>, documents: Option<&str>) -> Result<Vec<ImportedHost>, String> {
     const SSH: &str = "0";
     let mut out: Vec<ImportedHost> = Vec::new();
-    // Session names repeat across folders; the import list keys rows by name.
-    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Session names repeat, within a folder too; the import list keys rows by
+    // folder and name.
+    let mut names: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     let mut in_bookmarks = false;
+    let mut folder: Vec<String> = Vec::new();
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with(';') { continue; }
         if line.starts_with('[') {
             in_bookmarks = line.starts_with("[Bookmarks");
+            folder.clear();
             continue;
         }
         if !in_bookmarks { continue; }
         let Some((name, value)) = line.split_once('=') else { continue; };
         let name = name.trim();
-        if name == "SubRep" || name == "ImgNum" { continue; }
+        if name == "SubRep" {
+            folder = value.split('\\').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+            continue;
+        }
+        if name == "ImgNum" { continue; }
         let mut blocks = value.trim().split('#');
         let (Some(_reconnect), Some(_icon), Some(settings)) = (blocks.next(), blocks.next(), blocks.next()) else {
             continue;
@@ -12515,28 +12657,40 @@ fn parse_mobaxterm_sessions(text: &str) -> Result<Vec<ImportedHost>, String> {
         let hostname = field(1);
         if hostname.is_empty() { continue; }
         let port = field(2).parse::<u16>().ok().filter(|p| *p != 0).unwrap_or(22);
-        let user = match field(3) {
-            "<default>" => "",
-            u => u,
+        // `[name]`: sign in with MobaXterm's saved login `name`.
+        let (user, credential) = match field(3) {
+            "<default>" => ("", None),
+            u => match u.strip_prefix('[').and_then(|u| u.strip_suffix(']')) {
+                Some(login) if !login.trim().is_empty() => ("", Some(login.trim().to_string())),
+                _ => (u, None),
+            },
         };
-        // `_CurrentDrive_` is the drive MobaXterm ran from — nearly always C.
-        // A key file that isn't there is skipped by the import, not fatal.
-        let identity_file = Some(field(14))
-            .filter(|p| !p.is_empty())
-            .map(|p| p.replace("_CurrentDrive_", "C"));
+        let path = |i: usize| {
+            Some(field(i))
+                .filter(|p| !p.is_empty())
+                .map(|p| expand_mobaxterm_path(p, profile_dir, documents))
+        };
+        let proxy_jump = mobaxterm_jump_hosts(field(8), field(9), field(10));
+        let jump_identity_file = proxy_jump.as_ref().and_then(|_| path(15));
+        let folder_key = folder.join("\\");
         let mut alias = name.to_string();
         let mut n = 2;
-        while !names.insert(alias.clone()) {
+        while !names.insert((folder_key.clone(), alias.clone())) {
             alias = format!("{} ({})", name, n);
             n += 1;
         }
         out.push(ImportedHost {
+            key: format!("{}\\{}", folder_key, alias),
             host_alias: alias,
             hostname: hostname.to_string(),
             port,
             user: user.to_string(),
-            identity_file,
-            proxy_jump: mobaxterm_jump_hosts(field(8), field(9), field(10)),
+            identity_file: path(14),
+            proxy_jump,
+            folder: folder.clone(),
+            credential,
+            run_on_connect: Some(field(7)).filter(|c| !c.is_empty()).map(String::from),
+            jump_identity_file,
         });
     }
     if out.is_empty() {
@@ -12574,7 +12728,7 @@ fn mobaxterm_jump_hosts(hosts: &str, ports: &str, users: &str) -> Option<String>
 
 #[cfg(test)]
 mod client_import_tests {
-    use super::parse_client_import;
+    use super::{parse_client_hosts as parse_client_import, parse_mobaxterm_sessions_in, mobaxterm_skipped, expand_mobaxterm_path};
 
     /// Lines as MobaXterm writes them: a blank before the first `#`, the
     /// icon, the `%`-separated settings, then the terminal settings.
@@ -12634,11 +12788,66 @@ mod client_import_tests {
     #[test]
     fn a_name_used_in_two_folders_stays_two_rows() {
         let mut text = export(&[session("web", 109, "0%a.example%22%u%%-1%-1%%%%%0%0%0%%%-1")]);
-        text.push_str("[Bookmarks_1]\r\nSubRep=Prod\r\nImgNum=41\r\n");
+        text.push_str("[Bookmarks_1]\r\nSubRep=Prod\\East\r\nImgNum=41\r\n");
         text.push_str(&session("web", 109, "0%b.example%22%u%%-1%-1%%%%%0%0%0%%%-1"));
+        text.push_str("\r\n");
+        text.push_str(&session("web", 109, "0%c.example%22%u%%-1%-1%%%%%0%0%0%%%-1"));
         let hosts = parse_client_import(text).unwrap();
-        let names: Vec<&str> = hosts.iter().map(|h| h.host_alias.as_str()).collect();
-        assert_eq!(names, vec!["web", "web (2)"]);
+        let rows: Vec<(&str, String, &str)> = hosts.iter().map(|h| (h.host_alias.as_str(), h.folder.join("/"), h.key.as_str())).collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("web", "".to_string(), "\\web"),
+                ("web", "Prod/East".to_string(), "Prod\\East\\web"),
+                ("web (2)", "Prod/East".to_string(), "Prod\\East\\web (2)"),
+            ],
+            "each folder keeps its own names; only a repeat within one folder is numbered"
+        );
+    }
+
+    #[test]
+    fn saved_logins_commands_and_the_jump_hosts_key_carry_over() {
+        let text = export(&[
+            session("app", 109, r"0%app.example%22%[ops]%%-1%-1%sudo -i%bastion.example%22%jump%-1%0%0%%_ProfileDir_\.ssh\id_jump%-1"),
+            session("plain", 109, "0%plain.example%22%alice%%-1%-1%%%%%0%0%0%%%-1"),
+            session("odd", 109, "0%odd.example%22%[]%%-1%-1%%%%%0%0%0%%%-1"),
+        ]);
+        let hosts = parse_mobaxterm_sessions_in(&text, Some(r"C:\Users\me"), None).unwrap();
+        let app = &hosts[0];
+        assert_eq!((app.user.as_str(), app.credential.as_deref()), ("", Some("ops")));
+        assert_eq!(app.run_on_connect.as_deref(), Some("sudo -i"));
+        assert_eq!(app.proxy_jump.as_deref(), Some("jump@bastion.example"));
+        assert_eq!(app.jump_identity_file.as_deref(), Some(r"C:\Users\me\.ssh\id_jump"));
+        let plain = &hosts[1];
+        assert_eq!((plain.user.as_str(), plain.credential.as_deref(), plain.run_on_connect.as_deref()), ("alice", None, None));
+        assert_eq!(plain.jump_identity_file, None);
+        assert_eq!((hosts[2].user.as_str(), hosts[2].credential.as_deref()), ("[]", None), "an empty [] is not a login");
+    }
+
+    #[test]
+    fn mobaxterm_path_placeholders_expand() {
+        let docs = Some(r"C:\Users\me\Documents");
+        let home = Some(r"C:\Users\me");
+        assert_eq!(expand_mobaxterm_path(r"_CurrentDrive_:\keys\k.pem", home, docs), r"C:\keys\k.pem");
+        assert_eq!(expand_mobaxterm_path(r"_ProfileDir_\.ssh\id", home, docs), r"C:\Users\me\.ssh\id");
+        assert_eq!(expand_mobaxterm_path(r"_MyDocuments_\MobaXterm\home\.ssh\k", home, docs), r"C:\Users\me\Documents\MobaXterm\home\.ssh\k");
+        assert_eq!(expand_mobaxterm_path(r"_ProfileDir_\id", None, None), r"_ProfileDir_\id", "left as is without a folder to put in");
+    }
+
+    #[test]
+    fn sessions_that_arent_ssh_are_counted() {
+        let text = export(&[
+            session("desktop", 91, "4%c.example%3389%carol%%-1%0%0"),
+            session("desktop2", 91, "4%d.example%3389%carol%%-1%0%0"),
+            session("vnc", 128, "5%e.example%5900%%-1%0"),
+            session("web", 109, "0%f.example%22%u%%-1%-1%%%%%0%0%0%%%-1"),
+        ]);
+        assert_eq!(
+            mobaxterm_skipped(&text).as_deref(),
+            Some("Not imported: 2 RDP and 1 VNC sessions — Submarine connects over SSH only.")
+        );
+        let ssh_only = export(&[session("web", 109, "0%f.example%22%u%%-1%-1%%%%%0%0%0%%%-1")]);
+        assert_eq!(mobaxterm_skipped(&ssh_only), None);
     }
 
     #[test]
@@ -13986,6 +14195,7 @@ pub fn run() {
             accept_share, import_shared_profile, restore_personal_profile, share_set_role, share_revoke, share_leave, share_delete,
             profile_share_status, stop_sharing, profile_sync_stats,
             set_editor_label,
+            import_hosts,
             add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_jump_host, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
             get_credentials, generate_ssh_key,
             add_folder, rename_folder, delete_folder, get_folders,
@@ -14147,3 +14357,4 @@ mod tests {
         assert!(skipped_names_note(7).unwrap().starts_with("7 items skipped"));
     }
 }
+
