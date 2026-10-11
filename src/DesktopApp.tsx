@@ -19,6 +19,7 @@ import { useIsNarrow } from "./hooks/useViewport";
 import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./util/terminalFont";
 import { Sidebar } from "./components/Sidebar";
 import { NodeGrid } from "./components/NodeGrid";
+import { SessionTree } from "./components/SessionTree";
 import type { RdpLink } from "./components/RdpLinkModal";
 import AddNodePanel from "./components/AddNodePanel";
 import TerminalView from "./components/TerminalView";
@@ -661,6 +662,39 @@ function DesktopApp() {
     setActiveView("nodes");
     setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setRdpLinks([]); setCommands([]);
     addLog("Profile locked.", "info");
+  };
+
+  // The session tree (desktop): shown or hidden, and on which side. Per
+  // device, like the other UI preferences.
+  const readPref = (key: string, fallback: string) => {
+    try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
+  };
+  const writePref = (key: string, value: string) => {
+    try { localStorage.setItem(key, value); } catch { /* per-device nicety only */ }
+  };
+  const [treeOpen, setTreeOpen] = useState(() => readPref("submarine.sessionTree.open", "1") === "1");
+  const [treeSide, setTreeSide] = useState<"left" | "right">(() => (readPref("submarine.sessionTree.side", "right") === "left" ? "left" : "right"));
+  useEffect(() => writePref("submarine.sessionTree.open", treeOpen ? "1" : "0"), [treeOpen]);
+  useEffect(() => writePref("submarine.sessionTree.side", treeSide), [treeSide]);
+
+  // Open several servers at once (the session tree's multi-select and
+  // "Open all"), each in its own tab; focus lands on the first one.
+  const openServers = (list: any[]) => {
+    if (list.length === 0) return;
+    setSessions((prev: Session[]) => {
+      const seen = new Set(prev.map((p) => p.id));
+      const fresh = list
+        .filter((server) => !seen.has(`session-${server.id}`))
+        .map((server) => ({
+          id: `session-${server.id}`,
+          serverId: server.id,
+          serverName: server.name,
+          mirrors: server.mirrors,
+          runOnConnect: server.run_on_connect || "",
+        }));
+      return [...prev, ...fresh];
+    });
+    setActiveView(`session-${list[0].id}`);
   };
 
   const openServer = (server: any) => {
@@ -1491,6 +1525,24 @@ function DesktopApp() {
   // the un-shrunken layout viewport.
   if (loading) return <div className="h-full bg-black flex items-center justify-center font-mono text-xs text-primary animate-pulse">Loading…</div>;
 
+  const sessionTree = (
+    <SessionTree
+      servers={servers}
+      folders={folders}
+      rdpLinks={rdpLinks}
+      sessions={sessions}
+      statuses={sessionStatuses}
+      waiting={promptSessions}
+      activeSessionId={activeView}
+      onOpenServers={openServers}
+      onOpenRdp={async (id: number) => { await invoke("rdp_open", { id }); }}
+      onEditServer={handleEditNode}
+      side={treeSide}
+      onToggleSide={() => setTreeSide((s) => (s === "left" ? "right" : "left"))}
+      onClose={() => setTreeOpen(false)}
+    />
+  );
+
   return (
     <div className="h-full w-full bg-background flex flex-col overflow-hidden text-zinc-200 select-none">
       {TitleBar()}
@@ -1503,7 +1555,9 @@ function DesktopApp() {
         // tab-order stays intuitive and <main> grabs the full screen width
         // (terminal gains the ~50px the vertical rail used to eat).
         <div className={`flex-1 flex ${isMobile ? 'flex-col-reverse' : ''} overflow-hidden pt-10`}>
-          <Sidebar activeTab={activeView.startsWith('session-') ? 'nodes' : activeView} setActiveTab={setActiveView} isMobile={isMobile} onLogout={handleLogout} profileName={activeProfile} syncing={cloudSyncing} />
+          <Sidebar activeTab={activeView.startsWith('session-') ? 'nodes' : activeView} setActiveTab={setActiveView} isMobile={isMobile} onLogout={handleLogout} profileName={activeProfile} syncing={cloudSyncing}
+            treeOpen={treeOpen} onToggleTree={isMobile ? undefined : () => setTreeOpen((v) => !v)} />
+          {!isMobile && treeOpen && treeSide === "left" && sessionTree}
 
           <main className="flex-1 flex flex-col min-w-0 min-h-0 bg-transparent relative">
             {activeView === "nodes" && (
@@ -2341,6 +2395,7 @@ function DesktopApp() {
             )}
 
           </main>
+          {!isMobile && treeOpen && treeSide === "right" && sessionTree}
         </div>
       )}
 

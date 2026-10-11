@@ -1,4 +1,4 @@
-import { Server, KeyRound, Library, Activity, Settings, LogOut, UserCircle } from "lucide-react";
+import { Server, KeyRound, Library, Activity, Settings, LogOut, UserCircle, ListTree } from "lucide-react";
 
 // Vertical rail on desktop, horizontal bottom dock on mobile. Layout swap is
 // driven by `isMobile` so the terminal/session views can use the full screen
@@ -6,7 +6,7 @@ import { Server, KeyRound, Library, Activity, Settings, LogOut, UserCircle } fro
 // a 360px-wide viewport. The parent in DesktopApp uses `flex-col-reverse` on
 // mobile so this component visually lands at the bottom while staying first
 // in DOM order (keyboard tab-order stays intuitive).
-export const Sidebar = ({ activeTab, setActiveTab, isMobile, onLogout, profileName, syncing }: any) => {
+export const Sidebar = ({ activeTab, setActiveTab, isMobile, onLogout, profileName, syncing, treeOpen, onToggleTree }: any) => {
   // The profile rail is deliberately apart from the content rails below. Those
   // switch what you're looking at INSIDE the open profile; this one is about the
   // profile itself — its cloud sync and who else can get into it. It used to
@@ -115,6 +115,19 @@ export const Sidebar = ({ activeTab, setActiveTab, isMobile, onLogout, profileNa
       </div>
 
       <nav className="flex flex-col gap-3 w-full px-2">
+        {/* The session tree (SessionTree) shows beside whatever is open, so
+            it is a toggle rather than a view of its own. */}
+        {onToggleTree && (
+          <button
+            onClick={onToggleTree}
+            className={`p-2.5 rounded-xl transition-all duration-300 relative flex items-center justify-center ${
+              treeOpen ? 'text-primary bg-primary/10' : 'text-zinc-500 hover:text-zinc-200 hover:bg-white/5'
+            }`}
+            title={treeOpen ? 'Hide the session tree' : 'Show the session tree'}
+          >
+            <ListTree size={20} />
+          </button>
+        )}
         {items.map((item) => (
           <button
             key={item.id}
