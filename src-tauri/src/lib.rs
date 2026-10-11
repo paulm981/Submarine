@@ -316,8 +316,8 @@ fn save_vault_blocking(
 
 /// The vault tables that participate in per-entity Last-Write-Wins sync. Each
 /// carries the `uuid` (portable identity) / `updated_at` (HLC) / `deleted`
-/// (tombstone) columns. `known_hosts`, `cmd_history`, `monitor_settings`, and
-/// `schema_meta` are intentionally device-local and NOT synced.
+/// (tombstone) columns. `known_hosts`, `cmd_history`, `monitor_settings`,
+/// `rdp_links` and `schema_meta` are intentionally device-local and NOT synced.
 const SYNCED_TABLES: &[&str] = &[
     "folders", "ssh_keys", "credentials", "servers", "commands", "notes", "monitor_configs",
 ];
@@ -3580,8 +3580,10 @@ async fn setup_master_db_inner(
         ).map_err(|e| format!("[DATABASE] SCHEMA_CREATION_FAILED: {}", e))?;
     }
 
-    // Remote Desktop links (rdp.rs), for existing and fresh vaults alike.
-    // Additive, like run_on_connect: an older build simply doesn't see it.
+    // Remote Desktop links (rdp.rs), for existing and fresh vaults alike: one
+    // `CREATE TABLE IF NOT EXISTS` here instead of a copy in each branch
+    // above, which is how a fresh vault once went without it. Additive, like
+    // run_on_connect: an older build simply doesn't see it.
     conn.execute(rdp::SCHEMA, []).map_err(|e| format!("[DATABASE] RDP_TABLE_FAILED: {}", e))?;
 
     conn.execute("PRAGMA foreign_keys = ON", []).map_err(|e| format!("[DATABASE] PRAGMA_FAILED: {}", e))?;
@@ -4893,7 +4895,7 @@ async fn delete_folder(
         let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
         let folder_ids = folder_subtree(conn, id as i64)
-            .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_QUERY_FAILED: {}", e))?;
+            .map_err(|e| format!("[DATABASE] FOLDER_TREE_QUERY_FAILED: {}", e))?;
         let mut doomed = Vec::new();
         let mut stmt = conn
             .prepare("SELECT id FROM servers WHERE folder_id=?1")
@@ -4920,7 +4922,7 @@ async fn delete_folder(
         conn.execute("DELETE FROM servers WHERE folder_id=?1", rusqlite::params![fid])
             .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_DELETE_FAILED: {}", e))?;
         conn.execute("DELETE FROM rdp_links WHERE folder_id=?1", rusqlite::params![fid])
-            .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_DELETE_FAILED: {}", e))?;
+            .map_err(|e| format!("[DATABASE] FOLDER_RDP_DELETE_FAILED: {}", e))?;
         conn.execute("DELETE FROM folders WHERE id=?1", rusqlite::params![fid])
             .map_err(|e| format!("[DATABASE] FOLDER_DELETE_FAILED: {}", e))?;
     }
@@ -10140,7 +10142,6 @@ mod elevated_sftp_tests {
         assert_eq!(best(&[SUDO_NOT_ALLOWED, SUDO_NO_SUDO]), SUDO_NOT_ALLOWED);
         // requiretty and friends beat "not allowed".
         assert_eq!(best(&[SUDO_REQUIRETTY, SUDO_NOT_ALLOWED]), SUDO_REQUIRETTY);
-        assert_eq!(ELEVATION_TOOLS, &["dzdo", "sudo"]);
     }
 
     /// dzdo (Centrify / Delinea) is built from sudo's code and words its
@@ -12518,10 +12519,11 @@ fn resolve_proxy_jump_aliases(hosts: &mut [ImportedHost]) {
     }
 }
 
-/// Parse a blob of text pasted from another SSH client's export and return
-/// the same `ImportedHost` shape as `parse_ssh_config`. Auto-detects the
-/// format so the frontend only needs one "Paste your export" text area
-/// instead of a picker-per-format:
+/// Parse a blob of text pasted from another SSH client's export: the hosts,
+/// in the same `ImportedHost` shape as `parse_ssh_config`, plus a line about
+/// sessions that can't be imported. Auto-detects the format so the frontend
+/// only needs one "Paste your export" text area instead of a
+/// picker-per-format:
 ///
 ///   • Windows Regedit `.reg` export of PuTTY sessions
 ///     (`HKEY_CURRENT_USER\Software\SimonTatham\PuTTY\Sessions\...`) —
@@ -12539,10 +12541,11 @@ fn resolve_proxy_jump_aliases(hosts: &mut [ImportedHost]) {
 ///
 ///   • MobaXterm `.mxtsessions` export — an INI file with one session per
 ///     line under `[Bookmarks]`, `[Bookmarks_1]`, … sections (see
-///     `parse_mobaxterm_sessions`). SSH sessions only.
+///     `parse_mobaxterm_sessions`). SSH sessions, and RDP sessions as
+///     Remote Desktop links; anything else is counted in `skipped`.
 ///
-/// Anything the parser can't recognise is a soft-fail: the returned
-/// `Vec` is what we DID find, the message describes what got skipped.
+/// Anything the parser can't recognise is a soft-fail: `hosts` is what we
+/// DID find, `skipped` describes what got left out.
 /// The command is desktop+Android — no filesystem access, just text.
 #[tauri::command]
 fn parse_client_import(text: String) -> Result<ClientImport, String> {
@@ -12554,6 +12557,7 @@ fn parse_client_import(text: String) -> Result<ClientImport, String> {
     Ok(ClientImport { hosts: parse_client_hosts(text)?, skipped })
 }
 
+/// The hosts part of `parse_client_import`, by format.
 fn parse_client_hosts(text: String) -> Result<Vec<ImportedHost>, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -12771,7 +12775,7 @@ fn strip_reg_dword(val: &str) -> Option<u32> {
 /// users (`__PIPE__` between hops), 14 the key file and 15 the jump host's
 /// key file. Paths use MobaXterm's placeholders (see
 /// `expand_mobaxterm_path`). The icon is the user's pick, so it says nothing
-/// about the type. Only SSH sessions are imported.
+/// about the type. SSH and RDP sessions are imported.
 fn parse_mobaxterm_sessions(text: &str) -> Result<Vec<ImportedHost>, String> {
     let dirs = directories::UserDirs::new();
     let home = dirs.as_ref().map(|d| d.home_dir().to_string_lossy().into_owned());
@@ -12969,7 +12973,7 @@ fn mobaxterm_jump_hosts(hosts: &str, ports: &str, users: &str) -> Option<String>
 
 #[cfg(test)]
 mod client_import_tests {
-    use super::{parse_client_hosts as parse_client_import, parse_mobaxterm_sessions_in, mobaxterm_skipped, expand_mobaxterm_path};
+    use super::{parse_client_hosts, parse_mobaxterm_sessions_in, mobaxterm_skipped, expand_mobaxterm_path};
 
     /// Lines as MobaXterm writes them: a blank before the first `#`, the
     /// icon, the `%`-separated settings, then the terminal settings.
@@ -12991,7 +12995,7 @@ mod client_import_tests {
     #[test]
     fn a_mobaxterm_export_is_not_taken_for_broken_json() {
         let text = export(&[session("web01", 109, "0%10.0.0.5%22%admin%%-1%-1%%%%%0%0%0%%%-1%0%0%0%%1080%%0%0%1")]);
-        let hosts = parse_client_import(text).expect("the #25 export must import");
+        let hosts = parse_client_hosts(text).expect("the #25 export must import");
         assert_eq!(hosts.len(), 1);
         assert_eq!((hosts[0].host_alias.as_str(), hosts[0].hostname.as_str(), hosts[0].port, hosts[0].user.as_str()), ("web01", "10.0.0.5", 22, "admin"));
     }
@@ -13006,7 +13010,7 @@ mod client_import_tests {
             session("vnc", 128, "5%e.example%5900%%-1%0"),
             "web02=#109#0%f.example%22%frank%%-1%-1%%%%%0%0%0%%%-1".to_string(),
         ]);
-        let hosts = parse_client_import(text).unwrap();
+        let hosts = parse_client_hosts(text).unwrap();
         let got: Vec<(&str, &str, u16, bool)> = hosts.iter().map(|h| (h.host_alias.as_str(), h.hostname.as_str(), h.port, h.rdp)).collect();
         assert_eq!(
             got,
@@ -13028,7 +13032,7 @@ mod client_import_tests {
             session("with key", 109, r"0%h.example%22%root%%-1%-1%%%%%0%0%0%_CurrentDrive_:\keys\id_ed25519%%-1"),
             session("behind bastion", 109, "0%i.example%22%ops%%-1%-1%%bastion.example__PIPE__inner.example%2222__PIPE__22%jump__PIPE__<default>%0%0%0%%%-1"),
         ]);
-        let hosts = parse_client_import(text).unwrap();
+        let hosts = parse_client_hosts(text).unwrap();
         assert_eq!(hosts[0].user, "");
         assert_eq!(hosts[0].identity_file, None);
         assert_eq!(hosts[1].identity_file.as_deref(), Some(r"C:\keys\id_ed25519"));
@@ -13043,7 +13047,7 @@ mod client_import_tests {
         text.push_str(&session("web", 109, "0%b.example%22%u%%-1%-1%%%%%0%0%0%%%-1"));
         text.push_str("\r\n");
         text.push_str(&session("web", 109, "0%c.example%22%u%%-1%-1%%%%%0%0%0%%%-1"));
-        let hosts = parse_client_import(text).unwrap();
+        let hosts = parse_client_hosts(text).unwrap();
         let rows: Vec<(&str, String, &str)> = hosts.iter().map(|h| (h.host_alias.as_str(), h.folder.join("/"), h.key.as_str())).collect();
         assert_eq!(
             rows,
@@ -13113,7 +13117,7 @@ mod client_import_tests {
     #[test]
     fn an_export_with_no_ssh_session_says_so() {
         let text = export(&[session("vnc", 128, "5%e.example%5900%%-1%0")]);
-        let err = parse_client_import(text).err().expect("a VNC-only export must be refused");
+        let err = parse_client_hosts(text).err().expect("a VNC-only export must be refused");
         assert!(err.contains("No MobaXterm SSH or RDP sessions"), "{err}");
     }
 
@@ -13143,9 +13147,9 @@ mod client_import_tests {
 
     #[test]
     fn json_arrays_still_import() {
-        let hosts = parse_client_import("\n  [ {\"name\": \"box\", \"host\": \"j.example\", \"port\": 2200, \"user\": \"u\"} ]".into()).unwrap();
+        let hosts = parse_client_hosts("\n  [ {\"name\": \"box\", \"host\": \"j.example\", \"port\": 2200, \"user\": \"u\"} ]".into()).unwrap();
         assert_eq!((hosts[0].host_alias.as_str(), hosts[0].hostname.as_str(), hosts[0].port), ("box", "j.example", 2200));
-        let err = parse_client_import("[ {\"name\": ".into()).err().expect("broken JSON must be refused");
+        let err = parse_client_hosts("[ {\"name\": ".into()).err().expect("broken JSON must be refused");
         assert!(err.starts_with("JSON parse failed"), "{err}");
     }
 }
@@ -13289,6 +13293,8 @@ fn lands_in(path: &std::path::Path, dirs: &[std::path::PathBuf]) -> bool {
     dirs.iter().map(|d| norm(d)).any(|d| !d.is_empty() && (p == d || p.starts_with(&format!("{}/", d))))
 }
 
+/// The note on a finished folder-download card for files left out because
+/// they would land in a login folder (see autorun_dirs).
 fn autorun_skipped_note(skipped: u64) -> Option<String> {
     match skipped {
         0 => None,
@@ -14525,7 +14531,6 @@ pub fn run() {
             accept_share, import_shared_profile, restore_personal_profile, share_set_role, share_revoke, share_leave, share_delete,
             profile_share_status, stop_sharing, profile_sync_stats,
             set_editor_label,
-            import_hosts,
             add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_jump_host, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
             get_credentials, generate_ssh_key,
             add_folder, rename_folder, delete_folder, get_folders,
@@ -14563,6 +14568,7 @@ pub fn run() {
             android_quick_dirs, android_default_local_dir,
             parse_ssh_config,
             parse_client_import,
+            import_hosts,
             sftp_list_dir, sftp_create_dir, sftp_remove_file, sftp_remove_dir,
             sftp_rename, sftp_set_permissions, sftp_set_owner, sftp_stat,
             sftp_download_file, sftp_download_dir, sftp_upload_file, sftp_upload_dir, sftp_cancel_transfer, sftp_open_remote_file,

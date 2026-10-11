@@ -235,10 +235,14 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
                 folder_id,
                 notes: String::new(),
             };
-            match crate::rdp::save(conn, &link) {
-                Ok(_) => report.rdp_added += 1,
-                Err(why) => report.rdp_skipped.push(format!("{}: {}", name, why)),
+            // A host Remote Desktop can't take is reported; a database
+            // error still fails the import.
+            if let Err(why) = crate::rdp::validate(&link) {
+                report.rdp_skipped.push(format!("{}: {}", name, why));
+                continue;
             }
+            crate::rdp::save(conn, &link)?;
+            report.rdp_added += 1;
             continue;
         }
 

@@ -386,7 +386,7 @@ pub struct SftpElevation {
     pub server_path: String,
     /// `sudo` or `dzdo`, whichever the probe found allowed.
     pub tool: &'static str,
-    /// `None` = passwordless sudo (`sudo -n`).
+    /// `None` = passwordless (`sudo -n` / `dzdo -n`).
     pub password: Option<zeroize::Zeroizing<String>>,
 }
 

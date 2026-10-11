@@ -90,7 +90,7 @@ pub async fn live_edit_editor_pick(app: tauri::AppHandle) -> Result<LiveEditEdit
             dialog = dialog.add_filter("Programs", &["exe"]);
         }
         let Some(path) = dialog.pick_file() else { return Ok(editor_info(&app)) };
-        let file = editor_file(&app).ok_or("No settings folder")?;
+        let file = editor_file(&app).ok_or("Couldn't find the settings folder.")?;
         if let Some(dir) = file.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("Couldn't save the editor: {}", e))?;
         }

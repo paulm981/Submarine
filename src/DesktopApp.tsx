@@ -19,6 +19,7 @@ import { useIsNarrow } from "./hooks/useViewport";
 import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./util/terminalFont";
 import { Sidebar } from "./components/Sidebar";
 import { NodeGrid } from "./components/NodeGrid";
+import type { RdpLink } from "./components/RdpLinkModal";
 import AddNodePanel from "./components/AddNodePanel";
 import TerminalView from "./components/TerminalView";
 import SettingsPanel from "./components/SettingsPanel";
@@ -1514,7 +1515,7 @@ function DesktopApp() {
                   try { await invoke("rdp_open", { id }); }
                   catch (e) { addLog(`RDP_OPEN: ${e}`, "error"); throw e; }
                 }}
-                onSaveRdp={async (link: any) => {
+                onSaveRdp={async (link: RdpLink) => {
                   await invoke("rdp_save", { link });
                   await refreshRdpLinks();
                 }}

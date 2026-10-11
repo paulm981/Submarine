@@ -41,9 +41,18 @@ type ImportedHost = {
   credential?: string | null;
   run_on_connect?: string | null;
   jump_identity_file?: string | null;
+  // The jump host's MobaXterm saved login, if it signs in with one.
+  jump_credential?: string | null;
   // A Remote Desktop session: becomes an RDP link, not a server.
   rdp?: boolean;
 };
+
+// What `parse_client_import` hands back: the hosts, and a line about the
+// sessions it can't import (MobaXterm RDP, VNC…).
+type ClientImport = { hosts: ImportedHost[]; skipped: string | null };
+
+// One picked host for `import_hosts`, with the vault ids of its keys.
+type ImportRow = { host: ImportedHost; key_id: number | null; jump_key_id: number | null };
 
 // What `import_hosts` reports back (src-tauri/src/host_import.rs).
 type ImportReport = {
@@ -156,7 +165,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     setImportHosts([]);
     setImportSelected(new Set());
     try {
-      const res = await invoke<{ hosts: ImportedHost[]; skipped: string | null }>("parse_client_import", { text: importPasteText });
+      const res = await invoke<ClientImport>("parse_client_import", { text: importPasteText });
       setImportHosts(res.hosts);
       setImportSkipped(res.skipped);
     } catch (e: any) {
@@ -240,7 +249,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
       keysByPath.set(path, key);
       return key;
     };
-    const rows = [];
+    const rows: ImportRow[] = [];
     for (const host of picked) {
       const key = await loadKey(host.identity_file);
       const jumpKey = await loadKey(host.jump_identity_file);
