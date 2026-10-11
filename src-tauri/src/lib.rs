@@ -13919,18 +13919,36 @@ mod local_browse_tests {
 /// Pulls the auth bundle needed to open a monitor session for a node. Returns
 /// the resolved (username, password, key_pem, passphrase) following the same
 /// "vault vs custom_*" rule the interactive connect path uses — so monitor
-/// auth never silently diverges from what the user sees in the form.
+/// auth never silently diverges from what the user sees in the form. A node
+/// with a jump host carries the jump host's bundle too; like
+/// resolve_jump_auth, the jump host's own jump host is never followed.
 fn resolve_node_auth_for_monitor(
     conn: &rusqlite::Connection,
     node_id: i32,
 ) -> Result<monitor::NodeAuth, String> {
+    let (mut auth, jump_host_id) = resolve_node_auth_row(conn, node_id)?;
+    if let Some(jid) = jump_host_id.filter(|j| *j != node_id) {
+        let (mut jump, _) = resolve_node_auth_row(conn, jid)
+            .map_err(|e| format!("jump host: {}", e))?;
+        // Reached directly, as connect_jump_host does.
+        jump.proxy_type = "none".into();
+        auth.jump = Some(Box::new(jump));
+    }
+    Ok(auth)
+}
+
+fn resolve_node_auth_row(
+    conn: &rusqlite::Connection,
+    node_id: i32,
+) -> Result<(monitor::NodeAuth, Option<i32>), String> {
     let mut stmt = conn.prepare("
         SELECT s.host, s.port,
                s.username, c.username,
                s.password, c.password,
                s.key_id,   c.key_id,
                s.auth_type, c.auth_type as cred_auth_type,
-               s.proxy_type, s.proxy_host, s.proxy_port
+               s.proxy_type, s.proxy_host, s.proxy_port,
+               s.jump_host_id
         FROM servers s
         LEFT JOIN credentials c ON s.credential_id = c.id
         WHERE s.id = ?1
@@ -13951,6 +13969,7 @@ fn resolve_node_auth_for_monitor(
     let proxy_type: String = row.get::<_, Option<String>>(10).ok().flatten().unwrap_or_else(|| "none".into());
     let proxy_host: Option<String> = row.get(11).ok().flatten();
     let proxy_port: Option<i32> = row.get(12).ok().flatten();
+    let jump_host_id: Option<i32> = row.get(13).ok().flatten();
 
     let (username, password, key_id) = if auth_type == "vault" {
         (c_user.unwrap_or_default(), c_pass, c_key)
@@ -13980,19 +13999,23 @@ fn resolve_node_auth_for_monitor(
         (None, None)
     };
 
-    Ok(monitor::NodeAuth {
-        host,
-        port: port as u16,
-        // Blank stays blank: connect_for_monitor reports it instead of
-        // guessing root (#54).
-        username,
-        password,
-        private_key,
-        passphrase,
-        proxy_type,
-        proxy_host: proxy_host.filter(|s| !s.is_empty()),
-        proxy_port: proxy_port.map(|p| p as u16),
-    })
+    Ok((
+        monitor::NodeAuth {
+            host,
+            port: port as u16,
+            // Blank stays blank: connect_for_monitor reports it instead of
+            // guessing root (#54).
+            username,
+            password,
+            private_key,
+            passphrase,
+            proxy_type,
+            proxy_host: proxy_host.filter(|s| !s.is_empty()),
+            proxy_port: proxy_port.map(|p| p as u16),
+            jump: None,
+        },
+        jump_host_id,
+    ))
 }
 
 fn default_metrics() -> Vec<String> {
