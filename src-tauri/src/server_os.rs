@@ -8,12 +8,19 @@
 use crate::{DbState, SshState};
 use rusqlite::{params, OptionalExtension};
 
+/// A server moved to another host or port is asked again: what the old one
+/// reported says nothing about the new one. A trigger, so an edit that
+/// arrives by sync clears it too.
+pub(crate) const RESET_TRIGGER: &str = "CREATE TRIGGER IF NOT EXISTS servers_os_reset AFTER UPDATE OF host, port ON servers FOR EACH ROW
+  WHEN NEW.os IS NOT NULL AND (NEW.host IS NOT OLD.host OR NEW.port IS NOT OLD.port)
+  BEGIN UPDATE servers SET os = NULL WHERE id = NEW.id; END;";
+
 /// os-release on Linux and the BSDs that have it, then uname, then Windows'
 /// `ver` (cmd.exe, the default shell of Windows' OpenSSH server).
 const PROBE: &str = "cat /etc/os-release 2>/dev/null || uname -s 2>/dev/null || ver";
 
-/// The OS IDs the frontend has a badge for (src/util/osBadge.ts). An ID not
-/// among them is stored as the first of its ID_LIKE that is.
+/// The OS IDs the frontend has a badge for (src/components/OsBadge.tsx). An
+/// ID not among them is stored as the first of its ID_LIKE that is.
 const KNOWN: &[&str] = &[
     "ubuntu", "debian", "rhel", "centos", "rocky", "almalinux", "fedora", "ol", "amzn", "sles",
     "opensuse", "opensuse-leap", "alpine", "arch", "linuxmint", "raspbian", "freebsd", "linux",
@@ -55,33 +62,40 @@ fn parse_os(out: &str) -> Option<String> {
 
 /// Read the OS of the server behind `session_id` and remember it. Returns the
 /// OS ID, or None when the server's answer said nothing usable.
+///
+/// `host` is the server's host as the page knew it when it asked: the answer
+/// is stored only while the row still has it, so a server edited (or a
+/// profile switched) during the probe doesn't take another host's OS.
 #[tauri::command]
 pub async fn detect_server_os(
     ssh: tauri::State<'_, SshState>,
     db: tauri::State<'_, DbState>,
     session_id: String,
     server_id: i32,
+    host: String,
 ) -> Result<Option<String>, String> {
     let out = crate::run_exec_capture(&ssh, &session_id, PROBE, 15).await?;
     let Some(os) = parse_os(&out) else { return Ok(None) };
     let changed = {
         let conn_guard = db.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-        let current: Option<String> = conn
-            .query_row("SELECT os FROM servers WHERE id=?1", params![server_id], |r| r.get(0))
+        let current: Option<Option<String>> = conn
+            .query_row("SELECT os FROM servers WHERE id=?1 AND host=?2", params![server_id, host], |r| r.get(0))
             .optional()
-            .map_err(|e| format!("[DATABASE] SERVER_OS_QUERY_FAILED: {}", e))?
-            .flatten();
-        if current.as_deref() == Some(os.as_str()) {
-            false
-        } else {
-            // The merge flag holds the sync triggers back, as during a sync
-            // merge: what the server reports is not an edit to push.
-            let _ = conn.execute("INSERT INTO sync_flags(key, val) VALUES('merge', 1) ON CONFLICT(key) DO UPDATE SET val = 1", []);
-            let res = conn.execute("UPDATE servers SET os=?1 WHERE id=?2", params![os, server_id]);
-            let _ = conn.execute("UPDATE sync_flags SET val = 0 WHERE key = 'merge'", []);
-            res.map_err(|e| format!("[DATABASE] SERVER_OS_UPDATE_FAILED: {}", e))?;
-            true
+            .map_err(|e| format!("[DATABASE] SERVER_OS_QUERY_FAILED: {}", e))?;
+        match current {
+            // Gone, or no longer that host: nothing to store.
+            None => false,
+            Some(current) if current.as_deref() == Some(os.as_str()) => false,
+            Some(_) => {
+                // The merge flag holds the sync triggers back, as during a
+                // sync merge: what the server reports is not an edit to push.
+                let _ = conn.execute("INSERT INTO sync_flags(key, val) VALUES('merge', 1) ON CONFLICT(key) DO UPDATE SET val = 1", []);
+                let res = conn.execute("UPDATE servers SET os=?1 WHERE id=?2", params![os, server_id]);
+                let _ = conn.execute("UPDATE sync_flags SET val = 0 WHERE key = 'merge'", []);
+                res.map_err(|e| format!("[DATABASE] SERVER_OS_UPDATE_FAILED: {}", e))?;
+                true
+            }
         }
     };
     if changed {
@@ -92,7 +106,26 @@ pub async fn detect_server_os(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_os;
+    use super::{parse_os, RESET_TRIGGER};
+    use rusqlite::Connection;
+
+    #[test]
+    fn a_new_host_or_port_forgets_the_os() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, host TEXT, port INTEGER, os TEXT);").unwrap();
+        conn.execute_batch(RESET_TRIGGER).unwrap();
+        conn.execute_batch(RESET_TRIGGER).unwrap(); // every vault open runs it
+        conn.execute("INSERT INTO servers VALUES (1, 'web', 'a.example', 22, 'ubuntu')", []).unwrap();
+        let os = || conn.query_row("SELECT os FROM servers WHERE id = 1", [], |r| r.get::<_, Option<String>>(0)).unwrap();
+
+        conn.execute("UPDATE servers SET name = 'web1', host = 'a.example', port = 22", []).unwrap();
+        assert_eq!(os().as_deref(), Some("ubuntu"), "same host and port");
+        conn.execute("UPDATE servers SET host = 'b.example'", []).unwrap();
+        assert_eq!(os(), None);
+        conn.execute("UPDATE servers SET os = 'rocky'", []).unwrap();
+        conn.execute("UPDATE servers SET port = 2222", []).unwrap();
+        assert_eq!(os(), None);
+    }
 
     #[test]
     fn os_release_names_the_distribution() {

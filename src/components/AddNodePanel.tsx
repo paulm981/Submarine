@@ -114,9 +114,6 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
   const [importLoading, setImportLoading] = useState(false);
   const [importBusy, setImportBusy] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
-  // Separate from importError: the import worked, there's just something the
-  // user has to follow up on (a key that still needs its passphrase).
-  const [importNotice, setImportNotice] = useState<string | null>(null);
   // Sessions the pasted export holds that can't be imported (MobaXterm RDP…).
   const [importSkipped, setImportSkipped] = useState<string | null>(null);
   // What the finished import did and what's left to do; while set, the modal
@@ -144,7 +141,6 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     setImportSource("ssh");
     setImportPasteText("");
     setImportError(null);
-    setImportNotice(null);
     setImportSkipped(null);
     setImportHosts([]);
     setImportSelected(new Set());
@@ -164,7 +160,6 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
   const parsePastedImport = async (text: string = importPasteText) => {
     setImportLoading(true);
     setImportError(null);
-    setImportNotice(null);
     setImportSkipped(null);
     setImportHosts([]);
     setImportSelected(new Set());
@@ -197,7 +192,6 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     if (importBusy || importSource === next) return;
     setImportSource(next);
     setImportError(null);
-    setImportNotice(null);
     setImportSkipped(null);
     setImportHosts([]);
     setImportSelected(new Set());
@@ -218,7 +212,6 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     if (importBusy) return;
     setImportOpen(false);
     setImportError(null);
-    setImportNotice(null);
     setImportSkipped(null);
     setImportDone(null);
     setImportHosts([]);
@@ -252,7 +245,6 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     if (importSelected.size === 0 || importBusy) return;
     setImportBusy(true);
     setImportError(null);
-    setImportNotice(null);
     const picked = importHosts.filter((h) => importSelected.has(rowKey(h)));
     const keysByPath = new Map<string, ImportedSshKey | null>();
     const keyFailures = new Map<string, string>();
@@ -298,8 +290,8 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     }
     if (!report) return;
 
-    // Anything the user has to finish goes in the notice, and the modal stays
-    // open to show it.
+    // Anything the user has to finish goes in the summary the modal shows
+    // until Done.
     const todo: string[] = [];
     const loaded = [...keysByPath.values()].filter((k): k is ImportedSshKey => !!k);
     const needPassphrase = loaded.filter((k) => k.encrypted).length;
@@ -988,7 +980,8 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                     paste  → drop text from PuTTY, MobaXterm, or a JSON
                              export; Rust auto-detects the format so the
                              user doesn't need to say which client it came
-                             from. */}
+                             from. Gone once the import is done. */}
+            {!importDone && (
             <div className="px-4 py-2 border-b border-white/5 flex items-center gap-1 shrink-0">
               <button
                 onClick={() => switchImportSource("ssh")}
@@ -1013,6 +1006,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 Paste PuTTY / MobaXterm / JSON
               </button>
             </div>
+            )}
 
             {/* Body — one of loading / error / empty / list, or the result. */}
             <div className="flex-1 overflow-y-auto custom-scrollbar p-3">
@@ -1151,11 +1145,6 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                     </div>
                   )}
 
-                  {importNotice && (
-                    <div className="mt-3 p-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-amber-300 text-[11px] whitespace-pre-line">
-                      {importNotice}
-                    </div>
-                  )}
                 </>
               )}
               </>)}

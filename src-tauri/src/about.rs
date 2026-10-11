@@ -75,7 +75,9 @@ struct GhCompare {
 
 /// `ahead_by` of a GitHub compare: the commits in `head` that `base` lacks.
 async fn ahead_by(client: &reqwest::Client, base: &str, head: &str) -> Option<u64> {
-    let url = format!("https://api.github.com/repos/{}/compare/{}...{}", GITHUB_REPO, base, head);
+    // One commit per page: only the count is read, and a compare otherwise
+    // lists up to 250 commits.
+    let url = format!("https://api.github.com/repos/{}/compare/{}...{}?per_page=1", GITHUB_REPO, base, head);
     let resp = client.get(&url).header("Accept", "application/vnd.github+json").send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -121,8 +123,24 @@ pub async fn check_for_updates() -> Result<UpdateInfo, String> {
         .build()
         .map_err(|e| format!("[UPDATE] CLIENT: {}", e))?;
 
+    // The releases and the commit counts at the same time, so the manual
+    // check waits for the slowest request rather than all of them in turn.
+    let (info, (main_ahead, upstream_ahead)) = tokio::join!(latest_release(&client, &url, current), commit_counts(&client));
+    let mut info = info?;
+    if !BUILD_COMMIT.is_empty() {
+        info.main_ahead = main_ahead;
+        info.main_url = Some(format!("https://github.com/{}/compare/{}...main", GITHUB_REPO, BUILD_COMMIT));
+    }
+    info.upstream_ahead = upstream_ahead;
+    info.upstream_url = Some(format!("https://github.com/{}", GITHUB_REPO));
+    Ok(info)
+}
+
+/// The highest published release on `url` (GITHUB_REPO's releases), and
+/// whether it beats `current`.
+async fn latest_release(client: &reqwest::Client, url: &str, current: String) -> Result<UpdateInfo, String> {
     let resp = client
-        .get(&url)
+        .get(url)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
@@ -133,7 +151,7 @@ pub async fn check_for_updates() -> Result<UpdateInfo, String> {
         // GitHub / rate-limit error. Either way, don't nag — report "no
         // newer release known" so the UI stays quiet rather than scary.
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(with_commits(&client, UpdateInfo::none(current)).await);
+            return Ok(UpdateInfo::none(current));
         }
         return Err(format!("[UPDATE] HTTP {}", resp.status()));
     }
@@ -161,7 +179,7 @@ pub async fn check_for_updates() -> Result<UpdateInfo, String> {
         }
     }
 
-    let info = match best {
+    Ok(match best {
         None => UpdateInfo::none(current),
         Some((latest_clean, html_url)) => {
             let has_update = semver_greater(&latest_clean, &current);
@@ -172,8 +190,7 @@ pub async fn check_for_updates() -> Result<UpdateInfo, String> {
                 ..UpdateInfo::none(current)
             }
         }
-    };
-    Ok(with_commits(&client, info).await)
+    })
 }
 
 impl UpdateInfo {
@@ -191,17 +208,20 @@ impl UpdateInfo {
     }
 }
 
-/// Add the commit counts: the fork's main against this build, and the
-/// original project's main against the fork's. Best effort, like the rest.
-async fn with_commits(client: &reqwest::Client, mut info: UpdateInfo) -> UpdateInfo {
-    if !BUILD_COMMIT.is_empty() {
-        info.main_ahead = ahead_by(client, BUILD_COMMIT, "main").await;
-        info.main_url = Some(format!("https://github.com/{}/compare/{}...main", GITHUB_REPO, BUILD_COMMIT));
-    }
+/// The commits the fork's main has that this build doesn't, and the commits
+/// the original project's main has that the fork's doesn't. Best effort,
+/// like the rest: None when GitHub couldn't tell.
+async fn commit_counts(client: &reqwest::Client) -> (Option<u64>, Option<u64>) {
     let upstream_owner = UPSTREAM_REPO.split('/').next().unwrap_or(UPSTREAM_REPO);
-    info.upstream_ahead = ahead_by(client, "main", &format!("{}:main", upstream_owner)).await;
-    info.upstream_url = Some(format!("https://github.com/{}", GITHUB_REPO));
-    info
+    let upstream_head = format!("{}:main", upstream_owner);
+    let main = async {
+        if BUILD_COMMIT.is_empty() {
+            None
+        } else {
+            ahead_by(client, BUILD_COMMIT, "main").await
+        }
+    };
+    tokio::join!(main, ahead_by(client, "main", &upstream_head))
 }
 
 /// True when `a > b` under dotted-number compare (ignores any non-numeric

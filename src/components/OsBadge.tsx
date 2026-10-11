@@ -26,11 +26,15 @@ const OS: Record<string, { label: string; name: string; bg: string; fg?: string 
   linux: { label: "Lx", name: "Linux", bg: "#52525B" },
 };
 
-export const osName = (os?: string | null): string | null => (os ? OS[os]?.name ?? os : null);
+// Own keys only: the ID comes from the server, and `constructor` or
+// `__proto__` would otherwise find Object's.
+const lookup = (os: string) => (Object.hasOwn(OS, os) ? OS[os] : undefined);
+
+export const osName = (os?: string | null): string | null => (os ? lookup(os)?.name ?? os : null);
 
 export const OsBadge = ({ os, size = 14 }: { os?: string | null; size?: number }) => {
   if (!os) return null;
-  const known = OS[os] ?? { label: os.slice(0, 2).replace(/^./, (c) => c.toUpperCase()), name: os, bg: "#52525B" };
+  const known = lookup(os) ?? { label: os.slice(0, 2).replace(/^./, (c) => c.toUpperCase()), name: os, bg: "#52525B" };
   return (
     <span
       title={known.name}

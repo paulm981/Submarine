@@ -361,11 +361,20 @@ pub async fn pick_client_import_file() -> Result<Option<String>, String> {
         else {
             return Ok(None);
         };
-        let size = std::fs::metadata(&path).map_err(|e| format!("[FILE] IMPORT_OPEN_FAILED: {}", e))?.len();
-        if size > MAX_EXPORT_BYTES {
+        // A plain file, read no further than the cap: a pipe or a device
+        // reports no useful size, and opening a pipe waits for a writer.
+        use std::io::Read;
+        if !std::fs::metadata(&path).map_err(|e| format!("[FILE] IMPORT_OPEN_FAILED: {}", e))?.is_file() {
+            return Err("That isn't a file.".into());
+        }
+        let file = std::fs::File::open(&path).map_err(|e| format!("[FILE] IMPORT_OPEN_FAILED: {}", e))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_EXPORT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("[FILE] IMPORT_READ_FAILED: {}", e))?;
+        if bytes.len() as u64 > MAX_EXPORT_BYTES {
             return Err("That file is too big to be a session export.".into());
         }
-        let bytes = std::fs::read(&path).map_err(|e| format!("[FILE] IMPORT_READ_FAILED: {}", e))?;
         Ok(Some(decode_export(&bytes)))
     }
 }

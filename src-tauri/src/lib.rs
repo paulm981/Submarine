@@ -3589,7 +3589,14 @@ async fn setup_master_db_inner(
     // The OS each server last reported (server_os.rs), for its badge.
     // Device-local, not a synced column. Added here for both vault paths too;
     // on a vault that has it already this answers "duplicate column".
-    let _ = conn.execute("ALTER TABLE servers ADD COLUMN os TEXT", []);
+    if let Err(e) = conn.execute("ALTER TABLE servers ADD COLUMN os TEXT", []) {
+        let s = e.to_string();
+        if !s.contains("duplicate column name") {
+            return Err(format!("[DATABASE] SERVER_OS_MIGRATION_FAILED: {}", s));
+        }
+    }
+    conn.execute_batch(server_os::RESET_TRIGGER)
+        .map_err(|e| format!("[DATABASE] SERVER_OS_TRIGGER_FAILED: {}", e))?;
 
     conn.execute("PRAGMA foreign_keys = ON", []).map_err(|e| format!("[DATABASE] PRAGMA_FAILED: {}", e))?;
 

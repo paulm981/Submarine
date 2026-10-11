@@ -35,7 +35,9 @@ const appWindow = getCurrentWindow();
 // connect (one-shot, `serverId === 0` and `quickAuth` populated). SessionView
 // forwards `quickAuth` to `initiate_connection` which uses it instead of
 // looking up the DB row.
-type Session = { id: string; serverId: number; serverName: string; mirrors?: string; runOnConnect?: string; quickAuth?: QuickAuth | null };
+// `host`: the server's host when its tab was opened, which the OS badge
+// check goes by (an edit made while the tab is open doesn't move it).
+type Session = { id: string; serverId: number; serverName: string; host?: string; mirrors?: string; runOnConnect?: string; quickAuth?: QuickAuth | null };
 
 const hexToRgb = (hex: string) => {
   const r = parseInt(hex.slice(1, 3), 16);
@@ -263,6 +265,8 @@ function DesktopApp() {
     // "pull collaborators' changes" timer — your own edits still push ~6s after
     // you stop typing regardless of this.
     syncIntervalMin: Math.max(1, parseInt(localStorage.getItem('submarine-sync-interval-min') || '5', 10) || 5),
+    // Read each server's OS for its badge (server_os.rs). Defaults ON.
+    detectOs: localStorage.getItem('submarine-detect-os') !== 'off',
   });
 
   useEffect(() => {
@@ -276,6 +280,7 @@ function DesktopApp() {
     localStorage.setItem(FONT_FAMILY_KEY, appSettings.terminalFontFamily);
     localStorage.setItem('submarine-auto-sync', appSettings.autoSync ? 'on' : 'off');
     localStorage.setItem('submarine-sync-interval-min', String(appSettings.syncIntervalMin));
+    localStorage.setItem('submarine-detect-os', appSettings.detectOs ? 'on' : 'off');
     // Tell already-mounted terminals to re-fit with the new font size / face.
     // Without this dispatch the listener in TerminalView is dead code and
     // users have to close+reopen every terminal to see a size change.
@@ -578,6 +583,7 @@ function DesktopApp() {
         id: `session-${s.id}`,
         serverId: s.id,
         serverName: s.name,
+        host: s.host,
         mirrors: s.mirrors,
       }));
       setSessions((prev: any[]) => {
@@ -678,23 +684,30 @@ function DesktopApp() {
   useEffect(() => writePref("submarine.sessionTree.open", treeOpen ? "1" : "0"), [treeOpen]);
   useEffect(() => writePref("submarine.sessionTree.side", treeSide), [treeSide]);
 
-  // Each server's OS, read when its session first connects in this run of
-  // the app (src-tauri/src/server_os.rs), for the badges in the session tree
-  // and the server grid. A server that can't answer is not asked again.
+  // Each server's OS, for the badges in the session tree and the server grid
+  // (src-tauri/src/server_os.rs): read once, when a server whose OS isn't
+  // known yet connects, unless Settings turns it off. Moving a server to
+  // another host or port forgets its OS, so it is read again; a server that
+  // can't answer isn't asked again until the app restarts.
   const osChecked = useRef<Set<string>>(new Set());
   useEffect(() => {
+    if (!appSettings.detectOs) return;
     for (const s of sessions) {
-      if (s.serverId <= 0 || sessionStatuses[s.id] !== "connected" || osChecked.current.has(s.id)) continue;
-      osChecked.current.add(s.id);
-      const known = servers.find((x: any) => x.id === s.serverId)?.os;
-      invoke<string | null>("detect_server_os", { sessionId: s.id, serverId: s.serverId })
-        .then((os) => { if (os && os !== known) refreshServers(); })
+      if (s.serverId <= 0 || !s.host || sessionStatuses[s.id] !== "connected") continue;
+      const server = servers.find((x: any) => x.id === s.serverId);
+      if (!server || server.os) continue;
+      const key = `${server.id}|${s.host}|${server.port}`;
+      if (osChecked.current.has(key)) continue;
+      osChecked.current.add(key);
+      invoke<string | null>("detect_server_os", { sessionId: s.id, serverId: s.serverId, host: s.host })
+        .then((os) => { if (os) refreshServers(); })
         .catch(() => {});
     }
-  }, [sessionStatuses, sessions]);
+  }, [sessionStatuses, sessions, servers, appSettings.detectOs]);
 
-  // Open several servers at once (the session tree's multi-select and
-  // "Open all"), each in its own tab; focus lands on the first one.
+  // Open servers, each in its own tab (one already open is just shown);
+  // focus lands on the first. Several at once from the session tree's
+  // multi-select and "Open all".
   const openServers = (list: any[]) => {
     if (list.length === 0) return;
     setSessions((prev: Session[]) => {
@@ -705,7 +718,12 @@ function DesktopApp() {
           id: `session-${server.id}`,
           serverId: server.id,
           serverName: server.name,
+          host: server.host,
+          // Pass the raw mirrors JSON through to SessionView so the
+          // MirrorsPanel can pre-populate "Saved on this node" without
+          // another round-trip to the backend.
           mirrors: server.mirrors,
+          // Commands to auto-run once on the first terminal (see SessionView).
           runOnConnect: server.run_on_connect || "",
         }));
       return [...prev, ...fresh];
@@ -713,25 +731,7 @@ function DesktopApp() {
     setActiveView(`session-${list[0].id}`);
   };
 
-  const openServer = (server: any) => {
-    const sessionId = `session-${server.id}`;
-    const existing = sessions.find(s => s.id === sessionId);
-    if (!existing) {
-      setSessions([...sessions, {
-        id: sessionId,
-        serverId: server.id,
-        serverName: server.name,
-        // Pass the raw mirrors JSON through to SessionView so the
-        // MirrorsPanel can pre-populate "Saved on this node" without
-        // another round-trip to the backend.
-        mirrors: server.mirrors,
-        // Commands to auto-run once on the first terminal (see SessionView).
-        runOnConnect: server.run_on_connect || "",
-      }]);
-    }
-
-    setActiveView(sessionId);
-  };
+  const openServer = (server: any) => openServers([server]);
 
   // Spawn a session from inline Quick Connect auth AND leave behind a reusable
   // node in the root directory so the target can be reconnected later without
@@ -1543,6 +1543,7 @@ function DesktopApp() {
 
   const sessionTree = (
     <SessionTree
+      profile={activeProfile ?? ""}
       servers={servers}
       folders={folders}
       rdpLinks={rdpLinks}

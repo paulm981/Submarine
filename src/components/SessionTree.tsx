@@ -13,7 +13,8 @@ import { OsBadge, osName } from "./OsBadge";
 // Sessions sidebar: every folder, server and Remote Desktop link as one
 // compact list, with the servers that have a tab open marked by their
 // connection state. Double-click (or Enter) opens; Ctrl/Shift-click picks
-// several to open together; a folder's menu opens everything in it.
+// several to open together; a folder's menu opens everything in it. The
+// arrow keys move through the rows, and → / ← open and close a folder.
 
 type Row =
   | { kind: "folder"; id: number; name: string; depth: number; open: boolean; count: number }
@@ -22,12 +23,13 @@ type Row =
 
 type Menu = { x: number; y: number; row: Row };
 
-// Per-device view state; the tree works without it (see artifact-free note
-// in SettingsPanel: preferences live in local storage).
-const EXPANDED_KEY = "submarine.sessionTree.expanded";
-const readExpanded = (): Set<number> => {
+// Which folders are open, per device like the other preferences and per
+// profile, since folder ids are only unique within one vault. The tree works
+// without it.
+const expandedKey = (profile: string) => `submarine.sessionTree.expanded:${profile}`;
+const readExpanded = (profile: string): Set<number> => {
   try {
-    const raw = localStorage.getItem(EXPANDED_KEY);
+    const raw = localStorage.getItem(expandedKey(profile));
     return new Set(raw ? (JSON.parse(raw) as number[]) : []);
   } catch {
     return new Set();
@@ -40,9 +42,10 @@ const byName = (a: string, b: string) => a.localeCompare(b, undefined, { numeric
 const OPEN_MANY = 10;
 
 export const SessionTree = ({
-  servers, folders, rdpLinks, sessions, statuses, waiting, activeSessionId,
+  profile, servers, folders, rdpLinks, sessions, statuses, waiting, activeSessionId,
   onOpenServers, onOpenRdp, onEditServer, side, onToggleSide, onClose,
 }: {
+  profile: string;
   servers: any[];
   folders: FolderRow[];
   rdpLinks: RdpLink[];
@@ -59,7 +62,7 @@ export const SessionTree = ({
 }) => {
   const confirm = useConfirm();
   const [search, setSearch] = useState("");
-  const [expanded, setExpanded] = useState<Set<number>>(readExpanded);
+  const [expanded, setExpanded] = useState<Set<number>>(() => readExpanded(profile));
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [anchor, setAnchor] = useState<string | null>(null);
   const [menu, setMenu] = useState<Menu | null>(null);
@@ -67,8 +70,8 @@ export const SessionTree = ({
   const listRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    try { localStorage.setItem(EXPANDED_KEY, JSON.stringify([...expanded])); } catch { /* per-device nicety only */ }
-  }, [expanded]);
+    try { localStorage.setItem(expandedKey(profile), JSON.stringify([...expanded])); } catch { /* per-device nicety only */ }
+  }, [expanded, profile]);
 
   const index = useMemo(() => indexFolders(folders || []), [folders]);
   const known = (id: number | null | undefined) => (id != null && index.byId.has(id) ? id : null);
@@ -143,6 +146,24 @@ export const SessionTree = ({
 
   const rowKey = (r: Row) => (r.kind === "folder" ? `f:${r.id}` : r.key);
 
+  // The selection is what's on screen: rows hidden by a search or a closed
+  // folder, or deleted, drop out of it, so "Open N selected" opens what it
+  // says.
+  useEffect(() => {
+    const shown = new Set(rows.map(rowKey));
+    setSelected((prev) => {
+      const next = new Set([...prev].filter((k) => shown.has(k)));
+      return next.size === prev.size ? prev : next;
+    });
+    setAnchor((a) => (a && !shown.has(a) ? null : a));
+  }, [rows]);
+
+  // Keep the row the keyboard moved to in view.
+  useEffect(() => {
+    if (!anchor) return;
+    listRef.current?.querySelector(`[data-key="${anchor}"]`)?.scrollIntoView({ block: "nearest" });
+  }, [anchor]);
+
   const select = (r: Row, e: { ctrlKey: boolean; metaKey: boolean; shiftKey: boolean }) => {
     const key = rowKey(r);
     if (e.shiftKey && anchor) {
@@ -195,10 +216,9 @@ export const SessionTree = ({
     return { list, links };
   };
 
-  const openSelected = () => {
-    const { list, links } = pickedItems(selected);
-    openMany(list, links);
-  };
+  const picked = useMemo(() => pickedItems(selected), [selected, rows]);
+  const pickedCount = picked.list.length + picked.links.length;
+  const openSelected = () => openMany(picked.list, picked.links);
 
   // Every server and link in a folder, at any depth.
   const folderItems = (id: number) => {
@@ -214,15 +234,28 @@ export const SessionTree = ({
     return { list, links };
   };
 
+  const selectOnly = (r: Row) => {
+    setSelected(new Set([rowKey(r)]));
+    setAnchor(rowKey(r));
+  };
+
   const onKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter") { e.preventDefault(); openSelected(); return; }
+    const at = anchor ? rows.findIndex((r) => rowKey(r) === anchor) : -1;
+    const cur = at >= 0 ? rows[at] : undefined;
+    if (e.key === "Enter") {
+      e.preventDefault();
+      if (cur?.kind === "folder") toggleFolder(cur.id); else openSelected();
+      return;
+    }
+    if ((e.key === "ArrowRight" || e.key === "ArrowLeft") && cur?.kind === "folder") {
+      e.preventDefault();
+      if (cur.open !== (e.key === "ArrowRight")) toggleFolder(cur.id);
+      return;
+    }
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
     e.preventDefault();
-    const keys = rows.map(rowKey);
-    const at = anchor ? keys.indexOf(anchor) : -1;
-    const next = Math.max(0, Math.min(keys.length - 1, at + (e.key === "ArrowDown" ? 1 : -1)));
-    const r = rows[next];
-    if (r) { setSelected(new Set([rowKey(r)])); setAnchor(rowKey(r)); }
+    const next = Math.max(0, Math.min(rows.length - 1, at + (e.key === "ArrowDown" ? 1 : -1)));
+    if (rows[next]) selectOnly(rows[next]);
   };
 
   useEffect(() => {
@@ -274,12 +307,12 @@ export const SessionTree = ({
             className="w-full h-7 bg-[#1c1c21] border border-white/10 rounded-md pl-7 pr-2 text-[12px] text-zinc-100 outline-none focus:border-primary/50 placeholder:text-zinc-600"
           />
         </div>
-        {selected.size > 1 && (
+        {pickedCount > 1 && (
           <button
             onClick={openSelected}
             className="w-full h-7 rounded-md text-[11px] font-bold uppercase tracking-wider bg-primary/15 border border-primary/40 text-primary hover:bg-primary/25 flex items-center justify-center gap-1.5"
           >
-            <Play size={11} /> Open {selected.size} selected
+            <Play size={11} /> Open {pickedCount} selected
           </button>
         )}
       </div>
@@ -298,13 +331,17 @@ export const SessionTree = ({
         {rows.map((r) => {
           const pad = { paddingLeft: 6 + r.depth * 14 };
           if (r.kind === "folder") {
+            const key = rowKey(r);
             return (
               <div
-                key={`f:${r.id}`}
-                onClick={() => toggleFolder(r.id)}
+                key={key}
+                data-key={key}
+                onClick={() => { toggleFolder(r.id); selectOnly(r); }}
                 onContextMenu={(e) => { e.preventDefault(); setMenu({ x: e.clientX, y: e.clientY, row: r }); }}
                 style={pad}
-                className="h-[22px] pr-2 flex items-center gap-1 text-[12px] text-zinc-300 hover:bg-white/[0.04] cursor-pointer"
+                className={`h-[22px] pr-2 flex items-center gap-1 text-[12px] cursor-pointer ${
+                  selected.has(key) ? "bg-primary/20 text-white" : "text-zinc-300 hover:bg-white/[0.04]"
+                }`}
                 title={`${r.name} — ${r.count} inside`}
               >
                 <ChevronRight size={12} className={`shrink-0 text-zinc-500 transition-transform ${r.open ? "rotate-90" : ""}`} />
@@ -323,11 +360,12 @@ export const SessionTree = ({
           return (
             <div
               key={r.key}
+              data-key={r.key}
               onClick={(e) => select(r, e)}
               onDoubleClick={() => (isServer ? onOpenServers([r.server]) : openRdp(r.link))}
               onContextMenu={(e) => {
                 e.preventDefault();
-                if (!selected.has(r.key)) { setSelected(new Set([r.key])); setAnchor(r.key); }
+                if (!selected.has(r.key)) selectOnly(r);
                 setMenu({ x: e.clientX, y: e.clientY, row: r });
               }}
               style={{ paddingLeft: 6 + r.depth * 14 + 12 }}
@@ -379,12 +417,12 @@ export const SessionTree = ({
             );
           })() : (() => {
             const r = menu.row;
-            const many = selected.size > 1 && selected.has(r.key);
+            const many = pickedCount > 1 && selected.has(r.key);
             const host = r.kind === "server" ? r.server.host : r.link.host;
             return (
               <>
                 <button className={menuItem} onClick={() => { setMenu(null); many ? openSelected() : (r.kind === "server" ? onOpenServers([r.server]) : openRdp(r.link)); }}>
-                  <Play size={12} /> {many ? `Open ${selected.size} selected` : r.kind === "server" ? "Open" : "Open in Remote Desktop"}
+                  <Play size={12} /> {many ? `Open ${pickedCount} selected` : r.kind === "server" ? "Open" : "Open in Remote Desktop"}
                 </button>
                 {r.kind === "server" && !many && (
                   <button className={menuItem} onClick={() => { setMenu(null); onEditServer(r.server); }}>
