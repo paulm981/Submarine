@@ -29,6 +29,7 @@ mod sftp_remove;
 mod local_open;
 mod host_import;
 mod rdp;
+mod server_os;
 #[cfg(test)]
 mod ssh_test_server;
 use ssh_manager::SshState;
@@ -3585,6 +3586,17 @@ async fn setup_master_db_inner(
     // above, which is how a fresh vault once went without it. Additive, like
     // run_on_connect: an older build simply doesn't see it.
     conn.execute(rdp::SCHEMA, []).map_err(|e| format!("[DATABASE] RDP_TABLE_FAILED: {}", e))?;
+    // The OS each server last reported (server_os.rs), for its badge.
+    // Device-local, not a synced column. Added here for both vault paths too;
+    // on a vault that has it already this answers "duplicate column".
+    if let Err(e) = conn.execute("ALTER TABLE servers ADD COLUMN os TEXT", []) {
+        let s = e.to_string();
+        if !s.contains("duplicate column name") {
+            return Err(format!("[DATABASE] SERVER_OS_MIGRATION_FAILED: {}", s));
+        }
+    }
+    conn.execute_batch(server_os::RESET_TRIGGER)
+        .map_err(|e| format!("[DATABASE] SERVER_OS_TRIGGER_FAILED: {}", e))?;
 
     conn.execute("PRAGMA foreign_keys = ON", []).map_err(|e| format!("[DATABASE] PRAGMA_FAILED: {}", e))?;
 
@@ -4712,7 +4724,7 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
     // ORDER BY (position, id): `position` is the manual drag-to-reorder rank
     // (default 0 for never-reordered rows), and id breaks ties so the order is
     // stable and, before any reorder, identical to the old rowid order.
-    let mut stmt = conn.prepare("SELECT id, name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, updated_at, edited_by, position FROM servers ORDER BY position, id")
+    let mut stmt = conn.prepare("SELECT id, name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, updated_at, edited_by, position, os FROM servers ORDER BY position, id")
         .map_err(|e| format!("[DATABASE] PREPARE_FAILED: {}", e))?;
 
     let rows = stmt.query_map([], |row| {
@@ -4743,6 +4755,8 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
             "edited_by": row.get::<_, Option<String>>(21)?,
             // Manual drag-to-reorder rank (see ORDER BY above).
             "position": row.get::<_, i64>(22).unwrap_or(0),
+            // Last OS the server reported (server_os.rs); null until then.
+            "os": row.get::<_, Option<String>>(23).unwrap_or(None),
         }))
     }).map_err(|e| format!("[DATABASE] QUERY_MAPPING_FAILED: {}", e))?;
 
@@ -14591,7 +14605,7 @@ pub fn run() {
             android_quick_dirs, android_default_local_dir,
             parse_ssh_config,
             parse_client_import,
-            import_hosts,
+            import_hosts, host_import::pick_client_import_file,
             sftp_list_dir, sftp_create_dir, sftp_remove_file, sftp_remove_dir,
             sftp_rename, sftp_set_permissions, sftp_set_owner, sftp_stat,
             sftp_download_file, sftp_download_dir, sftp_upload_file, sftp_upload_dir, sftp_cancel_transfer, sftp_open_remote_file,
@@ -14604,6 +14618,7 @@ pub fn run() {
             portable::get_storage_info,
             local_open::live_edit_editor_get, local_open::live_edit_editor_pick, local_open::live_edit_editor_reset,
             rdp::rdp_list, rdp::rdp_save, rdp::rdp_delete, rdp::rdp_open,
+            server_os::detect_server_os,
             fonts::list_system_fonts,
             clipboard_read_text
         ])

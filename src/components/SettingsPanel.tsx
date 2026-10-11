@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, FileEdit } from "lucide-react";
+import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, FileEdit, Server } from "lucide-react";
 import {
   MAX_FONT_SIZE, MIN_FONT_SIZE, clampFontSize, fontFamilyCss,
   isFontAvailable, primaryFontName, sanitizeFontFamily,
@@ -348,6 +348,35 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
           </div>
           
           <TerminalFontSettings settings={settings} setSettings={setSettings} />
+        </section>
+
+        {/* Servers Section */}
+        <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
+          <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
+            <Server size={14} /> Servers
+          </div>
+
+          <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
+            <div className="flex items-center justify-between gap-4">
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-zinc-100">Show each server's OS</div>
+                <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
+                  The first time a server connects, Submarine reads <span className="font-mono text-zinc-300">/etc/os-release</span>{' '}
+                  (or <span className="font-mono text-zinc-300">uname</span> / <span className="font-mono text-zinc-300">ver</span>)
+                  in the background for the badge beside its name. Turn off where every command is recorded or a
+                  key only allows one command.
+                </p>
+              </div>
+              <button
+                role="switch"
+                aria-checked={settings.detectOs !== false}
+                onClick={() => setSettings((s: any) => ({ ...s, detectOs: !(s.detectOs !== false) }))}
+                className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${settings.detectOs !== false ? 'bg-primary' : 'bg-zinc-700'}`}
+              >
+                <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${settings.detectOs !== false ? 'left-[22px]' : 'left-0.5'}`} />
+              </button>
+            </div>
+          </div>
         </section>
 
         {!IS_ANDROID && (

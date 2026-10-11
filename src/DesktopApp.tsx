@@ -19,6 +19,7 @@ import { useIsNarrow } from "./hooks/useViewport";
 import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./util/terminalFont";
 import { Sidebar } from "./components/Sidebar";
 import { NodeGrid } from "./components/NodeGrid";
+import { SessionTree } from "./components/SessionTree";
 import type { RdpLink } from "./components/RdpLinkModal";
 import AddNodePanel from "./components/AddNodePanel";
 import TerminalView from "./components/TerminalView";
@@ -34,7 +35,9 @@ const appWindow = getCurrentWindow();
 // connect (one-shot, `serverId === 0` and `quickAuth` populated). SessionView
 // forwards `quickAuth` to `initiate_connection` which uses it instead of
 // looking up the DB row.
-type Session = { id: string; serverId: number; serverName: string; mirrors?: string; runOnConnect?: string; quickAuth?: QuickAuth | null };
+// `host`: the server's host when its tab was opened, which the OS badge
+// check goes by (an edit made while the tab is open doesn't move it).
+type Session = { id: string; serverId: number; serverName: string; host?: string; mirrors?: string; runOnConnect?: string; quickAuth?: QuickAuth | null };
 
 const hexToRgb = (hex: string) => {
   const r = parseInt(hex.slice(1, 3), 16);
@@ -262,6 +265,8 @@ function DesktopApp() {
     // "pull collaborators' changes" timer — your own edits still push ~6s after
     // you stop typing regardless of this.
     syncIntervalMin: Math.max(1, parseInt(localStorage.getItem('submarine-sync-interval-min') || '5', 10) || 5),
+    // Read each server's OS for its badge (server_os.rs). Defaults ON.
+    detectOs: localStorage.getItem('submarine-detect-os') !== 'off',
   });
 
   useEffect(() => {
@@ -275,6 +280,7 @@ function DesktopApp() {
     localStorage.setItem(FONT_FAMILY_KEY, appSettings.terminalFontFamily);
     localStorage.setItem('submarine-auto-sync', appSettings.autoSync ? 'on' : 'off');
     localStorage.setItem('submarine-sync-interval-min', String(appSettings.syncIntervalMin));
+    localStorage.setItem('submarine-detect-os', appSettings.detectOs ? 'on' : 'off');
     // Tell already-mounted terminals to re-fit with the new font size / face.
     // Without this dispatch the listener in TerminalView is dead code and
     // users have to close+reopen every terminal to see a size change.
@@ -577,6 +583,7 @@ function DesktopApp() {
         id: `session-${s.id}`,
         serverId: s.id,
         serverName: s.name,
+        host: s.host,
         mirrors: s.mirrors,
       }));
       setSessions((prev: any[]) => {
@@ -660,28 +667,71 @@ function DesktopApp() {
     setSessions([]);
     setActiveView("nodes");
     setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setRdpLinks([]); setCommands([]);
+    osChecked.current.clear();
     addLog("Profile locked.", "info");
   };
 
-  const openServer = (server: any) => {
-    const sessionId = `session-${server.id}`;
-    const existing = sessions.find(s => s.id === sessionId);
-    if (!existing) {
-      setSessions([...sessions, {
-        id: sessionId,
-        serverId: server.id,
-        serverName: server.name,
-        // Pass the raw mirrors JSON through to SessionView so the
-        // MirrorsPanel can pre-populate "Saved on this node" without
-        // another round-trip to the backend.
-        mirrors: server.mirrors,
-        // Commands to auto-run once on the first terminal (see SessionView).
-        runOnConnect: server.run_on_connect || "",
-      }]);
-    }
-
-    setActiveView(sessionId);
+  // The session tree (desktop): shown or hidden, and on which side. Per
+  // device, like the other UI preferences.
+  const readPref = (key: string, fallback: string) => {
+    try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
   };
+  const writePref = (key: string, value: string) => {
+    try { localStorage.setItem(key, value); } catch { /* per-device nicety only */ }
+  };
+  const [treeOpen, setTreeOpen] = useState(() => readPref("submarine.sessionTree.open", "1") === "1");
+  const [treeSide, setTreeSide] = useState<"left" | "right">(() => (readPref("submarine.sessionTree.side", "right") === "left" ? "left" : "right"));
+  useEffect(() => writePref("submarine.sessionTree.open", treeOpen ? "1" : "0"), [treeOpen]);
+  useEffect(() => writePref("submarine.sessionTree.side", treeSide), [treeSide]);
+
+  // Each server's OS, for the badges in the session tree and the server grid
+  // (src-tauri/src/server_os.rs): read once, when a server whose OS isn't
+  // known yet connects, unless Settings turns it off. Moving a server to
+  // another host or port forgets its OS, so it is read again; a server that
+  // can't answer isn't asked again until the app restarts.
+  const osChecked = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!appSettings.detectOs) return;
+    for (const s of sessions) {
+      if (s.serverId <= 0 || !s.host || sessionStatuses[s.id] !== "connected") continue;
+      const server = servers.find((x: any) => x.id === s.serverId);
+      if (!server || server.os) continue;
+      const key = `${server.id}|${s.host}|${server.port}`;
+      if (osChecked.current.has(key)) continue;
+      osChecked.current.add(key);
+      invoke<string | null>("detect_server_os", { sessionId: s.id, serverId: s.serverId, host: s.host })
+        .then((os) => { if (os) refreshServers(); })
+        .catch(() => {});
+    }
+  }, [sessionStatuses, sessions, servers, appSettings.detectOs]);
+
+  // Open servers, each in its own tab (one already open is just shown);
+  // focus lands on the first. Several at once from the session tree's
+  // multi-select and "Open all".
+  const openServers = (list: any[]) => {
+    if (list.length === 0) return;
+    setSessions((prev: Session[]) => {
+      const seen = new Set(prev.map((p) => p.id));
+      const fresh = list
+        .filter((server) => !seen.has(`session-${server.id}`))
+        .map((server) => ({
+          id: `session-${server.id}`,
+          serverId: server.id,
+          serverName: server.name,
+          host: server.host,
+          // Pass the raw mirrors JSON through to SessionView so the
+          // MirrorsPanel can pre-populate "Saved on this node" without
+          // another round-trip to the backend.
+          mirrors: server.mirrors,
+          // Commands to auto-run once on the first terminal (see SessionView).
+          runOnConnect: server.run_on_connect || "",
+        }));
+      return [...prev, ...fresh];
+    });
+    setActiveView(`session-${list[0].id}`);
+  };
+
+  const openServer = (server: any) => openServers([server]);
 
   // Spawn a session from inline Quick Connect auth AND leave behind a reusable
   // node in the root directory so the target can be reconnected later without
@@ -1491,6 +1541,25 @@ function DesktopApp() {
   // the un-shrunken layout viewport.
   if (loading) return <div className="h-full bg-black flex items-center justify-center font-mono text-xs text-primary animate-pulse">Loading…</div>;
 
+  const sessionTree = (
+    <SessionTree
+      profile={activeProfile ?? ""}
+      servers={servers}
+      folders={folders}
+      rdpLinks={rdpLinks}
+      sessions={sessions}
+      statuses={sessionStatuses}
+      waiting={promptSessions}
+      activeSessionId={activeView}
+      onOpenServers={openServers}
+      onOpenRdp={async (id: number) => { await invoke("rdp_open", { id }); }}
+      onEditServer={handleEditNode}
+      side={treeSide}
+      onToggleSide={() => setTreeSide((s) => (s === "left" ? "right" : "left"))}
+      onClose={() => setTreeOpen(false)}
+    />
+  );
+
   return (
     <div className="h-full w-full bg-background flex flex-col overflow-hidden text-zinc-200 select-none">
       {TitleBar()}
@@ -1503,7 +1572,9 @@ function DesktopApp() {
         // tab-order stays intuitive and <main> grabs the full screen width
         // (terminal gains the ~50px the vertical rail used to eat).
         <div className={`flex-1 flex ${isMobile ? 'flex-col-reverse' : ''} overflow-hidden pt-10`}>
-          <Sidebar activeTab={activeView.startsWith('session-') ? 'nodes' : activeView} setActiveTab={setActiveView} isMobile={isMobile} onLogout={handleLogout} profileName={activeProfile} syncing={cloudSyncing} />
+          <Sidebar activeTab={activeView.startsWith('session-') ? 'nodes' : activeView} setActiveTab={setActiveView} isMobile={isMobile} onLogout={handleLogout} profileName={activeProfile} syncing={cloudSyncing}
+            treeOpen={treeOpen} onToggleTree={isMobile ? undefined : () => setTreeOpen((v) => !v)} />
+          {!isMobile && treeOpen && treeSide === "left" && sessionTree}
 
           <main className="flex-1 flex flex-col min-w-0 min-h-0 bg-transparent relative">
             {activeView === "nodes" && (
@@ -2341,6 +2412,7 @@ function DesktopApp() {
             )}
 
           </main>
+          {!isMobile && treeOpen && treeSide === "right" && sessionTree}
         </div>
       )}
 

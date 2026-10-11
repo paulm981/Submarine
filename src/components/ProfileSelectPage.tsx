@@ -32,12 +32,21 @@ interface CloudStatus { signed_in: boolean; email: string | null; }
 interface CloudProfile { profile: string; name: string; records: number; live_records: number; last_updated: string; }
 // Result of the GitHub release check (backend: about::check_for_updates).
 // `has_update` is true only when `latest` is a strictly newer semver than the
-// running build.
-interface UpdateInfo { current: string; latest: string | null; has_update: boolean; release_url: string | null; }
+// running build. `main_ahead`: commits on the fork's main this build lacks;
+// `upstream_ahead`: commits on the original project's main the fork lacks.
+// Null when GitHub couldn't tell.
+interface UpdateInfo {
+  current: string; latest: string | null; has_update: boolean; release_url: string | null;
+  main_ahead: number | null; main_url: string | null;
+  upstream_ahead: number | null; upstream_url: string | null;
+}
+// Whether the check found anything to announce.
+const hasNews = (u: UpdateInfo) => (u.has_update && !!u.latest) || (u.main_ahead ?? 0) > 0 || (u.upstream_ahead ?? 0) > 0;
+const changes = (n: number) => `${n} new change${n === 1 ? "" : "s"}`;
 // The running version and the project's GitHub page (backend: about::app_info).
 interface AppInfo { version: string; github_repo_url: string; }
 // The GitHub link's fallback, should app_info ever fail (about::GITHUB_REPO).
-const REPO_URL = "https://github.com/SinaXhpm/Submarine";
+const REPO_URL = "https://github.com/paulm981/Submarine";
 
 // The picker's unit of display: one profile, wherever it lives. `local` = an
 // on-disk vault exists here; `cloud` = the matching cloud partition (or null).
@@ -143,13 +152,13 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
 
   useEffect(() => { refreshCloud(); }, [refreshCloud]);
 
-  // Check GitHub for a newer release once per app open (this page mounts on
-  // launch and on every return to the picker). Best-effort and silent: the
-  // fetch+semver-compare happens in Rust (about::check_for_updates), and any
-  // failure — offline, rate-limited, no releases — simply shows nothing.
+  // Check GitHub for a newer release or newer commits once per app open (this
+  // page mounts on launch and on every return to the picker). Best-effort and
+  // silent: the fetch+compare happens in Rust (about::check_for_updates), and
+  // any failure — offline, rate-limited, no releases — simply shows nothing.
   useEffect(() => {
     invoke<UpdateInfo>("check_for_updates")
-      .then((u) => { if (u.has_update && u.latest) setUpdate(u); })
+      .then((u) => { if (hasNews(u)) setUpdate(u); })
       .catch(() => {});
   }, []);
 
@@ -172,18 +181,18 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   const openRepo = () => openLink(appInfo?.github_repo_url ?? REPO_URL);
 
   // The footer's "Check for updates". Unlike the silent check above it reports
-  // every outcome; a newer release lands in `update`, so the same notice
-  // announces it.
+  // every outcome; a newer release or newer commits land in `update`, so the
+  // same notices announce them.
   const checkForUpdates = async () => {
     if (check === "checking") return;
     setCheck("checking");
     try {
       const u = await invoke<UpdateInfo>("check_for_updates");
-      if (u.has_update && u.latest) {
+      if (hasNews(u)) {
         setUpdate(u);
         setCheck("idle");
       } else {
-        setCheck(u.latest ? "latest" : "none");
+        setCheck(u.latest || u.main_ahead === 0 ? "latest" : "none");
       }
     } catch (e) {
       setCheckError(cleanErr(e));
@@ -685,8 +694,9 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
         <CloudBar status={cloudStatus} busy={busy} onManage={() => setCloudOpen(true)} />
 
         {/* GitHub, the update check and the running version side by side,
-            with a live "new version" notice underneath when one is available
-            (the check steps aside then — the notice says it all). */}
+            with live "new version" / "new changes" notices underneath when
+            there are any (the check steps aside then — the notices say it
+            all). */}
         <div className="mt-4 flex flex-col items-center gap-2.5">
           <div aria-live="polite" className="flex flex-wrap items-center justify-center gap-1 text-[11.5px]">
             <FooterButton onClick={openRepo} title="Open Submarine on GitHub" icon={<Github size={12} />} label="GitHub" />
@@ -696,7 +706,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
                 <FooterButton
                   onClick={checkForUpdates}
                   disabled={check === "checking"}
-                  title={check === "error" ? `Couldn't reach GitHub: ${checkError}` : "Look for a newer release on GitHub"}
+                  title={check === "error" ? `Couldn't reach GitHub: ${checkError}` : "Look for a newer release or newer changes on GitHub"}
                   icon={checkItem.icon}
                   label={checkItem.label}
                   tone={checkItem.tone}
@@ -718,20 +728,28 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
             </p>
           )}
           {update?.has_update && update.latest && (
-            <button
+            <NewsButton
               onClick={openReleaseNotes}
               title="Open the release notes on GitHub"
-              className="group flex items-center gap-1.5 text-[10.5px] text-primary/90 hover:text-primary animate-in fade-in slide-in-from-bottom-1 duration-700"
-            >
-              {/* pulsing dot — the "something new" signal */}
-              <span className="relative flex h-1.5 w-1.5">
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary/70 opacity-75" />
-                <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-primary" />
-              </span>
-              <ArrowUpCircle size={11} className="shrink-0" />
-              <span>New version <span className="font-mono font-semibold">v{update.latest}</span> available</span>
-              <span className="opacity-60 transition-transform group-hover:translate-x-0.5">→</span>
-            </button>
+              label={<>New version <span className="font-mono font-semibold">v{update.latest}</span> available</>}
+            />
+          )}
+          {/* Built from source: newer commits on the fork's main mean pull
+              and rebuild; newer commits on the original project mean the
+              fork wants a Sync fork on GitHub first. */}
+          {(update?.main_ahead ?? 0) > 0 && update?.main_url && (
+            <NewsButton
+              onClick={() => openLink(update.main_url!)}
+              title="See the new changes on GitHub, then pull them and rebuild"
+              label={<>{changes(update.main_ahead!)} on main — pull and rebuild</>}
+            />
+          )}
+          {(update?.upstream_ahead ?? 0) > 0 && update?.upstream_url && (
+            <NewsButton
+              onClick={() => openLink(update.upstream_url!)}
+              title="Open the fork on GitHub and use Sync fork to bring them in"
+              label={<>The original project has {changes(update.upstream_ahead!)} — Sync fork on GitHub</>}
+            />
           )}
         </div>
       </div>
@@ -799,6 +817,24 @@ const FooterButton = ({
 );
 
 const FooterDot = () => <span aria-hidden className="text-zinc-700 select-none">·</span>;
+
+// A "something new" notice under the footer row: a new release or new changes.
+const NewsButton = ({ onClick, title, label }: { onClick: () => void; title: string; label: React.ReactNode }) => (
+  <button
+    onClick={onClick}
+    title={title}
+    className="group flex items-center gap-1.5 text-[10.5px] text-primary/90 hover:text-primary animate-in fade-in slide-in-from-bottom-1 duration-700"
+  >
+    {/* pulsing dot — the "something new" signal */}
+    <span className="relative flex h-1.5 w-1.5">
+      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary/70 opacity-75" />
+      <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-primary" />
+    </span>
+    <ArrowUpCircle size={11} className="shrink-0" />
+    <span>{label}</span>
+    <span className="opacity-60 transition-transform group-hover:translate-x-0.5">→</span>
+  </button>
+);
 
 const CloudBar = ({
   status, busy, onManage,

@@ -338,9 +338,92 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
     Ok(report)
 }
 
+/// Exports bigger than this aren't session lists (MobaXterm's for a few
+/// hundred sessions is about 100 KB).
+const MAX_EXPORT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Pick a session export (MobaXterm `.mxtsessions`, PuTTY `.reg`, JSON) in a
+/// native dialog and hand back its text for `parse_client_import`, as if it
+/// had been pasted. `None` when the dialog is cancelled.
+#[tauri::command]
+pub async fn pick_client_import_file() -> Result<Option<String>, String> {
+    #[cfg(target_os = "android")]
+    {
+        Err("Choosing a file isn't available on Android — paste the export instead.".into())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Choose a session export")
+            .add_filter("Session exports", &["mxtsessions", "reg", "json", "txt"])
+            .add_filter("All files", &["*"])
+            .pick_file()
+        else {
+            return Ok(None);
+        };
+        // A plain file, read no further than the cap: a pipe or a device
+        // reports no useful size, and opening a pipe waits for a writer.
+        use std::io::Read;
+        if !std::fs::metadata(&path).map_err(|e| format!("[FILE] IMPORT_OPEN_FAILED: {}", e))?.is_file() {
+            return Err("That isn't a file.".into());
+        }
+        let file = std::fs::File::open(&path).map_err(|e| format!("[FILE] IMPORT_OPEN_FAILED: {}", e))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_EXPORT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("[FILE] IMPORT_READ_FAILED: {}", e))?;
+        if bytes.len() as u64 > MAX_EXPORT_BYTES {
+            return Err("That file is too big to be a session export.".into());
+        }
+        Ok(Some(decode_export(&bytes)))
+    }
+}
+
+/// regedit writes `.reg` exports as UTF-16 with a byte-order mark; MobaXterm
+/// writes its exports in the Windows code page, which is UTF-8 only when the
+/// names are plain ASCII.
+fn decode_export(bytes: &[u8]) -> String {
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        return String::from_utf16_lossy(&units);
+    }
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => bytes.iter().map(|&b| windows_1252(b)).collect(),
+    }
+}
+
+fn windows_1252(b: u8) -> char {
+    // 0x80–0x9F are the only bytes where Windows-1252 differs from Latin-1.
+    const HIGH: [char; 32] = [
+        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8D}', 'Ž', '\u{8F}',
+        '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9D}', 'ž', 'Ÿ',
+    ];
+    match b {
+        0x80..=0x9F => HIGH[(b - 0x80) as usize],
+        _ => b as char,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exports_decode_whatever_wrote_them() {
+        // regedit: UTF-16 LE with a byte-order mark.
+        let mut reg = vec![0xFF, 0xFE];
+        for u in "Windows Registry Editor".encode_utf16() {
+            reg.extend_from_slice(&u.to_le_bytes());
+        }
+        assert_eq!(decode_export(&reg), "Windows Registry Editor");
+        // UTF-8, with or without a byte-order mark.
+        assert_eq!(decode_export("[Bookmarks]\r\nJürgen=".as_bytes()), "[Bookmarks]\r\nJürgen=");
+        assert_eq!(decode_export(b"\xEF\xBB\xBF[Bookmarks]"), "[Bookmarks]");
+        // MobaXterm in the Windows code page: é is 0xE9, € is 0x80.
+        assert_eq!(decode_export(b"caf\xE9 \x80"), "café €");
+    }
 
     fn vault() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
