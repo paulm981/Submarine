@@ -29,12 +29,17 @@ fn editor_file(app: &tauri::AppHandle) -> Option<PathBuf> {
     app.path().app_config_dir().ok().map(|d| d.join(EDITOR_FILE))
 }
 
-/// The editor picked under Settings, while it is still there.
+/// The editor picked under Settings, while it is still there. A program
+/// file, or on macOS an app bundle (a folder, e.g. Zed.app).
 fn chosen_editor(app: &tauri::AppHandle) -> Option<PathBuf> {
     let raw = std::fs::read(editor_file(app)?).ok()?;
     let choice: EditorChoice = serde_json::from_slice(&raw).ok()?;
     let path = PathBuf::from(choice.path);
-    path.is_file().then_some(path)
+    (path.is_file() || is_app_bundle(&path)).then_some(path)
+}
+
+fn is_app_bundle(path: &Path) -> bool {
+    cfg!(target_os = "macos") && path.is_dir() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("app"))
 }
 
 /// By full path: a bare `notepad.exe` would be looked for next to
@@ -128,7 +133,15 @@ pub fn open_for_editing(app: &tauri::AppHandle, file: &Path) -> Result<(), Strin
 
 #[cfg(not(target_os = "android"))]
 fn start_editor(editor: &Path, file: &Path) -> Result<(), String> {
-    let mut child = std::process::Command::new(editor)
+    // An app bundle is started through `open -a`, as Finder would.
+    let mut cmd = if is_app_bundle(editor) {
+        let mut c = std::process::Command::new("/usr/bin/open");
+        c.arg("-a").arg(editor);
+        c
+    } else {
+        std::process::Command::new(editor)
+    };
+    let mut child = cmd
         .arg(file)
         .spawn()
         .map_err(|e| format!("couldn't start {}: {}", editor.display(), e))?;
