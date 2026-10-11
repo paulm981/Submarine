@@ -1,9 +1,11 @@
-import { Search, Plus, Server, Globe, Folder, ChevronLeft, Trash2, Edit2, Zap, Check, X, Copy, GripVertical } from "lucide-react";
+import { Search, Plus, Server, Globe, Folder, ChevronLeft, ChevronRight, Trash2, Edit2, Zap, Check, X, Copy, GripVertical, MonitorSmartphone } from "lucide-react";
 import { useState, useEffect, useLayoutEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import { useConfirm } from "../ui/confirm";
+import { childFolders, folderPath, parentOf, subtreeIds } from "../util/folderPath";
+import RdpLinkModal, { RdpLink } from "./RdpLinkModal";
 
-export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp, onActiveFolderChange, onOpenServer, onEditServer, onAddClick, onQuickConnect, onRemoveServer, onRemoveFolder, onRenameFolder, onCloneServer, onReorderServers, isMobile }: any) => {
+export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFolderIdProp, onActiveFolderChange, onOpenServer, onEditServer, onAddClick, onQuickConnect, onRemoveServer, onRemoveFolder, onRenameFolder, onCloneServer, onReorderServers, onOpenRdp, onSaveRdp, onRemoveRdp, isMobile }: any) => {
   const [search, setSearch] = useState("");
   // Native window.confirm() is a silent no-op inside Tauri's Android WebView
   // (same shim gap useTextPrompt was added for), so the delete buttons here
@@ -38,6 +40,14 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
   ) || [];
 
   const currentFolder = folders?.find((f: any) => f.id === activeFolderId);
+  // Folders nest (parent_id): the grid shows the folders directly inside the
+  // open one, and the header the path to it.
+  const allFolders: any[] = folders || [];
+  const crumbs = folderPath(allFolders, activeFolderId);
+  const parentFolderId = currentFolder ? parentOf(allFolders, currentFolder) : null;
+  // A server or link whose folder is gone shows at the top level.
+  const knownFolder = (id: number | null | undefined) => id != null && allFolders.some((f: any) => f.id === id);
+  const inFolder = (folderId: number | null | undefined) => (knownFolder(folderId) ? folderId : null) === activeFolderId;
 
   // If search is active, we might want to just show all matching servers flat,
   // or still respect the folder. Let's just show them flat if searching.
@@ -45,7 +55,20 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
 
   const displayedServers = isSearching
     ? filteredServers
-    : filteredServers.filter((s: any) => s.folder_id === activeFolderId);
+    : filteredServers.filter((s: any) => inFolder(s.folder_id));
+
+  const q = search.toLowerCase();
+  const displayedRdp: RdpLink[] = (rdpLinks || []).filter((l: RdpLink) =>
+    isSearching
+      ? l.name.toLowerCase().includes(q) || l.host.toLowerCase().includes(q)
+      : inFolder(l.folder_id),
+  );
+  const displayedFolders = isSearching ? [] : childFolders(allFolders, activeFolderId);
+
+  // Add / edit dialog for a Remote Desktop link; null while closed.
+  const [rdpDraft, setRdpDraft] = useState<RdpLink | null>(null);
+  const [rdpError, setRdpError] = useState<string | null>(null);
+  const newRdp = () => setRdpDraft({ name: "", host: "", port: 3389, username: "", folder_id: activeFolderId, notes: "" });
 
   // ── Modern floating drag-to-reorder (pointer-based: mouse AND touch) ────────
   // Grabbing the grip lifts the node out of the grid: a fixed-position clone
@@ -336,11 +359,65 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
     );
   };
 
+  // A Remote Desktop link: same card shape as a server, a sky accent and a
+  // monitor glyph. Click opens the system's Remote Desktop client.
+  const renderRdp = (l: RdpLink) => (
+    <div
+      key={`rdp-${l.id}`}
+      onClick={async () => {
+        setRdpError(null);
+        try { await onOpenRdp(l.id); }
+        catch (e: any) { setRdpError(`${l.name}: ${typeof e === "string" ? e : (e?.message || String(e))}`); }
+      }}
+      title={l.notes || `Open ${l.name} in Remote Desktop`}
+      className="group relative flex items-center gap-3 h-16 pl-3.5 pr-2 rounded-xl bg-gradient-to-br from-[#17171c] to-[#121216] border border-white/5 hover:border-sky-400/40 hover:bg-white/[0.015] transition-colors duration-150 cursor-pointer overflow-hidden"
+    >
+      <span aria-hidden className="absolute left-0 top-0 bottom-0 w-[3px] bg-sky-400/70" />
+      <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-sky-400/25 to-sky-400/[0.03] border border-sky-400/20 flex items-center justify-center text-sky-300 shadow-inner shrink-0">
+        <MonitorSmartphone size={15} />
+      </div>
+      <div className="min-w-0 flex-1">
+        <h3 className="font-bold text-zinc-100 text-[13px] truncate tracking-tight leading-tight">{l.name}</h3>
+        <div className="flex items-center gap-1 mt-0.5">
+          <span className="text-[9px] font-black tracking-wider text-sky-300/80">RDP</span>
+          <span className="text-[10.5px] text-zinc-300 font-mono truncate">
+            {l.username ? `${l.username} @ ` : ""}{l.host}{l.port && l.port !== 3389 ? `:${l.port}` : ""}
+          </span>
+        </div>
+      </div>
+      <div className="flex items-center gap-0.5 shrink-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 [@media(hover:none)]:!opacity-100 sm:absolute sm:right-1.5 sm:top-1/2 sm:-translate-y-1/2 sm:pl-8 sm:bg-gradient-to-l sm:from-[#121216] sm:via-[#121216] sm:to-transparent transition-all duration-200">
+        <button
+          onClick={(e) => { e.stopPropagation(); setRdpDraft({ ...l }); }}
+          title="Edit"
+          className="p-1.5 rounded-lg text-zinc-500 hover:text-white hover:bg-white/5 transition-all"
+        >
+          <Edit2 size={13} />
+        </button>
+        <button
+          onClick={async (e) => {
+            e.stopPropagation();
+            if (await confirm({ title: 'Delete Remote Desktop link?', message: `“${l.name}” will be removed from this profile.`, destructive: true })) {
+              onRemoveRdp(l.id);
+            }
+          }}
+          title="Delete"
+          className="p-1.5 rounded-lg text-zinc-500 hover:text-red-500 hover:bg-white/5 transition-all"
+        >
+          <Trash2 size={13} />
+        </button>
+      </div>
+    </div>
+  );
+
   // Folders share the compact horizontal language so the grid reads as one
   // surface: a tinted folder glyph, name + server count, inline rename in
   // place, and the same hover lift as server cards.
   const FolderCard = ({ f }: { f: any }) => {
-    const serverCount = servers?.filter((s: any) => s.folder_id === f.id).length || 0;
+    // Everything inside, at any depth, so a folder of folders isn't "0".
+    const inside = subtreeIds(allFolders, f.id);
+    const serverCount = (servers?.filter((s: any) => inside.has(s.folder_id)).length || 0)
+      + ((rdpLinks || []).filter((l: RdpLink) => l.folder_id != null && inside.has(l.folder_id)).length);
+    const subfolderCount = childFolders(allFolders, f.id).length;
     const isRenaming = renaming?.id === f.id;
     const accent = f.color || 'rgb(var(--primary))';
     return (
@@ -376,6 +453,7 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
             <>
               <h3 className="font-bold text-zinc-100 text-[13px] truncate tracking-tight leading-tight">{f.name}</h3>
               <span className="text-[10px] text-zinc-500 font-bold uppercase tracking-[0.12em]">
+                {subfolderCount > 0 && (subfolderCount === 1 ? '1 folder · ' : `${subfolderCount} folders · `)}
                 {serverCount === 1 ? '1 server' : `${serverCount} servers`}
               </span>
             </>
@@ -414,7 +492,7 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
               <button
                 onClick={async (e) => {
                   e.stopPropagation();
-                  if (await confirm({ title: 'Delete folder?', message: `“${f.name}” and every server inside it will be removed.`, destructive: true })) {
+                  if (await confirm({ title: 'Delete folder?', message: `“${f.name}” and every folder, server and Remote Desktop link inside it will be removed.`, destructive: true })) {
                     onRemoveFolder(f.id);
                   }
                 }}
@@ -449,13 +527,23 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
         {!isSearching && activeFolderId !== null && (
           <div className="flex items-center gap-3 mb-6">
             <button
-              onClick={() => setActiveFolderId(null)}
-              className="w-8 h-8 bg-black rounded-xl border border-white/5 flex items-center justify-center hover:bg-white/10 hover:text-white text-zinc-500 transition-all shadow-inner"
+              onClick={() => setActiveFolderId(parentFolderId)}
+              title="Up one folder"
+              className="w-8 h-8 shrink-0 bg-black rounded-xl border border-white/5 flex items-center justify-center hover:bg-white/10 hover:text-white text-zinc-500 transition-all shadow-inner"
             >
               <ChevronLeft size={16} />
             </button>
-            <h2 className="text-[15px] font-bold text-primary tracking-tight flex items-center gap-2 flex-1">
-              <Folder size={16} /> {currentFolder?.name}
+            <h2 className="text-[15px] font-bold text-primary tracking-tight flex items-center gap-1.5 flex-1 min-w-0 flex-wrap">
+              <Folder size={16} className="shrink-0" />
+              <button onClick={() => setActiveFolderId(null)} className="text-zinc-500 hover:text-zinc-200 font-semibold">All</button>
+              {crumbs.map((c: any, i: number) => (
+                <span key={c.id} className="flex items-center gap-1.5 min-w-0">
+                  <ChevronRight size={12} className="text-zinc-600 shrink-0" />
+                  {i === crumbs.length - 1
+                    ? <span className="truncate">{c.name}</span>
+                    : <button onClick={() => setActiveFolderId(c.id)} className="text-zinc-400 hover:text-zinc-100 font-semibold truncate">{c.name}</button>}
+                </span>
+              ))}
             </h2>
             {/* Adding a server from inside a folder pre-selects this folder
                 in the new-node panel, so the user doesn't have to repeat
@@ -466,10 +554,18 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
             >
               <Plus size={13} /> Add server
             </button>
+            {onSaveRdp && (
+              <button
+                onClick={newRdp}
+                className="h-8 px-3 bg-sky-500/10 text-sky-300 border border-sky-500/25 hover:bg-sky-500/20 rounded-lg flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider shrink-0"
+              >
+                <MonitorSmartphone size={13} /> Add RDP link
+              </button>
+            )}
           </div>
         )}
 
-        {servers?.length === 0 && folders?.length === 0 ? (
+        {servers?.length === 0 && folders?.length === 0 && (rdpLinks || []).length === 0 ? (
           <div className="h-full flex items-center justify-center">
             <button
               onClick={onAddClick}
@@ -504,28 +600,39 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
                     <Zap size={13} /> Quick connect
                   </button>
                 )}
+                {onSaveRdp && (
+                  <button
+                    onClick={newRdp}
+                    className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg bg-sky-500/10 border border-sky-500/25 text-sky-300 text-[11px] font-bold uppercase tracking-wider hover:bg-sky-500/20 transition-colors"
+                  >
+                    <MonitorSmartphone size={13} /> Add RDP link
+                  </button>
+                )}
               </div>
             )}
 
           <div ref={gridRef} className={`grid ${isMobile ? 'grid-cols-1' : 'grid-cols-2 lg:grid-cols-3 xl:grid-cols-4'} gap-3`}>
 
-            {/* Render Folders (only in root, and when not searching) */}
-            {!isSearching && activeFolderId === null && folders?.map((f: any) => (
+            {/* The folders directly inside the open one (none while searching). */}
+            {displayedFolders.map((f: any) => (
               <FolderCard key={`folder-${f.id}`} f={f} />
             ))}
 
             {/* Render Servers — honours the live drag order while reordering. */}
             {orderedServers.map((s: any) => renderServer(s))}
 
+            {/* Remote Desktop links, after the servers. Not draggable: no data-sid. */}
+            {displayedRdp.map((l) => renderRdp(l))}
+
             {/* Empty Folder State */}
-            {!isSearching && activeFolderId !== null && displayedServers.length === 0 && (
+            {!isSearching && activeFolderId !== null && displayedServers.length === 0 && displayedFolders.length === 0 && displayedRdp.length === 0 && (
               <div className="col-span-full py-10 text-center text-zinc-600 text-xs italic">
                 Nothing in this folder yet.
               </div>
             )}
 
             {/* Empty Search State */}
-            {isSearching && displayedServers.length === 0 && (
+            {isSearching && displayedServers.length === 0 && displayedRdp.length === 0 && (
               <div className="col-span-full py-10 text-center text-zinc-600 text-xs italic">
                 No matches.
               </div>
@@ -535,6 +642,18 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
           </>
         )}
       </div>
+
+      {rdpError && (
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-40 max-w-md px-3 py-2 bg-rose-500/15 border border-rose-500/30 rounded-lg text-rose-200 text-[11.5px] flex items-center gap-2">
+          <span className="flex-1">{rdpError}</span>
+          <button onClick={() => setRdpError(null)} className="text-rose-200/70 hover:text-white"><X size={13} /></button>
+        </div>
+      )}
+
+      {rdpDraft && createPortal(
+        <RdpLinkModal link={rdpDraft} folders={allFolders} onSave={onSaveRdp} onClose={() => setRdpDraft(null)} />,
+        document.body
+      )}
 
       {/* Floating drag clone — a fixed-position copy of the node that the
           pointer carries while the grid reflows underneath. pointer-events:none

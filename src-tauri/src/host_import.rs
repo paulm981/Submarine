@@ -14,6 +14,7 @@
 //!   same host, port and user, or saved as a new one with its key, and every
 //!   host behind it is linked to it. Submarine jumps through one host only,
 //!   so a chain of several is reported and left for the user;
+//! - an RDP session becomes a Remote Desktop link (rdp.rs) in its folder;
 //! - a server already saved with the same name, host, port and folder is
 //!   left alone, so importing the same file twice adds nothing.
 
@@ -47,6 +48,8 @@ pub(crate) struct ImportReport {
     pub jump_linked: usize,
     /// Hosts whose jump chain has more than one hop: imported without one.
     pub multi_hop: Vec<String>,
+    /// Remote Desktop sessions added as RDP links (rdp.rs).
+    pub rdp_added: usize,
 }
 
 /// `[user@]host[:port]`, with `[v6]:port` for IPv6 literals.
@@ -199,6 +202,35 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
         let port = if h.port == 0 { 22 } else { h.port };
         let folder_id = folders.resolve(conn, &h.folder).map_err(db)?;
 
+        if h.rdp {
+            let existing: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM rdp_links WHERE name = ?1 AND host = ?2 AND port = ?3 AND folder_id IS ?4 LIMIT 1",
+                    params![name, host, port, folder_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(db)?;
+            if existing.is_some() {
+                report.already_there += 1;
+                continue;
+            }
+            // A saved-login name says nothing about the Windows user; leave
+            // it for Remote Desktop to ask (and remember).
+            let link = crate::rdp::RdpLink {
+                id: None,
+                name: name.to_string(),
+                host: host.to_string(),
+                port,
+                username: h.user.trim().to_string(),
+                folder_id,
+                notes: String::new(),
+            };
+            crate::rdp::save(conn, &link)?;
+            report.rdp_added += 1;
+            continue;
+        }
+
         let existing: Option<i64> = conn
             .query_row(
                 "SELECT id FROM servers WHERE name = ?1 AND host = ?2 AND port = ?3 AND folder_id IS ?4 LIMIT 1",
@@ -298,7 +330,36 @@ mod tests {
              INSERT INTO ssh_keys(name, private_key) VALUES ('id_jump', 'k1'), ('own', 'k2');",
         )
         .unwrap();
+        conn.execute_batch(crate::rdp::SCHEMA).unwrap();
         conn
+    }
+
+    #[test]
+    fn rdp_sessions_become_links_in_their_folder() {
+        let conn = vault();
+        let rdp = ImportRow {
+            host: ImportedHost {
+                host_alias: "desk (GUI)".into(),
+                hostname: "desk.example".into(),
+                port: 3389,
+                folder: vec!["Prod".into()],
+                credential: Some("OPS".into()),
+                rdp: true,
+                ..Default::default()
+            },
+            key_id: None,
+            jump_key_id: None,
+        };
+        let r = import_rows(&conn, std::slice::from_ref(&rdp)).unwrap();
+        assert_eq!((r.rdp_added, r.added), (1, 0));
+        assert!(r.logins_created.is_empty(), "no Login for an RDP session");
+        let links = crate::rdp::list(&conn).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!((links[0].name.as_str(), links[0].host.as_str(), links[0].port, links[0].username.as_str()), ("desk (GUI)", "desk.example", 3389, ""));
+        let folder: String = conn.query_row("SELECT name FROM folders WHERE id = ?1", [links[0].folder_id.unwrap()], |r| r.get(0)).unwrap();
+        assert_eq!(folder, "Prod");
+        let again = import_rows(&conn, &[rdp]).unwrap();
+        assert_eq!((again.rdp_added, again.already_there), (0, 1));
     }
 
     fn moba(name: &str, folder: &[&str], host: &str, login: Option<&str>, jump: Option<&str>) -> ImportRow {

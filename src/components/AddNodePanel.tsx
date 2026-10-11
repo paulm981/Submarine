@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
+import { folderOptions } from "../util/folderPath";
 import { Cpu, X, Link2, ArrowLeftRight, Shield, Key, User, FolderPlus, Download, CheckSquare, Square, History, Plus, Copy } from "lucide-react";
 import PasswordField from "./PasswordField";
 import { useTextPrompt } from "../ui/confirm";
@@ -40,6 +41,8 @@ type ImportedHost = {
   credential?: string | null;
   run_on_connect?: string | null;
   jump_identity_file?: string | null;
+  // A Remote Desktop session: becomes an RDP link, not a server.
+  rdp?: boolean;
 };
 
 // What `import_hosts` reports back (src-tauri/src/host_import.rs).
@@ -51,6 +54,7 @@ type ImportReport = {
   jump_hosts_created: string[];
   jump_linked: number;
   multi_hop: string[];
+  rdp_added: number;
 };
 
 const rowKey = (h: ImportedHost) => h.key || h.host_alias;
@@ -65,7 +69,7 @@ type ImportedSshKey = {
   encrypted: boolean;
 };
 
-const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credentials, refreshCredentials, sshKeys, refreshSshKeys, folders, refreshFolders, refreshServers, servers, isEditMode, formError, isMobile }: any) => {
+const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credentials, refreshCredentials, refreshRdpLinks, sshKeys, refreshSshKeys, folders, refreshFolders, refreshServers, servers, isEditMode, formError, isMobile }: any) => {
   const [isCreatingFolder, setIsCreatingFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
   // Set while the native key picker is open so the Browse button can't be
@@ -257,6 +261,9 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     if (refreshCredentials) {
       try { await refreshCredentials(); } catch { /* same */ }
     }
+    if (refreshRdpLinks) {
+      try { await refreshRdpLinks(); } catch { /* same */ }
+    }
     if (keysByPath.size > 0 && refreshSshKeys) {
       try { await refreshSshKeys(); } catch { /* same — the list refreshes on next open */ }
     }
@@ -293,6 +300,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
       `${plural(report.added, "server")} imported` +
       (report.folders_created ? `, ${plural(report.folders_created, "folder")} created` : "") +
       (report.jump_linked ? `, ${report.jump_linked} linked to a jump host` : "") +
+      (report.rdp_added ? `, ${plural(report.rdp_added, "Remote Desktop link")} added` : "") +
       (report.already_there ? `; ${report.already_there} already saved, left as they were` : "") +
       ".";
     if (todo.length > 0) {
@@ -372,7 +380,9 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
   const handleCreateFolder = async () => {
     if (!newFolderName.trim()) return;
     try {
-      await invoke("add_folder", { name: newFolderName, parentId: null });
+      // Inside the folder picked above, so folders can nest; at the top level
+      // when that's Root.
+      await invoke("add_folder", { name: newFolderName, parentId: newNode.folderId ? parseInt(newNode.folderId) : null });
       setNewFolderName("");
       setIsCreatingFolder(false);
       refreshFolders();
@@ -439,7 +449,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 <div className="flex gap-2">
                   <select className="flex-1 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" value={newNode.folderId} onChange={e => setNewNode({ ...newNode, folderId: e.target.value })}>
                     <option value="" className="bg-[#1a1a1e] text-zinc-500">-- Root --</option>
-                    {folders?.map((f: any) => <option key={f.id} value={f.id.toString()} className="bg-[#1a1a1e] text-white">{f.name}</option>)}
+                    {folderOptions(folders || []).map((f) => <option key={f.id} value={f.id.toString()} className="bg-[#1a1a1e] text-white">{f.label}</option>)}
                   </select>
                   <button onClick={() => setIsCreatingFolder(true)} className="w-9 h-9 bg-white/5 border border-white/10 rounded-lg text-primary hover:bg-white/10 transition-all flex items-center justify-center shrink-0">
                     <FolderPlus size={14} />
@@ -447,7 +457,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 </div>
               ) : (
                 <div className="flex gap-2 animate-in fade-in">
-                  <input type="text" className="flex-1 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" placeholder="Folder name…" value={newFolderName} onChange={e => setNewFolderName(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleCreateFolder()} />
+                  <input type="text" className="flex-1 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" placeholder={newNode.folderId ? "New folder inside the one picked…" : "Folder name…"} value={newFolderName} onChange={e => setNewFolderName(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleCreateFolder()} />
                   <button onClick={handleCreateFolder} className="h-9 px-3 bg-primary text-black font-bold text-[12px] rounded-lg hover:bg-primary transition-all">Add</button>
                   <button onClick={() => setIsCreatingFolder(false)} className="w-9 h-9 bg-white/5 text-zinc-400 rounded-lg hover:bg-white/10 transition-all flex justify-center items-center shrink-0"><X size={14} /></button>
                 </div>
@@ -1064,6 +1074,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                           />
                           <div className="flex-1 min-w-0">
                             <div className="text-[12.5px] font-bold text-white truncate">
+                              {h.rdp && <span className="mr-1.5 px-1 py-px rounded text-[9.5px] font-black tracking-wider bg-sky-500/15 text-sky-300 border border-sky-500/30 align-middle">RDP</span>}
                               {h.host_alias}
                             </div>
                             <div className="text-[11px] font-mono text-zinc-400 truncate">

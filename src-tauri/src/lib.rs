@@ -28,6 +28,7 @@ mod webkit_sandbox;
 mod sftp_remove;
 mod local_open;
 mod host_import;
+mod rdp;
 #[cfg(test)]
 mod ssh_test_server;
 use ssh_manager::SshState;
@@ -3445,6 +3446,9 @@ async fn setup_master_db_inner(
             "CREATE INDEX IF NOT EXISTS idx_cmd_history_ts ON cmd_history(ts DESC)",
             [],
         ).map_err(|e| format!("[DATABASE] CMD_HISTORY_INDEX_FAILED: {}", e))?;
+        // Remote Desktop links (rdp.rs). Additive, like run_on_connect below:
+        // an older build simply doesn't see the table.
+        conn.execute(rdp::SCHEMA, []).map_err(|e| format!("[DATABASE] RDP_TABLE_FAILED: {}", e))?;
         const SCHEMA_VERSION: i64 = 6;
         let stored: i64 = conn.query_row(
             "SELECT CAST(value AS INTEGER) FROM schema_meta WHERE key = 'schema_version'",
@@ -4881,18 +4885,25 @@ async fn delete_folder(
     id: i32,
 ) -> Result<(), String> {
     // Same orphaned-poller problem as delete_server, one level up: this deletes
-    // every server in the folder, so every one of their monitors has to be
-    // stopped first. Collect the ids while the rows still exist.
-    let doomed: Vec<i32> = {
+    // every server in the folder and the folders inside it, so every one of
+    // their monitors has to be stopped first. Collect the ids while the rows
+    // still exist.
+    let (folder_ids, doomed): (Vec<i64>, Vec<i32>) = {
         let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        let folder_ids = folder_subtree(conn, id as i64)
+            .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_QUERY_FAILED: {}", e))?;
+        let mut doomed = Vec::new();
         let mut stmt = conn
             .prepare("SELECT id FROM servers WHERE folder_id=?1")
             .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_QUERY_FAILED: {}", e))?;
-        let rows = stmt
-            .query_map(rusqlite::params![id], |r| r.get::<_, i32>(0))
-            .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_QUERY_FAILED: {}", e))?;
-        rows.filter_map(|r| r.ok()).collect()
+        for fid in &folder_ids {
+            let rows = stmt
+                .query_map(rusqlite::params![fid], |r| r.get::<_, i32>(0))
+                .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_QUERY_FAILED: {}", e))?;
+            doomed.extend(rows.filter_map(|r| r.ok()));
+        }
+        (folder_ids, doomed)
     };
     for node_id in doomed {
         monitor::stop_monitor(map.inner().clone(), node_id).await;
@@ -4901,17 +4912,58 @@ async fn delete_folder(
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
 
-    // First, delete all servers in this folder
-    conn.execute("DELETE FROM servers WHERE folder_id=?1", rusqlite::params![id])
-        .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_DELETE_FAILED: {}", e))?;
-
-    // Then delete the folder
-    conn.execute("DELETE FROM folders WHERE id=?1", rusqlite::params![id])
-        .map_err(|e| format!("[DATABASE] FOLDER_DELETE_FAILED: {}", e))?;
+    // The folder, the folders inside it, and every server and Remote Desktop
+    // link in any of them: a folder left behind would lose its parent and
+    // turn up at the top level.
+    for fid in &folder_ids {
+        conn.execute("DELETE FROM servers WHERE folder_id=?1", rusqlite::params![fid])
+            .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_DELETE_FAILED: {}", e))?;
+        conn.execute("DELETE FROM rdp_links WHERE folder_id=?1", rusqlite::params![fid])
+            .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_DELETE_FAILED: {}", e))?;
+        conn.execute("DELETE FROM folders WHERE id=?1", rusqlite::params![fid])
+            .map_err(|e| format!("[DATABASE] FOLDER_DELETE_FAILED: {}", e))?;
+    }
 
     drop(conn_guard);
     save_vault_internal(&state)?;
     Ok(())
+}
+
+/// A folder and every folder inside it, at any depth, the folder first.
+/// Guarded against a parent loop (which sync could in principle produce).
+fn folder_subtree(conn: &rusqlite::Connection, root: i64) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM folders WHERE parent_id=?1")?;
+    let mut out = vec![root];
+    let mut i = 0;
+    while i < out.len() {
+        let children: Vec<i64> = stmt
+            .query_map(rusqlite::params![out[i]], |r| r.get::<_, i64>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for c in children {
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod folder_subtree_tests {
+    #[test]
+    fn a_folders_subtree_holds_every_level_and_survives_a_loop() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE folders(id INTEGER PRIMARY KEY, name TEXT, parent_id INTEGER);
+             INSERT INTO folders VALUES (1,'a',NULL),(2,'b',1),(3,'c',2),(4,'d',1),(5,'other',NULL),(6,'x',7),(7,'y',6);",
+        )
+        .unwrap();
+        assert_eq!(super::folder_subtree(&conn, 1).unwrap(), vec![1, 2, 4, 3]);
+        assert_eq!(super::folder_subtree(&conn, 5).unwrap(), vec![5]);
+        assert_eq!(super::folder_subtree(&conn, 6).unwrap(), vec![6, 7]);
+    }
 }
 
 #[tauri::command]
@@ -12186,6 +12238,10 @@ struct ImportedHost {
     /// The key the jump host signs in with (MobaXterm's jump host key).
     #[serde(default)]
     jump_identity_file: Option<String>,
+    /// A Remote Desktop session (MobaXterm's RDP): imported as an RDP link
+    /// (rdp.rs), not a server.
+    #[serde(default)]
+    rdp: bool,
 }
 
 /// What the pasted-import parser found: the hosts, and a line about the
@@ -12643,8 +12699,8 @@ fn expand_mobaxterm_path(path: &str, profile_dir: Option<&str>, documents: Optio
     out
 }
 
-/// The sessions a MobaXterm export holds that aren't SSH, as one line for
-/// the import dialog: "Not imported: 8 RDP and 2 VNC sessions …".
+/// The sessions a MobaXterm export holds that can't be imported (not SSH or
+/// RDP), as one line for the import dialog: "Not imported: 2 VNC sessions …".
 fn mobaxterm_skipped(text: &str) -> Option<String> {
     let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     let mut in_bookmarks = false;
@@ -12660,11 +12716,10 @@ fn mobaxterm_skipped(text: &str) -> Option<String> {
         }
         let Some(settings) = value.split('#').nth(2) else { continue };
         let kind = match settings.split('%').next().unwrap_or("").trim() {
-            "0" => continue,
+            "0" | "4" => continue,
             "1" => "Telnet",
             "2" => "Rsh",
             "3" => "XDMCP",
-            "4" => "RDP",
             "5" => "VNC",
             "6" => "FTP",
             "7" => "SFTP",
@@ -12689,7 +12744,7 @@ fn mobaxterm_skipped(text: &str) -> Option<String> {
         _ => format!("{} and {}", parts[..parts.len() - 1].join(", "), parts[parts.len() - 1]),
     };
     Some(format!(
-        "Not imported: {} {} — Submarine connects over SSH only.",
+        "Not imported: {} {} — Submarine imports SSH and RDP sessions.",
         list,
         if total == 1 { "session" } else { "sessions" }
     ))
@@ -12697,6 +12752,7 @@ fn mobaxterm_skipped(text: &str) -> Option<String> {
 
 fn parse_mobaxterm_sessions_in(text: &str, profile_dir: Option<&str>, documents: Option<&str>) -> Result<Vec<ImportedHost>, String> {
     const SSH: &str = "0";
+    const RDP: &str = "4";
     let mut out: Vec<ImportedHost> = Vec::new();
     // Session names repeat, within a folder too; the import list keys rows by
     // folder and name.
@@ -12725,10 +12781,14 @@ fn parse_mobaxterm_sessions_in(text: &str, profile_dir: Option<&str>, documents:
         };
         let fields: Vec<&str> = settings.split('%').map(str::trim).collect();
         let field = |i: usize| fields.get(i).copied().unwrap_or("");
-        if field(0) != SSH { continue; }
+        let rdp = match field(0) {
+            SSH => false,
+            RDP => true,
+            _ => continue,
+        };
         let hostname = field(1);
         if hostname.is_empty() { continue; }
-        let port = field(2).parse::<u16>().ok().filter(|p| *p != 0).unwrap_or(22);
+        let port = field(2).parse::<u16>().ok().filter(|p| *p != 0).unwrap_or(if rdp { 3389 } else { 22 });
         // `[name]`: sign in with MobaXterm's saved login `name`.
         let (user, credential) = match field(3) {
             "<default>" => ("", None),
@@ -12742,7 +12802,9 @@ fn parse_mobaxterm_sessions_in(text: &str, profile_dir: Option<&str>, documents:
                 .filter(|p| !p.is_empty())
                 .map(|p| expand_mobaxterm_path(p, profile_dir, documents))
         };
-        let proxy_jump = mobaxterm_jump_hosts(field(8), field(9), field(10));
+        // RDP sessions keep only host, port, user and folder: their other
+        // fields mean something else.
+        let proxy_jump = (!rdp).then(|| mobaxterm_jump_hosts(field(8), field(9), field(10))).flatten();
         let jump_identity_file = proxy_jump.as_ref().and_then(|_| path(15));
         let folder_key = folder.join("\\");
         let mut alias = name.to_string();
@@ -12757,16 +12819,17 @@ fn parse_mobaxterm_sessions_in(text: &str, profile_dir: Option<&str>, documents:
             hostname: hostname.to_string(),
             port,
             user: user.to_string(),
-            identity_file: path(14),
+            identity_file: (!rdp).then(|| path(14)).flatten(),
             proxy_jump,
             folder: folder.clone(),
             credential,
-            run_on_connect: Some(field(7)).filter(|c| !c.is_empty()).map(String::from),
+            run_on_connect: (!rdp).then(|| Some(field(7)).filter(|c| !c.is_empty()).map(String::from)).flatten(),
             jump_identity_file,
+            rdp,
         });
     }
     if out.is_empty() {
-        return Err("No MobaXterm SSH sessions found in the pasted text.".into());
+        return Err("No MobaXterm SSH or RDP sessions found in the pasted text.".into());
     }
     Ok(out)
 }
@@ -12838,8 +12901,18 @@ mod client_import_tests {
             "web02=#109#0%f.example%22%frank%%-1%-1%%%%%0%0%0%%%-1".to_string(),
         ]);
         let hosts = parse_client_import(text).unwrap();
-        let got: Vec<(&str, &str, u16)> = hosts.iter().map(|h| (h.host_alias.as_str(), h.hostname.as_str(), h.port)).collect();
-        assert_eq!(got, vec![("default icon", "a.example", 2222), ("debian icon", "b.example", 22), ("web02", "f.example", 22)]);
+        let got: Vec<(&str, &str, u16, bool)> = hosts.iter().map(|h| (h.host_alias.as_str(), h.hostname.as_str(), h.port, h.rdp)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("default icon", "a.example", 2222, false),
+                ("debian icon", "b.example", 22, false),
+                ("desktop", "c.example", 3389, true),
+                ("web02", "f.example", 22, false),
+            ],
+            "SSH sessions, and RDP as RDP links; SFTP and VNC are left out"
+        );
+        assert!(hosts[2].proxy_jump.is_none() && hosts[2].run_on_connect.is_none() && hosts[2].identity_file.is_none());
     }
 
     #[test]
@@ -12916,7 +12989,7 @@ mod client_import_tests {
         ]);
         assert_eq!(
             mobaxterm_skipped(&text).as_deref(),
-            Some("Not imported: 2 RDP and 1 VNC sessions — Submarine connects over SSH only.")
+            Some("Not imported: 1 VNC session — Submarine imports SSH and RDP sessions.")
         );
         let ssh_only = export(&[session("web", 109, "0%f.example%22%u%%-1%-1%%%%%0%0%0%%%-1")]);
         assert_eq!(mobaxterm_skipped(&ssh_only), None);
@@ -12924,9 +12997,9 @@ mod client_import_tests {
 
     #[test]
     fn an_export_with_no_ssh_session_says_so() {
-        let text = export(&[session("desktop", 91, "4%c.example%3389%carol%%-1%0%0")]);
-        let err = parse_client_import(text).err().expect("an RDP-only export must be refused");
-        assert!(err.contains("No MobaXterm SSH sessions"), "{err}");
+        let text = export(&[session("vnc", 128, "5%e.example%5900%%-1%0")]);
+        let err = parse_client_import(text).err().expect("a VNC-only export must be refused");
+        assert!(err.contains("No MobaXterm SSH or RDP sessions"), "{err}");
     }
 
     #[test]
@@ -14316,6 +14389,7 @@ pub fn run() {
             about::app_info, about::check_for_updates, about::open_external_url,
             portable::get_storage_info,
             local_open::live_edit_editor_get, local_open::live_edit_editor_pick, local_open::live_edit_editor_reset,
+            rdp::rdp_list, rdp::rdp_save, rdp::rdp_delete, rdp::rdp_open,
             fonts::list_system_fonts,
             clipboard_read_text
         ])

@@ -184,6 +184,9 @@ function DesktopApp() {
   const [credentials, setCredentials] = useState<any[]>([]);
   const [sshKeys, setSshKeys] = useState<any[]>([]);
   const [folders, setFolders] = useState<any[]>([]);
+  // Remote Desktop links (src-tauri/src/rdp.rs): shown with the servers, open
+  // the system's Remote Desktop client.
+  const [rdpLinks, setRdpLinks] = useState<any[]>([]);
   const [commands, setCommands] = useState<any[]>([]);
   const [logs, setLogs] = useState<{ msg: string, type: string, time: string }[]>([]);
   const [isCommandPanelOpen, setIsCommandPanelOpen] = useState(false);
@@ -354,6 +357,10 @@ function DesktopApp() {
     try { setFolders((await invoke("get_folders")) as any[]); }
     catch (e) { addLog(`SYNC_FOLDERS: ${e}`, "error"); }
   };
+  const refreshRdpLinks = async () => {
+    try { setRdpLinks((await invoke("rdp_list")) as any[]); }
+    catch (e) { addLog(`SYNC_RDP_LINKS: ${e}`, "error"); }
+  };
   const refreshCommands = async () => {
     try { setCommands((await invoke("get_commands")) as any[]); }
     catch (e) { addLog(`SYNC_COMMANDS: ${e}`, "error"); }
@@ -368,6 +375,7 @@ function DesktopApp() {
       refreshCredentials(),
       refreshSshKeys(),
       refreshFolders(),
+      refreshRdpLinks(),
       refreshCommands(),
       refreshNotes(),
     ]);
@@ -519,8 +527,9 @@ function DesktopApp() {
   const removeFolder = async (id: number) => {
     try {
       await invoke("delete_folder", { id });
-      // delete_folder cascades to its servers (see main.rs), so refresh both.
-      await Promise.all([refreshFolders(), refreshServers()]);
+      // delete_folder cascades to the folders, servers and Remote Desktop
+      // links inside it (lib.rs), so refresh all three.
+      await Promise.all([refreshFolders(), refreshServers(), refreshRdpLinks()]);
       bumpSync();
       addLog("Folder removed.", "info");
     } catch (e) { addLog(`DELETE_EXCEPTION: ${e}`, "error"); }
@@ -649,7 +658,7 @@ function DesktopApp() {
     setActiveProfile(null);
     setSessions([]);
     setActiveView("nodes");
-    setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setCommands([]);
+    setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setRdpLinks([]); setCommands([]);
     addLog("Profile locked.", "info");
   };
 
@@ -1500,6 +1509,19 @@ function DesktopApp() {
               <NodeGrid
                 servers={servers}
                 folders={folders}
+                rdpLinks={rdpLinks}
+                onOpenRdp={async (id: number) => {
+                  try { await invoke("rdp_open", { id }); }
+                  catch (e) { addLog(`RDP_OPEN: ${e}`, "error"); throw e; }
+                }}
+                onSaveRdp={async (link: any) => {
+                  await invoke("rdp_save", { link });
+                  await refreshRdpLinks();
+                }}
+                onRemoveRdp={async (id: number) => {
+                  try { await invoke("rdp_delete", { id }); await refreshRdpLinks(); }
+                  catch (e) { addLog(`RDP_DELETE: ${e}`, "error"); }
+                }}
                 activeFolderId={activeFolderId}
                 onActiveFolderChange={setActiveFolderId}
                 onOpenServer={openServer}
@@ -2419,7 +2441,7 @@ function DesktopApp() {
           }
         }}
         formError={formError}
-        credentials={credentials} refreshCredentials={refreshCredentials} sshKeys={sshKeys} refreshSshKeys={refreshSshKeys} folders={folders} refreshFolders={refreshFolders}
+        credentials={credentials} refreshCredentials={refreshCredentials} refreshRdpLinks={refreshRdpLinks} sshKeys={sshKeys} refreshSshKeys={refreshSshKeys} folders={folders} refreshFolders={refreshFolders}
         refreshServers={refreshServers}
         servers={servers}
         isMobile={isMobile}
