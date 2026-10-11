@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
+import { folderOptions } from "../util/folderPath";
 import { Cpu, X, Link2, ArrowLeftRight, Shield, Key, User, FolderPlus, Download, CheckSquare, Square, History, Plus, Copy } from "lucide-react";
 import PasswordField from "./PasswordField";
 import { useTextPrompt } from "../ui/confirm";
@@ -32,7 +33,33 @@ type ImportedHost = {
   user: string;
   identity_file: string | null;
   proxy_jump: string | null;
+  // Unique within one parse (MobaXterm repeats names across folders); empty
+  // means host_alias is.
+  key?: string;
+  folder?: string[];
+  // MobaXterm saved login (`[name]` as the user): becomes a shared Login.
+  credential?: string | null;
+  run_on_connect?: string | null;
+  jump_identity_file?: string | null;
+  // A Remote Desktop session: becomes an RDP link, not a server.
+  rdp?: boolean;
 };
+
+// What `import_hosts` reports back (src-tauri/src/host_import.rs).
+type ImportReport = {
+  added: number;
+  already_there: number;
+  folders_created: number;
+  logins_created: string[];
+  jump_hosts_created: string[];
+  jump_linked: number;
+  multi_hop: string[];
+  rdp_added: number;
+};
+
+const rowKey = (h: ImportedHost) => h.key || h.host_alias;
+
+const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 // What `import_ssh_key_file` hands back after putting a key file in the vault.
 type ImportedSshKey = {
@@ -42,7 +69,7 @@ type ImportedSshKey = {
   encrypted: boolean;
 };
 
-const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credentials, sshKeys, refreshSshKeys, folders, refreshFolders, refreshServers, servers, isEditMode, formError, isMobile }: any) => {
+const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credentials, refreshCredentials, refreshRdpLinks, sshKeys, refreshSshKeys, folders, refreshFolders, refreshServers, servers, isEditMode, formError, isMobile }: any) => {
   const [isCreatingFolder, setIsCreatingFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
   // Set while the native key picker is open so the Browse button can't be
@@ -79,6 +106,8 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
   // Separate from importError: the import worked, there's just something the
   // user has to follow up on (a key that still needs its passphrase).
   const [importNotice, setImportNotice] = useState<string | null>(null);
+  // Sessions the pasted export holds that can't be imported (MobaXterm RDP…).
+  const [importSkipped, setImportSkipped] = useState<string | null>(null);
   const [importHosts, setImportHosts] = useState<ImportedHost[]>([]);
   const [importSelected, setImportSelected] = useState<Set<string>>(new Set());
   // Source selector for the import modal. `ssh` = the on-disk OpenSSH
@@ -102,6 +131,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     setImportPasteText("");
     setImportError(null);
     setImportNotice(null);
+    setImportSkipped(null);
     setImportHosts([]);
     setImportSelected(new Set());
     setImportLoading(true);
@@ -121,11 +151,13 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     setImportLoading(true);
     setImportError(null);
     setImportNotice(null);
+    setImportSkipped(null);
     setImportHosts([]);
     setImportSelected(new Set());
     try {
-      const hosts = await invoke<ImportedHost[]>("parse_client_import", { text: importPasteText });
-      setImportHosts(hosts);
+      const res = await invoke<{ hosts: ImportedHost[]; skipped: string | null }>("parse_client_import", { text: importPasteText });
+      setImportHosts(res.hosts);
+      setImportSkipped(res.skipped);
     } catch (e: any) {
       setImportError(typeof e === "string" ? e : (e?.message || String(e)));
     } finally {
@@ -138,6 +170,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     setImportSource(next);
     setImportError(null);
     setImportNotice(null);
+    setImportSkipped(null);
     setImportHosts([]);
     setImportSelected(new Set());
     if (next === "ssh") {
@@ -158,6 +191,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     setImportOpen(false);
     setImportError(null);
     setImportNotice(null);
+    setImportSkipped(null);
     setImportHosts([]);
     setImportSelected(new Set());
     setImportPasteText("");
@@ -167,7 +201,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     if (importSelected.size === importHosts.length) {
       setImportSelected(new Set());
     } else {
-      setImportSelected(new Set(importHosts.map((h) => h.host_alias)));
+      setImportSelected(new Set(importHosts.map(rowKey)));
     }
   };
 
@@ -180,104 +214,100 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     });
   };
 
-  // Fire one `add_server` per selected host. A host that named an IdentityFile
-  // comes in key-authenticated; anything else lands as auth_type "custom_pass"
-  // with no password — a valid row that won't connect until the user fills it
-  // in. Errors per-host are surfaced but don't abort the batch; the modal
-  // shows how many landed and how many failed.
+  // Load each distinct key file into the vault (import_ssh_key_file dedupes
+  // by content), then hand every picked host to `import_hosts`, which writes
+  // folders, Logins, jump hosts and servers in one transaction. A host whose
+  // key can't be read still imports, signing in without it; the notice says
+  // which key and why (a PuTTY .ppk, say, needs exporting as OpenSSH first).
   const importSelectedHosts = async () => {
     if (importSelected.size === 0 || importBusy) return;
     setImportBusy(true);
     setImportError(null);
     setImportNotice(null);
-    let ok = 0;
-    let failed = 0;
-    let lastErr: string | null = null;
-    // Several hosts routinely point at the same `~/.ssh/id_ed25519`. The Rust
-    // side already dedupes by key content, but caching here means one read and
-    // one vault write for the whole batch instead of one per host. `null`
-    // records a path we already tried and couldn't use, so we don't retry a
-    // missing file once per host that mentions it.
+    const picked = importHosts.filter((h) => importSelected.has(rowKey(h)));
     const keysByPath = new Map<string, ImportedSshKey | null>();
-    let keysAttached = 0;
-    let keysNeedingPassphrase = 0;
-    for (const host of importHosts) {
-      if (!importSelected.has(host.host_alias)) continue;
+    const keyFailures = new Map<string, string>();
+    const loadKey = async (path: string | null | undefined): Promise<ImportedSshKey | null> => {
+      if (!path) return null;
+      if (keysByPath.has(path)) return keysByPath.get(path) ?? null;
       let key: ImportedSshKey | null = null;
-      if (host.identity_file) {
-        if (keysByPath.has(host.identity_file)) {
-          key = keysByPath.get(host.identity_file) ?? null;
-        } else {
-          try {
-            key = await invoke<ImportedSshKey>("import_ssh_key_file", {
-              path: host.identity_file,
-              name: null,
-            });
-          } catch {
-            // An unreadable IdentityFile isn't a reason to skip the host —
-            // the server row is still worth having. It just imports
-            // password-less, exactly as it did before keys were attached.
-            key = null;
-          }
-          keysByPath.set(host.identity_file, key);
-          if (key) {
-            keysAttached++;
-            if (key.encrypted) keysNeedingPassphrase++;
-          }
-        }
-      }
       try {
-        await invoke<number>("add_server", {
-          name: host.host_alias,
-          host: host.hostname || host.host_alias,
-          port: host.port || 22,
-          // No user in the export (MobaXterm's <default>, an ssh_config
-          // entry without User): leave it blank, so connecting asks
-          // "Login as" — where empty still means root (#72).
-          username: host.user ? host.user.trim() : "",
-          password: null,
-          credentialId: null,
-          folderId: null,
-          proxyType: "none",
-          proxyHost: "",
-          proxyPort: 1080,
-          tunnels: [],
-          authType: key ? "custom_key" : "custom_pass",
-          keyId: key ? key.id : null,
-          autostart: false,
-          mirrors: [],
-          color: null,
-        });
-        ok++;
+        key = await invoke<ImportedSshKey>("import_ssh_key_file", { path, name: null });
       } catch (e: any) {
-        failed++;
-        lastErr = typeof e === "string" ? e : (e?.message || String(e));
+        keyFailures.set(path, typeof e === "string" ? e : (e?.message || String(e)));
       }
+      keysByPath.set(path, key);
+      return key;
+    };
+    const rows = [];
+    for (const host of picked) {
+      const key = await loadKey(host.identity_file);
+      const jumpKey = await loadKey(host.jump_identity_file);
+      rows.push({ host, key_id: key ? key.id : null, jump_key_id: jumpKey ? jumpKey.id : null });
+    }
+    let report: ImportReport | null = null;
+    try {
+      report = await invoke<ImportReport>("import_hosts", { rows });
+    } catch (e: any) {
+      setImportError(typeof e === "string" ? e : (e?.message || String(e)));
     }
     setImportBusy(false);
-    if (failed > 0) {
-      setImportError(`${ok} imported, ${failed} failed${lastErr ? `: ${lastErr}` : ""}`);
-    }
     if (refreshServers) {
       try { await refreshServers(); } catch { /* refresh failure isn't fatal */ }
     }
-    if (keysAttached > 0 && refreshSshKeys) {
+    if (refreshFolders) {
+      try { await refreshFolders(); } catch { /* same */ }
+    }
+    if (refreshCredentials) {
+      try { await refreshCredentials(); } catch { /* same */ }
+    }
+    if (refreshRdpLinks) {
+      try { await refreshRdpLinks(); } catch { /* same */ }
+    }
+    if (keysByPath.size > 0 && refreshSshKeys) {
       try { await refreshSshKeys(); } catch { /* same — the list refreshes on next open */ }
     }
-    // A passphrase-protected key's passphrase isn't anywhere in the config
-    // file. The user can add it under Settings › SSH keys, or leave it and be
-    // asked at connect time (issue #30) — either way, hold the modal open and
-    // point it out so the import isn't silently half-finished.
-    if (keysNeedingPassphrase > 0) {
-      setImportNotice(
-        `${ok} imported, ${keysAttached} SSH key${keysAttached === 1 ? "" : "s"} attached. ` +
-        `${keysNeedingPassphrase} of them need a passphrase — add it under Settings › SSH keys, or leave it empty to be asked when connecting.`,
+    if (!report) return;
+
+    // Anything the user has to finish goes in the notice, and the modal stays
+    // open to show it.
+    const todo: string[] = [];
+    const loaded = [...keysByPath.values()].filter((k): k is ImportedSshKey => !!k);
+    const needPassphrase = loaded.filter((k) => k.encrypted).length;
+    if (report.logins_created.length > 0) {
+      todo.push(
+        `${plural(report.logins_created.length, "Login")} created (${report.logins_created.join(", ")}). ` +
+        `Fill in each one's user name and password once under Logins, or leave them empty to be asked when connecting.`,
       );
+    }
+    if (report.jump_hosts_created.length > 0) {
+      todo.push(`Jump ${report.jump_hosts_created.length === 1 ? "host" : "hosts"} saved: ${report.jump_hosts_created.join(", ")}.`);
+    }
+    if (report.multi_hop.length > 0) {
+      todo.push(
+        `${plural(report.multi_hop.length, "host")} use a chain of jump hosts, which Submarine can't do (one jump host per server): ` +
+        `${report.multi_hop.slice(0, 5).join(", ")}${report.multi_hop.length > 5 ? "…" : ""}. They were imported without one.`,
+      );
+    }
+    for (const [path, why] of keyFailures) {
+      const ppk = /\.ppk$/i.test(path) ? " PuTTY .ppk keys need converting first: PuTTYgen › Conversions › Export OpenSSH key." : "";
+      todo.push(`Couldn't load the key ${path}: ${why}.${ppk} Hosts using it were imported without it.`);
+    }
+    if (needPassphrase > 0) {
+      todo.push(`${plural(needPassphrase, "key")} need a passphrase — add it under Settings › SSH keys, or leave it empty to be asked when connecting.`);
+    }
+    const summary =
+      `${plural(report.added, "server")} imported` +
+      (report.folders_created ? `, ${plural(report.folders_created, "folder")} created` : "") +
+      (report.jump_linked ? `, ${report.jump_linked} linked to a jump host` : "") +
+      (report.rdp_added ? `, ${plural(report.rdp_added, "Remote Desktop link")} added` : "") +
+      (report.already_there ? `; ${report.already_there} already saved, left as they were` : "") +
+      ".";
+    if (todo.length > 0) {
+      setImportNotice([summary, ...todo].join("\n\n"));
       return;
     }
-    if (failed === 0) {
-      closeImportModal();
-    }
+    closeImportModal();
   };
 
   // Browse to a key on disk and select it on this server in one step. The key
@@ -350,7 +380,9 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
   const handleCreateFolder = async () => {
     if (!newFolderName.trim()) return;
     try {
-      await invoke("add_folder", { name: newFolderName, parentId: null });
+      // Inside the folder picked above, so folders can nest; at the top level
+      // when that's Root.
+      await invoke("add_folder", { name: newFolderName, parentId: newNode.folderId ? parseInt(newNode.folderId) : null });
       setNewFolderName("");
       setIsCreatingFolder(false);
       refreshFolders();
@@ -417,7 +449,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 <div className="flex gap-2">
                   <select className="flex-1 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" value={newNode.folderId} onChange={e => setNewNode({ ...newNode, folderId: e.target.value })}>
                     <option value="" className="bg-[#1a1a1e] text-zinc-500">-- Root --</option>
-                    {folders?.map((f: any) => <option key={f.id} value={f.id.toString()} className="bg-[#1a1a1e] text-white">{f.name}</option>)}
+                    {folderOptions(folders || []).map((f) => <option key={f.id} value={f.id.toString()} className="bg-[#1a1a1e] text-white">{f.label}</option>)}
                   </select>
                   <button onClick={() => setIsCreatingFolder(true)} className="w-9 h-9 bg-white/5 border border-white/10 rounded-lg text-primary hover:bg-white/10 transition-all flex items-center justify-center shrink-0">
                     <FolderPlus size={14} />
@@ -425,7 +457,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 </div>
               ) : (
                 <div className="flex gap-2 animate-in fade-in">
-                  <input type="text" className="flex-1 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" placeholder="Folder name…" value={newFolderName} onChange={e => setNewFolderName(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleCreateFolder()} />
+                  <input type="text" className="flex-1 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" placeholder={newNode.folderId ? "New folder inside the one picked…" : "Folder name…"} value={newFolderName} onChange={e => setNewFolderName(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleCreateFolder()} />
                   <button onClick={handleCreateFolder} className="h-9 px-3 bg-primary text-black font-bold text-[12px] rounded-lg hover:bg-primary transition-all">Add</button>
                   <button onClick={() => setIsCreatingFolder(false)} className="w-9 h-9 bg-white/5 text-zinc-400 rounded-lg hover:bg-white/10 transition-all flex justify-center items-center shrink-0"><X size={14} /></button>
                 </div>
@@ -1024,10 +1056,10 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
 
                   <div className="space-y-1.5">
                     {importHosts.map((h) => {
-                      const isSel = importSelected.has(h.host_alias);
+                      const isSel = importSelected.has(rowKey(h));
                       return (
                         <label
-                          key={h.host_alias}
+                          key={rowKey(h)}
                           className={`flex items-start gap-3 p-2.5 rounded-lg border cursor-pointer transition-all ${
                             isSel
                               ? "bg-primary/10 border-primary/40"
@@ -1037,20 +1069,26 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                           <input
                             type="checkbox"
                             checked={isSel}
-                            onChange={() => toggleOne(h.host_alias)}
+                            onChange={() => toggleOne(rowKey(h))}
                             className="mt-0.5 accent-primary shrink-0"
                           />
                           <div className="flex-1 min-w-0">
                             <div className="text-[12.5px] font-bold text-white truncate">
+                              {h.rdp && <span className="mr-1.5 px-1 py-px rounded text-[9.5px] font-black tracking-wider bg-sky-500/15 text-sky-300 border border-sky-500/30 align-middle">RDP</span>}
                               {h.host_alias}
                             </div>
                             <div className="text-[11px] font-mono text-zinc-400 truncate">
                               {h.user ? `${h.user}@` : ""}{h.hostname}:{h.port}
                             </div>
-                            {(h.identity_file || h.proxy_jump) && (
+                            {h.folder && h.folder.length > 0 && (
+                              <div className="text-[10.5px] text-zinc-500 truncate">{h.folder.join(" › ")}</div>
+                            )}
+                            {(h.credential || h.identity_file || h.proxy_jump || h.run_on_connect) && (
                               <div className="mt-0.5 text-[10.5px] text-zinc-600 truncate">
+                                {h.credential && <span className="mr-2">login: {h.credential}</span>}
                                 {h.identity_file && <span className="mr-2">key: {h.identity_file}</span>}
-                                {h.proxy_jump && <span>jump: {h.proxy_jump}</span>}
+                                {h.proxy_jump && <span className="mr-2">jump: {h.proxy_jump}</span>}
+                                {h.run_on_connect && <span>runs: {h.run_on_connect}</span>}
                               </div>
                             )}
                           </div>
@@ -1065,8 +1103,14 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                     </div>
                   )}
 
+                  {importSkipped && (
+                    <div className="mt-3 p-2 bg-white/[0.03] border border-white/10 rounded-lg text-zinc-400 text-[11px]">
+                      {importSkipped}
+                    </div>
+                  )}
+
                   {importNotice && (
-                    <div className="mt-3 p-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-amber-300 text-[11px]">
+                    <div className="mt-3 p-2 bg-amber-500/10 border border-amber-500/20 rounded-lg text-amber-300 text-[11px] whitespace-pre-line">
                       {importNotice}
                     </div>
                   )}

@@ -384,6 +384,8 @@ pub struct SshState {
 pub struct SftpElevation {
     /// Absolute path of the server's sftp-server binary (probed once).
     pub server_path: String,
+    /// `sudo` or `dzdo`, whichever the probe found allowed.
+    pub tool: &'static str,
     /// `None` = passwordless sudo (`sudo -n`).
     pub password: Option<zeroize::Zeroizing<String>>,
 }
@@ -615,6 +617,12 @@ impl client::Handler for ClientHandler {
         let mut is_known = false;
         let mut mismatch = false; // same key family, different fingerprint
         let mut prior_fingerprints: Vec<String> = Vec::new();
+        // Key types trusted for this host other than the offered one's. A
+        // server that suddenly offers only a different type is rare; it is
+        // also how a man in the middle without the real key gets the mild
+        // first-time prompt instead of the CHANGED warning. OpenSSH warns
+        // about it too.
+        let mut other_key_types: Vec<String> = Vec::new();
         // Read known_hosts in a SCOPED block — the std mutex guard mustn't
         // cross any `.await` (the !Send guard would break the future's Send
         // bound). A poisoned mutex sets `aborted` so we fail closed instead
@@ -647,6 +655,10 @@ impl client::Handler for ClientHandler {
                                             if same_type {
                                                 mismatch = true;
                                                 prior_fingerprints.push(saved_fp);
+                                            } else if let Some(kt) = saved_kt {
+                                                if !other_key_types.contains(&kt) {
+                                                    other_key_types.push(kt);
+                                                }
                                             }
                                         }
                                     }
@@ -710,6 +722,14 @@ impl client::Handler for ClientHandler {
                 "msg": "⚠ WARNING: Remote host key has CHANGED since you last connected. This could indicate a man-in-the-middle attack, or the server's host key was rotated. Verify out-of-band before accepting.",
                 "type": "error"
             }));
+        } else if !other_key_types.is_empty() {
+            let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
+                "msg": format!(
+                    "⚠ WARNING: This host is trusted with a {} key, but now offers only a {} key. Servers rarely change key type; verify out-of-band before accepting.",
+                    other_key_types.join(" / "), key_type
+                ),
+                "type": "error"
+            }));
         } else {
             let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
                 "msg": "Host fingerprint is unknown. Waiting for user approval...",
@@ -723,10 +743,12 @@ impl client::Handler for ClientHandler {
         self.prompt_pending.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = self.app.emit(&format!("fingerprint-prompt-{}", self.session_id), serde_json::json!({
             "host": self.server_host,
+            "port": self.server_port,
             "keyType": key_type,
             "fingerprint": fp_str,
             "mismatch": mismatch,
             "priorFingerprints": prior_fingerprints,
+            "otherKeyTypes": other_key_types,
             // Frontend MUST echo this back via verify_fingerprint_response.
             // Without it the response is rejected. Defeats stale-channel /
             // session-id-guessing attacks against the TOFU prompt.

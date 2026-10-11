@@ -317,9 +317,11 @@ pub async fn start_tunnel(
         let (addr, port) = if let Some((a, p)) = s.rsplit_once(':') {
             (a.to_string(), p.parse::<u32>().map_err(|e| format!("Invalid server port: {}", e))?)
         } else {
-            // Bare port on the server defaults to listening on all interfaces,
-            // subject to the server's `GatewayPorts` setting.
-            ("0.0.0.0".to_string(), s.parse::<u32>().map_err(|e| format!("Invalid server port: {}", e))?)
+            // A bare port listens on the server's loopback only, as `ssh -R`
+            // does. Asking for 0.0.0.0 here would publish the local service
+            // on every interface of a server whose `GatewayPorts` is
+            // `clientspecified`; `0.0.0.0:port` still asks for that.
+            ("localhost".to_string(), s.parse::<u32>().map_err(|e| format!("Invalid server port: {}", e))?)
         };
         Some((addr, port))
     } else {

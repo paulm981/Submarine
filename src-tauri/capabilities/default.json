@@ -18,7 +18,6 @@
     "core:window:allow-is-maximized",
     "core:window:allow-start-dragging",
     "core:window:allow-start-resize-dragging",
-    "core:window:allow-set-title",
-    "opener:allow-open-url"
+    "core:window:allow-set-title"
   ]
 }

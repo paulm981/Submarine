@@ -259,7 +259,7 @@ const TunnelsPanel = ({ sessionId, serverId, disabled = false }: TunnelsPanelPro
             <span className="text-[10px] text-zinc-500 font-mono flex-1 leading-snug">
               {draft.type === "D" && "SOCKS5 proxy on this machine; traffic exits via the server."}
               {draft.type === "L" && "Connections to your local addr are tunneled to the target through the server."}
-              {draft.type === "R" && "Server listens on bind addr (defaults to 0.0.0.0); incoming connections are forwarded back here. Needs GatewayPorts in sshd_config to listen externally."}
+              {draft.type === "R" && "Server listens on bind addr (a bare port: the server's localhost only); incoming connections are forwarded back here. Use 0.0.0.0:port to listen on every interface, which also needs GatewayPorts in sshd_config."}
             </span>
             <button
               onClick={addTunnel}

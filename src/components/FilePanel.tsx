@@ -10,6 +10,7 @@ import {
 import { FileEntry, FileProvider } from "../fs/types";
 import { localDir, localJoin } from "../fs/localPath";
 import { useConfirm, useOverwritePrompt, OverwriteChoice } from "../ui/confirm";
+import { visibleName } from "../util/fileName";
 import { IS_ANDROID } from "../util/platform";
 import { nameFilterMatcher } from "../util/nameFilter";
 
@@ -816,24 +817,42 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
     }
   };
 
-  // Remote: open in OS default editor with a save-watcher that re-uploads on
-  // every change. Backed by the existing `sftp_open_remote_file` command.
+  // Remote: open in a text editor (Settings › Live Edit; Notepad on Windows)
+  // with a save-watcher that re-uploads on every change. Never the file's own
+  // default action, which on Windows would run an .exe, .bat or .sh.
   const liveEditEntry = async (entry: FileEntry) => {
     if (!sessionId || entry.isDir) return;
     try {
-      notify(`Opening ${entry.name} in default editor…`, "info");
+      notify(`Opening ${visibleName(entry.name)} in your editor…`, "info");
       await invoke("sftp_open_remote_file", { sessionId, remotePath: entry.path });
     } catch (err: any) {
       notify(`Open failed: ${err}`, "error");
     }
   };
 
-  // Local: open file in default OS application.
+  // Local: open file in default OS application. A file Windows would run
+  // (program, script, shortcut) comes back as `RUNS:<path>` and is opened
+  // only once the user says so.
   const openLocalEntry = async (entry: FileEntry) => {
     if (entry.isDir) { fetch(entry.path); return; }
     try {
       await invoke("local_open_file", { localPath: entry.path });
     } catch (err: any) {
+      if (typeof err === "string" && err.startsWith("RUNS:")) {
+        const ok = await confirmDialog({
+          title: "Run this program?",
+          message: `“${visibleName(entry.name)}” is a program, script or shortcut. Opening it runs it on this computer. Only run it if you trust where it came from.`,
+          okLabel: "Run it",
+          destructive: true,
+        });
+        if (!ok) return;
+        try {
+          await invoke("local_open_file", { localPath: entry.path, runProgram: true });
+        } catch (e: any) {
+          notify(`Open failed: ${e}`, "error");
+        }
+        return;
+      }
       notify(`Open failed: ${err}`, "error");
     }
   };
@@ -1346,7 +1365,7 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
                     )}
                   </span>
                   <div className="min-w-0 flex-1">
-                    <div className={`truncate text-[11px] ${entry.brokenLink ? "text-zinc-400 line-through decoration-rose-400/50" : "text-zinc-100"}`}>{entry.name}</div>
+                    <div className={`truncate text-[11px] ${entry.brokenLink ? "text-zinc-400 line-through decoration-rose-400/50" : "text-zinc-100"}`} title={visibleName(entry.name)}>{visibleName(entry.name)}</div>
                     {/* Narrow-viewport subline: on < sm the SIZE / CHANGED /
                         RIGHTS cells are display:none (so they don't force
                         horizontal scroll), and their info collapses into

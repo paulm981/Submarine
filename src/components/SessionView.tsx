@@ -1130,11 +1130,19 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
                                the old fingerprints we used to trust */}
       {fingerprintPrompt && (() => {
         const isMismatch = !!fingerprintPrompt.mismatch;
-        const tone = isMismatch
+        // Trusted before under another key type, and now offering only this
+        // one: as alarming as a changed key (see check_server_key).
+        const otherTypes: string[] = Array.isArray(fingerprintPrompt.otherKeyTypes) ? fingerprintPrompt.otherKeyTypes : [];
+        const isOtherType = !isMismatch && otherTypes.length > 0;
+        const alarming = isMismatch || isOtherType;
+        const hostLabel = fingerprintPrompt.port && fingerprintPrompt.port !== 22
+          ? `${fingerprintPrompt.host}:${fingerprintPrompt.port}`
+          : fingerprintPrompt.host;
+        const tone = alarming
           ? "border-red-500/40 bg-red-500/10"
           : "border-amber-500/30 bg-amber-500/5";
-        const accent = isMismatch ? "text-red-400" : "text-amber-500";
-        const acceptBtn = isMismatch
+        const accent = alarming ? "text-red-400" : "text-amber-500";
+        const acceptBtn = alarming
           ? "bg-red-500 text-white hover:bg-red-400"
           : "bg-amber-500 text-black hover:bg-amber-400";
         return (
@@ -1143,11 +1151,11 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
             <ShieldAlert className={`${accent} mt-1`} size={20} />
             <div>
               <h3 className={`text-sm font-bold ${accent} uppercase tracking-widest`}>
-                {isMismatch ? "Host key has CHANGED" : "Unknown host fingerprint"}
+                {isMismatch ? "Host key has CHANGED" : isOtherType ? "Different key type than before" : "Unknown host fingerprint"}
               </h3>
               {isMismatch ? (
                 <p className="text-zinc-300 mt-2 mb-4 leading-relaxed">
-                  The host '{fingerprintPrompt.host}' is presenting a different key than the one you trusted before. This is what a man-in-the-middle attack looks like — but it can also mean the server admin rotated the key.<br/><br/>
+                  The host '{hostLabel}' is presenting a different key than the one you trusted before. This is what a man-in-the-middle attack looks like — but it can also mean the server admin rotated the key.<br/><br/>
                   New {fingerprintPrompt.keyType} fingerprint: <span className="text-white font-bold break-all">{fingerprintPrompt.fingerprint}</span><br/>
                   {Array.isArray(fingerprintPrompt.priorFingerprints) && fingerprintPrompt.priorFingerprints.length > 0 && (
                     <span className="block mt-1 text-zinc-500 text-[11px]">
@@ -1156,9 +1164,15 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
                   )}
                   <span className="block mt-3 text-red-300 text-[12px]">Verify the new fingerprint out-of-band (call the admin, check the server console) before accepting.</span>
                 </p>
+              ) : isOtherType ? (
+                <p className="text-zinc-300 mt-2 mb-4 leading-relaxed">
+                  You already trust a {otherTypes.join(" / ")} key for '{hostLabel}', but it now offers only a {fingerprintPrompt.keyType} key. Servers rarely change key type; this is also what a man-in-the-middle without the real key looks like.<br/><br/>
+                  {fingerprintPrompt.keyType} key fingerprint: <span className="text-white font-bold break-all">{fingerprintPrompt.fingerprint}</span>
+                  <span className="block mt-3 text-red-300 text-[12px]">Check it on the server (<span className="font-mono">ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub</span>) or with its admin before accepting.</span>
+                </p>
               ) : (
                 <p className="text-zinc-400 mt-2 mb-4 leading-relaxed">
-                  The authenticity of host '{fingerprintPrompt.host}' can't be established.<br/>
+                  The authenticity of host '{hostLabel}' can't be established.<br/>
                   {fingerprintPrompt.keyType} key fingerprint is <span className="text-white font-bold break-all">{fingerprintPrompt.fingerprint}</span>.<br/>
                   Are you sure you want to continue connecting?
                 </p>
@@ -1168,13 +1182,13 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
                   onClick={() => handleFingerprintResponse(true)}
                   className={`px-6 py-2 ${acceptBtn} font-bold text-xs uppercase tracking-wider rounded-lg transition-colors flex items-center gap-2`}
                 >
-                  <Check size={14} /> {isMismatch ? "Accept new key" : "Accept & save"}
+                  <Check size={14} /> {alarming ? "Accept new key" : "Accept & save"}
                 </button>
                 <button
                   onClick={() => handleFingerprintResponse(false)}
                   className="px-6 py-2 bg-white/5 text-zinc-300 font-bold text-xs uppercase tracking-wider rounded-lg hover:bg-white/10 transition-colors flex items-center gap-2"
                 >
-                  <X size={14} /> {isMismatch ? "Abort" : "Reject"}
+                  <X size={14} /> {alarming ? "Abort" : "Reject"}
                 </button>
               </div>
             </div>
