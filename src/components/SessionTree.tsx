@@ -7,6 +7,7 @@ import {
 import { useConfirm } from "../ui/confirm";
 import { FolderRow, indexFolders } from "../util/folderPath";
 import type { RdpLink } from "./RdpLinkModal";
+import { OsBadge, osName } from "./OsBadge";
 
 // The session tree beside the main view, in the spirit of MobaXterm's
 // Sessions sidebar: every folder, server and Remote Desktop link as one
@@ -333,12 +334,15 @@ export const SessionTree = ({
               className={`h-[22px] pr-2 flex items-center gap-1.5 text-[12px] cursor-pointer ${
                 isSel ? "bg-primary/20 text-white" : isActive ? "bg-white/[0.06] text-white" : "text-zinc-300 hover:bg-white/[0.04]"
               }`}
-              title={`${name}\n${host}${isServer ? "" : " (Remote Desktop)"}`}
+              title={`${name}\n${host}${isServer ? (r.server.os ? ` · ${osName(r.server.os)}` : "") : " · Remote Desktop"}`}
             >
               {isServer
-                ? <TerminalSquare size={13} className="shrink-0 text-amber-300/90" />
+                ? (r.server.os ? <OsBadge os={r.server.os} size={13} /> : <TerminalSquare size={13} className="shrink-0 text-amber-300/90" />)
                 : <MonitorSmartphone size={13} className="shrink-0 text-sky-300" />}
-              <span className="truncate">{name}</span>
+              <span className={`truncate ${isServer ? "" : "text-sky-200"}`}>{name}</span>
+              {!isServer && (
+                <span className="ml-auto shrink-0 px-1 rounded text-[8.5px] font-black tracking-wider bg-sky-500/15 text-sky-300 border border-sky-500/30">RDP</span>
+              )}
               {status && (
                 <span title={dotTitle(status.st)} className={`ml-auto shrink-0 h-1.5 w-1.5 rounded-full ${dot(status.st)}`} />
               )}

@@ -5,6 +5,7 @@ import { useConfirm } from "../ui/confirm";
 import { FolderRow, childFolders, folderPath, indexFolders, subtreeCounts } from "../util/folderPath";
 import RdpLinkModal, { RdpLink } from "./RdpLinkModal";
 import { IS_ANDROID } from "../util/platform";
+import { OsBadge } from "./OsBadge";
 
 export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFolderIdProp, onActiveFolderChange, onOpenServer, onEditServer, onAddClick, onQuickConnect, onRemoveServer, onRemoveFolder, onRenameFolder, onCloneServer, onReorderServers, onOpenRdp, onSaveRdp, onRemoveRdp, isMobile }: any) => {
   const [search, setSearch] = useState("");
@@ -314,12 +315,17 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
           </button>
         )}
 
-        {/* Monogram avatar. */}
-        <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-primary/25 to-primary/[0.03] border border-primary/20 flex items-center justify-center text-primary shadow-inner shrink-0">
-          {monogram
-            ? <span className="font-black text-[14px] leading-none">{monogram}</span>
-            : <Server size={14} />}
-        </div>
+        {/* OS badge once the server has reported its OS (server_os.rs),
+            the monogram until then. */}
+        {s.os ? (
+          <div className="w-9 h-9 flex items-center justify-center shrink-0"><OsBadge os={s.os} size={30} /></div>
+        ) : (
+          <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-primary/25 to-primary/[0.03] border border-primary/20 flex items-center justify-center text-primary shadow-inner shrink-0">
+            {monogram
+              ? <span className="font-black text-[14px] leading-none">{monogram}</span>
+              : <Server size={14} />}
+          </div>
+        )}
 
         {/* Name + host — flex-1 + min-w-0 so long values truncate cleanly. */}
         <div className="min-w-0 flex-1">
@@ -377,16 +383,16 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
         catch (e: any) { setRdpError(`${l.name}: ${typeof e === "string" ? e : (e?.message || String(e))}`); }
       }}
       title={l.notes || `Open ${l.name} in Remote Desktop`}
-      className="group relative flex items-center gap-3 h-16 pl-3.5 pr-2 rounded-xl bg-gradient-to-br from-[#17171c] to-[#121216] border border-white/5 hover:border-sky-400/40 hover:bg-white/[0.015] transition-colors duration-150 cursor-pointer overflow-hidden"
+      className="group relative flex items-center gap-3 h-16 pl-3.5 pr-2 rounded-xl bg-gradient-to-br from-sky-950/40 to-[#121216] border border-dashed border-sky-400/30 hover:border-sky-400/60 transition-colors duration-150 cursor-pointer overflow-hidden"
     >
       <span aria-hidden className="absolute left-0 top-0 bottom-0 w-[3px] bg-sky-400/70" />
-      <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-sky-400/25 to-sky-400/[0.03] border border-sky-400/20 flex items-center justify-center text-sky-300 shadow-inner shrink-0">
-        <MonitorSmartphone size={15} />
+      <div className="w-9 h-9 rounded-lg bg-[#0078D4] flex items-center justify-center text-white shadow-inner shrink-0">
+        <MonitorSmartphone size={16} />
       </div>
       <div className="min-w-0 flex-1">
-        <h3 className="font-bold text-zinc-100 text-[13px] truncate tracking-tight leading-tight">{l.name}</h3>
+        <h3 className="font-bold text-sky-100 text-[13px] truncate tracking-tight leading-tight">{l.name}</h3>
         <div className="flex items-center gap-1 mt-0.5">
-          <span className="text-[9px] font-black tracking-wider text-sky-300/80">RDP</span>
+          <span className="px-1 rounded text-[8.5px] font-black tracking-wider bg-sky-500/15 text-sky-300 border border-sky-500/30">REMOTE DESKTOP</span>
           <span className="text-[10.5px] text-zinc-300 font-mono truncate">
             {l.username ? `${l.username} @ ` : ""}{l.host}{l.port && l.port !== 3389 ? `:${l.port}` : ""}
           </span>

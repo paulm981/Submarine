@@ -661,6 +661,7 @@ function DesktopApp() {
     setSessions([]);
     setActiveView("nodes");
     setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setRdpLinks([]); setCommands([]);
+    osChecked.current.clear();
     addLog("Profile locked.", "info");
   };
 
@@ -676,6 +677,21 @@ function DesktopApp() {
   const [treeSide, setTreeSide] = useState<"left" | "right">(() => (readPref("submarine.sessionTree.side", "right") === "left" ? "left" : "right"));
   useEffect(() => writePref("submarine.sessionTree.open", treeOpen ? "1" : "0"), [treeOpen]);
   useEffect(() => writePref("submarine.sessionTree.side", treeSide), [treeSide]);
+
+  // Each server's OS, read when its session first connects in this run of
+  // the app (src-tauri/src/server_os.rs), for the badges in the session tree
+  // and the server grid. A server that can't answer is not asked again.
+  const osChecked = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    for (const s of sessions) {
+      if (s.serverId <= 0 || sessionStatuses[s.id] !== "connected" || osChecked.current.has(s.id)) continue;
+      osChecked.current.add(s.id);
+      const known = servers.find((x: any) => x.id === s.serverId)?.os;
+      invoke<string | null>("detect_server_os", { sessionId: s.id, serverId: s.serverId })
+        .then((os) => { if (os && os !== known) refreshServers(); })
+        .catch(() => {});
+    }
+  }, [sessionStatuses, sessions]);
 
   // Open several servers at once (the session tree's multi-select and
   // "Open all"), each in its own tab; focus lands on the first one.
