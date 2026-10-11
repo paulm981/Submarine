@@ -5,12 +5,24 @@
 //! is intentionally NOT automated — we surface the release URL and let
 //! the user pick whether to grab it (auto-update infrastructure is a
 //! separate, bigger problem involving signed updates).
+//!
+//! This build is a fork that is built from source, so the check also says
+//! how many commits the fork's main has that this build doesn't (pull and
+//! rebuild), and how many the original project has that the fork doesn't
+//! yet (GitHub's "Sync fork").
 
 use serde::Serialize;
 
 /// `<owner>/<repo>` on GitHub (canonical casing). Used to build the API URL
 /// for the releases query and the user-facing repo URL.
-pub const GITHUB_REPO: &str = "SinaXhpm/Submarine";
+pub const GITHUB_REPO: &str = "paulm981/Submarine";
+
+/// The project GITHUB_REPO was forked from.
+pub const UPSTREAM_REPO: &str = "SinaXhpm/Submarine";
+
+/// The commit this build was made from (build.rs); empty when it wasn't
+/// built from a git checkout.
+const BUILD_COMMIT: &str = env!("SUBMARINE_GIT_SHA");
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AppInfo {
@@ -45,6 +57,30 @@ pub struct UpdateInfo {
     /// Direct link to the latest release page. Frontend shows an "Open
     /// release notes" button when has_update is true.
     pub release_url: Option<String>,
+    /// Commits on the fork's main that this build doesn't have, and the
+    /// GitHub page listing them. None when that couldn't be told (a build
+    /// not made from a pushed commit, GitHub unreachable).
+    pub main_ahead: Option<u64>,
+    pub main_url: Option<String>,
+    /// Commits on the original project's main not yet in the fork's main.
+    pub upstream_ahead: Option<u64>,
+    pub upstream_url: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhCompare {
+    #[serde(default)]
+    ahead_by: u64,
+}
+
+/// `ahead_by` of a GitHub compare: the commits in `head` that `base` lacks.
+async fn ahead_by(client: &reqwest::Client, base: &str, head: &str) -> Option<u64> {
+    let url = format!("https://api.github.com/repos/{}/compare/{}...{}", GITHUB_REPO, base, head);
+    let resp = client.get(&url).header("Accept", "application/vnd.github+json").send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<GhCompare>().await.ok().map(|c| c.ahead_by)
 }
 
 /// Subset of GitHub's `/releases/latest` JSON we actually care about.
@@ -97,7 +133,7 @@ pub async fn check_for_updates() -> Result<UpdateInfo, String> {
         // GitHub / rate-limit error. Either way, don't nag — report "no
         // newer release known" so the UI stays quiet rather than scary.
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(UpdateInfo { current, latest: None, has_update: false, release_url: None });
+            return Ok(with_commits(&client, UpdateInfo::none(current)).await);
         }
         return Err(format!("[UPDATE] HTTP {}", resp.status()));
     }
@@ -125,18 +161,47 @@ pub async fn check_for_updates() -> Result<UpdateInfo, String> {
         }
     }
 
-    match best {
-        None => Ok(UpdateInfo { current, latest: None, has_update: false, release_url: None }),
+    let info = match best {
+        None => UpdateInfo::none(current),
         Some((latest_clean, html_url)) => {
             let has_update = semver_greater(&latest_clean, &current);
-            Ok(UpdateInfo {
-                current,
+            UpdateInfo {
                 latest: Some(latest_clean),
                 has_update,
                 release_url: if html_url.is_empty() { None } else { Some(html_url) },
-            })
+                ..UpdateInfo::none(current)
+            }
+        }
+    };
+    Ok(with_commits(&client, info).await)
+}
+
+impl UpdateInfo {
+    fn none(current: String) -> Self {
+        UpdateInfo {
+            current,
+            latest: None,
+            has_update: false,
+            release_url: None,
+            main_ahead: None,
+            main_url: None,
+            upstream_ahead: None,
+            upstream_url: None,
         }
     }
+}
+
+/// Add the commit counts: the fork's main against this build, and the
+/// original project's main against the fork's. Best effort, like the rest.
+async fn with_commits(client: &reqwest::Client, mut info: UpdateInfo) -> UpdateInfo {
+    if !BUILD_COMMIT.is_empty() {
+        info.main_ahead = ahead_by(client, BUILD_COMMIT, "main").await;
+        info.main_url = Some(format!("https://github.com/{}/compare/{}...main", GITHUB_REPO, BUILD_COMMIT));
+    }
+    let upstream_owner = UPSTREAM_REPO.split('/').next().unwrap_or(UPSTREAM_REPO);
+    info.upstream_ahead = ahead_by(client, "main", &format!("{}:main", upstream_owner)).await;
+    info.upstream_url = Some(format!("https://github.com/{}", GITHUB_REPO));
+    info
 }
 
 /// True when `a > b` under dotted-number compare (ignores any non-numeric
