@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { folderOptions } from "../util/folderPath";
+import { IS_ANDROID } from "../util/platform";
 import { Cpu, X, Link2, ArrowLeftRight, Shield, Key, User, FolderPlus, Download, CheckSquare, Square, History, Plus, Copy } from "lucide-react";
 import PasswordField from "./PasswordField";
 import { useTextPrompt } from "../ui/confirm";
@@ -118,6 +119,9 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
   const [importNotice, setImportNotice] = useState<string | null>(null);
   // Sessions the pasted export holds that can't be imported (MobaXterm RDP…).
   const [importSkipped, setImportSkipped] = useState<string | null>(null);
+  // What the finished import did and what's left to do; while set, the modal
+  // shows it with a Done button instead of the host list.
+  const [importDone, setImportDone] = useState<string | null>(null);
   const [importHosts, setImportHosts] = useState<ImportedHost[]>([]);
   const [importSelected, setImportSelected] = useState<Set<string>>(new Set());
   // Source selector for the import modal. `ssh` = the on-disk OpenSSH
@@ -157,7 +161,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
 
   // Parse whatever's in the textarea. Rust auto-detects the format so we
   // don't need three separate importers here.
-  const parsePastedImport = async () => {
+  const parsePastedImport = async (text: string = importPasteText) => {
     setImportLoading(true);
     setImportError(null);
     setImportNotice(null);
@@ -165,7 +169,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     setImportHosts([]);
     setImportSelected(new Set());
     try {
-      const res = await invoke<ClientImport>("parse_client_import", { text: importPasteText });
+      const res = await invoke<ClientImport>("parse_client_import", { text });
       setImportHosts(res.hosts);
       setImportSkipped(res.skipped);
     } catch (e: any) {
@@ -174,6 +178,20 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
       setImportLoading(false);
     }
   };
+  // Read an export file (MobaXterm .mxtsessions, PuTTY .reg, JSON) through
+  // the native dialog and parse it straight away, as if it had been pasted.
+  const chooseImportFile = async () => {
+    setImportError(null);
+    try {
+      const text = await invoke<string | null>("pick_client_import_file");
+      if (text == null) return;
+      setImportPasteText(text);
+      await parsePastedImport(text);
+    } catch (e: any) {
+      setImportError(typeof e === "string" ? e : (e?.message || String(e)));
+    }
+  };
+
 
   const switchImportSource = async (next: "ssh" | "paste") => {
     if (importBusy || importSource === next) return;
@@ -202,6 +220,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     setImportError(null);
     setImportNotice(null);
     setImportSkipped(null);
+    setImportDone(null);
     setImportHosts([]);
     setImportSelected(new Set());
     setImportPasteText("");
@@ -316,11 +335,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
       (report.rdp_added ? `, ${plural(report.rdp_added, "Remote Desktop link")} added` : "") +
       (report.already_there ? `; ${report.already_there} already saved, left as they were` : "") +
       ".";
-    if (todo.length > 0) {
-      setImportNotice([summary, ...todo].join("\n\n"));
-      return;
-    }
-    closeImportModal();
+    setImportDone([summary, ...todo].join("\n\n"));
   };
 
   // Browse to a key on disk and select it on this server in one step. The key
@@ -432,11 +447,11 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
             {!isEditMode && (
               <button
                 onClick={openImportModal}
-                title="Import from ~/.ssh/config"
+                title="Import from MobaXterm, PuTTY, ~/.ssh/config or JSON"
                 className="h-8 px-2.5 flex items-center gap-1.5 text-[11px] font-bold text-primary bg-primary/10 border border-primary/30 hover:bg-primary/20 rounded-xl transition-all"
               >
                 <Download size={12} />
-                <span className="hidden sm:inline">Import from ~/.ssh/config</span>
+                <span className="hidden sm:inline">Import sessions</span>
                 <span className="sm:hidden">Import</span>
               </button>
             )}
@@ -999,8 +1014,14 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               </button>
             </div>
 
-            {/* Body — one of loading / error / empty / list. */}
+            {/* Body — one of loading / error / empty / list, or the result. */}
             <div className="flex-1 overflow-y-auto custom-scrollbar p-3">
+              {importDone && (
+                <div className="m-1 p-3 bg-emerald-500/[0.06] border border-emerald-500/20 rounded-lg text-zinc-200 text-[12px] leading-relaxed whitespace-pre-line">
+                  {importDone}
+                </div>
+              )}
+              {!importDone && (<>
               {importSource === "paste" && importHosts.length === 0 && !importLoading && (
                 <div className="space-y-2 mb-2">
                   <div className="text-[11px] text-zinc-400 leading-relaxed px-1">
@@ -1018,9 +1039,17 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                     rows={10}
                     className="w-full bg-black/40 border border-white/10 rounded-lg p-3 text-[11px] font-mono text-zinc-200 placeholder:text-zinc-600 focus:border-primary/40 focus:outline-none resize-none custom-scrollbar"
                   />
-                  <div className="flex justify-end">
+                  <div className="flex justify-end gap-2">
+                    {!IS_ANDROID && (
+                      <button
+                        onClick={chooseImportFile}
+                        className="h-8 px-3 rounded-lg text-[11px] font-bold uppercase tracking-wider bg-white/[0.04] text-zinc-300 border border-white/10 hover:bg-white/[0.08] hover:text-white transition-all"
+                      >
+                        Choose file…
+                      </button>
+                    )}
                     <button
-                      onClick={parsePastedImport}
+                      onClick={() => parsePastedImport()}
                       disabled={!importPasteText.trim()}
                       className="h-8 px-3 rounded-lg text-[11px] font-bold uppercase tracking-wider bg-primary/10 text-primary border border-primary/30 hover:bg-primary/20 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
                     >
@@ -1129,10 +1158,19 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                   )}
                 </>
               )}
+              </>)}
             </div>
 
             {/* Modal footer */}
             <div className="p-3 border-t border-white/5 shrink-0 flex items-center justify-end gap-2">
+              {importDone ? (
+                <button
+                  onClick={closeImportModal}
+                  className="px-4 h-8 rounded-lg text-[11px] font-bold uppercase tracking-wider bg-primary/15 border border-primary/40 text-primary hover:bg-primary/25"
+                >
+                  Done
+                </button>
+              ) : (<>
               <button
                 onClick={closeImportModal}
                 disabled={importBusy}
@@ -1148,6 +1186,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 <Download size={11} />
                 {importBusy ? "Importing…" : `Import ${importSelected.size} selected`}
               </button>
+              </>)}
             </div>
           </div>
         </div>,
