@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { AlertTriangle, MonitorSmartphone, X } from "lucide-react";
-import { folderOptions } from "../util/folderPath";
+import { FolderRow, folderOptions } from "../util/folderPath";
 
 // Add or edit a Remote Desktop link (src-tauri/src/rdp.rs). The link only
-// stores where to connect; Windows' Remote Desktop does the rest and keeps the
-// password itself when "Remember me" is ticked.
+// stores where to connect; the system's Remote Desktop client does the rest
+// and keeps the password itself.
 export type RdpLink = {
   id?: number | null;
   name: string;
@@ -20,7 +20,7 @@ const label = "text-[10px] font-bold text-zinc-300 uppercase tracking-wider ml-0
 
 const RdpLinkModal = ({ link, folders, onSave, onClose }: {
   link: RdpLink;
-  folders: any[];
+  folders: FolderRow[];
   onSave: (link: RdpLink) => Promise<void>;
   onClose: () => void;
 }) => {
@@ -102,8 +102,9 @@ const RdpLinkModal = ({ link, folders, onSave, onClose }: {
           </div>
 
           <p className="text-[10.5px] text-zinc-400 leading-snug pt-1">
-            Opens in Windows' Remote Desktop with your usual Remote Desktop settings. Submarine never stores the
-            password: tick “Remember me” in Remote Desktop and Windows keeps it for this computer.
+            Opens in Remote Desktop with your usual Remote Desktop settings (on macOS and Linux, in the app that
+            opens .rdp files). Submarine never stores the password: tick “Remember me” in Remote Desktop and
+            Windows keeps it for this computer.
           </p>
         </div>
 

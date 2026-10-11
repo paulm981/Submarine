@@ -13,6 +13,9 @@
 //!
 //! Links live in the vault's `rdp_links` table, which is not part of cloud
 //! sync (they stay on this device and travel with profile export/import).
+//! Its folder_id has no foreign key, unlike servers': sync can delete a
+//! folder that only this device has links in, and that must not fail.
+//! delete_folder removes the links itself.
 
 use crate::DbState;
 use rusqlite::{params, Connection};
@@ -63,7 +66,7 @@ fn valid_username(user: &str) -> bool {
     user.len() <= 256 && !user.chars().any(|c| c.is_control())
 }
 
-fn validate(link: &RdpLink) -> Result<(), String> {
+pub(crate) fn validate(link: &RdpLink) -> Result<(), String> {
     if link.name.trim().is_empty() {
         return Err("Give the link a name.".into());
     }
@@ -170,14 +173,14 @@ fn encode_rdp(text: &str) -> Vec<u8> {
 }
 
 #[tauri::command]
-pub(crate) async fn rdp_list(state: tauri::State<'_, DbState>) -> Result<Vec<RdpLink>, String> {
+pub async fn rdp_list(state: tauri::State<'_, DbState>) -> Result<Vec<RdpLink>, String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     list(conn).map_err(|e| format!("[DATABASE] RDP_LIST_FAILED: {}", e))
 }
 
 #[tauri::command]
-pub(crate) async fn rdp_save(state: tauri::State<'_, DbState>, link: RdpLink) -> Result<i64, String> {
+pub async fn rdp_save(state: tauri::State<'_, DbState>, link: RdpLink) -> Result<i64, String> {
     let id = {
         let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
@@ -188,7 +191,7 @@ pub(crate) async fn rdp_save(state: tauri::State<'_, DbState>, link: RdpLink) ->
 }
 
 #[tauri::command]
-pub(crate) async fn rdp_delete(state: tauri::State<'_, DbState>, id: i64) -> Result<(), String> {
+pub async fn rdp_delete(state: tauri::State<'_, DbState>, id: i64) -> Result<(), String> {
     {
         let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
@@ -201,7 +204,7 @@ pub(crate) async fn rdp_delete(state: tauri::State<'_, DbState>, id: i64) -> Res
 
 /// Open a link in the system's Remote Desktop client.
 #[tauri::command]
-pub(crate) async fn rdp_open(state: tauri::State<'_, DbState>, id: i64) -> Result<(), String> {
+pub async fn rdp_open(state: tauri::State<'_, DbState>, id: i64) -> Result<(), String> {
     let link = {
         let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;

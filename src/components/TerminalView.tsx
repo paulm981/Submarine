@@ -8,6 +8,7 @@ import 'xterm/css/xterm.css';
 import { useIsNarrow } from '../hooks/useViewport';
 import { MobileKeyBar, ModifiersState, ModKey, SpecialKey } from './MobileKeyBar';
 import { useBroadcast } from '../ui/broadcast';
+import { useConfirm } from '../ui/confirm';
 import HistorySearchOverlay from './HistorySearchOverlay';
 import { DEFAULT_FONT_STACK, fontFamilyCss, readFontFamily, readFontSize } from '../util/terminalFont';
 import { IS_ANDROID, IS_LINUX } from '../util/platform';
@@ -466,6 +467,11 @@ const TerminalView = ({
     toastTimerRef.current = window.setTimeout(() => setToast(null), 1400);
   };
 
+  // Read by the terminal's link handler, which is set up once per terminal.
+  const confirmDialog = useConfirm();
+  const confirmRef = useRef(confirmDialog);
+  confirmRef.current = confirmDialog;
+
   useEffect(() => {
     if (!terminalRef.current) return;
 
@@ -486,12 +492,13 @@ const TerminalView = ({
       },
       // Hyperlinks a program prints (OSC 8). xterm's default opens them in
       // a new webview window; ask, then hand http(s) links to the system
-      // browser (open_external_url refuses anything else).
+      // browser (open_external_url refuses anything else). The themed
+      // confirm, as window.confirm() does nothing in Android's WebView.
       linkHandler: {
         activate: (_event, uri) => {
           if (!/^https?:\/\//i.test(uri)) return;
-          if (!window.confirm(`Open this link in your browser?\n\n${uri}`)) return;
-          invoke('open_external_url', { url: uri }).catch(() => {});
+          confirmRef.current({ title: 'Open this link in your browser?', message: uri, okLabel: 'Open' })
+            .then((ok) => { if (ok) invoke('open_external_url', { url: uri }).catch(() => {}); });
         },
       },
       allowProposedApi: true

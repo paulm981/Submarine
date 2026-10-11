@@ -599,7 +599,7 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
         const dest = provider.joinPath(destDir, entry.name);
         if (dest === entry.path) throw new Error("Destination is the current location — nothing to move.");
         await provider.rename(entry.path, dest);
-        notify(`Moved ${entry.name} → ${destDir}`, "success");
+        notify(`Moved ${visibleName(entry.name)} → ${destDir}`, "success");
       } else if (type === "move-bulk" && v1) {
         // v1 is the destination *directory*; each selected item keeps its
         // own name under it.
@@ -611,13 +611,13 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
             await provider.rename(it.path, provider.joinPath(dest, it.name));
             count++;
           } catch (err: any) {
-            notify(`Move failed for ${it.name}: ${err}`, "error");
+            notify(`Move failed for ${visibleName(it.name)}: ${err}`, "error");
           }
         }
         if (count > 0) {
           setSelected(new Set());
           lastSelectedPathRef.current = null;
-          notify(items.length === 1 ? `Moved ${items[0].name} → ${dest}` : `Moved ${count} of ${items.length} items → ${dest}`, "success");
+          notify(items.length === 1 ? `Moved ${visibleName(items[0].name)} → ${dest}` : `Moved ${count} of ${items.length} items → ${dest}`, "success");
         }
       } else if (type === "mkdir" && v1) {
         await provider.mkdir(provider.joinPath(currentPath, v1));
@@ -664,10 +664,10 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
       title: items.length === 1 ? "Delete item" : `Delete ${items.length} items`,
       message: items.length === 1
         ? (items[0].isSymlink
-            ? `Delete the link “${items[0].name}”? Only the link is removed; what it points to is not touched.`
+            ? `Delete the link “${visibleName(items[0].name)}”? Only the link is removed; what it points to is not touched.`
             : items[0].isDir
-            ? `Permanently delete folder “${items[0].name}” and everything inside?`
-            : `Permanently delete “${items[0].name}”?`)
+            ? `Permanently delete folder “${visibleName(items[0].name)}” and everything inside?`
+            : `Permanently delete “${visibleName(items[0].name)}”?`)
         : `Permanently delete ${items.length} items? Folders include their contents; links are removed without touching what they point to.`,
       okLabel: "Delete",
       destructive: true,
@@ -698,12 +698,12 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
     } else if (failure) {
       notify(
         items.length === 1
-          ? `Delete failed for ${failure.name}: ${failure.reason}`
-          : `Deleted ${count} of ${items.length} items. ${failed === 1 ? "" : `${failed} failed; the first: `}${failure.name}: ${failure.reason}`,
+          ? `Delete failed for ${visibleName(failure.name)}: ${failure.reason}`
+          : `Deleted ${count} of ${items.length} items. ${failed === 1 ? "" : `${failed} failed; the first: `}${visibleName(failure.name)}: ${failure.reason}`,
         "error",
       );
     } else {
-      notify(items.length === 1 ? `Deleted ${items[0].name}` : `Deleted ${count} of ${items.length} items`, "success");
+      notify(items.length === 1 ? `Deleted ${visibleName(items[0].name)}` : `Deleted ${count} of ${items.length} items`, "success");
     }
     // A folder that could not be removed completely, or whose delete was
     // stopped, may have lost part of its contents: show what is there now.
@@ -743,7 +743,7 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
     const dirCount  = items.filter(e =>  e.isDir).length;
     const summary =
       items.length === 1
-        ? `Downloading ${items[0].isDir ? "folder " : ""}${items[0].name}…`
+        ? `Downloading ${items[0].isDir ? "folder " : ""}${visibleName(items[0].name)}…`
         : `Downloading ${fileCount} files${dirCount ? ` + ${dirCount} folder${dirCount === 1 ? "" : "s"}` : ""}…`;
     notify(summary, "info");
     const batch: OverwriteBatch = { kind: "ask" };
@@ -763,11 +763,11 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
         if (res === "done") count++;
         if (res === "cancelled") { cancelled = true; }
       } catch (err: any) {
-        notify(`Download failed for ${e.name}: ${err}`, "error");
+        notify(`Download failed for ${visibleName(e.name)}: ${err}`, "error");
       }
     }
     if (count > 0) {
-      notify(items.length === 1 ? `Downloaded ${items[0].name}` : `Downloaded ${count} of ${items.length} items`, "success");
+      notify(items.length === 1 ? `Downloaded ${visibleName(items[0].name)}` : `Downloaded ${count} of ${items.length} items`, "success");
     } else if (cancelled) {
       notify("Download batch cancelled", "info");
     }
@@ -786,7 +786,7 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
     const fileCount = items.filter((e) => !e.isDir).length;
     const dirCount = items.filter((e) => e.isDir).length;
     const summary = items.length === 1
-      ? `Uploading ${items[0].isDir ? "folder " : ""}${items[0].name}…`
+      ? `Uploading ${items[0].isDir ? "folder " : ""}${visibleName(items[0].name)}…`
       : `Uploading ${fileCount} file${fileCount === 1 ? "" : "s"}${dirCount ? ` + ${dirCount} folder${dirCount === 1 ? "" : "s"}` : ""}…`;
     notify(summary, "info");
     const batch: OverwriteBatch = { kind: "ask" };
@@ -807,11 +807,11 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
         if (res === "done") count++;
         if (res === "cancelled") { cancelled = true; }
       } catch (err: any) {
-        notify(`Upload failed for ${e.name}: ${err}`, "error");
+        notify(`Upload failed for ${visibleName(e.name)}: ${err}`, "error");
       }
     }
     if (count > 0) {
-      notify(items.length === 1 ? `Uploaded ${items[0].name}` : `Uploaded ${count} of ${items.length} items`, "success");
+      notify(items.length === 1 ? `Uploaded ${visibleName(items[0].name)}` : `Uploaded ${count} of ${items.length} items`, "success");
     } else if (cancelled) {
       notify("Upload batch cancelled", "info");
     }
@@ -1131,7 +1131,7 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
                   }`}>
                   <div className="flex items-center gap-2 truncate">
                     {s.isDir ? <Folder size={11} className="text-indigo-300 shrink-0" /> : <File size={11} className="text-zinc-500 shrink-0" />}
-                    <span className="truncate">{s.name}</span>
+                    <span className="truncate">{visibleName(s.name)}</span>
                   </div>
                   {s.isDir && <span className="text-[9px] bg-indigo-500/20 text-indigo-300 px-1 rounded">dir</span>}
                 </button>
@@ -1303,7 +1303,7 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
                 onClick={(e) => onRowClick(e, entry, sortedEntries)}
                 onDoubleClick={() => {
                   if (entry.isDir) { fetch(entry.path); return; }
-                  if (entry.brokenLink) { notify(`“${entry.name}” is a broken link: its target is missing or not accessible.`, "error"); return; }
+                  if (entry.brokenLink) { notify(`“${visibleName(entry.name)}” is a broken link: its target is missing or not accessible.`, "error"); return; }
                   // For files: remote → live-edit (download + open editor +
                   // auto-upload on save); local → open in the OS default app.
                   // Both are desktop-only — on Android a double-tap on a file
@@ -1515,7 +1515,7 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
             <div className="space-y-3">
               {modal.type === "properties" ? (
                 <>
-                  <div>Name: <span className="text-zinc-100 font-bold">{modal.entry?.name}</span></div>
+                  <div>Name: <span className="text-zinc-100 font-bold">{visibleName(modal.entry?.name || "")}</span></div>
                   <div>Path: <span className="text-zinc-400 text-[10px] block truncate">{modal.entry?.path}</span></div>
                   {modal.entry?.isSymlink && (
                     <div className="text-[10px] text-amber-300/80">

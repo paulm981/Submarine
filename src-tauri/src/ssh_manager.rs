@@ -29,7 +29,7 @@ pub fn host_key_fingerprint(key: &PublicKey) -> String {
 /// family. Case and surrounding whitespace are ignored, and a
 /// `-cert-v01@openssh.com` suffix maps a certificate type to the family of the
 /// key it certifies.
-fn key_type_family(key_type: &str) -> String {
+pub(crate) fn key_type_family(key_type: &str) -> String {
     let kt = key_type.trim().to_ascii_lowercase();
     let base = kt.strip_suffix("-cert-v01@openssh.com").unwrap_or(&kt);
     match base {
@@ -386,7 +386,7 @@ pub struct SftpElevation {
     pub server_path: String,
     /// `sudo` or `dzdo`, whichever the probe found allowed.
     pub tool: &'static str,
-    /// `None` = passwordless sudo (`sudo -n`).
+    /// `None` = passwordless (`sudo -n` / `dzdo -n`).
     pub password: Option<zeroize::Zeroizing<String>>,
 }
 
@@ -609,11 +609,13 @@ impl client::Handler for ClientHandler {
         //     (key_type_family folds rsa-sha2-512 / rsa-sha2-256 / ssh-rsa
         //     together: older rows carry the negotiated RSA signature name,
         //     newer ones `ssh-rsa`, and a changed RSA key must still warn.)
-        //   - no match and only OTHER families are on file (e.g. the server
-        //     just added an ed25519 key beside its old rsa key) → NOT a change;
-        //     falls through to the ordinary unknown-key prompt.
-        // This mirrors OpenSSH's per-(host,keytype) known_hosts semantics and
-        // stops benign algorithm additions from firing a false MITM warning.
+        //   - no match and only OTHER families are on file → the server no
+        //     longer offers the trusted key. A server that merely added an
+        //     ed25519 key beside its old rsa key doesn't get here: the client
+        //     asks for the trusted types first (ssh_preferred_for_host), so it
+        //     keeps presenting the old key. Prompted with the red "different
+        //     key type" warning (other_key_types), as OpenSSH warns.
+        // This mirrors OpenSSH's per-(host,keytype) known_hosts semantics.
         let mut is_known = false;
         let mut mismatch = false; // same key family, different fingerprint
         let mut prior_fingerprints: Vec<String> = Vec::new();

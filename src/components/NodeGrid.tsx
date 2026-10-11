@@ -1,9 +1,10 @@
 import { Search, Plus, Server, Globe, Folder, ChevronLeft, ChevronRight, Trash2, Edit2, Zap, Check, X, Copy, GripVertical, MonitorSmartphone } from "lucide-react";
-import { useState, useEffect, useLayoutEffect, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
 import { useConfirm } from "../ui/confirm";
-import { childFolders, folderPath, parentOf, subtreeIds } from "../util/folderPath";
+import { FolderRow, childFolders, folderPath, indexFolders, subtreeCounts } from "../util/folderPath";
 import RdpLinkModal, { RdpLink } from "./RdpLinkModal";
+import { IS_ANDROID } from "../util/platform";
 
 export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFolderIdProp, onActiveFolderChange, onOpenServer, onEditServer, onAddClick, onQuickConnect, onRemoveServer, onRemoveFolder, onRenameFolder, onCloneServer, onReorderServers, onOpenRdp, onSaveRdp, onRemoveRdp, isMobile }: any) => {
   const [search, setSearch] = useState("");
@@ -39,15 +40,21 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
     s.host.includes(search)
   ) || [];
 
-  const currentFolder = folders?.find((f: any) => f.id === activeFolderId);
   // Folders nest (parent_id): the grid shows the folders directly inside the
-  // open one, and the header the path to it.
-  const allFolders: any[] = folders || [];
-  const crumbs = folderPath(allFolders, activeFolderId);
-  const parentFolderId = currentFolder ? parentOf(allFolders, currentFolder) : null;
+  // open one, and the header the path to it. The index and the counts are
+  // built once per change, not per card: an import brings hundreds.
+  const allFolders: FolderRow[] = folders || [];
+  const folderIndex = useMemo(() => indexFolders(allFolders), [folders]);
+  const serverCounts = useMemo(() => subtreeCounts(folderIndex, (servers || []).map((s: any) => s.folder_id)), [folderIndex, servers]);
+  const rdpCounts = useMemo(() => subtreeCounts(folderIndex, (rdpLinks || []).map((l: RdpLink) => l.folder_id)), [folderIndex, rdpLinks]);
+  // Remote Desktop links open a desktop client (rdp.rs), which Android has
+  // no counterpart for here.
+  const canRdp = !!onSaveRdp && !IS_ANDROID;
+  const crumbs = folderPath(folderIndex, activeFolderId);
+  const parentFolderId = activeFolderId != null ? (folderIndex.parent.get(activeFolderId) ?? null) : null;
   // A server or link whose folder is gone shows at the top level.
-  const knownFolder = (id: number | null | undefined) => id != null && allFolders.some((f: any) => f.id === id);
-  const inFolder = (folderId: number | null | undefined) => (knownFolder(folderId) ? folderId : null) === activeFolderId;
+  const inFolder = (folderId: number | null | undefined) =>
+    (folderId != null && folderIndex.byId.has(folderId) ? folderId : null) === activeFolderId;
 
   // If search is active, we might want to just show all matching servers flat,
   // or still respect the folder. Let's just show them flat if searching.
@@ -57,13 +64,13 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
     ? filteredServers
     : filteredServers.filter((s: any) => inFolder(s.folder_id));
 
-  const q = search.toLowerCase();
+  // Matched the way filteredServers matches servers.
   const displayedRdp: RdpLink[] = (rdpLinks || []).filter((l: RdpLink) =>
     isSearching
-      ? l.name.toLowerCase().includes(q) || l.host.toLowerCase().includes(q)
+      ? l.name.toLowerCase().includes(search.toLowerCase()) || l.host.includes(search)
       : inFolder(l.folder_id),
   );
-  const displayedFolders = isSearching ? [] : childFolders(allFolders, activeFolderId);
+  const displayedFolders = isSearching ? [] : childFolders(folderIndex, activeFolderId);
 
   // Add / edit dialog for a Remote Desktop link; null while closed.
   const [rdpDraft, setRdpDraft] = useState<RdpLink | null>(null);
@@ -414,10 +421,9 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
   // place, and the same hover lift as server cards.
   const FolderCard = ({ f }: { f: any }) => {
     // Everything inside, at any depth, so a folder of folders isn't "0".
-    const inside = subtreeIds(allFolders, f.id);
-    const serverCount = (servers?.filter((s: any) => inside.has(s.folder_id)).length || 0)
-      + ((rdpLinks || []).filter((l: RdpLink) => l.folder_id != null && inside.has(l.folder_id)).length);
-    const subfolderCount = childFolders(allFolders, f.id).length;
+    const serverCount = serverCounts.get(f.id) ?? 0;
+    const rdpCount = rdpCounts.get(f.id) ?? 0;
+    const subfolderCount = childFolders(folderIndex, f.id).length;
     const isRenaming = renaming?.id === f.id;
     const accent = f.color || 'rgb(var(--primary))';
     return (
@@ -455,6 +461,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
               <span className="text-[10px] text-zinc-500 font-bold uppercase tracking-[0.12em]">
                 {subfolderCount > 0 && (subfolderCount === 1 ? '1 folder · ' : `${subfolderCount} folders · `)}
                 {serverCount === 1 ? '1 server' : `${serverCount} servers`}
+                {rdpCount > 0 && ` · ${rdpCount} RDP`}
               </span>
             </>
           )}
@@ -480,7 +487,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
           </div>
         ) : (
           <div className="relative flex items-center shrink-0">
-            <span className="text-[10px] bg-black/60 text-zinc-400 px-1.5 py-0.5 rounded-md font-mono group-hover:opacity-0 transition-opacity">{serverCount}</span>
+            <span className="text-[10px] bg-black/60 text-zinc-400 px-1.5 py-0.5 rounded-md font-mono group-hover:opacity-0 transition-opacity">{serverCount + rdpCount}</span>
             <div className="absolute right-0 flex items-center gap-0.5 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 [@media(hover:none)]:!opacity-100 transition-all bg-gradient-to-l from-[#16161b] via-[#16161b] to-transparent pl-6">
               <button
                 onClick={(e) => { e.stopPropagation(); setRenaming({ id: f.id, draft: f.name || "" }); }}
@@ -536,7 +543,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
             <h2 className="text-[15px] font-bold text-primary tracking-tight flex items-center gap-1.5 flex-1 min-w-0 flex-wrap">
               <Folder size={16} className="shrink-0" />
               <button onClick={() => setActiveFolderId(null)} className="text-zinc-500 hover:text-zinc-200 font-semibold">All</button>
-              {crumbs.map((c: any, i: number) => (
+              {crumbs.map((c, i) => (
                 <span key={c.id} className="flex items-center gap-1.5 min-w-0">
                   <ChevronRight size={12} className="text-zinc-600 shrink-0" />
                   {i === crumbs.length - 1
@@ -554,7 +561,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
             >
               <Plus size={13} /> Add server
             </button>
-            {onSaveRdp && (
+            {canRdp && (
               <button
                 onClick={newRdp}
                 className="h-8 px-3 bg-sky-500/10 text-sky-300 border border-sky-500/25 hover:bg-sky-500/20 rounded-lg flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider shrink-0"
@@ -600,7 +607,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
                     <Zap size={13} /> Quick connect
                   </button>
                 )}
-                {onSaveRdp && (
+                {canRdp && (
                   <button
                     onClick={newRdp}
                     className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg bg-sky-500/10 border border-sky-500/25 text-sky-300 text-[11px] font-bold uppercase tracking-wider hover:bg-sky-500/20 transition-colors"
@@ -614,7 +621,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
           <div ref={gridRef} className={`grid ${isMobile ? 'grid-cols-1' : 'grid-cols-2 lg:grid-cols-3 xl:grid-cols-4'} gap-3`}>
 
             {/* The folders directly inside the open one (none while searching). */}
-            {displayedFolders.map((f: any) => (
+            {displayedFolders.map((f) => (
               <FolderCard key={`folder-${f.id}`} f={f} />
             ))}
 

@@ -90,7 +90,7 @@ pub async fn live_edit_editor_pick(app: tauri::AppHandle) -> Result<LiveEditEdit
             dialog = dialog.add_filter("Programs", &["exe"]);
         }
         let Some(path) = dialog.pick_file() else { return Ok(editor_info(&app)) };
-        let file = editor_file(&app).ok_or("No settings folder")?;
+        let file = editor_file(&app).ok_or("Couldn't find the settings folder.")?;
         if let Some(dir) = file.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("Couldn't save the editor: {}", e))?;
         }
@@ -155,7 +155,10 @@ fn start_editor(editor: &Path, file: &Path) -> Result<(), String> {
 
 /// File types Windows runs, rather than shows, when they are opened:
 /// programs, scripts, shortcuts, installers, disk images, settings files and
-/// the Office formats that carry macros. Anything %PATHEXT% lists counts too.
+/// the macro-enabled Office formats. The older .doc / .xls / .ppt can carry
+/// macros too but are everyday documents, so they open without asking;
+/// Office blocks macros in files marked as downloaded (mark_from_internet).
+/// Anything %PATHEXT% lists counts too.
 #[cfg(any(windows, test))]
 const RUNS_ON_OPEN: &[&str] = &[
     // programs and installers
