@@ -155,7 +155,10 @@ fn start_editor(editor: &Path, file: &Path) -> Result<(), String> {
 
 /// File types Windows runs, rather than shows, when they are opened:
 /// programs, scripts, shortcuts, installers, disk images, settings files and
-/// the Office formats that carry macros. Anything %PATHEXT% lists counts too.
+/// the macro-enabled Office formats. The older .doc / .xls / .ppt can carry
+/// macros too but are everyday documents, so they open without asking;
+/// Office blocks macros in files marked as downloaded (mark_from_internet).
+/// Anything %PATHEXT% lists counts too.
 #[cfg(any(windows, test))]
 const RUNS_ON_OPEN: &[&str] = &[
     // programs and installers

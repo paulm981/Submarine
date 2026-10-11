@@ -3446,9 +3446,6 @@ async fn setup_master_db_inner(
             "CREATE INDEX IF NOT EXISTS idx_cmd_history_ts ON cmd_history(ts DESC)",
             [],
         ).map_err(|e| format!("[DATABASE] CMD_HISTORY_INDEX_FAILED: {}", e))?;
-        // Remote Desktop links (rdp.rs). Additive, like run_on_connect below:
-        // an older build simply doesn't see the table.
-        conn.execute(rdp::SCHEMA, []).map_err(|e| format!("[DATABASE] RDP_TABLE_FAILED: {}", e))?;
         const SCHEMA_VERSION: i64 = 6;
         let stored: i64 = conn.query_row(
             "SELECT CAST(value AS INTEGER) FROM schema_meta WHERE key = 'schema_version'",
@@ -3582,6 +3579,10 @@ async fn setup_master_db_inner(
              INSERT INTO schema_meta (key, value) VALUES ('schema_version', '6');"
         ).map_err(|e| format!("[DATABASE] SCHEMA_CREATION_FAILED: {}", e))?;
     }
+
+    // Remote Desktop links (rdp.rs), for existing and fresh vaults alike.
+    // Additive, like run_on_connect: an older build simply doesn't see it.
+    conn.execute(rdp::SCHEMA, []).map_err(|e| format!("[DATABASE] RDP_TABLE_FAILED: {}", e))?;
 
     conn.execute("PRAGMA foreign_keys = ON", []).map_err(|e| format!("[DATABASE] PRAGMA_FAILED: {}", e))?;
 
@@ -6517,6 +6518,46 @@ pub(crate) fn ssh_preferred_algorithms() -> russh::Preferred {
     }
 }
 
+/// ssh_preferred_algorithms with the host-key types already trusted for
+/// `host:port` moved to the front, as OpenSSH orders them. A server that has
+/// gained a newer key type then keeps presenting the one on file, instead of
+/// asking the user to trust a key they have never seen; and when
+/// check_server_key does meet another type while one is on file, the server
+/// no longer offers the trusted one, which is worth its red warning. The
+/// monitor orders them the same way, so it still negotiates the key the
+/// interactive session stored.
+pub(crate) fn ssh_preferred_for_host(db: &StdMutex<Option<Connection>>, host: &str, port: u16) -> russh::Preferred {
+    let known: Vec<String> = db
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            let conn = guard.as_ref()?;
+            let mut stmt = conn.prepare("SELECT key_type FROM known_hosts WHERE host=?1 AND port=?2").ok()?;
+            let rows = stmt
+                .query_map(rusqlite::params![host, port], |r| r.get::<_, Option<String>>(0))
+                .ok()?;
+            Some(rows.filter_map(|r| r.ok().flatten()).collect())
+        })
+        .unwrap_or_default();
+    let mut preferred = ssh_preferred_algorithms();
+    prefer_host_key_types(&mut preferred, &known);
+    preferred
+}
+
+fn prefer_host_key_types(preferred: &mut russh::Preferred, known_types: &[String]) {
+    let families: Vec<String> = known_types.iter().map(|t| ssh_manager::key_type_family(t)).collect();
+    let (mut first, rest): (Vec<_>, Vec<_>) = preferred
+        .key
+        .iter()
+        .cloned()
+        .partition(|a| families.contains(&ssh_manager::key_type_family(a.as_str())));
+    if first.is_empty() {
+        return;
+    }
+    first.extend(rest);
+    preferred.key = std::borrow::Cow::Owned(first);
+}
+
 /// Bounds for `diffie-hellman-group-exchange-sha256` (issue #33), shared like
 /// `ssh_preferred_algorithms`. russh's default minimum is 3072 bits, which
 /// aborts the handshake with servers whose moduli (or appliance firmware)
@@ -7059,7 +7100,9 @@ async fn connect_jump_host(
     };
 
     // 4. Handshake.
-    let config = std::sync::Arc::new(build_ssh_client_config());
+    let mut config = build_ssh_client_config();
+    config.preferred = ssh_preferred_for_host(db, &host, port as u16);
+    let config = std::sync::Arc::new(config);
     log("Jump host: SSH handshake...", "info");
     // The 15s handshake cap bounds only the pre-prompt transport+kex phase;
     // once check_server_key shows a first-time fingerprint prompt the wait
@@ -7852,8 +7895,11 @@ async fn initiate_connection(
 
         emit_log("Starting SSH Handshake and establishing secure session...", "info");
         // Config (keepalive, windows, algorithm negotiation) is shared with the
-        // ProxyJump hop — see build_ssh_client_config for the full rationale.
-        let config = Arc::new(build_ssh_client_config());
+        // ProxyJump hop — see build_ssh_client_config for the full rationale —
+        // with this host's trusted key types first (ssh_preferred_for_host).
+        let mut config = build_ssh_client_config();
+        config.preferred = ssh_preferred_for_host(&db_for_jump, &host, port as u16);
+        let config = Arc::new(config);
 
         let connect_future = client::connect_stream(config, StreamWrapper(stream), handler);
 
@@ -9862,6 +9908,7 @@ fn classify_sudo_failure(msg: &str) -> String {
         || m.contains("not in the sudoers")
         || m.contains("not allowed")
         || m.contains("may not run sudo")
+        || m.contains("may not run dzdo")
     {
         SUDO_NOT_ALLOWED.into()
     } else {
@@ -10101,6 +10148,7 @@ mod elevated_sftp_tests {
     #[test]
     fn dzdo_errors_map_to_the_same_codes() {
         assert_eq!(classify_sudo_failure("dzdo: a password is required"), SUDO_NEED_PASSWORD);
+        assert_eq!(classify_sudo_failure("Sorry, user bob may not run dzdo on host."), SUDO_NOT_ALLOWED);
         assert_eq!(classify_sudo_failure("Sorry, try again. dzdo: 1 incorrect password attempt"), SUDO_WRONG_PASSWORD);
         assert_eq!(
             classify_sudo_failure("Sorry, user bob is not allowed to execute '/usr/libexec/openssh/sftp-server' as root on host."),
@@ -10987,7 +11035,21 @@ async fn sftp_download_dir(
     }
 
     // Shown on the finished transfer card when the walk skipped names.
-    let skipped_note = skipped_names_note(skipped_names);
+    // The destination passed the policy, but the server names the folders
+    // inside it: a home-folder backup downloaded into C:\Users would put its
+    // AppData\…\Startup\x.bat in the real Startup folder. Files that would
+    // land in a folder the system runs things from at login are left out and
+    // counted on the card.
+    let autorun = autorun_dirs();
+    let dest_root = std::path::PathBuf::from(&local_path).join(&folder_name);
+    let before = files.len();
+    files.retain(|(_, rel, _)| !lands_in(&dest_root.join(rel), &autorun));
+    let skipped_autorun = (before - files.len()) as u64;
+
+    let skipped_note = match (skipped_names_note(skipped_names), autorun_skipped_note(skipped_autorun)) {
+        (Some(a), Some(b)) => Some(format!("{}; {}", a, b)),
+        (a, b) => a.or(b),
+    };
 
     if files.is_empty() {
         // Still create the (empty) destination folder so the UI sees the
@@ -11036,13 +11098,6 @@ async fn sftp_download_dir(
             emit_progress(transferred, total_bytes, "error",
                 Some(format!("unsafe path escaped destination: {}", dest.display())));
             return Err(format!("unsafe path escaped destination: {}", dest.display()));
-        }
-        // The destination passed the policy, but the server names the
-        // folders inside it: a home-folder backup downloaded into C:\Users
-        // would put its AppData\…\Startup\x.bat in the real Startup folder.
-        if let Err(e) = check_local_path_policy(dest.clone()) {
-            emit_progress(transferred, total_bytes, "error", Some(e.clone()));
-            return Err(e);
         }
         if let Some(parent) = dest.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -12238,6 +12293,9 @@ struct ImportedHost {
     /// The key the jump host signs in with (MobaXterm's jump host key).
     #[serde(default)]
     jump_identity_file: Option<String>,
+    /// The saved login the jump host signs in with (MobaXterm `[name]`).
+    #[serde(default)]
+    jump_credential: Option<String>,
     /// A Remote Desktop session (MobaXterm's RDP): imported as an RDP link
     /// (rdp.rs), not a server.
     #[serde(default)]
@@ -12405,7 +12463,8 @@ fn parse_ssh_config(path: Option<String>) -> Result<Vec<ImportedHost>, String> {
                             }
                             "user" => b.user = Some(val.to_string()),
                             "identityfile" => b.identity_file = Some(val.to_string()),
-                            "proxyjump" => b.proxy_jump = Some(val.to_string()),
+                            // `none` turns off a ProxyJump set by a wildcard block.
+                            "proxyjump" => b.proxy_jump = (!val.eq_ignore_ascii_case("none")).then(|| val.to_string()),
                             _ => {}
                         }
                     }
@@ -12419,8 +12478,43 @@ fn parse_ssh_config(path: Option<String>) -> Result<Vec<ImportedHost>, String> {
         if let Some(last) = cur.take() {
             flush_block(&last, &mut out);
         }
-
+        resolve_proxy_jump_aliases(&mut out);
         Ok(out)
+    }
+}
+
+/// OpenSSH looks up each ProxyJump hop in the same config, so `ProxyJump
+/// bastion` means the `Host bastion` block's HostName, User and Port. Spell
+/// such hops out, so the import can match or save the real host whether or
+/// not the bastion block itself is picked.
+#[cfg(not(target_os = "android"))]
+fn resolve_proxy_jump_aliases(hosts: &mut [ImportedHost]) {
+    let by_alias: std::collections::HashMap<String, (String, String, u16)> = hosts
+        .iter()
+        .map(|h| (h.host_alias.clone(), (h.user.clone(), h.hostname.clone(), h.port)))
+        .collect();
+    for h in hosts.iter_mut() {
+        let Some(spec) = h.proxy_jump.as_deref() else { continue };
+        let hops: Vec<String> = spec
+            .split(',')
+            .map(str::trim)
+            .map(|hop| match by_alias.get(hop) {
+                Some((user, host, port)) if !hop.contains(['@', ':']) => {
+                    let mut out = String::new();
+                    if !user.is_empty() {
+                        out.push_str(user);
+                        out.push('@');
+                    }
+                    out.push_str(host);
+                    if *port != 22 {
+                        out.push_str(&format!(":{}", port));
+                    }
+                    out
+                }
+                _ => hop.to_string(),
+            })
+            .collect();
+        h.proxy_jump = Some(hops.join(","));
     }
 }
 
@@ -12806,6 +12900,7 @@ fn parse_mobaxterm_sessions_in(text: &str, profile_dir: Option<&str>, documents:
         // fields mean something else.
         let proxy_jump = (!rdp).then(|| mobaxterm_jump_hosts(field(8), field(9), field(10))).flatten();
         let jump_identity_file = proxy_jump.as_ref().and_then(|_| path(15));
+        let jump_credential = proxy_jump.as_ref().and_then(|_| mobaxterm_jump_login(field(8), field(10)));
         let folder_key = folder.join("\\");
         let mut alias = name.to_string();
         let mut n = 2;
@@ -12825,6 +12920,7 @@ fn parse_mobaxterm_sessions_in(text: &str, profile_dir: Option<&str>, documents:
             credential,
             run_on_connect: (!rdp).then(|| Some(field(7)).filter(|c| !c.is_empty()).map(String::from)).flatten(),
             jump_identity_file,
+            jump_credential,
             rdp,
         });
     }
@@ -12834,8 +12930,18 @@ fn parse_mobaxterm_sessions_in(text: &str, profile_dir: Option<&str>, documents:
     Ok(out)
 }
 
+/// The saved login a MobaXterm jump host signs in with: `[name]` as the
+/// jump user, for a single jump host.
+fn mobaxterm_jump_login(hosts: &str, users: &str) -> Option<String> {
+    let hops = hosts.split("__PIPE__").filter(|h| !h.trim().is_empty()).count();
+    let user = users.split("__PIPE__").next().unwrap_or("").trim();
+    let login = user.strip_prefix('[')?.strip_suffix(']')?.trim();
+    (hops == 1 && !login.is_empty()).then(|| login.to_string())
+}
+
 /// MobaXterm's jump hosts (one `__PIPE__`-separated list each for names,
-/// ports and users) as an OpenSSH ProxyJump value: `user@host:port,…`.
+/// ports and users) as an OpenSSH ProxyJump value: `user@host:port,…`. A
+/// saved login (`[name]`) is no user name; see mobaxterm_jump_login.
 fn mobaxterm_jump_hosts(hosts: &str, ports: &str, users: &str) -> Option<String> {
     let list = |s: &str| s.split("__PIPE__").map(str::trim).map(String::from).collect::<Vec<_>>();
     let (ports, users) = (list(ports), list(users));
@@ -12844,7 +12950,7 @@ fn mobaxterm_jump_hosts(hosts: &str, ports: &str, users: &str) -> Option<String>
         .enumerate()
         .filter(|(_, host)| !host.is_empty())
         .map(|(i, host)| {
-            let user = users.get(i).filter(|u| !u.is_empty() && u.as_str() != "<default>");
+            let user = users.get(i).filter(|u| !u.is_empty() && u.as_str() != "<default>" && !(u.starts_with('[') && u.ends_with(']')));
             let port = ports.get(i).and_then(|p| p.parse::<u16>().ok()).filter(|p| *p != 0 && *p != 22);
             let mut hop = String::new();
             if let Some(u) = user {
@@ -12963,10 +13069,19 @@ mod client_import_tests {
         assert_eq!(app.run_on_connect.as_deref(), Some("sudo -i"));
         assert_eq!(app.proxy_jump.as_deref(), Some("jump@bastion.example"));
         assert_eq!(app.jump_identity_file.as_deref(), Some(r"C:\Users\me\.ssh\id_jump"));
+        assert_eq!(app.jump_credential, None);
         let plain = &hosts[1];
         assert_eq!((plain.user.as_str(), plain.credential.as_deref(), plain.run_on_connect.as_deref()), ("alice", None, None));
         assert_eq!(plain.jump_identity_file, None);
         assert_eq!((hosts[2].user.as_str(), hosts[2].credential.as_deref()), ("[]", None), "an empty [] is not a login");
+    }
+
+    #[test]
+    fn a_jump_hosts_saved_login_is_not_taken_for_a_user_name() {
+        let text = export(&[session("app", 109, "0%app.example%22%[ops]%%-1%-1%%bastion.example%22%[jumplogin]%-1%0%0%%%-1")]);
+        let hosts = parse_mobaxterm_sessions_in(&text, None, None).unwrap();
+        assert_eq!(hosts[0].proxy_jump.as_deref(), Some("bastion.example"));
+        assert_eq!(hosts[0].jump_credential.as_deref(), Some("jumplogin"));
     }
 
     #[test]
@@ -13000,6 +13115,30 @@ mod client_import_tests {
         let text = export(&[session("vnc", 128, "5%e.example%5900%%-1%0")]);
         let err = parse_client_import(text).err().expect("a VNC-only export must be refused");
         assert!(err.contains("No MobaXterm SSH or RDP sessions"), "{err}");
+    }
+
+    #[test]
+    fn ssh_config_jump_aliases_name_the_real_host() {
+        let host = |alias: &str, hostname: &str, user: &str, port: u16, jump: Option<&str>| super::ImportedHost {
+            host_alias: alias.into(),
+            hostname: hostname.into(),
+            user: user.into(),
+            port,
+            proxy_jump: jump.map(Into::into),
+            ..Default::default()
+        };
+        let mut hosts = vec![
+            host("app", "10.0.0.2", "ops", 22, Some("bastion")),
+            host("db", "10.0.0.3", "ops", 22, Some("me@other.example:2200")),
+            host("deep", "10.0.0.4", "", 22, Some("bastion,inner")),
+            host("bastion", "10.0.0.1", "jump", 2222, None),
+            host("inner", "10.9.0.1", "", 22, None),
+        ];
+        super::resolve_proxy_jump_aliases(&mut hosts);
+        assert_eq!(hosts[0].proxy_jump.as_deref(), Some("jump@10.0.0.1:2222"));
+        assert_eq!(hosts[1].proxy_jump.as_deref(), Some("me@other.example:2200"), "a spelled-out hop stays as it is");
+        assert_eq!(hosts[2].proxy_jump.as_deref(), Some("jump@10.0.0.1:2222,10.9.0.1"));
+        assert_eq!(hosts[3].proxy_jump, None);
     }
 
     #[test]
@@ -13110,6 +13249,52 @@ fn check_download_dir_target(parent: &str, name: &str) -> Result<(), String> {
     }
     guard_local_path(&parent_dir.join(name).to_string_lossy(), true)?;
     Ok(())
+}
+
+/// The folders this system runs programs from at login, for this user and
+/// for all users.
+fn autorun_dirs() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut out = Vec::new();
+    if cfg!(windows) {
+        for var in ["APPDATA", "ProgramData"] {
+            if let Some(base) = std::env::var_os(var) {
+                out.push(PathBuf::from(base).join(r"Microsoft\Windows\Start Menu\Programs\Startup"));
+            }
+        }
+    } else if let Some(home) = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf()) {
+        if cfg!(target_os = "macos") {
+            out.push(home.join("Library/LaunchAgents"));
+            out.push("/Library/LaunchAgents".into());
+            out.push("/Library/LaunchDaemons".into());
+        } else {
+            let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".config"));
+            out.push(config.join("autostart"));
+            out.push("/etc/xdg/autostart".into());
+        }
+    }
+    out
+}
+
+/// Whether `path` is one of `dirs` or inside one. Compared as text (the file
+/// doesn't exist yet), with Windows' verbatim prefix and separators evened
+/// out, and without regard to case where the file system ignores it.
+fn lands_in(path: &std::path::Path, dirs: &[std::path::PathBuf]) -> bool {
+    let norm = |p: &std::path::Path| {
+        let s = p.to_string_lossy().replace('\\', "/");
+        let s = s.strip_prefix("//?/").unwrap_or(&s).trim_end_matches('/').to_string();
+        if cfg!(any(windows, target_os = "macos")) { s.to_lowercase() } else { s }
+    };
+    let p = norm(path);
+    dirs.iter().map(|d| norm(d)).any(|d| !d.is_empty() && (p == d || p.starts_with(&format!("{}/", d))))
+}
+
+fn autorun_skipped_note(skipped: u64) -> Option<String> {
+    match skipped {
+        0 => None,
+        1 => Some("1 file skipped: it would land in a folder this computer runs programs from at login".into()),
+        n => Some(format!("{} files skipped: they would land in a folder this computer runs programs from at login", n)),
+    }
 }
 
 /// The note on a finished folder-download card when the walk skipped names
@@ -14497,10 +14682,38 @@ mod tests {
     }
 
     #[test]
+    fn trusted_host_key_types_are_asked_for_first() {
+        let names = |p: &russh::Preferred| p.key.iter().map(|a| a.as_str().to_string()).collect::<Vec<_>>();
+        let stock = names(&ssh_preferred_algorithms());
+        let mut p = ssh_preferred_algorithms();
+        prefer_host_key_types(&mut p, &[]);
+        assert_eq!(names(&p), stock, "nothing on file: the usual order");
+        let mut p = ssh_preferred_algorithms();
+        prefer_host_key_types(&mut p, &["rsa-sha2-512".to_string()]);
+        let got = names(&p);
+        assert_eq!(&got[..3], &["rsa-sha2-512", "rsa-sha2-256", "ssh-rsa"], "every RSA signature name first");
+        assert_eq!(got.len(), stock.len());
+        let mut p = ssh_preferred_algorithms();
+        prefer_host_key_types(&mut p, &["ecdsa-sha2-nistp384".to_string(), "ssh-ed25519".to_string()]);
+        assert_eq!(&names(&p)[..2], &["ssh-ed25519", "ecdsa-sha2-nistp384"], "trusted types keep their own order");
+    }
+
+    #[test]
+    fn files_bound_for_a_login_folder_are_caught() {
+        let dirs = vec![std::path::PathBuf::from("/home/me/.config/autostart")];
+        assert!(lands_in(std::path::Path::new("/home/me/.config/autostart/x.desktop"), &dirs));
+        assert!(lands_in(std::path::Path::new("/home/me/.config/autostart"), &dirs));
+        assert!(!lands_in(std::path::Path::new("/home/me/Downloads/alice/.config/autostart/x.desktop"), &dirs));
+        assert!(!lands_in(std::path::Path::new("/home/me/.config/autostart-old/x"), &dirs));
+        assert!(!lands_in(std::path::Path::new("/anything"), &[std::path::PathBuf::new()]));
+        assert_eq!(autorun_skipped_note(0), None);
+        assert!(autorun_skipped_note(2).unwrap().starts_with("2 files skipped"));
+    }
+
+    #[test]
     fn skipped_names_note_counts() {
         assert_eq!(skipped_names_note(0), None);
         assert!(skipped_names_note(1).unwrap().starts_with("1 item skipped"));
         assert!(skipped_names_note(7).unwrap().starts_with("7 items skipped"));
     }
 }
-

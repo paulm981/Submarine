@@ -1,8 +1,8 @@
 import { Search, Plus, Server, Globe, Folder, ChevronLeft, ChevronRight, Trash2, Edit2, Zap, Check, X, Copy, GripVertical, MonitorSmartphone } from "lucide-react";
-import { useState, useEffect, useLayoutEffect, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
 import { useConfirm } from "../ui/confirm";
-import { childFolders, folderPath, parentOf, subtreeIds } from "../util/folderPath";
+import { childFolders, folderPath, indexFolders, subtreeCounts } from "../util/folderPath";
 import RdpLinkModal, { RdpLink } from "./RdpLinkModal";
 
 export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFolderIdProp, onActiveFolderChange, onOpenServer, onEditServer, onAddClick, onQuickConnect, onRemoveServer, onRemoveFolder, onRenameFolder, onCloneServer, onReorderServers, onOpenRdp, onSaveRdp, onRemoveRdp, isMobile }: any) => {
@@ -41,13 +41,19 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
 
   const currentFolder = folders?.find((f: any) => f.id === activeFolderId);
   // Folders nest (parent_id): the grid shows the folders directly inside the
-  // open one, and the header the path to it.
+  // open one, and the header the path to it. The index and the counts are
+  // built once per change, not per card: an import brings hundreds.
   const allFolders: any[] = folders || [];
-  const crumbs = folderPath(allFolders, activeFolderId);
-  const parentFolderId = currentFolder ? parentOf(allFolders, currentFolder) : null;
+  const folderIndex = useMemo(() => indexFolders(folders || []), [folders]);
+  const itemCounts = useMemo(
+    () => subtreeCounts(folderIndex, [...(servers || []).map((s: any) => s.folder_id), ...(rdpLinks || []).map((l: RdpLink) => l.folder_id)]),
+    [folderIndex, servers, rdpLinks],
+  );
+  const crumbs = folderPath(folderIndex, activeFolderId);
+  const parentFolderId = activeFolderId != null ? (folderIndex.parent.get(activeFolderId) ?? null) : null;
   // A server or link whose folder is gone shows at the top level.
-  const knownFolder = (id: number | null | undefined) => id != null && allFolders.some((f: any) => f.id === id);
-  const inFolder = (folderId: number | null | undefined) => (knownFolder(folderId) ? folderId : null) === activeFolderId;
+  const inFolder = (folderId: number | null | undefined) =>
+    (folderId != null && folderIndex.byId.has(folderId) ? folderId : null) === activeFolderId;
 
   // If search is active, we might want to just show all matching servers flat,
   // or still respect the folder. Let's just show them flat if searching.
@@ -63,7 +69,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
       ? l.name.toLowerCase().includes(q) || l.host.toLowerCase().includes(q)
       : inFolder(l.folder_id),
   );
-  const displayedFolders = isSearching ? [] : childFolders(allFolders, activeFolderId);
+  const displayedFolders = isSearching ? [] : childFolders(folderIndex, activeFolderId);
 
   // Add / edit dialog for a Remote Desktop link; null while closed.
   const [rdpDraft, setRdpDraft] = useState<RdpLink | null>(null);
@@ -414,10 +420,8 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
   // place, and the same hover lift as server cards.
   const FolderCard = ({ f }: { f: any }) => {
     // Everything inside, at any depth, so a folder of folders isn't "0".
-    const inside = subtreeIds(allFolders, f.id);
-    const serverCount = (servers?.filter((s: any) => inside.has(s.folder_id)).length || 0)
-      + ((rdpLinks || []).filter((l: RdpLink) => l.folder_id != null && inside.has(l.folder_id)).length);
-    const subfolderCount = childFolders(allFolders, f.id).length;
+    const serverCount = itemCounts.get(f.id) ?? 0;
+    const subfolderCount = childFolders(folderIndex, f.id).length;
     const isRenaming = renaming?.id === f.id;
     const accent = f.color || 'rgb(var(--primary))';
     return (

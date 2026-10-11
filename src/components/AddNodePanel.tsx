@@ -55,6 +55,7 @@ type ImportReport = {
   jump_linked: number;
   multi_hop: string[];
   rdp_added: number;
+  rdp_skipped: string[];
 };
 
 const rowKey = (h: ImportedHost) => h.key || h.host_alias;
@@ -288,6 +289,9 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
         `${plural(report.multi_hop.length, "host")} use a chain of jump hosts, which Submarine can't do (one jump host per server): ` +
         `${report.multi_hop.slice(0, 5).join(", ")}${report.multi_hop.length > 5 ? "…" : ""}. They were imported without one.`,
       );
+    }
+    if (report.rdp_skipped.length > 0) {
+      todo.push(`${plural(report.rdp_skipped.length, "Remote Desktop session")} not imported: ${report.rdp_skipped.join("; ")}`);
     }
     for (const [path, why] of keyFailures) {
       const ppk = /\.ppk$/i.test(path) ? " PuTTY .ppk keys need converting first: PuTTYgen › Conversions › Export OpenSSH key." : "";

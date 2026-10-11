@@ -801,7 +801,11 @@ async fn connect_for_monitor(
     }
     let (key_pair, password) = classify_auth(auth)?;
 
-    let config = Arc::new(monitor_client_config());
+    // The same host-key order as the interactive session, so it negotiates
+    // the key that session stored (see crate::ssh_preferred_for_host).
+    let mut config = monitor_client_config();
+    config.preferred = crate::ssh_preferred_for_host(db, &auth.host, auth.port);
+    let config = Arc::new(config);
 
     let handler = MonitorHandler {
         db: Arc::clone(db),

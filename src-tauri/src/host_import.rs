@@ -50,11 +50,15 @@ pub(crate) struct ImportReport {
     pub multi_hop: Vec<String>,
     /// Remote Desktop sessions added as RDP links (rdp.rs).
     pub rdp_added: usize,
+    /// Remote Desktop sessions left out, with why ("name: reason").
+    pub rdp_skipped: Vec<String>,
 }
 
-/// `[user@]host[:port]`, with `[v6]:port` for IPv6 literals.
+/// `[user@]host[:port]`, with `[v6]:port` for IPv6 literals, and OpenSSH's
+/// `ssh://[user@]host[:port]` form.
 fn parse_hop(hop: &str) -> Option<(String, String, u16)> {
     let hop = hop.trim();
+    let hop = hop.strip_prefix("ssh://").unwrap_or(hop).trim_end_matches('/');
     let (user, rest) = match hop.rsplit_once('@') {
         Some((u, r)) => (u.trim().to_string(), r.trim()),
         None => (String::new(), hop),
@@ -148,15 +152,20 @@ fn insert_server(
     folder_id: Option<i64>,
     run_on_connect: &str,
 ) -> rusqlite::Result<i64> {
-    // Same rule as add_server (normalize_server_identity): a server signs in
-    // with a Login, or with its own user and key, or its own user and
-    // password, never a mix.
-    let (auth_type, username, credential_id, key_id) = match (key_id, credential_id) {
-        (Some(k), _) => ("custom_key", Some(username), None, Some(k)),
-        (None, Some(c)) => ("vault", None, Some(c), None),
-        (None, None) => ("custom_pass", Some(username), None, None),
+    // Its own key wins over a Login; then add_server's rule decides which
+    // fields the row keeps (normalize_server_identity).
+    let auth_type = match (key_id, credential_id) {
+        (Some(_), _) => "custom_key",
+        (None, Some(_)) => "vault",
+        (None, None) => "custom_pass",
     };
-    let username = username.map(str::trim).filter(|u| !u.is_empty());
+    let (username, _, key_id, credential_id) = crate::normalize_server_identity(
+        auth_type,
+        Some(username.to_string()),
+        None,
+        key_id.map(|k| k as i32),
+        credential_id.map(|c| c as i32),
+    );
     conn.execute(
         "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect)
          VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, 'none', '', 1080, '[]', ?7, ?8, 0, '[]', NULL, '', ?9)",
@@ -226,8 +235,10 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
                 folder_id,
                 notes: String::new(),
             };
-            crate::rdp::save(conn, &link)?;
-            report.rdp_added += 1;
+            match crate::rdp::save(conn, &link) {
+                Ok(_) => report.rdp_added += 1,
+                Err(why) => report.rdp_skipped.push(format!("{}: {}", name, why)),
+            }
             continue;
         }
 
@@ -245,7 +256,9 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
             continue;
         }
 
-        let credential_id = match h.credential.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        // A server with its own key signs in with that (insert_server), so its
+        // saved login would be a Login nothing uses.
+        let credential_id = match h.credential.as_deref().map(str::trim).filter(|c| !c.is_empty() && row.key_id.is_none()) {
             Some(c) => Some(login_id(conn, &mut logins, c, &mut report).map_err(db)?),
             None => None,
         };
@@ -253,7 +266,8 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
         let id = insert_server(conn, name, host, port, &h.user, credential_id, row.key_id, folder_id, run).map_err(db)?;
         report.added += 1;
         by_alias.entry(name.to_lowercase()).or_insert(id);
-        if h.proxy_jump.as_deref().is_some_and(|j| !j.trim().is_empty()) {
+        // `none` is OpenSSH's "no jump host", e.g. to override a wildcard block.
+        if h.proxy_jump.as_deref().map(str::trim).is_some_and(|j| !j.is_empty() && !j.eq_ignore_ascii_case("none")) {
             pending_jumps.push((id, row));
         }
     }
@@ -300,7 +314,11 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
                 Some(j) => j,
                 None => {
                     let name = format!("{} (jump host)", short_host(&host));
-                    let j = insert_server(conn, &name, &host, port, &user, None, row.jump_key_id, None, "").map_err(db)?;
+                    let login = match row.host.jump_credential.as_deref().map(str::trim).filter(|c| !c.is_empty() && row.jump_key_id.is_none()) {
+                        Some(c) => Some(login_id(conn, &mut logins, c, &mut report).map_err(db)?),
+                        None => None,
+                    };
+                    let j = insert_server(conn, &name, &host, port, &user, login, row.jump_key_id, None, "").map_err(db)?;
                     report.jump_hosts_created.push(name);
                     j
                 }
@@ -482,7 +500,8 @@ mod tests {
         let mut row = moba("git", &[], "git.example", Some("git-login"), None);
         row.host.user = "git".into();
         row.key_id = Some(2);
-        import_rows(&conn, &[row]).unwrap();
+        let r = import_rows(&conn, &[row]).unwrap();
+        assert!(r.logins_created.is_empty(), "no Login that nothing uses");
         let (auth, user, key, cred): (String, Option<String>, Option<i64>, Option<i64>) = conn
             .query_row("SELECT auth_type, username, key_id, credential_id FROM servers WHERE name = 'git'", [], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -492,11 +511,47 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_rdp_host_is_reported_and_the_rest_imports() {
+        let conn = vault();
+        let rdp = |name: &str, host: &str| ImportRow {
+            host: ImportedHost { host_alias: name.into(), hostname: host.into(), port: 3389, rdp: true, ..Default::default() },
+            key_id: None,
+            jump_key_id: None,
+        };
+        let r = import_rows(&conn, &[rdp("good", "pc1.example"), rdp("bad", "my pc"), moba("web1", &[], "web1.example", None, None)]).unwrap();
+        assert_eq!((r.rdp_added, r.added), (1, 1));
+        assert_eq!(r.rdp_skipped.len(), 1);
+        assert!(r.rdp_skipped[0].starts_with("bad: "), "{:?}", r.rdp_skipped);
+    }
+
+    #[test]
+    fn proxy_jump_none_means_no_jump_host() {
+        let conn = vault();
+        let r = import_rows(&conn, &[moba("web1", &[], "web1.example", None, Some("none"))]).unwrap();
+        assert_eq!((r.jump_linked, r.jump_hosts_created.len()), (0, 0));
+    }
+
+    #[test]
+    fn a_jump_hosts_saved_login_signs_it_in() {
+        let conn = vault();
+        let mut row = moba("web1", &[], "web1.example", None, Some("bastion.example"));
+        row.jump_key_id = None;
+        row.host.jump_credential = Some("JUMP".into());
+        let r = import_rows(&conn, &[row]).unwrap();
+        assert_eq!(r.logins_created, vec!["JUMP"]);
+        let (auth, cred): (String, Option<i64>) = conn
+            .query_row("SELECT auth_type, credential_id FROM servers WHERE name = 'bastion (jump host)'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((auth.as_str(), cred.is_some()), ("vault", true));
+    }
+
+    #[test]
     fn hops_parse() {
         assert_eq!(parse_hop("ops@host:2222"), Some(("ops".into(), "host".into(), 2222)));
         assert_eq!(parse_hop("host"), Some(("".into(), "host".into(), 22)));
         assert_eq!(parse_hop("u@[fe80::1]:22"), Some(("u".into(), "fe80::1".into(), 22)));
         assert_eq!(parse_hop("fe80::1"), Some(("".into(), "fe80::1".into(), 22)));
+        assert_eq!(parse_hop("ssh://ops@bastion:2222"), Some(("ops".into(), "bastion".into(), 2222)));
         assert_eq!(parse_hop("host:notaport"), None);
         assert_eq!(parse_hop(""), None);
     }
