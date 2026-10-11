@@ -484,6 +484,16 @@ const TerminalView = ({
         cursor: '#60a5fa',
         selectionBackground: 'rgba(96, 165, 250, 0.3)',
       },
+      // Hyperlinks a program prints (OSC 8). xterm's default opens them in
+      // a new webview window; ask, then hand http(s) links to the system
+      // browser (open_external_url refuses anything else).
+      linkHandler: {
+        activate: (_event, uri) => {
+          if (!/^https?:\/\//i.test(uri)) return;
+          if (!window.confirm(`Open this link in your browser?\n\n${uri}`)) return;
+          invoke('open_external_url', { url: uri }).catch(() => {});
+        },
+      },
       allowProposedApi: true
     });
 

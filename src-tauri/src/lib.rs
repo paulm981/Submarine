@@ -6402,9 +6402,10 @@ pub(crate) fn ssh_preferred_algorithms() -> russh::Preferred {
         kex::DH_G16_SHA512,
         kex::DH_G15_SHA512,
         kex::DH_G14_SHA256,
-        // Legacy, last resort for old servers.
+        // Legacy, last resort for old servers. Not the 1024-bit group 1,
+        // which is within reach of a well-funded attacker (Logjam) and which
+        // OpenSSH stopped offering in 7.0.
         kex::DH_G14_SHA1,
-        kex::DH_G1_SHA1,
         // Pseudo-algorithms, never selected as the KEX: RFC 8308 ext-info
         // (server-sig-algs → RSA SHA-2 user auth) and OpenSSH strict KEX
         // (Terrapin mitigation).
