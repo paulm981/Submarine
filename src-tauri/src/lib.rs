@@ -9726,6 +9726,9 @@ struct SftpListResult {
 // A probe runs first (as the login user) to find sftp-server and check that
 // sudo will allow exactly that command, so failures come back as precise
 // errors instead of a broken SFTP stream.
+//
+// `dzdo`, Centrify / Delinea's sudo for Active Directory-managed hosts, takes
+// the same options and is tried the same way; see ELEVATION_TOOLS.
 
 type SessionHandleArc = Arc<tokio::sync::Mutex<russh::client::Handle<ssh_manager::ClientHandler>>>;
 
@@ -9754,9 +9757,29 @@ if [ -z "$S" ] && [ -r /etc/ssh/sshd_config ]; then
 fi
 if [ -z "$S" ]; then echo __SUB_SUDO:NO_SFTP_SERVER; exit 0; fi
 echo "__SUB_SUDO:PATH:$S"
-if command -v sudo >/dev/null 2>&1; then :; else echo __SUB_SUDO:NO_SUDO; exit 0; fi
-if [ "$SUB_MODE" = pw ]; then OUT=$(sudo -S -k -p "" -l "$S" 2>&1); else OUT=$(sudo -n -l "$S" 2>&1); fi
+if command -v "$SUB_TOOL" >/dev/null 2>&1; then :; else echo __SUB_SUDO:NO_SUDO; exit 0; fi
+if [ "$SUB_MODE" = pw ]; then OUT=$("$SUB_TOOL" -S -k -p "" -l "$S" 2>&1); else OUT=$("$SUB_TOOL" -n -l "$S" 2>&1); fi
 if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s "$OUT" | tr "\n" " ")"; fi"#;
+
+/// Programs that can run sftp-server as root, in the order they're tried.
+/// `dzdo` first: a host that has it is managed through it, and sudo there is
+/// often present but not set up for the user. Hosts without dzdo answer
+/// NO_SUDO for it at once and go on to sudo.
+const ELEVATION_TOOLS: &[&str] = &["dzdo", "sudo"];
+
+/// The error worth showing when no tool worked: one the user can act on
+/// before "not allowed", and "not allowed" before "not installed".
+fn elevation_error_rank(e: &str) -> u8 {
+    if e == SUDO_NO_SUDO {
+        0
+    } else if e == SUDO_NOT_ALLOWED {
+        1
+    } else if e == SUDO_NEED_PASSWORD {
+        3
+    } else {
+        2
+    }
+}
 
 /// Only plain absolute paths are ever interpolated into a remote command.
 fn is_safe_remote_exec_path(p: &str) -> bool {
@@ -9832,10 +9855,33 @@ async fn exec_with_stdin_capture(
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
-/// Find sftp-server and check sudo for it. Returns the sftp-server path.
-async fn probe_sudo_sftp(session_arc: &SessionHandleArc, password: Option<&str>) -> Result<String, String> {
+/// Find sftp-server and a tool (ELEVATION_TOOLS) that may run it as root.
+/// Returns the sftp-server path and the tool.
+///
+/// Without a password every tool gets a try, so a passwordless sudo isn't
+/// missed behind a dzdo that wants one. With one, a tool that isn't there or
+/// doesn't allow the user hands over to the next, and any other answer (a
+/// wrong password above all) ends it, so a mistyped password counts as one
+/// failed attempt, not one per tool.
+async fn probe_sudo_sftp(session_arc: &SessionHandleArc, password: Option<&str>) -> Result<(String, &'static str), String> {
+    let mut best: Option<String> = None;
+    for tool in ELEVATION_TOOLS {
+        match probe_sudo_sftp_with(session_arc, password, tool).await {
+            Ok(path) => return Ok((path, tool)),
+            Err(e) if password.is_some() && e != SUDO_NO_SUDO && e != SUDO_NOT_ALLOWED => return Err(e),
+            Err(e) => {
+                if best.as_deref().is_none_or(|b| elevation_error_rank(&e) > elevation_error_rank(b)) {
+                    best = Some(e);
+                }
+            }
+        }
+    }
+    Err(best.unwrap_or_else(|| SUDO_NO_SUDO.into()))
+}
+
+async fn probe_sudo_sftp_with(session_arc: &SessionHandleArc, password: Option<&str>, tool: &str) -> Result<String, String> {
     let mode = if password.is_some() { "pw" } else { "n" };
-    let cmd = format!("env SUB_MODE={} sh -c '{}'", mode, SUDO_SFTP_PROBE);
+    let cmd = format!("env SUB_MODE={} SUB_TOOL={} sh -c '{}'", mode, tool, SUDO_SFTP_PROBE);
     let stdin = password.map(|p| zeroize::Zeroizing::new(format!("{}\n", p)));
     let out = exec_with_stdin_capture(session_arc, &cmd, stdin.as_ref().map(|s| s.as_bytes()), 25).await?;
     let mut path: Option<String> = None;
@@ -9923,8 +9969,9 @@ async fn open_elevated_sftp(
     if !is_safe_remote_exec_path(&elevation.server_path) {
         return Err(format!("{}: unusual sftp-server path", SUDO_FAILED));
     }
-    let sudo = if elevation.password.is_some() { "sudo -S -k -p ''" } else { "sudo -n" };
-    let cmd = format!("echo {}; exec {} {}", ELEVATED_SFTP_READY, sudo, elevation.server_path);
+    let tool = if ELEVATION_TOOLS.contains(&elevation.tool) { elevation.tool } else { "sudo" };
+    let flags = if elevation.password.is_some() { "-S -k -p ''" } else { "-n" };
+    let cmd = format!("echo {}; exec {} {} {}", ELEVATED_SFTP_READY, tool, flags, elevation.server_path);
     let channel = {
         let session = session_arc.lock().await;
         session.channel_open_session().await.map_err(|e| e.to_string())?
@@ -9983,6 +10030,30 @@ mod elevated_sftp_tests {
         assert_eq!(classify_sudo_failure("bob is not in the sudoers file."), SUDO_NOT_ALLOWED);
         assert_eq!(classify_sudo_failure(""), SUDO_NOT_ALLOWED);
         assert!(classify_sudo_failure("sudo: something odd").starts_with(SUDO_FAILED));
+    }
+
+    #[test]
+    fn the_most_useful_elevation_error_wins() {
+        let best = |errs: &[&str]| errs.iter().copied().max_by_key(|e| elevation_error_rank(e)).unwrap().to_string();
+        // dzdo not installed, sudo wants a password: ask for it.
+        assert_eq!(best(&[SUDO_NO_SUDO, SUDO_NEED_PASSWORD]), SUDO_NEED_PASSWORD);
+        // dzdo refuses the user, sudo not installed: say "not allowed".
+        assert_eq!(best(&[SUDO_NOT_ALLOWED, SUDO_NO_SUDO]), SUDO_NOT_ALLOWED);
+        // requiretty and friends beat "not allowed".
+        assert_eq!(best(&[SUDO_REQUIRETTY, SUDO_NOT_ALLOWED]), SUDO_REQUIRETTY);
+        assert_eq!(ELEVATION_TOOLS, &["dzdo", "sudo"]);
+    }
+
+    /// dzdo (Centrify / Delinea) is built from sudo's code and words its
+    /// answers the same way, after its own name.
+    #[test]
+    fn dzdo_errors_map_to_the_same_codes() {
+        assert_eq!(classify_sudo_failure("dzdo: a password is required"), SUDO_NEED_PASSWORD);
+        assert_eq!(classify_sudo_failure("Sorry, try again. dzdo: 1 incorrect password attempt"), SUDO_WRONG_PASSWORD);
+        assert_eq!(
+            classify_sudo_failure("Sorry, user bob is not allowed to execute '/usr/libexec/openssh/sftp-server' as root on host."),
+            SUDO_NOT_ALLOWED
+        );
     }
 
     /// What sudo-rs 0.2.13 prints (Ubuntu 26.04) for the probe's two commands.
@@ -10088,12 +10159,12 @@ async fn sftp_set_elevated(
         }
     }
     let (_, session_arc) = sftp_transport(&state, &session_id).await?;
-    let (server_path, used_password) = match probe_sudo_sftp(&session_arc, None).await {
-        Ok(path) => (path, None),
+    let ((server_path, tool), used_password) = match probe_sudo_sftp(&session_arc, None).await {
+        Ok(found) => (found, None),
         Err(e) if e == SUDO_NEED_PASSWORD => {
             let Some(pw) = password else { return Err(e) };
-            let path = probe_sudo_sftp(&session_arc, Some(pw.as_str())).await?;
-            (path, Some(pw))
+            let found = probe_sudo_sftp(&session_arc, Some(pw.as_str())).await?;
+            (found, Some(pw))
         }
         Err(e) => return Err(e),
     };
@@ -10101,7 +10172,7 @@ async fn sftp_set_elevated(
     set_sftp_mode(
         &state,
         &session_id,
-        Some(ssh_manager::SftpElevation { server_path, password: used_password }),
+        Some(ssh_manager::SftpElevation { server_path, tool, password: used_password }),
     )
     .await;
     // Open it right away so a failure shows up here, not on the next click.

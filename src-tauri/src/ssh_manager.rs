@@ -384,6 +384,8 @@ pub struct SshState {
 pub struct SftpElevation {
     /// Absolute path of the server's sftp-server binary (probed once).
     pub server_path: String,
+    /// `sudo` or `dzdo`, whichever the probe found allowed.
+    pub tool: &'static str,
     /// `None` = passwordless sudo (`sudo -n`).
     pub password: Option<zeroize::Zeroizing<String>>,
 }

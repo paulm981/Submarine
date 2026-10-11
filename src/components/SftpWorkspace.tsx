@@ -15,11 +15,11 @@ import { useIsNarrow } from "../hooks/useViewport";
 type ElevationStatus = { elevated: boolean; passwordless: boolean };
 
 const SUDO_MESSAGES: Record<string, string> = {
-  "[SUDO] NEED_PASSWORD": "sudo needs a password.",
-  "[SUDO] WRONG_PASSWORD": "Wrong sudo password.",
-  "[SUDO] NOT_ALLOWED": "This user isn't allowed to run sftp-server with sudo.",
+  "[SUDO] NEED_PASSWORD": "sudo / dzdo needs a password.",
+  "[SUDO] WRONG_PASSWORD": "Wrong sudo / dzdo password.",
+  "[SUDO] NOT_ALLOWED": "This user isn't allowed to run sftp-server with sudo or dzdo.",
   "[SUDO] REQUIRETTY": "sudo on this server requires a terminal (requiretty), so it can't be used for file access.",
-  "[SUDO] NO_SUDO": "sudo isn't installed on this server.",
+  "[SUDO] NO_SUDO": "Neither sudo nor dzdo is installed on this server.",
   "[SUDO] NO_SFTP_SERVER": "Couldn't find the sftp-server program on this server.",
 };
 
