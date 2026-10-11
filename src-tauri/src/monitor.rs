@@ -194,6 +194,11 @@ pub struct NodeAuth {
     pub proxy_type: String,
     pub proxy_host: Option<String>,
     pub proxy_port: Option<u16>,
+    /// The jump host to go through (the server's ProxyJump), as the
+    /// interactive session does: one hop, reached directly, and the
+    /// server's own proxy setting then doesn't apply.
+    #[serde(default)]
+    pub jump: Option<Box<NodeAuth>>,
 }
 
 /// A user-defined metric. The probe loop wraps each command in BEGIN/END
@@ -373,7 +378,7 @@ async fn run_poller(
 ) {
     let node_id = entry.node_id;
     let mut last: Option<RawSnapshot> = None;
-    let mut handle: Option<russh::client::Handle<MonitorHandler>> = None;
+    let mut handle: Option<MonitorSession> = None;
     let mut backoff = Duration::from_secs(2);
     let backoff_max = Duration::from_secs(60);
 
@@ -523,7 +528,7 @@ async fn run_poller(
         // hot-updates from the UI take effect on the NEXT cycle.
         let customs_snap: Vec<CustomMetric> = entry.custom_metrics.lock().await.clone();
         let h = handle.as_ref().unwrap();
-        match poll_once(h, &customs_snap, poll_timeout).await {
+        match poll_once(&h.session, &customs_snap, poll_timeout).await {
             Ok(raw) => {
                 let enabled_snap = entry.enabled_metrics.lock().await.clone();
                 let sample = compute_sample(node_id, &raw, &last, &enabled_snap, &customs_snap);
@@ -786,11 +791,55 @@ fn monitor_client_config() -> client::Config {
     config
 }
 
+/// A monitor's SSH connection, with the jump host's when it goes through one:
+/// that connection carries this one, so it has to stay open as long.
+struct MonitorSession {
+    session: russh::client::Handle<MonitorHandler>,
+    jump: Option<russh::client::Handle<MonitorHandler>>,
+}
+
+impl MonitorSession {
+    fn is_closed(&self) -> bool {
+        self.session.is_closed() || self.jump.as_ref().is_some_and(|j| j.is_closed())
+    }
+}
+
 async fn connect_for_monitor(
     db: &Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
     auth: &NodeAuth,
     connect_timeout: Duration,
-) -> Result<russh::client::Handle<MonitorHandler>, String> {
+) -> Result<MonitorSession, String> {
+    // Through the jump host like `ssh -J`: log in to it, open a channel to
+    // the server, and run this server's handshake over that channel. Both
+    // host keys must already be trusted (from a terminal session), as for a
+    // direct connection.
+    let Some(jump) = auth.jump.as_deref() else {
+        require_username(auth)?;
+        let transport = open_transport(auth, connect_timeout).await?;
+        let session = login_for_monitor(db, auth, transport, connect_timeout).await?;
+        return Ok(MonitorSession { session, jump: None });
+    };
+    require_username(auth)?;
+    let in_jump = |e: String| format!("jump host {}: {}", jump.host, e);
+    require_username(jump).map_err(in_jump)?;
+    let transport = open_transport(jump, connect_timeout).await.map_err(in_jump)?;
+    let bastion = login_for_monitor(db, jump, transport, connect_timeout).await.map_err(in_jump)?;
+    let channel = tokio::time::timeout(
+        connect_timeout,
+        bastion.channel_open_direct_tcpip(auth.host.clone(), auth.port as u32, "127.0.0.1", 0),
+    )
+    .await
+    .map_err(|_| format!("jump host {}: no channel to {}:{} in time", jump.host, auth.host, auth.port))?
+    .map_err(|e| format!("jump host {}: could not reach {}:{}: {}", jump.host, auth.host, auth.port, e))?;
+    // Always drained, as for the interactive session's hop (see
+    // tunnel::DrainedChannelStream): a plain ChannelStream can deadlock the
+    // two connections on each other.
+    let transport: Box<dyn AsyncStream> = Box::new(crate::tunnel::drained_stream(channel));
+    let session = login_for_monitor(db, auth, transport, connect_timeout).await?;
+    Ok(MonitorSession { session, jump: Some(bastion) })
+}
+
+fn require_username(auth: &NodeAuth) -> Result<(), String> {
     if auth.username.trim().is_empty() {
         // A node saved without a username is asked "Login as" when a terminal
         // connects (issue #54); monitoring can't ask, and falling back to root
@@ -799,6 +848,17 @@ async fn connect_for_monitor(
             "No username is saved for this node — monitoring can't ask for one; save the username to monitor it".into(),
         );
     }
+    Ok(())
+}
+
+/// Handshake over `transport` (checking the host key against known_hosts)
+/// and log in.
+async fn login_for_monitor(
+    db: &Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
+    auth: &NodeAuth,
+    transport: Box<dyn AsyncStream>,
+    connect_timeout: Duration,
+) -> Result<russh::client::Handle<MonitorHandler>, String> {
     let (key_pair, password) = classify_auth(auth)?;
 
     // The same host-key order as the interactive session, so it negotiates
@@ -813,7 +873,6 @@ async fn connect_for_monitor(
         port: auth.port,
     };
 
-    let transport = open_transport(auth, connect_timeout).await?;
     // Handshake budget mirrors the interactive path. We don't expose it
     // separately in settings; it's bounded by `connect_timeout` * 2 so very
     // chatty hosts (algorithm negotiation through a slow proxy) still get
@@ -1479,5 +1538,99 @@ mod tests {
             (session.gex.min_group_size(), session.gex.preferred_group_size(), session.gex.max_group_size()),
         );
         assert_eq!(monitor.keepalive_max, 0);
+    }
+}
+
+#[cfg(test)]
+mod jump_host_tests {
+    use super::*;
+    use crate::ssh_test_server::{serve, TestServer};
+    use std::sync::atomic::Ordering;
+
+    /// A TestServer on a loopback port, as monitoring connects over TCP.
+    async fn listen(server: TestServer) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                serve(server.clone(), |_| {}, socket);
+            }
+        });
+        port
+    }
+
+    /// known_hosts trusting the test servers' key for `trusted` hosts only.
+    fn known_hosts(trusted: &[(&str, u16)]) -> Arc<std::sync::Mutex<Option<rusqlite::Connection>>> {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE known_hosts (id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT, port INTEGER, fingerprint TEXT, key_type TEXT);")
+            .unwrap();
+        let fp = crate::ssh_manager::host_key_fingerprint(crate::ssh_test_server::host_key().public_key());
+        for (host, port) in trusted {
+            conn.execute(
+                "INSERT INTO known_hosts (host, port, fingerprint, key_type) VALUES (?1, ?2, ?3, 'ssh-ed25519')",
+                rusqlite::params![host, port, fp],
+            )
+            .unwrap();
+        }
+        Arc::new(std::sync::Mutex::new(Some(conn)))
+    }
+
+    fn node(host: &str, port: u16, jump: Option<NodeAuth>) -> NodeAuth {
+        NodeAuth {
+            host: host.into(),
+            port,
+            username: "test".into(),
+            password: Some("test".into()),
+            private_key: None,
+            passphrase: None,
+            proxy_type: "none".into(),
+            proxy_host: None,
+            proxy_port: None,
+            jump: jump.map(Box::new),
+        }
+    }
+
+    #[tokio::test]
+    async fn monitoring_reaches_a_server_through_its_jump_host() {
+        let bastion = TestServer::default();
+        let behind = Arc::clone(&bastion.jump_target_received);
+        let port = listen(bastion).await;
+        let db = known_hosts(&[("127.0.0.1", port), ("inner.example", 22)]);
+        let conn = connect_for_monitor(&db, &node("inner.example", 22, Some(node("127.0.0.1", port, None))), Duration::from_secs(10))
+            .await
+            .expect("a monitor session through the jump host");
+        assert!(conn.jump.is_some() && !conn.is_closed());
+        // What the monitor sends lands on the server behind the jump host.
+        let channel = conn.session.channel_open_session().await.unwrap();
+        channel.data(&b"ping"[..]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while behind.load(Ordering::SeqCst) < 4 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the bytes must reach the server behind the jump host");
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_server_behind_the_jump_host_is_refused() {
+        let port = listen(TestServer::default()).await;
+        let db = known_hosts(&[("127.0.0.1", port)]);
+        let err = connect_for_monitor(&db, &node("inner.example", 22, Some(node("127.0.0.1", port, None))), Duration::from_secs(10))
+            .await
+            .err()
+            .expect("an unknown host key behind the jump host must be refused");
+        assert!(!err.starts_with("jump host"), "the server's own key failed, not the jump host's: {err}");
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_jump_host_is_refused() {
+        let port = listen(TestServer::default()).await;
+        let db = known_hosts(&[("inner.example", 22)]);
+        let err = connect_for_monitor(&db, &node("inner.example", 22, Some(node("127.0.0.1", port, None))), Duration::from_secs(10))
+            .await
+            .err()
+            .expect("an unknown jump host key must be refused");
+        assert!(err.starts_with("jump host 127.0.0.1"), "{err}");
     }
 }

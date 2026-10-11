@@ -164,7 +164,7 @@ impl client::Handler for TestClient {
     }
 }
 
-fn host_key() -> russh::keys::PrivateKey {
+pub(crate) fn host_key() -> russh::keys::PrivateKey {
     use russh::keys::ssh_key::private::{Ed25519Keypair, Ed25519PrivateKey};
     russh::keys::PrivateKey::from(Ed25519Keypair::from(Ed25519PrivateKey::from_bytes(&[42u8; 32])))
 }
