@@ -549,6 +549,25 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
   // we used to mint a brand-new terminal_id and remount TerminalView,
   // which dropped the entire visual buffer of their previous session.
   const [connectionEpoch, setConnectionEpoch] = useState(0);
+
+  // See startupRanForEpochRef. Typed only once the terminal's shell is open
+  // and has printed its login banner (TerminalView's onShellReady): typed
+  // any sooner, through a slow jump host, they reached a terminal that
+  // wasn't open yet and were dropped without a word.
+  const startupTerminalId = `${session.id}-term-0`;
+  const startupCommands = (session.runOnConnect || "")
+    .split(/\r?\n/)
+    .map((l: string) => l.trimEnd())
+    .filter((l: string) => l.trim().length > 0);
+  const onShellReadyFor = (terminalId: string) =>
+    terminalId === startupTerminalId && startupCommands.length > 0
+      ? () => {
+          if (startupRanForEpochRef.current === connectionEpoch) return;
+          startupRanForEpochRef.current = connectionEpoch;
+          const bytes = Array.from(new TextEncoder().encode(startupCommands.join('\n') + '\n'));
+          invoke('write_terminal_data', { terminalId, data: bytes }).catch(() => {});
+        }
+      : undefined;
   const openContainerTerminal = (containerName: string, useSudo: boolean) => {
     const newId = `${session.id}-term-${Date.now()}`;
     setTerminals(prev => [...prev, {
@@ -686,9 +705,13 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
   const toolPanelRef = useRef<HTMLDivElement | null>(null);
 
   const initiatedRef = useRef(false);
-  // Guards the per-node "run on connect" commands to fire exactly once for
-  // this session view — first successful connect only, never on reconnect.
-  const ranOnConnectRef = useRef(false);
+  // Per-node "run on connect" commands (servers.run_on_connect, e.g.
+  // `dzdo su -`): typed into the first terminal once its shell is up — on
+  // the first connect, and again after a reconnect, whose fresh login has
+  // lost what they did, as MobaXterm runs a session's command on each start.
+  // Once per connection: the terminal mounting again (into or out of a
+  // split) doesn't type them a second time.
+  const startupRanForEpochRef = useRef(-1);
 
   // ---- Auto-reconnect: fixed 5s cadence, retried FOREVER -------------------
   // After a previously-good session drops we retry every 5 seconds, forever —
@@ -845,23 +868,6 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
       // routes into the fresh PTY.
       if (wasReconnect) {
         setConnectionEpoch(e => e + 1);
-      } else if (session.runOnConnect && session.runOnConnect.trim() && !ranOnConnectRef.current) {
-        // Per-node on-connect commands: auto-typed ONCE into the first
-        // terminal on the INITIAL connect only (the `else` gates out
-        // reconnects; ranOnConnectRef gates out any duplicate success
-        // event). Delayed so the PTY is open and the shell has printed its
-        // prompt — the commands then land after it instead of racing the
-        // shell's startup and getting swallowed.
-        ranOnConnectRef.current = true;
-        const cmds = session.runOnConnect
-          .split(/\r?\n/)
-          .map((l: string) => l.trimEnd())
-          .filter((l: string) => l.trim().length > 0)
-          .join('\n') + '\n';
-        const bytes = Array.from(new TextEncoder().encode(cmds));
-        setTimeout(() => {
-          invoke('write_terminal_data', { terminalId: `${session.id}-term-0`, data: bytes }).catch(() => {});
-        }, 700);
       }
       // The handshake may have inserted a row into `known_hosts` (user just
       // accepted a new fingerprint). Flush the encrypted vault so the entry
@@ -1785,6 +1791,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
                       focusSignal={focusTick}
                       containerExec={t.container ? { container: t.container.name, useSudo: t.container.useSudo } : undefined}
                       connectionEpoch={connectionEpoch}
+                      onShellReady={onShellReadyFor(t.id)}
                       serverId={session.serverId}
                       serverName={session.serverName}
                     />
@@ -1890,6 +1897,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
                     isActive={false}
                     containerExec={t.container ? { container: t.container.name, useSudo: t.container.useSudo } : undefined}
                     connectionEpoch={connectionEpoch}
+                    onShellReady={onShellReadyFor(t.id)}
                     serverId={session.serverId}
                     serverName={session.serverName}
                   />
@@ -1908,6 +1916,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
                   focusSignal={focusTick}
                   containerExec={t.container ? { container: t.container.name, useSudo: t.container.useSudo } : undefined}
                   connectionEpoch={connectionEpoch}
+                  onShellReady={onShellReadyFor(t.id)}
                   serverId={session.serverId}
                   serverName={session.serverName}
                 />

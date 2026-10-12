@@ -128,7 +128,7 @@ pub fn configure() {
 
     match decide(user_set_webkit_var, opted_out, packaged_runtime, probe_bwrap) {
         Decision::Enable => {
-            std::env::set_var("WEBKIT_FORCE_SANDBOX", "1");
+            crate::local_term::set_webview_env("WEBKIT_FORCE_SANDBOX", "1");
             eprintln!("[webkit] web content sandbox: ON (bubblewrap)");
         }
         Decision::RespectUser => {

@@ -67,6 +67,21 @@ export const subtreeCounts = (index: FolderIndex, folderOf: (number | null | und
   return counts;
 };
 
+// A folder and every folder inside it, at any depth (loop-safe, as the
+// index is).
+export const subtreeIds = (index: FolderIndex, id: number): number[] => {
+  const out: number[] = [];
+  const seen = new Set<number>();
+  const walk = (fid: number) => {
+    if (seen.has(fid)) return;
+    seen.add(fid);
+    out.push(fid);
+    for (const f of index.children.get(fid) ?? []) walk(f.id);
+  };
+  walk(id);
+  return out;
+};
+
 // For pickers: every folder as "Outer › Inner", sorted, so two folders that
 // share a name in different places can be told apart.
 export const folderOptions = (folders: FolderRow[]): { id: number; label: string }[] => {

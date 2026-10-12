@@ -17,7 +17,6 @@
 use std::path::{Path, PathBuf};
 use tauri::Manager;
 
-/// Under app_config_dir (so `submarine-data` in portable mode).
 const EDITOR_FILE: &str = "live_edit_editor.json";
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -25,15 +24,60 @@ struct EditorChoice {
     path: String,
 }
 
-fn editor_file(app: &tauri::AppHandle) -> Option<PathBuf> {
-    app.path().app_config_dir().ok().map(|d| d.join(EDITOR_FILE))
+/// A small settings file of this computer's — a program picked in a native
+/// dialog, which the page can't set — kept as JSON under app_config_dir (so
+/// `submarine-data` in portable mode). Live Edit's editor here, the Home
+/// terminal's shell in local_term.rs.
+fn setting_file(app: &tauri::AppHandle, name: &str) -> Option<PathBuf> {
+    app.path().app_config_dir().ok().map(|d| d.join(name))
+}
+
+pub(crate) fn read_setting<T: serde::de::DeserializeOwned>(app: &tauri::AppHandle, name: &str) -> Option<T> {
+    let raw = std::fs::read(setting_file(app, name)?).ok()?;
+    serde_json::from_slice(&raw).ok()
+}
+
+/// `what` names the setting in the error ("the editor").
+pub(crate) fn write_setting<T: serde::Serialize>(app: &tauri::AppHandle, name: &str, value: &T, what: &str) -> Result<(), String> {
+    let file = setting_file(app, name).ok_or("Couldn't find the settings folder.")?;
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Couldn't save {}: {}", what, e))?;
+    }
+    let json = serde_json::to_vec(value).map_err(|e| e.to_string())?;
+    std::fs::write(&file, json).map_err(|e| format!("Couldn't save {}: {}", what, e))
+}
+
+/// Forget a setting: a file that isn't there is already forgotten.
+pub(crate) fn remove_setting(app: &tauri::AppHandle, name: &str, what: &str) -> Result<(), String> {
+    let Some(file) = setting_file(app, name) else { return Ok(()) };
+    match std::fs::remove_file(&file) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Couldn't reset {}: {}", what, e)),
+    }
+}
+
+/// `%SystemRoot%\System32`. Windows' own programs are started from here by
+/// full path: a bare `notepad.exe` would be looked for next to submarine.exe
+/// first, which in portable mode is a folder on a USB stick.
+#[cfg(windows)]
+pub(crate) fn system32() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+}
+
+/// The code units of UTF-16 LE text, as regedit, mstsc and wsl.exe write it
+/// (a stray last byte is dropped).
+pub(crate) fn utf16le_units(bytes: &[u8]) -> Vec<u16> {
+    bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
 }
 
 /// The editor picked under Settings, while it is still there. A program
 /// file, or on macOS an app bundle (a folder, e.g. Zed.app).
 fn chosen_editor(app: &tauri::AppHandle) -> Option<PathBuf> {
-    let raw = std::fs::read(editor_file(app)?).ok()?;
-    let choice: EditorChoice = serde_json::from_slice(&raw).ok()?;
+    let choice: EditorChoice = read_setting(app, EDITOR_FILE)?;
     let path = PathBuf::from(choice.path);
     (path.is_file() || is_app_bundle(&path)).then_some(path)
 }
@@ -42,15 +86,9 @@ fn is_app_bundle(path: &Path) -> bool {
     cfg!(target_os = "macos") && path.is_dir() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("app"))
 }
 
-/// By full path: a bare `notepad.exe` would be looked for next to
-/// submarine.exe first, which in portable mode is a folder on a USB stick.
 #[cfg(windows)]
 fn notepad() -> PathBuf {
-    std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
-        .join("System32")
-        .join("notepad.exe")
+    system32().join("notepad.exe")
 }
 
 #[derive(serde::Serialize)]
@@ -69,7 +107,7 @@ fn editor_info(app: &tauri::AppHandle) -> LiveEditEditor {
 }
 
 #[tauri::command]
-pub fn live_edit_editor_get(app: tauri::AppHandle) -> LiveEditEditor {
+pub async fn live_edit_editor_get(app: tauri::AppHandle) -> LiveEditEditor {
     editor_info(&app)
 }
 
@@ -90,27 +128,16 @@ pub async fn live_edit_editor_pick(app: tauri::AppHandle) -> Result<LiveEditEdit
             dialog = dialog.add_filter("Programs", &["exe"]);
         }
         let Some(path) = dialog.pick_file() else { return Ok(editor_info(&app)) };
-        let file = editor_file(&app).ok_or("Couldn't find the settings folder.")?;
-        if let Some(dir) = file.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("Couldn't save the editor: {}", e))?;
-        }
         let choice = EditorChoice { path: path.to_string_lossy().into_owned() };
-        let json = serde_json::to_vec(&choice).map_err(|e| e.to_string())?;
-        std::fs::write(&file, json).map_err(|e| format!("Couldn't save the editor: {}", e))?;
+        write_setting(&app, EDITOR_FILE, &choice, "the editor")?;
         Ok(editor_info(&app))
     }
 }
 
 /// Back to the default editor.
 #[tauri::command]
-pub fn live_edit_editor_reset(app: tauri::AppHandle) -> Result<LiveEditEditor, String> {
-    if let Some(file) = editor_file(&app) {
-        match std::fs::remove_file(&file) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("Couldn't reset the editor: {}", e)),
-        }
-    }
+pub async fn live_edit_editor_reset(app: tauri::AppHandle) -> Result<LiveEditEditor, String> {
+    remove_setting(&app, EDITOR_FILE, "the editor")?;
     Ok(editor_info(&app))
 }
 

@@ -54,6 +54,14 @@ const SEARCH_OPTIONS: ISearchOptions = {
 const SSH_COMMANDS = { write: 'write_terminal_data', resize: 'resize_terminal', close: 'close_terminal' };
 const LOCAL_COMMANDS = { write: 'local_terminal_write', resize: 'local_terminal_resize', close: 'local_terminal_close' };
 
+// When a freshly opened shell counts as ready for typed-in commands (the
+// per-server "run on connect" ones): once its output has paused this long —
+// past the login banner, at the prompt — or when it has printed nothing for
+// the first, longer while, and at the latest after the cap.
+const SHELL_QUIET_MS = 300;
+const SHELL_FIRST_OUTPUT_MS = 1500;
+const SHELL_READY_CAP_MS = 5000;
+
 // State machine for the modifier stickies on the mobile key bar.
 // off → armed → locked → off (cycled by repeated taps).
 const cycleMod = (s: "off" | "armed" | "locked"): "off" | "armed" | "locked" =>
@@ -72,6 +80,7 @@ const TerminalView = ({
   serverName = "",
   attachOnly = false,
   local,
+  onShellReady,
 }: {
   sessionId: string;
   terminalId: string;
@@ -122,13 +131,42 @@ const TerminalView = ({
   serverId?: number;
   serverName?: string;
   /// A shell on this computer (the Home view) instead of one on a server:
-  /// `shell` is a local_shells id, or null for the default; `onOpened` gets
+  /// `shell` is a list_local_shells id, or null for the default; `onOpened` gets
   /// the label of the shell that started. A local terminal is never a
   /// broadcast target or source and keeps no command history — it isn't a
   /// server session.
   local?: { shell: string | null; onOpened?: (label: string) => void };
+  /// Called each time this terminal's SSH shell has been opened (first
+  /// connect and every reconnect) and has printed what it prints on login,
+  /// so typed-in commands land at its prompt (SessionView's run-on-connect).
+  onShellReady?: () => void;
 }) => {
   const commands = local ? LOCAL_COMMANDS : SSH_COMMANDS;
+
+  // The wait for a freshly opened shell to be ready (SHELL_QUIET_MS): armed
+  // when open_terminal returns, pushed back by each output batch. Refs only,
+  // so the long-lived output listener can drive it.
+  const onShellReadyRef = useRef(onShellReady);
+  useEffect(() => { onShellReadyRef.current = onShellReady; }, [onShellReady]);
+  const readyWatchRef = useRef<{ quiet: number; cap: number } | null>(null);
+  const stopReadyWatch = () => {
+    const w = readyWatchRef.current;
+    if (w) { window.clearTimeout(w.quiet); window.clearTimeout(w.cap); }
+    readyWatchRef.current = null;
+  };
+  const shellReady = () => {
+    if (!readyWatchRef.current) return;
+    stopReadyWatch();
+    onShellReadyRef.current?.();
+  };
+  const watchForShellReady = () => {
+    if (!onShellReadyRef.current) return;
+    stopReadyWatch();
+    readyWatchRef.current = {
+      quiet: window.setTimeout(shellReady, SHELL_FIRST_OUTPUT_MS),
+      cap: window.setTimeout(shellReady, SHELL_READY_CAP_MS),
+    };
+  };
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -335,7 +373,7 @@ const TerminalView = ({
         terminalId,
         cols: term.cols || 80,
         rows: term.rows || 24,
-      }).then(syncSize, e => {
+      }).then(() => { syncSize(); watchForShellReady(); }, e => {
         term.writeln(`\x1b[31mReconnect failed: ${e}\x1b[0m`);
       });
     }
@@ -442,7 +480,9 @@ const TerminalView = ({
           searchInputRef.current?.focus();
           searchInputRef.current?.select();
         });
-      } else if (e.key === 'r' || e.key === 'R') {
+      } else if ((e.key === 'r' || e.key === 'R') && !local) {
+        // Servers' command history. A local shell keeps Ctrl+R for its own
+        // reverse search (bash, PowerShell's PSReadLine).
         e.preventDefault();
         setShowHistory(true);
       }
@@ -526,7 +566,9 @@ const TerminalView = ({
     term.loadAddon(searchAddon);
     term.open(terminalRef.current);
     
-    setTimeout(() => {
+    // Cleared on unmount: a terminal closed within these 50ms must not open
+    // its PTY after the close was sent.
+    const openTimer = window.setTimeout(() => {
       fitAddon.fit();
       
       // Start PTY Session with correct dimensions only ONCE. Attach-only
@@ -575,7 +617,7 @@ const TerminalView = ({
             terminalId,
             cols: term.cols || 80,
             rows: term.rows || 24
-          }).then(syncSize, e => {
+          }).then(() => { syncSize(); watchForShellReady(); }, e => {
             term.writeln(`\x1b[31mFailed to open terminal: ${e}\x1b[0m`);
           });
         }
@@ -877,6 +919,8 @@ const TerminalView = ({
       // JSON byte array — ~4x larger and one event per SSH packet, which flooded
       // this main-thread handler and froze the tab on big output). Decode back
       // to bytes; xterm buffers any multibyte sequence split across batches.
+      const w = readyWatchRef.current;
+      if (w) { window.clearTimeout(w.quiet); w.quiet = window.setTimeout(shellReady, SHELL_QUIET_MS); }
       const bin = atob(event.payload as string);
       const data = new Uint8Array(bin.length);
       for (let i = 0; i < bin.length; i++) data[i] = bin.charCodeAt(i);
@@ -981,6 +1025,8 @@ const TerminalView = ({
     window.visualViewport?.addEventListener('resize', onVvResize);
 
     return () => {
+      window.clearTimeout(openTimer);
+      stopReadyWatch();
       fontDisposed = true;
       window.removeEventListener('submarine-settings-changed', handleSettingsChange);
       resizeObserver.disconnect();
@@ -1101,7 +1147,7 @@ const TerminalView = ({
           </span>
         </div>
       )}
-      <HistorySearchOverlay
+      {!local && <HistorySearchOverlay
         isOpen={showHistory}
         onClose={() => {
           setShowHistory(false);
@@ -1122,7 +1168,7 @@ const TerminalView = ({
             commandBufPastedRef.current = false;
           }
         }}
-      />
+      />}
       {/* Disabled badge: NON-blocking. xterm stays interactive for scroll +
           mouse selection so the user can copy whatever was on screen at the
           time the session dropped. Keystrokes are still swallowed at the

@@ -36,9 +36,9 @@ export const Sidebar = ({ activeTab, setActiveTab, isMobile, onLogout, profileNa
   // room the user asked us to give back on narrow viewports.
   // "Tile two sessions together" moved out of a dedicated Compare rail
   // and into a per-session-tab "Merge into current view" action — the
-  // sidebar stays focused on the persistent-content activities (Servers,
-  // Logins, Library, Monitor) so it isn't padded with a workflow that
-  // only makes sense while sessions are open.
+  // sidebar stays focused on the persistent-content activities (Home,
+  // Servers, Logins, Library, Monitor) so it isn't padded with a workflow
+  // that only makes sense while sessions are open.
   const items = [
     // Home: the terminals on this computer (HomePane), where the app opens.
     ...(hasHome ? [{ id: 'home', icon: Home, label: 'Home' }] : []),

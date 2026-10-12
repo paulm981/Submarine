@@ -5,7 +5,8 @@ import {
   Pencil, Play, Search, TerminalSquare, X,
 } from "lucide-react";
 import { useConfirm } from "../ui/confirm";
-import { FolderRow, indexFolders } from "../util/folderPath";
+import { FolderRow, indexFolders, subtreeCounts, subtreeIds } from "../util/folderPath";
+import { sessionDot } from "../util/sessionStatus";
 import type { RdpLink } from "./RdpLinkModal";
 import { OsBadge, osName } from "./OsBadge";
 
@@ -26,7 +27,7 @@ type Menu = { x: number; y: number; row: Row };
 // Which folders are open, per device like the other preferences and per
 // profile, since folder ids are only unique within one vault. The tree works
 // without it.
-const expandedKey = (profile: string) => `submarine.sessionTree.expanded:${profile}`;
+const expandedKey = (profile: string) => `submarine-session-tree-expanded-${profile}`;
 const readExpanded = (profile: string): Set<number> => {
   try {
     const raw = localStorage.getItem(expandedKey(profile));
@@ -92,6 +93,12 @@ export const SessionTree = ({
     return m;
   }, [servers, rdpLinks, index]);
 
+  // Everything inside each folder, at any depth, for its count.
+  const counts = useMemo(
+    () => subtreeCounts(index, [...(servers || []).map((s) => s.folder_id), ...(rdpLinks || []).map((l) => l.folder_id)]),
+    [servers, rdpLinks, index],
+  );
+
   const q = search.trim().toLowerCase();
   const matchesServer = (s: any) => s.name.toLowerCase().includes(q) || String(s.host).toLowerCase().includes(q);
   const matchesLink = (l: RdpLink) => l.name.toLowerCase().includes(q) || l.host.toLowerCase().includes(q);
@@ -102,15 +109,6 @@ export const SessionTree = ({
   // shows everything in it.
   const rows = useMemo(() => {
     const out: Row[] = [];
-    const total = new Map<number, number>();
-    const countOf = (id: number): number => {
-      if (total.has(id)) return total.get(id)!;
-      const c = contents.get(id);
-      let n = (c?.servers.length ?? 0) + (c?.links.length ?? 0);
-      for (const f of index.children.get(id) ?? []) n += countOf(f.id);
-      total.set(id, n);
-      return n;
-    };
     const hits = new Map<number | null, boolean>();
     const hasHit = (id: number | null): boolean => {
       if (hits.has(id)) return hits.get(id)!;
@@ -126,7 +124,7 @@ export const SessionTree = ({
         const named = !!q && matchesFolder(f.name);
         if (q && !all && !named && !hasHit(f.id)) continue;
         const open = q ? true : expanded.has(f.id);
-        out.push({ kind: "folder", id: f.id, name: f.name, depth, open, count: countOf(f.id) });
+        out.push({ kind: "folder", id: f.id, name: f.name, depth, open, count: counts.get(f.id) ?? 0 });
         if (open) walk(f.id, depth + 1, all || named);
       }
       const c = contents.get(parent);
@@ -139,7 +137,7 @@ export const SessionTree = ({
     };
     walk(null, 0, false);
     return out;
-  }, [index, contents, expanded, q]);
+  }, [index, contents, counts, expanded, q]);
 
   const toggleFolder = (id: number) =>
     setExpanded((prev) => {
@@ -226,16 +224,11 @@ export const SessionTree = ({
 
   // Every server and link in a folder, at any depth.
   const folderItems = (id: number) => {
-    const list: any[] = [];
-    const links: RdpLink[] = [];
-    const walk = (fid: number) => {
-      const c = contents.get(fid);
-      list.push(...(c?.servers ?? []));
-      links.push(...(c?.links ?? []));
-      for (const f of index.children.get(fid) ?? []) walk(f.id);
+    const inside = subtreeIds(index, id).map((fid) => contents.get(fid));
+    return {
+      list: inside.flatMap((c) => c?.servers ?? []),
+      links: inside.flatMap((c) => c?.links ?? []),
     };
-    walk(id);
-    return { list, links };
   };
 
   const selectOnly = (r: Row) => {
@@ -246,14 +239,16 @@ export const SessionTree = ({
   const onKeyDown = (e: React.KeyboardEvent) => {
     const at = anchor ? rows.findIndex((r) => rowKey(r) === anchor) : -1;
     const cur = at >= 0 ? rows[at] : undefined;
+    // While searching every folder shows open, so opening or closing one
+    // would change only what shows once the search is cleared.
     if (e.key === "Enter") {
       e.preventDefault();
-      if (cur?.kind === "folder") toggleFolder(cur.id); else openSelected();
+      if (cur?.kind === "folder") { if (!q) toggleFolder(cur.id); } else openSelected();
       return;
     }
     if ((e.key === "ArrowRight" || e.key === "ArrowLeft") && cur?.kind === "folder") {
       e.preventDefault();
-      if (cur.open !== (e.key === "ArrowRight")) toggleFolder(cur.id);
+      if (!q && cur.open !== (e.key === "ArrowRight")) toggleFolder(cur.id);
       return;
     }
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
@@ -262,31 +257,12 @@ export const SessionTree = ({
     if (rows[next]) selectOnly(rows[next]);
   };
 
-  useEffect(() => {
-    if (!menu) return;
-    const close = () => setMenu(null);
-    window.addEventListener("click", close);
-    window.addEventListener("blur", close);
-    return () => { window.removeEventListener("click", close); window.removeEventListener("blur", close); };
-  }, [menu]);
-
   const statusOf = (serverId: number) => {
     const sess = sessions.find((s) => s.serverId === serverId);
     if (!sess) return null;
-    const st = waiting.has(sess.id) ? "waiting" : (statuses[sess.id] ?? "connecting");
-    return { id: sess.id, st };
+    return { id: sess.id, dot: sessionDot(statuses[sess.id] ?? "connecting", waiting.has(sess.id)) };
   };
-  const dot = (st: string) =>
-    st === "waiting"      ? "bg-primary animate-pulse" :
-    st === "connected"    ? "bg-emerald-400" :
-    st === "connecting"   ? "bg-amber-400 animate-pulse" :
-    st === "failed" || st === "disconnected" ? "bg-rose-500" : "bg-zinc-500";
-  const dotTitle = (st: string) =>
-    st === "waiting" ? "Waiting for you — open the tab to answer" :
-    st === "connected" ? "Connected" : st === "connecting" ? "Connecting…" :
-    st === "failed" ? "Connection failed" : st === "disconnected" ? "Disconnected" : st;
-
-  const menuItem = "w-full flex items-center gap-2 px-3 py-1.5 text-left text-[12px] text-zinc-200 hover:bg-white/10";
+  const menuItem = "w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left disabled:opacity-40 disabled:hover:bg-transparent";
 
   return (
     <aside
@@ -308,8 +284,9 @@ export const SessionTree = ({
             onChange={(e) => setSearch(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Escape") setSearch("");
-              // ↓ or Enter: on to the first match, to open with Enter.
-              if (e.key === "ArrowDown" || e.key === "Enter") {
+              // ↓ or Enter: on to the first match, to open with Enter. Not
+              // the Enter that ends an IME composition.
+              if (e.key === "ArrowDown" || (e.key === "Enter" && !e.nativeEvent.isComposing)) {
                 e.preventDefault();
                 const first = rows.find((r) => r.kind !== "folder") ?? rows[0];
                 if (first) selectOnly(first);
@@ -395,7 +372,7 @@ export const SessionTree = ({
                 <span className="ml-auto shrink-0 px-1 rounded text-[8.5px] font-black tracking-wider bg-sky-500/15 text-sky-300 border border-sky-500/30">RDP</span>
               )}
               {status && (
-                <span title={dotTitle(status.st)} className={`ml-auto shrink-0 h-1.5 w-1.5 rounded-full ${dot(status.st)}`} />
+                <span title={status.dot.title} className={`ml-auto shrink-0 h-1.5 w-1.5 rounded-full ${status.dot.tone}`} />
               )}
             </div>
           );
@@ -409,11 +386,18 @@ export const SessionTree = ({
         </div>
       )}
 
+      {/* A layer under the menu takes the click (or right-click) that closes
+          it, so that click doesn't also select the row beneath. */}
       {menu && createPortal(
+        <>
         <div
-          className="fixed z-[9999] min-w-[200px] py-1 bg-[#18181c] border border-white/10 rounded-lg shadow-2xl"
-          style={{ left: Math.min(menu.x, window.innerWidth - 220), top: Math.min(menu.y, window.innerHeight - 160) }}
-          onClick={(e) => e.stopPropagation()}
+          className="fixed inset-0 z-[9998]"
+          onClick={() => setMenu(null)}
+          onContextMenu={(e) => { e.preventDefault(); setMenu(null); }}
+        />
+        <div
+          className="fixed z-[9999] w-[240px] py-1 bg-[#15151a] border border-white/10 rounded-lg shadow-2xl text-[11.5px]"
+          style={{ left: Math.min(menu.x, window.innerWidth - 260), top: Math.min(menu.y, window.innerHeight - 160) }}
         >
           {menu.row.kind === "folder" ? (() => {
             const f = menu.row;
@@ -421,10 +405,10 @@ export const SessionTree = ({
             return (
               <>
                 <button className={menuItem} onClick={() => { setMenu(null); openMany(list, links); }} disabled={list.length + links.length === 0}>
-                  <Play size={12} /> Open all in this folder ({list.length + links.length})
+                  <Play size={13} className="text-zinc-500" /> Open all in this folder ({list.length + links.length})
                 </button>
                 <button className={menuItem} onClick={() => { setMenu(null); toggleFolder(f.id); }}>
-                  <ChevronRight size={12} /> {f.open ? "Collapse" : "Expand"}
+                  <ChevronRight size={13} className="text-zinc-500" /> {f.open ? "Collapse" : "Expand"}
                 </button>
               </>
             );
@@ -435,22 +419,23 @@ export const SessionTree = ({
             return (
               <>
                 <button className={menuItem} onClick={() => { setMenu(null); many ? openSelected() : (r.kind === "server" ? onOpenServers([r.server]) : openRdp(r.link)); }}>
-                  <Play size={12} /> {many ? `Open ${pickedCount} selected` : r.kind === "server" ? "Open" : "Open in Remote Desktop"}
+                  <Play size={13} className="text-zinc-500" /> {many ? `Open ${pickedCount} selected` : r.kind === "server" ? "Open" : "Open in Remote Desktop"}
                 </button>
                 {r.kind === "server" && !many && (
                   <button className={menuItem} onClick={() => { setMenu(null); onEditServer(r.server); }}>
-                    <Pencil size={12} /> Edit
+                    <Pencil size={13} className="text-zinc-500" /> Edit
                   </button>
                 )}
                 {!many && (
                   <button className={menuItem} onClick={() => { setMenu(null); navigator.clipboard?.writeText(String(host)).catch(() => {}); }}>
-                    <Copy size={12} /> Copy host name
+                    <Copy size={13} className="text-zinc-500" /> Copy host name
                   </button>
                 )}
               </>
             );
           })()}
-        </div>,
+        </div>
+        </>,
         document.body,
       )}
     </aside>

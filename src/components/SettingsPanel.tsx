@@ -83,13 +83,13 @@ function HomeTerminalSettings() {
   const [info, setInfo] = useState<LocalShells | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
-    invoke<LocalShells>("local_shells").then(setInfo).catch(() => setInfo(null));
+    invoke<LocalShells>("list_local_shells").then(setInfo).catch((e) => setError(String(e)));
   }, []);
   const run = (cmd: string, args?: Record<string, unknown>) => {
     setError(null);
     invoke<LocalShells>(cmd, args).then(setInfo).catch((e) => setError(String(e)));
   };
-  if (!info) return null;
+  if (!info) return error ? <p className="text-[11.5px] text-red-400">Couldn't list the shells: {error}</p> : null;
   return (
     <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
       <p className="text-sm text-zinc-400 leading-relaxed">
@@ -114,9 +114,16 @@ function HomeTerminalSettings() {
         </div>
       </div>
       {info.custom && (
-        <CopyValue value={info.custom} className="max-w-full text-zinc-300">
-          <span className="font-mono text-[11.5px] break-all select-text">{info.custom}</span>
-        </CopyValue>
+        <div className="space-y-1">
+          <CopyValue value={info.custom} className="max-w-full text-zinc-300">
+            <span className="font-mono text-[11.5px] break-all select-text">{info.custom}</span>
+          </CopyValue>
+          {info.custom_missing && (
+            <p className="text-[11.5px] text-amber-400/90 leading-relaxed">
+              That program isn't there any more, so Home uses the shell checked above. Choose it again, or forget it.
+            </p>
+          )}
+        </div>
       )}
       <div className="flex gap-2">
         <button
@@ -443,6 +450,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
           </div>
         </section>
 
+        {/* Home Terminal Section */}
         {!IS_ANDROID && (
           <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
             <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
@@ -452,6 +460,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
           </section>
         )}
 
+        {/* Live Edit Section */}
         {!IS_ANDROID && (
           <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
             <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">

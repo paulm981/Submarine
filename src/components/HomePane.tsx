@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { ChevronDown, Plus, TerminalSquare, X } from "lucide-react";
 import TerminalView from "./TerminalView";
 
@@ -13,11 +13,11 @@ import TerminalView from "./TerminalView";
 // (DesktopApp keeps this pane mounted once it has been shown).
 
 export interface LocalShell { id: string; label: string; }
-export interface LocalShells { shells: LocalShell[]; default_id: string; custom: string | null; }
+export interface LocalShells { shells: LocalShell[]; default_id: string; custom: string | null; custom_missing: boolean; }
 
 interface HomeTab {
   id: string;
-  /// local_shells id; null = the default at the time it opened.
+  /// list_local_shells id; null = the default at the time it opened.
   shell: string | null;
   label: string;
   ended: boolean;
@@ -25,7 +25,9 @@ interface HomeTab {
 
 const newId = () => `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-export const HomePane = ({ visible }: { visible: boolean }) => {
+// `onLiveShells`: how many of its shells are still running, for the close and
+// lock confirmations (0 once the pane unmounts).
+export const HomePane = ({ visible, onLiveShells }: { visible: boolean; onLiveShells?: (n: number) => void }) => {
   const [tabs, setTabs] = useState<HomeTab[]>([]);
   const [active, setActive] = useState<string | null>(null);
   const [shells, setShells] = useState<LocalShells | null>(null);
@@ -34,7 +36,7 @@ export const HomePane = ({ visible }: { visible: boolean }) => {
   const opened = useRef(false);
 
   const loadShells = () =>
-    invoke<LocalShells>("local_shells").then(setShells).catch(() => setShells(null));
+    invoke<LocalShells>("list_local_shells").then(setShells).catch(() => setShells(null));
 
   const openShell = (shell: string | null) => {
     const label = shell ? (shells?.shells.find((s) => s.id === shell)?.label ?? "Terminal") : "Terminal";
@@ -57,24 +59,34 @@ export const HomePane = ({ visible }: { visible: boolean }) => {
   // Coming back to Home puts the caret in its terminal.
   useEffect(() => { if (visible) setFocusTick((n) => n + 1); }, [visible]);
 
-  // A shell that exits leaves its tab, marked, with its last output.
-  const tabIds = tabs.map((t) => t.id).join(",");
-  useEffect(() => {
-    const unlisten = tabIds.split(",").filter(Boolean).map((id) =>
-      listen(`terminal-closed-${id}`, () =>
-        setTabs((prev) => prev.map((x) => (x.id === id ? { ...x, ended: true } : x))),
-      ),
-    );
-    return () => { unlisten.forEach((p) => p.then((u) => u())); };
-  }, [tabIds]);
+  const live = tabs.filter((t) => !t.ended).length;
+  const onLiveShellsRef = useRef(onLiveShells);
+  onLiveShellsRef.current = onLiveShells;
+  useEffect(() => { onLiveShellsRef.current?.(live); }, [live]);
+  useEffect(() => () => onLiveShellsRef.current?.(0), []);
 
+  // A shell that exits leaves its tab, marked, with its last output. One
+  // listener per tab for as long as the tab is open, so an exit can't slip
+  // through while the listeners are being redone.
+  const closedListeners = useRef(new Map<string, Promise<UnlistenFn>>());
   useEffect(() => {
-    if (!menu) return;
-    const close = () => setMenu(null);
-    window.addEventListener("click", close);
-    window.addEventListener("blur", close);
-    return () => { window.removeEventListener("click", close); window.removeEventListener("blur", close); };
-  }, [menu]);
+    const ids = new Set(tabs.map((t) => t.id));
+    for (const id of ids) {
+      if (closedListeners.current.has(id)) continue;
+      closedListeners.current.set(id, listen(`terminal-closed-${id}`, () =>
+        setTabs((prev) => prev.map((x) => (x.id === id ? { ...x, ended: true } : x))),
+      ));
+    }
+    for (const [id, unlisten] of closedListeners.current) {
+      if (ids.has(id)) continue;
+      unlisten.then((u) => u());
+      closedListeners.current.delete(id);
+    }
+  }, [tabs]);
+  useEffect(() => () => {
+    for (const unlisten of closedListeners.current.values()) unlisten.then((u) => u());
+    closedListeners.current.clear();
+  }, []);
 
   // Closing a tab ends its shell (TerminalView closes it on unmount); the
   // tab to its left takes over.
@@ -125,10 +137,9 @@ export const HomePane = ({ visible }: { visible: boolean }) => {
             </button>
             <button
               onClick={(e) => {
-                e.stopPropagation();
                 const rect = e.currentTarget.getBoundingClientRect();
                 loadShells();
-                setMenu((m) => (m ? null : { x: rect.left, y: rect.bottom + 4 }));
+                setMenu({ x: rect.left, y: rect.bottom + 4 });
               }}
               title="Choose a shell"
               className="h-8 w-5 flex items-center justify-center text-zinc-500 hover:bg-white/10 hover:text-white rounded-r-lg border-l border-dashed border-white/10 transition-all"
@@ -159,6 +170,7 @@ export const HomePane = ({ visible }: { visible: boolean }) => {
             <TerminalView
               sessionId="home"
               terminalId={t.id}
+              disabled={t.ended}
               isActive={visible && active === t.id}
               isActiveView={visible}
               focusSignal={focusTick}
@@ -172,24 +184,30 @@ export const HomePane = ({ visible }: { visible: boolean }) => {
       </div>
 
       {menu && createPortal(
-        <div
-          className="fixed z-[9999] min-w-[220px] py-1 bg-[#18181c] border border-white/10 rounded-lg shadow-2xl"
-          style={{ left: Math.min(menu.x, window.innerWidth - 240), top: menu.y }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          {(shells?.shells ?? []).map((s) => (
-            <button
-              key={s.id}
-              onClick={() => openShell(s.id)}
-              className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-[12px] text-zinc-200 hover:bg-white/10"
-            >
-              <TerminalSquare size={12} className="text-zinc-500" />
-              <span className="flex-1">{s.label}</span>
-              {s.id === shells?.default_id && <span className="text-[9.5px] font-bold uppercase tracking-wider text-primary/70">Default</span>}
-            </button>
-          ))}
-          {!shells && <div className="px-3 py-1.5 text-[12px] text-zinc-500">Looking for shells…</div>}
-        </div>,
+        <>
+          <div
+            className="fixed inset-0 z-[9998]"
+            onClick={() => setMenu(null)}
+            onContextMenu={(e) => { e.preventDefault(); setMenu(null); }}
+          />
+          <div
+            style={{ left: Math.min(menu.x, window.innerWidth - 260), top: menu.y }}
+            className="fixed z-[9999] w-[240px] bg-[#15151a] border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
+          >
+            {(shells?.shells ?? []).map((s) => (
+              <button
+                key={s.id}
+                onClick={() => openShell(s.id)}
+                className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left"
+              >
+                <TerminalSquare size={13} className="text-zinc-500" />
+                <span className="flex-1">{s.label}</span>
+                {s.id === shells?.default_id && <span className="text-[9.5px] font-bold uppercase tracking-wider text-primary/70">Default</span>}
+              </button>
+            ))}
+            {!shells && <div className="px-3 py-1.5 text-zinc-500">Looking for shells…</div>}
+          </div>
+        </>,
         document.body,
       )}
     </div>

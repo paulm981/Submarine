@@ -47,9 +47,11 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
   const allFolders: FolderRow[] = folders || [];
   const folderIndex = useMemo(() => indexFolders(allFolders), [folders]);
   const serverCounts = useMemo(() => subtreeCounts(folderIndex, (servers || []).map((s: any) => s.folder_id)), [folderIndex, servers]);
-  const rdpCounts = useMemo(() => subtreeCounts(folderIndex, (rdpLinks || []).map((l: RdpLink) => l.folder_id)), [folderIndex, rdpLinks]);
   // Remote Desktop links open a desktop client (rdp.rs), which Android has
-  // no counterpart for here.
+  // no counterpart for here: links that came with a profile stay hidden
+  // there rather than show and fail.
+  const shownRdp: RdpLink[] = IS_ANDROID ? [] : (rdpLinks || []);
+  const rdpCounts = useMemo(() => subtreeCounts(folderIndex, shownRdp.map((l) => l.folder_id)), [folderIndex, rdpLinks]);
   const canRdp = !!onSaveRdp && !IS_ANDROID;
   const crumbs = folderPath(folderIndex, activeFolderId);
   const parentFolderId = activeFolderId != null ? (folderIndex.parent.get(activeFolderId) ?? null) : null;
@@ -66,7 +68,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
     : filteredServers.filter((s: any) => inFolder(s.folder_id));
 
   // Matched the way filteredServers matches servers.
-  const displayedRdp: RdpLink[] = (rdpLinks || []).filter((l: RdpLink) =>
+  const displayedRdp: RdpLink[] = shownRdp.filter((l: RdpLink) =>
     isSearching
       ? l.name.toLowerCase().includes(search.toLowerCase()) || l.host.includes(search)
       : inFolder(l.folder_id),
@@ -578,7 +580,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
           </div>
         )}
 
-        {servers?.length === 0 && folders?.length === 0 && (rdpLinks || []).length === 0 ? (
+        {servers?.length === 0 && folders?.length === 0 && shownRdp.length === 0 ? (
           <div className="h-full flex items-center justify-center">
             <button
               onClick={onAddClick}

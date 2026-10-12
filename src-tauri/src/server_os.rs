@@ -10,8 +10,10 @@ use rusqlite::{params, OptionalExtension};
 
 /// A server moved to another host or port is asked again: what the old one
 /// reported says nothing about the new one. A trigger, so an edit that
-/// arrives by sync clears it too.
-pub(crate) const RESET_TRIGGER: &str = "CREATE TRIGGER IF NOT EXISTS servers_os_reset AFTER UPDATE OF host, port ON servers FOR EACH ROW
+/// arrives by sync clears it too. Dropped and re-created on every vault open,
+/// like the sync triggers, so its definition is always this build's.
+pub(crate) const RESET_TRIGGER: &str = "DROP TRIGGER IF EXISTS servers_os_reset;
+  CREATE TRIGGER servers_os_reset AFTER UPDATE OF host, port ON servers FOR EACH ROW
   WHEN NEW.os IS NOT NULL AND (NEW.host IS NOT OLD.host OR NEW.port IS NOT OLD.port)
   BEGIN UPDATE servers SET os = NULL WHERE id = NEW.id; END;";
 
@@ -88,12 +90,12 @@ pub async fn detect_server_os(
             None => false,
             Some(current) if current.as_deref() == Some(os.as_str()) => false,
             Some(_) => {
-                // The merge flag holds the sync triggers back, as during a
-                // sync merge: what the server reports is not an edit to push.
-                let _ = conn.execute("INSERT INTO sync_flags(key, val) VALUES('merge', 1) ON CONFLICT(key) DO UPDATE SET val = 1", []);
-                let res = conn.execute("UPDATE servers SET os=?1 WHERE id=?2", params![os, server_id]);
-                let _ = conn.execute("UPDATE sync_flags SET val = 0 WHERE key = 'merge'", []);
-                res.map_err(|e| format!("[DATABASE] SERVER_OS_UPDATE_FAILED: {}", e))?;
+                // Held back from the sync triggers: what the server reports
+                // is not an edit to push.
+                crate::with_merge_flag(conn, |c| {
+                    c.execute("UPDATE servers SET os=?1 WHERE id=?2", params![os, server_id])
+                        .map_err(|e| format!("[DATABASE] SERVER_OS_UPDATE_FAILED: {}", e))
+                })?;
                 true
             }
         }

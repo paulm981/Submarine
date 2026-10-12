@@ -49,7 +49,7 @@ type ImportedHost = {
 };
 
 // What `parse_client_import` hands back: the hosts, and a line about the
-// sessions it can't import (MobaXterm RDP, VNC…).
+// sessions it can't import (MobaXterm VNC, serial…).
 type ClientImport = { hosts: ImportedHost[]; skipped: string | null };
 
 // One picked host for `import_hosts`, with the vault ids of its keys.
@@ -114,7 +114,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
   const [importLoading, setImportLoading] = useState(false);
   const [importBusy, setImportBusy] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
-  // Sessions the pasted export holds that can't be imported (MobaXterm RDP…).
+  // Sessions the pasted export holds that can't be imported (MobaXterm VNC…).
   const [importSkipped, setImportSkipped] = useState<string | null>(null);
   // What the finished import did and what's left to do; while set, the modal
   // shows it with a Done button instead of the host list.
@@ -239,7 +239,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
   // Load each distinct key file into the vault (import_ssh_key_file dedupes
   // by content), then hand every picked host to `import_hosts`, which writes
   // folders, Logins, jump hosts and servers in one transaction. A host whose
-  // key can't be read still imports, signing in without it; the notice says
+  // key can't be read still imports, signing in without it; the summary says
   // which key and why (a PuTTY .ppk, say, needs exporting as OpenSSH first).
   const importSelectedHosts = async () => {
     if (importSelected.size === 0 || importBusy) return;
@@ -314,7 +314,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
       todo.push(`${plural(report.rdp_skipped.length, "Remote Desktop session")} not imported: ${report.rdp_skipped.join("; ")}`);
     }
     for (const [path, why] of keyFailures) {
-      const ppk = /\.ppk$/i.test(path) ? " PuTTY .ppk keys need converting first: PuTTYgen › Conversions › Export OpenSSH key." : "";
+      const ppk = /\.ppk$/i.test(path) ? " PuTTY .ppk keys need converting first: PuTTYgen › Conversions › Export OpenSSH key (force new file format) — the older format can't be read with a passphrase." : "";
       todo.push(`Couldn't load the key ${path}: ${why}.${ppk} Hosts using it were imported without it.`);
     }
     if (needPassphrase > 0) {
@@ -912,14 +912,14 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               })()}
             </div>
 
-            {/* On-connect commands — auto-typed into the FIRST terminal the
-                first time you connect to this server (not on reconnects, not
-                on extra shells you open later). One command per line. */}
+            {/* On-connect commands — auto-typed into the FIRST terminal once
+                its shell is up, on connecting and again after a reconnect
+                (not on extra shells you open later). One command per line. */}
             <div className="space-y-1.5 pt-1">
               <label className="text-[11px] font-bold text-zinc-400 ml-1 flex items-center gap-2">
                 <span>Run on connect</span>
                 <span className="text-[10px] text-zinc-600 font-normal normal-case tracking-normal">
-                  Commands auto-run once on the first terminal. One per line.
+                  Typed into the first terminal on connect and after a reconnect. One per line.
                 </span>
               </label>
               <textarea
