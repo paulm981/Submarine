@@ -14542,15 +14542,21 @@ async fn monitor_resume_all(
     Ok(())
 }
 
-/// The clipboard's text, for a paste into the terminal. Only the Linux
-/// frontend asks; the others read it in the page.
+/// The clipboard's text, for a paste into the terminal (a right-click, or
+/// the Wall's paste). The Linux and Windows frontends ask here; macOS reads
+/// it in the page.
 ///
 /// WebKitGTK refuses the page's `navigator.clipboard.readText()` (#89). And
 /// where the webview reads the clipboard itself (a keyboard paste, or the
 /// page API once it is allowed), it crashes the whole app when nothing owns
 /// the clipboard (seen with WebKitGTK 2.54). So on Linux the page asks here
-/// and GTK is asked directly. A clipboard that is empty or holds no text
-/// gives an empty string.
+/// and GTK is asked directly.
+///
+/// On Windows the page's read is WebView2's to allow, behind a permission
+/// prompt: blocked or dismissed once, every right-click paste failed with
+/// "Clipboard read denied". The Win32 clipboard is read directly instead.
+///
+/// A clipboard that is empty or holds no text gives an empty string.
 #[tauri::command]
 async fn clipboard_read_text(app: tauri::AppHandle) -> Result<String, String> {
     #[cfg(target_os = "linux")]
@@ -14568,11 +14574,75 @@ async fn clipboard_read_text(app: tauri::AppHandle) -> Result<String, String> {
             _ => Err("The clipboard did not answer.".to_string()),
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
     {
         let _ = app;
-        Err("Reading the clipboard here is only for Linux.".to_string())
+        tokio::task::spawn_blocking(windows_clipboard_text)
+            .await
+            .map_err(|e| e.to_string())?
     }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = app;
+        Err("Reading the clipboard here is only for Linux and Windows.".to_string())
+    }
+}
+
+/// The Win32 clipboard's text (CF_UNICODETEXT).
+#[cfg(windows)]
+fn windows_clipboard_text() -> Result<String, String> {
+    use std::ffi::c_void;
+    const CF_UNICODETEXT: u32 = 13;
+    #[link(name = "user32")]
+    extern "system" {
+        fn OpenClipboard(owner: *mut c_void) -> i32;
+        fn CloseClipboard() -> i32;
+        fn IsClipboardFormatAvailable(format: u32) -> i32;
+        fn GetClipboardData(format: u32) -> *mut c_void;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalLock(mem: *mut c_void) -> *mut c_void;
+        fn GlobalUnlock(mem: *mut c_void) -> i32;
+        fn GlobalSize(mem: *mut c_void) -> usize;
+    }
+    struct Opened;
+    impl Drop for Opened {
+        fn drop(&mut self) {
+            unsafe { CloseClipboard() };
+        }
+    }
+    // Only one program can have the clipboard open, and some hold it for a
+    // moment (clipboard managers, Remote Desktop sharing the clipboard).
+    let mut opened = None;
+    for _ in 0..10 {
+        if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
+            opened = Some(Opened);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let Some(_opened) = opened else {
+        return Err("Another program is using the clipboard — try again.".to_string());
+    };
+    if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) } == 0 {
+        return Ok(String::new());
+    }
+    let mem = unsafe { GetClipboardData(CF_UNICODETEXT) };
+    if mem.is_null() {
+        return Ok(String::new());
+    }
+    let ptr = unsafe { GlobalLock(mem) } as *const u16;
+    if ptr.is_null() {
+        return Ok(String::new());
+    }
+    // Up to the first NUL, and never past the block's own size.
+    let units = unsafe { GlobalSize(mem) } / 2;
+    let wide = unsafe { std::slice::from_raw_parts(ptr, units) };
+    let len = wide.iter().position(|&c| c == 0).unwrap_or(units);
+    let text = String::from_utf16_lossy(&wide[..len]);
+    unsafe { GlobalUnlock(mem) };
+    Ok(text)
 }
 
 /// Library entrypoint shared by both the desktop `bin/main.rs` shim and

@@ -12,6 +12,7 @@ import { useConfirm } from '../ui/confirm';
 import HistorySearchOverlay from './HistorySearchOverlay';
 import { DEFAULT_FONT_STACK, fontFamilyCss, readFontFamily, readFontSize } from '../util/terminalFont';
 import { IS_ANDROID, IS_LINUX } from '../util/platform';
+import { readClipboardText } from '../util/clipboard';
 
 // Does the recent remote OUTPUT look like a no-echo password / passphrase
 // prompt? Used to skip command-history capture so typed secrets (sudo, su,
@@ -799,13 +800,6 @@ const TerminalView = ({
     // clobber the clipboard. Disarm on blur so only a release we actually see
     // can copy.
     const onWindowBlur = () => { selectionArmed = false; };
-    // The clipboard's text for a paste. On Linux it comes from the backend:
-    // WebKitGTK refuses the page's own clipboard read (#89), and where the
-    // webview reads the clipboard itself it crashes the whole app when the
-    // clipboard is empty (seen with WebKitGTK 2.54), so it is kept out of it
-    // there.
-    const readClipboardText = (): Promise<string> =>
-      IS_LINUX ? invoke<string>('clipboard_read_text') : navigator.clipboard.readText();
     const pasteText = (text: string) => {
       pastingRef.current = true;
       try {
@@ -819,8 +813,10 @@ const TerminalView = ({
     const pasteClipboard = async (toast: boolean) => {
       if (disabledRef.current) return;
       let text = '';
+      // From the backend on Linux and Windows (util/clipboard), whose error
+      // says why; the page's own read only fails when it's refused.
       try { text = await readClipboardText(); }
-      catch { notify('Clipboard read denied', 'err'); return; }
+      catch (e) { notify(typeof e === 'string' ? e : 'Clipboard read denied', 'err'); return; }
       if (!text) return;
       // Hand the text to xterm's own paste path instead of writing it raw to
       // the PTY. xterm collapses CRLF / lone LF to a single CR (one Enter per
