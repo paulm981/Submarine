@@ -17,7 +17,7 @@
 > - **MultiExec on Walls**: terminals from many servers side by side. With Broadcast on, typing goes to all of them; click into one to type to it alone, pause the ones to leave out, paste or send a set of commands to all. Save walls and open a whole folder as one.
 > - **A session tree** beside the terminal that manages folders, servers and Remote Desktop links (drag and drop, rename, move).
 > - **MobaXterm session import**: nested folders, saved logins, jump hosts, startup commands such as `dzdo su -`, Remote Desktop sessions.
-> - **A Home view** of terminals on your own computer (PowerShell, Command Prompt, WSL, Git Bash).
+> - **A Home view** of terminals on your own computer: PowerShell, Command Prompt, Git Bash and each WSL distribution by name on Windows (the default one marked, and a hint when WSL has none); the login shell and every other installed shell on macOS and Linux.
 > - **Sync through storage you own**: a folder that OneDrive, Dropbox, Nextcloud, Syncthing or a network share keeps the same on your computers, or a private git repository — no third-party service. Encrypted with the profile's password first; Remote Desktop links sync too. The original project's cloud stays off unless you turn it on.
 > - OS badges, jump hosts that let a hundred servers log in a few at a time, and hardening for Windows.
 >

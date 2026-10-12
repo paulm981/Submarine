@@ -12,8 +12,31 @@ import TerminalView from "./TerminalView";
 // broadcast or the Wall, and they stay open while the user works elsewhere
 // (DesktopApp keeps this pane mounted once it has been shown).
 
-export interface LocalShell { id: string; label: string; }
-export interface LocalShells { shells: LocalShell[]; default_id: string; custom: string | null; custom_missing: boolean; }
+// A shell Home can start (local_term.rs): `group` is the heading it's listed
+// under — "Windows" and "WSL" on Windows, "This computer" elsewhere, "Your
+// choice" for a program the user picked — and `detail` what tells it apart
+// ("default" for WSL's default distribution, "your login shell", a path).
+export interface LocalShell { id: string; label: string; group: string; detail: string | null; }
+// `notes`: what to say under a heading with nothing to list (WSL not
+// installed, or no Linux in it yet).
+export interface ShellNote { group: string; text: string; }
+export interface LocalShells { shells: LocalShell[]; notes: ShellNote[]; default_id: string; custom: string | null; custom_missing: boolean; }
+
+export interface ShellGroup { name: string; shells: LocalShell[]; notes: string[]; }
+
+/// The shells under their headings, in the order they're listed, each with
+/// its notes. The Home menu and Settings show the same list this way.
+export const shellGroups = (info: LocalShells): ShellGroup[] => {
+  const groups: ShellGroup[] = [];
+  const get = (name: string) => {
+    let g = groups.find((x) => x.name === name);
+    if (!g) groups.push((g = { name, shells: [], notes: [] }));
+    return g;
+  };
+  for (const s of info.shells) get(s.group).shells.push(s);
+  for (const n of info.notes ?? []) get(n.group).notes.push(n.text);
+  return groups;
+};
 
 interface HomeTab {
   id: string;
@@ -191,20 +214,39 @@ export const HomePane = ({ visible, onLiveShells }: { visible: boolean; onLiveSh
             onContextMenu={(e) => { e.preventDefault(); setMenu(null); }}
           />
           <div
-            style={{ left: Math.min(menu.x, window.innerWidth - 260), top: menu.y }}
-            className="fixed z-[9999] w-[240px] bg-[#15151a] border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
+            style={{ left: Math.min(menu.x, window.innerWidth - 280), top: menu.y }}
+            className="fixed z-[9999] w-[260px] max-h-[70vh] overflow-y-auto custom-scrollbar bg-[#15151a] border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
           >
-            {(shells?.shells ?? []).map((s) => (
-              <button
-                key={s.id}
-                onClick={() => openShell(s.id)}
-                className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left"
-              >
-                <TerminalSquare size={13} className="text-zinc-500" />
-                <span className="flex-1">{s.label}</span>
-                {s.id === shells?.default_id && <span className="text-[9.5px] font-bold uppercase tracking-wider text-primary/70">Default</span>}
-              </button>
-            ))}
+            {shells && (() => {
+              const groups = shellGroups(shells);
+              // Headings only once there's more than one kind to tell apart.
+              const headed = groups.length > 1 || groups.some((g) => g.notes.length > 0);
+              return groups.map((g, i) => (
+                <div key={g.name} className={i > 0 ? "mt-1 pt-1 border-t border-white/5" : ""}>
+                  {headed && (
+                    <div className="px-3 pt-1 pb-0.5 text-[9.5px] font-bold uppercase tracking-wider text-zinc-500">{g.name}</div>
+                  )}
+                  {g.shells.map((s) => (
+                    <button
+                      key={s.id}
+                      onClick={() => openShell(s.id)}
+                      title={s.detail ? `${s.label} — ${s.detail}` : s.label}
+                      className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left"
+                    >
+                      <TerminalSquare size={13} className="text-zinc-500 shrink-0" />
+                      <span className="flex-1 min-w-0">
+                        <span className="block truncate">{s.label}</span>
+                        {s.detail && <span className="block truncate text-[10px] text-zinc-500">{s.detail}</span>}
+                      </span>
+                      {s.id === shells.default_id && <span className="shrink-0 text-[9.5px] font-bold uppercase tracking-wider text-primary/70">Default</span>}
+                    </button>
+                  ))}
+                  {g.notes.map((n, j) => (
+                    <div key={j} className="px-3 py-1 text-[10.5px] text-zinc-500 leading-snug">{n}</div>
+                  ))}
+                </div>
+              ));
+            })()}
             {!shells && <div className="px-3 py-1.5 text-zinc-500">Looking for shells…</div>}
           </div>
         </>,

@@ -5,7 +5,7 @@ import {
   isFontAvailable, primaryFontName, sanitizeFontFamily,
 } from "../util/terminalFont";
 import { invoke } from "@tauri-apps/api/core";
-import type { LocalShells } from "./HomePane";
+import { shellGroups, type LocalShells } from "./HomePane";
 import CopyValue from "./CopyValue";
 import FontPicker from "./FontPicker";
 import { loadInstalledFonts } from "../util/systemFonts";
@@ -183,23 +183,31 @@ function HomeTerminalSettings() {
         Home opens a terminal on this computer, in your home folder. New ones start this shell; the arrow
         beside + in Home starts any of the others.
       </p>
-      <div className="space-y-1.5">
-        <span className="text-[11px] font-black text-zinc-500 uppercase tracking-wider">Shell</span>
-        <div className="flex flex-col gap-1">
-          {info.shells.map((s) => (
-            <label key={s.id} className="flex items-center gap-2.5 px-3 h-9 rounded-xl border border-white/5 bg-zinc-900/60 hover:bg-white/[0.04] cursor-pointer">
-              <input
-                type="radio"
-                name="home-shell"
-                checked={info.default_id === s.id}
-                onChange={() => run("local_shell_set_default", { id: s.id })}
-                className="accent-[var(--primary-hex)]"
-              />
-              <span className="text-[12.5px] text-zinc-200">{s.label}</span>
-            </label>
-          ))}
+      {shellGroups(info).map((g) => (
+        <div key={g.name} className="space-y-1.5">
+          <span className="text-[11px] font-black text-zinc-500 uppercase tracking-wider">{g.name}</span>
+          <div className="flex flex-col gap-1">
+            {g.shells.map((s) => (
+              <label key={s.id} className="flex items-center gap-2.5 px-3 min-h-9 py-1.5 rounded-xl border border-white/5 bg-zinc-900/60 hover:bg-white/[0.04] cursor-pointer">
+                <input
+                  type="radio"
+                  name="home-shell"
+                  checked={info.default_id === s.id}
+                  onChange={() => run("local_shell_set_default", { id: s.id })}
+                  className="accent-[var(--primary-hex)]"
+                />
+                <span className="min-w-0">
+                  <span className="block text-[12.5px] text-zinc-200">{s.label}</span>
+                  {s.detail && <span className="block text-[11px] text-zinc-500 break-all">{s.detail}</span>}
+                </span>
+              </label>
+            ))}
+            {g.notes.map((n, i) => (
+              <p key={i} className="text-[11.5px] text-zinc-500 leading-relaxed px-1">{n}</p>
+            ))}
+          </div>
         </div>
-      </div>
+      ))}
       {info.custom && (
         <div className="space-y-1">
           <CopyValue value={info.custom} className="max-w-full text-zinc-300">

@@ -47,19 +47,50 @@ pub(crate) fn set_webview_env(name: &'static str, value: &str) {
     }
 }
 
+// The headings shells are listed under, the same on every system: what the
+// computer itself runs, Linux under WSL (Windows only), the program the user
+// picked.
+#[cfg(windows)]
+const GROUP_SYSTEM: &str = "Windows";
+#[cfg(not(windows))]
+const GROUP_SYSTEM: &str = "This computer";
+#[cfg(windows)]
+const GROUP_WSL: &str = "WSL";
+const GROUP_CUSTOM: &str = "Your choice";
+
 /// A shell the Home view can start.
 #[derive(Serialize, Clone, Debug)]
 pub struct Shell {
     pub id: String,
     pub label: String,
+    /// The heading it's listed under (GROUP_*).
+    pub group: &'static str,
+    /// What tells it apart: "default" for WSL's default distribution, "your
+    /// login shell", or where the program is.
+    pub detail: Option<String>,
     #[serde(skip)]
     program: PathBuf,
     #[serde(skip)]
     args: Vec<String>,
 }
 
-fn shell(id: impl Into<String>, label: impl Into<String>, program: PathBuf, args: &[&str]) -> Shell {
-    Shell { id: id.into(), label: label.into(), program, args: args.iter().map(|a| a.to_string()).collect() }
+fn shell(id: impl Into<String>, label: impl Into<String>, group: &'static str, program: PathBuf, args: &[&str]) -> Shell {
+    Shell { id: id.into(), label: label.into(), group, detail: None, program, args: args.iter().map(|a| a.to_string()).collect() }
+}
+
+impl Shell {
+    fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+}
+
+/// Something to say under a heading that has nothing to list — that WSL
+/// isn't installed, or has no Linux yet — so an empty list isn't a puzzle.
+#[derive(Serialize, Clone, Debug)]
+pub struct Note {
+    pub group: &'static str,
+    pub text: String,
 }
 
 /// The program picked with "Choose program…", while it's still there. On
@@ -71,16 +102,18 @@ fn custom_program(config: &Config) -> Option<PathBuf> {
     there.then_some(p)
 }
 
-/// The shells on this computer, the usual one first. Programs go by full
-/// path: a bare name would be looked for next to submarine.exe first.
-/// `list_wsl`: also name each WSL distribution, which asks wsl.exe.
-fn shells(config: &Config, list_wsl: bool) -> Vec<Shell> {
-    let mut out = system_shells(list_wsl);
+/// The shells on this computer, the usual one first, and what to say about
+/// a heading with none. Programs go by full path: a bare name would be
+/// looked for next to submarine.exe first. `list_wsl`: also name each WSL
+/// distribution, which asks wsl.exe.
+fn shells(config: &Config, list_wsl: bool) -> (Vec<Shell>, Vec<Note>) {
+    let (mut out, notes) = system_shells(list_wsl);
     if let Some(custom) = custom_program(config) {
         let name = custom.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        out.push(shell("custom", format!("{} (your choice)", name), custom, &[]));
+        let shown = custom.display().to_string();
+        out.push(shell("custom", name, GROUP_CUSTOM, custom, &[]).detail(shown));
     }
-    out
+    (out, notes)
 }
 
 /// The shell an id names, without listing WSL's distributions: a `wsl:` id
@@ -91,22 +124,104 @@ fn find_shell(config: &Config, id: &str) -> Option<Shell> {
         let wsl = crate::local_open::system32().join("wsl.exe");
         return (wsl.is_file() && valid_distro(name)).then(|| wsl_shell(&wsl, Some(name)));
     }
-    shells(config, false).into_iter().find(|s| s.id == id)
+    shells(config, false).0.into_iter().find(|s| s.id == id)
 }
 
+/// `wsl`: WSL's default distribution, whichever it is when it starts (the id
+/// earlier builds listed); `wsl:<name>`: that distribution.
 #[cfg(windows)]
 fn wsl_shell(wsl: &std::path::Path, distro: Option<&str>) -> Shell {
     match distro {
-        Some(d) => shell(format!("wsl:{}", d), format!("WSL: {}", d), wsl.to_path_buf(), &["-d", d, "--cd", "~"]),
-        None => shell("wsl", "WSL", wsl.to_path_buf(), &["--cd", "~"]),
+        Some(d) => shell(format!("wsl:{}", d), d, GROUP_WSL, wsl.to_path_buf(), &["-d", d, "--cd", "~"]),
+        None => shell("wsl", "WSL (default)", GROUP_WSL, wsl.to_path_buf(), &["--cd", "~"]),
     }
 }
 
+/// Each distribution by name, WSL's default first and marked so — the one a
+/// bare `wsl` starts.
 #[cfg(windows)]
-fn system_shells(list_wsl: bool) -> Vec<Shell> {
+fn wsl_entries(wsl: &std::path::Path, distros: &[String], default: Option<&str>) -> Vec<Shell> {
+    order_default_first(distros, default)
+        .into_iter()
+        .map(|(d, is_default)| {
+            let s = wsl_shell(wsl, Some(d));
+            if is_default { s.detail("default") } else { s }
+        })
+        .collect()
+}
+
+/// The names with `default` (matched as WSL does, ignoring case) first,
+/// each with whether it is the default.
+#[cfg(any(windows, test))]
+fn order_default_first<'a>(names: &'a [String], default: Option<&str>) -> Vec<(&'a str, bool)> {
+    let is_default = |n: &str| default.is_some_and(|d| d.eq_ignore_ascii_case(n));
+    let mut out: Vec<(&str, bool)> = names.iter().map(|n| (n.as_str(), is_default(n))).collect();
+    out.sort_by_key(|(_, d)| !*d);
+    out
+}
+
+/// WSL's default distribution, as it records it for this user: the GUID in
+/// `Lxss\DefaultDistribution`, and that key's `DistributionName`. None when
+/// there's none, or it can't be read.
+#[cfg(windows)]
+fn wsl_default_distro() -> Option<String> {
+    const LXSS: &str = r"Software\Microsoft\Windows\CurrentVersion\Lxss";
+    let guid = user_registry_string(LXSS, "DefaultDistribution")?;
+    if !guid.starts_with('{') || guid.len() > 40 {
+        return None;
+    }
+    user_registry_string(&format!(r"{LXSS}\{guid}"), "DistributionName")
+}
+
+/// A string value under HKEY_CURRENT_USER.
+#[cfg(windows)]
+fn user_registry_string(key: &str, value: &str) -> Option<String> {
+    use std::ffi::c_void;
+    // (HKEY)(ULONG_PTR)(LONG)0x80000001, sign-extended as Windows does.
+    const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as i32 as isize;
+    const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegGetValueW(
+            hkey: isize,
+            subkey: *const u16,
+            value: *const u16,
+            flags: u32,
+            kind: *mut u32,
+            data: *mut c_void,
+            bytes: *mut u32,
+        ) -> i32;
+    }
+    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (key, value) = (wide(key), wide(value));
+    let mut buf = vec![0u16; 260];
+    let mut bytes = (buf.len() * 2) as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut c_void,
+            &mut bytes,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let units = (bytes as usize / 2).min(buf.len());
+    let len = buf[..units].iter().position(|&c| c == 0).unwrap_or(units);
+    let s = String::from_utf16_lossy(&buf[..len]);
+    (!s.is_empty()).then_some(s)
+}
+
+#[cfg(windows)]
+fn system_shells(list_wsl: bool) -> (Vec<Shell>, Vec<Note>) {
     let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
     let sys = crate::local_open::system32();
     let mut out = Vec::new();
+    let mut notes = Vec::new();
     // PowerShell 7 when it's installed: from its installer, or from the
     // Store, whose copy is an app alias only symlink_metadata can see.
     let pwsh = env("ProgramFiles")
@@ -118,10 +233,10 @@ fn system_shells(list_wsl: bool) -> Vec<Shell> {
                 .filter(|p| std::fs::symlink_metadata(p).is_ok())
         });
     if let Some(p) = pwsh {
-        out.push(shell("pwsh", "PowerShell 7", p, &["-NoLogo"]));
+        out.push(shell("pwsh", "PowerShell 7", GROUP_SYSTEM, p, &["-NoLogo"]));
     }
-    out.push(shell("powershell", "Windows PowerShell", sys.join(r"WindowsPowerShell\v1.0\powershell.exe"), &["-NoLogo"]));
-    out.push(shell("cmd", "Command Prompt", sys.join("cmd.exe"), &[]));
+    out.push(shell("powershell", "Windows PowerShell", GROUP_SYSTEM, sys.join(r"WindowsPowerShell\v1.0\powershell.exe"), &["-NoLogo"]));
+    out.push(shell("cmd", "Command Prompt", GROUP_SYSTEM, sys.join("cmd.exe"), &[]));
     // Git for Windows' bash itself, not git-bash.exe, which opens a window
     // of its own.
     let git_bash = [env("ProgramFiles"), env("ProgramFiles(x86)"), env("LOCALAPPDATA").map(|d| d.join("Programs"))]
@@ -130,21 +245,31 @@ fn system_shells(list_wsl: bool) -> Vec<Shell> {
         .map(|d| d.join(r"Git\bin\bash.exe"))
         .find(|p| p.is_file());
     if let Some(p) = git_bash {
-        out.push(shell("gitbash", "Git Bash", p, &["--login", "-i"]));
+        out.push(shell("gitbash", "Git Bash", GROUP_SYSTEM, p, &["--login", "-i"]));
     }
     let wsl = sys.join("wsl.exe");
-    if wsl.is_file() {
-        let distros = if list_wsl { wsl_distros(&wsl) } else { Vec::new() };
-        // The default distribution, and each one by name when there are
-        // several to tell apart.
-        if !list_wsl || !distros.is_empty() {
-            out.push(wsl_shell(&wsl, None));
+    let note = |text: &str| Note { group: GROUP_WSL, text: text.to_string() };
+    if !wsl.is_file() {
+        if list_wsl {
+            notes.push(note("WSL isn't installed. To add Linux: run wsl --install in PowerShell as administrator, then restart."));
         }
-        if distros.len() > 1 {
-            out.extend(distros.iter().map(|d| wsl_shell(&wsl, Some(d))));
+    } else if !list_wsl {
+        // Starting one by id needs no list: `wsl` is the default distribution.
+        out.push(wsl_shell(&wsl, None));
+    } else {
+        match wsl_distros(&wsl) {
+            Some(distros) if distros.is_empty() => notes.push(note(
+                "WSL has no Linux distribution yet. To add one: run wsl --install -d Ubuntu in PowerShell.",
+            )),
+            Some(distros) => out.extend(wsl_entries(&wsl, &distros, wsl_default_distro().as_deref())),
+            None => {
+                // It may still be starting: offer its default all the same.
+                out.push(wsl_shell(&wsl, None));
+                notes.push(note("WSL didn't answer in time — it may still be starting. Open this list again to see each distribution."));
+            }
         }
     }
-    out
+    (out, notes)
 }
 
 /// A WSL distribution's name as it may go after `wsl.exe -d`: plain, and
@@ -157,10 +282,12 @@ fn valid_distro(name: &str) -> bool {
 }
 
 /// The WSL distributions installed, from `wsl.exe -l -q`, leaving out Docker
-/// Desktop's, which aren't shells. Given up on after a few seconds: wsl.exe
-/// can take that long to answer when WSL itself is still starting.
+/// Desktop's, which aren't shells. None when it gives no answer within a few
+/// seconds — wsl.exe can take that long while WSL itself is still starting.
+/// It fails, rather than lists nothing, when there's no distribution (or WSL
+/// isn't set up): that counts as an empty list.
 #[cfg(windows)]
-fn wsl_distros(wsl: &std::path::Path) -> Vec<String> {
+fn wsl_distros(wsl: &std::path::Path) -> Option<Vec<String>> {
     use std::os::windows::process::CommandExt;
     use std::process::Stdio;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -174,16 +301,17 @@ fn wsl_distros(wsl: &std::path::Path) -> Vec<String> {
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
     else {
-        return Vec::new();
+        return None;
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => return Some(Vec::new()),
             Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(50)),
             _ => {
                 let _ = child.kill();
-                return Vec::new();
+                return None;
             }
         }
     }
@@ -191,7 +319,7 @@ fn wsl_distros(wsl: &std::path::Path) -> Vec<String> {
     if let Some(mut stdout) = child.stdout.take() {
         let _ = std::io::Read::read_to_end(&mut stdout, &mut out);
     }
-    parse_wsl_list(&out)
+    Some(parse_wsl_list(&out))
 }
 
 /// `wsl -l -q` writes UTF-16 LE, one name per line — or UTF-8 when WSL_UTF8
@@ -210,13 +338,13 @@ fn parse_wsl_list(raw: &[u8]) -> Vec<String> {
 }
 
 #[cfg(not(windows))]
-fn system_shells(_list_wsl: bool) -> Vec<Shell> {
+fn system_shells(_list_wsl: bool) -> (Vec<Shell>, Vec<Note>) {
     let login = std::env::var_os("SHELL")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute() && p.is_file())
         .unwrap_or_else(|| PathBuf::from("/bin/sh"));
     let name = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let mut out = vec![shell("login", format!("Login shell ({})", name(&login)), login.clone(), &["-l"])];
+    let mut out = vec![shell("login", name(&login), GROUP_SYSTEM, login.clone(), &["-l"]).detail("your login shell")];
     // The others /etc/shells lists, once each (it often names a shell
     // under both /bin and /usr/bin).
     let mut seen = vec![std::fs::canonicalize(&login).unwrap_or(login)];
@@ -227,9 +355,12 @@ fn system_shells(_list_wsl: bool) -> Vec<Shell> {
             continue;
         }
         seen.push(real);
-        out.push(shell(format!("shell:{}", p.display()), name(&p), p, &["-l"]));
+        // Its path, which tells apart two of the same name (/bin/bash and
+        // Homebrew's, say).
+        let shown = p.display().to_string();
+        out.push(shell(format!("shell:{}", p.display()), name(&p), GROUP_SYSTEM, p, &["-l"]).detail(shown));
     }
-    out
+    (out, Vec::new())
 }
 
 /// The shells in /etc/shells, without the ones that only refuse a login.
@@ -244,9 +375,11 @@ fn etc_shells(listed: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct LocalShells {
     shells: Vec<Shell>,
+    /// What to say under a heading with nothing to list (Note).
+    notes: Vec<Note>,
     /// The id new Home terminals start: the saved choice while it's among
     /// `shells`, else the first.
     default_id: String,
@@ -258,15 +391,27 @@ pub struct LocalShells {
 
 fn local_shells_info(app: &tauri::AppHandle) -> LocalShells {
     let config = read_config(app);
-    let shells = shells(&config, true);
-    let default_id = config
-        .default
-        .clone()
+    let (shells, notes) = shells(&config, true);
+    // `wsl` (WSL's default, which earlier builds listed) is listed now under
+    // its distribution's name.
+    let saved = config.default.clone().map(|d| {
+        if d != "wsl" {
+            return d;
+        }
+        shells.iter().find(|s| s.id.starts_with("wsl:") && s.detail.as_deref() == Some("default")).map_or(d, |s| s.id.clone())
+    });
+    let default_id = saved
         .filter(|d| shells.iter().any(|s| &s.id == d))
         .or_else(|| shells.first().map(|s| s.id.clone()))
         .unwrap_or_default();
     let custom_missing = config.custom.is_some() && custom_program(&config).is_none();
-    LocalShells { shells, default_id, custom: config.custom, custom_missing }
+    LocalShells { shells, notes, default_id, custom: config.custom, custom_missing }
+}
+
+/// local_shells_info off the async runtime: listing WSL waits on wsl.exe.
+async fn shells_info(app: &tauri::AppHandle) -> LocalShells {
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || local_shells_info(&app)).await.unwrap_or_default()
 }
 
 /// The saved choice while that shell is still here, else the first.
@@ -275,12 +420,12 @@ fn default_shell(config: &Config) -> Option<Shell> {
         .default
         .as_deref()
         .and_then(|d| find_shell(config, d))
-        .or_else(|| shells(config, false).into_iter().next())
+        .or_else(|| shells(config, false).0.into_iter().next())
 }
 
 #[tauri::command]
 pub async fn list_local_shells(app: tauri::AppHandle) -> LocalShells {
-    local_shells_info(&app)
+    shells_info(&app).await
 }
 
 /// The shell new Home terminals start: one of `list_local_shells`.
@@ -292,7 +437,7 @@ pub async fn local_shell_set_default(app: tauri::AppHandle, id: String) -> Resul
     }
     config.default = Some(id);
     write_config(&app, &config)?;
-    Ok(local_shells_info(&app))
+    Ok(shells_info(&app).await)
 }
 
 /// Pick a program of your own in a native dialog; it becomes the default.
@@ -309,12 +454,12 @@ pub async fn local_shell_pick_custom(app: tauri::AppHandle) -> Result<LocalShell
         if cfg!(windows) {
             dialog = dialog.add_filter("Programs", &["exe"]);
         }
-        let Some(path) = dialog.pick_file() else { return Ok(local_shells_info(&app)) };
+        let Some(path) = dialog.pick_file() else { return Ok(shells_info(&app).await) };
         let mut config = read_config(&app);
         config.custom = Some(path.to_string_lossy().into_owned());
         config.default = Some("custom".into());
         write_config(&app, &config)?;
-        Ok(local_shells_info(&app))
+        Ok(shells_info(&app).await)
     }
 }
 
@@ -327,7 +472,7 @@ pub async fn local_shell_clear_custom(app: tauri::AppHandle) -> Result<LocalShel
         config.default = None;
     }
     write_config(&app, &config)?;
-    Ok(local_shells_info(&app))
+    Ok(shells_info(&app).await)
 }
 
 /// Ids come from the page: `local-` and a short plain name, so one can't be
@@ -716,6 +861,14 @@ mod tests {
     }
 
     #[test]
+    fn wsl_lists_its_default_first() {
+        let names: Vec<String> = ["Ubuntu", "Debian", "kali-linux"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(order_default_first(&names, Some("debian")), vec![("Debian", true), ("Ubuntu", false), ("kali-linux", false)]);
+        // Not known: as WSL listed them, none marked.
+        assert_eq!(order_default_first(&names, None), vec![("Ubuntu", false), ("Debian", false), ("kali-linux", false)]);
+    }
+
+    #[test]
     fn etc_shells_leaves_out_the_ones_that_refuse_logins() {
         let listed = "# /etc/shells: valid login shells\n/bin/sh\n/usr/bin/bash\n/usr/sbin/nologin\n/bin/false\n/usr/bin/git-shell\n  /usr/bin/zsh  \nnot-a-path\n";
         assert_eq!(etc_shells(listed), vec![PathBuf::from("/bin/sh"), PathBuf::from("/usr/bin/bash"), PathBuf::from("/usr/bin/zsh")]);
@@ -732,10 +885,10 @@ mod tests {
     #[test]
     fn a_custom_program_only_counts_while_it_exists() {
         let config = Config { default: None, custom: Some("/no/such/program".into()) };
-        assert!(!shells(&config, false).iter().any(|s| s.id == "custom"));
+        assert!(!shells(&config, false).0.iter().any(|s| s.id == "custom"));
         let here = std::env::current_exe().unwrap();
         let config = Config { default: None, custom: Some(here.to_string_lossy().into_owned()) };
-        assert!(shells(&config, false).iter().any(|s| s.id == "custom"));
+        assert!(shells(&config, false).0.iter().any(|s| s.id == "custom"));
         assert_eq!(find_shell(&config, "custom").map(|s| s.program), Some(here));
     }
 
@@ -743,7 +896,7 @@ mod tests {
     fn run_shell(terms: &pty::LocalTerms, id: &str) -> (std::sync::mpsc::Receiver<Vec<u8>>, std::sync::mpsc::Receiver<()>) {
         let (out_tx, out_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let (end_tx, end_rx) = std::sync::mpsc::channel::<()>();
-        let sh = shell("t", "sh", PathBuf::from("/bin/sh"), &[]);
+        let sh = shell("t", "sh", GROUP_SYSTEM, PathBuf::from("/bin/sh"), &[]);
         pty::spawn(
             terms,
             id,
@@ -764,7 +917,7 @@ mod tests {
         set_webview_env("SUBMARINE_TEST_WEBVIEW_ONLY", "1");
         let terms = pty::LocalTerms::default();
         let (out_rx, end_rx) = run_shell(&terms, "local-test");
-        let sh = shell("t", "sh", PathBuf::from("/bin/sh"), &[]);
+        let sh = shell("t", "sh", GROUP_SYSTEM, PathBuf::from("/bin/sh"), &[]);
         assert!(pty::spawn(&terms, "local-test", &sh, None, (80, 24), |_| {}, || {}).is_err(), "one shell per id");
         pty::resize(&terms, "local-test", 100, 30).unwrap();
         pty::write(&terms, "local-test", b"echo sub$((40+2))marine $TERM [${SUBMARINE_TEST_WEBVIEW_ONLY:-unset}]; pwd; exit\n").unwrap();
