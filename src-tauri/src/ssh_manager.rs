@@ -464,6 +464,75 @@ impl LastHeard {
     }
 }
 
+/// One "trust this host key?" question at a time per host, port and key.
+/// Opening a folder of servers behind one jump host — or several sessions
+/// to the same host — put up the same prompt once per session; now the
+/// first one asks and the rest take its answer. The value is `None` until
+/// it's answered.
+type HostKeyQuestion = (String, u16, String);
+type AskedQuestions = HashMap<HostKeyQuestion, (u64, tokio::sync::watch::Receiver<Option<HostKeyAnswer>>)>;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HostKeyAnswer {
+    Accepted,
+    Rejected,
+    /// Nobody answered in time: the sessions waiting on it give up too,
+    /// rather than putting the prompt up again one after another.
+    Unanswered,
+}
+static HOST_KEY_QUESTIONS: std::sync::Mutex<Option<AskedQuestions>> = std::sync::Mutex::new(None);
+static HOST_KEY_QUESTION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+enum HostKeyTurn {
+    /// Another session is asking this: its answer comes through here.
+    Follow(tokio::sync::watch::Receiver<Option<HostKeyAnswer>>),
+    /// This session asks.
+    Ask(HostKeyAsker),
+}
+
+/// The session asking a host-key question, until it's done (dropped).
+struct HostKeyAsker {
+    question: HostKeyQuestion,
+    id: u64,
+    tx: tokio::sync::watch::Sender<Option<HostKeyAnswer>>,
+}
+
+impl HostKeyAsker {
+    fn answer(&self, answer: HostKeyAnswer) {
+        let _ = self.tx.send(Some(answer));
+    }
+}
+
+impl Drop for HostKeyAsker {
+    fn drop(&mut self) {
+        let mut guard = HOST_KEY_QUESTIONS.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(map) = guard.as_mut() {
+            if map.get(&self.question).is_some_and(|(id, _)| *id == self.id) {
+                map.remove(&self.question);
+            }
+        }
+    }
+}
+
+fn host_key_turn(question: HostKeyQuestion) -> HostKeyTurn {
+    let mut guard = HOST_KEY_QUESTIONS.lock().unwrap_or_else(|p| p.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if let Some((_, rx)) = map.get(&question) {
+        return HostKeyTurn::Follow(rx.clone());
+    }
+    let (tx, rx) = tokio::sync::watch::channel(None);
+    let id = HOST_KEY_QUESTION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    map.insert(question.clone(), (id, rx));
+    HostKeyTurn::Ask(HostKeyAsker { question, id, tx })
+}
+
+/// The answer the asking session got: `None` when it went away without one
+/// (its tab closed, or it was replaced) — then the next one asks.
+async fn asked_answer(mut rx: tokio::sync::watch::Receiver<Option<HostKeyAnswer>>) -> Option<HostKeyAnswer> {
+    let answered = rx.wait_for(|v| v.is_some()).await.map(|v| *v);
+    answered.unwrap_or_else(|_| *rx.borrow())
+}
+
 pub struct ClientHandler {
     pub app: AppHandle,
     pub session_id: String,
@@ -739,6 +808,54 @@ impl client::Handler for ClientHandler {
             }));
         }
 
+        // The same question already on screen for another session: take its
+        // answer instead of asking again. If it goes unanswered, ask here.
+        let question: HostKeyQuestion = (self.server_host.clone(), self.server_port, fp_str.clone());
+        let asker = loop {
+            let rx = match host_key_turn(question.clone()) {
+                HostKeyTurn::Ask(a) => break a,
+                HostKeyTurn::Follow(rx) => rx,
+            };
+            let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
+                "msg": "Another session is asking about this same host key — waiting for that answer.",
+                "type": "info"
+            }));
+            // Waiting on a person, so the handshake timeout holds off (see below).
+            self.prompt_pending.store(true, std::sync::atomic::Ordering::SeqCst);
+            let wait = asked_answer(rx);
+            tokio::pin!(wait);
+            let answer = loop {
+                tokio::select! {
+                    a = &mut wait => break Some(a),
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(500)) => {
+                        if !self.attempt.may_prompt().await {
+                            break None;
+                        }
+                    }
+                }
+            };
+            self.prompt_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+            let (msg, outcome) = match answer {
+                // This attempt was replaced or closed while waiting.
+                None => {
+                    self.fp_outcome.store(0, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(false);
+                }
+                Some(None) => continue,
+                Some(Some(HostKeyAnswer::Accepted)) => ("Host key accepted (answered in another session).", 1),
+                Some(Some(HostKeyAnswer::Rejected)) => ("Host key rejected (answered in another session).", 0),
+                Some(Some(HostKeyAnswer::Unanswered)) => {
+                    ("Host key verification timed out (the prompt in another session wasn't answered).", 2)
+                }
+            };
+            let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
+                "msg": msg,
+                "type": if outcome == 1 { "success" } else { "error" }
+            }));
+            self.fp_outcome.store(outcome, std::sync::atomic::Ordering::SeqCst);
+            return Ok(outcome == 1);
+        };
+
         // Mark a prompt as pending BEFORE emitting it. The connect driver
         // reads this to keep its 15s handshake timeout from killing the human
         // approval window below — the timeout bounds only the pre-prompt phase.
@@ -757,14 +874,38 @@ impl client::Handler for ClientHandler {
             "nonce": self.connect_nonce,
         }));
 
-        let decision = if let Some(rx) = self.fp_rx.take() {
+        let decision = if let Some(mut rx) = self.fp_rx.take() {
             // 90s is enough for a human to read the prompt, switch windows
             // to verify the fingerprint out-of-band, and click. The old 10s
             // window routinely tripped on attentive users and then surfaced
             // as a confusing "Auth failed" because russh interprets the
             // returned `false` as "client rejected the host key" and tears
             // the connection down — same error path as wrong credentials.
-            match tokio::time::timeout(tokio::time::Duration::from_secs(90), rx).await {
+            // An attempt replaced or closed meanwhile stops waiting at once,
+            // so sessions waiting on this answer don't sit out the 90s.
+            let deadline = tokio::time::sleep(tokio::time::Duration::from_secs(90));
+            tokio::pin!(deadline);
+            // Ok(answer) | Ok(Err) = channel gone | Err(true) = timed out |
+            // Err(false) = this attempt was replaced or closed.
+            let waited: Result<Result<bool, ()>, bool> = loop {
+                tokio::select! {
+                    r = &mut rx => break Ok(r.map_err(|_| ())),
+                    _ = &mut deadline => break Err(true),
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(500)) => {
+                        if !self.attempt.may_prompt().await {
+                            break Err(false);
+                        }
+                    }
+                }
+            };
+            match waited {
+                // Quietly, like a superseded attempt above: the tab has moved
+                // on. Its prompt goes; the sessions waiting on it ask next.
+                Err(false) => {
+                    let _ = self.app.emit(&format!("fingerprint-prompt-dismiss-{}", self.session_id), serde_json::json!({ "nonce": self.connect_nonce }));
+                    self.fp_outcome.store(0, std::sync::atomic::Ordering::SeqCst);
+                    Ok(false)
+                }
                 Ok(Ok(true)) => {
                     // Save to database. If this was a mismatch the stale
                     // same-FAMILY rows are replaced in the same transaction —
@@ -787,6 +928,7 @@ impl client::Handler for ClientHandler {
                         "msg": if mismatch { "New host key accepted. Old entries replaced." } else { "Host key accepted and saved." },
                         "type": "success"
                     }));
+                    asker.answer(HostKeyAnswer::Accepted);
                     self.fp_outcome.store(1, std::sync::atomic::Ordering::SeqCst);
                     Ok(true)
                 }
@@ -795,6 +937,7 @@ impl client::Handler for ClientHandler {
                         "msg": "Host key rejected by user.",
                         "type": "error"
                     }));
+                    asker.answer(HostKeyAnswer::Rejected);
                     let _ = self.app.emit(&format!("fingerprint-prompt-dismiss-{}", self.session_id), serde_json::json!({ "nonce": self.connect_nonce }));
                     self.fp_outcome.store(0, std::sync::atomic::Ordering::SeqCst);
                     Ok(false)
@@ -805,6 +948,7 @@ impl client::Handler for ClientHandler {
                         "type": "error"
                     }));
                     let _ = self.app.emit(&format!("fingerprint-prompt-dismiss-{}", self.session_id), serde_json::json!({ "nonce": self.connect_nonce }));
+                    asker.answer(HostKeyAnswer::Unanswered);
                     self.fp_outcome.store(2, std::sync::atomic::Ordering::SeqCst);
                     Ok(false)
                 }
@@ -824,6 +968,8 @@ impl client::Handler for ClientHandler {
         // The human window has resolved (accepted / rejected / timed out) —
         // clear the flag so the driver's prompt-aware timeout settles promptly.
         self.prompt_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        // Sessions waiting on this answer have it (or, unanswered, ask next).
+        drop(asker);
         decision
     }
 
@@ -908,6 +1054,29 @@ impl client::Handler for ClientHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn one_host_key_question_at_a_time() {
+        let q = || ("hk-test.example".to_string(), 22u16, "SHA256:abc".to_string());
+        let HostKeyTurn::Ask(asker) = host_key_turn(q()) else { panic!("first one asks") };
+        let HostKeyTurn::Follow(rx) = host_key_turn(q()) else { panic!("second one follows") };
+        // Another key on the same host is its own question.
+        let HostKeyTurn::Ask(_other) = host_key_turn(("hk-test.example".into(), 22, "SHA256:xyz".into())) else {
+            panic!("a different key asks for itself")
+        };
+        let waiting = tokio::spawn(asked_answer(rx));
+        asker.answer(HostKeyAnswer::Accepted);
+        assert_eq!(waiting.await.unwrap(), Some(HostKeyAnswer::Accepted));
+        drop(asker);
+
+        // Gone without an answer: the follower hears None and asks itself.
+        let HostKeyTurn::Ask(asker) = host_key_turn(q()) else { panic!("asks again once the first is done") };
+        let HostKeyTurn::Follow(rx) = host_key_turn(q()) else { panic!("follows") };
+        let waiting = tokio::spawn(asked_answer(rx));
+        drop(asker);
+        assert_eq!(waiting.await.unwrap(), None);
+        assert!(matches!(host_key_turn(q()), HostKeyTurn::Ask(_)));
+    }
 
     #[test]
     fn last_heard_counts_only_what_arrived_after_the_question() {

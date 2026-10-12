@@ -6,9 +6,8 @@ import {
   Plus, X, RefreshCw, Terminal, Key, Trash2,
   ArrowLeftRight, Shield, User, Cpu, TerminalSquare, List, Edit2,
   StickyNote, Search, Square, Copy, ChevronLeft, MoreVertical, Radio,
-  ChevronDown, Columns, LayoutGrid, Pin, PinOff, Home
+  ChevronDown, Columns, LayoutGrid, Home, Pause
 } from "lucide-react";
-import { useBroadcast } from "./ui/broadcast";
 
 import ProfileSelectPage from "./components/ProfileSelectPage";
 import logoUrl from "./assets/logo.png";
@@ -24,7 +23,9 @@ import HomePane from "./components/HomePane";
 import { IS_ANDROID } from "./util/platform";
 import type { RdpLink } from "./components/RdpLinkModal";
 import AddNodePanel from "./components/AddNodePanel";
-import TerminalView from "./components/TerminalView";
+import WallView, { type Wall, type WallMember } from "./components/WallView";
+import WallsMenu, { AllTabsMenu, WallEditorModal, WallPicker, type SavedWall } from "./components/WallsMenu";
+import { appHotkey } from "./ui/terminalDock";
 import SettingsPanel from "./components/SettingsPanel";
 import ProfilePanel from "./components/ProfilePanel";
 import { SessionView } from "./components/SessionView";
@@ -39,7 +40,9 @@ const appWindow = getCurrentWindow();
 // looking up the DB row.
 // `host`: the server's host when its tab was opened, which the OS badge
 // check goes by (an edit made while the tab is open doesn't move it).
-type Session = { id: string; serverId: number; serverName: string; host?: string; mirrors?: string; runOnConnect?: string; quickAuth?: QuickAuth | null };
+// `wallId`: opened into that Wall (a folder of servers opened at once), so it
+// has no tab of its own until it's popped out of the Wall.
+type Session = { id: string; serverId: number; serverName: string; host?: string; mirrors?: string; runOnConnect?: string; quickAuth?: QuickAuth | null; wallId?: string };
 
 // The Home view (HomePane): terminals on this computer, where the app opens
 // and where closing the last session tab goes back to. Android has no shells
@@ -57,11 +60,6 @@ const hexToRgb = (hex: string) => {
 function DesktopApp() {
   const [loading, setLoading] = useState(true);
   const [isUnlocked, setIsUnlocked] = useState(false);
-  // Multi-exec broadcast state lives in a shared provider (see App.tsx) so
-  // TerminalView instances across every tab can read `enabled` + `targets`
-  // without prop-drilling. The pill in the tab strip is the toggle + picker.
-  const broadcast = useBroadcast();
-  const [broadcastMenuOpen, setBroadcastMenuOpen] = useState(false);
   // `activeProfile` is the name the user picked + unlocked. Stays null
   // until ProfileSelectPage's onUnlocked fires, at which point the app
   // flips straight into the main view — no intermediate state.
@@ -90,30 +88,25 @@ function DesktopApp() {
   // the "Merge with…" context action on session tabs so users don't need
   // a separate Compare page to see two servers together.
   const [mergedSessionIds, setMergedSessionIds] = useState<string[]>([]);
-  // "Wall" pinboard — a permanent tab at the end of the session strip
-  // that hosts a user-controlled grid of individual terminals. Each
-  // pin is a (sessionId, terminalId) pair; the tile mounts its OWN
-  // TerminalView with `attachOnly=true`, hitching onto the same PTY
-  // as the primary xterm in the session tab. That means the session
-  // still owns the PTY lifecycle (open on tab creation, close on tab
-  // close) and the Wall tile is a live mirror — it receives every
-  // byte the PTY writes and can also send input into it. Trade-off:
-  // scrollback in the Wall tile only accumulates from the moment of
-  // pin (the primary xterm holds the full pre-pin history), and the
-  // two xterms may fight briefly over resize_terminal on view switch,
-  // which reflows correctly once one settles.
-  type WallItem = { id: string; sessionId: string; terminalId: string };
-  const [wallItems, setWallItems] = useState<WallItem[]>([]);
-  // User-controlled grid density. Higher = smaller tiles, tighter row
-  // packing. Clamped at 1..6 which covers phone-portrait (1) through
-  // wide-monitor (6) comfortably; anything past 6 makes xterm columns
-  // useless.
-  const [wallCols, setWallCols] = useState<number>(2);
-  const [wallPickerOpen, setWallPickerOpen] = useState(false);
+  // Walls (WallView): terminals from many servers side by side, each Wall a
+  // view of its own (`activeView` = its id) with a tab after Home. A Wall
+  // with Broadcast on types to all of its terminals — MultiExec. Members are
+  // terminals of open sessions; sessions opened INTO a Wall (Session.wallId)
+  // have no tab of their own, so a hundred servers are one tab, not a
+  // hundred. Saved walls (multiexec.rs) are named sets of servers to open as
+  // a Wall again.
+  const [walls, setWalls] = useState<Wall[]>([]);
+  const wallSeq = useRef(0);
+  const [savedWalls, setSavedWalls] = useState<SavedWall[]>([]);
+  // Which Wall's "Add terminals" picker is open; the Walls ▾ and All tabs ▾
+  // menus; the saved-wall editor.
+  const [wallPickerFor, setWallPickerFor] = useState<string | null>(null);
+  const [wallsMenuOpen, setWallsMenuOpen] = useState(false);
+  const [allTabsOpen, setAllTabsOpen] = useState(false);
+  const [wallEditor, setWallEditor] = useState<SavedWall | null>(null);
   // Per-session terminals + active terminal id, bubbled up from each
   // SessionView via onTerminalsChange. Sourced here so the Wall picker
-  // and pin/unpin helpers can enumerate terminals without duplicating
-  // SessionView's state.
+  // can enumerate terminals without duplicating SessionView's state.
   type SessionTerm = { id: string; title: string; container?: { name: string; useSudo: boolean } };
   const [sessionTerminals, setSessionTerminals] = useState<Record<string, SessionTerm[]>>({});
   const [sessionActiveTerm, setSessionActiveTerm] = useState<Record<string, string>>({});
@@ -127,17 +120,64 @@ function DesktopApp() {
     });
     setSessionActiveTerm(prev => (prev[sid] === activeTermId ? prev : { ...prev, [sid]: activeTermId }));
   }, []);
-  const wallHasTerminal = (terminalId: string) => wallItems.some(i => i.terminalId === terminalId);
-  const pinTerminalToWall = (sid: string, terminalId: string) => {
-    if (wallHasTerminal(terminalId)) return;
-    setWallItems(prev => [...prev, { id: `wall-${terminalId}`, sessionId: sid, terminalId }]);
+  const updateWall = useCallback((id: string, patch: Partial<Wall>) => {
+    setWalls(prev => prev.map(w => (w.id === id ? { ...w, ...patch } : w)));
+  }, []);
+  // A closed session leaves every Wall it was on, and its terminals are
+  // forgotten — reopened, the server starts again at its first terminal.
+  const forgetSession = useCallback((sid: string) => {
+    setWalls(prev => prev.map(w => {
+      if (!w.members.some(m => m.sessionId === sid)) return w;
+      const members = w.members.filter(m => m.sessionId !== sid);
+      return { ...w, members, paused: w.paused.filter(t => members.some(m => m.terminalId === t)) };
+    }));
+    setSessionTerminals(prev => {
+      if (!(sid in prev)) return prev;
+      const { [sid]: _gone, ...rest } = prev;
+      return rest;
+    });
+    setSessionActiveTerm(prev => {
+      if (!(sid in prev)) return prev;
+      const { [sid]: _gone, ...rest } = prev;
+      return rest;
+    });
+  }, []);
+  // The terminal a session joins a Wall with: the one on screen in its tab.
+  const terminalOf = (sid: string) => sessionActiveTerm[sid] ?? `${sid}-term-0`;
+  const addToWall = (wallId: string, add: WallMember[]) => {
+    setWalls(prev => prev.map(w => {
+      if (w.id !== wallId) return w;
+      const fresh = add.filter(m => !w.members.some(x => x.terminalId === m.terminalId));
+      return fresh.length ? { ...w, members: [...w.members, ...fresh] } : w;
+    }));
   };
-  const unpinTerminalFromWall = (terminalId: string) => {
-    setWallItems(prev => prev.filter(i => i.terminalId !== terminalId));
+  const removeFromWall = (wallId: string, terminalId: string) => {
+    setWalls(prev => prev.map(w => (w.id !== wallId ? w : {
+      ...w,
+      members: w.members.filter(m => m.terminalId !== terminalId),
+      paused: w.paused.filter(t => t !== terminalId),
+    })));
   };
-  const unpinSessionFromWall = (sid: string) => {
-    setWallItems(prev => prev.filter(i => i.sessionId !== sid));
+  const makeWallId = () => `wall-${++wallSeq.current}`;
+  const newWall = (name: string, members: WallMember[], opts: { broadcast?: boolean; cols?: number; savedId?: number | null; id?: string } = {}) => {
+    const id = opts.id ?? makeWallId();
+    setWalls(prev => [...prev, {
+      id, name, members, broadcast: !!opts.broadcast, paused: [], solo: null, cols: opts.cols ?? 0, savedId: opts.savedId ?? null,
+    }]);
+    setMergedSessionIds([]);
+    setActiveView(id);
+    return id;
   };
+  const activeWall = walls.find(w => w.id === activeView) ?? null;
+  // The tab strip scrolls the tab on screen into view — with dozens open, a
+  // tab popped out of a Wall or picked from All tabs lands past the edge.
+  const tabStripRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const strip = tabStripRef.current;
+    if (!strip) return;
+    const tab = [...strip.querySelectorAll<HTMLElement>("[data-tab]")].find(el => el.dataset.tab === activeView);
+    tab?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [activeView, sessions, walls.length]);
   // Mobile-only session picker toggle. Horizontally-scrolling tabs eat
   // the whole title row on a 400 px phone; replacing them with a compact
   // dropdown gives the tab strip predictable width and matches iOS/
@@ -343,10 +383,6 @@ function DesktopApp() {
         setSessions(prev => prev.filter(s => s.id !== sessId));
         setSessionStatuses(prev => { const { [sessId]: _, ...rest } = prev; return rest; });
         setActiveView(prev => (prev === sessId ? START_VIEW : prev));
-        // Purge the closing session from broadcast state so a stale id doesn't
-        // linger in the target set (would let a user re-enable broadcast and
-        // silently exclude a phantom target from the count).
-        broadcast.removeSession(sessId);
         // If the closing session was merged as a side pane in another
         // session's canvas, drop it — otherwise the tile would render
         // an empty <SessionView>. Collapse the whole split when it
@@ -355,15 +391,15 @@ function DesktopApp() {
           const next = prev.filter(id => id !== sessId);
           return next.length < 2 ? [] : next;
         });
-        // Purge the closing session from the Wall pinboard too — a stale
-        // tile with no backing SessionView would render blank.
-        setWallItems(prev => prev.filter(i => i.sessionId !== sessId));
+        // And leaves the Walls it was on — a tile with no session behind it
+        // would stay blank.
+        forgetSession(sessId);
         closeHandlersRef.current.delete(sessId);
       };
       closeHandlersRef.current.set(sessId, h);
     }
     return h;
-  }, [broadcast]);
+  }, [forgetSession]);
 
   // Stable identity matters: SessionView memoises on prop equality, so a
   // fresh `addLog` reference on every DesktopApp render would force every
@@ -401,6 +437,10 @@ function DesktopApp() {
     try { setRdpLinks(await invoke<RdpLink[]>("rdp_list")); }
     catch (e) { addLog(`SYNC_RDP_LINKS: ${e}`, "error"); }
   };
+  const refreshSavedWalls = async () => {
+    try { setSavedWalls(await invoke<SavedWall[]>("wall_list")); }
+    catch (e) { addLog(`SYNC_WALLS: ${e}`, "error"); }
+  };
   const refreshCommands = async () => {
     try { setCommands((await invoke("get_commands")) as any[]); }
     catch (e) { addLog(`SYNC_COMMANDS: ${e}`, "error"); }
@@ -416,6 +456,7 @@ function DesktopApp() {
       refreshSshKeys(),
       refreshFolders(),
       refreshRdpLinks(),
+      refreshSavedWalls(),
       refreshCommands(),
       refreshNotes(),
     ]);
@@ -780,6 +821,8 @@ function DesktopApp() {
     setIsUnlocked(false);
     setActiveProfile(null);
     setSessions([]);
+    setWalls([]);
+    setSavedWalls([]);
     setActiveView(START_VIEW);
     setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setRdpLinks([]); setCommands([]);
     osChecked.current.clear();
@@ -809,28 +852,308 @@ function DesktopApp() {
   // Open servers, each in its own tab (one already open is just shown);
   // focus lands on the first. Several at once from the session tree's
   // multi-select and "Open all".
+  const sessionFor = (server: any): Session => ({
+    id: `session-${server.id}`,
+    serverId: server.id,
+    serverName: server.name,
+    host: server.host,
+    // Pass the raw mirrors JSON through to SessionView so the
+    // MirrorsPanel can pre-populate "Saved on this node" without
+    // another round-trip to the backend.
+    mirrors: server.mirrors,
+    // Commands to auto-run once on the first terminal (see SessionView).
+    runOnConnect: server.run_on_connect || "",
+  });
   const openServers = (list: any[]) => {
     if (list.length === 0) return;
     setSessions((prev: Session[]) => {
       const seen = new Set(prev.map((p) => p.id));
       const fresh = list
         .filter((server) => !seen.has(`session-${server.id}`))
-        .map((server) => ({
-          id: `session-${server.id}`,
-          serverId: server.id,
-          serverName: server.name,
-          host: server.host,
-          // Pass the raw mirrors JSON through to SessionView so the
-          // MirrorsPanel can pre-populate "Saved on this node" without
-          // another round-trip to the backend.
-          mirrors: server.mirrors,
-          // Commands to auto-run once on the first terminal (see SessionView).
-          runOnConnect: server.run_on_connect || "",
-        }));
+        .map(sessionFor);
       return [...prev, ...fresh];
     });
     setActiveView(`session-${list[0].id}`);
   };
+
+  // Open servers as one Wall instead of a tab each: the ones not open yet
+  // connect inside the Wall (no tab of their own until popped out); ones
+  // already open join with the terminal on screen in their tab. A saved wall
+  // that's open already is just shown.
+  const openServersAsWall = (list: any[], name: string, opts: { broadcast?: boolean; cols?: number; savedId?: number | null } = {}) => {
+    if (opts.savedId != null) {
+      const open = walls.find(w => w.savedId === opts.savedId);
+      if (open) {
+        if (opts.broadcast && !open.broadcast) updateWall(open.id, { broadcast: true });
+        setMergedSessionIds([]);
+        setActiveView(open.id);
+        return;
+      }
+    }
+    if (list.length === 0) return;
+    const id = makeWallId();
+    const openIds = new Set(sessions.map(s => s.id));
+    setSessions((prev: Session[]) => {
+      const seen = new Set(prev.map((p) => p.id));
+      const fresh = list
+        .filter((server) => !seen.has(`session-${server.id}`))
+        .map((server) => ({ ...sessionFor(server), wallId: id }));
+      return [...prev, ...fresh];
+    });
+    const members: WallMember[] = [];
+    for (const server of list) {
+      const sid = `session-${server.id}`;
+      const terminalId = openIds.has(sid) ? terminalOf(sid) : `${sid}-term-0`;
+      if (!members.some(m => m.terminalId === terminalId)) members.push({ sessionId: sid, terminalId });
+    }
+    newWall(name, members, { ...opts, id });
+  };
+
+  const openSavedWall = (sw: SavedWall, broadcast = false) => {
+    const list = sw.server_ids.map(id => servers.find((s: any) => s.id === id)).filter(Boolean);
+    if (list.length === 0) {
+      void confirm({ title: `"${sw.name}" is empty`, message: "None of its servers exist any more. Edit it to pick some.", okLabel: "OK", cancelLabel: "Close" });
+      return;
+    }
+    openServersAsWall(list, sw.name, { broadcast, cols: sw.cols, savedId: sw.id });
+  };
+
+  // Save a Wall's servers as a saved wall, or update the one it came from.
+  // Quick-connect sessions have no saved server to open again.
+  const saveWall = async (w: Wall) => {
+    const ids = [...new Set(w.members
+      .map(m => sessions.find(s => s.id === m.sessionId)?.serverId)
+      .filter((id): id is number => !!id && id > 0))];
+    if (ids.length === 0) {
+      await confirm({ title: "Nothing to save", message: "None of this wall's terminals are on a saved server (quick-connect sessions can't be opened again).", okLabel: "OK", cancelLabel: "Close" });
+      return;
+    }
+    let name = w.name;
+    let savedId = w.savedId != null && savedWalls.some(x => x.id === w.savedId) ? w.savedId : null;
+    if (savedId == null) {
+      const typed = await textPrompt({
+        title: "Save wall",
+        message: `Opens these ${ids.length} server${ids.length === 1 ? "" : "s"} again as a wall, from Walls ▾.`,
+        initialValue: w.name,
+        okLabel: "Save",
+        validate: (v) => (v.trim() ? null : "Give the wall a name."),
+      });
+      if (typed == null) return;
+      name = typed.trim();
+      savedId = null;
+    }
+    try {
+      const id = await invoke<number>("wall_save", { wall: { id: savedId, name, server_ids: ids, cols: w.cols } });
+      updateWall(w.id, { savedId: id, name });
+      await refreshSavedWalls();
+      addLog(`Saved wall "${name}".`, "success");
+    } catch (e) {
+      addLog(`WALL_SAVE: ${e}`, "error");
+    }
+  };
+
+  const renameWall = async (w: Wall) => {
+    const typed = await textPrompt({
+      title: "Rename wall",
+      initialValue: w.name,
+      okLabel: "Rename",
+      validate: (v) => (v.trim() ? null : "Give the wall a name."),
+    });
+    if (typed != null) updateWall(w.id, { name: typed.trim() });
+  };
+
+  // Close a Wall. Its terminals' sessions stay open in their tabs; the ones
+  // opened into it (no tab of their own) close with it — unless another
+  // open Wall has them, which then keeps them.
+  const closeWall = async (wallId: string) => {
+    const keeper = (sid: string) => walls.find(o => o.id !== wallId && o.members.some(m => m.sessionId === sid));
+    const own = sessions.filter(s => s.wallId === wallId);
+    const closing = own.filter(s => !keeper(s.id));
+    if (closing.some(s => sessionStatuses[s.id] === "connected")) {
+      const ok = await confirm({
+        title: "Close this wall?",
+        message: `${closing.length} session${closing.length === 1 ? " was" : "s were"} opened into it and ${closing.length === 1 ? "has no tab" : "have no tabs"} of ${closing.length === 1 ? "its" : "their"} own, so ${closing.length === 1 ? "it closes" : "they close"} with it.`,
+        okLabel: "Close",
+        destructive: true,
+      });
+      if (!ok) return;
+    }
+    const closingIds = new Set(closing.map(s => s.id));
+    setSessions(prev => prev
+      .filter(s => !closingIds.has(s.id))
+      .map(s => (s.wallId === wallId ? { ...s, wallId: keeper(s.id)?.id } : s)));
+    setSessionStatuses(prev => {
+      const next = { ...prev };
+      for (const sid of closingIds) delete next[sid];
+      return next;
+    });
+    setWalls(prev => prev.filter(w => w.id !== wallId));
+    for (const sid of closingIds) forgetSession(sid);
+    setActiveView(prev => (prev === wallId || closingIds.has(prev) ? START_VIEW : prev));
+  };
+
+  // A tile's ✕. A session that was opened for this Wall (no tab of its own)
+  // closes — unless another Wall has it too, which then keeps it; any other
+  // just leaves the Wall and keeps its tab.
+  const removeWallMember = (wall: Wall, m: WallMember) => {
+    const s = sessions.find(x => x.id === m.sessionId);
+    const sameSessionHere = wall.members.some(o => o.sessionId === m.sessionId && o.terminalId !== m.terminalId);
+    if (s?.wallId === wall.id && !sameSessionHere) {
+      const other = walls.find(o => o.id !== wall.id && o.members.some(x => x.sessionId === m.sessionId));
+      if (!other) {
+        void closeSessions([m.sessionId]);
+        return;
+      }
+      setSessions(prev => prev.map(x => (x.id === m.sessionId ? { ...x, wallId: other.id } : x)));
+    }
+    removeFromWall(wall.id, m.terminalId);
+  };
+
+  // Close sessions by id (All tabs ▾), asking first when any is connected.
+  // Unmounting a SessionView disconnects it.
+  const closeSessions = async (ids: string[]) => {
+    if (ids.length === 0) return;
+    const connected = ids.filter(id => sessionStatuses[id] === "connected").length;
+    if (connected > 0) {
+      const ok = await confirm({
+        title: ids.length === 1 ? "Close this session?" : `Close ${ids.length} sessions?`,
+        message: connected === 1 ? "Its SSH connection will be dropped." : `${connected} SSH connections will be dropped.`,
+        okLabel: "Close",
+        destructive: true,
+      });
+      if (!ok) return;
+    }
+    const closing = new Set(ids);
+    setSessions(prev => prev.filter(s => !closing.has(s.id)));
+    setSessionStatuses(prev => {
+      const next = { ...prev };
+      for (const id of closing) delete next[id];
+      return next;
+    });
+    setMergedSessionIds(prev => {
+      const next = prev.filter(id => !closing.has(id));
+      return next.length < 2 ? [] : next;
+    });
+    for (const id of closing) forgetSession(id);
+    setActiveView(prev => (closing.has(prev) ? START_VIEW : prev));
+  };
+
+  const saveSavedWall = async (w: SavedWall, open: boolean) => {
+    try {
+      const id = await invoke<number>("wall_save", { wall: w });
+      setWallEditor(null);
+      await refreshSavedWalls();
+      if (open) openSavedWall({ ...w, id }, false);
+    } catch (e) {
+      await confirm({ title: "Couldn't save the wall", message: String(e), okLabel: "OK", cancelLabel: "Close" });
+    }
+  };
+  const deleteSavedWall = async (w: SavedWall) => {
+    if (w.id == null) return;
+    const ok = await confirm({
+      title: `Delete the wall "${w.name}"?`,
+      message: "Only the saved wall goes; its servers stay, and a wall of it that is open stays open.",
+      okLabel: "Delete",
+      destructive: true,
+    });
+    if (!ok) return;
+    try {
+      await invoke("wall_delete", { id: w.id });
+      setWalls(prev => prev.map(x => (x.savedId === w.id ? { ...x, savedId: null } : x)));
+      await refreshSavedWalls();
+    } catch (e) {
+      addLog(`WALL_DELETE: ${e}`, "error");
+    }
+  };
+
+  // Broadcast on/off — the title bar's button and Ctrl+Shift+B. On a Wall it
+  // flips that Wall's Broadcast. Elsewhere it goes back to the Wall that is
+  // broadcasting, or — when none is — puts every open server tab on one and
+  // starts broadcasting to them (the second time, that same Wall as it was).
+  const autoWallRef = useRef<string | null>(null);
+  const toggleBroadcast = () => {
+    if (!isUnlocked) return;
+    if (activeWall) {
+      updateWall(activeWall.id, { broadcast: !activeWall.broadcast });
+      return;
+    }
+    const live = walls.find(w => w.broadcast);
+    if (live) {
+      setMergedSessionIds([]);
+      setActiveView(live.id);
+      return;
+    }
+    const tabs = sessions.filter(s => !s.wallId);
+    if (tabs.length === 0) {
+      // Everything open is on Walls already: broadcast on the newest.
+      const last = walls[walls.length - 1];
+      if (last) {
+        updateWall(last.id, { broadcast: true });
+        setMergedSessionIds([]);
+        setActiveView(last.id);
+      }
+      return;
+    }
+    // The Wall it made before comes back as it was left: terminals taken off
+    // it stay off.
+    const auto = walls.find(w => w.id === autoWallRef.current);
+    if (auto) {
+      updateWall(auto.id, { broadcast: true });
+      setMergedSessionIds([]);
+      setActiveView(auto.id);
+      return;
+    }
+    const members = tabs.map(s => ({ sessionId: s.id, terminalId: terminalOf(s.id) }));
+    autoWallRef.current = newWall("Broadcast", members, { broadcast: true });
+  };
+  const toggleBroadcastRef = useRef(toggleBroadcast);
+  toggleBroadcastRef.current = toggleBroadcast;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (appHotkey(e) !== "broadcast" || e.repeat) return;
+      e.preventDefault();
+      // Not under a dialog: a paste confirm, say, is about the Wall as it is.
+      if (document.querySelector('[aria-modal="true"]')) return;
+      toggleBroadcastRef.current();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // A session opened into a Wall that's then shown on its own — "open in
+  // its own tab", or picked from the tree or All tabs — gets its tab.
+  useEffect(() => {
+    const s = sessions.find(x => x.id === activeView);
+    if (s?.wallId) setSessions(prev => prev.map(x => (x.id === s.id ? { ...x, wallId: undefined } : x)));
+  }, [activeView, sessions]);
+
+  // A session opened into a Wall that's no longer on it (or on any Wall) is
+  // never left running with no tab and no tile: another Wall that has it
+  // takes it, or it gets its tab.
+  useEffect(() => {
+    const home = (s: Session) => walls.find(w => w.members.some(m => m.sessionId === s.id));
+    const stray = sessions.filter(s => s.wallId && !walls.some(w => w.id === s.wallId && w.members.some(m => m.sessionId === s.id)));
+    if (stray.length === 0) return;
+    const ids = new Set(stray.map(s => s.id));
+    setSessions(prev => prev.map(s => (ids.has(s.id) && s.wallId ? { ...s, wallId: home(s)?.id } : s)));
+  }, [sessions, walls]);
+
+  // A terminal closed in its session leaves the Walls it was on.
+  useEffect(() => {
+    setWalls(prev => {
+      let changed = false;
+      const next = prev.map(w => {
+        const members = w.members.filter(m => {
+          const terms = sessionTerminals[m.sessionId];
+          return !terms || terms.some(t => t.id === m.terminalId);
+        });
+        if (members.length === w.members.length) return w;
+        changed = true;
+        return { ...w, members, paused: w.paused.filter(t => members.some(m => m.terminalId === t)) };
+      });
+      return changed ? next : prev;
+    });
+  }, [sessionTerminals]);
 
   const openServer = (server: any) => openServers([server]);
 
@@ -960,7 +1283,7 @@ function DesktopApp() {
               type="button"
               onClick={() => setMobileSessionPickerOpen(v => !v)}
               className={`w-full h-7 px-3 rounded-full flex items-center gap-2 border transition-all ${
-                activeView.startsWith('session-') || activeView === 'wall'
+                activeView.startsWith('session-') || activeWall
                   ? 'bg-primary/15 text-primary border-primary/40 shadow-inner'
                   : 'bg-white/[0.06] text-zinc-300 border-white/10'
               }`}
@@ -968,7 +1291,7 @@ function DesktopApp() {
               aria-expanded={mobileSessionPickerOpen}
             >
               {(() => {
-                const isWall = activeView === 'wall';
+                const isWall = !!activeWall;
                 const cur = sessions.find(s => s.id === activeView);
                 const st = cur ? (sessionStatuses[cur.id] ?? 'connecting') : null;
                 const dotTone =
@@ -984,8 +1307,8 @@ function DesktopApp() {
                       ? <LayoutGrid size={12} className="shrink-0 text-primary" />
                       : (cur && <span className={`w-2 h-2 rounded-full shrink-0 ${dotTone}`} />)}
                     <span className="truncate flex-1 text-left text-[11px] font-bold">
-                      {isWall
-                        ? `Wall${wallItems.length > 0 ? ` · ${wallItems.length} pinned` : ''}`
+                      {activeWall
+                        ? `${activeWall.name} · ${activeWall.members.length}`
                         : cur ? cur.serverName : `${sessions.length} open session${sessions.length === 1 ? '' : 's'}`}
                     </span>
                     {mergedSessionIds.length > 0 && (
@@ -1005,7 +1328,7 @@ function DesktopApp() {
                   role="listbox"
                   className="absolute z-[70] top-8 left-0 right-0 bg-[#15151a] border border-white/10 rounded-xl shadow-2xl p-1.5 max-h-[60vh] overflow-y-auto custom-scrollbar"
                 >
-                  {sessions.map(s => {
+                  {sessions.filter(s => !s.wallId).map(s => {
                     const st = sessionStatuses[s.id] ?? 'connecting';
                     const dot =
                       promptSessions.has(s.id) ? 'bg-primary animate-pulse' :
@@ -1070,12 +1393,11 @@ function DesktopApp() {
                             invoke('disconnect_session', { sessionId: sid }).catch(() => {});
                             setSessions(prev => prev.filter(x => x.id !== sid));
                             setSessionStatuses(prev => { const { [sid]: _, ...rest } = prev; return rest; });
-                            broadcast.removeSession(sid);
                             setMergedSessionIds(prev => {
                               const next = prev.filter(id => id !== sid);
                               return next.length < 2 ? [] : next;
                             });
-                            unpinSessionFromWall(sid);
+                            forgetSession(sid);
                             setActiveView(prev => (prev === sid ? START_VIEW : prev));
                           }}
                           title="Close session"
@@ -1086,31 +1408,31 @@ function DesktopApp() {
                       </div>
                     );
                   })}
-                  {/* Wall entry — mobile equivalent of the desktop Wall
-                      tab. Same pinboard, same state; just a different
-                      entry point since the horizontal tab strip is
-                      replaced by this dropdown on phone. */}
-                  <div className="border-t border-white/5 my-1" />
-                  <button
-                    onClick={() => {
-                      setMergedSessionIds([]);
-                      setActiveView('wall');
-                      setMobileSessionPickerOpen(false);
-                    }}
-                    className={`w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-left transition-all ${
-                      activeView === 'wall'
-                        ? 'bg-primary/15 text-primary'
-                        : 'text-zinc-200 hover:bg-white/[0.06]'
-                    }`}
-                  >
-                    <LayoutGrid size={13} className="shrink-0" />
-                    <span className="text-[12px] font-semibold flex-1">Wall</span>
-                    {wallItems.length > 0 && (
+                  {/* Walls — the phone's equivalent of the desktop Wall
+                      tabs, since the horizontal tab strip is replaced by
+                      this dropdown. */}
+                  {walls.length > 0 && <div className="border-t border-white/5 my-1" />}
+                  {walls.map(w => (
+                    <button
+                      key={w.id}
+                      onClick={() => {
+                        setMergedSessionIds([]);
+                        setActiveView(w.id);
+                        setMobileSessionPickerOpen(false);
+                      }}
+                      className={`w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-left transition-all ${
+                        activeView === w.id
+                          ? 'bg-primary/15 text-primary'
+                          : 'text-zinc-200 hover:bg-white/[0.06]'
+                      }`}
+                    >
+                      {w.broadcast ? <Radio size={13} className="shrink-0 text-orange-300" /> : <LayoutGrid size={13} className="shrink-0" />}
+                      <span className="text-[12px] font-semibold flex-1 truncate">{w.name}</span>
                       <span className="text-[9px] font-bold uppercase tracking-wider text-primary/70">
-                        {wallItems.length} pinned
+                        {w.members.length}
                       </span>
-                    )}
-                  </button>
+                    </button>
+                  ))}
                 </div>
               </>
             )}
@@ -1124,6 +1446,7 @@ function DesktopApp() {
           strip below is hidden on mobile. */}
       <div
         data-tauri-drag-region
+        ref={tabStripRef}
         className={`${isMobile ? 'hidden' : 'flex'} flex-1 gap-1 overflow-x-auto no-scrollbar h-full items-end pb-1`}
         onWheel={(e) => { e.currentTarget.scrollLeft += e.deltaY; }}
       >
@@ -1144,7 +1467,42 @@ function DesktopApp() {
             <span className="text-[11px] font-semibold whitespace-nowrap tracking-tight">Home</span>
           </div>
         )}
-        {sessions.map(s => {
+        {/* Walls come next: each is one tab however many servers it shows.
+            Orange while it broadcasts. */}
+        {walls.map(w => {
+          const on = activeView === w.id;
+          return (
+            <div
+              key={w.id}
+              data-tab={w.id}
+              onClick={() => { setMergedSessionIds([]); setActiveView(w.id); }}
+              title={`${w.name} — ${w.members.length} terminal${w.members.length === 1 ? '' : 's'}${w.broadcast ? ', broadcasting' : ''}`}
+              className={`group no-drag flex items-center gap-1.5 h-7 px-3 rounded-full cursor-pointer transition-all shrink-0 mr-1 ${
+                w.broadcast
+                  ? on
+                    ? 'bg-orange-500/20 text-orange-200 border border-orange-400/50 shadow-inner'
+                    : 'bg-orange-500/[0.08] text-orange-300/90 border border-orange-400/30 hover:bg-orange-500/15'
+                  : on
+                    ? 'bg-primary/15 text-primary border border-primary/40 shadow-inner shadow-primary/10'
+                    : 'bg-white/[0.06] text-zinc-300 border border-white/10 hover:bg-white/[0.1] hover:border-white/20 hover:text-white'
+              }`}
+            >
+              {w.broadcast ? <Radio size={12} className="shrink-0 animate-pulse" /> : <LayoutGrid size={12} className="shrink-0" />}
+              <span className="text-[11px] font-semibold whitespace-nowrap tracking-tight">{w.name}</span>
+              <span className="text-[10px] tabular-nums opacity-70">{w.members.length}</span>
+              <button
+                type="button"
+                aria-label="Close wall"
+                title="Close this wall"
+                className="hidden sm:flex ml-0.5 h-5 w-5 items-center justify-center rounded hover:bg-white/5 shrink-0 opacity-0 group-hover:opacity-100 text-zinc-400 hover:text-red-400 transition-opacity"
+                onClick={(e) => { e.stopPropagation(); void closeWall(w.id); }}
+              >
+                <X size={12} />
+              </button>
+            </div>
+          );
+        })}
+        {sessions.filter(s => !s.wallId).map(s => {
           const st = sessionStatuses[s.id] ?? "connecting";
           // Dot palette: green = connected, amber = connecting, red = failed
           // or disconnected. The pulse animation only runs while connecting
@@ -1167,14 +1525,19 @@ function DesktopApp() {
             st === "disconnected" ? "Disconnected" :
                                     st;
           // Broadcast indicator: small orange dot next to the status dot when
-          // this session is in the target set AND broadcast is armed. Kept
-          // separate from the status dot so the user can still tell "is it
-          // connected?" and "is it broadcasting?" at a glance.
-          const isBroadcastTarget = broadcast.enabled && broadcast.targetSessionIds.has(s.id);
+          // this session is on a Wall that is broadcasting — a pause mark
+          // instead when it's paused there. Kept separate from the status dot
+          // so the user can still tell "is it connected?" and "is it
+          // broadcasting?" at a glance.
+          const broadcasting = walls.filter(w => w.broadcast && w.members.some(m => m.sessionId === s.id));
+          const isBroadcastTarget = broadcasting.length > 0;
+          const isPausedTarget = isBroadcastTarget && broadcasting.every(w =>
+            w.members.every(m => m.sessionId !== s.id || w.paused.includes(m.terminalId)));
           const isMergedTab = mergedSessionIds.includes(s.id);
           return (
             <div
               key={s.id}
+              data-tab={s.id}
               onClick={(e) => {
                 // Ctrl/⌘-click toggles this tab in the split beside the
                 // currently-active session view — a quick keyboard-free
@@ -1226,7 +1589,11 @@ function DesktopApp() {
                 className={`w-2 h-2 rounded-full mr-2 shrink-0 ${dotTone}`}
                 aria-label={dotTitle}
               />
-              {isBroadcastTarget && (
+              {isPausedTarget ? (
+                <span title="Paused in the broadcast" aria-label="Paused in the broadcast" className="mr-1.5 shrink-0 text-zinc-400 flex">
+                  <Pause size={9} />
+                </span>
+              ) : isBroadcastTarget && (
                 <span
                   title="Broadcast target"
                   aria-label="Broadcast target"
@@ -1289,8 +1656,7 @@ function DesktopApp() {
                     const { [s.id]: _, ...rest } = prev;
                     return rest;
                   });
-                  broadcast.removeSession(s.id);
-                  unpinSessionFromWall(s.id);
+                  forgetSession(s.id);
                   setActiveView(prev => (prev === s.id ? START_VIEW : prev));
                 }}
               >
@@ -1300,168 +1666,125 @@ function DesktopApp() {
           );
         })}
       </div>
-      {/* Wall trigger — moved OUT of the scrollable tab strip and next
-          to the Broadcast pill so both multi-session affordances live
-          in the same "utility cluster" at the right edge of the title
-          bar. Icon-only on every viewport (mobile inherits from
-          Broadcast's compact pattern), badge for pin count so state is
-          legible without text. Visible whenever there's at least one
-          open session — the Wall itself only becomes useful with pins
-          but the button is the discoverability entry point. */}
-      {sessions.length >= 1 && (
-        <div className="relative no-drag shrink-0 mx-1">
+      {/* The multi-session cluster, anchored at the right edge however many
+          tabs are open: All tabs ▾ (every session, searchable), Walls ▾
+          (open and saved walls) and Broadcast. Icon-only on every viewport;
+          a badge carries the count. */}
+      {isUnlocked && sessions.length > 0 && (
+        <div className="relative no-drag shrink-0 mx-0.5">
+          <button
+            type="button"
+            onClick={() => setAllTabsOpen(v => !v)}
+            title={`All sessions (${sessions.length})`}
+            aria-label="All sessions"
+            className={`relative flex items-center justify-center w-7 h-7 rounded-full transition-all ${
+              allTabsOpen
+                ? "bg-primary/15 border border-primary/40 text-primary"
+                : "bg-white/[0.06] border border-white/10 text-zinc-400 hover:bg-white/[0.1] hover:text-white"
+            }`}
+          >
+            <List size={12} />
+            <span
+              className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-1 rounded-full bg-zinc-300 text-[9px] font-bold text-black flex items-center justify-center leading-none"
+              aria-hidden="true"
+            >
+              {sessions.length}
+            </span>
+          </button>
+          {allTabsOpen && (
+            <AllTabsMenu
+              sessions={sessions}
+              walls={walls}
+              statuses={sessionStatuses}
+              waiting={promptSessions}
+              activeView={activeView}
+              onShowSession={(sid) => { setAllTabsOpen(false); setMergedSessionIds([]); setActiveView(sid); }}
+              onShowWall={(wid) => { setAllTabsOpen(false); setMergedSessionIds([]); setActiveView(wid); }}
+              onCloseSessions={(ids) => { void closeSessions(ids); }}
+              onDismiss={() => setAllTabsOpen(false)}
+            />
+          )}
+        </div>
+      )}
+      {isUnlocked && (
+        <div className="relative no-drag shrink-0 mx-0.5">
           <button
             type="button"
             onClick={() => {
-              // Plain click on Wall exits any active session-split —
-              // split-view and Wall are two different multi-view modes
-              // and switching between them shouldn't leave stale
-              // merged state behind.
-              setMergedSessionIds([]);
-              setActiveView("wall");
+              if (!wallsMenuOpen) void refreshSavedWalls();
+              setWallsMenuOpen(v => !v);
             }}
-            title={wallItems.length > 0
-              ? `Wall · ${wallItems.length} pinned terminal${wallItems.length === 1 ? '' : 's'}`
-              : "Wall — pinboard for terminals across servers"}
-            aria-label="Wall pinboard"
-            className={`relative flex items-center justify-center w-7 h-7 rounded-full transition-all ${
-              activeView === "wall"
+            title="Walls — terminals from many servers side by side"
+            aria-label="Walls"
+            className={`relative flex items-center justify-center gap-0.5 h-7 px-2 rounded-full transition-all ${
+              activeWall || wallsMenuOpen
                 ? "bg-primary/15 border border-primary/40 text-primary shadow-inner shadow-primary/10"
                 : "bg-white/[0.06] border border-white/10 text-zinc-400 hover:bg-white/[0.1] hover:text-white"
             }`}
           >
             <LayoutGrid size={12} />
-            {wallItems.length > 0 && (
-              <span
-                className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-1 rounded-full bg-primary text-[9px] font-bold text-black flex items-center justify-center leading-none"
-                aria-hidden="true"
-              >
-                {wallItems.length}
-              </span>
-            )}
+            <ChevronDown size={10} />
           </button>
-        </div>
-      )}
-      {/* Broadcast trigger — session-scoped multi-exec. Lives OUTSIDE the
-          scrollable tab strip so it stays anchored at the right edge no
-          matter how many tabs are open. Compact icon-only button (no
-          "Broadcast" text) to reclaim titlebar space; the dropdown reveals
-          the full checkbox picker. When armed, a small orange count badge
-          hangs off the corner so the state is legible at a glance without
-          words. Hidden until there are 2+ sessions since a single session
-          has no one to broadcast to. */}
-      {sessions.length >= 2 && (
-        <div className="relative no-drag shrink-0 mx-1">
-          <button
-            type="button"
-            onClick={() => setBroadcastMenuOpen(v => !v)}
-            title={broadcast.enabled
-              ? `Broadcasting to ${broadcast.targetSessionIds.size} session${broadcast.targetSessionIds.size === 1 ? "" : "s"}`
-              : "Broadcast input to multiple sessions"}
-            aria-label="Broadcast input"
-            className={`relative flex items-center justify-center w-7 h-7 rounded-full transition-all ${
-              broadcast.enabled
-                ? "bg-orange-500/15 border border-orange-400/40 text-orange-300 shadow-inner shadow-orange-400/10"
-                : "bg-white/[0.06] border border-white/10 text-zinc-400 hover:bg-white/[0.1] hover:text-white"
-            }`}
-          >
-            <Radio size={12} className={broadcast.enabled ? "animate-pulse" : ""} />
-            {broadcast.enabled && broadcast.targetSessionIds.size > 0 && (
-              <span
-                className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-1 rounded-full bg-orange-500 text-[9px] font-bold text-black flex items-center justify-center leading-none"
-                aria-hidden="true"
-              >
-                {broadcast.targetSessionIds.size}
-              </span>
-            )}
-          </button>
-          {broadcastMenuOpen && (
-            <>
-              <div
-                className="fixed inset-0 z-[60]"
-                onClick={() => setBroadcastMenuOpen(false)}
-              />
-              <div className="absolute z-[70] top-full mt-1 right-0 w-[280px] bg-[#15151a] border border-white/10 rounded-lg shadow-2xl p-2 text-[11px]">
-                <div className="flex items-center justify-between mb-2 px-1">
-                  <label className="flex items-center gap-2 cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      className="accent-orange-400"
-                      checked={broadcast.enabled}
-                      onChange={broadcast.toggleEnabled}
-                    />
-                    <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-200">
-                      Broadcast input
-                    </span>
-                  </label>
-                  <button
-                    onClick={() => setBroadcastMenuOpen(false)}
-                    className="text-zinc-500 hover:text-white p-0.5"
-                    aria-label="Close"
-                  >
-                    <X size={12} />
-                  </button>
-                </div>
-                <div className="flex items-center gap-1.5 px-1 pb-2 border-b border-white/5">
-                  <button
-                    onClick={() => broadcast.selectAll(sessions.map(s => s.id))}
-                    className="px-2 py-0.5 rounded bg-white/[0.04] border border-white/10 text-[10px] uppercase tracking-wider text-zinc-300 hover:bg-white/[0.08] hover:text-white"
-                  >
-                    All
-                  </button>
-                  <button
-                    onClick={() => broadcast.selectNone()}
-                    className="px-2 py-0.5 rounded bg-white/[0.04] border border-white/10 text-[10px] uppercase tracking-wider text-zinc-300 hover:bg-white/[0.08] hover:text-white"
-                  >
-                    None
-                  </button>
-                  <div className="flex-1" />
-                  <span className={`text-[10px] font-bold uppercase tracking-wider ${
-                    broadcast.enabled && broadcast.targetSessionIds.size >= 2
-                      ? "text-orange-300"
-                      : "text-zinc-500"
-                  }`}>
-                    {broadcast.enabled
-                      ? (broadcast.targetSessionIds.size >= 2
-                          ? `Live · ${broadcast.targetSessionIds.size}`
-                          : "Pick 2+")
-                      : "Off"}
-                  </span>
-                </div>
-                <div className="max-h-[240px] overflow-y-auto custom-scrollbar mt-2 space-y-0.5">
-                  {sessions.map(s => {
-                    const checked = broadcast.targetSessionIds.has(s.id);
-                    const st = sessionStatuses[s.id] ?? "connecting";
-                    return (
-                      <label
-                        key={s.id}
-                        className={`flex items-center gap-2 px-2 py-1.5 rounded cursor-pointer ${
-                          checked ? "bg-orange-500/10" : "hover:bg-white/[0.04]"
-                        }`}
-                      >
-                        <input
-                          type="checkbox"
-                          className="accent-orange-400 shrink-0"
-                          checked={checked}
-                          onChange={() => broadcast.toggleTarget(s.id)}
-                        />
-                        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                          st === "connected" ? "bg-emerald-400" :
-                          st === "connecting" ? "bg-amber-400" :
-                          "bg-rose-500"
-                        }`} />
-                        <span className="truncate text-[11px] font-medium text-zinc-200 flex-1">
-                          {s.serverName}
-                        </span>
-                      </label>
-                    );
-                  })}
-                </div>
-              </div>
-            </>
+          {wallsMenuOpen && (
+            <WallsMenu
+              walls={walls}
+              activeId={activeView}
+              saved={savedWalls}
+              canFromTabs={sessions.some(s => !s.wallId)}
+              onShow={(wid) => { setWallsMenuOpen(false); setMergedSessionIds([]); setActiveView(wid); }}
+              onCloseWall={(wid) => { setWallsMenuOpen(false); void closeWall(wid); }}
+              onOpenSaved={(w, b) => { setWallsMenuOpen(false); openSavedWall(w, b); }}
+              onEditSaved={(w) => { setWallsMenuOpen(false); setWallEditor(w); }}
+              onDeleteSaved={(w) => { setWallsMenuOpen(false); void deleteSavedWall(w); }}
+              onNew={() => { setWallsMenuOpen(false); setWallEditor({ id: null, name: "", server_ids: [], cols: 0 }); }}
+              onFromTabs={() => {
+                setWallsMenuOpen(false);
+                newWall("Open tabs", sessions.filter(s => !s.wallId).map(s => ({ sessionId: s.id, terminalId: terminalOf(s.id) })));
+              }}
+              onDismiss={() => setWallsMenuOpen(false)}
+            />
           )}
         </div>
       )}
+      {/* Broadcast — MultiExec. Click (or Ctrl+Shift+B): on a Wall, its
+          Broadcast on/off; elsewhere, back to the Wall that's broadcasting,
+          or every open tab onto one, broadcasting. Orange while any Wall
+          broadcasts, with how many terminals it's typing to. */}
+      {isUnlocked && (sessions.length > 0 || activeWall) && (() => {
+        const live = activeWall?.broadcast ? activeWall : walls.find(w => w.broadcast) ?? null;
+        const reach = live ? live.members.filter(m => !live.paused.includes(m.terminalId)).length : 0;
+        return (
+          <div className="relative no-drag shrink-0 mx-1">
+            <button
+              type="button"
+              onClick={toggleBroadcast}
+              title={
+                activeWall
+                  ? (activeWall.broadcast ? "Stop broadcasting (Ctrl+Shift+B)" : "Broadcast: type to every terminal on this wall (Ctrl+Shift+B)")
+                  : live
+                    ? `Back to ${live.name}, broadcasting (Ctrl+Shift+B)`
+                    : "Broadcast: type to all open tabs at once, on a wall (Ctrl+Shift+B)"
+              }
+              aria-label="Broadcast input"
+              className={`relative flex items-center justify-center w-7 h-7 rounded-full transition-all ${
+                live
+                  ? "bg-orange-500/15 border border-orange-400/40 text-orange-300 shadow-inner shadow-orange-400/10"
+                  : "bg-white/[0.06] border border-white/10 text-zinc-400 hover:bg-white/[0.1] hover:text-white"
+              }`}
+            >
+              <Radio size={12} className={live ? "animate-pulse" : ""} />
+              {live && (
+                <span
+                  className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-1 rounded-full bg-orange-500 text-[9px] font-bold text-black flex items-center justify-center leading-none"
+                  aria-hidden="true"
+                >
+                  {reach}
+                </span>
+              )}
+            </button>
+          </div>
+        );
+      })()}
       {/* Window controls: desktop only. Android has its own gesture nav /
           system back button, and the WebView window has no minimise or
           maximise affordance to surface — so we hide the whole cluster on
@@ -1517,40 +1840,42 @@ function DesktopApp() {
               }}
             >Disconnect</button>
 
-            {/* Pin/Unpin the session's currently-active terminal to
-                the Wall — one-click convenience so users don't have to
-                open the picker + tick a specific terminal for the
-                common "just pin what I'm looking at" case. The picker
-                remains for choosing a specific non-active terminal or
-                pinning multiple at once. */}
+            {/* Walls: put the terminal on screen in this tab on one of the
+                open Walls (or take it off), or start a new Wall with it.
+                A Wall's own Add picker is for other terminals and servers. */}
             {(() => {
-              const activeTid = sessionActiveTerm[targetId];
-              const activeTermPinned = activeTid ? wallHasTerminal(activeTid) : false;
-              const anyPinned = wallItems.some(i => i.sessionId === targetId);
+              const tid = terminalOf(targetId);
               return (
                 <>
-                  {activeTid && (
-                    <button
-                      className="w-full text-left px-3 py-1.5 hover:bg-primary/15 hover:text-primary text-zinc-200 flex items-center gap-2"
-                      onClick={() => {
-                        if (activeTermPinned) unpinTerminalFromWall(activeTid);
-                        else pinTerminalToWall(targetId, activeTid);
-                        setTabMenu(null);
-                      }}
-                    >
-                      {activeTermPinned
-                        ? (<><PinOff size={12} className="text-zinc-500" /> Unpin active terminal</>)
-                        : (<><Pin size={12} className="text-zinc-500" /> Pin active terminal to Wall</>)}
-                    </button>
-                  )}
-                  {anyPinned && (
-                    <button
-                      className="w-full text-left px-3 py-1.5 hover:bg-rose-500/10 hover:text-rose-300 text-zinc-400 flex items-center gap-2 text-[10.5px]"
-                      onClick={() => { unpinSessionFromWall(targetId); setTabMenu(null); }}
-                    >
-                      <PinOff size={11} /> Unpin ALL from this session
-                    </button>
-                  )}
+                  <div className="border-t border-white/5 my-1" />
+                  <div className="px-3 pt-1 pb-1 text-[9.5px] font-bold uppercase tracking-widest text-zinc-500">
+                    On a wall
+                  </div>
+                  {walls.map(w => {
+                    const on = w.members.some(m => m.terminalId === tid);
+                    return (
+                      <label key={w.id} className={`flex items-center gap-2 mx-1 px-2 py-1.5 rounded cursor-pointer ${on ? "bg-primary/10" : "hover:bg-white/[0.04]"}`}>
+                        <input
+                          type="checkbox"
+                          className="accent-primary shrink-0"
+                          checked={on}
+                          onChange={() => (on ? removeFromWall(w.id, tid) : addToWall(w.id, [{ sessionId: targetId, terminalId: tid }]))}
+                        />
+                        {w.broadcast ? <Radio size={11} className="text-orange-300 shrink-0" /> : <LayoutGrid size={11} className="text-zinc-500 shrink-0" />}
+                        <span className="truncate text-[11px] text-zinc-200 flex-1">{w.name}</span>
+                      </label>
+                    );
+                  })}
+                  <button
+                    className="w-full text-left px-3 py-1.5 hover:bg-primary/15 hover:text-primary text-zinc-200 flex items-center gap-2"
+                    onClick={() => {
+                      const name = sessions.find(x => x.id === targetId)?.serverName ?? "Wall";
+                      newWall(name, [{ sessionId: targetId, terminalId: tid }]);
+                      setTabMenu(null);
+                    }}
+                  >
+                    <Plus size={12} className="text-zinc-500" /> New wall with this terminal
+                  </button>
                 </>
               );
             })()}
@@ -1636,12 +1961,11 @@ function DesktopApp() {
                 invoke("disconnect_session", { sessionId: sid }).catch(() => {});
                 setSessions(prev => prev.filter(sess => sess.id !== sid));
                 setSessionStatuses(prev => { const { [sid]: _, ...rest } = prev; return rest; });
-                broadcast.removeSession(sid);
                 setMergedSessionIds(prev => {
                   const next = prev.filter(id => id !== sid);
                   return next.length < 2 ? [] : next;
                 });
-                unpinSessionFromWall(sid);
+                forgetSession(sid);
                 setActiveView(prev => (prev === sid ? START_VIEW : prev));
                 setTabMenu(null);
               }}
@@ -1670,6 +1994,7 @@ function DesktopApp() {
       waiting={promptSessions}
       activeSessionId={activeView}
       onOpenServers={openServers}
+      onOpenAsWall={(list, name) => openServersAsWall(list, name)}
       onOpenRdp={openRdp}
       onEditServer={handleEditNode}
       onNewServer={addServerIn}
@@ -2016,6 +2341,7 @@ function DesktopApp() {
                             label={sess.serverName}
                             onReset={() => {
                               setSessions(prev => prev.filter(s => s.id !== sess.id));
+                              forgetSession(sess.id);
                               if (activeView === sess.id) setActiveView(START_VIEW);
                             }}
                           >
@@ -2047,237 +2373,59 @@ function DesktopApp() {
               </div>
             )}
 
-            {/* Wall canvas — a grid of individual terminal tiles pinned
-                from any session. Independent of the session-split
-                canvas above; the two live side-by-side in `main` with
-                only one visible at a time. Wall tiles mount their own
-                TerminalView in attach-only mode so xterm scrollback +
-                PTY ownership stay with the primary xterm in the
-                session tab. */}
-            {activeView === "wall" && (
-              <div className="absolute inset-0 flex flex-col overflow-hidden bg-[#0a0a0d]">
-                {/* Toolbar: cols selector + Add + Clear. Rows are
-                    derived automatically from tile count so users only
-                    have to pick the horizontal density they want. */}
-                <div className="h-10 shrink-0 border-b border-white/5 bg-[#111114] flex items-center gap-2 px-3">
-                  <LayoutGrid size={12} className="text-primary/70 shrink-0" />
-                  <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-400 shrink-0">
-                    Wall {wallItems.length > 0 ? `· ${wallItems.length}` : ''}
-                  </span>
-                  <div className="flex items-center gap-1 ml-2 shrink-0">
-                    <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-500">Cols</span>
-                    {[1, 2, 3, 4, 5, 6].map(n => (
-                      <button
-                        key={n}
-                        onClick={() => setWallCols(n)}
-                        title={`${n} column${n === 1 ? '' : 's'} per row`}
-                        className={`h-6 w-6 rounded flex items-center justify-center text-[10px] font-bold transition-all ${
-                          wallCols === n
-                            ? 'bg-primary/20 text-primary border border-primary/40'
-                            : 'text-zinc-400 hover:bg-white/[0.06] border border-transparent'
-                        }`}
-                      >
-                        {n}
-                      </button>
-                    ))}
-                  </div>
-                  <div className="flex-1" />
-                  <button
-                    onClick={() => setWallPickerOpen(v => !v)}
-                    title="Pick terminals to pin"
-                    className="px-3 py-1 bg-primary/15 hover:bg-primary/25 text-primary border border-primary/30 rounded-md text-[10px] font-bold uppercase tracking-wider flex items-center gap-1.5"
-                  >
-                    <Plus size={11} /> Add
-                  </button>
-                  {wallItems.length > 0 && (
-                    <button
-                      onClick={() => setWallItems([])}
-                      title="Unpin everything (terminals stay open in their sessions)"
-                      className="px-3 py-1 bg-white/[0.04] hover:bg-rose-500/15 hover:text-rose-300 border border-white/10 rounded-md text-[10px] font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-1.5"
-                    >
-                      <X size={11} /> Clear
-                    </button>
-                  )}
-                </div>
-
-                {/* Grid canvas. Empty state overlaid when nothing is
-                    pinned so we don't just show a black rectangle to a
-                    first-time visitor. */}
-                <div className="flex-1 relative bg-black/40 overflow-auto custom-scrollbar">
-                  {wallItems.length === 0 ? (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 text-center px-6 pointer-events-none">
-                      <LayoutGrid size={40} className="text-zinc-600" />
-                      <div className="text-zinc-400 text-[13px] max-w-md leading-relaxed">
-                        The Wall is a pinboard for watching multiple <em>terminals</em> at once.<br/>
-                        Right-click a session tab or use the <span className="text-primary font-semibold">Add</span> button above to pin any terminal from any server.
-                      </div>
-                    </div>
-                  ) : (
-                    <div
-                      className="min-h-full grid gap-1.5 p-1.5"
-                      style={{
-                        gridTemplateColumns: `repeat(${wallCols}, minmax(0, 1fr))`,
-                        gridAutoRows: `minmax(220px, 1fr)`,
-                      }}
-                    >
-                      {wallItems.map(item => {
-                        const sess = sessions.find(s => s.id === item.sessionId);
-                        if (!sess) return null;
-                        const terms = sessionTerminals[item.sessionId] ?? [];
-                        const term = terms.find(t => t.id === item.terminalId);
-                        const st = sessionStatuses[item.sessionId] ?? 'connecting';
-                        const dotTone =
-                          st === 'connected'    ? 'bg-emerald-400' :
-                          st === 'connecting'   ? 'bg-amber-400 animate-pulse' :
-                                                  'bg-rose-500';
-                        return (
-                          <div
-                            key={item.id}
-                            className="flex flex-col overflow-hidden border border-white/10 rounded-md bg-[#09090b] shadow-[0_2px_10px_rgba(0,0,0,0.4)] hover:border-primary/30 transition-colors"
-                          >
-                            {/* Slim tile header — server + terminal
-                                title, quick-jump into the session,
-                                unpin. Terminal body below owns focus
-                                so keystrokes go to xterm directly. */}
-                            <div className="h-7 shrink-0 flex items-center gap-2 px-2 border-b border-white/5 bg-[#141418] text-[10.5px] select-none">
-                              <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotTone}`} />
-                              <span className="font-bold text-zinc-200 uppercase tracking-wider truncate">
-                                {sess.serverName}
-                              </span>
-                              <span className="text-zinc-600">·</span>
-                              <span className="text-zinc-400 truncate flex-1">
-                                {term?.title ?? item.terminalId}
-                              </span>
-                              <button
-                                onClick={() => setActiveView(sess.id)}
-                                title="Open this session in its own tab"
-                                className="h-5 w-5 rounded flex items-center justify-center text-zinc-500 hover:text-primary hover:bg-white/[0.05] transition-all"
-                              >
-                                <TerminalSquare size={11} />
-                              </button>
-                              <button
-                                onClick={() => unpinTerminalFromWall(item.terminalId)}
-                                title="Unpin from Wall"
-                                className="h-5 w-5 rounded flex items-center justify-center text-zinc-500 hover:text-red-400 hover:bg-white/[0.05] transition-all"
-                              >
-                                <PinOff size={11} />
-                              </button>
-                            </div>
-                            {/* Attach-only TerminalView: hitches onto
-                                the same PTY as the session's primary
-                                xterm without owning the lifecycle, so
-                                closing the Wall or unpinning doesn't
-                                drop the session. */}
-                            {sessionStatuses[item.sessionId] === 'connected' ? (
-                              <div className="flex-1 min-h-0 relative">
-                                <TerminalView
-                                  sessionId={item.sessionId}
-                                  terminalId={item.terminalId}
-                                  attachOnly
-                                  disabled={false}
-                                  isActive={true}
-                                  serverId={sess.serverId}
-                                  serverName={sess.serverName}
-                                />
-                              </div>
-                            ) : (
-                              <div className="flex-1 flex items-center justify-center text-zinc-500 text-[10.5px] font-medium uppercase tracking-wider">
-                                Session {st}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-
-                {/* Wall picker popover — 2-level session → terminal
-                    tree so users can precisely pick which shells to
-                    pin. Ticking a terminal pins; unticking unpins.
-                    Session rows aren't selectable themselves; they
-                    only group their terminals visually. */}
-                {wallPickerOpen && (
-                  <>
-                    <div className="fixed inset-0 z-[65]" onClick={() => setWallPickerOpen(false)} />
-                    <div className="absolute top-12 right-3 z-[66] w-80 max-h-[70vh] bg-[#15151a] border border-white/10 rounded-xl shadow-2xl p-2 flex flex-col">
-                      <div className="px-2 pb-2 flex items-center justify-between shrink-0">
-                        <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">
-                          Pin terminals
-                        </span>
-                        <button
-                          onClick={() => setWallPickerOpen(false)}
-                          className="h-5 w-5 rounded flex items-center justify-center text-zinc-500 hover:text-white hover:bg-white/[0.05]"
-                        >
-                          <X size={11} />
-                        </button>
-                      </div>
-                      {sessions.length === 0 ? (
-                        <div className="px-2 py-6 text-center text-zinc-500 text-[11px]">
-                          No open sessions yet.
-                        </div>
-                      ) : (
-                        <div className="overflow-y-auto custom-scrollbar space-y-1 pr-1">
-                          {sessions.map(s => {
-                            const terms = sessionTerminals[s.id] ?? [];
-                            const st = sessionStatuses[s.id] ?? 'connecting';
-                            return (
-                              <div key={s.id} className="rounded bg-white/[0.02] border border-white/5">
-                                <div className="flex items-center gap-2 px-2 py-1.5 border-b border-white/5">
-                                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                                    st === 'connected' ? 'bg-emerald-400' :
-                                    st === 'connecting' ? 'bg-amber-400' :
-                                    'bg-rose-500'
-                                  }`} />
-                                  <span className="text-[11px] font-bold text-zinc-200 truncate flex-1">
-                                    {s.serverName}
-                                  </span>
-                                  <span className="text-[9px] uppercase tracking-wider text-zinc-500">
-                                    {terms.length} term{terms.length === 1 ? '' : 's'}
-                                  </span>
-                                </div>
-                                {terms.length === 0 ? (
-                                  <div className="px-3 py-2 text-[10px] text-zinc-500 italic">
-                                    Session not yet ready.
-                                  </div>
-                                ) : (
-                                  <div className="p-1 space-y-0.5">
-                                    {terms.map(t => {
-                                      const checked = wallHasTerminal(t.id);
-                                      return (
-                                        <label
-                                          key={t.id}
-                                          className={`flex items-center gap-2 px-2 py-1.5 rounded cursor-pointer ${
-                                            checked ? 'bg-primary/10' : 'hover:bg-white/[0.04]'
-                                          }`}
-                                        >
-                                          <input
-                                            type="checkbox"
-                                            className="accent-primary shrink-0"
-                                            checked={checked}
-                                            onChange={() => {
-                                              if (checked) unpinTerminalFromWall(t.id);
-                                              else pinTerminalToWall(s.id, t.id);
-                                            }}
-                                          />
-                                          <TerminalSquare size={11} className="text-zinc-500 shrink-0" />
-                                          <span className="text-[11px] text-zinc-200 truncate flex-1">
-                                            {t.title}
-                                          </span>
-                                        </label>
-                                      );
-                                    })}
-                                  </div>
-                                )}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  </>
+            {/* The Wall on screen (WallView). Only it is mounted: its tiles
+                borrow the terminals from their tabs while it's shown, and
+                give them back when it isn't. */}
+            {activeWall && (
+              <div className="absolute inset-0">
+                <WallView
+                  key={activeWall.id}
+                  wall={activeWall}
+                  sessions={sessions}
+                  statuses={sessionStatuses}
+                  waiting={promptSessions}
+                  terminalTitles={sessionTerminals}
+                  snippets={commands}
+                  onChange={(patch) => updateWall(activeWall.id, patch)}
+                  onOpenSession={(sid) => { setMergedSessionIds([]); setActiveView(sid); }}
+                  onRemove={(m) => removeWallMember(activeWall, m)}
+                  onReconnect={(sid) => window.dispatchEvent(new CustomEvent(`session-reconnect-${sid}`))}
+                  onAdd={() => setWallPickerFor(activeWall.id)}
+                  onSave={() => { void saveWall(activeWall); }}
+                  onRename={() => { void renameWall(activeWall); }}
+                />
+                {wallPickerFor === activeWall.id && (
+                  <WallPicker
+                    wall={activeWall}
+                    sessions={sessions}
+                    terminals={sessionTerminals}
+                    statuses={sessionStatuses}
+                    servers={servers}
+                    folders={folders}
+                    onToggle={(m) => (activeWall.members.some(x => x.terminalId === m.terminalId)
+                      ? removeWallMember(activeWall, m)
+                      : addToWall(activeWall.id, [m]))}
+                    onConnect={(server) => {
+                      const sid = `session-${server.id}`;
+                      const open = sessions.some(x => x.id === sid);
+                      if (!open) {
+                        setSessions(prev => (prev.some(x => x.id === sid) ? prev : [...prev, { ...sessionFor(server), wallId: activeWall.id }]));
+                      }
+                      addToWall(activeWall.id, [{ sessionId: sid, terminalId: open ? terminalOf(sid) : `${sid}-term-0` }]);
+                    }}
+                    onClose={() => setWallPickerFor(null)}
+                  />
                 )}
               </div>
+            )}
+            {wallEditor && (
+              <WallEditorModal
+                initial={wallEditor}
+                servers={servers}
+                folders={folders}
+                onSave={(w, open) => { void saveSavedWall(w, open); }}
+                onClose={() => setWallEditor(null)}
+              />
             )}
 
             {/* Library = Commands + Notes merged.
