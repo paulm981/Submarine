@@ -450,6 +450,37 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
           </div>
         </section>
 
+        {/* Updates Section */}
+        <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
+          <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
+            <RefreshCw size={14} /> Updates
+          </div>
+
+          <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
+            <p className="text-sm text-zinc-400 leading-relaxed">
+              The profile screen says when there's a new release of this build. Built from source, it also says when
+              the fork's main has changes to pull and rebuild.
+            </p>
+            <div className="flex items-center justify-between gap-4 border-t border-white/5 pt-4">
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-zinc-100">Watch the original project</div>
+                <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
+                  For whoever maintains the fork: also say when SinaXhpm/Submarine has changes the fork doesn't
+                  have yet, so you can use Sync fork on GitHub.
+                </p>
+              </div>
+              <button
+                role="switch"
+                aria-checked={!!settings.watchUpstream}
+                onClick={() => setSettings((s: any) => ({ ...s, watchUpstream: !s.watchUpstream }))}
+                className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${settings.watchUpstream ? 'bg-primary' : 'bg-zinc-700'}`}
+              >
+                <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${settings.watchUpstream ? 'left-[22px]' : 'left-0.5'}`} />
+              </button>
+            </div>
+          </div>
+        </section>
+
         {/* Home Terminal Section */}
         {!IS_ANDROID && (
           <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">

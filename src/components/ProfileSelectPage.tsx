@@ -46,7 +46,14 @@ const changes = (n: number) => `${n} new change${n === 1 ? "" : "s"}`;
 // The silent check's answer, kept for the rest of this run of the app: the
 // picker comes back on every lock, and each check is three unauthenticated
 // GitHub calls out of the 60 an hour an office's shared address gets.
-let silentCheck: Promise<UpdateInfo> | null = null;
+// Kept with the setting it was asked with, so turning that on asks again.
+let silentCheck: { watching: boolean; answer: Promise<UpdateInfo> } | null = null;
+// Settings › Updates: also say when the original project has changes the
+// fork lacks — for whoever maintains the fork. Read here because this page
+// shows before the app's settings are loaded.
+const watchUpstream = () => {
+  try { return localStorage.getItem("submarine-watch-upstream") === "on"; } catch { return false; }
+};
 // The running version and the project's GitHub page (backend: about::app_info).
 interface AppInfo { version: string; github_repo_url: string; }
 // The GitHub link's fallback, should app_info ever fail (about::GITHUB_REPO).
@@ -162,8 +169,11 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   // fetch+compare happens in Rust (about::check_for_updates), and any
   // failure — offline, rate-limited, no releases — simply shows nothing.
   useEffect(() => {
-    silentCheck ??= invoke<UpdateInfo>("check_for_updates");
-    silentCheck
+    const watching = watchUpstream();
+    if (silentCheck?.watching !== watching) {
+      silentCheck = { watching, answer: invoke<UpdateInfo>("check_for_updates", { watchUpstream: watching }) };
+    }
+    silentCheck.answer
       .then((u) => { if (hasNews(u)) setUpdate(u); })
       .catch(() => { silentCheck = null; });
   }, []);
@@ -193,7 +203,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     if (check === "checking") return;
     setCheck("checking");
     try {
-      const u = await invoke<UpdateInfo>("check_for_updates");
+      const u = await invoke<UpdateInfo>("check_for_updates", { watchUpstream: watchUpstream() });
       if (hasNews(u)) {
         setUpdate(u);
         setCheck("idle");

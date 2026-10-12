@@ -19,7 +19,7 @@ import { useIsNarrow } from "./hooks/useViewport";
 import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./util/terminalFont";
 import { Sidebar } from "./components/Sidebar";
 import { NodeGrid } from "./components/NodeGrid";
-import { SessionTree } from "./components/SessionTree";
+import { SessionTree, type TreeItems } from "./components/SessionTree";
 import HomePane from "./components/HomePane";
 import { IS_ANDROID } from "./util/platform";
 import type { RdpLink } from "./components/RdpLinkModal";
@@ -296,6 +296,9 @@ function DesktopApp() {
     syncIntervalMin: Math.max(1, parseInt(localStorage.getItem('submarine-sync-interval-min') || '5', 10) || 5),
     // Read each server's OS for its badge (server_os.rs). Defaults ON.
     detectOs: localStorage.getItem('submarine-detect-os') !== 'off',
+    // Fork maintainers only: the update check also counts the original
+    // project's new commits (about.rs). Defaults OFF.
+    watchUpstream: localStorage.getItem('submarine-watch-upstream') === 'on',
   });
 
   useEffect(() => {
@@ -310,6 +313,7 @@ function DesktopApp() {
     localStorage.setItem('submarine-auto-sync', appSettings.autoSync ? 'on' : 'off');
     localStorage.setItem('submarine-sync-interval-min', String(appSettings.syncIntervalMin));
     localStorage.setItem('submarine-detect-os', appSettings.detectOs ? 'on' : 'off');
+    localStorage.setItem('submarine-watch-upstream', appSettings.watchUpstream ? 'on' : 'off');
     // Tell already-mounted terminals to re-fit with the new font size / face.
     // Without this dispatch the listener in TerminalView is dead code and
     // users have to close+reopen every terminal to see a size change.
@@ -569,6 +573,41 @@ function DesktopApp() {
       bumpSync();
       addLog("Folder removed.", "info");
     } catch (e) { addLog(`DELETE_EXCEPTION: ${e}`, "error"); }
+  };
+
+  // A new server in a folder (or at the top level): the Add server panel,
+  // with that folder already picked.
+  const addServerIn = (folderId?: number | null) => {
+    setNewNode({
+      ...defaultNode,
+      folderId: folderId != null ? String(folderId) : "",
+    });
+    setIsPanelOpen(true);
+  };
+
+  const cloneServer = async (id: number) => {
+    try { await invoke("clone_server", { id }); refreshServers(); bumpSync(); addLog("Node cloned.", "success"); }
+    catch (e) { addLog(`CLONE_ERROR: ${e}`, "error"); }
+  };
+
+  const createFolder = async (name: string, parentId: number | null) => {
+    await invoke("add_folder", { name, parentId });
+    await refreshFolders();
+    bumpSync();
+    addLog(`Folder "${name}" created.`, "info");
+  };
+
+  // The session tree's drag and drop and "Move to…" (tree_moves.rs).
+  // Rethrows so the tree can say what didn't move.
+  const moveItems = async (items: TreeItems, folderId: number | null) => {
+    try {
+      if (items.servers.length) await invoke("move_servers", { ids: items.servers, folderId });
+      if (items.links.length) await invoke("move_rdp_links", { ids: items.links, folderId });
+      for (const id of items.folders) await invoke("move_folder", { id, parentId: folderId });
+    } finally {
+      await Promise.all([refreshFolders(), refreshServers(), refreshRdpLinks()]);
+      bumpSync();
+    }
   };
 
   const openRdp = async (id: number) => {
@@ -1619,6 +1658,15 @@ function DesktopApp() {
       onOpenServers={openServers}
       onOpenRdp={openRdp}
       onEditServer={handleEditNode}
+      onNewServer={addServerIn}
+      onCloneServer={cloneServer}
+      onRemoveServer={removeServer}
+      onCreateFolder={createFolder}
+      onRenameFolder={renameFolder}
+      onRemoveFolder={removeFolder}
+      onSaveRdp={saveRdp}
+      onRemoveRdp={removeRdp}
+      onMove={moveItems}
       side={treeSide}
       onToggleSide={() => setTreeSide((s) => (s === "left" ? "right" : "left"))}
       onClose={() => setTreeOpen(false)}
@@ -1654,25 +1702,16 @@ function DesktopApp() {
                 onActiveFolderChange={setActiveFolderId}
                 onOpenServer={openServer}
                 onEditServer={handleEditNode}
-                onAddClick={(folderId?: number | null) => {
-                  // When invoked from inside a folder header, seed the new
-                  // node's folderId so the user doesn't have to re-pick the
-                  // folder they just clicked into. Bare invocation (from the
-                  // root grid's "Add server" card) stays at the empty default.
-                  setNewNode({
-                    ...defaultNode,
-                    folderId: folderId != null ? String(folderId) : "",
-                  });
-                  setIsPanelOpen(true);
-                }}
+                // When invoked from inside a folder header, seed the new
+                // node's folderId so the user doesn't have to re-pick the
+                // folder they just clicked into. Bare invocation (from the
+                // root grid's "Add server" card) stays at the empty default.
+                onAddClick={addServerIn}
                 onQuickConnect={() => setIsQuickConnectOpen(true)}
                 onRemoveServer={removeServer}
                 onRemoveFolder={removeFolder}
                 onRenameFolder={renameFolder}
-                onCloneServer={async (id: number) => {
-                  try { await invoke("clone_server", { id }); refreshServers(); bumpSync(); addLog("Node cloned.", "success"); }
-                  catch (e) { addLog(`CLONE_ERROR: ${e}`, "error"); }
-                }}
+                onCloneServer={cloneServer}
                 onReorderServers={async (ids: number[]) => {
                   // Rethrow on failure so NodeGrid drops its optimistic order
                   // override and reverts to the real (unchanged) arrangement.
