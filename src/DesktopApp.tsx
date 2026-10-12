@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getVersion } from "@tauri-apps/api/app";
 import {
   Plus, X, RefreshCw, Terminal, Key, Trash2,
   ArrowLeftRight, Shield, User, Cpu, TerminalSquare, List, Edit2,
@@ -219,12 +218,14 @@ function DesktopApp() {
     appWindow.toggleMaximize().catch(console.error);
   }, []);
 
-  // App version for the title bar, pulled from Tauri (tauri.conf.json) rather
-  // than hardcoded so it can never drift from the real build. Shown faded next
-  // to the brand name; stays empty (renders nothing) if the call ever fails.
-  const [appVersion, setAppVersion] = useState<string>("");
+  // Version for the title bar, from the build itself (about::app_info) rather
+  // than hardcoded so it can never drift from the real build. Every build of
+  // the fork has the original project's version, so the fork's build number
+  // goes beside it, and the commit in the tooltip. Shown faded next to the
+  // brand name; renders nothing if the call ever fails.
+  const [appVersion, setAppVersion] = useState<{ version: string; build: number | null; commit: string | null } | null>(null);
   useEffect(() => {
-    getVersion().then(setAppVersion).catch(() => {});
+    invoke<{ version: string; build: number | null; commit: string | null }>("app_info").then(setAppVersion).catch(() => {});
   }, []);
 
   // Persist the user's current folder across NodeGrid unmount/remount cycles.
@@ -1284,7 +1285,13 @@ function DesktopApp() {
         <img src={logoUrl} alt="" draggable={false} className="h-6 w-auto max-w-[24px] object-contain select-none" />
         <span className="text-[12px] font-bold text-white tracking-tight">Submarine</span>
         {appVersion && (
-          <span data-tauri-drag-region className="text-[11px] text-zinc-500/60 tracking-tight tabular-nums">v{appVersion}</span>
+          <span
+            data-tauri-drag-region
+            title={appVersion.commit ? `Built from commit ${appVersion.commit}` : undefined}
+            className="text-[11px] text-zinc-500/60 tracking-tight tabular-nums"
+          >
+            v{appVersion.version}{appVersion.build != null && <> · build {appVersion.build}</>}
+          </span>
         )}
       </div>
 

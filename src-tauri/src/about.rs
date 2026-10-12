@@ -12,6 +12,11 @@
 //! many commits the fork's main has that this build doesn't — to pull and
 //! rebuild, or to download the next build — and how many the original
 //! project has that the fork doesn't yet (GitHub's "Sync fork").
+//!
+//! Every build of the fork carries the original project's version, so each
+//! also has a build number (build.rs: main's commit count). The Latest build
+//! release names its own in its title, and a higher one there is a newer
+//! build to download.
 
 use serde::Serialize;
 
@@ -27,6 +32,13 @@ pub const UPSTREAM_REPO: &str = "SinaXhpm/Submarine";
 const BUILD_COMMIT: &str = env!("SUBMARINE_GIT_SHA");
 /// "source", "main" or "release" (build.rs).
 const BUILD_KIND: &str = env!("SUBMARINE_BUILD_KIND");
+/// The fork's build number (build.rs): main's commit count, so a higher one
+/// is newer. Empty when it couldn't be counted.
+const BUILD_NUMBER: &str = env!("SUBMARINE_BUILD_NUMBER");
+
+fn build_number() -> Option<u64> {
+    BUILD_NUMBER.parse().ok()
+}
 /// The tag of the release the workflow keeps for the latest build of main
 /// (.github/workflows/build.yml).
 pub const LATEST_MAIN_TAG: &str = "latest-main";
@@ -39,6 +51,9 @@ pub struct AppInfo {
     /// The first 7 characters of the commit it was built from, when known —
     /// so two builds of the same version can be told apart.
     pub commit: Option<String>,
+    /// The fork's build number, when known: every build of the fork has the
+    /// original project's version, and this is what tells them apart.
+    pub build: Option<u64>,
 }
 
 /// Static info bundled with the binary. Version comes from CARGO_PKG_VERSION
@@ -50,6 +65,7 @@ pub fn app_info() -> AppInfo {
         github_repo_url: format!("https://github.com/{}", GITHUB_REPO),
         github_releases_url: format!("https://github.com/{}/releases", GITHUB_REPO),
         commit: BUILD_COMMIT.get(..7).map(str::to_string),
+        build: build_number(),
     }
 }
 
@@ -77,6 +93,10 @@ pub struct UpdateInfo {
     /// This is the workflow's build of main: newer commits mean a newer build
     /// to download (main_url is then its release page), not one to make.
     pub main_build: bool,
+    /// This build's number, and the Latest build release's (read from its
+    /// title), when known: a higher one there is a newer build to download.
+    pub build: Option<u64>,
+    pub latest_build: Option<u64>,
     /// Commits on the original project's main not yet in the fork's main
     /// (None when that couldn't be told), and the fork's page, where GitHub
     /// offers "Sync fork".
@@ -109,6 +129,8 @@ async fn ahead_by(client: &reqwest::Client, base: &str, head: &str) -> Option<u6
 struct GhRelease {
     #[serde(default)]
     tag_name: String,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     html_url: String,
     #[serde(default)]
@@ -195,7 +217,13 @@ async fn latest_release(client: &reqwest::Client, url: &str, current: String) ->
     // Highest published, non-prerelease semver wins. Drafts are only visible
     // with auth (we're anonymous) but we skip them defensively all the same.
     let mut best: Option<(String, String)> = None; // (clean_version, html_url)
+    let mut latest_build = None;
     for r in releases {
+        // The Latest build release is a pre-release, so it never counts as a
+        // version; its title carries its build number.
+        if r.tag_name == LATEST_MAIN_TAG {
+            latest_build = r.name.as_deref().and_then(build_in_title);
+        }
         if r.draft || r.prerelease || r.tag_name.is_empty() {
             continue;
         }
@@ -209,7 +237,7 @@ async fn latest_release(client: &reqwest::Client, url: &str, current: String) ->
         }
     }
 
-    Ok(match best {
+    let mut info = match best {
         None => UpdateInfo::none(current),
         Some((latest_clean, html_url)) => {
             let has_update = semver_greater(&latest_clean, &current);
@@ -220,7 +248,17 @@ async fn latest_release(client: &reqwest::Client, url: &str, current: String) ->
                 ..UpdateInfo::none(current)
             }
         }
-    })
+    };
+    info.latest_build = latest_build;
+    Ok(info)
+}
+
+/// The build number in the Latest build release's title, which the workflow
+/// writes as "Latest build (main) · build 225".
+fn build_in_title(title: &str) -> Option<u64> {
+    let (_, rest) = title.rsplit_once("build ")?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 impl UpdateInfo {
@@ -233,6 +271,8 @@ impl UpdateInfo {
             main_ahead: None,
             main_url: None,
             main_build: false,
+            build: build_number(),
+            latest_build: None,
             upstream_ahead: None,
             upstream_url: None,
         }
@@ -301,4 +341,16 @@ pub fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), Strin
     app.opener()
         .open_url(&url, None::<&str>)
         .map_err(|e| format!("[OPEN] {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_in_title;
+
+    #[test]
+    fn the_latest_build_title_gives_its_number() {
+        assert_eq!(build_in_title("Latest build (main) · build 225"), Some(225));
+        assert_eq!(build_in_title("Latest build (main)"), None);
+        assert_eq!(build_in_title("Latest build (main) · build"), None);
+    }
 }

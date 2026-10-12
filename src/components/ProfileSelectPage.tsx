@@ -37,13 +37,22 @@ interface CloudProfile { profile: string; name: string; records: number; live_re
 // (`main_build`: this is the workflow's build of main, so they come as a
 // newer build to download); `upstream_ahead`: commits on the original
 // project's main the fork lacks. Null when GitHub couldn't tell.
+// `build` / `latest_build`: this build's number and the Latest build
+// release's (about.rs), when known.
 interface UpdateInfo {
   current: string; latest: string | null; has_update: boolean; release_url: string | null;
   main_ahead: number | null; main_url: string | null; main_build: boolean;
+  build: number | null; latest_build: number | null;
   upstream_ahead: number | null; upstream_url: string | null;
 }
+// On a Latest build whose number and the newest one's are both known, the
+// numbers say whether there's a newer build — the commit count alone also
+// counts a merge whose build hasn't finished yet.
+const byNumber = (u: UpdateInfo) => u.main_build && u.build != null && u.latest_build != null;
+const newerBuild = (u: UpdateInfo) => (byNumber(u) && u.latest_build! > u.build! ? u.latest_build : null);
+const mainAhead = (u: UpdateInfo) => (byNumber(u) ? 0 : u.main_ahead ?? 0);
 // Whether the check found anything to announce.
-const hasNews = (u: UpdateInfo) => (u.has_update && !!u.latest) || (u.main_ahead ?? 0) > 0 || (u.upstream_ahead ?? 0) > 0;
+const hasNews = (u: UpdateInfo) => (u.has_update && !!u.latest) || newerBuild(u) != null || mainAhead(u) > 0 || (u.upstream_ahead ?? 0) > 0;
 const changes = (n: number) => `${n} new change${n === 1 ? "" : "s"}`;
 // The silent check's answer, kept for the rest of this run of the app: the
 // picker comes back on every lock, and each check is up to three
@@ -58,8 +67,9 @@ const watchUpstream = () => {
   try { return localStorage.getItem("submarine-watch-upstream") === "on"; } catch { return false; }
 };
 // The running version and the project's GitHub page (backend: about::app_info).
-// `commit`: the build's commit, short, when known (about::app_info).
-interface AppInfo { version: string; github_repo_url: string; commit: string | null; }
+// `commit`: the build's commit, short, when known; `build`: the fork's build
+// number, when known (about::app_info).
+interface AppInfo { version: string; github_repo_url: string; commit: string | null; build: number | null; }
 // The GitHub link's fallback, should app_info ever fail (about::GITHUB_REPO).
 const REPO_URL = "https://github.com/paulm981/Submarine";
 
@@ -223,7 +233,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
         setUpdate(u);
         setCheck("idle");
       } else {
-        setCheck(u.latest || u.main_ahead === 0 ? "latest" : "none");
+        setCheck(u.latest || byNumber(u) || u.main_ahead === 0 ? "latest" : "none");
       }
     } catch (e) {
       setCheckError(cleanErr(e));
@@ -768,7 +778,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
               <>
                 <FooterDot />
                 <span className="px-1.5 font-mono text-[11px] text-zinc-600 select-text" title={appInfo.commit ? `Built from commit ${appInfo.commit}` : undefined}>
-                  v{appInfo.version}{appInfo.commit && <span className="text-zinc-700"> · {appInfo.commit}</span>}
+                  v{appInfo.version}{appInfo.build != null && <> · build {appInfo.build}</>}{appInfo.commit && <span className="text-zinc-700"> · {appInfo.commit}</span>}
                 </span>
               </>
             )}
@@ -791,7 +801,14 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
               (the workflow's build of main), or to pull and rebuild (built
               from source). Newer commits on the original project mean the
               fork wants a Sync fork on GitHub first. */}
-          {(update?.main_ahead ?? 0) > 0 && update?.main_url && (
+          {update && newerBuild(update) != null && update.main_url && (
+            <NewsButton
+              onClick={() => openLink(update.main_url!)}
+              title="Open the latest build's download page"
+              label={<>Build {newerBuild(update)} is out (this is {update.build}) — download it</>}
+            />
+          )}
+          {update && mainAhead(update) > 0 && update.main_url && (
             <NewsButton
               onClick={() => openLink(update.main_url!)}
               title={update.main_build ? "Open the latest build's download page" : "See the new changes on GitHub, then pull them and rebuild"}

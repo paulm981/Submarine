@@ -566,7 +566,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
             <p className="text-sm text-zinc-400 leading-relaxed">
               The profile screen says when there's a new release. On a build downloaded from "Latest build", it also
               says when there's a newer one to download; built from source, when the fork's main has changes to pull
-              and rebuild.
+              and rebuild. Each build of the fork has a number, shown in the title bar: a higher one is newer.
             </p>
             <div className="flex items-center justify-between gap-4 border-t border-white/5 pt-4">
               <div className="min-w-0">
