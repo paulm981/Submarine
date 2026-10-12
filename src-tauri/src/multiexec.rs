@@ -10,8 +10,8 @@
 //!   10), so opening a folder of 100 servers behind one used to fail most of
 //!   them. Servers reached directly aren't queued.
 //! - Saved walls: a named set of servers to open as one Wall later. Kept in
-//!   the vault's `walls` table, which is device-local like `rdp_links` — not
-//!   cloud-synced, and travels with profile export/import.
+//!   the vault's `walls` table, which is device-local — not synced (it names
+//!   servers by this vault's row ids) — and travels with profile export/import.
 
 use crate::ssh_manager::{ConnectAttempt, SshState, TerminalCommand};
 use crate::DbState;

@@ -74,6 +74,45 @@ function JumpLoginLimit() {
   );
 }
 
+// Submarine Cloud: the original project's hosted sync, sign-in and sharing.
+// Kept by the backend (cloud.rs), which contacts it only while this is on;
+// off by default, as profiles sync through the user's own storage instead.
+function CloudSwitch() {
+  const [on, setOn] = useState<boolean | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    invoke<boolean>("get_cloud_enabled").then(setOn).catch(() => setOn(null));
+  }, []);
+  const toggle = () => {
+    if (on === null) return;
+    setError(null);
+    invoke<boolean>("set_cloud_enabled", { enabled: !on }).then(setOn).catch((e) => setError(String(e)));
+  };
+  return (
+    <div className="flex items-center justify-between gap-4">
+      <div className="min-w-0">
+        <div className="text-sm font-semibold text-zinc-100">Submarine Cloud</div>
+        <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
+          The original project's hosted sync service (submarine.sinaxhpm.com), with sign-in and sharing. While
+          this is off, Submarine never contacts it and its buttons are hidden — profiles sync through your own
+          folder or git repository instead, set up on the Profile tab.
+        </p>
+        {error && <p className="text-[11px] text-red-400 mt-1">{error}</p>}
+      </div>
+      <button
+        role="switch"
+        aria-checked={on === true}
+        aria-label="Submarine Cloud"
+        disabled={on === null}
+        onClick={toggle}
+        className={`relative shrink-0 w-11 h-6 rounded-full transition-colors disabled:opacity-40 ${on ? 'bg-primary' : 'bg-zinc-700'}`}
+      >
+        <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${on ? 'left-[22px]' : 'left-0.5'}`} />
+      </button>
+    </div>
+  );
+}
+
 // Kept by the backend, not in local storage: the editor is started with files
 // from servers, so it can only be set through the native file dialog.
 function LiveEditSettings() {
@@ -379,7 +418,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
         <p className="text-[13px] text-zinc-400 mt-2">
           Tweak how Submarine looks and feels.
           {' '}
-          <span className="text-zinc-500 italic">Per-device — preferences live in this machine's local storage and don't sync with your cloud profile.</span>
+          <span className="text-zinc-500 italic">Per-device — preferences live in this machine's local storage and don't sync with your profile.</span>
         </p>
       </header>
 
@@ -593,10 +632,10 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
           </section>
         )}
 
-        {/* Cloud Section */}
+        {/* Sync Section */}
         <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
           <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
-            <Cloud size={14} /> Cloud Sync
+            <Cloud size={14} /> Sync
           </div>
 
           <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
@@ -605,8 +644,8 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
                 <div className="text-sm font-semibold text-zinc-100">Auto-sync</div>
                 <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
                   Keep open profiles synced in the background — shortly after you make a change, when
-                  you return to the window, and every few minutes to pull in others' edits on shared
-                  profiles. Turn off to sync only with the manual button.
+                  you return to the window, and every few minutes to pick up changes made on your other
+                  computers. Turn off to sync only with the Sync now button.
                 </p>
               </div>
               <button
@@ -626,6 +665,10 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
                 on the Profile tab, next to Sync now.
               </div>
             )}
+
+            <div className="border-t border-white/5 pt-4">
+              <CloudSwitch />
+            </div>
           </div>
         </section>
 

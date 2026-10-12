@@ -466,25 +466,28 @@ function DesktopApp() {
     ]);
   };
 
-  // Per-entity cloud sync of the currently-open profile. Pushes every locally
-  // changed record and merges back the server's view (Last-Write-Wins by HLC),
-  // without the server ever decrypting anything. A guard prevents overlapping
-  // runs; on success we reload all local lists so a pulled change shows at once.
+  // Per-entity sync of the currently-open profile, through the user's own
+  // folder or repository (store_sync.rs) or Submarine Cloud: merges in what's
+  // there and sends this computer's changes (Last-Write-Wins by HLC), all of
+  // it encrypted. A guard prevents overlapping runs; on success we reload all
+  // local lists so a pulled change shows at once.
   const handleCloudSync = useCallback(async () => {
     setCloudSyncing(true);
     try {
       const report = await invoke<{ pushed: number; pulled: number }>("sync_now");
       await refreshAll();
       setLastSyncLabel(`Last synced ${new Date().toLocaleTimeString()}`);
-      addLog(`Cloud sync complete — pushed ${report.pushed}, pulled ${report.pulled}.`, "success");
+      addLog(`Sync complete — sent ${report.pushed}, received ${report.pulled}.`, "success");
     } catch (e) {
       const msg = String(e);
-      if (/NO_TOKEN|invalid_token|Missing auth|401/i.test(msg)) {
+      if (/NOT_SET_UP/.test(msg)) {
+        addLog("Sync: this profile doesn't sync anywhere yet — set that up on its Profile tab.", "error");
+      } else if (/NO_TOKEN|NOT_SIGNED_IN|invalid_token|Missing auth|401/i.test(msg)) {
         addLog("Cloud sync: not signed in. Open the Cloud panel from the profile picker and sign in first.", "error");
       } else if (/NO_PROFILE_OPEN|DB_NOT_OPEN|NO_KEY|NO_HLC/i.test(msg)) {
-        addLog("Cloud sync: no profile open — unlock a profile first.", "error");
+        addLog("Sync: no profile open — unlock a profile first.", "error");
       } else {
-        addLog(`Cloud sync failed: ${msg}`, "error");
+        addLog(`Sync failed: ${msg.replace(/^\[[A-Z_]+\]\s*/, "")}`, "error");
       }
     } finally {
       setCloudSyncing(false);
@@ -677,10 +680,11 @@ function DesktopApp() {
   const saveRdp = async (link: RdpLink) => {
     await invoke("rdp_save", { link });
     await refreshRdpLinks();
+    bumpSync();
   };
 
   const removeRdp = async (id: number) => {
-    try { await invoke("rdp_delete", { id }); await refreshRdpLinks(); }
+    try { await invoke("rdp_delete", { id }); await refreshRdpLinks(); bumpSync(); }
     catch (e) { addLog(`RDP_DELETE: ${e}`, "error"); }
   };
 
@@ -2789,6 +2793,7 @@ function DesktopApp() {
         refreshServers={refreshServers}
         servers={servers}
         isMobile={isMobile}
+        onImported={bumpSync}
       />
 
       <QuickConnectModal

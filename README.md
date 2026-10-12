@@ -18,6 +18,7 @@
 > - **A session tree** beside the terminal that manages folders, servers and Remote Desktop links (drag and drop, rename, move).
 > - **MobaXterm session import**: nested folders, saved logins, jump hosts, startup commands such as `dzdo su -`, Remote Desktop sessions.
 > - **A Home view** of terminals on your own computer (PowerShell, Command Prompt, WSL, Git Bash).
+> - **Sync through storage you own**: a folder that OneDrive, Dropbox, Nextcloud, Syncthing or a network share keeps the same on your computers, or a private git repository — no third-party service. Encrypted with the profile's password first; Remote Desktop links sync too. The original project's cloud stays off unless you turn it on.
 > - OS badges, jump hosts that let a hundred servers log in a few at a time, and hardening for Windows.
 >
 > **Download:** the [latest build](https://github.com/paulm981/Submarine/releases/tag/latest-main) is made from every change to `main` — on Windows, [`Submarine-windows-x64-setup.exe`](https://github.com/paulm981/Submarine/releases/download/latest-main/Submarine-windows-x64-setup.exe) (see [Install](#install)). Builds, updates and issues for this fork live here; the original project's README follows.
@@ -166,7 +167,9 @@ Manage Docker on any session host without typing a single `docker` command.
 ### End-to-End Encrypted Profile Sync
 
 - Save servers once, access them on every machine you own
-- The sync server hosts an opaque encrypted blob — we have no way to read it (see [Security](#security))
+- **Through storage you own** (this fork): a folder that OneDrive, Dropbox, Nextcloud, Syncthing or a network share keeps the same on your computers, or a private git repository on GitHub, GitLab or your own server. Set it up on the **Profile** tab; on another computer, choose **From storage** in the profile list and enter the profile's password.
+- Everything is encrypted with the profile's password before it leaves your computer — names, hosts, logins and keys alike. Each computer writes only its own file, so a sync tool never has two versions of one file to choose between. A git branch is kept to a single commit that each sync replaces, so no history piles up; git signs in the way it does on that computer (an SSH key, or Git Credential Manager).
+- The original project's hosted cloud, with sign-in and sharing, is still there, off unless you turn it on under **Settings → Sync**. Its server only ever holds encrypted data too (see [Security](#security))
 - No registration. No password recovery email. Your master password never leaves your device.
 
 ### Productivity
@@ -203,8 +206,8 @@ Submarine can keep all of its data next to the executable instead of in your use
 
 A first portable launch starts with no profiles. To carry existing data over, close Submarine and copy two things into `submarine-data`:
 
-- the contents of `%APPDATA%\com.submarine.app`, except `sync_device.json` — it identifies each install to cloud sync, and the portable copy creates its own;
-- the folder `%LOCALAPPDATA%\com.submarine.app\EBWebView`. It holds the app's settings, including **Auto-sync**. Without it Auto-sync starts out on, and the first profile you open is uploaded to your cloud — so if you skip this folder, turn Auto-sync off in Settings before opening a profile you keep only on this computer.
+- the contents of `%APPDATA%\com.submarine.app`, except `sync_device.json` — it identifies each install to sync, and the portable copy creates its own;
+- the folder `%LOCALAPPDATA%\com.submarine.app\EBWebView`. It holds the app's settings, including **Auto-sync**. Without it Auto-sync starts out on, and a profile set up to sync (to your own storage, or to the cloud when that's on) syncs as soon as you open it — so if you skip this folder, turn Auto-sync off in Settings before opening one you mean to keep only on this computer.
 
 `submarine-data` then holds your encrypted profiles and your cloud sign-in token, so keep it somewhere only you can read.
 

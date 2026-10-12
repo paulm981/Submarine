@@ -33,6 +33,7 @@ mod server_os;
 mod local_term;
 mod tree_moves;
 mod multiexec;
+mod store_sync;
 #[cfg(test)]
 mod ssh_test_server;
 use ssh_manager::SshState;
@@ -321,10 +322,9 @@ fn save_vault_blocking(
 /// The vault tables that participate in per-entity Last-Write-Wins sync. Each
 /// carries the `uuid` (portable identity) / `updated_at` (HLC) / `deleted`
 /// (tombstone) columns. `known_hosts`, `cmd_history`, `monitor_settings`,
-/// `rdp_links`, `walls` and `schema_meta` are intentionally device-local and
-/// NOT synced.
+/// `walls` and `schema_meta` are intentionally device-local and NOT synced.
 const SYNCED_TABLES: &[&str] = &[
-    "folders", "ssh_keys", "credentials", "servers", "commands", "notes", "monitor_configs",
+    "folders", "ssh_keys", "credentials", "servers", "commands", "notes", "monitor_configs", "rdp_links",
 ];
 
 /// Opaque 128-bit hex id for a synced row. Not RFC-4122 formatted — we only
@@ -420,6 +420,7 @@ fn backfill_identity_cols(table: &str) -> &'static [&'static str] {
         "ssh_keys" => &["name", "public_key"],
         "credentials" => &["name", "username", "auth_type"],
         "servers" => &["name", "host", "port", "username"],
+        "rdp_links" => &["name", "host", "port", "username"],
         "commands" => &["title", "content"],
         "notes" => &["title"],
         // monitor_configs hangs off a server; its identity is that server's.
@@ -661,7 +662,8 @@ mod sync_trigger_tests {
              CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE commands(id INTEGER PRIMARY KEY, title TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE notes(id INTEGER PRIMARY KEY, title TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
-             CREATE TABLE monitor_configs(node_id INTEGER PRIMARY KEY, enabled_metrics TEXT, custom_metrics TEXT, paused INTEGER NOT NULL DEFAULT 1, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);",
+             CREATE TABLE monitor_configs(node_id INTEGER PRIMARY KEY, enabled_metrics TEXT, custom_metrics TEXT, paused INTEGER NOT NULL DEFAULT 1, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
+             CREATE TABLE rdp_links(id INTEGER PRIMARY KEY, name TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);",
         ).unwrap();
         let hlc = std::sync::Arc::new(hlc::Hlc::new("testnode".into(), 0));
         register_sync_functions(&conn, &hlc).unwrap();
@@ -784,6 +786,12 @@ const ENTITIES: &[EntitySpec] = &[
             Fk { key: "key_uuid", col: "key_id", ref_table: "ssh_keys", required: false },
             Fk { key: "jump_uuid", col: "jump_host_id", ref_table: "servers", required: false },
         ],
+    },
+    // Remote Desktop links (rdp.rs); after `folders`, which they sit in.
+    EntitySpec {
+        table: "rdp_links",
+        cols: &["name", "host", "port", "username", "notes", "edited_by"],
+        fks: &[Fk { key: "folder_uuid", col: "folder_id", ref_table: "folders", required: false }],
     },
     EntitySpec { table: "commands", cols: &["title", "content", "edited_by"], fks: &[] },
     EntitySpec { table: "notes", cols: &["title", "body", "edited_by"], fks: &[] },
@@ -966,6 +974,14 @@ fn apply_remote_inner(conn: &Connection, key: &[u8; 32], records: &[SyncRecord],
             eprintln!("[SYNC] fk fixup skipped {}.{} uuid={}: {}", f.table, f.fk_col, f.uuid, e);
         }
     }
+    // A Remote Desktop link's folder has no foreign key (rdp.rs), so a folder
+    // this batch deleted can leave a link pointing at nothing: one this device
+    // made in it since it last synced. It goes to the top level, not nowhere.
+    tx.execute(
+        "UPDATE rdp_links SET folder_id = NULL WHERE folder_id IS NOT NULL AND folder_id NOT IN (SELECT id FROM folders)",
+        [],
+    )
+    .map_err(|e| format!("[SYNC] RDP_FOLDER_FIXUP: {e}"))?;
     tx.commit().map_err(|e| format!("[SYNC] TX_COMMIT: {e}"))?;
     if skipped > 0 {
         eprintln!("[SYNC] merge committed with {skipped} record(s) skipped");
@@ -1221,6 +1237,14 @@ async fn sync_now(
     db_state: tauri::State<'_, DbState>,
     cloud: tauri::State<'_, std::sync::Arc<cloud::CloudState>>,
 ) -> Result<SyncReport, String> {
+    // A profile that syncs through the user's own folder or repository syncs
+    // there, and never with the cloud (store_sync.rs).
+    if let Some(report) = store_sync::sync_if_linked(&app, &db_state).await? {
+        return Ok(report);
+    }
+    if !cloud.enabled() {
+        return Err("[SYNC] NOT_SET_UP: this profile doesn't sync anywhere yet — set that up on its Profile tab.".into());
+    }
     let profile = db_state
         .active_profile
         .lock()
@@ -1332,6 +1356,14 @@ async fn sync_now(
     {
         let conn_g = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
         let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
+        // Still the profile this sync started on: profiles can be switched
+        // during the round trip, and one profile's items must never be merged
+        // into another's vault.
+        let now_open = db_state.active_profile.lock().map_err(|_| "[STATE] LOCK_PROFILE")?.clone();
+        let now_dek: Option<String> = conn.query_row("SELECT value FROM sync_meta WHERE key='dek'", [], |r| r.get(0)).ok();
+        if now_open.as_deref() != Some(profile.as_str()) || now_dek.as_deref() != Some(hex::encode(dek).as_str()) {
+            return Err("[SYNC] The profile was closed during the sync.".into());
+        }
         apply_remote_records(conn, &dek, &remote, &hlc)?;
     }
     // Persist the merged vault so the applied changes survive a restart.
@@ -1368,6 +1400,10 @@ struct ProfileSyncStats {
     /// Live comparison against the cloud. `None` when offline / not signed in /
     /// never synced — the panel then shows recent edits only.
     diff: Option<SyncDiff>,
+    /// For a profile synced through the user's own storage: the computers
+    /// whose files are there, and how many files its key doesn't open.
+    devices: Vec<store_sync::Device>,
+    unreadable: usize,
 }
 
 /// Read-only sync + activity snapshot for the Profile panel. The recent-edits
@@ -1389,7 +1425,7 @@ async fn profile_sync_stats(
 
     // Local snapshot under the lock: records, DEK, routing, recent edits, and a
     // uuid→name map for servers so the diff can name what's out of sync.
-    let (local, dek, share, cloud_profile, recent_edits, server_names) = {
+    let (local, dek, share, cloud_profile, recent_edits, server_names, linked_store) = {
         let conn_g = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
         let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
         let (dek, _created) = get_or_create_dek(conn)?;
@@ -1452,6 +1488,7 @@ async fn profile_sync_stats(
             cloud_profile,
             recent_edits,
             server_names,
+            store_sync::is_linked(conn),
         )
     };
 
@@ -1463,62 +1500,82 @@ async fn profile_sync_stats(
         .unwrap_or(0);
     let _ = &dek; // reserved for future decrypt of incoming node names
 
-    // Best-effort dry run: pure pull (empty push mutates nothing on the server).
-    let diff = {
-        let pulled = if let Some((share_id, _role)) = &share {
-            cloud::shared_sync_exchange(&app, &cloud, share_id, "", &[]).await
-        } else {
-            cloud::sync_exchange(&app, &cloud, &cloud_profile, "", &[], None).await
-        };
-        match pulled {
-            Ok(server) => {
-                use std::collections::HashMap;
-                let local_map: HashMap<&str, (&str, &str)> = local
-                    .iter()
-                    .map(|r| (r.uuid.as_str(), (r.updated_at.as_str(), r.entity_type.as_str())))
-                    .collect();
-                let server_map: HashMap<&str, (&str, &str)> = server
-                    .iter()
-                    // The reserved escrow record is bookkeeping, not user data.
-                    .filter(|r| r.entity_type != ESCROW_ETYPE)
-                    .map(|r| (r.uuid.as_str(), (r.updated_at.as_str(), r.entity_type.as_str())))
-                    .collect();
-
-                let mut in_sync = 0usize;
-                let mut needs_push = 0usize;
-                let mut needs_pull = 0usize;
-                let mut out: Vec<String> = Vec::new();
-
-                let mut uuids: std::collections::HashSet<&str> = std::collections::HashSet::new();
-                uuids.extend(local_map.keys());
-                uuids.extend(server_map.keys());
-                for u in uuids {
-                    let l = local_map.get(u).map(|(ua, _)| *ua).unwrap_or("");
-                    let s = server_map.get(u).map(|(ua, _)| *ua).unwrap_or("");
-                    let is_server = local_map.get(u).map(|(_, et)| *et == "servers").unwrap_or(false)
-                        || server_map.get(u).map(|(_, et)| *et == "servers").unwrap_or(false);
-                    if l == s {
-                        in_sync += 1;
-                    } else {
-                        if l > s {
-                            needs_push += 1;
-                        } else {
-                            needs_pull += 1;
-                        }
-                        if is_server && out.len() < 20 {
-                            if let Some(name) = server_names.get(u) {
-                                out.push(name.clone());
-                            }
-                        }
-                    }
-                }
-                Some(SyncDiff { in_sync, needs_push, needs_pull, out_of_sync_nodes: out })
+    // Best-effort dry run, read only: the store's files (store_sync.rs), or
+    // a pure pull from the cloud (an empty push mutates nothing there).
+    let mut devices = Vec::new();
+    let mut unreadable = 0;
+    let remote = if linked_store {
+        match store_sync::peek(&app, &db_state).await {
+            Ok(Some(p)) => {
+                devices = p.devices;
+                unreadable = p.unreadable;
+                Some(p.records)
             }
-            Err(_) => None,
+            _ => None,
         }
+    } else if !cloud.enabled() {
+        None
+    } else if let Some((share_id, _role)) = &share {
+        cloud::shared_sync_exchange(&app, &cloud, share_id, "", &[]).await.ok()
+    } else {
+        cloud::sync_exchange(&app, &cloud, &cloud_profile, "", &[], None).await.ok()
     };
+    let diff = remote.map(|server| sync_diff(&local, &server, &server_names));
 
-    Ok(ProfileSyncStats { total_records, vault_bytes, recent_edits, diff })
+    Ok(ProfileSyncStats { total_records, vault_bytes, recent_edits, diff, devices, unreadable })
+}
+
+/// How this vault's records compare with a sync partner's, item by item —
+/// each side's newest stamp per item (a live row or its tombstone).
+fn sync_diff(
+    local: &[SyncRecord],
+    server: &[SyncRecord],
+    server_names: &std::collections::HashMap<String, String>,
+) -> SyncDiff {
+    use std::collections::HashMap;
+    fn newest(records: &[SyncRecord]) -> HashMap<&str, (&str, &str)> {
+        let mut m: HashMap<&str, (&str, &str)> = HashMap::new();
+        // The reserved escrow record is bookkeeping, not user data.
+        for r in records.iter().filter(|r| r.entity_type != ESCROW_ETYPE) {
+            let e = m.entry(r.uuid.as_str()).or_insert((r.updated_at.as_str(), r.entity_type.as_str()));
+            if r.updated_at.as_str() > e.0 {
+                *e = (r.updated_at.as_str(), r.entity_type.as_str());
+            }
+        }
+        m
+    }
+    let local_map = newest(local);
+    let server_map = newest(server);
+
+    let mut in_sync = 0usize;
+    let mut needs_push = 0usize;
+    let mut needs_pull = 0usize;
+    let mut out: Vec<String> = Vec::new();
+
+    let mut uuids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    uuids.extend(local_map.keys());
+    uuids.extend(server_map.keys());
+    for u in uuids {
+        let l = local_map.get(u).map(|(ua, _)| *ua).unwrap_or("");
+        let s = server_map.get(u).map(|(ua, _)| *ua).unwrap_or("");
+        let is_server = local_map.get(u).map(|(_, et)| *et == "servers").unwrap_or(false)
+            || server_map.get(u).map(|(_, et)| *et == "servers").unwrap_or(false);
+        if l == s {
+            in_sync += 1;
+        } else {
+            if l > s {
+                needs_push += 1;
+            } else {
+                needs_pull += 1;
+            }
+            if is_server && out.len() < 20 {
+                if let Some(name) = server_names.get(u) {
+                    out.push(name.clone());
+                }
+            }
+        }
+    }
+    SyncDiff { in_sync, needs_push, needs_pull, out_of_sync_nodes: out }
 }
 
 // ===========================================================================
@@ -2314,7 +2371,7 @@ mod sync_engine_tests {
         assert_eq!(decrypt_entity(&blob, &dek2).unwrap(), b"{\"host\":\"h\"}");
     }
 
-    fn device(node: &str) -> (Connection, std::sync::Arc<hlc::Hlc>) {
+    pub(crate) fn device(node: &str) -> (Connection, std::sync::Arc<hlc::Hlc>) {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE folders(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, parent_id INTEGER, color TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
@@ -2323,7 +2380,8 @@ mod sync_engine_tests {
              CREATE TABLE servers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT, key_id INTEGER, autostart INTEGER, mirrors TEXT, color TEXT, notes TEXT, run_on_connect TEXT, jump_host_id INTEGER, position INTEGER NOT NULL DEFAULT 0, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE commands(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE notes(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
-             CREATE TABLE monitor_configs(node_id INTEGER PRIMARY KEY, enabled_metrics TEXT, custom_metrics TEXT, paused INTEGER, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);",
+             CREATE TABLE monitor_configs(node_id INTEGER PRIMARY KEY, enabled_metrics TEXT, custom_metrics TEXT, paused INTEGER, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
+             CREATE TABLE rdp_links(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 3389, username TEXT NOT NULL DEFAULT '', folder_id INTEGER, notes TEXT NOT NULL DEFAULT '', uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);",
         ).unwrap();
         let hlc = std::sync::Arc::new(hlc::Hlc::new(node.into(), 0));
         register_sync_functions(&conn, &hlc).unwrap();
@@ -3601,6 +3659,21 @@ async fn setup_master_db_inner(
     // above, which is how a fresh vault once went without it. Additive, like
     // run_on_connect: an older build simply doesn't see it.
     conn.execute(rdp::SCHEMA, []).map_err(|e| format!("[DATABASE] RDP_TABLE_FAILED: {}", e))?;
+    // Its sync columns came later (links sync like servers do); links made
+    // before them get their ids from the backfill below.
+    for stmt in [
+        "ALTER TABLE rdp_links ADD COLUMN uuid TEXT",
+        "ALTER TABLE rdp_links ADD COLUMN updated_at TEXT",
+        "ALTER TABLE rdp_links ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE rdp_links ADD COLUMN edited_by TEXT",
+    ] {
+        if let Err(e) = conn.execute(stmt, []) {
+            let s = e.to_string();
+            if !s.contains("duplicate column name") {
+                return Err(format!("[DATABASE] RDP_SYNC_MIGRATION_FAILED: {}", s));
+            }
+        }
+    }
     // Saved walls (multiexec.rs): device-local too, added the same way.
     conn.execute(multiexec::SCHEMA, []).map_err(|e| format!("[DATABASE] WALLS_TABLE_FAILED: {}", e))?;
     // The OS each server last reported (server_os.rs), for its badge.
@@ -14622,7 +14695,10 @@ pub fn run() {
             cloud::cloud_set_password, cloud::cloud_login, cloud::cloud_logout,
             cloud::cloud_request_password_reset, cloud::cloud_reset_password,
             cloud::cloud_request_login_link, cloud::cloud_login_with_link,
+            cloud::get_cloud_enabled, cloud::set_cloud_enabled,
             sync_now,
+            store_sync::store_status, store_sync::store_setup, store_sync::store_disconnect,
+            store_sync::store_find_profiles, store_sync::store_restore_profile,
             identity_status, setup_identity, reset_identity,
             share_current_profile, invite_to_share, list_shares, share_member_list,
             accept_share, import_shared_profile, restore_personal_profile, share_set_role, share_revoke, share_leave, share_delete,
