@@ -99,7 +99,11 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
+      # All of main's history: the build number is its commit count
+      # (src-tauri/build.rs), and a shallow clone can't count it.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # Compute the version string we'll stamp into Cargo.toml and
       # tauri.conf.json. For tag pushes we use the tag (strip the leading
@@ -615,6 +619,11 @@ jobs:
     # out. Never without it (see "Name the files").
     if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     steps:
+      # For the build number, counted as build.rs counts it.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -657,12 +666,13 @@ jobs:
         run: |
           set -euo pipefail
           SHORT="${SHA:0:7}"
+          BUILD="$(git rev-list --count --first-parent "$SHA")"
           WHEN="$(date -u '+%Y-%m-%d %H:%M UTC')"
           DL="https://github.com/$REPO/releases/download/latest-main"
           has() { [ -f "latest/$1" ]; }
           link() { echo "[$2]($DL/$1)"; }
           {
-            echo "The newest build of \`main\`: commit [\`$SHORT\`](https://github.com/$REPO/commit/$SHA), built $WHEN. This page is replaced every time something is merged into \`main\`; numbered versions are the other releases."
+            echo "The newest build of \`main\`: **build $BUILD**, commit [\`$SHORT\`](https://github.com/$REPO/commit/$SHA), built $WHEN. This page is replaced every time something is merged into \`main\`; numbered versions are the other releases. Submarine shows its build number in the title bar and on the profile screen."
             echo
             echo "### Windows"
             echo "- **$(link Submarine-windows-x64-setup.exe Submarine-windows-x64-setup.exe)**: installs Submarine, or updates it — run a newer one over it. Your profiles and settings are kept."
@@ -687,7 +697,7 @@ jobs:
               (IFS='|'; echo "${linux[*]}" | sed 's/|/ · /g')
             fi
             echo
-            echo "Submarine says when there's a newer build: the profile screen shows *\"N new changes on main — download the latest build\"*."
+            echo "Submarine says when there's a newer build: the profile screen shows *\"Build N is out — download it\"*."
           } > notes.md
           # Deleting it (and its tag) and making it again moves the tag to this
           # commit and drops the previous build's files.
@@ -695,6 +705,6 @@ jobs:
           gh release create latest-main latest/* \
             --repo "$REPO" \
             --target "$SHA" \
-            --title "Latest build (main)" \
+            --title "Latest build (main) · build $BUILD" \
             --notes-file notes.md \
             --prerelease

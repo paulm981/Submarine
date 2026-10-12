@@ -194,7 +194,7 @@ Download from **[Latest build](https://github.com/paulm981/Submarine/releases/ta
 | Arch / Manjaro / EndeavourOS | `Submarine-linux-x86_64.pkg.tar.zst` — `sudo pacman -U Submarine-linux-x86_64.pkg.tar.zst` |
 | Any Linux | `Submarine-linux-x86_64.AppImage` — `chmod +x` and double-click |
 
-To update, run the newer setup `.exe` over the installed one. Submarine tells you when there is one: the profile screen shows *"N new changes on main — download the latest build"*, and the version at the bottom of it says which commit you have.
+To update, run the newer setup `.exe` over the installed one. Submarine tells you when there is one: the profile screen shows *"Build N is out — download it"*. Every build of the fork keeps the original project's version (v0.3.8), so each has a **build number** too — in the title bar and at the bottom of the profile screen (`v0.3.8 · build 225 · 9867c6e`, the last part being the commit). A higher build number is newer; the Latest build page names its own.
 
 Numbered versions, when there are any, are on the [releases page](https://github.com/paulm981/Submarine/releases) with versioned file names (and an `.msi` for deploying to many PCs). The Android `.apk` comes from the [original project's releases](https://github.com/sinaxhpm/submarine/releases).
 
@@ -307,7 +307,7 @@ npm run tauri build        # build release bundle
 
 [`.github/workflows/build.yml`](.github/workflows/build.yml) builds the installers on GitHub's Windows, macOS and Linux runners:
 
-- **Every merge into `main`** replaces the [Latest build](https://github.com/paulm981/Submarine/releases/tag/latest-main) release (a pre-release, tag `latest-main`) with that commit's installers. If the Windows build fails, the previous Latest build stays up.
+- **Every merge into `main`** replaces the [Latest build](https://github.com/paulm981/Submarine/releases/tag/latest-main) release (a pre-release, tag `latest-main`) with that commit's installers. If the Windows build fails, the previous Latest build stays up. Its build number is main's commit count along its own line (`git rev-list --count --first-parent HEAD`), so each merge adds one; `src-tauri/build.rs` stamps the same number into the app.
 - **A version tag** makes a numbered release: `git tag v0.4.0 && git push origin v0.4.0`.
 - **Run workflow** on the [Actions tab](https://github.com/paulm981/Submarine/actions/workflows/build.yml) builds on demand; it only publishes when `publish_release` is set.
 

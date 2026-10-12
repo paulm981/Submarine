@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   Activity, Pause, Play, Trash2, Plus, X, Wifi, WifiOff, AlertTriangle,
-  RefreshCw, Settings2, FileCode2, Settings as SettingsIcon, Bell, BellOff, Volume2,
+  RefreshCw, Settings2, FileCode2, Settings as SettingsIcon, Bell, BellOff, Volume2, Search,
 } from "lucide-react";
 import Sparkline from "./Sparkline";
 import { useConfirm } from "../ui/confirm";
@@ -203,6 +203,8 @@ const MonitoringPanel = ({ servers, addLog }: Props) => {
   const confirm = useConfirm();
   const [rows, setRows] = useState<MonitorRow[]>([]);
   const [addOpen, setAddOpen] = useState(false);
+  // The add list's search: name or host, as the session tree's search.
+  const [addQuery, setAddQuery] = useState("");
   const [configFor, setConfigFor] = useState<number | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -384,6 +386,11 @@ const MonitoringPanel = ({ servers, addLog }: Props) => {
     () => servers.filter((s: any) => !rows.some((r) => r.node_id === s.id)),
     [servers, rows]
   );
+  const addMatches = useMemo(() => {
+    const q = addQuery.trim().toLowerCase();
+    if (!q) return availableToAdd;
+    return availableToAdd.filter((s: any) => s.name.toLowerCase().includes(q) || String(s.host).toLowerCase().includes(q));
+  }, [availableToAdd, addQuery]);
   const anyRunning = rows.some((r) => !r.paused);
   const allPaused = rows.length > 0 && rows.every((r) => r.paused);
   const configRow = configFor !== null ? rows.find((r) => r.node_id === configFor) || null : null;
@@ -406,7 +413,7 @@ const MonitoringPanel = ({ servers, addLog }: Props) => {
         </div>
         <div className="flex items-center gap-1.5 sm:gap-2">
           <button
-            onClick={() => setAddOpen(true)}
+            onClick={() => { setAddQuery(""); setAddOpen(true); }}
             title="Add node"
             className="h-9 px-2.5 sm:px-3.5 rounded-lg text-[12px] font-bold uppercase tracking-wider bg-primary/15 text-primary border border-primary/30 hover:bg-primary/25 flex items-center gap-1.5"
           >
@@ -511,19 +518,45 @@ const MonitoringPanel = ({ servers, addLog }: Props) => {
 
       {/* Add modal */}
       {addOpen && (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-3" onClick={() => setAddOpen(false)}>
+        // Held near the top rather than centred, so it doesn't jump as the
+        // search shortens the list.
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-start justify-center p-3 pt-[5vh]" onClick={() => setAddOpen(false)}>
           <div className="w-full max-w-md max-h-[90vh] flex flex-col bg-[#121214] border border-white/10 rounded-xl shadow-2xl" onClick={(e) => e.stopPropagation()}>
             <div className="px-4 py-3 border-b border-white/5 flex items-center justify-between">
               <span className="text-[12px] font-bold uppercase tracking-widest text-white">Add Node to Monitor</span>
               <button onClick={() => setAddOpen(false)} className="text-zinc-400 hover:text-white"><X size={16} /></button>
             </div>
+            {availableToAdd.length > 0 && (
+              <div className="px-3 pt-3">
+                <div className="relative">
+                  <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-500 pointer-events-none" />
+                  <input
+                    autoFocus
+                    value={addQuery}
+                    onChange={(e) => setAddQuery(e.target.value)}
+                    onKeyDown={(e) => {
+                      // Enter adds the first match; Escape clears, then closes.
+                      if (e.key === "Enter" && addMatches.length > 0 && !busy) addNode(addMatches[0].id);
+                      if (e.key === "Escape") { e.stopPropagation(); if (addQuery) setAddQuery(""); else setAddOpen(false); }
+                    }}
+                    placeholder={`Find a server (${availableToAdd.length})…`}
+                    aria-label="Find a server"
+                    className="w-full h-8 pl-8 pr-3 bg-zinc-900/60 border border-white/10 rounded-lg text-[12.5px] text-zinc-50 placeholder:text-zinc-500 outline-none focus:border-primary/50"
+                  />
+                </div>
+              </div>
+            )}
             <div className="p-2 flex-1 overflow-y-auto custom-scrollbar">
               {availableToAdd.length === 0 ? (
                 <div className="text-center text-zinc-300 text-[12px] font-mono py-6">
                   All saved nodes are already being monitored.
                 </div>
+              ) : addMatches.length === 0 ? (
+                <div className="text-center text-zinc-400 text-[12px] py-6">
+                  No server matches “{addQuery.trim()}”.
+                </div>
               ) : (
-                availableToAdd.map((s: any) => (
+                addMatches.map((s: any) => (
                   <button
                     key={s.id}
                     onClick={() => addNode(s.id)}

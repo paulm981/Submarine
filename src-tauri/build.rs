@@ -36,6 +36,25 @@ fn main() {
         "source"
     };
     println!("cargo:rustc-env=SUBMARINE_BUILD_KIND={}", kind);
+    // The fork's build number: how many commits main's own line holds
+    // (`--first-parent`, so a merged pull request counts once). It only ever
+    // grows, so a higher number is a newer build, and the workflow names the
+    // Latest build release with the same count (about.rs compares the two).
+    // Empty when it can't be counted: outside a git checkout, or in a
+    // shallow clone, whose count would be far too low.
+    println!("cargo:rerun-if-env-changed=SUBMARINE_BUILD_NUMBER");
+    let digits = |n: &String| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit());
+    let number = std::env::var("SUBMARINE_BUILD_NUMBER")
+        .ok()
+        .filter(digits)
+        .or_else(|| {
+            if git(&["rev-parse", "--is-shallow-repository"]).as_deref() != Some("false") {
+                return None;
+            }
+            git(&["rev-list", "--count", "--first-parent", "HEAD"]).filter(digits)
+        })
+        .unwrap_or_default();
+    println!("cargo:rustc-env=SUBMARINE_BUILD_NUMBER={}", number);
     // Rebuild when HEAD moves. Asked of git rather than assumed to be under
     // ../.git, which is a file in a worktree or a submodule. Only paths that
     // exist: cargo reruns a build script on every build when one it watches
