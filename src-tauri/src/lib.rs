@@ -31,6 +31,7 @@ mod host_import;
 mod rdp;
 mod server_os;
 mod local_term;
+mod tree_moves;
 #[cfg(test)]
 mod ssh_test_server;
 use ssh_manager::SshState;
@@ -882,7 +883,11 @@ fn collect_local_records(conn: &Connection, key: &[u8; 32], since: &str) -> Resu
 /// with the auto-stamp triggers suppressed so incoming HLC stamps are written
 /// verbatim, and advances the local clock past everything seen.
 fn apply_remote_records(conn: &Connection, key: &[u8; 32], records: &[SyncRecord], hlc: &hlc::Hlc) -> Result<(), String> {
-    with_merge_flag(conn, |c| apply_remote_inner(c, key, records, hlc))
+    with_merge_flag(conn, |c| apply_remote_inner(c, key, records, hlc))?;
+    // Folder moves made on two devices can merge into a loop; undone here, as
+    // this device's edit, which the next push carries back (tree_moves.rs).
+    tree_moves::break_folder_loops(conn).map_err(|e| format!("[SYNC] FOLDER_LOOP: {e}"))?;
+    Ok(())
 }
 
 /// Run `f` with the sync auto-stamp triggers held back (the `merge` flag the
@@ -4916,6 +4921,10 @@ async fn delete_folder(
     let (folder_ids, doomed): (Vec<i64>, Vec<i32>) = {
         let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        // A loop from sync is broken first (tree_moves.rs), so the folders
+        // inside this one are the ones the page shows inside it.
+        tree_moves::break_folder_loops(conn)
+            .map_err(|e| format!("[DATABASE] FOLDER_LOOP_REPAIR_FAILED: {}", e))?;
         let folder_ids = folder_subtree(conn, id as i64)
             .map_err(|e| format!("[DATABASE] FOLDER_TREE_QUERY_FAILED: {}", e))?;
         let mut doomed = Vec::new();
@@ -4956,7 +4965,7 @@ async fn delete_folder(
 
 /// A folder and every folder inside it, at any depth, the folder first.
 /// Guarded against a parent loop (which sync could in principle produce).
-fn folder_subtree(conn: &rusqlite::Connection, root: i64) -> rusqlite::Result<Vec<i64>> {
+pub(crate) fn folder_subtree(conn: &rusqlite::Connection, root: i64) -> rusqlite::Result<Vec<i64>> {
     let mut stmt = conn.prepare("SELECT id FROM folders WHERE parent_id=?1")?;
     let mut out = vec![root];
     let mut i = 0;
@@ -14604,6 +14613,7 @@ pub fn run() {
             add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_jump_host, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
             get_credentials, generate_ssh_key,
             add_folder, rename_folder, delete_folder, get_folders,
+            tree_moves::move_servers, tree_moves::move_rdp_links, tree_moves::move_folder, tree_moves::delete_tree_items,
             add_command, edit_command, delete_command, get_commands,
             cmd_history_add, cmd_history_list, cmd_history_clear,
             add_note, edit_note, delete_note, get_notes,

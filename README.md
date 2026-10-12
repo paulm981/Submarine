@@ -12,6 +12,8 @@
   </p>
 </div>
 
+> **This is a fork.** [paulm981/Submarine](https://github.com/paulm981/Submarine) is [Submarine](https://github.com/sinaxhpm/submarine) by Sina with additions for people moving over from MobaXterm: a session tree beside the terminal that manages folders, servers and Remote Desktop links (drag and drop, rename, move); MobaXterm session import (nested folders, saved logins, jump hosts, startup commands such as `dzdo su -`, Remote Desktop sessions); a Home view of terminals on your own computer (PowerShell, Command Prompt, WSL, Git Bash); OS badges; and hardening for Windows. Builds, updates and issues for this fork live here; the original project's README follows.
+
 ---
 
 <div align="center">
@@ -170,7 +172,7 @@ Manage Docker on any session host without typing a single `docker` command.
 
 ## Install
 
-Pick a binary from the [latest release](https://github.com/sinaxhpm/submarine/releases) and you're done — no extra dependencies.
+Pick a binary from the [latest release](https://github.com/paulm981/Submarine/releases) and you're done — no extra dependencies.
 
 | OS | File |
 |---|---|
@@ -280,8 +282,8 @@ No. Distribution is via sideloadable APK from the [releases page](https://github
 Requirements: Node 20+, Rust 1.90+, [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your OS. The SSH stack is pure Rust, so no OpenSSL or Perl is needed on any platform.
 
 ```bash
-git clone https://github.com/sinaxhpm/submarine
-cd submarine
+git clone https://github.com/paulm981/Submarine
+cd Submarine
 npm install
 npm run tauri dev          # run in development
 npm run tauri build        # build release bundle

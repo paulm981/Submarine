@@ -9,8 +9,13 @@ fn main() {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
+    // A release build (SUBMARINE_RELEASE set by the workflow that publishes
+    // it) leaves it empty: its users get new versions as releases, not by
+    // pulling commits and rebuilding.
+    println!("cargo:rerun-if-env-changed=SUBMARINE_RELEASE");
     let commit = git(&["rev-parse", "HEAD"])
         .filter(|c| c.len() == 40 && c.chars().all(|ch| ch.is_ascii_hexdigit()))
+        .filter(|_| std::env::var_os("SUBMARINE_RELEASE").is_none())
         .unwrap_or_default();
     println!("cargo:rustc-env=SUBMARINE_GIT_SHA={}", commit);
     // Rebuild when HEAD moves. Asked of git rather than assumed to be under

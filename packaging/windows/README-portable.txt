@@ -26,4 +26,4 @@ token, so keep it somewhere only you can read.
 Needs the Microsoft Edge WebView2 runtime, a Windows system component that
 is preinstalled on Windows 11 and current Windows 10.
 
-More detail: https://github.com/sinaxhpm/submarine#portable-mode-windows
+More detail: https://github.com/paulm981/Submarine#portable-mode-windows

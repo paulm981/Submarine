@@ -21,7 +21,7 @@ pub const GITHUB_REPO: &str = "paulm981/Submarine";
 pub const UPSTREAM_REPO: &str = "SinaXhpm/Submarine";
 
 /// The commit this build was made from (build.rs); empty when it wasn't
-/// built from a git checkout.
+/// built from a git checkout, and in a release build.
 const BUILD_COMMIT: &str = env!("SUBMARINE_GIT_SHA");
 
 #[derive(Debug, Clone, Serialize)]
@@ -112,8 +112,12 @@ struct GhRelease {
 /// SEMVER ourselves, then compare that to `current`. Anonymous calls are rate-
 /// limited to ~60/hour per IP — fine for an occasional check. The timeout is
 /// short so a hung connection can't leave the check spinning.
+///
+/// `watch_upstream`: also count the original project's new commits — for
+/// whoever maintains the fork (Settings › Updates), the only one who can
+/// "Sync fork"; everyone else is spared the notice and the call.
 #[tauri::command]
-pub async fn check_for_updates() -> Result<UpdateInfo, String> {
+pub async fn check_for_updates(watch_upstream: Option<bool>) -> Result<UpdateInfo, String> {
     let current = env!("CARGO_PKG_VERSION").to_string();
     let url = format!("https://api.github.com/repos/{}/releases?per_page=100", GITHUB_REPO);
 
@@ -128,14 +132,18 @@ pub async fn check_for_updates() -> Result<UpdateInfo, String> {
 
     // The releases and the commit counts at the same time, so the manual
     // check waits for the slowest request rather than all of them in turn.
-    let (info, (main_ahead, upstream_ahead)) = tokio::join!(latest_release(&client, &url, current), commit_counts(&client));
+    let watch_upstream = watch_upstream.unwrap_or(false);
+    let (info, (main_ahead, upstream_ahead)) =
+        tokio::join!(latest_release(&client, &url, current), commit_counts(&client, watch_upstream));
     let mut info = info?;
     if !BUILD_COMMIT.is_empty() {
         info.main_ahead = main_ahead;
         info.main_url = Some(format!("https://github.com/{}/compare/{}...main", GITHUB_REPO, BUILD_COMMIT));
     }
-    info.upstream_ahead = upstream_ahead;
-    info.upstream_url = Some(format!("https://github.com/{}", GITHUB_REPO));
+    if watch_upstream {
+        info.upstream_ahead = upstream_ahead;
+        info.upstream_url = Some(format!("https://github.com/{}", GITHUB_REPO));
+    }
     Ok(info)
 }
 
@@ -211,10 +219,11 @@ impl UpdateInfo {
     }
 }
 
-/// The commits the fork's main has that this build doesn't, and the commits
-/// the original project's main has that the fork's doesn't. Best effort,
-/// like the rest: None when GitHub couldn't tell.
-async fn commit_counts(client: &reqwest::Client) -> (Option<u64>, Option<u64>) {
+/// The commits the fork's main has that this build doesn't (for a build made
+/// from source), and — when asked — the commits the original project's main
+/// has that the fork's doesn't. Best effort, like the rest: None when GitHub
+/// couldn't tell, or it wasn't asked.
+async fn commit_counts(client: &reqwest::Client, watch_upstream: bool) -> (Option<u64>, Option<u64>) {
     let upstream_owner = UPSTREAM_REPO.split('/').next().unwrap_or(UPSTREAM_REPO);
     let upstream_head = format!("{}:main", upstream_owner);
     let main = async {
@@ -224,7 +233,14 @@ async fn commit_counts(client: &reqwest::Client) -> (Option<u64>, Option<u64>) {
             ahead_by(client, BUILD_COMMIT, "main").await
         }
     };
-    tokio::join!(main, ahead_by(client, "main", &upstream_head))
+    let upstream = async {
+        if watch_upstream {
+            ahead_by(client, "main", &upstream_head).await
+        } else {
+            None
+        }
+    };
+    tokio::join!(main, upstream)
 }
 
 /// True when `a > b` under dotted-number compare (ignores any non-numeric
