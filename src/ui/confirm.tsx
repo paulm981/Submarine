@@ -74,6 +74,9 @@ export interface ConfirmOptions {
   okLabel?: string;
   cancelLabel?: string;
   destructive?: boolean;
+  /** Shows a "Don't ask again" box; called when it's ticked and the answer
+   *  is OK (the caller turns its setting off). */
+  dontAskAgain?: () => void;
 }
 
 type Resolver = (value: boolean) => void;
@@ -155,6 +158,8 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
   const chainedAtRef = useRef(-Infinity);
   const [, repaint] = useReducer((n: number) => n + 1, 0);
   const [tpValue, setTpValue] = useState("");
+  // The confirm's "Don't ask again" box, unticked for each new confirm.
+  const [dontAsk, setDontAsk] = useState(false);
   const [tpError, setTpError] = useState<string | null>(null);
 
   const active = queueRef.current[0] ?? null;
@@ -169,6 +174,7 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
   const tpPanelRef = useRef<HTMLDivElement | null>(null);
   useFocusTrap(owState?.id ?? null, owPanelRef);
   useFocusTrap(state?.id ?? null, confirmPanelRef);
+  useEffect(() => { setDontAsk(false); }, [state?.id]);
   useFocusTrap(tpState?.id ?? null, tpPanelRef);
 
   // A text prompt starts from its own initial value, never from what was
@@ -225,7 +231,10 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
   };
 
   const close = (value: boolean) => {
-    if (state && advance(state)) state.resolve(value);
+    if (state && advance(state)) {
+      if (value && dontAsk) state.opts.dontAskAgain?.();
+      state.resolve(value);
+    }
   };
   const closeOverwrite = (choice: OverwriteChoice) => {
     if (owState && advance(owState)) owState.resolve(choice);
@@ -376,7 +385,13 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
             <p className="text-[12px] text-zinc-300 leading-relaxed mb-4 whitespace-pre-wrap break-words">
               {state.opts.message}
             </p>
-            <div className="flex justify-end gap-2">
+            <div className="flex items-center justify-end gap-2">
+              {state.opts.dontAskAgain && (
+                <label className="mr-auto flex items-center gap-2 text-[11px] text-zinc-400 cursor-pointer select-none">
+                  <input type="checkbox" className="accent-primary" checked={dontAsk} onChange={(e) => setDontAsk(e.target.checked)} />
+                  Don't ask again
+                </label>
+              )}
               <button onClick={() => close(false)}
                       className="px-3 h-8 rounded text-[11px] font-bold uppercase tracking-wider bg-white/[0.04] border border-white/10 text-zinc-300 hover:bg-white/[0.08] hover:text-white">
                 {state.opts.cancelLabel || "Cancel"}
