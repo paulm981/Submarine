@@ -32,6 +32,7 @@ mod rdp;
 mod server_os;
 mod local_term;
 mod tree_moves;
+mod multiexec;
 #[cfg(test)]
 mod ssh_test_server;
 use ssh_manager::SshState;
@@ -320,7 +321,8 @@ fn save_vault_blocking(
 /// The vault tables that participate in per-entity Last-Write-Wins sync. Each
 /// carries the `uuid` (portable identity) / `updated_at` (HLC) / `deleted`
 /// (tombstone) columns. `known_hosts`, `cmd_history`, `monitor_settings`,
-/// `rdp_links` and `schema_meta` are intentionally device-local and NOT synced.
+/// `rdp_links`, `walls` and `schema_meta` are intentionally device-local and
+/// NOT synced.
 const SYNCED_TABLES: &[&str] = &[
     "folders", "ssh_keys", "credentials", "servers", "commands", "notes", "monitor_configs",
 ];
@@ -3599,6 +3601,8 @@ async fn setup_master_db_inner(
     // above, which is how a fresh vault once went without it. Additive, like
     // run_on_connect: an older build simply doesn't see it.
     conn.execute(rdp::SCHEMA, []).map_err(|e| format!("[DATABASE] RDP_TABLE_FAILED: {}", e))?;
+    // Saved walls (multiexec.rs): device-local too, added the same way.
+    conn.execute(multiexec::SCHEMA, []).map_err(|e| format!("[DATABASE] WALLS_TABLE_FAILED: {}", e))?;
     // The OS each server last reported (server_os.rs), for its badge.
     // Device-local, not a synced column. Added here for both vault paths too;
     // on a vault that has it already this answers "duplicate column".
@@ -7081,6 +7085,17 @@ async fn connect_jump_host(
     };
     // A blank bastion username is resolved after the handshake (issue #54).
     let saved_user = user.trim().to_string();
+
+    // Wait for a turn to log in to this jump host (multiexec.rs), held until
+    // this login is done, so opening a folder of servers behind it doesn't
+    // trip its limit on logins in progress.
+    let _login_turn = multiexec::login_turn(app, jump_server_id, attempt, |limit| {
+        log(
+            &format!("Waiting for a login slot on the jump host ({} logging in at a time)...", limit),
+            "info",
+        )
+    })
+    .await?;
 
     // 2. Direct TCP to the bastion.
     log(&format!("Connecting to jump host {}:{}...", host, port), "info");
@@ -14624,6 +14639,7 @@ pub fn run() {
             initiate_connection, verify_fingerprint_response, submit_kbi_response, disconnect_session,
             start_tunnel, stop_tunnel, list_tunnels, restart_session_tunnels, persist_session_tunnels,
             open_terminal, write_terminal_data, resize_terminal, close_terminal,
+            multiexec::write_terminals_data,
             local_term::list_local_shells, local_term::local_shell_set_default,
             local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
             local_term::local_terminal_open, local_term::local_terminal_write,
@@ -14665,6 +14681,8 @@ pub fn run() {
             portable::get_storage_info,
             local_open::live_edit_editor_get, local_open::live_edit_editor_pick, local_open::live_edit_editor_reset,
             rdp::rdp_list, rdp::rdp_save, rdp::rdp_delete, rdp::rdp_open,
+            multiexec::wall_list, multiexec::wall_save, multiexec::wall_delete,
+            multiexec::get_jump_login_limit, multiexec::set_jump_login_limit,
             server_os::detect_server_os,
             fonts::list_system_fonts,
             clipboard_read_text

@@ -26,6 +26,54 @@ interface LiveEditEditor {
   default_label: string;
 }
 
+// How many sessions log in to the same jump host at once (multiexec.rs):
+// opening a folder of servers behind one queues the rest. Kept by the
+// backend, which does the queueing.
+function JumpLoginLimit() {
+  const [limit, setLimit] = useState<number | null>(null);
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    invoke<number>("get_jump_login_limit").then((n) => { setLimit(n); setDraft(String(n)); }).catch(() => setLimit(null));
+  }, []);
+  const save = () => {
+    const n = Number(draft.trim());
+    if (!Number.isInteger(n) || n < 0 || n > 256) {
+      setError("A whole number from 0 to 256.");
+      return;
+    }
+    setError(null);
+    invoke<number>("set_jump_login_limit", { limit: n })
+      .then((v) => { setLimit(v); setDraft(String(v)); })
+      .catch((e) => setError(String(e)));
+  };
+  return (
+    <div className="flex items-center justify-between gap-4">
+      <div className="min-w-0">
+        <div className="text-sm font-semibold text-zinc-100">Logins at a time per jump host</div>
+        <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
+          When many servers behind one jump host open at once (a folder opened as a wall), this many log in to it
+          together and the rest wait their turn — a jump host turns away logins past its own limit (OpenSSH starts
+          at 10). 0 means no limit. Servers reached directly aren't held back.
+        </p>
+        {error && <p className="text-[11px] text-red-400 mt-1">{error}</p>}
+      </div>
+      <input
+        type="number"
+        min={0}
+        max={256}
+        aria-label="Logins at a time per jump host"
+        value={draft}
+        disabled={limit === null}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={save}
+        onKeyDown={(e) => { if (e.key === "Enter") save(); }}
+        className="shrink-0 w-20 h-9 px-2 bg-zinc-900/60 border border-white/10 rounded-lg text-[13px] text-zinc-50 text-center outline-none focus:border-primary/50"
+      />
+    </div>
+  );
+}
+
 // Kept by the backend, not in local storage: the editor is started with files
 // from servers, so it can only be set through the native file dialog.
 function LiveEditSettings() {
@@ -447,6 +495,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
                 <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${settings.detectOs !== false ? 'left-[22px]' : 'left-0.5'}`} />
               </button>
             </div>
+            <JumpLoginLimit />
           </div>
         </section>
 
