@@ -6,7 +6,7 @@ import {
   Plus, X, RefreshCw, Terminal, Key, Trash2,
   ArrowLeftRight, Shield, User, Cpu, TerminalSquare, List, Edit2,
   StickyNote, Search, Square, Copy, ChevronLeft, MoreVertical, Radio,
-  ChevronDown, Columns, LayoutGrid, Pin, PinOff
+  ChevronDown, Columns, LayoutGrid, Pin, PinOff, Home
 } from "lucide-react";
 import { useBroadcast } from "./ui/broadcast";
 
@@ -20,6 +20,8 @@ import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./
 import { Sidebar } from "./components/Sidebar";
 import { NodeGrid } from "./components/NodeGrid";
 import { SessionTree } from "./components/SessionTree";
+import HomePane from "./components/HomePane";
+import { IS_ANDROID } from "./util/platform";
 import type { RdpLink } from "./components/RdpLinkModal";
 import AddNodePanel from "./components/AddNodePanel";
 import TerminalView from "./components/TerminalView";
@@ -38,6 +40,12 @@ const appWindow = getCurrentWindow();
 // `host`: the server's host when its tab was opened, which the OS badge
 // check goes by (an edit made while the tab is open doesn't move it).
 type Session = { id: string; serverId: number; serverName: string; host?: string; mirrors?: string; runOnConnect?: string; quickAuth?: QuickAuth | null };
+
+// The Home view (HomePane): terminals on this computer, where the app opens
+// and where closing the last session tab goes back to. Android has no shells
+// to offer, so it keeps the server grid there.
+const HAS_HOME = !IS_ANDROID;
+const START_VIEW = HAS_HOME ? "home" : "nodes";
 
 const hexToRgb = (hex: string) => {
   const r = parseInt(hex.slice(1, 3), 16);
@@ -62,7 +70,11 @@ function DesktopApp() {
   // `cloudSyncing` gates the sidebar button; `lastSyncLabel` feeds its tooltip.
   const [cloudSyncing, setCloudSyncing] = useState(false);
   const [lastSyncLabel, setLastSyncLabel] = useState<string | null>(null);
-  const [activeView, setActiveView] = useState<string>("nodes");
+  const [activeView, setActiveView] = useState<string>(START_VIEW);
+  // HomePane mounts the first time Home is shown and then stays mounted, so
+  // its shells keep running while the user is in a session.
+  const [homeShown, setHomeShown] = useState(false);
+  useEffect(() => { if (activeView === "home") setHomeShown(true); }, [activeView]);
   const [sessions, setSessions] = useState<Session[]>([]);
   // Tracks the live status of each open session ('connecting' | 'connected'
   // | 'failed' | 'disconnected'). Updated via the callback every SessionView
@@ -190,7 +202,24 @@ function DesktopApp() {
   const [folders, setFolders] = useState<any[]>([]);
   // Remote Desktop links (src-tauri/src/rdp.rs): shown with the servers, open
   // the system's Remote Desktop client.
-  const [rdpLinks, setRdpLinks] = useState<any[]>([]);
+  const [rdpLinks, setRdpLinks] = useState<RdpLink[]>([]);
+  // The servers asked for their OS this run, by server, host and port (the
+  // OS badge effect below).
+  const osChecked = useRef<Set<string>>(new Set());
+
+  // The session tree (desktop): shown or hidden, and on which side. Per
+  // device, like the other UI preferences.
+  const readPref = (key: string, fallback: string) => {
+    try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
+  };
+  const writePref = (key: string, value: string) => {
+    try { localStorage.setItem(key, value); } catch { /* per-device nicety only */ }
+  };
+  const [treeOpen, setTreeOpen] = useState(() => readPref("submarine-session-tree-open", "1") === "1");
+  const [treeSide, setTreeSide] = useState<"left" | "right">(() => (readPref("submarine-session-tree-side", "right") === "left" ? "left" : "right"));
+  useEffect(() => writePref("submarine-session-tree-open", treeOpen ? "1" : "0"), [treeOpen]);
+  useEffect(() => writePref("submarine-session-tree-side", treeSide), [treeSide]);
+
   const [commands, setCommands] = useState<any[]>([]);
   const [logs, setLogs] = useState<{ msg: string, type: string, time: string }[]>([]);
   const [isCommandPanelOpen, setIsCommandPanelOpen] = useState(false);
@@ -309,7 +338,7 @@ function DesktopApp() {
       h = () => {
         setSessions(prev => prev.filter(s => s.id !== sessId));
         setSessionStatuses(prev => { const { [sessId]: _, ...rest } = prev; return rest; });
-        setActiveView(prev => (prev === sessId ? "nodes" : prev));
+        setActiveView(prev => (prev === sessId ? START_VIEW : prev));
         // Purge the closing session from broadcast state so a stale id doesn't
         // linger in the target set (would let a user re-enable broadcast and
         // silently exclude a phantom target from the count).
@@ -365,7 +394,7 @@ function DesktopApp() {
     catch (e) { addLog(`SYNC_FOLDERS: ${e}`, "error"); }
   };
   const refreshRdpLinks = async () => {
-    try { setRdpLinks((await invoke("rdp_list")) as any[]); }
+    try { setRdpLinks(await invoke<RdpLink[]>("rdp_list")); }
     catch (e) { addLog(`SYNC_RDP_LINKS: ${e}`, "error"); }
   };
   const refreshCommands = async () => {
@@ -542,6 +571,21 @@ function DesktopApp() {
     } catch (e) { addLog(`DELETE_EXCEPTION: ${e}`, "error"); }
   };
 
+  const openRdp = async (id: number) => {
+    try { await invoke("rdp_open", { id }); }
+    catch (e) { addLog(`RDP_OPEN: ${e}`, "error"); throw e; }
+  };
+
+  const saveRdp = async (link: RdpLink) => {
+    await invoke("rdp_save", { link });
+    await refreshRdpLinks();
+  };
+
+  const removeRdp = async (id: number) => {
+    try { await invoke("rdp_delete", { id }); await refreshRdpLinks(); }
+    catch (e) { addLog(`RDP_DELETE: ${e}`, "error"); }
+  };
+
   const renameFolder = async (id: number, name: string) => {
     try {
       await invoke("rename_folder", { id, name });
@@ -607,6 +651,22 @@ function DesktopApp() {
   // the user opening/closing tabs and either over- or under-confirm.
   const sessionsRef = useRef(sessions);
   useEffect(() => { sessionsRef.current = sessions; }, [sessions]);
+  // Home terminals still running (HomePane), which closing the window or
+  // locking the profile ends too.
+  const homeShellsRef = useRef(0);
+
+  // What closing or locking would end, for the confirmations below, or null
+  // when there's nothing to ask about. One Home shell on its own doesn't
+  // count — the app always has one, and every lock would ask.
+  const wouldEnd = () => {
+    const ssh = sessionsRef.current.length;
+    const local = homeShellsRef.current;
+    if (ssh === 0 && local < 2) return null;
+    const parts = [];
+    if (ssh > 0) parts.push(`${ssh} SSH session${ssh === 1 ? "" : "s"}`);
+    if (local > 0) parts.push(`${local} terminal${local === 1 ? "" : "s"} on this computer`);
+    return { what: parts.join(" and "), many: ssh + local > 1 };
+  };
 
   // Intercept BOTH the in-app X button (which calls appWindow.close()) AND
   // OS-level closes (Alt+F4, taskbar context-menu close, system shutdown).
@@ -619,12 +679,12 @@ function DesktopApp() {
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     appWindow.onCloseRequested(async (event) => {
-      const n = sessionsRef.current.length;
-      if (n === 0) return; // nothing to lose — let the close proceed
+      const ending = wouldEnd();
+      if (!ending) return; // nothing to lose — let the close proceed
       event.preventDefault();
       const ok = await confirm({
         title: "Close Submarine?",
-        message: `${n} SSH session${n === 1 ? "" : "s"} ${n === 1 ? "is" : "are"} still connected. Closing now disconnects ${n === 1 ? "it" : "them all"} and aborts any in-flight transfers.`,
+        message: `${ending.what} ${ending.many ? "are" : "is"} still open. Closing now ends ${ending.many ? "them all" : "it"} and aborts any in-flight transfers.`,
         okLabel: "Close anyway",
         cancelLabel: "Stay",
         destructive: true,
@@ -637,13 +697,15 @@ function DesktopApp() {
   }, [confirm]);
 
   // Lock the current profile and return to the picker. Confirms first when
-  // there are open SSH sessions because they will be torn down — accidental
-  // double-clicks on the lock icon shouldn't kill the user's terminal work.
+  // there are open SSH sessions (or Home terminals) because they will be
+  // torn down — accidental double-clicks on the lock icon shouldn't kill
+  // the user's terminal work.
   const handleLogout = async () => {
-    if (sessions.length > 0) {
+    const ending = wouldEnd();
+    if (ending) {
       const ok = await confirm({
         title: "Switch profile?",
-        message: `You have ${sessions.length} open SSH session${sessions.length === 1 ? "" : "s"}. Switching will disconnect ${sessions.length === 1 ? "it" : "them all"} and take you back to the profile picker.`,
+        message: `You have ${ending.what} open. Switching will end ${ending.many ? "them all" : "it"} and take you back to the profile picker.`,
         okLabel: "Switch",
         cancelLabel: "Stay",
         destructive: true,
@@ -665,31 +727,17 @@ function DesktopApp() {
     setIsUnlocked(false);
     setActiveProfile(null);
     setSessions([]);
-    setActiveView("nodes");
+    setActiveView(START_VIEW);
     setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setRdpLinks([]); setCommands([]);
     osChecked.current.clear();
     addLog("Profile locked.", "info");
   };
 
-  // The session tree (desktop): shown or hidden, and on which side. Per
-  // device, like the other UI preferences.
-  const readPref = (key: string, fallback: string) => {
-    try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
-  };
-  const writePref = (key: string, value: string) => {
-    try { localStorage.setItem(key, value); } catch { /* per-device nicety only */ }
-  };
-  const [treeOpen, setTreeOpen] = useState(() => readPref("submarine.sessionTree.open", "1") === "1");
-  const [treeSide, setTreeSide] = useState<"left" | "right">(() => (readPref("submarine.sessionTree.side", "right") === "left" ? "left" : "right"));
-  useEffect(() => writePref("submarine.sessionTree.open", treeOpen ? "1" : "0"), [treeOpen]);
-  useEffect(() => writePref("submarine.sessionTree.side", treeSide), [treeSide]);
-
   // Each server's OS, for the badges in the session tree and the server grid
   // (src-tauri/src/server_os.rs): read once, when a server whose OS isn't
   // known yet connects, unless Settings turns it off. Moving a server to
   // another host or port forgets its OS, so it is read again; a server that
-  // can't answer isn't asked again until the app restarts.
-  const osChecked = useRef<Set<string>>(new Set());
+  // can't answer isn't asked again until the app restarts (osChecked).
   useEffect(() => {
     if (!appSettings.detectOs) return;
     for (const s of sessions) {
@@ -975,7 +1023,7 @@ function DesktopApp() {
                               return next.length < 2 ? [] : next;
                             });
                             unpinSessionFromWall(sid);
-                            setActiveView(prev => (prev === sid ? 'nodes' : prev));
+                            setActiveView(prev => (prev === sid ? START_VIEW : prev));
                           }}
                           title="Close session"
                           className="h-8 w-8 shrink-0 rounded-lg flex items-center justify-center text-zinc-400 hover:text-red-400 hover:bg-white/[0.06] transition-all"
@@ -1026,6 +1074,23 @@ function DesktopApp() {
         className={`${isMobile ? 'hidden' : 'flex'} flex-1 gap-1 overflow-x-auto no-scrollbar h-full items-end pb-1`}
         onWheel={(e) => { e.currentTarget.scrollLeft += e.deltaY; }}
       >
+        {/* Home stays first, like MobaXterm's home tab: always there to go
+            back to, and not a session — no status, no close, never in a
+            broadcast or a split. */}
+        {HAS_HOME && isUnlocked && (
+          <div
+            onClick={() => setActiveView("home")}
+            title="Home — terminals on this computer"
+            className={`no-drag flex items-center gap-1.5 h-7 px-3 rounded-full cursor-pointer transition-all shrink-0 mr-1 ${
+              activeView === "home"
+                ? 'bg-primary/15 text-primary border border-primary/40 shadow-inner shadow-primary/10'
+                : 'bg-white/[0.06] text-zinc-300 border border-white/10 hover:bg-white/[0.1] hover:border-white/20 hover:text-white'
+            }`}
+          >
+            <Home size={12} className="shrink-0" />
+            <span className="text-[11px] font-semibold whitespace-nowrap tracking-tight">Home</span>
+          </div>
+        )}
         {sessions.map(s => {
           const st = sessionStatuses[s.id] ?? "connecting";
           // Dot palette: green = connected, amber = connecting, red = failed
@@ -1173,7 +1238,7 @@ function DesktopApp() {
                   });
                   broadcast.removeSession(s.id);
                   unpinSessionFromWall(s.id);
-                  setActiveView(prev => (prev === s.id ? "nodes" : prev));
+                  setActiveView(prev => (prev === s.id ? START_VIEW : prev));
                 }}
               >
                 <X size={12} />
@@ -1524,7 +1589,7 @@ function DesktopApp() {
                   return next.length < 2 ? [] : next;
                 });
                 unpinSessionFromWall(sid);
-                setActiveView(prev => (prev === sid ? "nodes" : prev));
+                setActiveView(prev => (prev === sid ? START_VIEW : prev));
                 setTabMenu(null);
               }}
             >Close tab</button>
@@ -1552,7 +1617,7 @@ function DesktopApp() {
       waiting={promptSessions}
       activeSessionId={activeView}
       onOpenServers={openServers}
-      onOpenRdp={async (id: number) => { await invoke("rdp_open", { id }); }}
+      onOpenRdp={openRdp}
       onEditServer={handleEditNode}
       side={treeSide}
       onToggleSide={() => setTreeSide((s) => (s === "left" ? "right" : "left"))}
@@ -1572,7 +1637,7 @@ function DesktopApp() {
         // tab-order stays intuitive and <main> grabs the full screen width
         // (terminal gains the ~50px the vertical rail used to eat).
         <div className={`flex-1 flex ${isMobile ? 'flex-col-reverse' : ''} overflow-hidden pt-10`}>
-          <Sidebar activeTab={activeView.startsWith('session-') ? 'nodes' : activeView} setActiveTab={setActiveView} isMobile={isMobile} onLogout={handleLogout} profileName={activeProfile} syncing={cloudSyncing}
+          <Sidebar activeTab={activeView.startsWith('session-') ? 'nodes' : activeView} setActiveTab={setActiveView} isMobile={isMobile} onLogout={handleLogout} profileName={activeProfile} syncing={cloudSyncing} hasHome={HAS_HOME}
             treeOpen={treeOpen} onToggleTree={isMobile ? undefined : () => setTreeOpen((v) => !v)} />
           {!isMobile && treeOpen && treeSide === "left" && sessionTree}
 
@@ -1582,18 +1647,9 @@ function DesktopApp() {
                 servers={servers}
                 folders={folders}
                 rdpLinks={rdpLinks}
-                onOpenRdp={async (id: number) => {
-                  try { await invoke("rdp_open", { id }); }
-                  catch (e) { addLog(`RDP_OPEN: ${e}`, "error"); throw e; }
-                }}
-                onSaveRdp={async (link: RdpLink) => {
-                  await invoke("rdp_save", { link });
-                  await refreshRdpLinks();
-                }}
-                onRemoveRdp={async (id: number) => {
-                  try { await invoke("rdp_delete", { id }); await refreshRdpLinks(); }
-                  catch (e) { addLog(`RDP_DELETE: ${e}`, "error"); }
-                }}
+                onOpenRdp={openRdp}
+                onSaveRdp={saveRdp}
+                onRemoveRdp={removeRdp}
                 activeFolderId={activeFolderId}
                 onActiveFolderChange={setActiveFolderId}
                 onOpenServer={openServer}
@@ -1909,7 +1965,7 @@ function DesktopApp() {
                             label={sess.serverName}
                             onReset={() => {
                               setSessions(prev => prev.filter(s => s.id !== sess.id));
-                              if (activeView === sess.id) setActiveView("nodes");
+                              if (activeView === sess.id) setActiveView(START_VIEW);
                             }}
                           >
                             <SessionView
@@ -1930,6 +1986,15 @@ function DesktopApp() {
                 </div>
               );
             })()}
+
+            {/* Home — terminals on this computer. Mounted the first time
+                it's shown and only hidden after that (like the sessions
+                canvas above), so its shells keep running. */}
+            {HAS_HOME && homeShown && (
+              <div className={`absolute inset-0 flex flex-col overflow-hidden bg-background ${activeView === "home" ? "" : "opacity-0 pointer-events-none"}`}>
+                <HomePane visible={activeView === "home"} onLiveShells={(n) => { homeShellsRef.current = n; }} />
+              </div>
+            )}
 
             {/* Wall canvas — a grid of individual terminal tiles pinned
                 from any session. Independent of the session-split

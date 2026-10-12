@@ -831,14 +831,14 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
   };
 
   // Local: open file in default OS application. A file Windows would run
-  // (program, script, shortcut) comes back as `RUNS:<path>` and is opened
-  // only once the user says so.
+  // (program, script, shortcut) comes back as `[OPEN] RUNS_WHEN_OPENED` and
+  // is opened only once the user says so.
   const openLocalEntry = async (entry: FileEntry) => {
     if (entry.isDir) { fetch(entry.path); return; }
     try {
       await invoke("local_open_file", { localPath: entry.path });
     } catch (err: any) {
-      if (typeof err === "string" && err.startsWith("RUNS:")) {
+      if (typeof err === "string" && err.startsWith("[OPEN] RUNS_WHEN_OPENED")) {
         const ok = await confirmDialog({
           title: "Run this program?",
           message: `“${visibleName(entry.name)}” is a program, script or shortcut. Opening it runs it on this computer. Only run it if you trust where it came from.`,

@@ -57,12 +57,15 @@ pub struct UpdateInfo {
     /// Direct link to the latest release page. Frontend shows an "Open
     /// release notes" button when has_update is true.
     pub release_url: Option<String>,
-    /// Commits on the fork's main that this build doesn't have, and the
-    /// GitHub page listing them. None when that couldn't be told (a build
-    /// not made from a pushed commit, GitHub unreachable).
+    /// Commits on the fork's main that this build doesn't have — None when
+    /// that couldn't be told (a build not made from a pushed commit, GitHub
+    /// unreachable) — and the GitHub page comparing them, whenever the build
+    /// knows its commit.
     pub main_ahead: Option<u64>,
     pub main_url: Option<String>,
-    /// Commits on the original project's main not yet in the fork's main.
+    /// Commits on the original project's main not yet in the fork's main
+    /// (None when that couldn't be told), and the fork's page, where GitHub
+    /// offers "Sync fork".
     pub upstream_ahead: Option<u64>,
     pub upstream_url: Option<String>,
 }

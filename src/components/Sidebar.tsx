@@ -1,4 +1,4 @@
-import { Server, KeyRound, Library, Activity, Settings, LogOut, UserCircle, ListTree } from "lucide-react";
+import { Server, KeyRound, Library, Activity, Settings, LogOut, UserCircle, ListTree, Home } from "lucide-react";
 
 // Vertical rail on desktop, horizontal bottom dock on mobile. Layout swap is
 // driven by `isMobile` so the terminal/session views can use the full screen
@@ -6,7 +6,7 @@ import { Server, KeyRound, Library, Activity, Settings, LogOut, UserCircle, List
 // a 360px-wide viewport. The parent in DesktopApp uses `flex-col-reverse` on
 // mobile so this component visually lands at the bottom while staying first
 // in DOM order (keyboard tab-order stays intuitive).
-export const Sidebar = ({ activeTab, setActiveTab, isMobile, onLogout, profileName, syncing, treeOpen, onToggleTree }: any) => {
+export const Sidebar = ({ activeTab, setActiveTab, isMobile, onLogout, profileName, syncing, treeOpen, onToggleTree, hasHome }: any) => {
   // The profile rail is deliberately apart from the content rails below. Those
   // switch what you're looking at INSIDE the open profile; this one is about the
   // profile itself — its cloud sync and who else can get into it. It used to
@@ -36,10 +36,12 @@ export const Sidebar = ({ activeTab, setActiveTab, isMobile, onLogout, profileNa
   // room the user asked us to give back on narrow viewports.
   // "Tile two sessions together" moved out of a dedicated Compare rail
   // and into a per-session-tab "Merge into current view" action — the
-  // sidebar stays focused on the persistent-content activities (Servers,
-  // Logins, Library, Monitor) so it isn't padded with a workflow that
-  // only makes sense while sessions are open.
+  // sidebar stays focused on the persistent-content activities (Home,
+  // Servers, Logins, Library, Monitor) so it isn't padded with a workflow
+  // that only makes sense while sessions are open.
   const items = [
+    // Home: the terminals on this computer (HomePane), where the app opens.
+    ...(hasHome ? [{ id: 'home', icon: Home, label: 'Home' }] : []),
     { id: 'nodes', icon: Server, label: 'Servers' },
     { id: 'vault', icon: KeyRound, label: 'Logins' },
     { id: 'library', icon: Library, label: 'Library' },

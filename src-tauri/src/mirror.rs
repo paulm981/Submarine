@@ -398,6 +398,10 @@ async fn sftp_download_file(
         let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(format!("local rename {:?} -> {:?}: {}", tmp_path, local, e));
     }
+    // Marked as downloaded, like every other file from a server
+    // (local_open.rs) — before the mtime below, which writing the mark
+    // would otherwise move on.
+    crate::local_open::mark_from_internet(local);
     if let Some(secs) = remote_mtime_secs {
         let ft = filetime::FileTime::from_unix_time(secs as i64, 0);
         let _ = filetime::set_file_mtime(local, ft);

@@ -158,8 +158,7 @@ fn rdp_file(link: &RdpLink, defaults: Option<&str>) -> String {
 #[cfg(any(windows, test))]
 fn decode_rdp(bytes: &[u8]) -> Option<String> {
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        return String::from_utf16(&units).ok();
+        return String::from_utf16(&crate::local_open::utf16le_units(rest)).ok();
     }
     String::from_utf8(bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes).to_vec()).ok()
 }
@@ -228,11 +227,7 @@ fn launch(_link: &RdpLink) -> Result<(), String> {
 fn launch(link: &RdpLink) -> Result<(), String> {
     #[cfg(windows)]
     {
-        let system = std::env::var_os("SystemRoot")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
-            .join("System32");
-        let mstsc = system.join("mstsc.exe");
+        let mstsc = crate::local_open::system32().join("mstsc.exe");
         if link.username.trim().is_empty() {
             std::process::Command::new(&mstsc)
                 .arg(format!("/v:{}", address(&link.host, link.port)))

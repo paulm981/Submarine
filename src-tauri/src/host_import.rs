@@ -8,7 +8,7 @@
 //! nothing half done:
 //!
 //! - folders are created as nested folders, reusing ones that already exist;
-//! - each saved login becomes one Login (Settings › Logins), reused by name,
+//! - each saved login becomes one Login (the Logins rail), reused by name,
 //!   with its user name and password left for the user to fill in once;
 //! - a single-hop jump host is matched to a server already saved with the
 //!   same host, port and user, or saved as a new one with its key, and every
@@ -384,8 +384,7 @@ pub async fn pick_client_import_file() -> Result<Option<String>, String> {
 /// names are plain ASCII.
 fn decode_export(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        return String::from_utf16_lossy(&units);
+        return String::from_utf16_lossy(&crate::local_open::utf16le_units(rest));
     }
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
     match std::str::from_utf8(bytes) {

@@ -43,6 +43,10 @@ interface UpdateInfo {
 // Whether the check found anything to announce.
 const hasNews = (u: UpdateInfo) => (u.has_update && !!u.latest) || (u.main_ahead ?? 0) > 0 || (u.upstream_ahead ?? 0) > 0;
 const changes = (n: number) => `${n} new change${n === 1 ? "" : "s"}`;
+// The silent check's answer, kept for the rest of this run of the app: the
+// picker comes back on every lock, and each check is three unauthenticated
+// GitHub calls out of the 60 an hour an office's shared address gets.
+let silentCheck: Promise<UpdateInfo> | null = null;
 // The running version and the project's GitHub page (backend: about::app_info).
 interface AppInfo { version: string; github_repo_url: string; }
 // The GitHub link's fallback, should app_info ever fail (about::GITHUB_REPO).
@@ -152,14 +156,16 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
 
   useEffect(() => { refreshCloud(); }, [refreshCloud]);
 
-  // Check GitHub for a newer release or newer commits once per app open (this
-  // page mounts on launch and on every return to the picker). Best-effort and
-  // silent: the fetch+compare happens in Rust (about::check_for_updates), and
-  // any failure — offline, rate-limited, no releases — simply shows nothing.
+  // Check GitHub for a newer release or newer commits once per run of the
+  // app (this page mounts on launch and on every return to the picker; the
+  // later mounts reuse the first answer). Best-effort and silent: the
+  // fetch+compare happens in Rust (about::check_for_updates), and any
+  // failure — offline, rate-limited, no releases — simply shows nothing.
   useEffect(() => {
-    invoke<UpdateInfo>("check_for_updates")
+    silentCheck ??= invoke<UpdateInfo>("check_for_updates");
+    silentCheck
       .then((u) => { if (hasNews(u)) setUpdate(u); })
-      .catch(() => {});
+      .catch(() => { silentCheck = null; });
   }, []);
 
   // A link that can't be opened (no browser / URL handler on this device)

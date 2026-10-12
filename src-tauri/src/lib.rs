@@ -30,6 +30,7 @@ mod local_open;
 mod host_import;
 mod rdp;
 mod server_os;
+mod local_term;
 #[cfg(test)]
 mod ssh_test_server;
 use ssh_manager::SshState;
@@ -881,9 +882,16 @@ fn collect_local_records(conn: &Connection, key: &[u8; 32], since: &str) -> Resu
 /// with the auto-stamp triggers suppressed so incoming HLC stamps are written
 /// verbatim, and advances the local clock past everything seen.
 fn apply_remote_records(conn: &Connection, key: &[u8; 32], records: &[SyncRecord], hlc: &hlc::Hlc) -> Result<(), String> {
+    with_merge_flag(conn, |c| apply_remote_inner(c, key, records, hlc))
+}
+
+/// Run `f` with the sync auto-stamp triggers held back (the `merge` flag the
+/// triggers' GUARD reads), so what it writes isn't stamped as a local edit to
+/// push: a sync merge, or a value only this device keeps (server_os.rs).
+pub(crate) fn with_merge_flag<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
     conn.execute("INSERT INTO sync_flags(key,val) VALUES('merge',1) ON CONFLICT(key) DO UPDATE SET val=1", [])
         .map_err(|e| format!("[SYNC] MERGE_ON: {e}"))?;
-    let r = apply_remote_inner(conn, key, records, hlc);
+    let r = f(conn);
     let _ = conn.execute("UPDATE sync_flags SET val=0 WHERE key='merge'", []);
     r
 }
@@ -12063,7 +12071,7 @@ async fn sftp_prepare_drag(
 
 /// `run_program`: the user confirmed opening a file Windows would run (a
 /// program, script or shortcut). Without it such a file is refused with
-/// `RUNS:<path>`, and the Local pane asks first.
+/// `[OPEN] RUNS_WHEN_OPENED: <path>`, and the Local pane asks first.
 #[tauri::command]
 async fn local_open_file(local_path: String, run_program: Option<bool>) -> Result<(), String> {
     #[cfg(target_os = "android")]
@@ -12075,7 +12083,7 @@ async fn local_open_file(local_path: String, run_program: Option<bool>) -> Resul
     {
         let safe = guard_local_path(&local_path, false)?;
         if run_program != Some(true) && safe.is_file() && local_open::runs_when_opened(&safe) {
-            return Err(format!("RUNS:{}", local_path));
+            return Err(format!("[OPEN] RUNS_WHEN_OPENED: {}", local_path));
         }
         open::that(&safe).map_err(|e| format!("Failed to open local file: {}", e))?;
         Ok(())
@@ -12318,7 +12326,7 @@ struct ImportedHost {
 }
 
 /// What the pasted-import parser found: the hosts, and a line about the
-/// sessions it can't bring in (MobaXterm's RDP, VNC, …).
+/// sessions it can't bring in (MobaXterm's VNC, serial, …).
 #[derive(serde::Serialize)]
 struct ClientImport {
     hosts: Vec<ImportedHost>,
@@ -12936,7 +12944,7 @@ fn parse_mobaxterm_sessions_in(text: &str, profile_dir: Option<&str>, documents:
             proxy_jump,
             folder: folder.clone(),
             credential,
-            run_on_connect: (!rdp).then(|| Some(field(7)).filter(|c| !c.is_empty()).map(String::from)).flatten(),
+            run_on_connect: (!rdp).then(|| Some(field(7)).filter(|c| !c.is_empty()).map(mobaxterm_unescape)).flatten(),
             jump_identity_file,
             jump_credential,
             rdp,
@@ -12946,6 +12954,17 @@ fn parse_mobaxterm_sessions_in(text: &str, profile_dir: Option<&str>, documents:
         return Err("No MobaXterm SSH or RDP sessions found in the pasted text.".into());
     }
     Ok(out)
+}
+
+/// MobaXterm writes the characters its own format uses — `;`, `|`, `#`, `%`
+/// and `"` — as words in a setting's text: `cd /opt__PTVIRG__ ls`. Back to
+/// what the user typed.
+fn mobaxterm_unescape(text: &str) -> String {
+    text.replace("__PTVIRG__", ";")
+        .replace("__PIPE__", "|")
+        .replace("__DIEZE__", "#")
+        .replace("__PERCENT__", "%")
+        .replace("__DBLQUO__", "\"")
 }
 
 /// The saved login a MobaXterm jump host signs in with: `[name]` as the
@@ -12988,6 +13007,17 @@ fn mobaxterm_jump_hosts(hosts: &str, ports: &str, users: &str) -> Option<String>
 #[cfg(test)]
 mod client_import_tests {
     use super::{parse_client_hosts, parse_mobaxterm_sessions_in, mobaxterm_skipped, expand_mobaxterm_path};
+
+    #[test]
+    fn a_startup_command_comes_back_as_it_was_typed() {
+        let text = export(&[session(
+            "app",
+            109,
+            "0%app.example%22%ops%%-1%-1%cd /opt/app__PTVIRG__ ps aux __PIPE__ grep __DBLQUO__java__DBLQUO__ __DIEZE__ 100__PERCENT__%%%%0%0%0%%%-1",
+        )]);
+        let hosts = parse_mobaxterm_sessions_in(&text, None, None).unwrap();
+        assert_eq!(hosts[0].run_on_connect.as_deref(), Some("cd /opt/app; ps aux | grep \"java\" # 100%"));
+    }
 
     /// Lines as MobaXterm writes them: a blank before the first `#`, the
     /// icon, the `%`-separated settings, then the terminal settings.
@@ -14466,7 +14496,9 @@ pub fn run() {
     //
     // Every override is gated on `var_os(...).is_none()` so power users
     // (or distros that ship a patched WebKit) can opt back in by exporting
-    // the variable themselves before launching.
+    // the variable themselves before launching. They're set through
+    // local_term::set_webview_env, which keeps them from the shells the Home
+    // view starts: they're for WebKit, not for the user's own programs.
     #[cfg(target_os = "linux")]
     {
         // The single most effective override for the EGL_BAD_PARAMETER abort
@@ -14477,25 +14509,25 @@ pub fn run() {
         // host Mesa. Set before any of the more granular flags so it wins
         // on builds of WebKit that ignore the renderer-specific switches.
         if std::env::var_os("WEBKIT_DISABLE_HARDWARE_ACCELERATION").is_none() {
-            std::env::set_var("WEBKIT_DISABLE_HARDWARE_ACCELERATION", "1");
+            local_term::set_webview_env("WEBKIT_DISABLE_HARDWARE_ACCELERATION", "1");
         }
         // Older-renderer + DMA-BUF flags stay as belt-and-braces — they
         // cost nothing on builds where WEBKIT_DISABLE_HARDWARE_ACCELERATION
         // already wins, and they cover the corner cases where a downstream
         // patched WebKit honours one but not the other.
         if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+            local_term::set_webview_env("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
         }
         if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
-            std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+            local_term::set_webview_env("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
         }
         if std::env::var_os("GDK_BACKEND").is_none() {
-            std::env::set_var("GDK_BACKEND", "x11");
+            local_term::set_webview_env("GDK_BACKEND", "x11");
         }
         // Mesa software rasteriser flag kept as the final fallback in case
         // WebKit's "no hardware" path still calls into Mesa somewhere.
         if std::env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none() {
-            std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+            local_term::set_webview_env("LIBGL_ALWAYS_SOFTWARE", "1");
         }
         // Sandbox the web process (bubblewrap) when this machine supports it.
         // The rendering flags above still reach it: WebKit's bwrap launcher
@@ -14533,6 +14565,7 @@ pub fn run() {
         // Docker live-log stream registry — keyed by frontend-issued stream id,
         // values are tokio AbortHandles so the user can stop tailing on demand.
         .manage(docker::DockerStreams::new())
+        .manage(local_term::LocalTerms::default())
         // Monitoring state is its own root-level Tauri-managed value, separate
         // from SshState — monitors and interactive sessions own different SSH
         // handles per node and don't share lifecycle.
@@ -14581,6 +14614,10 @@ pub fn run() {
             initiate_connection, verify_fingerprint_response, submit_kbi_response, disconnect_session,
             start_tunnel, stop_tunnel, list_tunnels, restart_session_tunnels, persist_session_tunnels,
             open_terminal, write_terminal_data, resize_terminal, close_terminal,
+            local_term::list_local_shells, local_term::local_shell_set_default,
+            local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
+            local_term::local_terminal_open, local_term::local_terminal_write,
+            local_term::local_terminal_resize, local_term::local_terminal_close,
             ssh_info_probe_section, ssh_systemctl_action, ssh_kill_process,
             ssh_iptables_chain, ssh_nft_chain,
             docker::ssh_docker_container_action,

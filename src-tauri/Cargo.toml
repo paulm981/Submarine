@@ -150,6 +150,10 @@ open = "5.1"
 # OS font folders ourselves. Pure Rust: it only parses font name tables. Not
 # on Android, which lists no installed fonts (see fonts.rs).
 fontdb = "0.24"
+# The Home view's local terminals (local_term.rs): a pseudo-terminal for a
+# shell on this computer — ConPTY on Windows, openpty elsewhere. WezTerm's;
+# not on Android, which has no shells to offer.
+portable-pty = "0.9"
 
 # ---------------------------------------------------------------------------
 # Linux-only. GTK's own crates, already in the build through Tauri (same
