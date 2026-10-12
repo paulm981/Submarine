@@ -17,42 +17,104 @@ use crate::ssh_manager::{ConnectAttempt, SshState, TerminalCommand};
 use crate::DbState;
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 // ── Typing to many ─────────────────────────────────────────────────────────
 
-/// The same bytes to each terminal. Terminals that are gone (closed, or their
-/// session dropped) are skipped; the rest still get the data. Each terminal's
-/// queue takes it straight away unless that terminal's link is backed up;
-/// only those are waited on, after everyone else has theirs, so one slow
-/// server doesn't hold up the keystroke for the other ninety-nine. (A full
-/// queue doesn't let a later write in ahead of one waiting on it, so each
-/// terminal still gets the keys in order.)
-#[tauri::command]
-pub async fn write_terminals_data(state: tauri::State<'_, SshState>, terminal_ids: Vec<String>, data: Vec<u8>) -> Result<(), String> {
-    use tokio::sync::mpsc::error::TrySendError;
-    // Senders are cloned out so the map isn't held across the sends (see
-    // write_terminal_data).
-    let txs: Vec<_> = {
-        let map = state.terminal_txs.lock().await;
-        let mut seen = HashSet::new();
-        terminal_ids
-            .iter()
-            .filter(|id| seen.insert(id.as_str()))
-            .filter_map(|id| map.get(id).cloned())
-            .collect()
+type TerminalTxs = Arc<tokio::sync::Mutex<HashMap<String, mpsc::Sender<TerminalCommand>>>>;
+type FeedMap = HashMap<String, (u64, mpsc::UnboundedSender<Vec<u8>>)>;
+
+/// Each broadcast terminal's input on its way to the terminal's own queue,
+/// in order: terminal id → (feed id, sender). A feed's task hands the bytes
+/// on one at a time, waiting only on its own terminal, and goes away once
+/// it has been idle for FEED_IDLE.
+static FEEDS: Mutex<Option<FeedMap>> = Mutex::new(None);
+static FEED_SEQ: AtomicU64 = AtomicU64::new(0);
+const FEED_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn feeds() -> std::sync::MutexGuard<'static, Option<FeedMap>> {
+    FEEDS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Queue `data` for one terminal, starting its feed if it has none.
+fn feed(txs: &TerminalTxs, terminal_id: &str, data: Vec<u8>) {
+    let mut guard = feeds();
+    let map = guard.get_or_insert_with(HashMap::new);
+    let data = match map.get(terminal_id) {
+        Some((_, tx)) => match tx.send(data) {
+            Ok(()) => return,
+            Err(e) => e.0,
+        },
+        None => data,
     };
-    let mut backed_up = Vec::new();
-    for tx in txs {
-        if let Err(TrySendError::Full(cmd)) = tx.try_send(TerminalCommand::Data(data.clone())) {
-            backed_up.push((tx, cmd));
+    let (tx, rx) = mpsc::unbounded_channel();
+    let id = FEED_SEQ.fetch_add(1, Ordering::Relaxed);
+    let _ = tx.send(data);
+    map.insert(terminal_id.to_string(), (id, tx));
+    tokio::spawn(forward(Arc::clone(txs), terminal_id.to_string(), id, rx));
+}
+
+async fn forward(txs: TerminalTxs, terminal_id: String, id: u64, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+    loop {
+        match tokio::time::timeout(FEED_IDLE, rx.recv()).await {
+            Ok(Some(data)) => {
+                // Looked up each time: a reconnect gives the terminal a new
+                // queue under the same id.
+                let tx = txs.lock().await.get(&terminal_id).cloned();
+                if let Some(tx) = tx {
+                    let _ = tx.send(TerminalCommand::Data(data)).await;
+                }
+            }
+            Ok(None) => return,
+            Err(_) => {
+                // Idle. Retire — unless input came in just now (it's queued
+                // under the same lock, so nothing can slip in after this).
+                let mut guard = feeds();
+                if !rx.is_empty() {
+                    continue;
+                }
+                if let Some(map) = guard.as_mut() {
+                    if map.get(&terminal_id).is_some_and(|(i, _)| *i == id) {
+                        map.remove(&terminal_id);
+                    }
+                }
+                return;
+            }
         }
     }
-    for (tx, cmd) in backed_up {
-        let _ = tx.send(cmd).await;
+}
+
+/// Typing into one terminal (write_terminal_data) while it has a feed goes
+/// through the feed too, so it can't overtake keys still queued from a
+/// broadcast. `Some(data)` back when there's no feed: send it directly.
+pub(crate) fn into_feed(terminal_id: &str, data: Vec<u8>) -> Option<Vec<u8>> {
+    let guard = feeds();
+    match guard.as_ref().and_then(|m| m.get(terminal_id)) {
+        Some((_, tx)) => tx.send(data).err().map(|e| e.0),
+        None => Some(data),
     }
+}
+
+async fn write_many(txs: &TerminalTxs, terminal_ids: &[String], data: &[u8]) {
+    let known: Vec<&String> = {
+        let map = txs.lock().await;
+        let mut seen = HashSet::new();
+        terminal_ids.iter().filter(|id| seen.insert(id.as_str()) && map.contains_key(*id)).collect()
+    };
+    for id in known {
+        feed(txs, id, data.to_vec());
+    }
+}
+
+/// The same bytes to each terminal, in one call instead of one IPC
+/// round-trip per server. Terminals that are gone (closed, or their session
+/// dropped) are skipped. Never waits: each terminal's feed delivers in
+/// order, so one server whose link is backed up holds up only itself.
+#[tauri::command]
+pub async fn write_terminals_data(state: tauri::State<'_, SshState>, terminal_ids: Vec<String>, data: Vec<u8>) -> Result<(), String> {
+    write_many(&state.terminal_txs, &terminal_ids, &data).await;
     Ok(())
 }
 
@@ -104,25 +166,49 @@ fn slots_for(jump_server_id: i32, limit: i64) -> Arc<Semaphore> {
 /// fewer than the limit are logging in, otherwise once one of them is done —
 /// first come, first served. `None` with no limit set. `waiting` is called
 /// once if the turn doesn't come straight away (for the session's log).
-/// Gives up when the attempt is replaced or its tab closed.
+/// Gives up when the attempt is replaced or its tab closed. A limit changed
+/// in Settings applies to logins already waiting too: they queue again under
+/// it (0 lets them all go).
 pub(crate) async fn login_turn(
     app: &tauri::AppHandle,
     jump_server_id: i32,
     attempt: &ConnectAttempt,
     waiting: impl FnOnce(i64),
 ) -> Result<Option<OwnedSemaphorePermit>, String> {
-    let limit = login_limit(app);
-    if limit == 0 {
-        return Ok(None);
+    let mut waiting = Some(waiting);
+    loop {
+        let limit = login_limit(app);
+        if limit == 0 {
+            return Ok(None);
+        }
+        let on_wait = || {
+            if let Some(w) = waiting.take() {
+                w(limit)
+            }
+        };
+        let turn = wait_for_turn(slots_for(jump_server_id, limit), attempt, on_wait, || login_limit(app) == limit).await?;
+        if let Turn::Got(permit) = turn {
+            return Ok(Some(permit));
+        }
     }
-    wait_for_turn(slots_for(jump_server_id, limit), attempt, || waiting(limit)).await.map(Some)
 }
 
-async fn wait_for_turn(sem: Arc<Semaphore>, attempt: &ConnectAttempt, waiting: impl FnOnce()) -> Result<OwnedSemaphorePermit, String> {
+enum Turn {
+    Got(OwnedSemaphorePermit),
+    /// The limit changed while waiting: queue again under the new one.
+    LimitChanged,
+}
+
+async fn wait_for_turn(
+    sem: Arc<Semaphore>,
+    attempt: &ConnectAttempt,
+    on_wait: impl FnOnce(),
+    same_limit: impl Fn() -> bool,
+) -> Result<Turn, String> {
     if let Ok(permit) = Arc::clone(&sem).try_acquire_owned() {
-        return Ok(permit);
+        return Ok(Turn::Got(permit));
     }
-    waiting();
+    on_wait();
     // One acquire, polled until it completes, keeps this login's place in the
     // queue; the timer only checks whether it is still wanted.
     let acquire = sem.acquire_owned();
@@ -130,11 +216,14 @@ async fn wait_for_turn(sem: Arc<Semaphore>, attempt: &ConnectAttempt, waiting: i
     loop {
         tokio::select! {
             permit = &mut acquire => {
-                return permit.map_err(|_| "jump host login queue closed".to_string());
+                return permit.map(Turn::Got).map_err(|_| "jump host login queue closed".to_string());
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                 if !attempt.is_current().await {
                     return Err("stopped waiting for a jump host login slot".into());
+                }
+                if !same_limit() {
+                    return Ok(Turn::LimitChanged);
                 }
             }
         }
@@ -333,8 +422,8 @@ mod tests {
         let turn = {
             let (sem, attempt) = (Arc::clone(&sem), attempt.clone());
             tokio::spawn(async move {
-                let r = wait_for_turn(sem, &attempt, || said = true).await;
-                (r.is_ok(), said)
+                let r = wait_for_turn(sem, &attempt, || said = true, || true).await;
+                (matches!(r, Ok(Turn::Got(_))), said)
             })
         };
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -342,9 +431,47 @@ mod tests {
         drop(held);
         assert_eq!(turn.await.unwrap(), (true, true));
 
-        // The tab reconnected or closed while waiting: it stops waiting.
+        // A new limit while waiting: it queues again under that one.
         let _held = Arc::clone(&sem).try_acquire_owned().unwrap();
+        assert!(matches!(wait_for_turn(Arc::clone(&sem), &attempt, || {}, || false).await, Ok(Turn::LimitChanged)));
+
+        // The tab reconnected or closed while waiting: it stops waiting.
         generations.lock().await.insert("s".into(), 2);
-        assert!(wait_for_turn(Arc::clone(&sem), &attempt, || {}).await.is_err());
+        assert!(wait_for_turn(Arc::clone(&sem), &attempt, || {}, || true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_backed_up_terminal_holds_up_only_itself_and_keeps_its_order() {
+        let (slow_tx, mut slow_rx) = mpsc::channel(1);
+        let (fast_tx, mut fast_rx) = mpsc::channel(64);
+        let txs: TerminalTxs = Arc::new(tokio::sync::Mutex::new(HashMap::from([
+            ("feed-test-slow".to_string(), slow_tx),
+            ("feed-test-fast".to_string(), fast_tx),
+        ])));
+        let ids = ["feed-test-slow".to_string(), "feed-test-fast".to_string(), "feed-test-gone".to_string()];
+        for k in 0..20u8 {
+            // Returns at once although the slow one takes one key at a time.
+            tokio::time::timeout(std::time::Duration::from_millis(200), write_many(&txs, &ids, &[k]))
+                .await
+                .expect("never waits on a slow terminal");
+        }
+        let data = |c: TerminalCommand| match c {
+            TerminalCommand::Data(d) => d[0],
+        };
+        let mut fast = Vec::new();
+        for _ in 0..20 {
+            fast.push(data(fast_rx.recv().await.unwrap()));
+        }
+        assert_eq!(fast, (0..20).collect::<Vec<u8>>());
+        // Typing into the slow one alone now goes behind what's queued for it.
+        assert!(into_feed("feed-test-slow", vec![99]).is_none());
+        assert_eq!(into_feed("feed-test-unknown", vec![1]), Some(vec![1]));
+        let mut slow = Vec::new();
+        for _ in 0..21 {
+            slow.push(data(slow_rx.recv().await.unwrap()));
+        }
+        let mut want: Vec<u8> = (0..20).collect();
+        want.push(99);
+        assert_eq!(slow, want);
     }
 }

@@ -977,6 +977,13 @@ const TerminalView = ({
     window.visualViewport?.addEventListener('resize', onVvResize);
 
     // A server terminal can be shown in a Wall and typed to from there.
+    // Whether its xterm has the keyboard, by the focus events xterm itself
+    // goes by (see `moved`).
+    let focused = false;
+    const onTextFocus = () => { focused = true; };
+    const onTextBlur = () => { focused = false; };
+    term.textarea?.addEventListener('focus', onTextFocus);
+    term.textarea?.addEventListener('blur', onTextBlur);
     const unregister = local ? null : registerTerminal({
       terminalId,
       sessionId,
@@ -991,9 +998,11 @@ const TerminalView = ({
       },
       moved: (docked) => {
         dockedRef.current = docked;
-        // Moving the element takes the keyboard from it without a blur event,
-        // so xterm would go on drawing the cursor of a terminal being typed in.
-        if (term.textarea && document.activeElement !== term.textarea) {
+        // Moving the element can take the keyboard from it without a blur
+        // event, so xterm would go on drawing the cursor of a terminal being
+        // typed in. Only then: xterm tells a program that asked (vim, tmux)
+        // about each blur, and one that never had focus mustn't hear it.
+        if (focused && term.textarea && document.activeElement !== term.textarea) {
           term.textarea.dispatchEvent(new FocusEvent('blur'));
         }
         requestAnimationFrame(() => {
@@ -1007,6 +1016,8 @@ const TerminalView = ({
 
     return () => {
       unregister?.();
+      term.textarea?.removeEventListener('focus', onTextFocus);
+      term.textarea?.removeEventListener('blur', onTextBlur);
       ptyLiveRef.current = false;
       window.clearTimeout(openTimer);
       stopReadyWatch();

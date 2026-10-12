@@ -123,13 +123,24 @@ function DesktopApp() {
   const updateWall = useCallback((id: string, patch: Partial<Wall>) => {
     setWalls(prev => prev.map(w => (w.id === id ? { ...w, ...patch } : w)));
   }, []);
-  // A closed session leaves every Wall it was on.
-  const dropSessionFromWalls = useCallback((sid: string) => {
+  // A closed session leaves every Wall it was on, and its terminals are
+  // forgotten — reopened, the server starts again at its first terminal.
+  const forgetSession = useCallback((sid: string) => {
     setWalls(prev => prev.map(w => {
       if (!w.members.some(m => m.sessionId === sid)) return w;
       const members = w.members.filter(m => m.sessionId !== sid);
       return { ...w, members, paused: w.paused.filter(t => members.some(m => m.terminalId === t)) };
     }));
+    setSessionTerminals(prev => {
+      if (!(sid in prev)) return prev;
+      const { [sid]: _gone, ...rest } = prev;
+      return rest;
+    });
+    setSessionActiveTerm(prev => {
+      if (!(sid in prev)) return prev;
+      const { [sid]: _gone, ...rest } = prev;
+      return rest;
+    });
   }, []);
   // The terminal a session joins a Wall with: the one on screen in its tab.
   const terminalOf = (sid: string) => sessionActiveTerm[sid] ?? `${sid}-term-0`;
@@ -151,7 +162,7 @@ function DesktopApp() {
   const newWall = (name: string, members: WallMember[], opts: { broadcast?: boolean; cols?: number; savedId?: number | null; id?: string } = {}) => {
     const id = opts.id ?? makeWallId();
     setWalls(prev => [...prev, {
-      id, name, members, broadcast: !!opts.broadcast, paused: [], cols: opts.cols ?? 0, savedId: opts.savedId ?? null,
+      id, name, members, broadcast: !!opts.broadcast, paused: [], solo: null, cols: opts.cols ?? 0, savedId: opts.savedId ?? null,
     }]);
     setMergedSessionIds([]);
     setActiveView(id);
@@ -382,13 +393,13 @@ function DesktopApp() {
         });
         // And leaves the Walls it was on — a tile with no session behind it
         // would stay blank.
-        dropSessionFromWalls(sessId);
+        forgetSession(sessId);
         closeHandlersRef.current.delete(sessId);
       };
       closeHandlersRef.current.set(sessId, h);
     }
     return h;
-  }, [dropSessionFromWalls]);
+  }, [forgetSession]);
 
   // Stable identity matters: SessionView memoises on prop equality, so a
   // fresh `addLog` reference on every DesktopApp render would force every
@@ -976,13 +987,8 @@ function DesktopApp() {
       for (const sid of closingIds) delete next[sid];
       return next;
     });
-    setWalls(prev => prev
-      .filter(w => w.id !== wallId)
-      .map(w => {
-        if (!w.members.some(m => closingIds.has(m.sessionId))) return w;
-        const members = w.members.filter(m => !closingIds.has(m.sessionId));
-        return { ...w, members, paused: w.paused.filter(t => members.some(m => m.terminalId === t)) };
-      }));
+    setWalls(prev => prev.filter(w => w.id !== wallId));
+    for (const sid of closingIds) forgetSession(sid);
     setActiveView(prev => (prev === wallId || closingIds.has(prev) ? START_VIEW : prev));
   };
 
@@ -1028,7 +1034,7 @@ function DesktopApp() {
       const next = prev.filter(id => !closing.has(id));
       return next.length < 2 ? [] : next;
     });
-    for (const id of closing) dropSessionFromWalls(id);
+    for (const id of closing) forgetSession(id);
     setActiveView(prev => (closing.has(prev) ? START_VIEW : prev));
   };
 
@@ -1063,7 +1069,7 @@ function DesktopApp() {
   // Broadcast on/off — the title bar's button and Ctrl+Shift+B. On a Wall it
   // flips that Wall's Broadcast. Elsewhere it goes back to the Wall that is
   // broadcasting, or — when none is — puts every open server tab on one and
-  // starts broadcasting to them.
+  // starts broadcasting to them (the second time, that same Wall as it was).
   const autoWallRef = useRef<string | null>(null);
   const toggleBroadcast = () => {
     if (!isUnlocked) return;
@@ -1088,15 +1094,16 @@ function DesktopApp() {
       }
       return;
     }
-    const members = tabs.map(s => ({ sessionId: s.id, terminalId: terminalOf(s.id) }));
+    // The Wall it made before comes back as it was left: terminals taken off
+    // it stay off.
     const auto = walls.find(w => w.id === autoWallRef.current);
     if (auto) {
-      addToWall(auto.id, members);
       updateWall(auto.id, { broadcast: true });
       setMergedSessionIds([]);
       setActiveView(auto.id);
       return;
     }
+    const members = tabs.map(s => ({ sessionId: s.id, terminalId: terminalOf(s.id) }));
     autoWallRef.current = newWall("Broadcast", members, { broadcast: true });
   };
   const toggleBroadcastRef = useRef(toggleBroadcast);
@@ -1105,6 +1112,8 @@ function DesktopApp() {
     const onKey = (e: KeyboardEvent) => {
       if (appHotkey(e) !== "broadcast" || e.repeat) return;
       e.preventDefault();
+      // Not under a dialog: a paste confirm, say, is about the Wall as it is.
+      if (document.querySelector('[aria-modal="true"]')) return;
       toggleBroadcastRef.current();
     };
     window.addEventListener("keydown", onKey);
@@ -1117,6 +1126,17 @@ function DesktopApp() {
     const s = sessions.find(x => x.id === activeView);
     if (s?.wallId) setSessions(prev => prev.map(x => (x.id === s.id ? { ...x, wallId: undefined } : x)));
   }, [activeView, sessions]);
+
+  // A session opened into a Wall that's no longer on it (or on any Wall) is
+  // never left running with no tab and no tile: another Wall that has it
+  // takes it, or it gets its tab.
+  useEffect(() => {
+    const home = (s: Session) => walls.find(w => w.members.some(m => m.sessionId === s.id));
+    const stray = sessions.filter(s => s.wallId && !walls.some(w => w.id === s.wallId && w.members.some(m => m.sessionId === s.id)));
+    if (stray.length === 0) return;
+    const ids = new Set(stray.map(s => s.id));
+    setSessions(prev => prev.map(s => (ids.has(s.id) && s.wallId ? { ...s, wallId: home(s)?.id } : s)));
+  }, [sessions, walls]);
 
   // A terminal closed in its session leaves the Walls it was on.
   useEffect(() => {
@@ -1377,7 +1397,7 @@ function DesktopApp() {
                               const next = prev.filter(id => id !== sid);
                               return next.length < 2 ? [] : next;
                             });
-                            dropSessionFromWalls(sid);
+                            forgetSession(sid);
                             setActiveView(prev => (prev === sid ? START_VIEW : prev));
                           }}
                           title="Close session"
@@ -1636,7 +1656,7 @@ function DesktopApp() {
                     const { [s.id]: _, ...rest } = prev;
                     return rest;
                   });
-                  dropSessionFromWalls(s.id);
+                  forgetSession(s.id);
                   setActiveView(prev => (prev === s.id ? START_VIEW : prev));
                 }}
               >
@@ -1945,7 +1965,7 @@ function DesktopApp() {
                   const next = prev.filter(id => id !== sid);
                   return next.length < 2 ? [] : next;
                 });
-                dropSessionFromWalls(sid);
+                forgetSession(sid);
                 setActiveView(prev => (prev === sid ? START_VIEW : prev));
                 setTabMenu(null);
               }}
@@ -2321,6 +2341,7 @@ function DesktopApp() {
                             label={sess.serverName}
                             onReset={() => {
                               setSessions(prev => prev.filter(s => s.id !== sess.id));
+                              forgetSession(sess.id);
                               if (activeView === sess.id) setActiveView(START_VIEW);
                             }}
                           >
@@ -2382,14 +2403,15 @@ function DesktopApp() {
                     servers={servers}
                     folders={folders}
                     onToggle={(m) => (activeWall.members.some(x => x.terminalId === m.terminalId)
-                      ? removeFromWall(activeWall.id, m.terminalId)
+                      ? removeWallMember(activeWall, m)
                       : addToWall(activeWall.id, [m]))}
                     onConnect={(server) => {
                       const sid = `session-${server.id}`;
-                      if (!sessions.some(x => x.id === sid)) {
+                      const open = sessions.some(x => x.id === sid);
+                      if (!open) {
                         setSessions(prev => (prev.some(x => x.id === sid) ? prev : [...prev, { ...sessionFor(server), wallId: activeWall.id }]));
                       }
-                      addToWall(activeWall.id, [{ sessionId: sid, terminalId: terminalOf(sid) }]);
+                      addToWall(activeWall.id, [{ sessionId: sid, terminalId: open ? terminalOf(sid) : `${sid}-term-0` }]);
                     }}
                     onClose={() => setWallPickerFor(null)}
                   />

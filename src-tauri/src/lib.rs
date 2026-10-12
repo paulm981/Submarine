@@ -9201,6 +9201,9 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
 #[tauri::command]
 async fn write_terminal_data(state: tauri::State<'_, SshState>, terminal_id: String, data: Vec<u8>) -> Result<(), String> {
     use crate::ssh_manager::TerminalCommand;
+    // Right after a broadcast this terminal may still have keys queued for
+    // it (multiexec.rs); these go behind them.
+    let Some(data) = multiexec::into_feed(&terminal_id, data) else { return Ok(()) };
     // Clone the Sender OUT of the map, then release the map lock before we
     // await on send(). If we held the guard across the send, a saturated
     // 32-slot mpsc on a slow SSH link would block every other terminal's

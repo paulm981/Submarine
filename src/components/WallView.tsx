@@ -36,6 +36,10 @@ export interface Wall {
   broadcast: boolean;
   /// Terminal ids left out of the broadcast.
   paused: string[];
+  /// With Broadcast on, the one terminal being typed to (clicked into);
+  /// null = typing to all. Kept here so leaving the Wall and coming back
+  /// doesn't quietly switch to typing to all.
+  solo: string | null;
   /// Tiles per row; 0 = fit to the count.
   cols: number;
   /// The saved wall it was opened from or saved as.
@@ -81,7 +85,14 @@ export const WallView = ({
 }) => {
   useDockVersion();
   const confirm = useConfirm();
-  const [solo, setSolo] = useState<string | null>(null);
+  // The keyboard is nowhere: the tile being typed to left the Wall. Typing
+  // to all again takes a click — it never just starts. `soloGone` is that
+  // moment, before `parked` is set.
+  const soloGone = !!wall.solo && !wall.members.some((m) => m.terminalId === wall.solo);
+  const solo = soloGone ? null : wall.solo;
+  const setSolo = (tid: string | null) => { if (tid !== wall.solo) onChange({ solo: tid }); };
+  const [parkedState, setParked] = useState(false);
+  const parked = parkedState || soloGone;
   const [sendOpen, setSendOpen] = useState(false);
   const [note, setNote] = useState<string | null>(null);
   const noteTimer = useRef(0);
@@ -151,13 +162,16 @@ export const WallView = ({
   // A paste into all of them goes through each terminal's own paste, so each
   // gets it the way pasting into it alone would (bracketed for vim and
   // modern shells). Anything with a line break runs something, so it asks.
+  // It goes only to the servers the confirm named (those still taking input
+  // when it's answered), and not at all if Broadcast went off meanwhile.
   const pasteToAll = useCallback(async (text: string) => {
-    if (!text) return;
+    if (!text || !wallRef.current.broadcast) return;
     const first = targetsNow();
     if (first.length === 0) {
       flash("No terminal is taking input.");
       return;
     }
+    const named = new Set(first.map((e) => e.terminalId));
     if (/[\r\n]/.test(text)) {
       const skipped = wallRef.current.members.length - first.length;
       const ok = await confirm({
@@ -166,11 +180,11 @@ export const WallView = ({
         okLabel: "Paste",
       });
       focusGhost();
-      if (!ok) return;
+      if (!ok || !wallRef.current.broadcast) return;
     }
     let n = 0;
-    for (const e of targetsNow()) if (e.paste(text)) n++;
-    flash(`Pasted into ${plural(n, "server")}.`);
+    for (const e of targetsNow()) if (named.has(e.terminalId) && e.paste(text)) n++;
+    flash(n === named.size ? `Pasted into ${plural(n, "server")}.` : `Pasted into ${n} of ${plural(named.size, "server")} — the rest stopped taking input.`);
   }, [confirm, focusGhost, targetsNow]);
   const pasteToAllRef = useRef(pasteToAll);
   pasteToAllRef.current = pasteToAll;
@@ -219,22 +233,38 @@ export const WallView = ({
     };
   }, [sendKeys]);
 
-  // Broadcast on and no tile picked: the keyboard goes to all.
+  // Broadcast on and no tile picked: the keyboard goes to all. A tile
+  // picked before the Wall was left gets the keyboard back.
   useEffect(() => {
     if (!wall.broadcast) {
-      setSolo(null);
+      if (wall.solo) onChange({ solo: null });
+      setParked(false);
       return;
     }
-    if (!solo) focusGhost();
-  }, [wall.broadcast, solo, focusGhost]);
+    if (solo) {
+      const id = requestAnimationFrame(() => {
+        if (!document.querySelector('[aria-modal="true"]')) dockedTerminal(solo)?.term.focus();
+      });
+      return () => cancelAnimationFrame(id);
+    }
+    if (!parked) focusGhost();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wall.broadcast, solo, parked, focusGhost]);
 
-  // A tile that left the Wall can't stay the one being typed to.
+  // The tile being typed to left the Wall (closed, removed): the keyboard
+  // goes nowhere rather than to all of them — nor stays with that terminal,
+  // which keeps it when it goes back to its tab out of sight.
   useEffect(() => {
-    if (solo && !wall.members.some((m) => m.terminalId === solo)) setSolo(null);
-  }, [wall.members, solo]);
+    if (!soloGone || !wall.solo) return;
+    dockedTerminal(wall.solo)?.term.blur();
+    setParked(true);
+    onChange({ solo: null });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [soloGone]);
 
   const backToAll = () => {
     if (!wall.broadcast) return;
+    setParked(false);
     setSolo(null);
     focusGhost();
   };
@@ -252,6 +282,7 @@ export const WallView = ({
     const onKey = (e: KeyboardEvent) => {
       if (appHotkey(e) !== "pause" || e.repeat) return;
       e.preventDefault();
+      if (document.querySelector('[aria-modal="true"]')) return;
       if (!wallRef.current.broadcast) {
         flash("Pausing is for Broadcast — turn it on first.");
         return;
@@ -282,18 +313,24 @@ export const WallView = ({
   const cols = wall.cols || autoCols(wall.members.length);
   const sessionOf = (sid: string) => sessions.find((s) => s.id === sid);
   const soloName = solo ? sessionOf(wall.members.find((m) => m.terminalId === solo)?.sessionId ?? "")?.serverName : null;
-  // Clicks on the bar and between tiles: back to typing to all. Its buttons
-  // keep the keyboard where it was.
-  const keepFocus = (e: React.MouseEvent) => {
-    if ((e.target as HTMLElement).closest("button, input, select, textarea")) e.preventDefault();
+  // A click on the bar (not on its buttons) or between tiles: back to typing
+  // to all. The buttons leave the keyboard where it was — clicking Cols or
+  // Save while typing to one server mustn't make the next command go to all
+  // of them. Send and Paste are for all, and say so themselves.
+  const onBarMouseDown = (e: React.MouseEvent) => {
+    if ((e.target as HTMLElement).closest("button, input, select, textarea")) {
+      e.preventDefault();
+      return;
+    }
+    backToAll();
   };
   const btn = "h-7 px-2.5 rounded-md text-[10px] font-bold uppercase tracking-wider flex items-center gap-1.5 border transition-colors";
 
   return (
-    <div className="absolute inset-0 flex flex-col overflow-hidden bg-[#0a0a0d]">
+    <div className="wall-root absolute inset-0 flex flex-col overflow-hidden bg-[#0a0a0d]">
       <div
         className="shrink-0 border-b border-white/5 bg-[#111114] flex flex-wrap items-center gap-2 px-3 py-1.5 min-h-10 relative"
-        onMouseDown={(e) => { keepFocus(e); backToAll(); }}
+        onMouseDown={onBarMouseDown}
       >
         {/* The keyboard terminal: in a 1px box so focusing it can't scroll
             anything on screen. */}
@@ -324,7 +361,15 @@ export const WallView = ({
         </button>
 
         {wall.broadcast && (
-          solo ? (
+          parked && !solo ? (
+            <button
+              onClick={backToAll}
+              title="Click to type to all of them"
+              className="text-[10.5px] font-semibold text-zinc-300 hover:text-white truncate max-w-[320px]"
+            >
+              Not typing anywhere — click a terminal, or here to type to all
+            </button>
+          ) : solo ? (
             <button
               onClick={backToAll}
               title="Click to type to all of them again"
@@ -351,14 +396,14 @@ export const WallView = ({
         {wall.broadcast && (
           <>
             <button
-              onClick={() => setSendOpen(true)}
+              onClick={() => { backToAll(); setSendOpen(true); }}
               title="Type a set of commands into all of them"
               className={`${btn} bg-white/[0.04] border-white/10 text-zinc-300 hover:bg-white/[0.08] hover:text-white`}
             >
               <Send size={11} /> Send…
             </button>
             <button
-              onClick={pasteClipboardToAll}
+              onClick={() => { backToAll(); pasteClipboardToAll(); }}
               title="Paste the clipboard into all of them (or right-click a terminal)"
               className={`${btn} bg-white/[0.04] border-white/10 text-zinc-300 hover:bg-white/[0.08] hover:text-white`}
             >
@@ -433,7 +478,11 @@ export const WallView = ({
                   broadcast={wall.broadcast}
                   solo={solo}
                   paused={isPaused(m.terminalId)}
-                  onFocusIn={() => { if (wallRef.current.broadcast) setSolo(m.terminalId); }}
+                  onFocusIn={() => {
+                    if (!wallRef.current.broadcast) return;
+                    setParked(false);
+                    setSolo(m.terminalId);
+                  }}
                   onHover={(on) => { hoveredRef.current = on ? m.terminalId : (hoveredRef.current === m.terminalId ? null : hoveredRef.current); }}
                   onPasteToAll={pasteClipboardToAll}
                   onTogglePause={() => togglePause(m.terminalId)}
