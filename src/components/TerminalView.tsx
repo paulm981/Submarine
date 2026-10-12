@@ -48,6 +48,12 @@ const SEARCH_OPTIONS: ISearchOptions = {
   },
 };
 
+// The backend commands behind a terminal: an SSH shell's, or a shell on this
+// computer's (src-tauri/src/local_term.rs). Both stream output as the same
+// `terminal-output-{id}` events, so only the commands differ.
+const SSH_COMMANDS = { write: 'write_terminal_data', resize: 'resize_terminal', close: 'close_terminal' };
+const LOCAL_COMMANDS = { write: 'local_terminal_write', resize: 'local_terminal_resize', close: 'local_terminal_close' };
+
 // State machine for the modifier stickies on the mobile key bar.
 // off → armed → locked → off (cycled by repeated taps).
 const cycleMod = (s: "off" | "armed" | "locked"): "off" | "armed" | "locked" =>
@@ -65,6 +71,7 @@ const TerminalView = ({
   serverId = 0,
   serverName = "",
   attachOnly = false,
+  local,
 }: {
   sessionId: string;
   terminalId: string;
@@ -114,7 +121,14 @@ const TerminalView = ({
   /// saved node anyway.
   serverId?: number;
   serverName?: string;
+  /// A shell on this computer (the Home view) instead of one on a server:
+  /// `shell` is a local_shells id, or null for the default; `onOpened` gets
+  /// the label of the shell that started. A local terminal is never a
+  /// broadcast target or source and keeps no command history — it isn't a
+  /// server session.
+  local?: { shell: string | null; onOpened?: (label: string) => void };
 }) => {
+  const commands = local ? LOCAL_COMMANDS : SSH_COMMANDS;
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -191,7 +205,7 @@ const TerminalView = ({
   // the mirrored keystrokes. Unregister only if we still hold the slot —
   // avoids racing with the newly-active terminal during a tab swap.
   useEffect(() => {
-    if (!isActive) return;
+    if (!isActive || local) return;
     registerActiveTerminal(sessionId, terminalId);
     return () => {
       unregisterActiveTerminal(sessionId, terminalId);
@@ -273,7 +287,7 @@ const TerminalView = ({
         bytes = [0x09];
       }
     }
-    invoke('write_terminal_data', { terminalId, data: bytes }).catch(console.error);
+    invoke(commands.write, { terminalId, data: bytes }).catch(console.error);
     if (consumes) consumeArmedModifiers();
   };
 
@@ -284,7 +298,7 @@ const TerminalView = ({
   // overwrites the dead entry transparently, so write_terminal_data
   // routes to the new task without changing the terminal_id.
   useEffect(() => {
-    if (connectionEpoch === lastEpochRef.current) return;
+    if (connectionEpoch === lastEpochRef.current || local) return;
     lastEpochRef.current = connectionEpoch;
     const term = xtermRef.current;
     if (!term) return;
@@ -530,9 +544,21 @@ const TerminalView = ({
         // that landed while it was starting (e.g. the chosen font finished
         // loading and changed the cell size) is sent again once it's open.
         const syncSize = () => {
-          invoke('resize_terminal', { terminalId, cols: term.cols, rows: term.rows }).catch(() => {});
+          invoke(commands.resize, { terminalId, cols: term.cols, rows: term.rows }).catch(() => {});
         };
-        if (containerExec) {
+        if (local) {
+          invoke<string>('local_terminal_open', {
+            terminalId,
+            shell: local.shell,
+            cols: term.cols || 80,
+            rows: term.rows || 24,
+          }).then((label) => {
+            syncSize();
+            local.onOpened?.(label);
+          }, e => {
+            term.writeln(`\x1b[31mCouldn't start the shell: ${e}\x1b[0m`);
+          });
+        } else if (containerExec) {
           invoke('open_container_terminal', {
             sessionId,
             terminalId,
@@ -595,10 +621,12 @@ const TerminalView = ({
       } else {
         bytes = Array.from(new TextEncoder().encode(data));
       }
-      invoke('write_terminal_data', {
+      invoke(commands.write, {
         terminalId,
         data: bytes,
       }).catch(console.error);
+      // A local shell stops here: not part of a broadcast, no history.
+      if (local) return;
 
       // ── Broadcast fan-out ────────────────────────────────────────────────
       // Broadcast writes AFTER the local write so if the fan-out throws
@@ -840,7 +868,7 @@ const TerminalView = ({
 
     // Handle Resize
     const onResizeDisposable = term.onResize(({ cols, rows }) => {
-      invoke('resize_terminal', { terminalId, cols, rows }).catch(console.error);
+      invoke(commands.resize, { terminalId, cols, rows }).catch(console.error);
     });
 
     // Handle Output with proper async cleanup for StrictMode
@@ -975,7 +1003,7 @@ const TerminalView = ({
       // Attach-only viewers unmount without closing so the primary
       // xterm (in the session tab) keeps working.
       if (!attachOnly) {
-        invoke('close_terminal', { terminalId }).catch(console.error);
+        invoke(commands.close, { terminalId }).catch(console.error);
       }
     };
   }, [sessionId, terminalId]);
@@ -1086,7 +1114,7 @@ const TerminalView = ({
           if (disabledRef.current) return;
           const payload = execute ? command + "\r" : command;
           const bytes = Array.from(new TextEncoder().encode(payload));
-          invoke('write_terminal_data', { terminalId, data: bytes }).catch(console.error);
+          invoke(commands.write, { terminalId, data: bytes }).catch(console.error);
           // Mirror the inserted command into the local buffer so the next
           // Enter (if the user typed one manually) still logs correctly.
           if (!execute) {

@@ -95,9 +95,11 @@ export const SessionTree = ({
   const q = search.trim().toLowerCase();
   const matchesServer = (s: any) => s.name.toLowerCase().includes(q) || String(s.host).toLowerCase().includes(q);
   const matchesLink = (l: RdpLink) => l.name.toLowerCase().includes(q) || l.host.toLowerCase().includes(q);
+  const matchesFolder = (name: string) => name.toLowerCase().includes(q);
 
   // The rows on screen, top to bottom. While searching, only matches and
-  // the folders leading to them, all open.
+  // the folders leading to them, all open; a folder whose name matches
+  // shows everything in it.
   const rows = useMemo(() => {
     const out: Row[] = [];
     const total = new Map<number, number>();
@@ -114,26 +116,28 @@ export const SessionTree = ({
       if (hits.has(id)) return hits.get(id)!;
       const c = contents.get(id);
       const own = !!c && (c.servers.some(matchesServer) || c.links.some(matchesLink));
-      const r = own || (index.children.get(id) ?? []).some((f) => hasHit(f.id));
+      const r = own || (index.children.get(id) ?? []).some((f) => matchesFolder(f.name) || hasHit(f.id));
       hits.set(id, r);
       return r;
     };
-    const walk = (parent: number | null, depth: number) => {
+    // `all`: inside a folder whose name matched, so everything shows.
+    const walk = (parent: number | null, depth: number, all: boolean) => {
       for (const f of index.children.get(parent) ?? []) {
-        if (q && !hasHit(f.id)) continue;
+        const named = !!q && matchesFolder(f.name);
+        if (q && !all && !named && !hasHit(f.id)) continue;
         const open = q ? true : expanded.has(f.id);
         out.push({ kind: "folder", id: f.id, name: f.name, depth, open, count: countOf(f.id) });
-        if (open) walk(f.id, depth + 1);
+        if (open) walk(f.id, depth + 1, all || named);
       }
       const c = contents.get(parent);
       for (const s of c?.servers ?? []) {
-        if (!q || matchesServer(s)) out.push({ kind: "server", key: `s:${s.id}`, server: s, depth });
+        if (!q || all || matchesServer(s)) out.push({ kind: "server", key: `s:${s.id}`, server: s, depth });
       }
       for (const l of c?.links ?? []) {
-        if (!q || matchesLink(l)) out.push({ kind: "rdp", key: `r:${l.id}`, link: l, depth });
+        if (!q || all || matchesLink(l)) out.push({ kind: "rdp", key: `r:${l.id}`, link: l, depth });
       }
     };
-    walk(null, 0);
+    walk(null, 0, false);
     return out;
   }, [index, contents, expanded, q]);
 
@@ -302,8 +306,17 @@ export const SessionTree = ({
           <input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Escape") setSearch(""); }}
-            placeholder="Find a session…"
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setSearch("");
+              // ↓ or Enter: on to the first match, to open with Enter.
+              if (e.key === "ArrowDown" || e.key === "Enter") {
+                e.preventDefault();
+                const first = rows.find((r) => r.kind !== "folder") ?? rows[0];
+                if (first) selectOnly(first);
+                listRef.current?.focus();
+              }
+            }}
+            placeholder="Find a session or folder…"
             className="w-full h-7 bg-[#1c1c21] border border-white/10 rounded-md pl-7 pr-2 text-[12px] text-zinc-100 outline-none focus:border-primary/50 placeholder:text-zinc-600"
           />
         </div>

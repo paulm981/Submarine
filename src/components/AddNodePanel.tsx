@@ -1153,8 +1153,10 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
             {/* Modal footer */}
             <div className="p-3 border-t border-white/5 shrink-0 flex items-center justify-end gap-2">
               {importDone ? (
+                // The import was the point of opening the panel, so Done
+                // closes it as well, not just the import.
                 <button
-                  onClick={closeImportModal}
+                  onClick={() => { closeImportModal(); onClose(); }}
                   className="px-4 h-8 rounded-lg text-[11px] font-bold uppercase tracking-wider bg-primary/15 border border-primary/40 text-primary hover:bg-primary/25"
                 >
                   Done

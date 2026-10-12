@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, FileEdit, Server } from "lucide-react";
+import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, FileEdit, Server, Home } from "lucide-react";
 import {
   MAX_FONT_SIZE, MIN_FONT_SIZE, clampFontSize, fontFamilyCss,
   isFontAvailable, primaryFontName, sanitizeFontFamily,
 } from "../util/terminalFont";
 import { invoke } from "@tauri-apps/api/core";
+import type { LocalShells } from "./HomePane";
 import CopyValue from "./CopyValue";
 import FontPicker from "./FontPicker";
 import { loadInstalledFonts } from "../util/systemFonts";
@@ -67,6 +68,69 @@ function LiveEditSettings() {
             className="px-4 h-9 bg-zinc-900 border border-white/5 text-zinc-300 rounded-xl text-xs font-bold uppercase hover:bg-white/5 transition-all"
           >
             Use {editor.default_label}
+          </button>
+        )}
+      </div>
+      {error && <p className="text-[11.5px] text-red-400">{error}</p>}
+    </div>
+  );
+}
+
+// The shell Home terminals start (src-tauri/src/local_term.rs). Kept by the
+// backend, like Live Edit's editor: a program of your own is picked in the
+// native dialog, never typed in here.
+function HomeTerminalSettings() {
+  const [info, setInfo] = useState<LocalShells | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    invoke<LocalShells>("local_shells").then(setInfo).catch(() => setInfo(null));
+  }, []);
+  const run = (cmd: string, args?: Record<string, unknown>) => {
+    setError(null);
+    invoke<LocalShells>(cmd, args).then(setInfo).catch((e) => setError(String(e)));
+  };
+  if (!info) return null;
+  return (
+    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
+      <p className="text-sm text-zinc-400 leading-relaxed">
+        Home opens a terminal on this computer, in your home folder. New ones start this shell; the arrow
+        beside + in Home starts any of the others.
+      </p>
+      <div className="space-y-1.5">
+        <span className="text-[11px] font-black text-zinc-500 uppercase tracking-wider">Shell</span>
+        <div className="flex flex-col gap-1">
+          {info.shells.map((s) => (
+            <label key={s.id} className="flex items-center gap-2.5 px-3 h-9 rounded-xl border border-white/5 bg-zinc-900/60 hover:bg-white/[0.04] cursor-pointer">
+              <input
+                type="radio"
+                name="home-shell"
+                checked={info.default_id === s.id}
+                onChange={() => run("local_shell_set_default", { id: s.id })}
+                className="accent-[var(--primary-hex)]"
+              />
+              <span className="text-[12.5px] text-zinc-200">{s.label}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      {info.custom && (
+        <CopyValue value={info.custom} className="max-w-full text-zinc-300">
+          <span className="font-mono text-[11.5px] break-all select-text">{info.custom}</span>
+        </CopyValue>
+      )}
+      <div className="flex gap-2">
+        <button
+          onClick={() => run("local_shell_pick_custom")}
+          className="flex-1 px-4 h-9 bg-primary/10 border border-primary/30 text-primary rounded-xl text-xs font-bold uppercase hover:bg-primary hover:text-zinc-950 transition-all"
+        >
+          Choose program…
+        </button>
+        {info.custom && (
+          <button
+            onClick={() => run("local_shell_clear_custom")}
+            className="px-4 h-9 bg-zinc-900 border border-white/5 text-zinc-300 rounded-xl text-xs font-bold uppercase hover:bg-white/5 transition-all"
+          >
+            Forget it
           </button>
         )}
       </div>
@@ -378,6 +442,15 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
             </div>
           </div>
         </section>
+
+        {!IS_ANDROID && (
+          <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
+            <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
+              <Home size={14} /> Home Terminal
+            </div>
+            <HomeTerminalSettings />
+          </section>
+        )}
 
         {!IS_ANDROID && (
           <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">

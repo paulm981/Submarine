@@ -30,6 +30,7 @@ mod local_open;
 mod host_import;
 mod rdp;
 mod server_os;
+mod local_term;
 #[cfg(test)]
 mod ssh_test_server;
 use ssh_manager::SshState;
@@ -14533,6 +14534,7 @@ pub fn run() {
         // Docker live-log stream registry — keyed by frontend-issued stream id,
         // values are tokio AbortHandles so the user can stop tailing on demand.
         .manage(docker::DockerStreams::new())
+        .manage(local_term::LocalTerms::default())
         // Monitoring state is its own root-level Tauri-managed value, separate
         // from SshState — monitors and interactive sessions own different SSH
         // handles per node and don't share lifecycle.
@@ -14619,6 +14621,10 @@ pub fn run() {
             local_open::live_edit_editor_get, local_open::live_edit_editor_pick, local_open::live_edit_editor_reset,
             rdp::rdp_list, rdp::rdp_save, rdp::rdp_delete, rdp::rdp_open,
             server_os::detect_server_os,
+            local_term::local_shells, local_term::local_shell_set_default,
+            local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
+            local_term::local_terminal_open, local_term::local_terminal_write,
+            local_term::local_terminal_resize, local_term::local_terminal_close,
             fonts::list_system_fonts,
             clipboard_read_text
         ])

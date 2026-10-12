@@ -6,7 +6,7 @@ import {
   Plus, X, RefreshCw, Terminal, Key, Trash2,
   ArrowLeftRight, Shield, User, Cpu, TerminalSquare, List, Edit2,
   StickyNote, Search, Square, Copy, ChevronLeft, MoreVertical, Radio,
-  ChevronDown, Columns, LayoutGrid, Pin, PinOff
+  ChevronDown, Columns, LayoutGrid, Pin, PinOff, Home
 } from "lucide-react";
 import { useBroadcast } from "./ui/broadcast";
 
@@ -20,6 +20,8 @@ import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./
 import { Sidebar } from "./components/Sidebar";
 import { NodeGrid } from "./components/NodeGrid";
 import { SessionTree } from "./components/SessionTree";
+import HomePane from "./components/HomePane";
+import { IS_ANDROID } from "./util/platform";
 import type { RdpLink } from "./components/RdpLinkModal";
 import AddNodePanel from "./components/AddNodePanel";
 import TerminalView from "./components/TerminalView";
@@ -38,6 +40,12 @@ const appWindow = getCurrentWindow();
 // `host`: the server's host when its tab was opened, which the OS badge
 // check goes by (an edit made while the tab is open doesn't move it).
 type Session = { id: string; serverId: number; serverName: string; host?: string; mirrors?: string; runOnConnect?: string; quickAuth?: QuickAuth | null };
+
+// The Home view (HomePane): terminals on this computer, where the app opens
+// and where closing the last session tab goes back to. Android has no shells
+// to offer, so it keeps the server grid there.
+const HAS_HOME = !IS_ANDROID;
+const START_VIEW = HAS_HOME ? "home" : "nodes";
 
 const hexToRgb = (hex: string) => {
   const r = parseInt(hex.slice(1, 3), 16);
@@ -62,7 +70,11 @@ function DesktopApp() {
   // `cloudSyncing` gates the sidebar button; `lastSyncLabel` feeds its tooltip.
   const [cloudSyncing, setCloudSyncing] = useState(false);
   const [lastSyncLabel, setLastSyncLabel] = useState<string | null>(null);
-  const [activeView, setActiveView] = useState<string>("nodes");
+  const [activeView, setActiveView] = useState<string>(START_VIEW);
+  // HomePane mounts the first time Home is shown and then stays mounted, so
+  // its shells keep running while the user is in a session.
+  const [homeShown, setHomeShown] = useState(false);
+  useEffect(() => { if (activeView === "home") setHomeShown(true); }, [activeView]);
   const [sessions, setSessions] = useState<Session[]>([]);
   // Tracks the live status of each open session ('connecting' | 'connected'
   // | 'failed' | 'disconnected'). Updated via the callback every SessionView
@@ -309,7 +321,7 @@ function DesktopApp() {
       h = () => {
         setSessions(prev => prev.filter(s => s.id !== sessId));
         setSessionStatuses(prev => { const { [sessId]: _, ...rest } = prev; return rest; });
-        setActiveView(prev => (prev === sessId ? "nodes" : prev));
+        setActiveView(prev => (prev === sessId ? START_VIEW : prev));
         // Purge the closing session from broadcast state so a stale id doesn't
         // linger in the target set (would let a user re-enable broadcast and
         // silently exclude a phantom target from the count).
@@ -665,7 +677,8 @@ function DesktopApp() {
     setIsUnlocked(false);
     setActiveProfile(null);
     setSessions([]);
-    setActiveView("nodes");
+    setActiveView(START_VIEW);
+    setHomeShown(false);
     setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setRdpLinks([]); setCommands([]);
     osChecked.current.clear();
     addLog("Profile locked.", "info");
@@ -975,7 +988,7 @@ function DesktopApp() {
                               return next.length < 2 ? [] : next;
                             });
                             unpinSessionFromWall(sid);
-                            setActiveView(prev => (prev === sid ? 'nodes' : prev));
+                            setActiveView(prev => (prev === sid ? START_VIEW : prev));
                           }}
                           title="Close session"
                           className="h-8 w-8 shrink-0 rounded-lg flex items-center justify-center text-zinc-400 hover:text-red-400 hover:bg-white/[0.06] transition-all"
@@ -1026,6 +1039,23 @@ function DesktopApp() {
         className={`${isMobile ? 'hidden' : 'flex'} flex-1 gap-1 overflow-x-auto no-scrollbar h-full items-end pb-1`}
         onWheel={(e) => { e.currentTarget.scrollLeft += e.deltaY; }}
       >
+        {/* Home stays first, like MobaXterm's home tab: always there to go
+            back to, and not a session — no status, no close, never in a
+            broadcast or a split. */}
+        {HAS_HOME && isUnlocked && (
+          <div
+            onClick={() => { setMergedSessionIds([]); setActiveView("home"); }}
+            title="Home — terminals on this computer"
+            className={`no-drag flex items-center gap-1.5 h-7 px-3 rounded-full cursor-pointer transition-all shrink-0 mr-1 ${
+              activeView === "home"
+                ? 'bg-primary/15 text-primary border border-primary/40 shadow-inner shadow-primary/10'
+                : 'bg-white/[0.06] text-zinc-300 border border-white/10 hover:bg-white/[0.1] hover:border-white/20 hover:text-white'
+            }`}
+          >
+            <Home size={12} className="shrink-0" />
+            <span className="text-[11px] font-semibold whitespace-nowrap tracking-tight">Home</span>
+          </div>
+        )}
         {sessions.map(s => {
           const st = sessionStatuses[s.id] ?? "connecting";
           // Dot palette: green = connected, amber = connecting, red = failed
@@ -1173,7 +1203,7 @@ function DesktopApp() {
                   });
                   broadcast.removeSession(s.id);
                   unpinSessionFromWall(s.id);
-                  setActiveView(prev => (prev === s.id ? "nodes" : prev));
+                  setActiveView(prev => (prev === s.id ? START_VIEW : prev));
                 }}
               >
                 <X size={12} />
@@ -1524,7 +1554,7 @@ function DesktopApp() {
                   return next.length < 2 ? [] : next;
                 });
                 unpinSessionFromWall(sid);
-                setActiveView(prev => (prev === sid ? "nodes" : prev));
+                setActiveView(prev => (prev === sid ? START_VIEW : prev));
                 setTabMenu(null);
               }}
             >Close tab</button>
@@ -1572,7 +1602,7 @@ function DesktopApp() {
         // tab-order stays intuitive and <main> grabs the full screen width
         // (terminal gains the ~50px the vertical rail used to eat).
         <div className={`flex-1 flex ${isMobile ? 'flex-col-reverse' : ''} overflow-hidden pt-10`}>
-          <Sidebar activeTab={activeView.startsWith('session-') ? 'nodes' : activeView} setActiveTab={setActiveView} isMobile={isMobile} onLogout={handleLogout} profileName={activeProfile} syncing={cloudSyncing}
+          <Sidebar activeTab={activeView.startsWith('session-') ? 'nodes' : activeView} setActiveTab={setActiveView} isMobile={isMobile} onLogout={handleLogout} profileName={activeProfile} syncing={cloudSyncing} hasHome={HAS_HOME}
             treeOpen={treeOpen} onToggleTree={isMobile ? undefined : () => setTreeOpen((v) => !v)} />
           {!isMobile && treeOpen && treeSide === "left" && sessionTree}
 
@@ -1909,7 +1939,7 @@ function DesktopApp() {
                             label={sess.serverName}
                             onReset={() => {
                               setSessions(prev => prev.filter(s => s.id !== sess.id));
-                              if (activeView === sess.id) setActiveView("nodes");
+                              if (activeView === sess.id) setActiveView(START_VIEW);
                             }}
                           >
                             <SessionView
@@ -1938,6 +1968,11 @@ function DesktopApp() {
                 TerminalView in attach-only mode so xterm scrollback +
                 PTY ownership stay with the primary xterm in the
                 session tab. */}
+            {HAS_HOME && homeShown && (
+              <div className={`absolute inset-0 flex flex-col overflow-hidden bg-background ${activeView === "home" ? "" : "opacity-0 pointer-events-none"}`}>
+                <HomePane visible={activeView === "home"} />
+              </div>
+            )}
             {activeView === "wall" && (
               <div className="absolute inset-0 flex flex-col overflow-hidden bg-[#0a0a0d]">
                 {/* Toolbar: cols selector + Add + Clear. Rows are
