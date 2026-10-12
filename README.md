@@ -12,7 +12,7 @@
   </p>
 </div>
 
-> **This is a fork.** [paulm981/Submarine](https://github.com/paulm981/Submarine) is [Submarine](https://github.com/sinaxhpm/submarine) by Sina with additions for people moving over from MobaXterm: a session tree beside the terminal that manages folders, servers and Remote Desktop links (drag and drop, rename, move); MobaXterm session import (nested folders, saved logins, jump hosts, startup commands such as `dzdo su -`, Remote Desktop sessions); a Home view of terminals on your own computer (PowerShell, Command Prompt, WSL, Git Bash); OS badges; Remote Desktop links; and hardening for Windows. Builds, updates and issues for this fork live here; the original project's README follows.
+> **This is a fork.** [paulm981/Submarine](https://github.com/paulm981/Submarine) is [Submarine](https://github.com/sinaxhpm/submarine) by Sina with additions for people moving over from MobaXterm: a session tree beside the terminal that manages folders, servers and Remote Desktop links (drag and drop, rename, move); MobaXterm session import (nested folders, saved logins, jump hosts, startup commands such as `dzdo su -`, Remote Desktop sessions); a Home view of terminals on your own computer (PowerShell, Command Prompt, WSL, Git Bash); OS badges; and hardening for Windows. Builds, updates and issues for this fork live here; the original project's README follows.
 
 ---
 

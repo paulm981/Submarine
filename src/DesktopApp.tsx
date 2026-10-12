@@ -585,9 +585,10 @@ function DesktopApp() {
     setIsPanelOpen(true);
   };
 
+  // Rethrows so the session tree can say it failed; the grid ignores that.
   const cloneServer = async (id: number) => {
     try { await invoke("clone_server", { id }); refreshServers(); bumpSync(); addLog("Node cloned.", "success"); }
-    catch (e) { addLog(`CLONE_ERROR: ${e}`, "error"); }
+    catch (e) { addLog(`CLONE_ERROR: ${e}`, "error"); throw e; }
   };
 
   const createFolder = async (name: string, parentId: number | null) => {
@@ -604,6 +605,19 @@ function DesktopApp() {
       if (items.servers.length) await invoke("move_servers", { ids: items.servers, folderId });
       if (items.links.length) await invoke("move_rdp_links", { ids: items.links, folderId });
       for (const id of items.folders) await invoke("move_folder", { id, parentId: folderId });
+    } finally {
+      await Promise.all([refreshFolders(), refreshServers(), refreshRdpLinks()]);
+      bumpSync();
+    }
+  };
+
+  // The session tree's Delete (tree_moves::delete_tree_items): one call and
+  // one vault save however much is selected. Rethrows so the tree can say
+  // what failed.
+  const deleteItems = async (items: TreeItems) => {
+    try {
+      await invoke("delete_tree_items", { servers: items.servers, links: items.links, folders: items.folders });
+      addLog("Removed from the session tree.", "info");
     } finally {
       await Promise.all([refreshFolders(), refreshServers(), refreshRdpLinks()]);
       bumpSync();
@@ -1660,12 +1674,10 @@ function DesktopApp() {
       onEditServer={handleEditNode}
       onNewServer={addServerIn}
       onCloneServer={cloneServer}
-      onRemoveServer={removeServer}
       onCreateFolder={createFolder}
       onRenameFolder={renameFolder}
-      onRemoveFolder={removeFolder}
       onSaveRdp={saveRdp}
-      onRemoveRdp={removeRdp}
+      onDelete={deleteItems}
       onMove={moveItems}
       side={treeSide}
       onToggleSide={() => setTreeSide((s) => (s === "left" ? "right" : "left"))}
@@ -1711,7 +1723,7 @@ function DesktopApp() {
                 onRemoveServer={removeServer}
                 onRemoveFolder={removeFolder}
                 onRenameFolder={renameFolder}
-                onCloneServer={cloneServer}
+                onCloneServer={(id: number) => cloneServer(id).catch(() => {})}
                 onReorderServers={async (ids: number[]) => {
                   // Rethrow on failure so NodeGrid drops its optimistic order
                   // override and reverts to the real (unchanged) arrangement.

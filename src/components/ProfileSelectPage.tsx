@@ -44,8 +44,9 @@ interface UpdateInfo {
 const hasNews = (u: UpdateInfo) => (u.has_update && !!u.latest) || (u.main_ahead ?? 0) > 0 || (u.upstream_ahead ?? 0) > 0;
 const changes = (n: number) => `${n} new change${n === 1 ? "" : "s"}`;
 // The silent check's answer, kept for the rest of this run of the app: the
-// picker comes back on every lock, and each check is three unauthenticated
-// GitHub calls out of the 60 an hour an office's shared address gets.
+// picker comes back on every lock, and each check is up to three
+// unauthenticated GitHub calls out of the 60 an hour an office's shared
+// address gets.
 // Kept with the setting it was asked with, so turning that on asks again.
 let silentCheck: { watching: boolean; answer: Promise<UpdateInfo> } | null = null;
 // Settings › Updates: also say when the original project has changes the

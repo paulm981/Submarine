@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { FolderInput, Folder, Search, X } from "lucide-react";
 import { FolderRow, folderOptions } from "../util/folderPath";
 
@@ -17,10 +17,15 @@ const MoveToFolderModal = ({ title, folders, exclude, onPick, onClose }: {
   const options = useMemo(() => folderOptions(folders).filter((o) => !exclude.has(o.id)), [folders, exclude]);
   const shown = q.trim() ? options.filter((o) => o.label.toLowerCase().includes(q.trim().toLowerCase())) : options;
   const item = "w-full flex items-center gap-2.5 px-3 py-1.5 rounded-md text-left text-[12px] text-zinc-200 hover:bg-white/[0.06] hover:text-white";
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
 
   return (
     <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-3" onClick={onClose}>
-      <div className="w-full max-w-md max-h-[80vh] flex flex-col bg-[#121214] border border-white/10 rounded-xl shadow-2xl" onClick={(e) => e.stopPropagation()}>
+      <div role="dialog" aria-modal="true" aria-label={title} className="w-full max-w-md max-h-[80vh] flex flex-col bg-[#121214] border border-white/10 rounded-xl shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div className="shrink-0 px-4 py-3 border-b border-white/5 flex items-center justify-between">
           <span className="text-[12px] font-bold uppercase tracking-widest text-white flex items-center gap-2">
             <FolderInput size={13} className="text-indigo-300" /> {title}
@@ -35,7 +40,6 @@ const MoveToFolderModal = ({ title, folders, exclude, onPick, onClose }: {
               value={q}
               onChange={(e) => setQ(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Escape") onClose();
                 if (e.key === "Enter" && !e.nativeEvent.isComposing && shown.length === 1) onPick(shown[0].id);
               }}
               placeholder="Find a folder…"

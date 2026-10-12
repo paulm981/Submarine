@@ -36,6 +36,9 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: "always"
   RUST_BACKTRACE: "1"
+  # A release build: its users update by release, so the app doesn't count
+  # commits to pull and rebuild (src-tauri/build.rs).
+  SUBMARINE_RELEASE: "1"
 
 jobs:
   build:
