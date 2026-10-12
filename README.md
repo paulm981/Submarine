@@ -4,15 +4,23 @@
   <p><strong>A fast, secure SSH and SFTP client for Windows, macOS, Linux — and now Android.</strong></p>
   <p>Manage servers, edit remote files, forward ports, and sync folders from one native window. Built with Rust and Tauri.</p>
   <p>
-    <a href="https://github.com/sinaxhpm/submarine/releases"><img alt="release" src="https://img.shields.io/github/v/release/sinaxhpm/submarine?include_prereleases" /></a>
-    <a href="https://github.com/sinaxhpm/submarine/releases"><img alt="downloads" src="https://img.shields.io/github/downloads/sinaxhpm/submarine/total" /></a>
-    <a href="https://github.com/sinaxhpm/submarine/actions"><img alt="ci" src="https://img.shields.io/github/actions/workflow/status/sinaxhpm/submarine/release.yml" /></a>
-    <img alt="platforms" src="https://img.shields.io/badge/platform-windows%20%7C%20macos%20%7C%20linux%20%7C%20android-blue" />
+    <a href="https://github.com/paulm981/Submarine/releases/tag/latest-main"><img alt="download the latest build" src="https://img.shields.io/badge/download-latest%20build-2ea44f" /></a>
+    <a href="https://github.com/paulm981/Submarine/actions/workflows/build.yml"><img alt="build" src="https://img.shields.io/github/actions/workflow/status/paulm981/Submarine/build.yml?branch=main&label=build" /></a>
+    <a href="https://github.com/paulm981/Submarine/releases/tag/latest-main"><img alt="built" src="https://img.shields.io/github/release-date-pre/paulm981/Submarine?label=built" /></a>
+    <a href="https://github.com/paulm981/Submarine/releases"><img alt="downloads" src="https://img.shields.io/github/downloads/paulm981/Submarine/total" /></a>
+    <img alt="platforms" src="https://img.shields.io/badge/platform-windows%20%7C%20macos%20%7C%20linux-blue" />
     <img alt="license" src="https://img.shields.io/badge/license-MIT-green" />
   </p>
 </div>
 
-> **This is a fork.** [paulm981/Submarine](https://github.com/paulm981/Submarine) is [Submarine](https://github.com/sinaxhpm/submarine) by Sina with additions for people moving over from MobaXterm: a session tree beside the terminal that manages folders, servers and Remote Desktop links (drag and drop, rename, move); MobaXterm session import (nested folders, saved logins, jump hosts, startup commands such as `dzdo su -`, Remote Desktop sessions); a Home view of terminals on your own computer (PowerShell, Command Prompt, WSL, Git Bash); OS badges; and hardening for Windows. Builds, updates and issues for this fork live here; the original project's README follows.
+> **This is a fork.** [paulm981/Submarine](https://github.com/paulm981/Submarine) is [Submarine](https://github.com/sinaxhpm/submarine) by Sina with additions for people moving over from MobaXterm:
+> - **MultiExec on Walls**: terminals from many servers side by side. With Broadcast on, typing goes to all of them; click into one to type to it alone, pause the ones to leave out, paste or send a set of commands to all. Save walls and open a whole folder as one.
+> - **A session tree** beside the terminal that manages folders, servers and Remote Desktop links (drag and drop, rename, move).
+> - **MobaXterm session import**: nested folders, saved logins, jump hosts, startup commands such as `dzdo su -`, Remote Desktop sessions.
+> - **A Home view** of terminals on your own computer (PowerShell, Command Prompt, WSL, Git Bash).
+> - OS badges, jump hosts that let a hundred servers log in a few at a time, and hardening for Windows.
+>
+> **Download:** the [latest build](https://github.com/paulm981/Submarine/releases/tag/latest-main) is made from every change to `main` — on Windows, [`Submarine-windows-x64-setup.exe`](https://github.com/paulm981/Submarine/releases/download/latest-main/Submarine-windows-x64-setup.exe) (see [Install](#install)). Builds, updates and issues for this fork live here; the original project's README follows.
 
 ---
 
@@ -25,8 +33,8 @@
 ## At a glance
 
 - **One window, many tools per server** — terminal, SFTP, tunnels, folder mirror, Docker, live server info, and a per-server command library, all as tabs around the same session
-- **Watch many servers at once** — session **split view** to tile any two sessions side-by-side, plus a global **Wall** pinboard for arbitrary terminals across hosts in a grid you control
-- **Broadcast input** — type once, send to N selected sessions simultaneously (Tmux `synchronize-panes` for cross-server)
+- **Watch many servers at once** — session **split view** to tile any two sessions side-by-side, plus **Walls**: grids of terminals from any servers, saved by name, a whole folder opened as one
+- **Broadcast input (MultiExec)** — on a Wall, type once and every terminal gets it; click into one to type to it alone, pause the ones to leave out, paste or send a set of commands to all (Tmux `synchronize-panes` for cross-server)
 - **Native and cross-platform** — Windows, macOS, Linux (`.deb` / `.rpm` / Arch / AppImage), and Android — same encrypted vault everywhere
 - **Zero-knowledge cloud sync** — profiles are Argon2id + AES-256-GCM sealed on your device before upload; the server (and everyone else) only sees ciphertext. Browser dashboard at [`api.sinaxhpm.com/account`](https://api.sinaxhpm.com/account/) to manage your account and stored profiles
 - **Docker manager** — containers, logs (live tail), stats, prune, and `docker exec` shells as first-class session tabs
@@ -172,23 +180,26 @@ Manage Docker on any session host without typing a single `docker` command.
 
 ## Install
 
-Pick a binary from the [latest release](https://github.com/paulm981/Submarine/releases) and you're done — no extra dependencies.
+Download from **[Latest build](https://github.com/paulm981/Submarine/releases/tag/latest-main)** — no extra dependencies. GitHub builds it from every change merged into `main`, and the file names stay the same from one build to the next, so a link to one always gets the newest:
 
 | OS | File |
 |---|---|
-| Windows 10 / 11 | `.exe` installer or `.msi`, or the [portable](#portable-mode-windows) `.zip` |
-| macOS (Apple Silicon, or Intel via Rosetta) | `.dmg` or `.app.zip` |
-| Debian / Ubuntu / Mint | `.deb` — `sudo apt install ./submarine_*.deb` |
-| Fedora / RHEL / openSUSE | `.rpm` — `sudo dnf install ./submarine-*.rpm` |
-| Arch / Manjaro / EndeavourOS | `.pkg.tar.zst` — `sudo pacman -U submarine-*.pkg.tar.zst` |
-| Any Linux | `.AppImage` — `chmod +x` and double-click |
-| Android 8.0+ | `.apk` — sideload, no Play Store required |
+| Windows 10 / 11 | [`Submarine-windows-x64-setup.exe`](https://github.com/paulm981/Submarine/releases/download/latest-main/Submarine-windows-x64-setup.exe) — installs, or updates an installed copy (profiles and settings are kept). Or [`Submarine-windows-x64-portable.zip`](https://github.com/paulm981/Submarine/releases/download/latest-main/Submarine-windows-x64-portable.zip), no install — see [portable mode](#portable-mode-windows) |
+| macOS (Apple Silicon, or Intel via Rosetta) | `Submarine-macos-arm64.dmg` or `.app.zip` |
+| Debian / Ubuntu / Mint | `Submarine-linux-amd64.deb` — `sudo apt install ./Submarine-linux-amd64.deb` |
+| Fedora / RHEL / openSUSE | `Submarine-linux-x86_64.rpm` — `sudo dnf install ./Submarine-linux-x86_64.rpm` |
+| Arch / Manjaro / EndeavourOS | `Submarine-linux-x86_64.pkg.tar.zst` — `sudo pacman -U Submarine-linux-x86_64.pkg.tar.zst` |
+| Any Linux | `Submarine-linux-x86_64.AppImage` — `chmod +x` and double-click |
+
+To update, run the newer setup `.exe` over the installed one. Submarine tells you when there is one: the profile screen shows *"N new changes on main — download the latest build"*, and the version at the bottom of it says which commit you have.
+
+Numbered versions, when there are any, are on the [releases page](https://github.com/paulm981/Submarine/releases) with versioned file names (and an `.msi` for deploying to many PCs). The Android `.apk` comes from the [original project's releases](https://github.com/sinaxhpm/submarine/releases).
 
 > Builds are currently **unsigned**. Windows SmartScreen will prompt — click "More info → Run anyway". On macOS you may need `xattr -d com.apple.quarantine /Applications/Submarine.app`. Android sideloading needs "Install unknown apps" enabled for the installer source.
 
 ### Portable mode (Windows)
 
-Submarine can keep all of its data next to the executable instead of in your user profile — on a USB stick, say. Create an empty folder named `submarine-data` beside `submarine.exe` and start the app; the `-portable.zip` release asset is already laid out that way. Profiles, the cloud sign-in, the window position and the UI preferences then live in `submarine-data`, and **Settings → Maintenance** shows the folder in use.
+Submarine can keep all of its data next to the executable instead of in your user profile — on a USB stick, say. Create an empty folder named `submarine-data` beside `submarine.exe` and start the app; the `-portable.zip` download is already laid out that way. Profiles, the cloud sign-in, the window position and the UI preferences then live in `submarine-data`, and **Settings → Maintenance** shows the folder in use.
 
 A first portable launch starts with no profiles. To carry existing data over, close Submarine and copy two things into `submarine-data`:
 
@@ -288,6 +299,16 @@ npm install
 npm run tauri dev          # run in development
 npm run tauri build        # build release bundle
 ```
+
+### Builds on GitHub
+
+[`.github/workflows/build.yml`](.github/workflows/build.yml) builds the installers on GitHub's Windows, macOS and Linux runners:
+
+- **Every merge into `main`** replaces the [Latest build](https://github.com/paulm981/Submarine/releases/tag/latest-main) release (a pre-release, tag `latest-main`) with that commit's installers. If the Windows build fails, the previous Latest build stays up.
+- **A version tag** makes a numbered release: `git tag v0.4.0 && git push origin v0.4.0`.
+- **Run workflow** on the [Actions tab](https://github.com/paulm981/Submarine/actions/workflows/build.yml) builds on demand; it only publishes when `publish_release` is set.
+
+Each run's files are also kept for 90 days under **Artifacts** on the run's page (GitHub sign-in needed there). Android is built for numbered releases only when the repository variable `BUILD_ANDROID` is `true` and the signing secrets the workflow names are set.
 
 ### Android build
 
