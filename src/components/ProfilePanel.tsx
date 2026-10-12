@@ -452,7 +452,11 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
             </div>
           </>
         ) : shared ? (
-          <p className="text-[12px] text-zinc-400">This profile is shared through Submarine Cloud, which keeps it in sync.</p>
+          <p className="text-[12px] text-zinc-400">
+            {cloudOn
+              ? "This profile is shared through Submarine Cloud, which keeps it in sync."
+              : "This profile is shared through Submarine Cloud, which is turned off — turn it on under Settings › Sync to keep it in sync, or to stop sharing it."}
+          </p>
         ) : (
           // Synced once already; this runs the app's own sync too, so its lists
           // show what came in and "Last synced" is right.
@@ -521,8 +525,9 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
         </section>
       )}
 
-      {/* ---- Access (sharing goes through the cloud) ---- */}
-      {cloudOn && (
+      {/* ---- Access (sharing goes through the cloud, so not for a profile
+          that syncs through the user's own storage) ---- */}
+      {cloudOn && !store && (
       <section className={card}>
         <div className="flex items-center justify-between gap-2">
           <div className={label}>Access</div>

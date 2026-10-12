@@ -144,8 +144,9 @@ fn valid_branch(b: &str) -> Result<(), String> {
     if ok { Ok(()) } else { Err("[STORE] That isn't a branch name git takes (letters, digits, - _ . /).".into()) }
 }
 
-/// The address to show: a token written into it (`https://user:token@…`)
-/// stays out of the screen.
+/// The address to show: whatever is written before the host
+/// (`https://user:token@…`, or a token as the user name) stays off the
+/// screen.
 fn shown_location(store: &Store) -> String {
     if store.kind != Kind::Git {
         return store.location.clone();
@@ -155,12 +156,45 @@ fn shown_location(store: &Store) -> String {
     let rest = &url[scheme_end + 3..];
     let host_end = rest.find('/').unwrap_or(rest.len());
     match rest[..host_end].rfind('@') {
-        Some(at) => {
-            let user = rest[..at].split(':').next().unwrap_or("");
-            format!("{}{}:•••@{}", &url[..scheme_end + 3], user, &rest[at + 1..])
-        }
+        Some(at) => format!("{}•••@{}", &url[..scheme_end + 3], &rest[at + 1..]),
         None => url.clone(),
     }
+}
+
+/// An http(s) address with a user name and password in it, split into the
+/// address without them and the two, decoded: git is given the password
+/// through its credential protocol rather than on its command line, where
+/// other users of the computer could read it, and it never reaches the
+/// user's own credential helper, which would store it.
+fn split_credentials(url: &str) -> (String, Option<(String, String)>) {
+    let lower = url.to_ascii_lowercase();
+    let Some(scheme_end) = url.find("://").filter(|_| lower.starts_with("https://") || lower.starts_with("http://")) else {
+        return (url.to_string(), None);
+    };
+    let rest = &url[scheme_end + 3..];
+    let host_end = rest.find('/').unwrap_or(rest.len());
+    let Some(at) = rest[..host_end].rfind('@') else { return (url.to_string(), None) };
+    let Some((user, pass)) = rest[..at].split_once(':') else { return (url.to_string(), None) };
+    let bare = format!("{}{}", &url[..scheme_end + 3], &rest[at + 1..]);
+    (bare, Some((percent_decode(user), percent_decode(pass))))
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Some(v) = std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A profile's place in a store.
@@ -298,17 +332,32 @@ fn stamps(records: &[SyncRecord]) -> Stamps {
 }
 
 /// Write `bytes` to `dir/name` whole or not at all: a sync tool or a crash
-/// sees the old file or the new one, never half of one.
+/// sees the old file or the new one, never half of one. The temporary file
+/// is made new, so a link someone left in its place is replaced, never
+/// written through; and the rename replaces a link at `name` rather than
+/// following it.
 fn write_whole(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("[STORE] Couldn't create {}: {e}", dir.display()))?;
     let tmp = dir.join(format!(".{name}.tmp"));
     let dest = dir.join(name);
     let res = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
+        let _ = std::fs::remove_file(&tmp);
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
-        std::fs::rename(&tmp, &dest)
+        // OneDrive, Dropbox or a virus scanner holding the old file open
+        // makes Windows refuse the rename for a moment.
+        let mut tries = 0;
+        loop {
+            match std::fs::rename(&tmp, &dest) {
+                Err(e) if tries < 5 && e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                r => return r,
+            }
+        }
     })();
     res.map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -343,8 +392,25 @@ struct Seen {
     has_key: bool,
 }
 
+/// Submarine's own folders in a store (`submarine-sync`, a profile's) must
+/// be folders, not links: written through, a link would put files wherever
+/// whoever planted it chose.
+fn refuse_links(profile_dir: &Path) -> Result<(), String> {
+    for p in [Some(profile_dir), profile_dir.parent()].into_iter().flatten() {
+        if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!("[STORE] {} is a link, not a folder — Submarine won't write through it.", p.display()));
+        }
+    }
+    Ok(())
+}
+
+fn is_plain_file(e: &std::fs::DirEntry) -> bool {
+    e.file_type().is_ok_and(|t| t.is_file())
+}
+
 fn read_profile(dir: &Path, key: &[u8; 32], node: &str) -> Result<Seen, String> {
     let mut seen = Seen::default();
+    refuse_links(dir)?;
     let entries = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(seen),
@@ -358,7 +424,7 @@ fn read_profile(dir: &Path, key: &[u8; 32], node: &str) -> Result<Seen, String> 
             seen.has_key = true;
             continue;
         }
-        if !name.ends_with(DEVICE_EXT) || name.starts_with('.') || !entry.path().is_file() {
+        if !name.ends_with(DEVICE_EXT) || name.starts_with('.') || !is_plain_file(&entry) {
             continue;
         }
         let file = match std::fs::read(entry.path()).map_err(|e| e.to_string()).and_then(|b| unseal(key, &b)) {
@@ -370,7 +436,7 @@ fn read_profile(dir: &Path, key: &[u8; 32], node: &str) -> Result<Seen, String> 
             }
         };
         let stem = &name[..name.len() - DEVICE_EXT.len()];
-        if valid_node(stem) {
+        if stem == node || valid_node(stem) {
             seen.devices.push(Device { name: file.device.clone(), written: file.written, this_one: stem == node });
             if stem == node {
                 seen.own = Some((file.profile.clone(), file.device.clone(), stamps(&file.records)));
@@ -452,6 +518,7 @@ struct Mine<'a> {
 /// drop the conflict copies that are merged in now. Returns how many items
 /// the store didn't have yet.
 fn write_profile(dir: &Path, key: &[u8; 32], seen: &Seen, mine: &Mine) -> Result<usize, String> {
+    refuse_links(dir)?;
     let ours = stamps(mine.records);
     let unchanged = seen
         .own
@@ -518,10 +585,13 @@ fn device_label() -> String {
 
 /// A git store's working copy, in the app's data folder: one per repository
 /// and branch. It never names the repository as a remote — the address is
-/// passed to each command — so a token in the address isn't written to disk
-/// outside the vault.
+/// passed to each command — and a password in the address is taken out of
+/// it (`split_credentials`), so neither is written to disk outside the vault.
 struct Repo {
     url: String,
+    /// User name and password from the address, given to git through an
+    /// environment variable its credential helper reads.
+    login: Option<(String, String)>,
     branch: String,
     dir: PathBuf,
 }
@@ -542,10 +612,15 @@ impl Repo {
         h.update(b"\0");
         h.update(store.branch.as_bytes());
         let id = hex::encode(&h.finalize()[..12]);
-        Ok(Repo { url: store.location.clone(), branch: store.branch.clone(), dir: base.join("sync-git").join(id) })
+        let (url, login) = split_credentials(&store.location);
+        Ok(Repo { url, login, branch: store.branch.clone(), dir: base.join("sync-git").join(id) })
     }
 
     async fn git(&self, args: &[&str], secs: u64) -> Result<String, String> {
+        self.git_env(args, &[], secs).await
+    }
+
+    async fn git_env(&self, args: &[&str], envs: &[(&str, &str)], secs: u64) -> Result<String, String> {
         let mut cmd = tokio::process::Command::new("git");
         cmd.current_dir(&self.dir);
         // Settings of the user's own that would change what's stored or
@@ -560,11 +635,29 @@ impl Repo {
             hooks.as_str(),
             "protocol.ext.allow=never",
             "commit.gpgSign=false",
+            "push.gpgSign=false",
             "gc.auto=0",
             "maintenance.auto=false",
             "core.logAllRefUpdates=false",
+            // A link in the repository is checked out as a plain file, so
+            // nothing written here can be sent somewhere else on disk.
+            "core.symlinks=false",
+            // The working copy is Submarine's own, wherever %APPDATA% is
+            // (a roaming share, a portable stick that records no owner).
+            "safe.directory=*",
         ] {
             cmd.arg("-c").arg(c);
+        }
+        if self.login.is_some() {
+            // Only this helper: the user's own would be asked to store the
+            // password from the address.
+            cmd.arg("-c").arg("credential.helper=");
+            cmd.arg("-c").arg(
+                "credential.helper=!f() { printf '%s\\n' \"username=$SUBMARINE_GIT_USER\" \"password=$SUBMARINE_GIT_PASS\"; }; f",
+            );
+        }
+        if let Some((user, pass)) = &self.login {
+            cmd.env("SUBMARINE_GIT_USER", user).env("SUBMARINE_GIT_PASS", pass);
         }
         cmd.args(args)
             .env_remove("GIT_DIR")
@@ -579,6 +672,9 @@ impl Repo {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
         // No terminal to ask in. On Windows git's own credential manager
         // shows its sign-in window instead, which is wanted.
         #[cfg(not(windows))]
@@ -617,6 +713,10 @@ impl Repo {
         if !self.dir.join(".git").is_dir() {
             self.git(&["init", "-q"], 30).await?;
         }
+        // A git that was stopped (a timeout, the app quitting) leaves its
+        // lock files, and every later command would refuse to run. Only
+        // Submarine works in this copy, and not now: they're stale.
+        remove_locks(&self.dir.join(".git"));
         // Above any .gitattributes of the user's: store every file as it is.
         let info = self.dir.join(".git").join("info");
         let _ = std::fs::create_dir_all(&info);
@@ -631,6 +731,17 @@ impl Repo {
         // It names where the fetch came from; nothing here reads it.
         let _ = std::fs::remove_file(self.dir.join(".git").join("FETCH_HEAD"));
         let base = self.git(&["rev-parse", "--verify", "refs/submarine/base^{commit}"], 30).await?;
+        // A branch with history, or with files of its own, isn't one this
+        // made: syncing would replace all of it with one commit.
+        let commit = self.git(&["cat-file", "-p", &base], 30).await?;
+        let has_parent = commit.lines().take_while(|l| !l.is_empty()).any(|l| l.starts_with("parent "));
+        let top = self.git(&["ls-tree", "--name-only", &base], 30).await?;
+        if has_parent || top.lines().any(|n| n != STORE_DIR) {
+            return Err(format!(
+                "[STORE] The branch \"{}\" already holds other work, which syncing would replace. Use a branch of its own — the default, {DEFAULT_BRANCH}, is made for this.",
+                self.branch
+            ));
+        }
         self.git(&["reset", "-q", "--hard", &base], 60).await?;
         self.git(&["clean", "-q", "-f", "-d", "-x"], 60).await?;
         Ok(Some(base))
@@ -646,6 +757,9 @@ impl Repo {
             if had == tree {
                 return Ok(Pushed::Unchanged);
             }
+        }
+        if base.is_none() {
+            self.give_empty_repository_a_main().await;
         }
         let commit = self.git(&["commit-tree", "--no-gpg-sign", "-m", "Submarine sync", &tree], 30).await?;
         let lease = format!("--force-with-lease=refs/heads/{}:{}", self.branch, base.unwrap_or(""));
@@ -665,6 +779,62 @@ impl Repo {
         let _ = self.git(&["gc", "-q", "--prune=now"], 60).await;
         Ok(Pushed::Sent)
     }
+
+    /// The first branch pushed to an empty repository becomes its default,
+    /// and GitLab protects a default branch from the force pushes sync
+    /// makes. So an empty repository first gets a `main` holding a short
+    /// README. Best effort: without it, sync still works where nothing is
+    /// protected.
+    async fn give_empty_repository_a_main(&self) {
+        if self.branch == "main" {
+            return;
+        }
+        match self.git(&["ls-remote", &self.url], 120).await {
+            Ok(refs) if refs.trim().is_empty() => {}
+            _ => return,
+        }
+        let readme = self.dir.join(".git").join("submarine-main-readme");
+        if std::fs::write(&readme, MAIN_README.replace("{branch}", &self.branch)).is_err() {
+            return;
+        }
+        let index = self.dir.join(".git").join("submarine-main-index");
+        let index_s = index.to_string_lossy().into_owned();
+        let readme_s = readme.to_string_lossy().into_owned();
+        let made = async {
+            let blob = self.git(&["hash-object", "-w", &readme_s], 30).await?;
+            let entry = format!("100644,{blob},README.md");
+            self.git_env(&["update-index", "--add", "--cacheinfo", &entry], &[("GIT_INDEX_FILE", &index_s)], 30).await?;
+            let tree = self.git_env(&["write-tree"], &[("GIT_INDEX_FILE", &index_s)], 30).await?;
+            let commit = self.git(&["commit-tree", "--no-gpg-sign", "-m", "About this repository", &tree], 30).await?;
+            self.git(&["push", "-q", "--no-verify", &self.url, &format!("{commit}:refs/heads/main")], 180).await
+        }
+        .await;
+        if let Err(e) = made {
+            eprintln!("[STORE] couldn't give the empty repository a main branch: {e}");
+        }
+        let _ = std::fs::remove_file(&readme);
+        let _ = std::fs::remove_file(&index);
+    }
+}
+
+const MAIN_README: &str = "# Submarine sync\n\n\
+Submarine keeps encrypted profiles on the `{branch}` branch of this repository, to sync them between your computers.\n\
+Everything there is encrypted with each profile's password. That branch is kept to a single commit, replaced at each sync.\n";
+
+/// Remove git's lock files under `dir`.
+fn remove_locks(dir: &Path) {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for e in entries.flatten() {
+            let Ok(t) = e.file_type() else { continue };
+            if t.is_dir() && e.file_name() != "objects" {
+                stack.push(e.path());
+            } else if t.is_file() && e.file_name().to_string_lossy().ends_with(".lock") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
 }
 
 fn clear_worktree(dir: &Path) -> Result<(), String> {
@@ -674,7 +844,8 @@ fn clear_worktree(dir: &Path) -> Result<(), String> {
             continue;
         }
         let p = entry.path();
-        let r = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        let r = if is_dir { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
         r.map_err(|e| format!("[STORE] Couldn't clear {}: {e}", p.display()))?;
     }
     Ok(())
@@ -700,6 +871,8 @@ fn git_error(stderr: &str) -> String {
         " — the server didn't take your SSH key. Check that it's loaded (ssh-add) and added to your account."
     } else if low.contains("host key verification failed") {
         " — connect once from a terminal (ssh -T git@<server>) to accept the server's host key."
+    } else if low.contains("protected branch") || low.contains("force push") || low.contains("non-fast-forward") {
+        " — the server won't let this branch's commit be replaced, which each sync does. Allow force pushes on it (GitLab: Settings › Repository › Protected branches), or use a branch of its own."
     } else if low.contains("not found") || low.contains("does not appear to be a git repository") {
         " — check the address, and that your account can reach it."
     } else {
@@ -755,6 +928,20 @@ fn still_open(db: &DbState, conn: &Connection, open: &Open) -> Result<(), String
 struct Exchanged {
     pushed: usize,
     pulled: usize,
+    /// The salt `profile.key` was just sealed with, to record once the key
+    /// is really in the store (for git, once it's pushed).
+    key_salt: Option<String>,
+}
+
+/// Note that the store's `profile.key` is sealed under this vault's salt.
+async fn record_key_salt(db: &DbState, open: &Open, salt: &str) -> Result<(), String> {
+    {
+        let conn_g = db.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
+        let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
+        still_open(db, conn, open)?;
+        meta_set(conn, META_KEY_SALT, salt)?;
+    }
+    crate::save_vault_async(db).await
 }
 
 /// One read–merge–write against a profile's folder (in a synced folder, or
@@ -790,18 +977,11 @@ async fn exchange(app: &tauri::AppHandle, db: &DbState, dir: PathBuf, open: &Ope
     .await
     .map_err(|e| format!("[STORE] JOIN: {e}"))??;
 
-    if wrote_key {
-        if let Some((_, salt)) = &open.escrow {
-            let conn_g = db.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
-            let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
-            still_open(db, conn, open)?;
-            meta_set(conn, META_KEY_SALT, salt)?;
-        }
-    }
-    if pulled > 0 || wrote_key {
+    if pulled > 0 {
         crate::save_vault_async(db).await?;
     }
-    Ok(Exchanged { pushed, pulled })
+    let key_salt = if wrote_key { open.escrow.as_ref().map(|(_, salt)| salt.clone()) } else { None };
+    Ok(Exchanged { pushed, pulled, key_salt })
 }
 
 /// Sync the open profile with its store. Runs under `STORE_LOCK`.
@@ -811,6 +991,9 @@ async fn sync_open(app: &tauri::AppHandle, db: &DbState, open: &Open) -> Result<
         Kind::Folder => {
             let root = folder_root(&open.linked.store.location)?;
             let ex = exchange(app, db, data_dir(&root).join(id), open).await?;
+            if let Some(salt) = &ex.key_salt {
+                record_key_salt(db, open, salt).await?;
+            }
             Ok(SyncReport { pushed: ex.pushed, pulled: ex.pulled })
         }
         Kind::Git => {
@@ -824,7 +1007,12 @@ async fn sync_open(app: &tauri::AppHandle, db: &DbState, open: &Open) -> Result<
                 pulled += ex.pulled;
                 match repo.push(base.as_deref()).await? {
                     Pushed::Stale => continue,
-                    Pushed::Unchanged | Pushed::Sent => return Ok(SyncReport { pushed: ex.pushed, pulled }),
+                    Pushed::Unchanged | Pushed::Sent => {
+                        if let Some(salt) = &ex.key_salt {
+                            record_key_salt(db, open, salt).await?;
+                        }
+                        return Ok(SyncReport { pushed: ex.pushed, pulled });
+                    }
                 }
             }
             Err("[STORE] Other computers kept syncing at the same moment — try again.".into())
@@ -885,7 +1073,7 @@ fn find_same_profile(data: &Path, key: &[u8; 32]) -> Option<String> {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(DEVICE_EXT) && std::fs::read(entry.path()).is_ok_and(|b| unseal(key, &b).is_ok()) {
+            if name.ends_with(DEVICE_EXT) && is_plain_file(&entry) && std::fs::read(entry.path()).is_ok_and(|b| unseal(key, &b).is_ok()) {
                 return Some(id);
             }
         }
@@ -897,7 +1085,7 @@ fn profile_dirs(data: &Path) -> Vec<(String, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(data) else { return Vec::new() };
     let mut out: Vec<(String, PathBuf)> = entries
         .flatten()
-        .filter(|e| e.path().is_dir())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
             valid_id(&name).then(|| (name, e.path()))
@@ -914,7 +1102,7 @@ fn key_files(dir: &Path) -> Vec<String> {
         .flatten()
         .filter(|e| {
             let n = e.file_name().to_string_lossy().into_owned();
-            n.starts_with("profile") && n.ends_with(".key")
+            n.starts_with("profile") && n.ends_with(".key") && is_plain_file(e)
         })
         .filter_map(|e| std::fs::read_to_string(e.path()).ok())
         .map(|s| s.trim().to_string())
@@ -1251,7 +1439,13 @@ mod tests {
         assert!(Store::new("git", "https://x/y.git", Some("a..b")).is_err());
         assert!(Store::new("folder", "relative/path", None).is_err());
         let s = Store::new("git", "https://me:tok3n@example.com/r.git", None).unwrap();
-        assert_eq!(shown_location(&s), "https://me:•••@example.com/r.git");
+        assert_eq!(shown_location(&s), "https://•••@example.com/r.git");
+        assert_eq!(
+            split_credentials("https://me:p%40ss@example.com/r.git"),
+            ("https://example.com/r.git".to_string(), Some(("me".to_string(), "p@ss".to_string())))
+        );
+        assert_eq!(split_credentials("git@example.com:r.git").1, None);
+        assert_eq!(split_credentials("https://me@example.com/r.git").1, None);
     }
 
     fn git_available() -> bool {
@@ -1271,8 +1465,11 @@ mod tests {
         let bare = base.join("remote.git");
         assert!(std::process::Command::new("git").args(["init", "-q", "--bare"]).arg(&bare).status().unwrap().success());
         let url = bare.to_string_lossy().into_owned();
-        let repo = |n: &str| Repo { url: url.clone(), branch: DEFAULT_BRANCH.into(), dir: base.join(n) };
-        let (a, b) = (repo("a"), repo("b"));
+        let repo = |n: &str| Repo { url: url.clone(), login: None, branch: DEFAULT_BRANCH.into(), dir: base.join(n) };
+        let (a, mut b) = (repo("a"), repo("b"));
+        // A password from the address goes through the inline helper; a
+        // local repository never asks for it, but git must take the config.
+        b.login = Some(("me".into(), "p w'd".into()));
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             assert_eq!(a.pull().await.unwrap(), None);
@@ -1320,5 +1517,46 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1", "the branch is one commit, no history");
+        // The empty repository was given a main first, so the sync branch
+        // isn't its default.
+        let main = std::process::Command::new("git").arg("--git-dir").arg(&bare).args(["ls-tree", "--name-only", "main"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&main.stdout).trim(), "README.md");
+
+        // Pointed at a branch that holds other work (here that main), sync
+        // refuses rather than replacing it.
+        let c = Repo { url: url.clone(), login: None, branch: "main".into(), dir: base.join("c") };
+        let err = rt.block_on(c.pull()).unwrap_err();
+        assert!(err.contains("already holds other work"), "{err}");
+        let after = std::process::Command::new("git").arg("--git-dir").arg(&bare).args(["ls-tree", "--name-only", "main"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&after.stdout).trim(), "README.md");
+    }
+
+    // Links someone planted in a store are never written through.
+    #[cfg(unix)]
+    #[test]
+    fn links_in_the_store_are_not_followed() {
+        let base = tmp("links");
+        let victim = base.join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let dir = base.join("submarine-sync").join("p");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join(".aaaaaaaaaaaaaaaa.subdev.tmp")).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join(KEY_FILE)).unwrap();
+        write_whole(&dir, "aaaaaaaaaaaaaaaa.subdev", b"new").unwrap();
+        write_whole(&dir, KEY_FILE, b"key").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(std::fs::read(dir.join(KEY_FILE)).unwrap(), b"key");
+        // A profile folder that is itself a link is refused.
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let linked = base.join("submarine-sync").join("q");
+        std::os::unix::fs::symlink(&elsewhere, &linked).unwrap();
+        assert!(read_profile(&linked, &KEY, "aaaaaaaaaaaaaaaa").is_err());
+        let (a, ha) = device("A");
+        let seen = Seen::default();
+        let recs = merge(&a, &KEY, &ha, &seen).unwrap().0;
+        let mine = Mine { node: "aaaaaaaaaaaaaaaa", device: "A", profile: "p", records: &recs, key_file: None };
+        assert!(write_profile(&linked, &KEY, &seen, &mine).is_err());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
     }
 }

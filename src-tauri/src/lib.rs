@@ -1720,6 +1720,12 @@ async fn share_current_profile(
         if already.is_some() {
             return Err("[SHARE] ALREADY_SHARED: this profile is already shared — stop sharing first if you want a new share.".into());
         }
+        // It syncs through the user's own storage, never the cloud, so a
+        // share would never see its changes; and revoking a member rotates
+        // the key, which would split the store in two.
+        if store_sync::is_linked(conn) {
+            return Err("[SHARE] STORE_SYNC: this profile syncs through your own storage — stop that on the Profile tab before sharing it.".into());
+        }
         get_or_create_dek(conn)?.0
     };
     let sealed_self = hex::encode(identity::seal_to(&my_pub, &dek)?);
@@ -3741,7 +3747,7 @@ async fn setup_master_db_inner(
                SELECT updated_at FROM servers UNION ALL SELECT updated_at FROM credentials
                UNION ALL SELECT updated_at FROM ssh_keys UNION ALL SELECT updated_at FROM folders
                UNION ALL SELECT updated_at FROM commands UNION ALL SELECT updated_at FROM notes
-               UNION ALL SELECT updated_at FROM monitor_configs)",
+               UNION ALL SELECT updated_at FROM monitor_configs UNION ALL SELECT updated_at FROM rdp_links)",
             [],
             |r| r.get::<_, String>(0),
         )
