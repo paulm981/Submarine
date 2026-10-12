@@ -8,6 +8,7 @@ import { appHotkey, claimTerminal, dockedTerminal, forCursorMode, useDockVersion
 import { useConfirm } from "../ui/confirm";
 import { sessionDot } from "../util/sessionStatus";
 import { IS_LINUX } from "../util/platform";
+import { readClipboardText } from "../util/clipboard";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // A Wall: terminals from many servers side by side, MobaXterm MultiExec style.
@@ -189,10 +190,8 @@ export const WallView = ({
   const pasteToAllRef = useRef(pasteToAll);
   pasteToAllRef.current = pasteToAll;
 
-  const readClipboard = (): Promise<string> =>
-    IS_LINUX ? invoke<string>("clipboard_read_text") : navigator.clipboard.readText();
   const pasteClipboardToAll = () => {
-    readClipboard().then((t) => pasteToAllRef.current(t), () => flash("Couldn't read the clipboard."));
+    readClipboardText().then((t) => pasteToAllRef.current(t), (e) => flash(typeof e === "string" ? e : "Couldn't read the clipboard."));
   };
   const pasteClipboardRef = useRef(pasteClipboardToAll);
   pasteClipboardRef.current = pasteClipboardToAll;
