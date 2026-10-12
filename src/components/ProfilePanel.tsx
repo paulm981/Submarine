@@ -2,10 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Cloud, CloudOff, RefreshCw, Share2, UserPlus, X, Loader2, Users,
-  AlertTriangle, CheckCircle2, ShieldOff, Pencil, Eye, History, HardDrive,
+  AlertTriangle, CheckCircle2, ShieldOff, Pencil, Eye, History, HardDrive, FolderSync, GitBranch,
 } from "lucide-react";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
 import { RoleBadge, roleBlurb } from "./shareRoles";
+import { StoreDevices, StoreSetup, storeLabel, type StoreDevice, type StoreInfo } from "./StoreSync";
 
 interface RecentEdit { name: string; edited_by: string; updated_at: string; }
 interface SyncDiff { in_sync: number; needs_push: number; needs_pull: number; out_of_sync_nodes: string[]; }
@@ -14,6 +15,10 @@ interface SyncStats {
   vault_bytes: number;
   recent_edits: RecentEdit[];
   diff: SyncDiff | null;
+  /// Own storage only: the computers whose files are there, and how many
+  /// files this profile's key doesn't open.
+  devices: StoreDevice[];
+  unreadable: number;
 }
 
 // The leading 15 digits of an HLC stamp are wall-clock milliseconds.
@@ -33,7 +38,8 @@ function fmtBytes(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-// Everything about the OPEN profile, in one screen: its cloud sync, and who has
+// Everything about the OPEN profile, in one screen: its sync (through the
+// user's own storage, or Submarine Cloud when that's turned on), and who has
 // access to it.
 //
 // This exists because sharing used to be split in half — you created a share
@@ -71,6 +77,10 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
   const [st, setSt] = useState<ShareStatus | null>(null);
   const [members, setMembers] = useState<MemberInfo[] | null>(null);
   const [stats, setStats] = useState<SyncStats | null>(null);
+  // Where it syncs through the user's own storage: undefined until known.
+  const [store, setStore] = useState<StoreInfo | null | undefined>(undefined);
+  // Submarine Cloud is hidden unless turned on in Settings.
+  const [cloudOn, setCloudOn] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [ok, setOk] = useState<string | null>(null);
@@ -88,6 +98,8 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
   const fail = (e: unknown) => { setErr(clean(e)); setOk(null); };
 
   const refresh = useCallback(async () => {
+    invoke<StoreInfo | null>("store_status").then(setStore).catch(() => setStore(null));
+    invoke<boolean>("get_cloud_enabled").then(setCloudOn).catch(() => setCloudOn(false));
     try {
       const s = await invoke<ShareStatus>("profile_share_status");
       setSt(s);
@@ -238,6 +250,130 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
     loadStats();
   };
 
+  const stopStore = async () => {
+    if (!(await confirm({
+      title: "Stop syncing this profile?",
+      message: "It stays on this computer as it is, and what's in your storage stays there — your other computers keep syncing with each other. You can start again any time.",
+      okLabel: "Stop syncing",
+      destructive: true,
+    }))) return;
+    setBusy(true);
+    try {
+      await invoke("store_disconnect");
+      await refresh();
+      loadStats();
+      flash("This profile no longer syncs from this computer.");
+    } catch (e) { fail(e); } finally { setBusy(false); }
+  };
+
+  // Sync now, auto-sync and how this computer compares — the same for the
+  // user's own storage and the cloud; `partner` names which in the text.
+  const syncControls = (partner: string, isCloud: boolean) => (
+    <>
+      <div className="flex items-center gap-2 flex-wrap">
+        <button
+          onClick={doSync}
+          disabled={syncing}
+          className="h-9 px-3 rounded-lg bg-primary text-black text-[12.5px] font-bold disabled:opacity-40 flex items-center gap-2"
+        >
+          <RefreshCw size={13} className={syncing ? "animate-spin" : ""} />
+          {syncing ? "Syncing…" : "Sync now"}
+        </button>
+        <span className="text-[11px] text-zinc-500">{lastSyncLabel ?? "Not synced yet this session."}</span>
+      </div>
+      <div className="flex items-center gap-2 flex-wrap text-[11.5px]">
+        {autoSync ? (
+          <>
+            <span className="flex items-center gap-1.5 text-emerald-300/90">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              Auto-sync is on — your changes are saved to {partner} automatically.
+            </span>
+            <button onClick={onToggleAutoSync} className="text-zinc-400 hover:text-zinc-200 underline underline-offset-2 shrink-0">Turn off</button>
+          </>
+        ) : (
+          <>
+            <span className="flex items-center gap-1.5 text-zinc-400">
+              <span className="w-1.5 h-1.5 rounded-full bg-zinc-500" />
+              Auto-sync is off — changes sync only when you press Sync now.
+            </span>
+            <button onClick={onToggleAutoSync} className="text-primary hover:opacity-80 underline underline-offset-2 shrink-0">Turn on</button>
+          </>
+        )}
+      </div>
+      {/* The cadence lives here rather than in Settings: it only means
+          anything next to the Sync-now button and the on/off state it
+          modifies, and it's the answer to "is this thing even running?" */}
+      {autoSync && (
+        <div className="border-t border-white/5 pt-3 flex items-center gap-2 flex-wrap">
+          <span className="text-[11.5px] text-zinc-400">Check for others' changes every</span>
+          <div className="flex items-center gap-1">
+            {[1, 2, 5, 10, 15, 30].map((m) => (
+              <button
+                key={m}
+                onClick={() => onSetInterval(m)}
+                className={`h-7 px-2.5 rounded-md text-[11.5px] font-medium transition-colors ${
+                  syncIntervalMin === m
+                    ? "bg-primary text-black"
+                    : "bg-zinc-900/60 text-zinc-400 hover:text-zinc-200 border border-white/5"
+                }`}
+              >
+                {m}m
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      {stats?.diff && (() => {
+        const d = stats.diff!;
+        const pending = d.needs_push + d.needs_pull;
+        if (pending === 0) {
+          return (
+            <div className="flex items-center gap-1.5 text-[11.5px] text-emerald-300/90">
+              <CheckCircle2 size={12} /> Everything is in sync with {partner}.
+            </div>
+          );
+        }
+        return (
+          <div className="text-[11.5px] text-amber-200/90 space-y-1">
+            <div className="flex items-center gap-1.5">
+              <AlertTriangle size={12} />
+              {d.needs_push > 0 && <span>{d.needs_push} to send</span>}
+              {d.needs_push > 0 && d.needs_pull > 0 && <span className="text-zinc-500">·</span>}
+              {d.needs_pull > 0 && <span>{d.needs_pull} to receive</span>}
+              <span className="text-zinc-500">— run Sync now.</span>
+            </div>
+            {d.out_of_sync_nodes.length > 0 && (
+              <div className="text-[10.5px] text-zinc-500 pl-[18px]">
+                Nodes: {d.out_of_sync_nodes.slice(0, 8).join(", ")}
+                {d.out_of_sync_nodes.length > 8 ? ` +${d.out_of_sync_nodes.length - 8} more` : ""}
+              </div>
+            )}
+            {/* Only offered once syncing has demonstrably stopped helping.
+                Items that won't come down are almost always unreadable to
+                this device (pushed under a different key by a stray copy of
+                the vault), and no amount of syncing can ever clear them. */}
+            {stuck && isCloud && (
+              <div className="pl-[18px] pt-1 space-y-1">
+                <div className="text-[10.5px] text-zinc-500 leading-relaxed">
+                  Still {d.needs_pull} to receive after syncing. These are almost certainly
+                  items this device can't read — pushed by another copy of this profile that had its
+                  own key. Syncing will never clear them.
+                </div>
+                <button
+                  onClick={forcePush}
+                  disabled={busy || syncing}
+                  className="text-[11px] text-amber-300 hover:text-amber-200 underline underline-offset-2 disabled:opacity-40"
+                >
+                  Replace the cloud copy with this device
+                </button>
+              </div>
+            )}
+          </div>
+        );
+      })()}
+    </>
+  );
+
   const shared = !!st?.share_id;
   const isOwner = st?.role === "owner";
   const signedIn = st?.signed_in === true;
@@ -258,7 +394,7 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
           <p className="hidden sm:block text-[13px] text-zinc-400">
             {shared
               ? isOwner ? "You share this profile. Manage who gets in, below." : "Shared with you by someone else."
-              : "This profile lives only on your devices."}
+              : store ? "Synced between your computers through your own storage." : "This profile lives only on this computer."}
           </p>
         </div>
       </header>
@@ -276,9 +412,62 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
         </div>
       )}
 
-      {/* ---- Cloud + sync ---- */}
+      {/* ---- Sync through the user's own storage ---- */}
       <section className={card}>
-        <div className={label}>Cloud</div>
+        <div className={label}>Sync</div>
+        {store === undefined ? (
+          <div className="text-[11.5px] text-zinc-500 flex items-center gap-1.5"><Loader2 size={11} className="animate-spin" /> Loading…</div>
+        ) : store ? (
+          <>
+            <div className="flex items-center gap-2 min-w-0">
+              {store.kind === "folder"
+                ? <FolderSync size={14} className="text-primary shrink-0" />
+                : <GitBranch size={14} className="text-primary shrink-0" />}
+              <span className="text-[12.5px] text-zinc-200 font-mono truncate select-text" title={storeLabel(store)}>{storeLabel(store)}</span>
+            </div>
+            {syncControls("your storage", false)}
+            {stats && stats.unreadable > 0 && (
+              <div className="flex items-start gap-1.5 text-[11px] text-amber-300/80">
+                <AlertTriangle size={11} className="mt-0.5 shrink-0" />
+                <span>
+                  {stats.unreadable} file{stats.unreadable === 1 ? "" : "s"} in this profile's folder there {stats.unreadable === 1 ? "doesn't" : "don't"} open
+                  with its key, so {stats.unreadable === 1 ? "it's" : "they're"} left as {stats.unreadable === 1 ? "it is" : "they are"}.
+                </span>
+              </div>
+            )}
+            {stats && stats.devices.length > 0 && (
+              <div className="border-t border-white/5 pt-3 space-y-1.5">
+                <div className="text-[10.5px] text-zinc-500">Computers syncing this profile</div>
+                <StoreDevices devices={stats.devices} />
+              </div>
+            )}
+            <div className="pt-2 border-t border-white/5">
+              <button
+                onClick={stopStore}
+                disabled={busy || syncing}
+                className="h-8 px-3 rounded-lg bg-white/5 border border-white/10 text-zinc-300 hover:text-rose-300 hover:bg-rose-500/10 text-[11.5px] font-bold flex items-center gap-1.5 disabled:opacity-40"
+              >
+                <ShieldOff size={12} /> Stop syncing
+              </button>
+            </div>
+          </>
+        ) : shared ? (
+          <p className="text-[12px] text-zinc-400">
+            {cloudOn
+              ? "This profile is shared through Submarine Cloud, which keeps it in sync."
+              : "This profile is shared through Submarine Cloud, which is turned off — turn it on under Settings › Sync to keep it in sync, or to stop sharing it."}
+          </p>
+        ) : (
+          // Synced once already; this runs the app's own sync too, so its lists
+          // show what came in and "Last synced" is right.
+          <StoreSetup onDone={(m) => { flash(m); doSync(); }} />
+        )}
+      </section>
+
+      {/* ---- Submarine Cloud (when turned on in Settings) ---- */}
+      {cloudOn && !store && (
+      <section className={card}>
+        <div className={label}>Submarine Cloud</div>
         <div className="flex items-center gap-2 flex-wrap">
           {signedIn ? (
             <>
@@ -294,112 +483,9 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
             </>
           )}
         </div>
-        {signedIn && (
-          <>
-            <div className="flex items-center gap-2 flex-wrap">
-              <button
-                onClick={doSync}
-                disabled={syncing}
-                className="h-9 px-3 rounded-lg bg-primary text-black text-[12.5px] font-bold disabled:opacity-40 flex items-center gap-2"
-              >
-                <RefreshCw size={13} className={syncing ? "animate-spin" : ""} />
-                {syncing ? "Syncing…" : "Sync now"}
-              </button>
-              <span className="text-[11px] text-zinc-500">{lastSyncLabel ?? "Not synced yet this session."}</span>
-            </div>
-            <div className="flex items-center gap-2 flex-wrap text-[11.5px]">
-              {autoSync ? (
-                <>
-                  <span className="flex items-center gap-1.5 text-emerald-300/90">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                    Auto-sync is on — your changes are saved to the cloud automatically.
-                  </span>
-                  <button onClick={onToggleAutoSync} className="text-zinc-400 hover:text-zinc-200 underline underline-offset-2 shrink-0">Turn off</button>
-                </>
-              ) : (
-                <>
-                  <span className="flex items-center gap-1.5 text-zinc-400">
-                    <span className="w-1.5 h-1.5 rounded-full bg-zinc-500" />
-                    Auto-sync is off — changes sync only when you press Sync now.
-                  </span>
-                  <button onClick={onToggleAutoSync} className="text-primary hover:opacity-80 underline underline-offset-2 shrink-0">Turn on</button>
-                </>
-              )}
-            </div>
-            {/* The cadence lives here rather than in Settings: it only means
-                anything next to the Sync-now button and the on/off state it
-                modifies, and it's the answer to "is this thing even running?" */}
-            {autoSync && (
-              <div className="border-t border-white/5 pt-3 flex items-center gap-2 flex-wrap">
-                <span className="text-[11.5px] text-zinc-400">Check for others' changes every</span>
-                <div className="flex items-center gap-1">
-                  {[1, 2, 5, 10, 15, 30].map((m) => (
-                    <button
-                      key={m}
-                      onClick={() => onSetInterval(m)}
-                      className={`h-7 px-2.5 rounded-md text-[11.5px] font-medium transition-colors ${
-                        syncIntervalMin === m
-                          ? "bg-primary text-black"
-                          : "bg-zinc-900/60 text-zinc-400 hover:text-zinc-200 border border-white/5"
-                      }`}
-                    >
-                      {m}m
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-            {stats?.diff && (() => {
-              const d = stats.diff!;
-              const pending = d.needs_push + d.needs_pull;
-              if (pending === 0) {
-                return (
-                  <div className="flex items-center gap-1.5 text-[11.5px] text-emerald-300/90">
-                    <CheckCircle2 size={12} /> Everything is in sync with the cloud.
-                  </div>
-                );
-              }
-              return (
-                <div className="text-[11.5px] text-amber-200/90 space-y-1">
-                  <div className="flex items-center gap-1.5">
-                    <AlertTriangle size={12} />
-                    {d.needs_push > 0 && <span>{d.needs_push} to send</span>}
-                    {d.needs_push > 0 && d.needs_pull > 0 && <span className="text-zinc-500">·</span>}
-                    {d.needs_pull > 0 && <span>{d.needs_pull} to receive</span>}
-                    <span className="text-zinc-500">— run Sync now.</span>
-                  </div>
-                  {d.out_of_sync_nodes.length > 0 && (
-                    <div className="text-[10.5px] text-zinc-500 pl-[18px]">
-                      Nodes: {d.out_of_sync_nodes.slice(0, 8).join(", ")}
-                      {d.out_of_sync_nodes.length > 8 ? ` +${d.out_of_sync_nodes.length - 8} more` : ""}
-                    </div>
-                  )}
-                  {/* Only offered once syncing has demonstrably stopped helping.
-                      Items that won't come down are almost always unreadable to
-                      this device (pushed under a different key by a stray copy of
-                      the vault), and no amount of syncing can ever clear them. */}
-                  {stuck && (
-                    <div className="pl-[18px] pt-1 space-y-1">
-                      <div className="text-[10.5px] text-zinc-500 leading-relaxed">
-                        Still {d.needs_pull} to receive after syncing. These are almost certainly
-                        items this device can't read — pushed by another copy of this profile that had its
-                        own key. Syncing will never clear them.
-                      </div>
-                      <button
-                        onClick={forcePush}
-                        disabled={busy || syncing}
-                        className="text-[11px] text-amber-300 hover:text-amber-200 underline underline-offset-2 disabled:opacity-40"
-                      >
-                        Replace the cloud copy with this device
-                      </button>
-                    </div>
-                  )}
-                </div>
-              );
-            })()}
-          </>
-        )}
+        {signedIn && syncControls("the cloud", true)}
       </section>
+      )}
 
       {/* ---- Activity (recent edits + heaviness) ---- */}
       {stats && (stats.recent_edits.length > 0 || stats.total_records > 0) && (
@@ -439,7 +525,9 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
         </section>
       )}
 
-      {/* ---- Access ---- */}
+      {/* ---- Access (sharing goes through the cloud, so not for a profile
+          that syncs through the user's own storage) ---- */}
+      {cloudOn && !store && (
       <section className={card}>
         <div className="flex items-center justify-between gap-2">
           <div className={label}>Access</div>
@@ -560,6 +648,7 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
           </>
         )}
       </section>
+      )}
     </div>
   );
 }

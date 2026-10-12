@@ -14,6 +14,7 @@
 //! permissions on app_data give "good enough" protection.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,6 +36,12 @@ const REQUEST_TIMEOUT_SECS: u64 = 60;
 
 /// Filename for the persisted bearer token under `app_data_dir`.
 const TOKEN_FILENAME: &str = "cloud_token.json";
+
+/// Whether the cloud is used at all (Settings › Sync), a setting of this
+/// computer's (local_open.rs). Off by default: profiles sync through storage
+/// the user owns instead (store_sync.rs). An install that was already signed
+/// in when this setting arrived keeps the cloud on until it's turned off.
+const ENABLED_FILE: &str = "cloud_enabled.json";
 
 // ---------------------------------------------------------------------------
 // Wire types — request / response shapes
@@ -182,6 +189,9 @@ fn delete_stored_token(app: &tauri::AppHandle) {
 pub struct CloudState {
     http: reqwest::Client,
     inner: Mutex<Inner>,
+    /// Off: nothing here contacts the server — no sign-in, no sync, no
+    /// sharing — though a stored token is kept for when it's turned on.
+    enabled: AtomicBool,
 }
 
 struct Inner {
@@ -210,6 +220,7 @@ impl CloudState {
             .expect("reqwest client should build");
 
         let stored = read_stored_token(app);
+        let enabled = crate::local_open::read_setting::<bool>(app, ENABLED_FILE).unwrap_or(stored.is_some());
         let inner = Inner {
             token: stored.as_ref().map(|s| s.token.clone()),
             email: stored.as_ref().map(|s| s.email.clone()),
@@ -218,7 +229,17 @@ impl CloudState {
         Arc::new(Self {
             http,
             inner: Mutex::new(inner),
+            enabled: AtomicBool::new(enabled),
         })
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// For the calls that need no token (signing in): refused while off.
+    fn ensure_on(&self) -> Result<(), String> {
+        if self.enabled() { Ok(()) } else { Err(OFF.to_string()) }
     }
 
     pub async fn status(&self) -> CloudStatus {
@@ -259,7 +280,11 @@ impl CloudState {
         g.identity = None;
     }
 
+    /// None while the cloud is off, so every signed-in call stops there.
     pub async fn token(&self) -> Option<String> {
+        if !self.enabled() {
+            return None;
+        }
         self.inner.lock().await.token.clone()
     }
 
@@ -336,6 +361,7 @@ pub async fn cloud_signup(
     state: tauri::State<'_, Arc<CloudState>>,
     email: String,
 ) -> Result<SignupResponse, String> {
+    state.ensure_on()?;
     let email = email.trim().to_string();
     if email.is_empty() || !email.contains('@') {
         return Err("[CLOUD] INVALID_EMAIL".into());
@@ -366,6 +392,7 @@ pub async fn cloud_consume_verify_link(
     state: tauri::State<'_, Arc<CloudState>>,
     verify_token: String,
 ) -> Result<VerifyResponse, String> {
+    state.ensure_on()?;
     let verify_token = verify_token.trim().to_string();
     if verify_token.is_empty() {
         return Err("[CLOUD] EMPTY_TOKEN".into());
@@ -392,6 +419,7 @@ pub async fn cloud_set_password(
     claim_token: String,
     password: String,
 ) -> Result<CloudStatus, String> {
+    state.ensure_on()?;
     if password.len() < 8 {
         return Err("[CLOUD] WEAK_PASSWORD (min 8 chars)".into());
     }
@@ -423,6 +451,7 @@ pub async fn cloud_login(
     email: String,
     password: String,
 ) -> Result<CloudStatus, String> {
+    state.ensure_on()?;
     let email = email.trim().to_string();
     if email.is_empty() || password.is_empty() {
         return Err("[CLOUD] MISSING_CREDENTIALS".into());
@@ -475,6 +504,7 @@ pub async fn cloud_request_password_reset(
     state: tauri::State<'_, Arc<CloudState>>,
     email: String,
 ) -> Result<(), String> {
+    state.ensure_on()?;
     let email = email.trim().to_string();
     if email.is_empty() || !email.contains('@') {
         return Err("[CLOUD] INVALID_EMAIL".into());
@@ -503,6 +533,7 @@ pub async fn cloud_reset_password(
     reset_token: String,
     password: String,
 ) -> Result<CloudStatus, String> {
+    state.ensure_on()?;
     if password.len() < 8 {
         return Err("[CLOUD] WEAK_PASSWORD (min 8 chars)".into());
     }
@@ -535,6 +566,7 @@ pub async fn cloud_request_login_link(
     state: tauri::State<'_, Arc<CloudState>>,
     email: String,
 ) -> Result<(), String> {
+    state.ensure_on()?;
     let email = email.trim().to_string();
     if email.is_empty() || !email.contains('@') {
         return Err("[CLOUD] INVALID_EMAIL".into());
@@ -561,6 +593,7 @@ pub async fn cloud_login_with_link(
     state: tauri::State<'_, Arc<CloudState>>,
     login_token: String,
 ) -> Result<CloudStatus, String> {
+    state.ensure_on()?;
     let login_token = login_token.trim().to_string();
     if login_token.is_empty() {
         return Err("[CLOUD] EMPTY_TOKEN".into());
@@ -590,6 +623,7 @@ pub async fn cloud_login_with_link(
 /// Convenience: short-circuit if no token is set so the caller gets a
 /// stable error code instead of a generic 401 from the server.
 async fn require_token(state: &CloudState) -> Result<String, String> {
+    state.ensure_on()?;
     state
         .token()
         .await
@@ -1124,4 +1158,22 @@ pub async fn leave_share(app: &tauri::AppHandle, state: &CloudState, share_id: &
 pub async fn delete_share(app: &tauri::AppHandle, state: &CloudState, share_id: &str) -> Result<(), String> {
     let _: OkResp = shares_post(app, state, "/shares/delete", &serde_json::json!({ "share_id": share_id })).await?;
     Ok(())
+}
+
+const OFF: &str = "[CLOUD] OFF: Submarine Cloud is turned off — turn it on under Settings › Sync.";
+
+#[tauri::command]
+pub async fn get_cloud_enabled(state: tauri::State<'_, Arc<CloudState>>) -> Result<bool, String> {
+    Ok(state.enabled())
+}
+
+#[tauri::command]
+pub async fn set_cloud_enabled(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<CloudState>>,
+    enabled: bool,
+) -> Result<bool, String> {
+    crate::local_open::write_setting(&app, ENABLED_FILE, &enabled, "the cloud setting")?;
+    state.enabled.store(enabled, Ordering::Relaxed);
+    Ok(enabled)
 }

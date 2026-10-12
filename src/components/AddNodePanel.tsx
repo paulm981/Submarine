@@ -80,7 +80,7 @@ type ImportedSshKey = {
   encrypted: boolean;
 };
 
-const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credentials, refreshCredentials, refreshRdpLinks, sshKeys, refreshSshKeys, folders, refreshFolders, refreshServers, servers, isEditMode, formError, isMobile }: any) => {
+const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credentials, refreshCredentials, refreshRdpLinks, sshKeys, refreshSshKeys, folders, refreshFolders, refreshServers, servers, isEditMode, formError, isMobile, onImported }: any) => {
   const [isCreatingFolder, setIsCreatingFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
   // Set while the native key picker is open so the Browse button can't be
@@ -289,6 +289,8 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
       try { await refreshSshKeys(); } catch { /* same — the list refreshes on next open */ }
     }
     if (!report) return;
+    // Lets the app sync what came in (DesktopApp's bumpSync).
+    onImported?.();
 
     // Anything the user has to finish goes in the summary the modal shows
     // until Done.

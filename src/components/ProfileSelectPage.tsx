@@ -2,9 +2,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Plus, Trash2, X, AlertTriangle, ArrowRight, Download, Upload,
-  CheckCircle2, Cloud, CloudOff, HardDrive, ChevronDown, RefreshCw, ArrowUpCircle, Github,
+  CheckCircle2, Cloud, CloudOff, HardDrive, ChevronDown, RefreshCw, ArrowUpCircle, Github, FolderSync,
 } from "lucide-react";
 import CloudPanel from "./CloudPanel";
+import { StoreRestoreModal } from "./StoreSync";
 import logoUrl from "../assets/logo.png";
 import { IS_ANDROID } from "../util/platform";
 import { useTextPrompt, useConfirm } from "../ui/confirm";
@@ -98,6 +99,10 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   const [importStaged, setImportStaged] = useState<{ sourcePath?: string; bytesB64?: string; name: string } | null>(null);
   const importFileRef = useRef<HTMLInputElement | null>(null);
   const [cloudOpen, setCloudOpen] = useState(false);
+  // Submarine Cloud shows only when turned on in Settings (cloud.rs).
+  const [cloudOn, setCloudOn] = useState(false);
+  // "From your storage": get a profile synced from another computer.
+  const [storeOpen, setStoreOpen] = useState(false);
 
   // Cloud status surfaced directly on this page so the user doesn't have
   // to open the modal just to know if sync is connected or pending.
@@ -145,6 +150,13 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   // and just leave the cloud side empty.
   const refreshCloud = useCallback(async () => {
     try {
+      const on = await invoke<boolean>("get_cloud_enabled");
+      setCloudOn(on);
+      if (!on) {
+        setCloudStatus({ signed_in: false, email: null });
+        setCloudProfiles([]);
+        return;
+      }
       const s = await invoke<CloudStatus>("cloud_status");
       setCloudStatus(s);
       if (s.signed_in) {
@@ -590,6 +602,16 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
               >
                 <Upload size={12} /> Import
               </button>
+              {!IS_ANDROID && (
+                <button
+                  onClick={() => setStoreOpen(true)}
+                  disabled={busy}
+                  title="Get a profile you sync from another computer, through your own folder or git repository"
+                  className="flex-1 h-9 rounded-lg bg-white/[0.02] border border-white/5 hover:bg-white/5 hover:border-white/10 text-zinc-400 hover:text-zinc-100 text-[12px] font-medium transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
+                >
+                  <FolderSync size={12} /> From storage
+                </button>
+              )}
             </div>
 
             <p className="text-[11.5px] text-zinc-500 leading-relaxed text-center px-2 pt-1">
@@ -704,13 +726,23 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
               >
                 <Upload size={12} /> Import
               </button>
+              {!IS_ANDROID && (
+                <button
+                  onClick={() => setStoreOpen(true)}
+                  disabled={busy}
+                  title="Get a profile you sync from another computer, through your own folder or git repository"
+                  className="flex-1 h-9 rounded-lg bg-white/[0.02] border border-white/5 hover:bg-white/5 hover:border-white/10 text-zinc-400 hover:text-zinc-100 text-[12px] font-medium transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50 whitespace-nowrap"
+                >
+                  <FolderSync size={12} /> From storage
+                </button>
+              )}
             </div>
           </div>
         )}
 
-        {/* Cloud status bar — always visible. Signed-out shows a Connect
-            link; signed-in shows the account email + a way into Manage. */}
-        <CloudBar status={cloudStatus} busy={busy} onManage={() => setCloudOpen(true)} />
+        {/* Cloud status bar, while Submarine Cloud is turned on. Signed-out
+            shows a Connect link; signed-in the account email + Manage. */}
+        {cloudOn && <CloudBar status={cloudStatus} busy={busy} onManage={() => setCloudOpen(true)} />}
 
         {/* GitHub, the update check and the running version side by side,
             with live "new version" / "new changes" notices underneath when
@@ -775,6 +807,15 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
           )}
         </div>
       </div>
+
+      {storeOpen && (
+        <StoreRestoreModal
+          existing={profiles}
+          onClose={() => setStoreOpen(false)}
+          // The restore leaves the new profile open, as creating one does.
+          onRestored={(name) => { setStoreOpen(false); onUnlocked(name); }}
+        />
+      )}
 
       <CloudPanel
         isOpen={cloudOpen}

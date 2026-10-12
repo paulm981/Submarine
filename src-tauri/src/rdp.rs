@@ -11,11 +11,11 @@
 //! Passwords are never stored here. Remote Desktop's own "Remember me" keeps
 //! them in Windows Credential Manager.
 //!
-//! Links live in the vault's `rdp_links` table, which is not part of cloud
-//! sync (they stay on this device and travel with profile export/import).
-//! Its folder_id has no foreign key, unlike servers': sync can delete a
-//! folder that only this device has links in, and that must not fail.
-//! delete_folder removes the links itself.
+//! Links live in the vault's `rdp_links` table and sync like servers do
+//! (lib.rs `ENTITIES`). Its folder_id has no foreign key, unlike servers':
+//! a sync can delete a folder holding a link that only this device has yet,
+//! and that must not fail; the merge moves such links to the top level
+//! (`apply_remote_inner`). delete_folder removes the links itself.
 
 use crate::DbState;
 use rusqlite::{params, Connection};
