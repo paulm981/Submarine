@@ -32,12 +32,13 @@ interface CloudStatus { signed_in: boolean; email: string | null; }
 interface CloudProfile { profile: string; name: string; records: number; live_records: number; last_updated: string; }
 // Result of the GitHub release check (backend: about::check_for_updates).
 // `has_update` is true only when `latest` is a strictly newer semver than the
-// running build. `main_ahead`: commits on the fork's main this build lacks;
-// `upstream_ahead`: commits on the original project's main the fork lacks.
-// Null when GitHub couldn't tell.
+// running build. `main_ahead`: commits on the fork's main this build lacks
+// (`main_build`: this is the workflow's build of main, so they come as a
+// newer build to download); `upstream_ahead`: commits on the original
+// project's main the fork lacks. Null when GitHub couldn't tell.
 interface UpdateInfo {
   current: string; latest: string | null; has_update: boolean; release_url: string | null;
-  main_ahead: number | null; main_url: string | null;
+  main_ahead: number | null; main_url: string | null; main_build: boolean;
   upstream_ahead: number | null; upstream_url: string | null;
 }
 // Whether the check found anything to announce.
@@ -56,7 +57,8 @@ const watchUpstream = () => {
   try { return localStorage.getItem("submarine-watch-upstream") === "on"; } catch { return false; }
 };
 // The running version and the project's GitHub page (backend: about::app_info).
-interface AppInfo { version: string; github_repo_url: string; }
+// `commit`: the build's commit, short, when known (about::app_info).
+interface AppInfo { version: string; github_repo_url: string; commit: string | null; }
 // The GitHub link's fallback, should app_info ever fail (about::GITHUB_REPO).
 const REPO_URL = "https://github.com/paulm981/Submarine";
 
@@ -733,7 +735,9 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
             {appInfo && (
               <>
                 <FooterDot />
-                <span className="px-1.5 font-mono text-[11px] text-zinc-600 select-text">v{appInfo.version}</span>
+                <span className="px-1.5 font-mono text-[11px] text-zinc-600 select-text" title={appInfo.commit ? `Built from commit ${appInfo.commit}` : undefined}>
+                  v{appInfo.version}{appInfo.commit && <span className="text-zinc-700"> · {appInfo.commit}</span>}
+                </span>
               </>
             )}
           </div>
@@ -751,14 +755,15 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
               label={<>New version <span className="font-mono font-semibold">v{update.latest}</span> available</>}
             />
           )}
-          {/* Built from source: newer commits on the fork's main mean pull
-              and rebuild; newer commits on the original project mean the
+          {/* Newer commits on the fork's main: a newer build to download
+              (the workflow's build of main), or to pull and rebuild (built
+              from source). Newer commits on the original project mean the
               fork wants a Sync fork on GitHub first. */}
           {(update?.main_ahead ?? 0) > 0 && update?.main_url && (
             <NewsButton
               onClick={() => openLink(update.main_url!)}
-              title="See the new changes on GitHub, then pull them and rebuild"
-              label={<>{changes(update.main_ahead!)} on main — pull and rebuild</>}
+              title={update.main_build ? "Open the latest build's download page" : "See the new changes on GitHub, then pull them and rebuild"}
+              label={<>{changes(update.main_ahead!)} on main — {update.main_build ? "download the latest build" : "pull and rebuild"}</>}
             />
           )}
           {(update?.upstream_ahead ?? 0) > 0 && update?.upstream_url && (

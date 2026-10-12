@@ -1,19 +1,28 @@
-name: Release
+name: Build
 
-# Fires when you push a tag like v0.1.0. The job builds Submarine on
-# Windows, macOS, and Ubuntu, stamps the tag's version into Cargo.toml
-# and tauri.conf.json so the bundled binary's version matches the tag,
-# and uploads the installers/bundles as a draft GitHub Release.
+# Builds Submarine's installers on GitHub's runners (Windows, macOS, Linux):
 #
-# Triggering a release: locally run
-#   git tag v0.1.0 && git push origin v0.1.0
+#   • Every push to main (a merged pull request) → the "Latest build (main)"
+#     release, tag `latest-main`, replaced each time: the newest installers
+#     under fixed names, for anyone to download without building. The app
+#     knows it's such a build (src-tauri/build.rs) and says when there's a
+#     newer one to download.
+#   • A tag like v0.4.0 → a numbered release with versioned installers:
+#       git tag v0.4.0 && git push origin v0.4.0
+#   • Run workflow (Actions tab) → builds; publishes a numbered release only
+#     when `publish_release` is true.
+#
+# Android is built only when the repository variable BUILD_ANDROID is
+# "true" and the signing secrets are set (see the android job).
 on:
   push:
+    branches: [main]
     tags:
       - "v*"
-  # Manual button on the Actions tab — useful for sanity checks without
-  # cutting a real release. Choose any version string; nothing is published
-  # unless `publish_release` is true.
+    # A change to the docs alone isn't a new build. (Not checked for tags.)
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
   workflow_dispatch:
     inputs:
       version:
@@ -28,6 +37,12 @@ on:
 permissions:
   contents: write
 
+# A newer push to main replaces a build of main still running; a release
+# build is never cancelled.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+
 # Faster, cheaper CI builds. Incremental compilation costs time + disk in
 # clean-checkout environments where there's nothing to be incremental
 # against; -D warnings would be great here but breaks too many crates,
@@ -36,9 +51,12 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: "always"
   RUST_BACKTRACE: "1"
-  # A release build: its users update by release, so the app doesn't count
-  # commits to pull and rebuild (src-tauri/build.rs).
-  SUBMARINE_RELEASE: "1"
+  # Which kind of build (src-tauri/build.rs): the build of main, whose users
+  # update by downloading the next one — it knows its commit, to say when
+  # main has moved on — or a release, whose users update by release. The
+  # one not used is left empty.
+  SUBMARINE_BUILD: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'main' || '' }}
+  SUBMARINE_RELEASE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && '' || '1' }}
 
 jobs:
   build:
@@ -85,12 +103,15 @@ jobs:
 
       # Compute the version string we'll stamp into Cargo.toml and
       # tauri.conf.json. For tag pushes we use the tag (strip the leading
-      # 'v'); for manual runs we use the workflow input. The result is
-      # exposed to later steps via $GITHUB_ENV.
+      # 'v'); for manual runs we use the workflow input; a build of main
+      # keeps the version in tauri.conf.json (and isn't stamped). The result
+      # is exposed to later steps via $GITHUB_ENV.
       - name: Resolve version
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "$SUBMARINE_BUILD" = "main" ]; then
+            RAW="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             RAW="${{ github.event.inputs.version }}"
           else
             RAW="${{ github.ref_name }}"
@@ -117,6 +138,7 @@ jobs:
       # Get Info pane. Uses Node to avoid the cross-platform sed/awk
       # quoting maze.
       - name: Stamp version into manifests
+        if: env.SUBMARINE_BUILD != 'main'
         shell: bash
         run: |
           # Windows bundles MSI in the same job as NSIS; MSI requires
@@ -327,7 +349,13 @@ jobs:
   # SUBMARINE_KEYSTORE_* env vars that build.gradle.kts reads. If any
   # secret is missing, the build still runs but Gradle will produce an
   # unsigned release APK — the keystore secrets are gating, not blocking.
+  #
+  # Optional in this fork: only for a release, and only when the repository
+  # variable BUILD_ANDROID is "true" (Settings › Secrets and variables ›
+  # Actions › Variables) — so a release never waits on secrets that aren't
+  # there.
   android:
+    if: vars.BUILD_ANDROID == 'true' && !(github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -518,10 +546,14 @@ jobs:
 
   # Gather every platform's artifacts and attach them to a GitHub Release.
   # Skips when triggered via workflow_dispatch unless `publish_release=true`.
+  # Android, when it isn't built, doesn't hold the release up.
   release:
     needs: [build, android]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.publish_release == 'true'
+    if: >-
+      !cancelled() && needs.build.result == 'success'
+      && (needs.android.result == 'success' || needs.android.result == 'skipped')
+      && (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.publish_release == 'true')
     steps:
       # Resolve the tag string used for the GitHub Release. For tag pushes
       # this is github.ref_name (already "vX.Y.Z"). For workflow_dispatch,
@@ -560,11 +592,109 @@ jobs:
             \) -exec cp {} release-files/ \;
           ls -la release-files/
 
+      # Published straight away (the fork's owner tags deliberately); the
+      # app's update check only sees published releases.
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.TAG }}
           name: Submarine ${{ steps.tag.outputs.TAG }}
-          draft: true
+          draft: false
           generate_release_notes: true
           files: release-files/*
+
+  # The build of main: replaces the "Latest build (main)" release with this
+  # commit's installers, under names that don't change from one build to
+  # the next — so a link to the Windows installer always gets the newest.
+  # A pre-release, so the app's update check (which goes by numbered
+  # releases) doesn't take it for one.
+  latest:
+    needs: build
+    runs-on: ubuntu-latest
+    # Also when another platform's build failed: the Windows build still goes
+    # out. Never without it (see "Name the files").
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      # The MSI is left out: Windows won't install an MSI over one of the same
+      # version, and every build of main has the same version. The setup .exe
+      # installs over any earlier one. No Windows installer, no new release —
+      # the previous one stays up.
+      - name: Name the files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p latest
+          pick() { # pick <pattern> <name>
+            local f
+            f="$(find dist -type f -name "$1" | head -1)"
+            if [ -n "$f" ]; then cp "$f" "latest/$2"; else echo "::warning::no $1 in this build"; fi
+          }
+          pick "*-setup.exe"       "Submarine-windows-x64-setup.exe"
+          pick "*-portable.zip"    "Submarine-windows-x64-portable.zip"
+          pick "*.dmg"             "Submarine-macos-arm64.dmg"
+          pick "*.app.zip"         "Submarine-macos-arm64.app.zip"
+          pick "*.AppImage"        "Submarine-linux-x86_64.AppImage"
+          pick "*.deb"             "Submarine-linux-amd64.deb"
+          pick "*.rpm"             "Submarine-linux-x86_64.rpm"
+          pick "*.pkg.tar.zst"     "Submarine-linux-x86_64.pkg.tar.zst"
+          ls -la latest/
+          if [ ! -f latest/Submarine-windows-x64-setup.exe ]; then
+            echo "::error::The Windows build didn't finish, so the Latest build release is left as it was."
+            exit 1
+          fi
+
+      - name: Replace the Latest build release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          SHORT="${SHA:0:7}"
+          WHEN="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          DL="https://github.com/$REPO/releases/download/latest-main"
+          has() { [ -f "latest/$1" ]; }
+          link() { echo "[$2]($DL/$1)"; }
+          {
+            echo "The newest build of \`main\`: commit [\`$SHORT\`](https://github.com/$REPO/commit/$SHA), built $WHEN. This page is replaced every time something is merged into \`main\`; numbered versions are the other releases."
+            echo
+            echo "### Windows"
+            echo "- **$(link Submarine-windows-x64-setup.exe Submarine-windows-x64-setup.exe)**: installs Submarine, or updates it — run a newer one over it. Your profiles and settings are kept."
+            if has Submarine-windows-x64-portable.zip; then
+              echo "- **$(link Submarine-windows-x64-portable.zip Submarine-windows-x64-portable.zip)**: no install. Unzip anywhere (a USB stick works) and run \`submarine.exe\`; everything it keeps stays in the \`submarine-data\` folder beside it."
+            fi
+            echo
+            echo "These builds aren't code-signed, so the first time Windows may say *\"Windows protected your PC\"*: click **More info → Run anyway**."
+            if has Submarine-macos-arm64.dmg; then
+              echo
+              echo "### macOS (Apple silicon)"
+              echo "$(link Submarine-macos-arm64.dmg Submarine-macos-arm64.dmg). Unsigned: the first time, right-click the app → **Open**."
+            fi
+            linux=()
+            has Submarine-linux-x86_64.AppImage && linux+=("$(link Submarine-linux-x86_64.AppImage AppImage)")
+            has Submarine-linux-amd64.deb && linux+=("$(link Submarine-linux-amd64.deb .deb)")
+            has Submarine-linux-x86_64.rpm && linux+=("$(link Submarine-linux-x86_64.rpm .rpm)")
+            has Submarine-linux-x86_64.pkg.tar.zst && linux+=("$(link Submarine-linux-x86_64.pkg.tar.zst Arch)")
+            if [ "${#linux[@]}" -gt 0 ]; then
+              echo
+              echo "### Linux"
+              (IFS='|'; echo "${linux[*]}" | sed 's/|/ · /g')
+            fi
+            echo
+            echo "Submarine says when there's a newer build: the profile screen shows *\"N new changes on main — download the latest build\"*."
+          } > notes.md
+          # Deleting it (and its tag) and making it again moves the tag to this
+          # commit and drops the previous build's files.
+          gh release delete latest-main --repo "$REPO" --cleanup-tag --yes || true
+          gh release create latest-main latest/* \
+            --repo "$REPO" \
+            --target "$SHA" \
+            --title "Latest build (main)" \
+            --notes-file notes.md \
+            --prerelease

@@ -6,10 +6,12 @@
 //! the user pick whether to grab it (auto-update infrastructure is a
 //! separate, bigger problem involving signed updates).
 //!
-//! This build is a fork that is built from source, so the check also says
-//! how many commits the fork's main has that this build doesn't (pull and
-//! rebuild), and how many the original project has that the fork doesn't
-//! yet (GitHub's "Sync fork").
+//! The fork is used three ways (build.rs): built from source, downloaded as
+//! the workflow's build of the latest commit on main (the "Latest build"
+//! release), or as a numbered release. Besides releases, the check says how
+//! many commits the fork's main has that this build doesn't — to pull and
+//! rebuild, or to download the next build — and how many the original
+//! project has that the fork doesn't yet (GitHub's "Sync fork").
 
 use serde::Serialize;
 
@@ -23,12 +25,20 @@ pub const UPSTREAM_REPO: &str = "SinaXhpm/Submarine";
 /// The commit this build was made from (build.rs); empty when it wasn't
 /// built from a git checkout, and in a release build.
 const BUILD_COMMIT: &str = env!("SUBMARINE_GIT_SHA");
+/// "source", "main" or "release" (build.rs).
+const BUILD_KIND: &str = env!("SUBMARINE_BUILD_KIND");
+/// The tag of the release the workflow keeps for the latest build of main
+/// (.github/workflows/build.yml).
+pub const LATEST_MAIN_TAG: &str = "latest-main";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AppInfo {
     pub version: String,
     pub github_repo_url: String,
     pub github_releases_url: String,
+    /// The first 7 characters of the commit it was built from, when known —
+    /// so two builds of the same version can be told apart.
+    pub commit: Option<String>,
 }
 
 /// Static info bundled with the binary. Version comes from CARGO_PKG_VERSION
@@ -39,6 +49,7 @@ pub fn app_info() -> AppInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         github_repo_url: format!("https://github.com/{}", GITHUB_REPO),
         github_releases_url: format!("https://github.com/{}/releases", GITHUB_REPO),
+        commit: BUILD_COMMIT.get(..7).map(str::to_string),
     }
 }
 
@@ -63,6 +74,9 @@ pub struct UpdateInfo {
     /// knows its commit.
     pub main_ahead: Option<u64>,
     pub main_url: Option<String>,
+    /// This is the workflow's build of main: newer commits mean a newer build
+    /// to download (main_url is then its release page), not one to make.
+    pub main_build: bool,
     /// Commits on the original project's main not yet in the fork's main
     /// (None when that couldn't be told), and the fork's page, where GitHub
     /// offers "Sync fork".
@@ -138,7 +152,12 @@ pub async fn check_for_updates(watch_upstream: Option<bool>) -> Result<UpdateInf
     let mut info = info?;
     if !BUILD_COMMIT.is_empty() {
         info.main_ahead = main_ahead;
-        info.main_url = Some(format!("https://github.com/{}/compare/{}...main", GITHUB_REPO, BUILD_COMMIT));
+        info.main_build = BUILD_KIND == "main";
+        info.main_url = Some(if info.main_build {
+            format!("https://github.com/{}/releases/tag/{}", GITHUB_REPO, LATEST_MAIN_TAG)
+        } else {
+            format!("https://github.com/{}/compare/{}...main", GITHUB_REPO, BUILD_COMMIT)
+        });
     }
     if watch_upstream {
         info.upstream_ahead = upstream_ahead;
@@ -213,6 +232,7 @@ impl UpdateInfo {
             release_url: None,
             main_ahead: None,
             main_url: None,
+            main_build: false,
             upstream_ahead: None,
             upstream_url: None,
         }
