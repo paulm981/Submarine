@@ -495,6 +495,24 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
                 <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${settings.detectOs !== false ? 'left-[22px]' : 'left-0.5'}`} />
               </button>
             </div>
+            <div className="flex items-center justify-between gap-4">
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-zinc-100">Ask before closing a connected session</div>
+                <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
+                  Closing a tab whose SSH connection is up asks first. Off, it just closes. Closing several sessions
+                  at once, or quitting with sessions open, still asks.
+                </p>
+              </div>
+              <button
+                role="switch"
+                aria-checked={settings.confirmCloseSession !== false}
+                aria-label="Ask before closing a connected session"
+                onClick={() => setSettings((s: any) => ({ ...s, confirmCloseSession: !(s.confirmCloseSession !== false) }))}
+                className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${settings.confirmCloseSession !== false ? 'bg-primary' : 'bg-zinc-700'}`}
+              >
+                <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${settings.confirmCloseSession !== false ? 'left-[22px]' : 'left-0.5'}`} />
+              </button>
+            </div>
             <JumpLoginLimit />
           </div>
         </section>

@@ -339,6 +339,9 @@ function DesktopApp() {
     // Fork maintainers only: the update check also counts the original
     // project's new commits (about.rs). Defaults OFF.
     watchUpstream: localStorage.getItem('submarine-watch-upstream') === 'on',
+    // Ask before closing a tab whose session is connected (Settings ›
+    // Servers, or "Don't ask again" in the prompt). Defaults ON.
+    confirmCloseSession: localStorage.getItem('submarine-confirm-close') !== 'off',
   });
 
   useEffect(() => {
@@ -354,6 +357,7 @@ function DesktopApp() {
     localStorage.setItem('submarine-sync-interval-min', String(appSettings.syncIntervalMin));
     localStorage.setItem('submarine-detect-os', appSettings.detectOs ? 'on' : 'off');
     localStorage.setItem('submarine-watch-upstream', appSettings.watchUpstream ? 'on' : 'off');
+    localStorage.setItem('submarine-confirm-close', appSettings.confirmCloseSession ? 'on' : 'off');
     // Tell already-mounted terminals to re-fit with the new font size / face.
     // Without this dispatch the listener in TerminalView is dead code and
     // users have to close+reopen every terminal to see a size change.
@@ -1009,14 +1013,25 @@ function DesktopApp() {
     removeFromWall(wall.id, m.terminalId);
   };
 
+  // Closing one connected session asks first — unless that's turned off in
+  // Settings › Servers, or with "Don't ask again" right in the prompt.
+  // Closing several at once always asks.
+  const askCloseSession = () => (!appSettings.confirmCloseSession ? Promise.resolve(true) : confirm({
+    title: "Close this session?",
+    message: "The SSH connection will be dropped.",
+    okLabel: "Close",
+    destructive: true,
+    dontAskAgain: () => setAppSettings(s => ({ ...s, confirmCloseSession: false })),
+  }));
+
   // Close sessions by id (All tabs ▾), asking first when any is connected.
   // Unmounting a SessionView disconnects it.
   const closeSessions = async (ids: string[]) => {
     if (ids.length === 0) return;
     const connected = ids.filter(id => sessionStatuses[id] === "connected").length;
     if (connected > 0) {
-      const ok = await confirm({
-        title: ids.length === 1 ? "Close this session?" : `Close ${ids.length} sessions?`,
+      const ok = ids.length === 1 ? await askCloseSession() : await confirm({
+        title: `Close ${ids.length} sessions?`,
         message: connected === 1 ? "Its SSH connection will be dropped." : `${connected} SSH connections will be dropped.`,
         okLabel: "Close",
         destructive: true,
@@ -1642,15 +1657,7 @@ function DesktopApp() {
                   // drop — connecting/failed/disconnected close instantly.
                   // Status source of truth is the same sessionStatuses map
                   // that drives the coloured dot above.
-                  if (sessionStatuses[s.id] === "connected") {
-                    const ok = await confirm({
-                      title: "Close this session?",
-                      message: "The SSH connection will be dropped.",
-                      okLabel: "Close",
-                      destructive: true,
-                    });
-                    if (!ok) return;
-                  }
+                  if (sessionStatuses[s.id] === "connected" && !(await askCloseSession())) return;
                   setSessions(prev => prev.filter(sess => sess.id !== s.id));
                   setSessionStatuses(prev => {
                     const { [s.id]: _, ...rest } = prev;
