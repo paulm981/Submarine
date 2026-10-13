@@ -6,6 +6,8 @@ import { IS_ANDROID } from "../util/platform";
 import { Cpu, X, Link2, ArrowLeftRight, Shield, Key, User, FolderPlus, Download, CheckSquare, Square, History, Plus, Copy } from "lucide-react";
 import PasswordField from "./PasswordField";
 import { useTextPrompt } from "../ui/confirm";
+import { SCHEMES, readSchemeId, schemeById } from "../ui/terminalThemes";
+import { SchemeSwatch } from "./TerminalSchemes";
 
 // Compact "2h ago" style relative time for the attribution line.
 function relTime(d: Date): string {
@@ -932,6 +934,29 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 spellCheck={false}
                 className="w-full bg-[#1a1a1e] rounded-lg p-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner font-mono leading-relaxed resize-y"
               />
+            </div>
+
+            {/* Its own terminal colors (synced with the server), e.g. a light
+                scheme for production so it's never mistaken for the rest. */}
+            <div className="space-y-1.5 pt-1">
+              <label htmlFor="node-terminal-colors" className="text-[11px] font-bold text-zinc-400 ml-1 flex items-center gap-2">
+                <span>Terminal colors</span>
+                <span className="text-[10px] text-zinc-600 font-normal normal-case tracking-normal">
+                  Its own, so it stands out. Applies to its open terminals too.
+                </span>
+              </label>
+              <div className="flex items-center gap-2">
+                <select
+                  id="node-terminal-colors"
+                  value={newNode.terminalTheme || ""}
+                  onChange={(e) => setNewNode({ ...newNode, terminalTheme: e.target.value })}
+                  className="flex-1 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner"
+                >
+                  <option value="">Same as Settings ({schemeById(readSchemeId()).name})</option>
+                  {SCHEMES.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                </select>
+                <SchemeSwatch scheme={schemeById(newNode.terminalTheme || readSchemeId())} className="shrink-0 h-9" />
+              </div>
             </div>
           </div>
         </div>

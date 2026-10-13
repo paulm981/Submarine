@@ -766,6 +766,13 @@ struct EntitySpec {
     fks: &'static [Fk],
 }
 
+/// Nullable synced columns added after their entity already synced. A peer on
+/// an older build sends records without the key, which means "this build
+/// doesn't know the field", not "clear it" — so the merge keeps this device's
+/// value then (and leaves it NULL on a fresh insert). `position` has its own
+/// shim in apply_entity, as it is NOT NULL.
+const LATE_COLS: &[&str] = &["terminal_theme"];
+
 /// Applied in this order so most FK referents already exist on merge; the two
 /// self-referential FKs (folders.parent_id, servers.jump_host_id) are resolved
 /// in a deferred fixup pass afterwards.
@@ -779,7 +786,7 @@ const ENTITIES: &[EntitySpec] = &[
     EntitySpec { table: "credentials", cols: &["name", "auth_type", "username", "password", "edited_by"], fks: &[Fk { key: "key_uuid", col: "key_id", ref_table: "ssh_keys", required: false }] },
     EntitySpec {
         table: "servers",
-        cols: &["name", "host", "port", "username", "password", "proxy_type", "proxy_host", "proxy_port", "tunnels", "auth_type", "autostart", "mirrors", "color", "notes", "run_on_connect", "position", "edited_by"],
+        cols: &["name", "host", "port", "username", "password", "proxy_type", "proxy_host", "proxy_port", "tunnels", "auth_type", "autostart", "mirrors", "color", "notes", "run_on_connect", "terminal_theme", "position", "edited_by"],
         fks: &[
             Fk { key: "credential_uuid", col: "credential_id", ref_table: "credentials", required: false },
             Fk { key: "folder_uuid", col: "folder_id", ref_table: "folders", required: false },
@@ -1026,9 +1033,14 @@ fn apply_entity(conn: &Connection, key: &[u8; 32], spec: &EntitySpec, rec: &Sync
     // with the coerced 0 — otherwise an ordinary field edit synced from an old
     // peer would silently reset a manual drag-order on this device.
     let mut preserve_local_position = false;
+    // LATE_COLS the record doesn't carry: keep the local value on UPDATE.
+    let mut keep_local: Vec<&str> = Vec::new();
     for c in spec.cols {
         columns.push((*c).into());
         let val = obj.get(*c);
+        if val.is_none() && LATE_COLS.contains(c) {
+            keep_local.push(c);
+        }
         // Backward-compat shim: `position` was added to servers' synced cols in
         // 0.3.5. Records from a pre-0.3.5 peer omit the key entirely, so
         // json_to_sql(None) would bind an explicit SQL NULL — which violates
@@ -1102,6 +1114,8 @@ fn apply_entity(conn: &Connection, key: &[u8; 32], spec: &EntitySpec, rec: &Sync
                 // Peer didn't know about `position` — don't clobber our local
                 // drag-order with the coerced 0; keep the existing row value.
                 format!("position={}.position", spec.table)
+            } else if keep_local.contains(&c.as_str()) {
+                format!("{c}={}.{c}", spec.table)
             } else {
                 format!("{c}=excluded.{c}")
             }
@@ -2383,7 +2397,7 @@ mod sync_engine_tests {
             "CREATE TABLE folders(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, parent_id INTEGER, color TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE ssh_keys(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, public_key TEXT, private_key TEXT, passphrase TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE credentials(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, auth_type TEXT, username TEXT, password TEXT, key_id INTEGER, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
-             CREATE TABLE servers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT, key_id INTEGER, autostart INTEGER, mirrors TEXT, color TEXT, notes TEXT, run_on_connect TEXT, jump_host_id INTEGER, position INTEGER NOT NULL DEFAULT 0, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
+             CREATE TABLE servers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT, key_id INTEGER, autostart INTEGER, mirrors TEXT, color TEXT, notes TEXT, run_on_connect TEXT, jump_host_id INTEGER, position INTEGER NOT NULL DEFAULT 0, terminal_theme TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE commands(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE notes(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE monitor_configs(node_id INTEGER PRIMARY KEY, enabled_metrics TEXT, custom_metrics TEXT, paused INTEGER, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
@@ -2679,6 +2693,66 @@ mod sync_engine_tests {
             .expect("a server from a pre-0.3.5 peer (no position key) must merge, not be skipped");
         assert_eq!(host, "h");
         assert_eq!(pos, 0, "a missing position must default to 0");
+    }
+
+    // A server's terminal scheme syncs like its other fields — and an edit
+    // from a peer on a build without the column (the key absent from its
+    // record) changes what it changed but keeps the scheme, both on a row
+    // that exists and on one it inserts (NULL there).
+    #[test]
+    fn terminal_theme_syncs_and_an_older_peer_keeps_it() {
+        let (a, _ha) = device("A");
+        a.execute("INSERT INTO servers(name, host, terminal_theme) VALUES('prod','h1','nord')", []).unwrap();
+        let (b, hb) = device("B");
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let theme: Option<String> = b.query_row("SELECT terminal_theme FROM servers WHERE name='prod'", [], |r| r.get(0)).unwrap();
+        assert_eq!(theme.as_deref(), Some("nord"), "the scheme must sync");
+
+        // An older peer edits the host: its record has no terminal_theme key.
+        a.execute("UPDATE servers SET host='h2' WHERE name='prod'", []).unwrap();
+        let mut recs = collect_local_records(&a, &KEY, "").unwrap();
+        for r in recs.iter_mut() {
+            if r.entity_type == "servers" {
+                let plain = decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap();
+                let mut obj: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+                obj.as_object_mut().unwrap().remove("terminal_theme");
+                r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
+                r.updated_at = "999999999999999:99999:zzz".to_string();
+            }
+        }
+        apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+        let (host, theme): (String, Option<String>) = b
+            .query_row("SELECT host, terminal_theme FROM servers WHERE name='prod'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(host, "h2", "the older peer's edit must apply");
+        assert_eq!(theme.as_deref(), Some("nord"), "an absent key must keep the local scheme");
+
+        // A new device inserting the older peer's record gets no scheme.
+        let (c, hc) = device("C");
+        apply_remote_records(&c, &KEY, &recs, &hc).unwrap();
+        let theme: Option<String> = c.query_row("SELECT terminal_theme FROM servers WHERE name='prod'", [], |r| r.get(0)).unwrap();
+        assert_eq!(theme, None);
+
+        // An explicit null from a current peer still clears it.
+        a.execute("UPDATE servers SET terminal_theme=NULL WHERE name='prod'", []).unwrap();
+        let mut recs = collect_local_records(&a, &KEY, "").unwrap();
+        for r in recs.iter_mut() {
+            if r.entity_type == "servers" {
+                r.updated_at = "999999999999999:99999:zzzz".to_string();
+            }
+        }
+        apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+        let theme: Option<String> = b.query_row("SELECT terminal_theme FROM servers WHERE name='prod'", [], |r| r.get(0)).unwrap();
+        assert_eq!(theme, None, "a null from a peer that knows the column clears it");
+    }
+
+    #[test]
+    fn scheme_ids_are_cleaned() {
+        assert_eq!(clean_scheme_id(" tokyo-night "), Some("tokyo-night".into()));
+        assert_eq!(clean_scheme_id("Nord"), Some("nord".into()));
+        assert_eq!(clean_scheme_id("  "), None);
+        assert_eq!(clean_scheme_id("<x>;"), Some("x".into()));
+        assert_eq!(clean_scheme_id(&"a".repeat(100)).unwrap().len(), 64);
     }
 
     // Regression for the UPDATE-arm half of the 0.3.5 position shim. The INSERT
@@ -3693,6 +3767,15 @@ async fn setup_master_db_inner(
     }
     conn.execute_batch(server_os::RESET_TRIGGER)
         .map_err(|e| format!("[DATABASE] SERVER_OS_TRIGGER_FAILED: {}", e))?;
+    // The server's own terminal color scheme (an id from
+    // src/ui/terminalThemes.ts); NULL = the app's default. Synced, and in
+    // LATE_COLS, so an older peer's edit doesn't clear it.
+    if let Err(e) = conn.execute("ALTER TABLE servers ADD COLUMN terminal_theme TEXT", []) {
+        let s = e.to_string();
+        if !s.contains("duplicate column name") {
+            return Err(format!("[DATABASE] SERVER_THEME_MIGRATION_FAILED: {}", s));
+        }
+    }
 
     conn.execute("PRAGMA foreign_keys = ON", []).map_err(|e| format!("[DATABASE] PRAGMA_FAILED: {}", e))?;
 
@@ -4732,6 +4815,31 @@ async fn set_server_run_on_connect(state: tauri::State<'_, DbState>, id: i32, va
     Ok(())
 }
 
+/// Keep only what a scheme id can contain (lowercase letters, digits, dashes),
+/// at most 64 of them; empty = none.
+fn clean_scheme_id(raw: &str) -> Option<String> {
+    let id: String = raw.trim().to_ascii_lowercase().chars().filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-').take(64).collect();
+    (!id.is_empty()).then_some(id)
+}
+
+/// A server's own terminal color scheme, or `None` for the app's default.
+/// Its own command, like set_server_run_on_connect.
+#[tauri::command]
+async fn set_server_terminal_theme(state: tauri::State<'_, DbState>, id: i32, value: Option<String>) -> Result<(), String> {
+    let value = value.as_deref().and_then(clean_scheme_id);
+    let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+    let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+    // No write when nothing changed: every save of the edit panel calls this,
+    // and an UPDATE would restamp the row for sync even with the same value.
+    conn.execute(
+        "UPDATE servers SET terminal_theme=?1 WHERE id=?2 AND terminal_theme IS NOT ?1",
+        rusqlite::params![value, id],
+    ).map_err(|e| format!("[DATABASE] SERVER_THEME_FAILED: {}", e))?;
+    drop(conn_guard);
+    save_vault_internal(&state)?;
+    Ok(())
+}
+
 /// ProxyJump target for a node: `Some(other_server_id)` to bounce through that
 /// server, or `None` to connect directly. Written through its own command
 /// (like set_server_notes / set_server_run_on_connect) so it stays out of
@@ -4759,8 +4867,8 @@ async fn clone_server(state: tauri::State<'_, DbState>, id: i32) -> Result<i64, 
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     let affected = conn.execute(
-        "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id)
-         SELECT name || ' (copy)', host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, 0, mirrors, color, notes, run_on_connect, jump_host_id
+        "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, terminal_theme)
+         SELECT name || ' (copy)', host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, 0, mirrors, color, notes, run_on_connect, jump_host_id, terminal_theme
          FROM servers WHERE id = ?1",
         rusqlite::params![id],
     ).map_err(|e| format!("[DATABASE] SERVER_CLONE_FAILED: {}", e))?;
@@ -4820,7 +4928,7 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
     // ORDER BY (position, id): `position` is the manual drag-to-reorder rank
     // (default 0 for never-reordered rows), and id breaks ties so the order is
     // stable and, before any reorder, identical to the old rowid order.
-    let mut stmt = conn.prepare("SELECT id, name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, updated_at, edited_by, position, os FROM servers ORDER BY position, id")
+    let mut stmt = conn.prepare("SELECT id, name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, updated_at, edited_by, position, os, terminal_theme FROM servers ORDER BY position, id")
         .map_err(|e| format!("[DATABASE] PREPARE_FAILED: {}", e))?;
 
     let rows = stmt.query_map([], |row| {
@@ -4853,6 +4961,8 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
             "position": row.get::<_, i64>(22).unwrap_or(0),
             // Last OS the server reported (server_os.rs); null until then.
             "os": row.get::<_, Option<String>>(23).unwrap_or(None),
+            // Its own terminal color scheme id; null = the app's default.
+            "terminal_theme": row.get::<_, Option<String>>(24).unwrap_or(None),
         }))
     }).map_err(|e| format!("[DATABASE] QUERY_MAPPING_FAILED: {}", e))?;
 
@@ -14780,7 +14890,7 @@ pub fn run() {
             accept_share, import_shared_profile, restore_personal_profile, share_set_role, share_revoke, share_leave, share_delete,
             profile_share_status, stop_sharing, profile_sync_stats,
             set_editor_label,
-            add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_jump_host, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
+            add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_terminal_theme, set_server_jump_host, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
             get_credentials, generate_ssh_key,
             add_folder, rename_folder, delete_folder, get_folders,
             tree_moves::move_servers, tree_moves::move_rdp_links, tree_moves::move_folder, tree_moves::delete_tree_items,

@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import type { Terminal } from "xterm";
+import type { Terminal } from "@xterm/xterm";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Terminal dock — where a server terminal is on screen.

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, FileEdit, Server, Home } from "lucide-react";
+import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, FileEdit, Server, Home, Scale } from "lucide-react";
 import {
   MAX_FONT_SIZE, MIN_FONT_SIZE, clampFontSize, fontFamilyCss,
   isFontAvailable, primaryFontName, sanitizeFontFamily,
@@ -10,6 +10,9 @@ import CopyValue from "./CopyValue";
 import FontPicker from "./FontPicker";
 import { loadInstalledFonts } from "../util/systemFonts";
 import { IS_ANDROID } from "../util/platform";
+import { TerminalColorSettings } from "./TerminalSchemes";
+import LicensesDialog from "./LicensesDialog";
+import { DEFAULT_SCHEME } from "../ui/terminalThemes";
 
 // Where this install keeps its data (see src-tauri/src/portable.rs). `portable`
 // means a `submarine-data` folder next to the executable is in use; `warning`
@@ -413,6 +416,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
   // Read-only storage summary from the backend: where data lives and whether
   // a `submarine-data` folder next to the exe (portable mode) is in use.
   const [storage, setStorage] = useState<StorageInfo | null>(null);
+  const [licensesOpen, setLicensesOpen] = useState(false);
   useEffect(() => {
     invoke<StorageInfo>("get_storage_info").then(setStorage).catch(() => setStorage(null));
   }, []);
@@ -514,6 +518,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
           </div>
           
           <TerminalFontSettings settings={settings} setSettings={setSettings} />
+          <TerminalColorSettings settings={settings} setSettings={setSettings} />
         </section>
 
         {/* Servers Section */}
@@ -711,7 +716,10 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
             <button
               onClick={() => {
                 if(window.confirm('Reset all UI customizations?')) {
-                  setSettings((s: any) => ({ ...s, primaryColor: '#60a5fa', backgroundColor: '#0a0a0c', terminalFontSize: 14, terminalFontFamily: '' }));
+                  setSettings((s: any) => ({
+                    ...s, primaryColor: '#60a5fa', backgroundColor: '#0a0a0c', terminalFontSize: 14, terminalFontFamily: '',
+                    terminalScheme: DEFAULT_SCHEME, terminalGpu: true, terminalMinContrast: true,
+                  }));
                 }
               }}
               className="px-4 h-9 bg-zinc-900 border border-white/5 text-zinc-300 rounded-xl text-xs font-bold uppercase hover:bg-white/5 transition-all w-full"
@@ -720,7 +728,27 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
             </button>
           </div>
         </section>
+
+        {/* Open-source licenses */}
+        <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
+          <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
+            <Scale size={14} /> Open-source licenses
+          </div>
+          <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
+            <p className="text-sm text-zinc-400 leading-relaxed">
+              Submarine is MIT-licensed and built on open-source packages, fonts and color schemes. See each one
+              and its licence.
+            </p>
+            <button
+              onClick={() => setLicensesOpen(true)}
+              className="px-4 h-9 bg-zinc-900 border border-white/5 text-zinc-300 rounded-xl text-xs font-bold uppercase hover:bg-white/5 transition-all w-full flex items-center justify-center gap-2"
+            >
+              <Scale size={13} /> Open-source licenses
+            </button>
+          </div>
+        </section>
       </div>
+      {licensesOpen && <LicensesDialog onClose={() => setLicensesOpen(false)} />}
     </div>
   );
 };

@@ -1,16 +1,20 @@
 import { useEffect, useRef, useState } from 'react';
-import { Terminal } from 'xterm';
-import { FitAddon } from 'xterm-addon-fit';
-import { SearchAddon, ISearchOptions } from 'xterm-addon-search';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import { SearchAddon, ISearchOptions } from '@xterm/addon-search';
+import { Unicode11Addon } from '@xterm/addon-unicode11';
+import { WebLinksAddon } from '@xterm/addon-web-links';
+import { WebglAddon } from '@xterm/addon-webgl';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import 'xterm/css/xterm.css';
+import '@xterm/xterm/css/xterm.css';
 import { useIsNarrow } from '../hooks/useViewport';
 import { MobileKeyBar, ModifiersState, ModKey, SpecialKey } from './MobileKeyBar';
 import { appHotkey, registerTerminal, terminalStateChanged } from '../ui/terminalDock';
 import { useConfirm } from '../ui/confirm';
 import HistorySearchOverlay from './HistorySearchOverlay';
 import { DEFAULT_FONT_STACK, fontFamilyCss, readFontFamily, readFontSize } from '../util/terminalFont';
+import { MIN_CONTRAST_RATIO, readGpu, readMinContrast, schemeForServer } from '../ui/terminalThemes';
 import { IS_ANDROID, IS_LINUX } from '../util/platform';
 import { readClipboardText } from '../util/clipboard';
 
@@ -33,7 +37,7 @@ const looksLikePasswordPrompt = (out: string): boolean => {
 // match in orange. `decorations` uses the marker overlay so the highlight
 // survives scrollback and repaints (the addon's built-in selection-based
 // mode would clobber the user's own selection every keystroke). The
-// overview-ruler fields are typed as required in xterm-addon-search 0.13
+// overview-ruler fields are typed as required by @xterm/addon-search
 // but we don't render an overview ruler (no `overviewRulerLane` on the
 // terminal), so their values are cosmetic — mirror the match colors so
 // they'd still read sensibly if a ruler were ever enabled.
@@ -470,9 +474,8 @@ const TerminalView = ({
   // keystroke goes to the shell, not to nowhere.
   const closeSearch = () => {
     const addon = searchAddonRef.current;
-    // clearDecorations arrived in xterm-addon-search 0.13; guard for older
-    // typings even though our lockfile pins 0.13.0.
-    addon?.clearDecorations?.();
+    // Drop the match highlights.
+    addon?.clearDecorations();
     setShowSearch(false);
     // Return focus to xterm so keystrokes resume typing at the prompt.
     xtermRef.current?.focus();
@@ -500,6 +503,16 @@ const TerminalView = ({
   const confirmDialog = useConfirm();
   const confirmRef = useRef(confirmDialog);
   confirmRef.current = confirmDialog;
+  // The color scheme's background, for the padding around the grid.
+  const [background, setBackground] = useState(() => schemeForServer(serverId).theme.background);
+  // A link in the output was clicked: ask, then hand an http(s) one to the
+  // system browser (open_external_url refuses anything else). The themed
+  // confirm, as window.confirm() does nothing in Android's WebView.
+  const openLink = (uri: string) => {
+    if (!/^https?:\/\//i.test(uri)) return;
+    confirmRef.current({ title: 'Open this link in your browser?', message: uri, okLabel: 'Open' })
+      .then((ok) => { if (ok) invoke('open_external_url', { url: uri }).catch(() => {}); });
+  };
 
   useEffect(() => {
     if (!terminalRef.current) return;
@@ -513,23 +526,15 @@ const TerminalView = ({
       // from whatever face renders first — measuring the fallback and then
       // drawing the real font would leave gaps or overlapping glyphs.
       fontFamily: DEFAULT_FONT_STACK,
-      theme: {
-        background: '#09090b',
-        foreground: '#e4e4e7',
-        cursor: '#60a5fa',
-        selectionBackground: 'rgba(96, 165, 250, 0.3)',
-      },
+      // The server's own scheme, else this device's (Settings › Terminal);
+      // handleSettingsChange below follows later changes to either.
+      theme: schemeForServer(serverId).theme,
+      // Text a program colored too close to its background is lightened or
+      // darkened until it reads (WCAG AA, as VS Code's terminal does).
+      minimumContrastRatio: readMinContrast() ? MIN_CONTRAST_RATIO : 1,
       // Hyperlinks a program prints (OSC 8). xterm's default opens them in
-      // a new webview window; ask, then hand http(s) links to the system
-      // browser (open_external_url refuses anything else). The themed
-      // confirm, as window.confirm() does nothing in Android's WebView.
-      linkHandler: {
-        activate: (_event, uri) => {
-          if (!/^https?:\/\//i.test(uri)) return;
-          confirmRef.current({ title: 'Open this link in your browser?', message: uri, okLabel: 'Open' })
-            .then((ok) => { if (ok) invoke('open_external_url', { url: uri }).catch(() => {}); });
-        },
-      },
+      // a new webview window; ask instead (openLink).
+      linkHandler: { activate: (_event, uri) => openLink(uri) },
       allowProposedApi: true
     });
 
@@ -539,6 +544,12 @@ const TerminalView = ({
     const searchAddon = new SearchAddon();
     searchAddonRef.current = searchAddon;
     term.loadAddon(searchAddon);
+    // Unicode 11 character widths, so emoji and CJK take the two cells the
+    // shell expects and the cursor stays where it should after them.
+    term.loadAddon(new Unicode11Addon());
+    term.unicode.activeVersion = '11';
+    // Plain URLs in the output (not only OSC 8 links) are clickable too.
+    term.loadAddon(new WebLinksAddon((_event, uri) => openLink(uri)));
     // xterm draws into a div of its own, which a Wall can borrow (see
     // src/ui/terminalDock.ts) — so the mouse, resize and focus handling
     // below is bound to it, not to this component's wrapper.
@@ -548,6 +559,40 @@ const TerminalView = ({
     host.style.height = '100%';
     home.appendChild(host);
     term.open(host);
+
+    // Draw with the GPU (xterm's WebGL renderer) unless Settings turned it
+    // off. If WebGL isn't there, or the context is lost — a webview keeps
+    // only so many, so the oldest terminals lose theirs when many are open —
+    // xterm goes back to drawing with the DOM, which always works.
+    let webgl: WebglAddon | null = null;
+    // Lost its context once: stays on the DOM renderer until GPU drawing is
+    // turned off and on again, rather than taking a context back on the next
+    // settings change and so pushing another terminal's out.
+    let gpuLost = false;
+    const setGpu = (on: boolean) => {
+      if (!on) gpuLost = false;
+      if (on === !!webgl || (on && gpuLost)) return;
+      if (!on) {
+        webgl?.dispose();
+        webgl = null;
+        return;
+      }
+      try {
+        const addon = new WebglAddon();
+        addon.onContextLoss(() => {
+          addon.dispose();
+          if (webgl === addon) webgl = null;
+          gpuLost = true;
+        });
+        term.loadAddon(addon);
+        webgl = addon;
+      } catch {
+        // No WebGL here: don't try again on every settings change.
+        webgl = null;
+        gpuLost = true;
+      }
+    };
+    setGpu(readGpu());
     
     // Cleared on unmount: a terminal closed within these 50ms must not open
     // its PTY after the close was sent.
@@ -908,9 +953,25 @@ const TerminalView = ({
     });
     resizeObserver.observe(host);
     
+    // Colors, contrast and the renderer apply live to open terminals: a change
+    // in Settings, or to the server's own scheme (an edit, or a sync).
+    const applyLook = () => {
+      const { theme } = schemeForServer(serverId);
+      if (term.options.theme !== theme) {
+        term.options.theme = theme;
+        setBackground(theme.background);
+        // A Wall tile showing this terminal repaints its padding to match.
+        terminalStateChanged();
+      }
+      const ratio = readMinContrast() ? MIN_CONTRAST_RATIO : 1;
+      if (term.options.minimumContrastRatio !== ratio) term.options.minimumContrastRatio = ratio;
+      setGpu(readGpu());
+    };
+
     // Handle Settings Change — font size and face apply live to open terminals.
     let fontDisposed = false;
     const handleSettingsChange = () => {
+      applyLook();
       const size = readFontSize();
       const family = fontFamilyCss(readFontFamily());
       if (term.options.fontSize === size && term.options.fontFamily === family) return;
@@ -1032,6 +1093,7 @@ const TerminalView = ({
       unlistenPromise.then(unlisten => unlisten());
       searchAddon.dispose();
       searchAddonRef.current = null;
+      webgl?.dispose();
       term.dispose();
       host.remove();
       invoke(commands.close, { terminalId }).catch(console.error);
@@ -1043,7 +1105,7 @@ const TerminalView = ({
     // pane (between xterm and the system soft keyboard). On desktop the bar
     // isn't rendered at all, so the xterm child claims the full height as
     // before.
-    <div className="h-full w-full bg-[#09090b] p-2 pr-2 pb-0 relative flex flex-col">
+    <div className="h-full w-full p-2 pr-2 pb-0 relative flex flex-col" style={{ background }}>
       <div
         ref={terminalRef}
         className="flex-1 min-h-0 w-full overflow-hidden select-text"
