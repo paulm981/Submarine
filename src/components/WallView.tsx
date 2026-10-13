@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Terminal } from "xterm";
+import { Terminal } from "@xterm/xterm";
 import {
   ClipboardPaste, ExternalLink, LayoutGrid, Pause, Play, Plus, Radio, RotateCw, Save, Send, X,
 } from "lucide-react";
@@ -619,7 +619,8 @@ const WallTile = ({
           }
         }}
       >
-        <div ref={slotRef} className="absolute inset-0 p-1 select-text bg-[#09090b]" />
+        {/* The padding takes the terminal's own scheme background. */}
+        <div ref={slotRef} className="absolute inset-0 p-1 select-text" style={{ background: entry?.term.options.theme?.background ?? "#09090b" }} />
         {!entry && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-center px-3 bg-[#09090b]">
             <span className="text-[10.5px] font-semibold uppercase tracking-wider text-zinc-400">

@@ -105,7 +105,10 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 ### Terminal
 
 - Tabbed sessions per server and multiple shells per session
-- Full xterm.js — true colour, ANSI 256, mouse support
+- Full xterm.js 6 — true colour, ANSI 256, mouse support, drawn with the GPU (WebGL, falling back to the DOM), Unicode 11 widths so emoji and CJK line up
+- **Color schemes** — Submarine's own plus Campbell, One Half, Solarized, Dracula, Nord, Tokyo Night, Catppuccin and Gruvbox (Settings › Terminal, with a live preview). A server can have **its own**, which syncs with it — e.g. a light scheme for production
+- **Keep text readable** — text a program colors too close to the background is lifted to a 4.5:1 contrast, as in VS Code
+- **Clickable links** — URLs in the output and OSC 8 hyperlinks open in your browser after a prompt
 - **Select to copy** — release the mouse over your selection and it's in the clipboard
 - Right-click to paste
 - Wrapped lines copy as a single line (no phantom blank rows)
@@ -346,6 +349,8 @@ Designed and built by [Sina](https://sinaxhpm.com) in collaboration with [Claude
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+The app ships with the licences of everything in it: every build lists the JavaScript packages and Rust crates it includes, with their licence texts (`scripts/notices.mjs`), and the fonts' and color schemes' licences are in `public/licenses/`. In the app: Settings › Open-source licenses.
 
 ---
 

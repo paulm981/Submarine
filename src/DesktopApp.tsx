@@ -15,6 +15,7 @@ import QuickConnectModal, { QuickAuth } from "./components/QuickConnectModal";
 import { useConfirm, useTextPrompt } from "./ui/confirm";
 import { useIsNarrow } from "./hooks/useViewport";
 import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./util/terminalFont";
+import { GPU_KEY, MIN_CONTRAST_KEY, SCHEME_KEY, readGpu, readMinContrast, readSchemeId, setServerSchemes } from "./ui/terminalThemes";
 import { Sidebar } from "./components/Sidebar";
 import { NodeGrid } from "./components/NodeGrid";
 import { SessionTree, type TreeItems } from "./components/SessionTree";
@@ -301,6 +302,8 @@ function DesktopApp() {
     // Commands auto-typed into the FIRST terminal on the INITIAL connect only
     // (never on reconnect or extra shells). Newline-separated. Empty = off.
     runOnConnect: "" as string,
+    // The server's own terminal color scheme id; "" = the app's.
+    terminalTheme: "" as string,
     // ProxyJump: id (as a string, like credentialId/folderId) of another node
     // to bounce through. Empty = connect directly. parseInt'd to a number (or
     // null) at save time.
@@ -329,6 +332,11 @@ function DesktopApp() {
     terminalFontSize: readFontSize(),
     // '' = the built-in cross-platform monospace stack (see util/terminalFont).
     terminalFontFamily: readFontFamily(),
+    // Terminal colors (src/ui/terminalThemes.ts), GPU drawing and minimum
+    // contrast. A server's own colors, when it has some, win over the scheme.
+    terminalScheme: readSchemeId(),
+    terminalGpu: readGpu(),
+    terminalMinContrast: readMinContrast(),
     // Auto-sync defaults ON. Per-device (localStorage), like the other prefs.
     autoSync: localStorage.getItem('submarine-auto-sync') !== 'off',
     // Background pull cadence in minutes (min 1). Only gates the periodic
@@ -354,6 +362,9 @@ function DesktopApp() {
     localStorage.setItem('submarine-bg-color', appSettings.backgroundColor);
     localStorage.setItem(FONT_SIZE_KEY, appSettings.terminalFontSize.toString());
     localStorage.setItem(FONT_FAMILY_KEY, appSettings.terminalFontFamily);
+    localStorage.setItem(SCHEME_KEY, appSettings.terminalScheme);
+    localStorage.setItem(GPU_KEY, appSettings.terminalGpu ? 'on' : 'off');
+    localStorage.setItem(MIN_CONTRAST_KEY, appSettings.terminalMinContrast ? 'on' : 'off');
     localStorage.setItem('submarine-auto-sync', appSettings.autoSync ? 'on' : 'off');
     localStorage.setItem('submarine-sync-interval-min', String(appSettings.syncIntervalMin));
     localStorage.setItem('submarine-detect-os', appSettings.detectOs ? 'on' : 'off');
@@ -364,6 +375,12 @@ function DesktopApp() {
     // users have to close+reopen every terminal to see a size change.
     window.dispatchEvent(new CustomEvent('submarine-settings-changed'));
   }, [appSettings]);
+
+  // Servers' own terminal colors: open terminals recolor when one changes
+  // (an edit here, or one that came in with a sync).
+  useEffect(() => {
+    if (setServerSchemes(servers)) window.dispatchEvent(new CustomEvent('submarine-settings-changed'));
+  }, [servers]);
 
   useEffect(() => {
     // Nothing to set up before the first screen:
@@ -1241,6 +1258,7 @@ function DesktopApp() {
       color: server.color ?? null,
       notes: server.notes || "",
       runOnConnect: server.run_on_connect || "",
+      terminalTheme: server.terminal_theme || "",
       jumpHostId: server.jump_host_id?.toString() || "",
       // Attribution (read-only display): who last edited + the HLC stamp.
       editedBy: server.edited_by ?? null,
@@ -2769,6 +2787,11 @@ function DesktopApp() {
               await invoke("set_server_run_on_connect", { id: savedId, value: newNode.runOnConnect || "" });
             } catch (e) {
               addLog(`SAVE_RUN_ON_CONNECT_FAILED: ${e}`, "error");
+            }
+            try {
+              await invoke("set_server_terminal_theme", { id: savedId, value: newNode.terminalTheme || null });
+            } catch (e) {
+              addLog(`SAVE_TERMINAL_THEME_FAILED: ${e}`, "error");
             }
             // ProxyJump target — same separate-write pattern. Empty string
             // means "no jump host" → store NULL.
