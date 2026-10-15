@@ -13,7 +13,7 @@ import { shellGroups, type LocalShells } from "./HomePane";
 import CopyValue from "./CopyValue";
 import FontPicker from "./FontPicker";
 import { loadInstalledFonts } from "../util/systemFonts";
-import { IS_ANDROID } from "../util/platform";
+import { IS_ANDROID, IS_WINDOWS } from "../util/platform";
 import { TerminalColorSettings } from "./TerminalSchemes";
 import LicensesDialog from "./LicensesDialog";
 import { DEFAULT_SCHEME } from "../ui/terminalThemes";
@@ -918,7 +918,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, servers = [] }: any)
                 if(window.confirm('Reset all UI customizations?')) {
                   setSettings((s: any) => ({
                     ...s, primaryColor: '#60a5fa', backgroundColor: '#0a0a0c', terminalFontSize: 14, terminalFontFamily: '',
-                    terminalScheme: DEFAULT_SCHEME, terminalGpu: true, terminalMinContrast: true,
+                    terminalScheme: DEFAULT_SCHEME, terminalGpu: IS_WINDOWS, terminalMinContrast: true,
                   }));
                 }
               }}

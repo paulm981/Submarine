@@ -8,7 +8,7 @@ import {
 } from "lucide-react";
 import DockerTab from "./DockerTab";
 import { ScrollableTabs } from "./ScrollableTabs";
-import { useConfirm } from "../ui/confirm";
+import { useConfirm, useTextPrompt } from "../ui/confirm";
 import CopyValue from "./CopyValue";
 
 interface InfoPanelProps {
@@ -40,7 +40,59 @@ interface SystemctlResult {
   stdout: string;
   stderr: string;
   used_sudo: boolean;
+  /** `sudo` or `dzdo` when it ran as root. */
+  root_tool?: string | null;
 }
+
+// Actions that need root (a service, a kill, firewall rules) run through sudo
+// or dzdo (run_as_root in lib.rs). When the tool wants a password the panel
+// asks for it; the app keeps what worked for this tab only, in memory, and
+// also uses what the tab's SFTP root mode already has.
+const ROOT_MESSAGES: Record<string, string> = {
+  "[SUDO] NEED_PASSWORD": "sudo / dzdo needs a password.",
+  "[SUDO] WRONG_PASSWORD": "Wrong sudo / dzdo password.",
+  "[SUDO] NOT_ALLOWED": "This user isn't allowed to run that with sudo or dzdo.",
+  "[SUDO] REQUIRETTY": "sudo on this server requires a terminal (requiretty), so the panel can't use it. Run the command in the terminal instead.",
+  "[SUDO] NO_SUDO": "This needs root, and neither sudo nor dzdo is installed on this server.",
+};
+
+const describeRootError = (raw: string) => {
+  const code = Object.keys(ROOT_MESSAGES).find((k) => raw.includes(k));
+  return code ? ROOT_MESSAGES[code] : raw.replace(/^\[SUDO\] FAILED:?\s*/, "sudo failed: ");
+};
+
+/// invoke() for a command that may run as root: called without a password
+/// first; when sudo or dzdo asks for one, the user is asked and the command
+/// is called again with it. Null when the user cancels. Errors come back as
+/// Error with a readable message.
+const useRootInvoke = () => {
+  const textPrompt = useTextPrompt();
+  return useCallback(async <T,>(cmd: string, args: Record<string, unknown>, what: string): Promise<T | null> => {
+    let password: string | null = null;
+    for (let wrongTries = 0; ; ) {
+      try {
+        return await invoke<T>(cmd, { ...args, password });
+      } catch (e: any) {
+        const raw = typeof e === "string" ? e : (e?.message || String(e));
+        const wrong = raw.includes("[SUDO] WRONG_PASSWORD");
+        if ((!wrong && !raw.includes("[SUDO] NEED_PASSWORD")) || (wrong && ++wrongTries >= 3)) {
+          throw new Error(describeRootError(raw));
+        }
+        password = await textPrompt({
+          title: `${what} as root`,
+          message: wrong
+            ? "Wrong password, try again."
+            : "This needs root, and sudo or dzdo on this server wants your password. It's kept in memory for this tab only and never saved.",
+          password: true,
+          keepWhitespace: true,
+          okLabel: "Run as root",
+          validate: (v) => (v ? null : "Enter the password"),
+        });
+        if (password === null) return null;
+      }
+    }
+  }, [textPrompt]);
+};
 
 type SubTab = "overview" | "network" | "ports" | "processes" | "services" | "docker";
 const TABS: { id: SubTab; label: string; icon: any }[] = [
@@ -1229,7 +1281,27 @@ const NetworkTab = ({ sessionId, data }: { sessionId: string; data: NetworkData 
 // component state so re-collapsing / re-expanding is free.
 
 interface FirewallCardProps { sessionId: string; fw: FirewallData; }
-const FirewallCard = ({ sessionId, fw }: FirewallCardProps) => {
+const FirewallCard = ({ sessionId, fw: probed }: FirewallCardProps) => {
+  const rootInvoke = useRootInvoke();
+  // The rules read as root, for a host whose probe couldn't read them; the
+  // next probe's answer replaces them.
+  const [asRoot, setAsRoot] = useState<FirewallData | null>(null);
+  const [rootBusy, setRootBusy] = useState(false);
+  const [rootError, setRootError] = useState<string | null>(null);
+  useEffect(() => { setAsRoot(null); }, [probed]);
+  const fw = asRoot ?? probed;
+  const showAsRoot = async () => {
+    setRootBusy(true);
+    setRootError(null);
+    try {
+      const text = await rootInvoke<string>("ssh_firewall_as_root", { sessionId, engine: probed.engine }, "Read the firewall rules");
+      if (text !== null) setAsRoot(parseFirewall(text));
+    } catch (e: any) {
+      setRootError(e?.message || String(e));
+    } finally {
+      setRootBusy(false);
+    }
+  };
   const [openChains, setOpenChains] = useState<Record<string, boolean>>({});
   const [chainRules, setChainRules] = useState<Record<string, { loading: boolean; error: string | null; text: string | null }>>({});
   const [filter, setFilter] = useState("");
@@ -1323,8 +1395,19 @@ const FirewallCard = ({ sessionId, fw }: FirewallCardProps) => {
         actions={<StatusBadge tone="amber">denied</StatusBadge>}
       >
         <BannerIcon tone="amber" icon={<ShieldAlert size={14} />}>
-          Couldn't read <code className="font-mono px-1">{fw.engine}</code> rules — needs root and passwordless sudo isn't configured. Reconnect as root or grant <code className="font-mono px-1">NOPASSWD</code> sudo for this command.
+          Only root can read the <code className="font-mono px-1">{fw.engine}</code> rules on this server.
         </BannerIcon>
+        <div className="mt-2 flex items-center gap-2 flex-wrap">
+          <button
+            onClick={showAsRoot}
+            disabled={rootBusy}
+            className="h-7 px-2.5 rounded-lg flex items-center gap-1.5 text-[11px] font-semibold bg-amber-500/10 border border-amber-500/30 text-amber-200 hover:bg-amber-500/20 disabled:opacity-50"
+          >
+            {rootBusy ? <Loader2 size={12} className="animate-spin" /> : <ShieldAlert size={12} />}
+            Show as root (sudo / dzdo)
+          </button>
+          {rootError && <span className="text-[10.5px] text-rose-300">{rootError}</span>}
+        </div>
       </InfoCard>
     );
   }
@@ -1343,8 +1426,12 @@ const FirewallCard = ({ sessionId, fw }: FirewallCardProps) => {
     setChainRules(prev => ({ ...prev, [k]: { loading: true, error: null, text: null } }));
     try {
       const text = fw.engine === "iptables"
-        ? await invoke<string>("ssh_iptables_chain", { sessionId, table: c.table, chain: c.name })
-        : await invoke<string>("ssh_nft_chain", { sessionId, family: c.family, table: c.table, chain: c.name });
+        ? await rootInvoke<string>("ssh_iptables_chain", { sessionId, table: c.table, chain: c.name }, "Read the rules")
+        : await rootInvoke<string>("ssh_nft_chain", { sessionId, family: c.family, table: c.table, chain: c.name }, "Read the rules");
+      if (text === null) {
+        setChainRules(prev => { const next = { ...prev }; delete next[k]; return next; });
+        return;
+      }
       setChainRules(prev => ({ ...prev, [k]: { loading: false, error: null, text } }));
     } catch (e: any) {
       const msg = typeof e === "string" ? e : (e?.message || "chain fetch failed");
@@ -1455,6 +1542,7 @@ const PortsTab = ({ data, sessionId, onRefresh }: { data: PortsData; sessionId: 
   const [killing, setKilling] = useState<Record<string, boolean>>({});
   const [killError, setKillError] = useState<string | null>(null);
   const confirm = useConfirm();
+  const rootInvoke = useRootInvoke();
 
   const killProc = async (pid: string, name: string) => {
     const ok = await confirm({
@@ -1467,7 +1555,8 @@ const PortsTab = ({ data, sessionId, onRefresh }: { data: PortsData; sessionId: 
     setKilling(k => ({ ...k, [pid]: true }));
     setKillError(null);
     try {
-      const r = await invoke<SystemctlResult>("ssh_kill_process", { sessionId, pid: parseInt(pid, 10), signal: "TERM" });
+      const r = await rootInvoke<SystemctlResult>("ssh_kill_process", { sessionId, pid: parseInt(pid, 10), signal: "TERM" }, `Kill PID ${pid}`);
+      if (!r) return;
       if (!r.success) setKillError(`PID ${pid}: ${r.stdout || `kill exited ${r.exit_code}`}`);
       else setTimeout(onRefresh, 500);
     } catch (e: any) {
@@ -1619,6 +1708,7 @@ const ProcessesTab = ({ sessionId, disabled, visible = true }: { sessionId: stri
   const [sortKey, setSortKey] = useState<"cpu" | "mem">("cpu");
   const [killing, setKilling] = useState<Record<string, boolean>>({});
   const confirm = useConfirm();
+  const rootInvoke = useRootInvoke();
 
   // Also pause when the OS window is minimized/hidden. `visible` only tracks the
   // in-app Info tool being on screen; it stays true when the whole Submarine
@@ -1671,7 +1761,8 @@ const ProcessesTab = ({ sessionId, disabled, visible = true }: { sessionId: stri
     if (!ok) return;
     setKilling(k => ({ ...k, [row.pid]: true }));
     try {
-      const r = await invoke<SystemctlResult>("ssh_kill_process", { sessionId, pid: parseInt(row.pid, 10), signal: "TERM" });
+      const r = await rootInvoke<SystemctlResult>("ssh_kill_process", { sessionId, pid: parseInt(row.pid, 10), signal: "TERM" }, `Kill PID ${row.pid}`);
+      if (!r) return;
       if (!r.success) setErr(`PID ${row.pid}: ${r.stdout || `kill exited ${r.exit_code}`}`);
       setTimeout(fetchNow, 400);
     } catch (e: any) {
@@ -1791,6 +1882,7 @@ const ServicesTab = ({ sessionId, data, onRefresh }: { sessionId: string; data: 
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [lastResult, setLastResult] = useState<Record<string, { ok: boolean; msg: string; sudo: boolean } | undefined>>({});
   const confirm = useConfirm();
+  const rootInvoke = useRootInvoke();
   // First-arrival latch: once we've seen the first data payload we stop
   // clobbering the user's manual filter selection.
   const didSetInitialRef = useRef(false);
@@ -1858,12 +1950,14 @@ const ServicesTab = ({ sessionId, data, onRefresh }: { sessionId: string; data: 
     setBusy(b => ({ ...b, [unit]: true }));
     setLastResult(r => ({ ...r, [unit]: undefined }));
     try {
-      const r = await invoke<SystemctlResult>("ssh_systemctl_action", { sessionId, unit, action });
+      const verb = action[0].toUpperCase() + action.slice(1);
+      const r = await rootInvoke<SystemctlResult>("ssh_systemctl_action", { sessionId, unit, action }, `${verb} ${unit}`);
+      if (!r) return;
       setLastResult(prev => ({
         ...prev,
         [unit]: {
           ok: r.success,
-          msg: r.success ? `${action} succeeded${r.used_sudo ? " (via sudo)" : ""}` : (r.stdout || `${action} failed (exit ${r.exit_code})`),
+          msg: r.success ? `${action} succeeded${r.used_sudo ? ` (via ${r.root_tool || "sudo"})` : ""}` : (r.stdout || `${action} failed (exit ${r.exit_code})`),
           sudo: r.used_sudo,
         },
       }));

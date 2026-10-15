@@ -143,8 +143,9 @@ export function TerminalColorSettings({ settings, setSettings }: any) {
         <div className="min-w-0">
           <div className="text-sm font-semibold text-zinc-100">Draw with the GPU</div>
           <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
-            Faster scrolling and big outputs. Turn off if text looks wrong on this computer; terminals then draw
-            the way they always did.
+            Faster scrolling and big outputs. On by default on Windows. On macOS and Linux it starts off: there,
+            a terminal you aren't typing in (a split pane, a Wall's tiles) can stop showing new output. Turn it off
+            if text looks wrong.
           </p>
         </div>
         <Switch on={gpu} label="Draw with the GPU" onToggle={() => setSettings((s: any) => ({ ...s, terminalGpu: !gpu }))} />

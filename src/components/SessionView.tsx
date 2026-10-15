@@ -1,4 +1,4 @@
-import { useState, useEffect, useLayoutEffect, useRef, useCallback, memo } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, memo, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -27,6 +27,16 @@ type ShellSyncPushResult = { pushed: number; bytes: number; failed: { remote: st
 // Remembered per device like the panel's size; compact windows ignore it and
 // show the tool full screen.
 type ToolDock = "right" | "left" | "bottom" | "top";
+// A new terminal tab's number: the lowest one no open tab has (its own or,
+// renamed, its original), so closing tab 1 and opening another gives "1"
+// again rather than a second "2".
+const nextTabNumber = (terms: { title: string; baseTitle?: string }[]) => {
+  const used = new Set(terms.map(t => t.baseTitle ?? t.title));
+  let n = 1;
+  while (used.has(String(n))) n++;
+  return String(n);
+};
+
 const TOOL_DOCK_KEY = "submarine-tool-dock";
 const DOCK_OPTIONS: { id: ToolDock; label: string; Icon: typeof PanelRight }[] = [
   { id: "right", label: "Right of the terminal", Icon: PanelRight },
@@ -781,6 +791,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // panes redistributes those two panes' share and leaves the rest
   // alone. Reset (double-click a divider) flattens back to all-equal.
   const [splitRatios, setSplitRatios] = useState<number[]>([]);
+  const paneAreaRef = useRef<HTMLDivElement | null>(null);
   // "+" button's secondary menu — surfaced via right-click / long-press
   // so the primary click stays a fast "new tab" without stealing the
   // advanced flows (split view, compare across servers). Coordinates are
@@ -805,6 +816,66 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // We collapse to a stacked single-pane view: when a tool is open, the
   // tool takes full width and the terminal is hidden behind a back-chip.
   const isCompact = useIsCompact();
+
+  // The split is on screen when it has 2+ panes, there's room, and the tab in
+  // front is one of them. Picking another tab shows that one alone; picking
+  // one of the split's tabs again brings the split back as it was.
+  const splitOn = splitTerminals.length >= 2 && !isCompact && splitTerminals.includes(activeTab);
+  const splitShares = () => {
+    const total = splitRatios.reduce((a, b) => a + (b || 0), 0) || splitTerminals.length;
+    let at = 0;
+    return splitTerminals.map((_, i) => {
+      const size = (splitRatios[i] ?? 1) / total;
+      const share = { start: at, size };
+      at += size;
+      return share;
+    });
+  };
+  const paneRect = (slot: number): CSSProperties => {
+    const { start, size } = splitShares()[slot];
+    return splitOrientation === "h"
+      ? { left: `${start * 100}%`, width: `${size * 100}%`, top: 0, bottom: 0 }
+      : { top: `${start * 100}%`, height: `${size * 100}%`, left: 0, right: 0 };
+  };
+  const dividerPos = (slotIdx: number): CSSProperties => {
+    const { start, size } = splitShares()[slotIdx];
+    const at = `calc(${(start + size) * 100}% - 2px)`;
+    return splitOrientation === "h" ? { left: at } : { top: at };
+  };
+  // Show `id` beside what's on screen: added to the split in front, or a new
+  // split of the tab in front and `id`.
+  const splitWith = (id: string) => {
+    if (splitOn) {
+      if (splitTerminals.includes(id)) return;
+      setSplitTerminals(prev => [...prev, id]);
+      setSplitRatios(prev => [...prev, 1]);
+    } else if (id !== activeTab) {
+      setSplitTerminals([activeTab, id]);
+      setSplitRatios([1, 1]);
+    }
+  };
+  // Another shell on this server, beside the one(s) on screen.
+  const splitWithNew = () => {
+    const newId = `${session.id}-term-${Date.now()}`;
+    setTerminals(prev => [...prev, { id: newId, title: nextTabNumber(prev) }]);
+    splitWith(newId);
+    setActiveTab(newId);
+  };
+  // A pane leaves the split and stays open as a tab; with one pane left the
+  // split ends.
+  const removeFromSplit = (id: string) => {
+    const idx = splitTerminals.indexOf(id);
+    if (idx < 0) return;
+    const nextTerms = splitTerminals.filter(x => x !== id);
+    if (nextTerms.length < 2) {
+      setSplitTerminals([]);
+      setSplitRatios([]);
+    } else {
+      setSplitTerminals(nextTerms);
+      setSplitRatios(prev => prev.filter((_, i) => i !== idx));
+    }
+    if (activeTab === id) setActiveTab(nextTerms[0] ?? id);
+  };
   // Width of the right-side tool pane in pixels. The divider drag updates this
   // and we sync it to localStorage so subsequent sessions remember the split.
   // First-time default is a quarter of the current window width — looks right
@@ -1601,14 +1672,8 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           >
             <button
               onClick={() => {
-                // Clicking a tab NOT participating in the current split
-                // exits split mode entirely — split is scoped to the
-                // panes it was built with; jumping elsewhere means the
-                // user wants a plain full-pane view.
-                if (splitTerminals.length >= 2 && !splitTerminals.includes(t.id)) {
-                  setSplitTerminals([]);
-                  setSplitRatios([]);
-                }
+                // A tab outside the split shows alone; the split stays as it
+                // was for when one of its tabs is picked again (splitOn).
                 setActiveTab(t.id);
                 // Land the caret in the terminal even when the active one
                 // didn't change (re-clicking the current tab, or focus was in
@@ -1636,24 +1701,16 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               <button
                 onClick={(e) => {
                   e.stopPropagation();
-                  setTerminals(prev => prev.filter(x => x.id !== t.id));
-                  if (activeTab === t.id) setActiveTab(terminals[0].id);
-                  // Closing a terminal that's participating in the split
-                  // has to drop it from splitTerminals AND splitRatios or
-                  // the flex layout renders a torn-down partner.
-                  if (splitTerminals.includes(t.id)) {
-                    const idx = splitTerminals.indexOf(t.id);
-                    const nextTerms = splitTerminals.filter(id => id !== t.id);
-                    const nextRatios = splitRatios.filter((_, i) => i !== idx);
-                    // Falling below 2 members collapses back to the plain
-                    // absolute-overlap layout.
-                    if (nextTerms.length < 2) {
-                      setSplitTerminals([]);
-                      setSplitRatios([]);
-                    } else {
-                      setSplitTerminals(nextTerms);
-                      setSplitRatios(nextRatios);
-                    }
+                  const rest = terminals.filter(x => x.id !== t.id);
+                  setTerminals(rest);
+                  // A closed terminal leaves the split too, or the layout
+                  // would keep a slot for it.
+                  removeFromSplit(t.id);
+                  // The one in front closed: the split's next pane, else the
+                  // first tab left (not the closed one, when it was first).
+                  if (activeTab === t.id) {
+                    const nextInSplit = splitTerminals.find(id => id !== t.id && rest.some(x => x.id === id));
+                    setActiveTab(nextInSplit ?? rest[0].id);
                   }
                 }}
                 aria-label="Close terminal"
@@ -1677,7 +1734,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           <button
             onClick={() => {
               const newId = `${session.id}-term-${Date.now()}`;
-              setTerminals(prev => [...prev, { id: newId, title: `${prev.length + 1}` }]);
+              setTerminals(prev => [...prev, { id: newId, title: nextTabNumber(prev) }]);
               setActiveTab(newId);
             }}
             onContextMenu={(e) => {
@@ -1686,7 +1743,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               setPlusMenu({ x: rect.left, y: rect.bottom + 4 });
             }}
             className="h-10 w-10 sm:h-8 sm:w-8 ml-1 shrink-0 rounded-lg flex items-center justify-center text-zinc-500 hover:bg-white/10 hover:text-white transition-all border border-dashed border-white/10 relative"
-            title="New terminal · right-click for split view"
+            title="New terminal tab · right-click for more"
           >
             <Plus size={14} />
             {splitTerminals.length >= 2 && (
@@ -1699,6 +1756,30 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               </span>
             )}
           </button>
+          {/* Split: another shell on this server beside the one on screen
+              (watch a log in one, work in the other). The menu has the rest:
+              an open tab beside this one, flip, end the split. */}
+          {!isCompact && (
+            <button
+              onClick={splitWithNew}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                const rect = e.currentTarget.getBoundingClientRect();
+                setPlusMenu({ x: rect.left, y: rect.bottom + 4 });
+              }}
+              className={`h-10 w-10 sm:h-8 sm:w-8 shrink-0 rounded-lg flex items-center justify-center transition-all border ${
+                splitOn
+                  ? 'text-primary border-primary/30 bg-primary/10 hover:bg-primary/20'
+                  : 'text-zinc-500 border-dashed border-white/10 hover:bg-white/10 hover:text-white'
+              }`}
+              title={splitOn
+                ? "Add another pane: one more shell on this server · right-click for more"
+                : "Split: another shell on this server, side by side · right-click for more"}
+              aria-label="Split"
+            >
+              {splitOrientation === "h" ? <Columns size={14} /> : <Rows size={14} />}
+            </button>
+          )}
         </div>
 
         {/* Tool rail: icon + text label. The label collapses to icon-only on
@@ -1789,22 +1870,29 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                 <button
                   onClick={() => {
                     setPlusMenu(null);
-                    const newId = `${session.id}-term-${Date.now()}`;
-                    setTerminals(prev => [...prev, { id: newId, title: `${prev.length + 1}` }]);
-                    if (splitTerminals.length >= 2) {
-                      setSplitTerminals(prev => [...prev, newId]);
-                      setSplitRatios(prev => [...prev, 1]);
-                    } else {
-                      setSplitTerminals([activeTab, newId]);
-                      setSplitRatios([1, 1]);
-                    }
-                    setActiveTab(newId);
+                    splitWithNew();
                   }}
                   className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left"
                 >
                   {splitOrientation === "h" ? <Columns size={13} className="text-primary/70" /> : <Rows size={13} className="text-primary/70" />}
-                  <span className="flex-1">{splitTerminals.length >= 2 ? `Add pane (${splitTerminals.length + 1}-way split)` : "Split with new pane"}</span>
+                  <span className="flex-1">{splitOn ? `Add pane (${splitTerminals.length + 1}-way split)` : "Split with new pane"}</span>
                 </button>
+                {/* An open tab beside the one(s) on screen. */}
+                {terminals
+                  .filter(t => t.id !== activeTab && !(splitOn && splitTerminals.includes(t.id)))
+                  .map(t => (
+                    <button
+                      key={t.id}
+                      onClick={() => {
+                        setPlusMenu(null);
+                        splitWith(t.id);
+                      }}
+                      className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-300 hover:text-white text-left"
+                    >
+                      <SplitSquareHorizontal size={13} className="text-zinc-500" />
+                      <span className="flex-1 truncate">Show tab {t.title} beside this one</span>
+                    </button>
+                  ))}
                 <button
                   onClick={() => {
                     setSplitOrientation(o => o === "h" ? "v" : "h");
@@ -1815,7 +1903,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                   {splitOrientation === "h" ? <Rows size={13} className="text-zinc-500" /> : <Columns size={13} className="text-zinc-500" />}
                   <span className="flex-1">Flip orientation ({splitOrientation === "h" ? "→ vertical" : "→ horizontal"})</span>
                 </button>
-                {splitTerminals.length >= 2 && (
+                {splitOn && (
                   <button
                     onClick={() => {
                       setSplitTerminals([]);
@@ -1979,163 +2067,44 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
             hidden — so switching a tab that isn't in the split preserves
             its scrollback. The tiles fill the whole left panel; the tool
             side panel continues to work exactly as before. */}
-        <div className={`relative ${
+        <div ref={paneAreaRef} className={`relative ${
           activeTool && toolAlone ? 'hidden'
             : dockTopBottom && !toolAlone ? 'w-full flex-1 min-h-0'
             : 'h-full flex-1 min-w-0'
         }`}>
-          {splitTerminals.length >= 2 && !isCompact ? (
-            <div className={`absolute inset-0 flex ${splitOrientation === "h" ? "flex-row" : "flex-col"}`}>
-              {splitTerminals.map((termId, slotIdx) => {
-                const t = terminals.find(x => x.id === termId);
-                if (!t) return null;
-                const isFocused = activeTab === t.id;
-                const grow = splitRatios[slotIdx] ?? 1;
-                const notLast = slotIdx < splitTerminals.length - 1;
-                return (
-                  <div
-                    key={t.id}
-                    style={{ flexGrow: grow, flexBasis: 0 }}
-                    onMouseDown={() => setActiveTab(t.id)}
-                    onTouchStart={() => setActiveTab(t.id)}
-                    className={`relative min-w-0 min-h-0 border ${
-                      isFocused
-                        ? "border-primary/40 shadow-[inset_0_0_0_1px_rgba(var(--primary),0.15)]"
-                        : "border-white/[0.03]"
-                    }`}
-                  >
-                    <TerminalView
-                      sessionId={session.id}
-                      terminalId={t.id}
-                      disabled={status !== 'connected'}
-                      isActive={isFocused && !(activeTool && toolAlone)}
-                      isActiveView={isActiveView}
-                      focusSignal={focusTick}
-                      containerExec={t.container ? { container: t.container.name, useSudo: t.container.useSudo } : undefined}
-                      connectionEpoch={connectionEpoch}
-                      onShellReady={onShellReadyFor(t.id)}
-                      serverId={session.serverId}
-                      serverName={session.serverName}
-                    />
-                    {/* Per-pane detach affordance — pulls the pane out of
-                        the split without killing the underlying terminal.
-                        Positioned top-right so it doesn't fight the
-                        divider (which lives on the pane's right/bottom
-                        edge). Hidden until pane hover, tiny hit area. */}
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setSplitTerminals(prev => prev.filter(id => id !== t.id));
-                        setSplitRatios(prev => prev.filter((_, i) => i !== slotIdx));
-                        // If the focused pane left the split, hand focus
-                        // to whichever pane is left (or fall back to the
-                        // orphan terminal itself).
-                        if (isFocused) {
-                          const remaining = splitTerminals.filter(id => id !== t.id);
-                          setActiveTab(remaining[0] ?? t.id);
-                        }
-                      }}
-                      title="Remove this pane from the split (keeps the terminal)"
-                      className="absolute top-1 right-1 z-30 h-5 w-5 rounded flex items-center justify-center bg-black/40 border border-white/10 text-zinc-400 hover:text-white hover:bg-black/60 opacity-0 hover:opacity-100 group-hover/pane:opacity-100 focus-visible:opacity-100 transition-opacity"
-                    >
-                      <X size={11} />
-                    </button>
-                    {/* Divider between this pane and the next. Rendered
-                        only when there IS a next pane — otherwise a
-                        trailing divider would float in dead space. */}
-                    {notLast && (
-                      <div
-                        onMouseDown={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          const container = e.currentTarget.parentElement?.parentElement;
-                          if (!container) return;
-                          const rect = container.getBoundingClientRect();
-                          const total = splitOrientation === "h" ? rect.width : rect.height;
-                          const startClient = splitOrientation === "h" ? e.clientX : e.clientY;
-                          const sumGrow = splitRatios.reduce((a, b) => a + (b || 0), 0) || splitTerminals.length;
-                          const pxPerUnit = total / sumGrow;
-                          const startA = splitRatios[slotIdx] ?? 1;
-                          const startB = splitRatios[slotIdx + 1] ?? 1;
-                          const move = (ev: MouseEvent) => {
-                            const client = splitOrientation === "h" ? ev.clientX : ev.clientY;
-                            const deltaUnits = (client - startClient) / pxPerUnit;
-                            // Redistribute between the two adjacent panes
-                            // only — the rest of the row stays untouched.
-                            // Clamp each so neither collapses below 0.3
-                            // units (≈15% of the pair's original span).
-                            const minPair = 0.3;
-                            const combined = startA + startB;
-                            const nextA = Math.max(minPair, Math.min(combined - minPair, startA + deltaUnits));
-                            const nextB = combined - nextA;
-                            setSplitRatios(prev => {
-                              const copy = prev.slice();
-                              copy[slotIdx] = nextA;
-                              copy[slotIdx + 1] = nextB;
-                              return copy;
-                            });
-                          };
-                          const up = () => {
-                            window.removeEventListener("mousemove", move);
-                            window.removeEventListener("mouseup", up);
-                          };
-                          window.addEventListener("mousemove", move);
-                          window.addEventListener("mouseup", up);
-                        }}
-                        onDoubleClick={(e) => {
-                          e.stopPropagation();
-                          // Reset all panes to equal share, not just this
-                          // divider's pair — matches the "reset layout"
-                          // idiom users expect from tmux/tiling WMs.
-                          setSplitRatios(splitTerminals.map(() => 1));
-                        }}
-                        onContextMenu={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          setSplitOrientation(o => o === "h" ? "v" : "h");
-                        }}
-                        title="Drag to resize · double-click resets · right-click flips orientation"
-                        className={`absolute z-20 bg-white/5 hover:bg-primary/40 transition-colors ${
-                          splitOrientation === "h"
-                            ? "top-0 bottom-0 right-0 w-1 cursor-col-resize"
-                            : "left-0 right-0 bottom-0 h-1 cursor-row-resize"
-                        }`}
-                      />
-                    )}
-                  </div>
-                );
-              })}
-              {/* Off-screen host for terminals that are NOT in the split.
-                  Keeps them mounted so their PTY buffer / scrollback
-                  survives — critical for the "compare" workflow where the
-                  user swaps a partner in and out of the tile. */}
-              <div className="hidden">
-                {terminals.filter(t => !splitTerminals.includes(t.id)).map(t => (
-                  <TerminalView
-                    key={t.id}
-                    sessionId={session.id}
-                    terminalId={t.id}
-                    disabled={status !== 'connected'}
-                    isActive={false}
-                    containerExec={t.container ? { container: t.container.name, useSudo: t.container.useSudo } : undefined}
-                    connectionEpoch={connectionEpoch}
-                    onShellReady={onShellReadyFor(t.id)}
-                    serverId={session.serverId}
-                    serverName={session.serverName}
-                  />
-                ))}
-              </div>
-            </div>
-          ) : (
-            terminals.map(t => (
-              // A background tab stays mounted (its shell keeps running) but
-              // inert, so Tab can't land in a terminal that isn't shown.
-              <div key={t.id} inert={activeTab === t.id ? undefined : ""} className={`absolute inset-0 ${activeTab === t.id ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'}`}>
+          {/* One flat list, whatever the layout: each terminal keeps the same
+              place in the tree whether it's a pane of the split, the tab on
+              screen or hidden, so splitting, un-splitting or switching never
+              remounts a terminal (which would close its shell and open a
+              fresh one — a `tail -f` you were watching would be gone). The
+              split only changes where each one is drawn. A terminal not on
+              screen stays mounted (its shell keeps running) but inert, so
+              Tab can't land in it. */}
+          {terminals.map(t => {
+            const slot = splitOn ? splitTerminals.indexOf(t.id) : -1;
+            const inSplit = slot >= 0;
+            const shown = inSplit || (!splitOn && activeTab === t.id);
+            const isFocused = activeTab === t.id;
+            const onScreen = shown && !(activeTool && toolAlone);
+            return (
+              <div
+                key={t.id}
+                inert={shown ? undefined : ""}
+                style={inSplit ? paneRect(slot) : undefined}
+                onMouseDown={inSplit ? () => setActiveTab(t.id) : undefined}
+                onTouchStart={inSplit ? () => setActiveTab(t.id) : undefined}
+                className={`group/pane absolute ${inSplit ? 'min-w-0 min-h-0 border' : 'inset-0'} ${
+                  shown ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'
+                } ${inSplit ? (isFocused
+                  ? 'border-primary/40 shadow-[inset_0_0_0_1px_rgba(var(--primary),0.15)]'
+                  : 'border-white/[0.03]') : ''}`}
+              >
                 <TerminalView
                   sessionId={session.id}
                   terminalId={t.id}
                   disabled={status !== 'connected'}
-                  isActive={activeTab === t.id && !(activeTool && toolAlone)}
+                  isActive={isFocused && onScreen}
+                  visible={onScreen}
                   isActiveView={isActiveView}
                   focusSignal={focusTick}
                   containerExec={t.container ? { container: t.container.name, useSudo: t.container.useSudo } : undefined}
@@ -2144,9 +2113,79 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                   serverId={session.serverId}
                   serverName={session.serverName}
                 />
+                {/* Takes this pane out of the split; its terminal stays as
+                    a tab. Top-right, clear of the divider, shown on hover. */}
+                {inSplit && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      removeFromSplit(t.id);
+                    }}
+                    title="Take this pane out of the split (it stays open as a tab)"
+                    className="absolute top-1 right-1 z-30 h-5 w-5 rounded flex items-center justify-center bg-black/40 border border-white/10 text-zinc-400 hover:text-white hover:bg-black/60 opacity-0 hover:opacity-100 group-hover/pane:opacity-100 focus-visible:opacity-100 transition-opacity"
+                  >
+                    <X size={11} />
+                  </button>
+                )}
               </div>
-            ))
-          )}
+            );
+          })}
+          {/* Dividers between neighbouring panes: drag resizes those two,
+              double-click makes them all equal, right-click flips the
+              orientation. */}
+          {splitOn && splitTerminals.slice(0, -1).map((id, slotIdx) => (
+            <div
+              key={`divider-${id}`}
+              style={dividerPos(slotIdx)}
+              onMouseDown={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const area = paneAreaRef.current;
+                if (!area) return;
+                const rect = area.getBoundingClientRect();
+                const total = splitOrientation === "h" ? rect.width : rect.height;
+                const startClient = splitOrientation === "h" ? e.clientX : e.clientY;
+                const sumGrow = splitRatios.reduce((a, b) => a + (b || 0), 0) || splitTerminals.length;
+                const pxPerUnit = total / sumGrow;
+                const startA = splitRatios[slotIdx] ?? 1;
+                const startB = splitRatios[slotIdx + 1] ?? 1;
+                const move = (ev: MouseEvent) => {
+                  const client = splitOrientation === "h" ? ev.clientX : ev.clientY;
+                  const deltaUnits = (client - startClient) / pxPerUnit;
+                  // Only the two panes either side change; neither goes
+                  // below 0.3 units (about 15% of their combined span).
+                  const minPair = 0.3;
+                  const combined = startA + startB;
+                  const nextA = Math.max(minPair, Math.min(combined - minPair, startA + deltaUnits));
+                  setSplitRatios(prev => {
+                    const copy = prev.slice();
+                    copy[slotIdx] = nextA;
+                    copy[slotIdx + 1] = combined - nextA;
+                    return copy;
+                  });
+                };
+                const up = () => {
+                  window.removeEventListener("mousemove", move);
+                  window.removeEventListener("mouseup", up);
+                };
+                window.addEventListener("mousemove", move);
+                window.addEventListener("mouseup", up);
+              }}
+              onDoubleClick={(e) => {
+                e.stopPropagation();
+                setSplitRatios(splitTerminals.map(() => 1));
+              }}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setSplitOrientation(o => o === "h" ? "v" : "h");
+              }}
+              title="Drag to resize · double-click resets · right-click flips orientation"
+              className={`absolute z-20 bg-white/5 hover:bg-primary/40 transition-colors ${
+                splitOrientation === "h" ? "top-0 bottom-0 w-1 cursor-col-resize" : "left-0 right-0 h-1 cursor-row-resize"
+              }`}
+            />
+          ))}
         </div>
 
         {/* Resizable divider — only useful when both panes are visible. */}

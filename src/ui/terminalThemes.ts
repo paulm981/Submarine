@@ -1,4 +1,5 @@
 import type { ITheme } from "@xterm/xterm";
+import { IS_WINDOWS } from "../util/platform";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Terminal color schemes.
@@ -135,7 +136,9 @@ export function schemeForServer(serverId: number | undefined): TerminalScheme {
 
 // ── Other terminal preferences (per device) ─────────────────────────────────
 
-export const GPU_KEY = "submarine-terminal-gpu";
+// A new key: build 228 stored "on" for everyone under the old one, before
+// the default became per-platform (readGpu).
+export const GPU_KEY = "submarine-terminal-gpu-v2";
 export const MIN_CONTRAST_KEY = "submarine-terminal-min-contrast";
 
 /** WCAG AA's ratio for body text, the one VS Code's terminal defaults to. */
@@ -150,8 +153,12 @@ const readFlag = (key: string, fallback: boolean): boolean => {
   }
 };
 
-/** Draw with the GPU (xterm's WebGL renderer). Defaults on. */
-export const readGpu = (): boolean => readFlag(GPU_KEY, true);
+/** Draw with the GPU (xterm's WebGL renderer). On by default on Windows
+ *  only: in WebKit's web views (WebKitGTK on Linux, and macOS's) a WebGL
+ *  terminal that isn't the one being typed in stops showing new output —
+ *  a split pane's `tail -f`, a Wall's tiles — until something else redraws
+ *  it. Chromium's (WebView2 on Windows) draws them fine. */
+export const readGpu = (): boolean => readFlag(GPU_KEY, IS_WINDOWS);
 /** Lift text a program colored too close to the background. Defaults on. */
 export const readMinContrast = (): boolean => readFlag(MIN_CONTRAST_KEY, true);
 

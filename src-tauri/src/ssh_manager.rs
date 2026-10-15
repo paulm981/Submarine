@@ -414,11 +414,26 @@ pub struct SshState {
     /// of the same tab (the next SFTP op re-elevates) and is dropped when the
     /// tab closes.
     pub sftp_elevation: Arc<Mutex<HashMap<String, SftpElevation>>>,
+    /// Per-tab root access for the Info panel's actions (services, kill,
+    /// firewall rules): what worked last time, so it isn't probed or asked
+    /// for again. Dropped when the tab closes, like `sftp_elevation`.
+    pub root_access: Arc<Mutex<HashMap<String, RootAccess>>>,
     /// Secrets the user typed at connect time when the saved node / login / key
     /// had none (issue #30), keyed by the BASE session id (the tab). A reconnect
     /// or a dedicated `::sftp` / `::fwd` secondary reuses what the user already
     /// supplied instead of prompting again. See `PromptedSecrets`.
     pub prompted_secrets: Arc<Mutex<HashMap<String, PromptedSecrets>>>,
+}
+
+/// How an Info panel action gets root on a tab's server: the tool that let
+/// the user in (`sudo` or `dzdo`) and, when it asked for one, the password —
+/// in memory only, zeroised on drop, written to the tool's stdin, never on a
+/// command line (as for SftpElevation).
+#[derive(Clone)]
+pub struct RootAccess {
+    pub tool: &'static str,
+    /// `None` = passwordless (`-n`).
+    pub password: Option<zeroize::Zeroizing<String>>,
 }
 
 /// How an elevated SFTP channel is started. The sudo password (if any) lives
@@ -476,6 +491,7 @@ impl SshState {
             session_tunnel_specs: Arc::new(Mutex::new(HashMap::new())),
             session_generation: Arc::new(Mutex::new(HashMap::new())),
             sftp_elevation: Arc::new(Mutex::new(HashMap::new())),
+            root_access: Arc::new(Mutex::new(HashMap::new())),
             prompted_secrets: Arc::new(Mutex::new(HashMap::new())),
         }
     }
