@@ -21,6 +21,7 @@ import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./
 import { GPU_KEY, MIN_CONTRAST_KEY, SCHEME_KEY, readGpu, readMinContrast, readSchemeId, setServerSchemes } from "./ui/terminalThemes";
 import { HIGHLIGHT_KEY, normalizeRules, onSlowRule, readHighlightId, setCustomRules, setServerHighlights } from "./ui/highlight";
 import { logLine } from "./util/diagnostics";
+import { SCROLLBACK_KEY, readScrollback } from "./util/terminalScrollback";
 import { USE_LOCAL_SHELL_KEY, readUseLocalShell } from "./util/terminalShell";
 import { USE_SSH_AGENT_KEY, readUseSshAgent } from "./util/sshAgent";
 import { USE_SSH_CONFIG_KEY, readUseSshConfig } from "./util/sshConfig";
@@ -373,6 +374,8 @@ function DesktopApp() {
     // Which highlight set terminals use (src/ui/highlight.ts), unless their
     // server has its own.
     terminalHighlight: readHighlightId(),
+    // Lines each terminal keeps above the screen. See util/terminalScrollback.
+    terminalScrollback: readScrollback(),
     // Off by default: terminals start the remote account's own shell, same
     // as before this setting existed. See util/terminalShell.
     useLocalShell: readUseLocalShell(),
@@ -411,6 +414,7 @@ function DesktopApp() {
     localStorage.setItem(GPU_KEY, appSettings.terminalGpu ? 'on' : 'off');
     localStorage.setItem(MIN_CONTRAST_KEY, appSettings.terminalMinContrast ? 'on' : 'off');
     localStorage.setItem(HIGHLIGHT_KEY, appSettings.terminalHighlight);
+    localStorage.setItem(SCROLLBACK_KEY, String(appSettings.terminalScrollback));
     localStorage.setItem(USE_LOCAL_SHELL_KEY, appSettings.useLocalShell ? 'on' : 'off');
     localStorage.setItem(USE_SSH_AGENT_KEY, appSettings.useSshAgent ? 'on' : 'off');
     localStorage.setItem(USE_SSH_CONFIG_KEY, appSettings.useSshConfig ? 'on' : 'off');
