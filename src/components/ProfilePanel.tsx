@@ -2,11 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Cloud, CloudOff, RefreshCw, Share2, UserPlus, X, Loader2, Users,
-  AlertTriangle, CheckCircle2, ShieldOff, Pencil, Eye, History, HardDrive, FolderSync, GitBranch,
+  AlertTriangle, CheckCircle2, ShieldOff, Pencil, Eye, History, HardDrive, FolderSync, GitBranch, KeyRound,
 } from "lucide-react";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
 import { RoleBadge, roleBlurb } from "./shareRoles";
 import { StoreDevices, StoreSetup, storeLabel, type StoreDevice, type StoreInfo } from "./StoreSync";
+import { hostOf } from "./SyncServerSetting";
 
 interface RecentEdit { name: string; edited_by: string; updated_at: string; }
 interface SyncDiff { in_sync: number; needs_push: number; needs_pull: number; out_of_sync_nodes: string[]; }
@@ -56,9 +57,27 @@ interface ShareStatus {
   identity_unlocked: boolean;
   signed_in: boolean;
   email: string | null;
+  /** The server this profile syncs with; null until its first sync. */
+  cloud_server: string | null;
+  /** The sync server in use. */
+  current_server: string;
+  /** Whether that is a self-hosted one, not the default. */
+  custom_server: boolean;
 }
 
 interface MemberInfo { user_id: number; email: string; role: string; status: string; }
+// A member who wasn't given a share's new key after a removal, and why.
+interface LeftOut { email: string; reason: string; }
+const LEFT_OUT_WHY: Record<string, string> = {
+  key_changed: "their sharing key changed since you invited them",
+  other_account: "the server answered for another account",
+  no_key: "they have no sharing key on the server",
+  weak_key: "their sharing key can't be used",
+  upload_failed: "the upload failed",
+};
+const leftOutText = (l: LeftOut[]) =>
+  "These people didn't get the new key, so they can't see changes from now on until you invite them again: " +
+  l.map((x) => `${x.email} (${LEFT_OUT_WHY[x.reason] ?? x.reason})`).join(", ") + ".";
 
 type Props = {
   onSync: () => Promise<void> | void;
@@ -76,6 +95,10 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
 
   const [st, setSt] = useState<ShareStatus | null>(null);
   const [members, setMembers] = useState<MemberInfo[] | null>(null);
+  // The share key's fingerprint, and a new key's while it waits for an OK.
+  const [keys, setKeys] = useState<{ current: string | null; pending: string | null } | null>(null);
+  // A removal went through but replacing the key didn't: Replace the key shows.
+  const [keyRetry, setKeyRetry] = useState(false);
   const [stats, setStats] = useState<SyncStats | null>(null);
   // Where it syncs through the user's own storage: undefined until known.
   const [store, setStore] = useState<StoreInfo | null | undefined>(undefined);
@@ -109,6 +132,8 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
       } else {
         setMembers(null);
       }
+      try { setKeys(await invoke("share_key_state")); }
+      catch { setKeys(null); }
     } catch (e) { fail(e); }
   }, []);
 
@@ -220,9 +245,33 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
     }))) return;
     setBusy(true);
     try {
-      await invoke("share_revoke", { shareId: st!.share_id, memberUserId: m.user_id });
+      // Removing someone replaces the key, which needs the sharing identity.
+      if (!(await ensureIdentity())) return;
+      const r = await invoke<{ left_out: LeftOut[] }>("share_revoke", { shareId: st!.share_id, memberUserId: m.user_id });
+      setKeyRetry(false);
       await refresh();
-      flash(`${m.email} removed.`);
+      loadStats(); // the removal synced
+      if (r.left_out.length) fail(`${m.email} removed. ${leftOutText(r.left_out)}`);
+      else flash(`${m.email} removed.`);
+    } catch (e) {
+      // Out of the share, but the key wasn't replaced: offer to finish it.
+      if (String(e).includes("REVOKED_BUT_KEY_NOT_ROTATED")) setKeyRetry(true);
+      await refresh();
+      loadStats();
+      fail(e);
+    } finally { setBusy(false); }
+  };
+
+  const replaceKey = async () => {
+    setBusy(true); setErr(null);
+    try {
+      if (!(await ensureIdentity())) return;
+      const r = await invoke<{ left_out: LeftOut[] }>("share_replace_key");
+      setKeyRetry(false);
+      await refresh();
+      loadStats();
+      if (r.left_out.length) fail(`Key replaced. ${leftOutText(r.left_out)}`);
+      else flash("Key replaced.");
     } catch (e) { fail(e); } finally { setBusy(false); }
   };
 
@@ -377,6 +426,28 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
   const shared = !!st?.share_id;
   const isOwner = st?.role === "owner";
   const signedIn = st?.signed_in === true;
+  // A profile linked to another server than the one in use doesn't sync: its
+  // data and keys only ever go to the server it syncs with.
+  const otherServer = st?.cloud_server && st.cloud_server !== st.current_server ? st.cloud_server : null;
+
+  const moveHere = async () => {
+    if (!st || !otherServer) return;
+    const from = hostOf(otherServer), to = hostOf(st.current_server);
+    if (!(await confirm({
+      title: `Sync this profile with ${to}?`,
+      message:
+        `It syncs with ${from} now. From now on it syncs with ${to} instead, and the next sync uploads it there in full.\n\n` +
+        `Its copy on ${from} isn't changed or deleted.`,
+      okLabel: `Sync with ${to}`,
+    }))) return;
+    setBusy(true); setErr(null);
+    try {
+      await invoke("move_profile_to_current_server");
+      await refresh();
+      flash(`This profile now syncs with ${to}.`);
+      if (signedIn) await doSync();
+    } catch (e) { fail(e); } finally { setBusy(false); }
+  };
 
   const card = "bg-zinc-900/40 border border-white/5 rounded-xl p-4 space-y-3";
   const label = "text-[11px] font-bold uppercase tracking-wider text-zinc-500";
@@ -403,7 +474,7 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
         <div className="px-3 py-2 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-200 text-[12px] flex items-start gap-2">
           <AlertTriangle size={13} className="mt-0.5 shrink-0" />
           <span className="flex-1 break-words">{err}</span>
-          <button onClick={() => setErr(null)} className="text-rose-300/70 hover:text-white"><X size={12} /></button>
+          <button aria-label="Dismiss" onClick={() => setErr(null)} className="text-rose-300/70 hover:text-white"><X size={12} /></button>
         </div>
       )}
       {ok && !err && (
@@ -483,6 +554,34 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
             </>
           )}
         </div>
+        {st?.custom_server && !otherServer && (
+          <div className="text-[11px] text-zinc-500">
+            Sync server: <span className="font-mono text-zinc-400">{hostOf(st.current_server)}</span>
+          </div>
+        )}
+        {otherServer && st && (
+          <div className="px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/25 text-amber-100 text-[12px] space-y-2">
+            <div className="flex items-start gap-2">
+              <AlertTriangle size={13} className="mt-0.5 shrink-0 text-amber-300" />
+              <span className="flex-1 break-words">
+                This profile syncs with <span className="font-mono">{hostOf(otherServer)}</span>, not with{" "}
+                <span className="font-mono">{hostOf(st.current_server)}</span>, so it doesn't sync now.{" "}
+                {shared
+                  ? "A shared profile stays on the server it was shared on: switch the sync server back to sync it."
+                  : "Switch the sync server back, or move this profile to the server in use."}
+              </span>
+            </div>
+            {!shared && (
+              <button
+                onClick={moveHere}
+                disabled={busy}
+                className="h-8 px-3 rounded-lg bg-amber-500/20 border border-amber-400/30 text-amber-100 text-[12px] font-bold hover:bg-amber-500/30 disabled:opacity-40"
+              >
+                Sync with {hostOf(st.current_server)}
+              </button>
+            )}
+          </div>
+        )}
         {signedIn && syncControls("the cloud", true)}
       </section>
       )}
@@ -635,6 +734,33 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
                 ))
               )}
             </div>
+
+            {keys?.current && (
+              <p className="text-[10.5px] text-zinc-500 leading-relaxed">
+                Key fingerprint <span className="font-mono text-zinc-300">{keys.current}</span>.{" "}
+                {isOwner
+                  ? "When you remove someone, the key is replaced, and members compare the new one with this."
+                  : "If the key changes, compare the new one with the owner's."}
+              </p>
+            )}
+            {keys?.pending && (
+              <p className="text-[11px] text-amber-200/90 leading-relaxed">
+                A new key (<span className="font-mono">{keys.pending}</span>) is waiting for your OK in Servers. Until
+                you accept it, your changes aren't uploaded.
+              </p>
+            )}
+            {isOwner && keyRetry && (
+              <div className="flex items-center gap-2 text-[11px] text-amber-200/90">
+                <span className="flex-1">The key wasn't replaced, so whoever you removed still holds it.</span>
+                <button
+                  onClick={replaceKey}
+                  disabled={busy}
+                  className="h-7 px-2.5 rounded bg-amber-400/10 border border-amber-400/30 text-amber-200 hover:bg-amber-400/20 text-[11px] font-bold disabled:opacity-40 flex items-center gap-1.5"
+                >
+                  {busy ? <Loader2 size={11} className="animate-spin" /> : <KeyRound size={11} />} Replace the key
+                </button>
+              </div>
+            )}
 
             <div className="pt-2 border-t border-white/5">
               <button

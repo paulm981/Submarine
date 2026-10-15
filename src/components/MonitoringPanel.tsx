@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   Activity, Pause, Play, Trash2, Plus, X, Wifi, WifiOff, AlertTriangle,
-  RefreshCw, Settings2, FileCode2, Settings as SettingsIcon, Bell, BellOff, Volume2, Search,
+  RefreshCw, Settings2, FileCode2, Settings as SettingsIcon, Bell, BellOff, Volume2, Search, ShieldAlert,
 } from "lucide-react";
 import Sparkline from "./Sparkline";
 import { useConfirm } from "../ui/confirm";
@@ -27,6 +27,9 @@ interface MonitorRow {
   port: number;
   enabled_metrics: string[];
   custom_metrics: CustomMetric[];
+  /** Custom metrics someone else added in a shared profile, not allowed on
+   *  this device yet: listed but not run. */
+  held_metric_ids?: string[];
   paused: boolean;
   connected: boolean;
   last_error?: string | null;
@@ -524,7 +527,7 @@ const MonitoringPanel = ({ servers, addLog }: Props) => {
           <div className="w-full max-w-md max-h-[90vh] flex flex-col bg-[#121214] border border-white/10 rounded-xl shadow-2xl" onClick={(e) => e.stopPropagation()}>
             <div className="px-4 py-3 border-b border-white/5 flex items-center justify-between">
               <span className="text-[12px] font-bold uppercase tracking-widest text-white">Add Node to Monitor</span>
-              <button onClick={() => setAddOpen(false)} className="text-zinc-400 hover:text-white"><X size={16} /></button>
+              <button aria-label="Close" onClick={() => setAddOpen(false)} className="text-zinc-400 hover:text-white"><X size={16} /></button>
             </div>
             {availableToAdd.length > 0 && (
               <div className="px-3 pt-3">
@@ -664,6 +667,16 @@ const ServerCard = ({ row, sample, history, busy, onPause, onResume, onConfig, o
         </div>
       </div>
 
+      {/* Custom commands held for this device's OK (allowed from the server list) */}
+      {(row.held_metric_ids?.length ?? 0) > 0 && (
+        <div className="px-2 py-1 bg-amber-400/[0.06] border border-amber-400/25 rounded text-[10.5px] text-amber-100/90 font-mono flex items-center gap-1.5">
+          <ShieldAlert size={11} className="shrink-0 text-amber-400" />
+          <span className="truncate">
+            {row.held_metric_ids!.length === 1 ? "A custom command is" : `${row.held_metric_ids!.length} custom commands are`} waiting for your OK (Servers → Review)
+          </span>
+        </div>
+      )}
+
       {/* Outage strip (sticky while down) */}
       {inOutage && (
         <div className="px-2 py-1 bg-rose-500/15 border border-rose-500/40 rounded text-[10.5px] text-rose-100 font-mono flex items-center gap-1.5">
@@ -795,7 +808,7 @@ const SettingsModal = ({ onClose, onSaved }: {
           <span className="text-[12px] font-bold uppercase tracking-widest text-white flex items-center gap-2">
             <SettingsIcon size={13} className="text-primary" /> Monitor Settings
           </span>
-          <button onClick={onClose} className="text-zinc-400 hover:text-white"><X size={16} /></button>
+          <button aria-label="Close" onClick={onClose} className="text-zinc-400 hover:text-white"><X size={16} /></button>
         </div>
         <div className="flex-1 overflow-y-auto custom-scrollbar p-5 space-y-4">
           {!s ? (
@@ -968,7 +981,7 @@ const ConfigureSlideover = ({ row, busy, onClose, onSetMetrics, onSetCustoms }: 
             <div className="text-[12px] font-bold uppercase tracking-widest text-white">Configure</div>
             <div className="text-[12px] text-zinc-300 font-mono mt-0.5">{row.name} <span className="text-zinc-500">· {row.host}:{row.port}</span></div>
           </div>
-          <button onClick={onClose} className="text-zinc-400 hover:text-white"><X size={16} /></button>
+          <button aria-label="Close" onClick={onClose} className="text-zinc-400 hover:text-white"><X size={16} /></button>
         </div>
 
         <div className="flex-1 overflow-y-auto custom-scrollbar p-4 space-y-5">

@@ -2,14 +2,26 @@ import { useState, useEffect, useLayoutEffect, useRef, useCallback, memo } from 
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { TerminalSquare, Folder, FolderUp, Network, AlertTriangle, Check, X, ShieldAlert, KeyRound, Play, Library, Info, Container, Plus, SplitSquareHorizontal, Columns, Rows, RotateCw, Loader2, PanelRight, PanelLeft, PanelBottom, PanelTop, Maximize2, Minimize2 } from "lucide-react";
+import { TerminalSquare, Folder, FolderUp, Network, AlertTriangle, Check, X, ShieldAlert, KeyRound, Play, Library, Info, Container, Plus, SplitSquareHorizontal, Columns, Rows, RotateCw, Loader2, PanelRight, PanelLeft, PanelBottom, PanelTop, Maximize2, Minimize2, UploadCloud } from "lucide-react";
 import TerminalView from "./TerminalView";
 import SftpWorkspace, { type SftpView } from "./SftpWorkspace";
 import TunnelsPanel from "./TunnelsPanel";
 import InfoPanel from "./InfoPanel";
 import { CmdsPanel } from "./CmdsPanel";
+import { RenameInput } from "../ui/renameInput";
 import { useIsCompact } from "../hooks/useViewport";
 import { fontFamilyCss, readFontFamily, readFontSize } from "../util/terminalFont";
+import { readShellSyncPairs, useShellSyncServer, type ShellSyncPair } from "../util/shellSync";
+import { readUseLocalShell } from "../util/terminalShell";
+import { readUseSshAgent } from "../util/sshAgent";
+import { useSlideOverFocus } from "../ui/slideOverFocus";
+import { useConfirm } from "../ui/confirm";
+
+// What the shell-config push commands answer (mirror.rs' ShellSync* types).
+type ShellSyncShells = { remote_shell: string; local_shell: string; shell_mismatch: boolean };
+type ShellSyncEntry = { local: string; remote: string; size: number; action: string; reason: string | null; crlf: boolean };
+type ShellSyncReport = { home: string; entries: ShellSyncEntry[]; total_bytes: number };
+type ShellSyncPushResult = { pushed: number; bytes: number; failed: { remote: string; error: string }[]; backup: string | null };
 
 // Where the tool panel (SFTP, Ports, Library, Info) sits around the terminal.
 // Remembered per device like the panel's size; compact windows ignore it and
@@ -31,9 +43,12 @@ const DOCK_FLEX: Record<ToolDock, string> = {
   top: "flex-col-reverse",
 };
 // Above or below the terminal the panel has a height of its own; the
-// terminal always keeps at least MIN_TERMINAL_HEIGHT.
+// terminal always keeps at least MIN_TERMINAL_HEIGHT. Beside it, the same
+// with a width: in a narrow split tile a wide panel would otherwise take the
+// whole tile and leave the terminal 0 px wide (gone, but still typing).
 const MIN_TOOL_HEIGHT = 160;
 const MIN_TERMINAL_HEIGHT = 120;
+const MIN_TERMINAL_WIDTH = 200;
 // The panel can also take the terminal's place ("full screen"); remembered
 // with the dock.
 const TOOL_FULL_KEY = "submarine-tool-full";
@@ -142,13 +157,14 @@ const SepToggle = ({ on, onToggle, status, hint, onReconnect }: {
   );
 };
 
-// The SFTP panel's title bar: the title, the Dedicated toggle, then Mirror,
+// The title bar of a tool panel with a Dedicated toggle (SFTP, Port
+// Forwarding): the title, the toggle, then the panel's buttons (SFTP's Mirror),
 // full screen and close. In a narrow panel not all of it fits. What gives way,
-// in this order: the title shortens to "SFTP", the title goes, and only then
-// does Mirror lose its word. So the word is there whenever there is room for
-// it. The bar measures itself instead of using fixed widths, because the
-// toggle is wider while its status dot shows and the text's width depends on
-// the font.
+// in this order: the title shortens ("SFTP", "Ports"), the title goes, and
+// only then does Mirror lose its word. So the word is there whenever there is
+// room for it. The bar measures itself instead of using fixed widths, because
+// the toggle is wider while its status dot shows and the text's width depends
+// on the font.
 const TITLE_BAR_GAP = 12; // gap-3 between the title, the toggle and the buttons
 const MIRROR_WORD_GAP = 6; // gap-1.5 between Mirror's icon and its word
 const TITLE_BAR_TEXT = "text-[10px] font-bold uppercase tracking-wider";
@@ -160,11 +176,12 @@ const TITLE_BAR_FITS: TitleBarFit[] = [
   { title: "short", mirrorWord: false },
   { title: "none", mirrorWord: false },
 ];
-const SftpTitleBar = ({ toggle, mirrorOn, mirrorDisabled, onMirror, extra, onClose }: {
+const ToolTitleBar = ({ title, shortTitle, toggle, mirror, extra, onClose }: {
+  title: string;
+  shortTitle: string;
   toggle: React.ReactNode;
-  mirrorOn: boolean;
-  mirrorDisabled: boolean;
-  onMirror: () => void;
+  /** SFTP's Mirror button; the other panels have none. */
+  mirror?: { on: boolean; disabled: boolean; onToggle: () => void };
   /** Buttons between Mirror and Close (full screen). */
   extra: React.ReactNode;
   onClose: () => void;
@@ -188,7 +205,7 @@ const SftpTitleBar = ({ toggle, mirrorOn, mirrorDisabled, onMirror, extra, onClo
       const style = getComputedStyle(bar);
       const room = bar.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
       if (!(room > 0)) return; // not laid out
-      const word = width(mirrorWordRef.current) + MIRROR_WORD_GAP;
+      const word = mirrorWordRef.current ? width(mirrorWordRef.current) + MIRROR_WORD_GAP : 0;
       const iconButtons = width(buttons) - (fitRef.current.mirrorWord ? word : 0);
       const titles = { full: width(fullTitleRef.current), short: width(shortTitleRef.current), none: 0 };
       const needed = (f: TitleBarFit) =>
@@ -209,43 +226,48 @@ const SftpTitleBar = ({ toggle, mirrorOn, mirrorDisabled, onMirror, extra, onClo
     <div ref={barRef} className="relative h-10 px-4 flex items-center gap-3 border-b border-white/5 bg-white/5 overflow-hidden">
       {fit.title !== "none" && (
         <span className={`${TITLE_BAR_TEXT} text-zinc-400 truncate min-w-0`}>
-          {fit.title === "full" ? "SFTP File Browser" : "SFTP"}
+          {fit.title === "full" ? title : shortTitle}
         </span>
       )}
       <span ref={toggleRef} className="shrink-0 whitespace-nowrap">{toggle}</span>
       <div ref={buttonsRef} className="ml-auto flex items-center gap-2 shrink-0">
-        <button
-          onClick={onMirror}
-          disabled={mirrorDisabled}
-          aria-pressed={mirrorOn}
-          aria-label="Mirror"
-          title={mirrorDisabled
-            ? "Mirror needs a saved server"
-            : mirrorOn ? "Back to the files" : "Mirror: keep a local folder copied to this server"}
-          className={`h-6 px-2 rounded border flex items-center gap-1.5 ${TITLE_BAR_TEXT} transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
-            mirrorOn
-              ? 'text-primary bg-primary/10 border-primary/30'
-              : 'text-zinc-400 border-white/10 hover:text-white hover:bg-white/5'
-          }`}
-        >
-          <FolderUp size={12} className="shrink-0" />
-          {fit.mirrorWord && <span>Mirror</span>}
-        </button>
+        {mirror && (
+          <button
+            onClick={mirror.onToggle}
+            disabled={mirror.disabled}
+            aria-pressed={mirror.on}
+            aria-label="Mirror"
+            title={mirror.disabled
+              ? "Mirror needs a saved server"
+              : mirror.on ? "Back to the files" : "Mirror: keep a local folder copied to this server"}
+            className={`h-6 px-2 rounded border flex items-center gap-1.5 ${TITLE_BAR_TEXT} transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
+              mirror.on
+                ? 'text-primary bg-primary/10 border-primary/30'
+                : 'text-zinc-400 border-white/10 hover:text-white hover:bg-white/5'
+            }`}
+          >
+            <FolderUp size={12} className="shrink-0" />
+            {fit.mirrorWord && <span>Mirror</span>}
+          </button>
+        )}
         {extra}
         <button onClick={onClose} aria-label="Close" className="text-zinc-500 hover:text-white transition-colors shrink-0">
           <X size={14} />
         </button>
       </div>
       <div aria-hidden className="absolute left-0 top-0 invisible pointer-events-none whitespace-nowrap flex gap-4">
-        <span ref={fullTitleRef} className={TITLE_BAR_TEXT}>SFTP File Browser</span>
-        <span ref={shortTitleRef} className={TITLE_BAR_TEXT}>SFTP</span>
-        <span ref={mirrorWordRef} className={TITLE_BAR_TEXT}>Mirror</span>
+        <span ref={fullTitleRef} className={TITLE_BAR_TEXT}>{title}</span>
+        <span ref={shortTitleRef} className={TITLE_BAR_TEXT}>{shortTitle}</span>
+        {mirror && <span ref={mirrorWordRef} className={TITLE_BAR_TEXT}>Mirror</span>}
       </div>
     </div>
   );
 };
 
-const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless = false, onTerminalsChange, isActiveView = false, onPromptChange }: any) => {
+// `displayName`: the session tab's name, which the user may have changed
+// from the server's (DesktopApp's tabNames). `profile`: the unlocked
+// profile's name, for what is kept per server on this device.
+const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onStatusChange, chromeless = false, onTerminalsChange, isActiveView = false, onPromptChange }: any) => {
   const [status, setStatus] = useState<'connecting' | 'connected' | 'failed' | 'disconnected'>('connecting');
 
   // Bubble every status change up to the parent so the session-tab strip
@@ -400,6 +422,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
       quickAuth: session.quickAuth || null,
       sessionRole: "sftp",
       separateSessions: false,
+      useSshAgent: readUseSshAgent(),
     }).catch(console.error);
   };
   const openFwdConn = () => {
@@ -411,6 +434,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
       quickAuth: session.quickAuth || null,
       sessionRole: "forward",
       separateSessions: false,
+      useSshAgent: readUseSshAgent(),
     }).catch(console.error);
   };
 
@@ -540,7 +564,9 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
   // docker-exec session into a specific container (spawned from the Info
   // panel). Container slots stay otherwise identical — same xterm, same
   // events — they just point the backend at `open_container_terminal`.
-  const [terminals, setTerminals] = useState<{id: string, title: string, container?: { name: string; useSudo: boolean }}[]>(() => {
+  // `baseTitle`: the title a tab had before it was renamed, which an empty
+  // name brings back.
+  const [terminals, setTerminals] = useState<{id: string, title: string, baseTitle?: string, container?: { name: string; useSudo: boolean }}[]>(() => {
     return [{ id: `${session.id}-term-0`, title: '1' }];
   });
   // Bumped on every successful reconnect. TerminalView watches this prop
@@ -564,8 +590,38 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
       ? () => {
           if (startupRanForEpochRef.current === connectionEpoch) return;
           startupRanForEpochRef.current = connectionEpoch;
-          const bytes = Array.from(new TextEncoder().encode(startupCommands.join('\n') + '\n'));
-          invoke('write_terminal_data', { terminalId, data: bytes }).catch(() => {});
+          const cmds = startupCommands.join('\n') + '\n';
+          const typeThem = () => {
+            const bytes = Array.from(new TextEncoder().encode(cmds));
+            invoke('write_terminal_data', { terminalId, data: bytes }).catch(() => {});
+          };
+          if (!session.runOnConnectHeld) {
+            typeThem();
+            return;
+          }
+          // Someone this profile is shared with set or changed these
+          // commands and this device hasn't allowed them: ask, never type
+          // them unasked. Cancel has the focus, so a stray Enter is a no.
+          confirmRef.current({
+            title: "Run the on-connect commands?",
+            message: `Someone you share this profile with set these commands to run when you connect to ${session.serverName}:\n\n${cmds.trimEnd()}\n\nThey would be typed into your terminal on that server.`,
+            okLabel: "Allow and run",
+            cancelLabel: "Not now",
+            safeDefault: true,
+          }).then(async (ok) => {
+            if (!ok) {
+              addLog(`On-connect commands for ${session.serverName} not run: they are waiting for your OK.`, "info");
+              return;
+            }
+            try {
+              await invoke("allow_held", { serverId: session.serverId, items: ["run_on_connect"] });
+              window.dispatchEvent(new Event("submarine-held-changed"));
+            } catch (e) {
+              addLog(`ALLOW_FAILED: ${e}`, "error");
+              return;
+            }
+            typeThem();
+          });
         }
       : undefined;
   const openContainerTerminal = (containerName: string, useSudo: boolean) => {
@@ -616,6 +672,92 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
   }, [isActiveView]);
 
   const [activeTool, setActiveTool] = useState<'sftp' | 'tunnels' | 'mirrors' | 'cmds' | 'info' | null>(null);
+
+  // "Push shell config": a one-shot push, not a dockable tool pane like the
+  // four above, so it gets its own preview/confirm dialog. Offered on the
+  // servers picked in Settings → Shell config sync (this device's choice).
+  const shellSyncOffered = useShellSyncServer(session.serverUuid);
+  const [shellSyncOpen, setShellSyncOpen] = useState(false);
+  const [shellSyncBusy, setShellSyncBusy] = useState(false);
+  const [shellSyncError, setShellSyncError] = useState<string | null>(null);
+  // The pairs the preview was made for: a push sends exactly those.
+  const [shellSyncPairs, setShellSyncPairs] = useState<ShellSyncPair[]>([]);
+  const [shellSyncShells, setShellSyncShells] = useState<ShellSyncShells | null>(null);
+  const [shellSyncReport, setShellSyncReport] = useState<ShellSyncReport | null>(null);
+  // A push with failures stays open to list them.
+  const [shellSyncResult, setShellSyncResult] = useState<ShellSyncPushResult | null>(null);
+  // Bumped on each opening, so that an answer meant for an earlier one is
+  // dropped.
+  const shellSyncRun = useRef(0);
+  const shellSyncPanelRef = useSlideOverFocus(shellSyncOpen);
+
+  const fmtBytes = (n: number) => {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  };
+
+  const openShellSync = async () => {
+    const run = ++shellSyncRun.current;
+    const pairs = readShellSyncPairs();
+    setShellSyncOpen(true);
+    setShellSyncError(null);
+    setShellSyncReport(null);
+    setShellSyncResult(null);
+    setShellSyncShells(null);
+    setShellSyncPairs(pairs);
+    if (pairs.length === 0) {
+      setShellSyncError("Nothing to push yet: add files in Settings → Shell config sync.");
+      return;
+    }
+    setShellSyncBusy(true);
+    // Which shell the account logs into, for a note. Not asked when new
+    // terminals start this computer's own shell anyway (Settings → Use my
+    // default shell), and never in the way of the preview.
+    if (!readUseLocalShell()) {
+      invoke<ShellSyncShells>("shell_sync_probe", { sessionId: session.id })
+        .then((s) => { if (run === shellSyncRun.current) setShellSyncShells(s); }, () => {});
+    }
+    try {
+      const report = await invoke<ShellSyncReport>("shell_sync_preview", { sessionId: session.id, pairs });
+      if (run === shellSyncRun.current) setShellSyncReport(report);
+    } catch (e: any) {
+      if (run === shellSyncRun.current) setShellSyncError(String(e));
+    } finally {
+      if (run === shellSyncRun.current) setShellSyncBusy(false);
+    }
+  };
+
+  const confirmShellSync = async () => {
+    if (!shellSyncReport) return;
+    setShellSyncBusy(true);
+    setShellSyncError(null);
+    try {
+      const result = await invoke<ShellSyncPushResult>("shell_sync_push", { sessionId: session.id, pairs: shellSyncPairs });
+      const files = `${result.pushed} file${result.pushed === 1 ? "" : "s"} (${fmtBytes(result.bytes)})`;
+      const kept = result.backup ? `; the files it replaced are in ${result.backup}` : "";
+      if (result.failed.length === 0) {
+        addLog(`Shell config: pushed ${files} to ${session.serverName}${kept}.`, "success");
+        setShellSyncOpen(false);
+      } else {
+        addLog(`Shell config: pushed ${files} to ${session.serverName}, ${result.failed.length} failed${kept}.`, "warn");
+        setShellSyncResult(result);
+      }
+    } catch (e: any) {
+      setShellSyncError(String(e));
+    } finally {
+      setShellSyncBusy(false);
+    }
+  };
+
+  // A push under way: closing then would leave its outcome nowhere to show.
+  const shellSyncPushing = shellSyncBusy && !!shellSyncReport;
+  const closeShellSync = () => {
+    if (shellSyncPushing) return;
+    shellSyncRun.current++;
+    setShellSyncBusy(false);
+    setShellSyncOpen(false);
+  };
   // Split-pane state — an ORDERED array of terminal IDs that currently
   // share the main pane. `[]` or a single-id array means "no split, use
   // the usual absolute-overlap layout"; length ≥ 2 means the panes tile
@@ -645,6 +787,20 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
   // window-space, matching the pattern used by the session tab menu at
   // App level.
   const [plusMenu, setPlusMenu] = useState<{ x: number; y: number } | null>(null);
+  // A terminal tab's own menu (right-click, or a double-click straight into
+  // its name editor). A new title goes into `terminals`, so the Wall and
+  // split headers show it too.
+  const [termMenu, setTermMenu] = useState<{ x: number; y: number; termId: string } | null>(null);
+  const [termRename, setTermRename] = useState<string | null>(null);
+  useEffect(() => { if (!termMenu) setTermRename(null); }, [termMenu]);
+  const renameTerminal = (termId: string, name: string) => {
+    const title = name.trim();
+    setTerminals(prev => prev.map(t => {
+      if (t.id !== termId) return t;
+      if (!title) return t.baseTitle !== undefined ? { ...t, title: t.baseTitle, baseTitle: undefined } : t;
+      return { ...t, title, baseTitle: t.baseTitle ?? t.title };
+    }));
+  };
   // On narrow viewports the side-by-side terminal+tool layout doesn't fit.
   // We collapse to a stacked single-pane view: when a tool is open, the
   // tool takes full width and the terminal is hidden behind a back-chip.
@@ -712,6 +868,11 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
   // Once per connection: the terminal mounting again (into or out of a
   // split) doesn't type them a second time.
   const startupRanForEpochRef = useRef(-1);
+  // Asks before typing on-connect commands someone else set in a shared
+  // profile. Read through a ref: the shell-ready callback outlives renders.
+  const confirm = useConfirm();
+  const confirmRef = useRef(confirm);
+  confirmRef.current = confirm;
 
   // ---- Auto-reconnect: fixed 5s cadence, retried FOREVER -------------------
   // After a previously-good session drops we retry every 5 seconds, forever —
@@ -750,7 +911,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
     // into the auth-retry input is picked up by later attempts inside this
     // same effect closure (the effect itself only runs once).
     primarySeparateRef.current = separateFwdRef.current;
-    invoke("initiate_connection", { sessionId: session.id, serverId: session.serverId, customPassword: customPasswordRef.current || null, quickAuth: session.quickAuth || null, sessionRole: "primary", separateSessions: separateFwdRef.current })
+    invoke("initiate_connection", { sessionId: session.id, serverId: session.serverId, customPassword: customPasswordRef.current || null, quickAuth: session.quickAuth || null, sessionRole: "primary", separateSessions: separateFwdRef.current, useSshAgent: readUseSshAgent() })
       .catch(e => {
         pushLog({ msg: `Failed to initiate: ${e}`, type: 'error' });
         setStatus('failed');
@@ -978,6 +1139,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
         quickAuth: session.quickAuth || null,
         sessionRole: "primary",
         separateSessions: separateFwdRef.current,
+        useSshAgent: readUseSshAgent(),
       }).catch(console.error);
     }, delay);
   };
@@ -1004,6 +1166,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
       quickAuth: session.quickAuth || null,
       sessionRole: "primary",
       separateSessions: separateFwdRef.current,
+      useSshAgent: readUseSshAgent(),
     }).catch(console.error);
   };
 
@@ -1050,14 +1213,18 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
       return;
     }
     const startX = e.clientX;
-    const startWidth = toolPanelWidth;
+    const area = mainAreaRef.current?.clientWidth ?? window.innerWidth;
+    const maxWidth = Math.max(240, Math.min(900, area - MIN_TERMINAL_WIDTH - 4));
+    // Start from what's on screen: a width saved in a wider window shows
+    // capped.
+    const startWidth = Math.min(maxWidth, toolPanelRef.current?.getBoundingClientRect().width ?? toolPanelWidth);
     let latest = startWidth;
 
     const onMove = (ev: MouseEvent) => {
       // Dragging toward the terminal widens the tool pane: left for a pane
       // on the right, right for a pane on the left.
       const pulled = toolDock === "left" ? ev.clientX - startX : startX - ev.clientX;
-      latest = Math.max(240, Math.min(900, startWidth + pulled));
+      latest = Math.round(Math.max(240, Math.min(maxWidth, startWidth + pulled)));
       setToolPanelWidth(latest);
     };
 
@@ -1219,7 +1386,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
               {/* Which server is asking — the server's own wording rarely
                   says, and several tabs can be connecting at once. */}
               <p className="mt-0.5 text-[11.5px] text-zinc-500 truncate" title={session.serverName}>
-                {session.serverName}
+                {displayName || session.serverName}
               </p>
               {kbiPrompt.instructions && String(kbiPrompt.instructions).trim() && (
                 <p className="text-zinc-400 mt-2 leading-relaxed whitespace-pre-wrap break-words">
@@ -1317,7 +1484,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
             </div>
             <div className="min-w-0 flex-1">
               <h2 className="text-sm font-semibold text-zinc-100 truncate" title={session.serverName}>
-                {session.serverName}
+                {displayName || session.serverName}
               </h2>
               <p className={`text-[11px] mt-0.5 ${status === 'failed' ? 'text-red-400/90' : 'text-zinc-500'}`}>
                 {status === 'connecting' ? 'Connecting…' : 'Connection failed'}
@@ -1416,7 +1583,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
           full chrome and 2-3 sessions side-by-side would fight for
           vertical space with duplicate toolbars. */}
       {!chromeless && (
-      <div className="h-12 border-b border-white/5 bg-[#121214]/50 flex items-center px-2 sm:px-4 shrink-0 justify-between gap-1">
+      <div inert={shellSyncOpen ? "" : undefined} className="h-12 border-b border-white/5 bg-[#121214]/50 flex items-center px-2 sm:px-4 shrink-0 justify-between gap-1">
         <div
           className="flex items-center gap-1 overflow-x-auto no-scrollbar flex-1 mr-1 sm:mr-4 mask-fade-right"
           onWheel={(e) => { e.currentTarget.scrollLeft += e.deltaY; }}
@@ -1428,7 +1595,10 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
           const isFocusedHalf = activeTab === t.id;
           const isSplitPartner = !!(splitTerminals.includes(t.id) && !isFocusedHalf);
           return (
-          <div key={t.id} className="group relative flex items-center">
+          <div key={t.id} className="group relative flex items-center"
+            onContextMenu={(e) => { e.preventDefault(); setTermMenu({ x: e.clientX, y: e.clientY, termId: t.id }); }}
+            onDoubleClick={(e) => { setTermMenu({ x: e.clientX, y: e.clientY, termId: t.id }); setTermRename(t.id); }}
+          >
             <button
               onClick={() => {
                 // Clicking a tab NOT participating in the current split
@@ -1487,7 +1657,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
                   }
                 }}
                 aria-label="Close terminal"
-                className="absolute right-1 top-1/2 -translate-y-1/2 w-5 h-5 flex items-center justify-center rounded opacity-100 sm:opacity-0 sm:group-hover:opacity-100 hover:bg-white/5 hover:text-red-400 text-zinc-500 transition-all"
+                className="absolute right-1 top-1/2 -translate-y-1/2 w-5 h-5 flex items-center justify-center rounded opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100 hover:bg-white/5 hover:text-red-400 text-zinc-500 transition-all"
               >
                 <X size={12} />
               </button>
@@ -1561,6 +1731,22 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
               </button>
             );
           })}
+          {/* "Push shell config": only on the servers picked in Settings →
+              Shell config sync, not all of them. Unlike the four tabs above
+              it doesn't dock a panel: it's a one-shot push, so it opens a
+              preview/confirm dialog instead (see shellSyncOpen below). */}
+          {shellSyncOffered && (
+            <button
+              onClick={openShellSync}
+              disabled={status !== 'connected'}
+              title="Push shell config: your files from Settings → Shell config sync, to this server"
+              aria-label="Push shell config"
+              className="h-10 sm:h-8 px-2.5 rounded-lg flex items-center gap-1.5 transition-all text-zinc-300 bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/20 hover:text-white disabled:opacity-40 disabled:pointer-events-none"
+            >
+              <UploadCloud size={14} className="shrink-0" />
+              <span className="hidden md:inline text-[11px] font-semibold tracking-tight">Shell</span>
+            </button>
+          )}
           {/* Where the tool pane sits around the terminal. Compact windows
               show the tool full screen, so there is nothing to place. */}
           {!isCompact && (
@@ -1654,6 +1840,40 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
         document.body
       )}
 
+      {/* A terminal tab's menu: its name, edited in place. Enter keeps it
+          (an empty one brings back the tab's first title), Esc goes back
+          to the menu. */}
+      {termMenu && terminals.some(t => t.id === termMenu.termId) && createPortal(
+        <>
+          <div
+            className="fixed inset-0 z-[9998]"
+            onClick={() => setTermMenu(null)}
+            onContextMenu={(e) => { e.preventDefault(); setTermMenu(null); }}
+          />
+          <div
+            style={{ left: Math.min(termMenu.x, window.innerWidth - 240), top: Math.min(termMenu.y, window.innerHeight - 80) }}
+            className="fixed z-[9999] w-[220px] bg-[#15151a] border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
+          >
+            {termRename === termMenu.termId ? (
+              <RenameInput
+                initialValue={terminals.find(t => t.id === termMenu.termId)?.title ?? ""}
+                placeholder="Tab name (empty: the first one)"
+                onCommit={(v) => { renameTerminal(termMenu.termId, v); setTermMenu(null); }}
+                onCancel={() => setTermRename(null)}
+              />
+            ) : (
+              <button
+                onClick={() => setTermRename(termMenu.termId)}
+                className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left"
+              >
+                <span className="flex-1">Rename tab</span>
+              </button>
+            )}
+          </div>
+        </>,
+        document.body
+      )}
+
       {dockMenu && createPortal(
         <>
           <div
@@ -1742,6 +1962,8 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
           which shows it alone the same way. */}
       <div
         ref={mainAreaRef}
+        // Behind the push dialog: Tab can't reach the terminal under it.
+        inert={shellSyncOpen ? "" : undefined}
         className={`flex-1 flex overflow-hidden relative bg-[#09090b] ${toolAlone ? "" : DOCK_FLEX[toolDock]}`}
       >
         {/* Left Panel: Active Terminals.
@@ -1814,7 +2036,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
                         }
                       }}
                       title="Remove this pane from the split (keeps the terminal)"
-                      className="absolute top-1 right-1 z-30 h-5 w-5 rounded flex items-center justify-center bg-black/40 border border-white/10 text-zinc-400 hover:text-white hover:bg-black/60 opacity-0 hover:opacity-100 group-hover/pane:opacity-100 transition-opacity"
+                      className="absolute top-1 right-1 z-30 h-5 w-5 rounded flex items-center justify-center bg-black/40 border border-white/10 text-zinc-400 hover:text-white hover:bg-black/60 opacity-0 hover:opacity-100 group-hover/pane:opacity-100 focus-visible:opacity-100 transition-opacity"
                     >
                       <X size={11} />
                     </button>
@@ -1906,7 +2128,9 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
             </div>
           ) : (
             terminals.map(t => (
-              <div key={t.id} className={`absolute inset-0 ${activeTab === t.id ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'}`}>
+              // A background tab stays mounted (its shell keeps running) but
+              // inert, so Tab can't land in a terminal that isn't shown.
+              <div key={t.id} inert={activeTab === t.id ? undefined : ""} className={`absolute inset-0 ${activeTab === t.id ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'}`}>
                 <TerminalView
                   sessionId={session.id}
                   terminalId={t.id}
@@ -1947,13 +2171,15 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
           style={activeTool && !toolAlone
             ? (dockTopBottom
                 ? { height: `${toolPanelHeight}px`, maxHeight: `calc(100% - ${MIN_TERMINAL_HEIGHT + 4}px)` }
-                : { width: `${toolPanelWidth}px` })
+                : { width: `${toolPanelWidth}px`, maxWidth: `calc(100% - ${MIN_TERMINAL_WIDTH + 4}px)` })
             : undefined}
           className={`${activeTool ? (toolAlone ? 'flex-1 min-w-0' : 'shrink-0') : 'hidden'} bg-[#121214]/95 flex flex-col ${dockTopBottom && !toolAlone ? 'w-full' : 'h-full'} overflow-hidden ${activeTool ? 'animate-in slide-in-from-right duration-300' : ''}`}
         >
           {activeTool === 'sftp' && (
             <div className="flex-1 flex flex-col overflow-hidden">
-              <SftpTitleBar
+              <ToolTitleBar
+                title="SFTP File Browser"
+                shortTitle="SFTP"
                 toggle={
                   <SepToggle
                     on={separateSftp}
@@ -1963,9 +2189,11 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
                     onReconnect={reconnectSftpConn}
                   />
                 }
-                mirrorOn={sftpView === 'mirror'}
-                mirrorDisabled={!session.serverId}
-                onMirror={() => setSftpView(v => v === 'mirror' ? 'files' : 'mirror')}
+                mirror={{
+                  on: sftpView === 'mirror',
+                  disabled: !session.serverId,
+                  onToggle: () => setSftpView(v => v === 'mirror' ? 'files' : 'mirror'),
+                }}
                 extra={fullToggle}
                 onClose={() => setActiveTool(null)}
               />
@@ -1974,6 +2202,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
                   sessionId={session.id}
                   disabled={status !== 'connected'}
                   serverId={session.serverId}
+                  profile={profile}
                   mirrorsConfig={(() => {
                     try { return JSON.parse(session.mirrors || "[]"); } catch { return []; }
                   })()}
@@ -1985,9 +2214,10 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
 
           {activeTool === 'tunnels' && (
             <div className="flex-1 flex flex-col overflow-hidden">
-              <div className="h-10 px-4 flex items-center justify-between gap-3 border-b border-white/5 bg-white/5">
-                <div className="flex items-center gap-3 min-w-0">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 shrink-0">Port Forwarding</span>
+              <ToolTitleBar
+                title="Port Forwarding"
+                shortTitle="Ports"
+                toggle={
                   <SepToggle
                     on={separateFwd}
                     onToggle={toggleSeparateFwd}
@@ -1995,14 +2225,10 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
                     hint="Port forwards run on their own SSH connection, so heavy traffic doesn't slow the terminal down."
                     onReconnect={reconnectFwdConn}
                   />
-                </div>
-                <div className="flex items-center gap-2 shrink-0">
-                  {fullToggle}
-                  <button onClick={() => setActiveTool(null)} aria-label="Close" className="text-zinc-500 hover:text-white transition-colors shrink-0">
-                    <X size={14} />
-                  </button>
-                </div>
-              </div>
+                }
+                extra={fullToggle}
+                onClose={() => setActiveTool(null)}
+              />
               <div className="flex-1 overflow-hidden relative">
                 <TunnelsPanel sessionId={session.id} serverId={session.serverId} disabled={status !== 'connected'} />
               </div>
@@ -2042,6 +2268,172 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
           </div>
         </div>
       </div>
+
+      {/* Push shell config — preview/confirm dialog. Scoped to this session
+          (absolute, not a document.body portal) like promptOverlay above,
+          since it only makes sense for the session whose toolbar button
+          opened it. The session behind it is inert while it's open. */}
+      {shellSyncOpen && (() => {
+        const entries = shellSyncReport?.entries ?? [];
+        const pushes = entries.filter((e) => e.action === "new" || e.action === "update" || e.action === "server-newer");
+        const replaces = pushes.some((e) => e.action !== "new");
+        const badge = (e: ShellSyncEntry): [string, string] => {
+          switch (e.action) {
+            case "new": return ["new", "text-emerald-400"];
+            case "update": return ["update", "text-amber-400"];
+            case "server-newer": return ["newer on the server", "text-rose-400"];
+            case "skip-private": return [`not pushed: ${e.reason ?? "private"}`, "text-zinc-500"];
+            case "skip-link": return ["a link there: left alone", "text-zinc-500"];
+            case "skip-folder": return ["a folder there: left alone", "text-zinc-500"];
+            default: return ["not a file there: left alone", "text-zinc-500"];
+          }
+        };
+        const remoteShell = shellSyncShells?.remote_shell.split("/").pop() || "another shell";
+        return (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={`shell-sync-title-${session.id}`}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.stopPropagation();
+                closeShellSync();
+              }
+            }}
+            className="absolute inset-0 z-50 flex items-start justify-center bg-black/70 backdrop-blur-sm p-4 sm:p-8 overflow-y-auto"
+          >
+            <div
+              ref={shellSyncPanelRef}
+              tabIndex={-1}
+              className="max-w-xl w-full mt-6 sm:mt-12 bg-[#121215] border border-white/10 rounded-2xl shadow-2xl overflow-hidden outline-none"
+            >
+              <div className="px-5 py-4 border-b border-white/5 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 min-w-0">
+                  <UploadCloud size={15} className="text-primary shrink-0" />
+                  <h3 id={`shell-sync-title-${session.id}`} className="text-sm font-semibold text-zinc-100 truncate">
+                    Push shell config → {session.serverName}
+                  </h3>
+                </div>
+                <button
+                  onClick={closeShellSync}
+                  disabled={shellSyncPushing}
+                  aria-label="Close"
+                  className="shrink-0 text-zinc-500 hover:text-white transition-colors disabled:opacity-40"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+
+              <div className="px-5 py-4 space-y-3 max-h-[60vh] overflow-y-auto">
+                {shellSyncBusy && !shellSyncReport && (
+                  <div className="flex items-center gap-2 text-sm text-zinc-400 py-4">
+                    <Loader2 size={14} className="animate-spin" /> Checking what would change…
+                  </div>
+                )}
+
+                {shellSyncError && (
+                  <div className="flex items-start gap-2 text-[12px] text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2.5">
+                    <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+                    <span className="whitespace-pre-line break-words min-w-0">{shellSyncError}</span>
+                  </div>
+                )}
+
+                {shellSyncShells?.shell_mismatch && !shellSyncResult && (
+                  <div className="flex items-start gap-2 text-[12px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2.5">
+                    <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+                    <span>
+                      This computer's shell is <strong>{shellSyncShells.local_shell}</strong>, but this account
+                      logs into <strong>{remoteShell}</strong> on the server: files for {shellSyncShells.local_shell} are
+                      only read there once the account's shell changes, or with Settings → Use my default shell.
+                    </span>
+                  </div>
+                )}
+
+                {shellSyncResult && (
+                  <div className="space-y-2">
+                    <p className="text-[12px] text-zinc-300">
+                      Pushed {shellSyncResult.pushed} file{shellSyncResult.pushed === 1 ? "" : "s"}. These failed:
+                    </p>
+                    <div className="rounded-lg border border-red-500/20 divide-y divide-white/5 overflow-hidden">
+                      {shellSyncResult.failed.map((f, i) => (
+                        <div key={i} className="px-3 py-2 text-[12px]">
+                          <div className="truncate text-zinc-200" title={f.remote}>{f.remote}</div>
+                          <div className="text-red-400 break-words">{f.error}</div>
+                        </div>
+                      ))}
+                    </div>
+                    {shellSyncResult.backup && (
+                      <p className="text-[11px] text-zinc-500">The files it replaced are in {shellSyncResult.backup} on the server.</p>
+                    )}
+                  </div>
+                )}
+
+                {shellSyncReport && !shellSyncResult && (
+                  entries.length === 0 ? (
+                    <p className="text-sm text-zinc-400 py-2">Everything is up to date: nothing to push.</p>
+                  ) : (
+                    <>
+                      <p className="text-[11px] text-zinc-500">
+                        {pushes.length === 0
+                          ? "Nothing to push"
+                          : `${pushes.length} file${pushes.length === 1 ? "" : "s"} · ${fmtBytes(shellSyncReport.total_bytes)}`}
+                        {" "}· into {shellSyncReport.home} on the server
+                      </p>
+                      <div className="rounded-lg border border-white/10 divide-y divide-white/5 overflow-hidden">
+                        {entries.map((e, i) => {
+                          const [text, tone] = badge(e);
+                          const sends = pushes.includes(e);
+                          return (
+                            <div key={i} className="px-3 py-2 text-[12px]">
+                              <div className="flex items-center gap-2">
+                                <span className={`flex-1 min-w-0 truncate ${sends ? "text-zinc-300" : "text-zinc-500"}`} title={`${e.local} → ${e.remote}`}>
+                                  {e.remote}
+                                </span>
+                                {sends && <span className="shrink-0 text-zinc-500">{fmtBytes(e.size)}</span>}
+                                <span className={`shrink-0 text-[10px] font-bold uppercase tracking-wide ${tone}`}>{text}</span>
+                              </div>
+                              {e.crlf && (
+                                <p className="mt-0.5 text-[11px] text-amber-300">
+                                  Windows line endings: a shell on the server reads the extra \r as part of each line.
+                                </p>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                      {replaces && (
+                        <p className="text-[11px] text-zinc-500">
+                          A file it replaces is moved to ~/.submarine-trash on the server first and keeps its permissions.
+                        </p>
+                      )}
+                    </>
+                  )
+                )}
+              </div>
+
+              <div className="px-5 py-3.5 border-t border-white/5 flex items-center justify-end gap-2">
+                <button
+                  onClick={closeShellSync}
+                  disabled={shellSyncPushing}
+                  className="h-8 px-3 rounded-lg text-xs font-semibold text-zinc-300 hover:bg-white/5 transition-colors disabled:opacity-40"
+                >
+                  {shellSyncResult ? "Close" : "Cancel"}
+                </button>
+                {!shellSyncResult && (
+                  <button
+                    onClick={confirmShellSync}
+                    disabled={shellSyncBusy || pushes.length === 0}
+                    className="h-8 px-3 rounded-lg text-xs font-semibold bg-primary/10 text-primary hover:bg-primary/20 transition-colors disabled:opacity-40 disabled:pointer-events-none flex items-center gap-1.5"
+                  >
+                    {shellSyncPushing ? <Loader2 size={13} className="animate-spin" /> : <UploadCloud size={13} />}
+                    Push
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 

@@ -1,19 +1,47 @@
-import { Search, Plus, Server, Globe, Folder, ChevronLeft, ChevronRight, Trash2, Edit2, Zap, Check, X, Copy, GripVertical, MonitorSmartphone } from "lucide-react";
-import { useState, useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import { Search, Plus, Server, Globe, Folder, ChevronLeft, ChevronRight, Trash2, Edit2, Zap, Check, X, Copy, GripVertical, MonitorSmartphone, ShieldAlert, KeyRound } from "lucide-react";
+import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { useConfirm } from "../ui/confirm";
 import { FolderRow, childFolders, folderPath, indexFolders, subtreeCounts } from "../util/folderPath";
 import RdpLinkModal, { RdpLink } from "./RdpLinkModal";
 import { IS_ANDROID } from "../util/platform";
 import { OsBadge } from "./OsBadge";
+import { HeldReview } from "./HeldReview";
+import { HeldDeletions } from "./HeldDeletions";
 
-export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFolderIdProp, onActiveFolderChange, onOpenServer, onEditServer, onAddClick, onQuickConnect, onRemoveServer, onRemoveFolder, onRenameFolder, onCloneServer, onReorderServers, onOpenRdp, onSaveRdp, onRemoveRdp, isMobile }: any) => {
+export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFolderIdProp, onActiveFolderChange, onOpenServer, onEditServer, onAddClick, onQuickConnect, onRemoveServer, onRemoveFolder, onRenameFolder, onCloneServer, onReorderServers, onOpenRdp, onSaveRdp, onRemoveRdp, onAllowHeld, keyChange, onAcceptKey, heldDeletions, onResolveDeletions, isMobile }: any) => {
   const [search, setSearch] = useState("");
+  // Changes someone else made in a shared profile that this device holds
+  // back until its user allows them (see HeldReview).
+  const heldCount: number = (servers || []).reduce((n: number, s: any) => n + (s.held?.length || 0), 0);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const closeReview = useCallback(() => setReviewOpen(false), []);
+  // Deletions someone else's sync would have made here, held until the user
+  // decides (see HeldDeletions).
+  const deletionCount: number = (heldDeletions || []).length;
+  const [deletionsOpen, setDeletionsOpen] = useState(false);
+  const closeDeletions = useCallback(() => setDeletionsOpen(false), []);
   // Native window.confirm() is a silent no-op inside Tauri's Android WebView
   // (same shim gap useTextPrompt was added for), so the delete buttons here
   // silently did nothing on Android after v0.2.32 made the action cluster
   // always-visible on mobile. Route through the themed useConfirm hook.
   const confirm = useConfirm();
+  // A shared profile's new key, waiting for the user's OK: they compare its
+  // fingerprint with the one in the owner's Profile panel first. Cancel has
+  // the focus, so a stray Enter doesn't accept it.
+  const reviewKey = async () => {
+    if (!keyChange || !onAcceptKey) return;
+    const ok = await confirm({
+      title: "Use the new key?",
+      message:
+        `This shared profile's key was replaced, usually because its owner removed someone. The new key's fingerprint is ${keyChange}. ` +
+        "Ask the owner whether their Profile panel shows the same one. If it doesn't, the key didn't come from them: don't use it.",
+      okLabel: "Use the new key",
+      cancelLabel: "Not now",
+      safeDefault: true,
+    });
+    if (ok) onAcceptKey();
+  };
   // Folder navigation is controlled when the parent passes both props, so the
   // selection survives NodeGrid unmount/remount (the parent sticks it onto
   // its own state). Falls back to local state for older callers that don't
@@ -535,6 +563,58 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
           onChange={(e) => setSearch(e.target.value)}
         />
       </div>
+
+      {heldCount > 0 && onAllowHeld && (
+        <div role="status" className="max-w-xl w-full mx-auto -mt-3 mb-5 shrink-0 flex items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.06] px-3 py-2 text-[12px] text-amber-100/90">
+          <ShieldAlert size={14} className="text-amber-400 shrink-0" />
+          <span className="flex-1 min-w-0">
+            {heldCount === 1
+              ? "A change from someone you share this profile with is waiting for your OK."
+              : `${heldCount} changes from people you share this profile with are waiting for your OK.`}
+          </span>
+          <button
+            onClick={() => setReviewOpen(true)}
+            className="shrink-0 px-2.5 h-7 rounded text-[10.5px] font-bold uppercase tracking-wider bg-amber-400/10 border border-amber-400/30 text-amber-200 hover:bg-amber-400/20"
+          >
+            Review
+          </button>
+        </div>
+      )}
+      {reviewOpen && onAllowHeld && (
+        <HeldReview servers={servers || []} onAllow={onAllowHeld} onClose={closeReview} />
+      )}
+      {deletionCount > 0 && onResolveDeletions && (
+        <div role="status" className="max-w-xl w-full mx-auto -mt-3 mb-5 shrink-0 flex items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.06] px-3 py-2 text-[12px] text-amber-100/90">
+          <Trash2 size={14} className="text-amber-400 shrink-0" />
+          <span className="flex-1 min-w-0">
+            {deletionCount === 1 ? "An item was" : `${deletionCount} items were`} deleted by someone you share this
+            profile with. {deletionCount === 1 ? "It stays" : "They stay"} here until you decide.
+          </span>
+          <button
+            onClick={() => setDeletionsOpen(true)}
+            className="shrink-0 px-2.5 h-7 rounded text-[10.5px] font-bold uppercase tracking-wider bg-amber-400/10 border border-amber-400/30 text-amber-200 hover:bg-amber-400/20"
+          >
+            Review
+          </button>
+        </div>
+      )}
+      {deletionsOpen && onResolveDeletions && (
+        <HeldDeletions items={heldDeletions || []} onResolve={onResolveDeletions} onClose={closeDeletions} />
+      )}
+      {keyChange && onAcceptKey && (
+        <div role="status" className="max-w-xl w-full mx-auto -mt-3 mb-5 shrink-0 flex items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.06] px-3 py-2 text-[12px] text-amber-100/90">
+          <KeyRound size={14} className="text-amber-400 shrink-0" />
+          <span className="flex-1 min-w-0">
+            This shared profile's key has changed. Your changes aren't uploaded until you accept the new key.
+          </span>
+          <button
+            onClick={reviewKey}
+            className="shrink-0 px-2.5 h-7 rounded text-[10.5px] font-bold uppercase tracking-wider bg-amber-400/10 border border-amber-400/30 text-amber-200 hover:bg-amber-400/20"
+          >
+            Review
+          </button>
+        </div>
+      )}
 
       <div className="flex-1 overflow-y-auto custom-scrollbar pr-1 pb-10">
 

@@ -13,15 +13,22 @@ import logoUrl from "./assets/logo.png";
 import PasswordField from "./components/PasswordField";
 import QuickConnectModal, { QuickAuth } from "./components/QuickConnectModal";
 import { useConfirm, useTextPrompt } from "./ui/confirm";
+import { useSlideOverFocus } from "./ui/slideOverFocus";
+import { RenameInput } from "./ui/renameInput";
+import { forgetServerBookmarks } from "./util/sftpBookmarks";
 import { useIsNarrow } from "./hooks/useViewport";
 import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./util/terminalFont";
 import { GPU_KEY, MIN_CONTRAST_KEY, SCHEME_KEY, readGpu, readMinContrast, readSchemeId, setServerSchemes } from "./ui/terminalThemes";
+import { USE_LOCAL_SHELL_KEY, readUseLocalShell } from "./util/terminalShell";
+import { USE_SSH_AGENT_KEY, readUseSshAgent } from "./util/sshAgent";
 import { Sidebar } from "./components/Sidebar";
 import { NodeGrid } from "./components/NodeGrid";
 import { SessionTree, type TreeItems } from "./components/SessionTree";
 import HomePane from "./components/HomePane";
 import { IS_ANDROID } from "./util/platform";
 import type { RdpLink } from "./components/RdpLinkModal";
+import { folderTree } from "./util/folderTree";
+import type { HeldDeletion } from "./components/HeldDeletions";
 import AddNodePanel from "./components/AddNodePanel";
 import WallView, { type Wall, type WallMember } from "./components/WallView";
 import WallsMenu, { AllTabsMenu, WallEditorModal, WallPicker, type SavedWall } from "./components/WallsMenu";
@@ -42,7 +49,9 @@ const appWindow = getCurrentWindow();
 // check goes by (an edit made while the tab is open doesn't move it).
 // `wallId`: opened into that Wall (a folder of servers opened at once), so it
 // has no tab of its own until it's popped out of the Wall.
-type Session = { id: string; serverId: number; serverName: string; host?: string; mirrors?: string; runOnConnect?: string; quickAuth?: QuickAuth | null; wallId?: string };
+// `serverUuid` is the saved server's sync id, which keys this device's own
+// per-server settings (the Shell button, see util/shellSync.ts).
+type Session = { id: string; serverId: number; serverName: string; serverUuid?: string | null; host?: string; mirrors?: string; runOnConnect?: string; runOnConnectHeld?: boolean; quickAuth?: QuickAuth | null; wallId?: string };
 
 // The Home view (HomePane): terminals on this computer, where the app opens
 // and where closing the last session tab goes back to. Android has no shells
@@ -82,6 +91,18 @@ function DesktopApp() {
   // Right-click menu pinned to a session tab. Closed by any click outside or
   // by choosing one of the menu items.
   const [tabMenu, setTabMenu] = useState<{ x: number; y: number; sessionId: string } | null>(null);
+  // Names given to session tabs ("Rename tab" in that menu, or a
+  // double-click), by session id, so two tabs of one server can differ.
+  // Shown wherever the tab's name is; the server's own name stays its
+  // identity (logs, prompts, tools). Dropped when the session closes and on
+  // lock: session ids come from each profile's server ids, so another
+  // profile would reuse them.
+  const [tabNames, setTabNames] = useState<Record<string, string>>({});
+  // The tab whose menu shows the name editor; gone with the menu.
+  const [tabRename, setTabRename] = useState<string | null>(null);
+  useEffect(() => { if (!tabMenu) setTabRename(null); }, [tabMenu]);
+  const tabLabel = (s: Session) => tabNames[s.id] ?? s.serverName;
+  const clearTabName = (sid: string) => setTabNames(prev => { const { [sid]: _, ...rest } = prev; return rest; });
   // Sessions merged into the current session-view canvas. When a session
   // tab is being viewed and this set is non-empty, its SessionView renders
   // side-by-side with each merged partner instead of full-width. Used by
@@ -282,6 +303,13 @@ function DesktopApp() {
   const [isKeyPanelOpen, setIsKeyPanelOpen] = useState(false);
   const [editKeyData, setEditKeyData] = useState<any>({ id: null, name: "", public_key: "", private_key: "", passphrase: "" });
   const [formError, setFormError] = useState("");
+  const commandPanelRef = useSlideOverFocus(isCommandPanelOpen);
+  const notePanelRef = useSlideOverFocus(isNotePanelOpen);
+  const credPanelRef = useSlideOverFocus(isCredPanelOpen);
+  const keyPanelRef = useSlideOverFocus(isKeyPanelOpen);
+  // A panel or modal over the app: everything behind it goes inert, so Tab
+  // can't walk into a server list or a terminal under the backdrop.
+  const overlayOpen = isPanelOpen || isQuickConnectOpen || isCommandPanelOpen || isNotePanelOpen || isCredPanelOpen || isKeyPanelOpen;
 
   const defaultNode = {
     id: null as number | null,
@@ -291,7 +319,7 @@ function DesktopApp() {
     // *after* they've saved a few credentials and want to reuse one.
     authType: "custom_pass", credentialId: "", folderId: "", keyId: "",
     proxyType: "none", proxyHost: "", proxyPort: 1080,
-    tunnels: [] as { local: string, remote: string, type: string }[],
+    tunnels: [] as { local: string, remote: string, type: string, name?: string, stopped?: boolean }[],
     autostart: false,
     mirrors: [] as { local: string, remote: string, soft_delete: boolean, excludes: string[], conflict_resolution: string }[],
     color: null as string | null,
@@ -337,6 +365,12 @@ function DesktopApp() {
     terminalScheme: readSchemeId(),
     terminalGpu: readGpu(),
     terminalMinContrast: readMinContrast(),
+    // Off by default: terminals start the remote account's own shell, same
+    // as before this setting existed. See util/terminalShell.
+    useLocalShell: readUseLocalShell(),
+    // On by default: logins may use keys from an ssh-agent on this computer.
+    // See util/sshAgent.
+    useSshAgent: readUseSshAgent(),
     // Auto-sync defaults ON. Per-device (localStorage), like the other prefs.
     autoSync: localStorage.getItem('submarine-auto-sync') !== 'off',
     // Background pull cadence in minutes (min 1). Only gates the periodic
@@ -365,6 +399,8 @@ function DesktopApp() {
     localStorage.setItem(SCHEME_KEY, appSettings.terminalScheme);
     localStorage.setItem(GPU_KEY, appSettings.terminalGpu ? 'on' : 'off');
     localStorage.setItem(MIN_CONTRAST_KEY, appSettings.terminalMinContrast ? 'on' : 'off');
+    localStorage.setItem(USE_LOCAL_SHELL_KEY, appSettings.useLocalShell ? 'on' : 'off');
+    localStorage.setItem(USE_SSH_AGENT_KEY, appSettings.useSshAgent ? 'on' : 'off');
     localStorage.setItem('submarine-auto-sync', appSettings.autoSync ? 'on' : 'off');
     localStorage.setItem('submarine-sync-interval-min', String(appSettings.syncIntervalMin));
     localStorage.setItem('submarine-detect-os', appSettings.detectOs ? 'on' : 'off');
@@ -404,6 +440,7 @@ function DesktopApp() {
       h = () => {
         setSessions(prev => prev.filter(s => s.id !== sessId));
         setSessionStatuses(prev => { const { [sessId]: _, ...rest } = prev; return rest; });
+        clearTabName(sessId);
         setActiveView(prev => (prev === sessId ? START_VIEW : prev));
         // If the closing session was merged as a side pane in another
         // session's canvas, drop it — otherwise the tile would render
@@ -443,6 +480,24 @@ function DesktopApp() {
     try { setServers((await invoke("get_servers")) as any[]); }
     catch (e) { addLog(`SYNC_SERVERS: ${e}`, "error"); }
   }, [addLog]);
+  // A session allowed something held for this device's OK (on-connect
+  // commands): the servers' `held` lists have changed.
+  useEffect(() => {
+    const onHeldChanged = () => { refreshServers(); };
+    window.addEventListener("submarine-held-changed", onHeldChanged);
+    return () => window.removeEventListener("submarine-held-changed", onHeldChanged);
+  }, [refreshServers]);
+  // Allow what this device holds back for a server (see the review dialog in
+  // the server list), then show the list as it now is.
+  const allowHeld = useCallback(async (serverId: number, items: string[]) => {
+    try {
+      await invoke("allow_held", { serverId, items });
+      addLog(items.length ? `Allowed ${items.length} held change${items.length === 1 ? "" : "s"}.` : "Allowed the held changes.", "success");
+    } catch (e) {
+      addLog(`ALLOW_FAILED: ${e}`, "error");
+    }
+    await refreshServers();
+  }, [addLog, refreshServers]);
   const refreshCredentials = useCallback(async () => {
     try { setCredentials((await invoke("get_credentials")) as any[]); }
     catch (e) { addLog(`SYNC_CREDENTIALS: ${e}`, "error"); }
@@ -484,6 +539,25 @@ function DesktopApp() {
     ]);
   };
 
+  // What a shared profile waits on the user for: a new key, as a fingerprint
+  // (until it's accepted a sync only pulls, see note_share_key), and
+  // deletions someone else's sync would have made here (see HeldDeletions).
+  const [shareKeyChange, setShareKeyChange] = useState<string | null>(null);
+  const [heldDeletions, setHeldDeletions] = useState<HeldDeletion[]>([]);
+  const refreshSharedState = useCallback(async () => {
+    try {
+      const s = await invoke<{ current: string | null; pending: string | null }>("share_key_state");
+      setShareKeyChange(s.pending);
+    } catch {
+      setShareKeyChange(null);
+    }
+    try {
+      setHeldDeletions(await invoke<HeldDeletion[]>("held_deletions_list"));
+    } catch {
+      setHeldDeletions([]);
+    }
+  }, []);
+
   // Per-entity sync of the currently-open profile, through the user's own
   // folder or repository (store_sync.rs) or Submarine Cloud: merges in what's
   // there and sends this computer's changes (Last-Write-Wins by HLC), all of
@@ -492,10 +566,14 @@ function DesktopApp() {
   const handleCloudSync = useCallback(async () => {
     setCloudSyncing(true);
     try {
-      const report = await invoke<{ pushed: number; pulled: number }>("sync_now");
+      const report = await invoke<{ pushed: number; pulled: number; key_change: boolean }>("sync_now");
       await refreshAll();
+      refreshSharedState();
       setLastSyncLabel(`Last synced ${new Date().toLocaleTimeString()}`);
       addLog(`Sync complete — sent ${report.pushed}, received ${report.pulled}.`, "success");
+      if (report.key_change) {
+        addLog("This shared profile's key has changed. Your changes aren't uploaded until you accept the new key (Servers → Review).", "info");
+      }
     } catch (e) {
       const msg = String(e);
       if (/NOT_SET_UP/.test(msg)) {
@@ -526,6 +604,22 @@ function DesktopApp() {
   const autoSyncBusy = useRef(false);
   const isUnlockedRef = useRef(isUnlocked);
   useEffect(() => { isUnlockedRef.current = isUnlocked; }, [isUnlocked]);
+  // What a shared profile still waits on from an earlier session shows on unlock.
+  useEffect(() => {
+    if (isUnlocked) refreshSharedState();
+    else { setShareKeyChange(null); setHeldDeletions([]); }
+  }, [isUnlocked, refreshSharedState]);
+  // The user compared the new key's fingerprint with the owner's: use it, and
+  // sync, which uploads again.
+  const acceptShareKey = useCallback(async () => {
+    try {
+      await invoke("accept_share_key");
+      addLog("This shared profile now uses its new key.", "success");
+    } catch (e) {
+      addLog(`Couldn't switch to the new key: ${e}`, "error");
+    }
+    await handleCloudSync();
+  }, [addLog, handleCloudSync]);
   // Mirror cloudSyncing into a ref so quietSync can see a manual sync in flight
   // WITHOUT depending on the state — otherwise every sync would toggle
   // cloudSyncing, change quietSync's identity, and tear down + restart the
@@ -548,8 +642,9 @@ function DesktopApp() {
     autoSyncBusy.current = true;
     setCloudSyncing(true);
     try {
-      const report = await invoke<{ pushed: number; pulled: number }>("sync_now");
+      const report = await invoke<{ pushed: number; pulled: number; key_change: boolean }>("sync_now");
       if (report.pulled > 0) await refreshAllRef.current();
+      refreshSharedState();
       setLastSyncLabel(`Last synced ${new Date().toLocaleTimeString()}`);
     } catch {
       // Silent by design — not signed in, offline, or a viewer with nothing to
@@ -565,6 +660,22 @@ function DesktopApp() {
     // interval effect isn't rebuilt on every sync.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // The user's call on deletions held in a shared profile (HeldDeletions):
+  // kept rows go out with the sync that follows, which brings them back for
+  // everyone (a viewer's stay on this device).
+  const resolveHeldDeletions = useCallback(async (deleteThem: boolean) => {
+    try {
+      const n = await invoke<number>("resolve_held_deletions", { deleteThem });
+      const s = n === 1 ? "" : "s";
+      addLog(deleteThem ? `Deleted ${n} item${s} here too.` : `Kept ${n} item${s}.`, "success");
+    } catch (e) {
+      addLog(`HELD_DELETIONS: ${e}`, "error");
+    }
+    await refreshAllRef.current();
+    await refreshSharedState();
+    if (!deleteThem) await handleCloudSync();
+  }, [addLog, handleCloudSync, refreshSharedState]);
 
   // After-edit push, debounced so a burst of edits collapses into one sync a few
   // seconds after the user stops. Mutation handlers call this.
@@ -624,6 +735,7 @@ function DesktopApp() {
   const removeServer = async (id: number) => {
     try {
       await invoke("delete_server", { id });
+      if (activeProfile) forgetServerBookmarks(activeProfile, id);
       refreshServers();
       bumpSync();
       addLog("Server removed.", "info");
@@ -631,8 +743,14 @@ function DesktopApp() {
   };
 
   const removeFolder = async (id: number) => {
+    // delete_folder takes its subfolders and every server in them along; note
+    // which servers go, for the same per-server cleanup removeServer does.
+    const tree = folderTree(folders);
+    const inside = tree.subtreeOf(id);
+    const gone: number[] = (servers || []).filter((s: any) => inside.has(tree.serverFolder(s) as number)).map((s: any) => s.id);
     try {
       await invoke("delete_folder", { id });
+      if (activeProfile) gone.forEach((sid) => forgetServerBookmarks(activeProfile, sid));
       // delete_folder cascades to the folders, servers and Remote Desktop
       // links inside it (lib.rs), so refresh all three.
       await Promise.all([refreshFolders(), refreshServers(), refreshRdpLinks()]);
@@ -741,7 +859,14 @@ function DesktopApp() {
     // each new SessionView component then kicks off its own connect on mount.
     try {
       const list = await invoke<any[]>("get_servers");
-      const toStart = list.filter((s) => s.autostart);
+      // Autostart someone else switched on in a shared profile waits for
+      // this device's OK (Servers → Review) instead of connecting by itself.
+      const isHeld = (s: any) => (s.held || []).includes("autostart");
+      const waiting = list.filter((s) => s.autostart && isHeld(s));
+      if (waiting.length > 0) {
+        addLog(`Autostart: ${waiting.map((s) => s.name).join(", ")} waiting for your OK (Servers → Review).`, "info");
+      }
+      const toStart = list.filter((s) => s.autostart && !isHeld(s));
       if (toStart.length === 0) return;
       const newSessions = toStart.map((s) => ({
         id: `session-${s.id}`,
@@ -749,6 +874,7 @@ function DesktopApp() {
         serverName: s.name,
         host: s.host,
         mirrors: s.mirrors,
+        serverUuid: s.uuid ?? null,
       }));
       setSessions((prev: any[]) => {
         const seen = new Set(prev.map((p) => p.id));
@@ -847,6 +973,7 @@ function DesktopApp() {
     setIsUnlocked(false);
     setActiveProfile(null);
     setSessions([]);
+    setTabNames({});
     setWalls([]);
     setSavedWalls([]);
     setActiveView(START_VIEW);
@@ -887,8 +1014,12 @@ function DesktopApp() {
     // MirrorsPanel can pre-populate "Saved on this node" without
     // another round-trip to the backend.
     mirrors: server.mirrors,
-    // Commands to auto-run once on the first terminal (see SessionView).
+    serverUuid: server.uuid ?? null,
+    // Commands typed into the first terminal on connect (see SessionView).
     runOnConnect: server.run_on_connect || "",
+    // Set or changed by someone this profile is shared with, not allowed
+    // here yet: SessionView asks before typing them.
+    runOnConnectHeld: (server.held || []).includes("run_on_connect"),
   });
   const openServers = (list: any[]) => {
     if (list.length === 0) return;
@@ -1353,7 +1484,7 @@ function DesktopApp() {
                     <span className="truncate flex-1 text-left text-[11px] font-bold">
                       {activeWall
                         ? `${activeWall.name} · ${activeWall.members.length}`
-                        : cur ? cur.serverName : `${sessions.length} open session${sessions.length === 1 ? '' : 's'}`}
+                        : cur ? tabLabel(cur) : `${sessions.length} open session${sessions.length === 1 ? '' : 's'}`}
                     </span>
                     {mergedSessionIds.length > 0 && (
                       <span className="shrink-0 h-4 px-1 rounded-full bg-primary/25 text-primary text-[9px] font-bold flex items-center gap-0.5">
@@ -1396,7 +1527,7 @@ function DesktopApp() {
                           }`}
                         >
                           <span className={`w-2 h-2 rounded-full shrink-0 ${dot}`} />
-                          <span className="text-[12px] font-semibold truncate flex-1">{s.serverName}</span>
+                          <span className="text-[12px] font-semibold truncate flex-1">{tabLabel(s)}</span>
                           {isMerged && !isActive && (
                             <span className="text-[9px] font-bold uppercase tracking-wider text-primary/60">Split-in</span>
                           )}
@@ -1437,6 +1568,7 @@ function DesktopApp() {
                             invoke('disconnect_session', { sessionId: sid }).catch(() => {});
                             setSessions(prev => prev.filter(x => x.id !== sid));
                             setSessionStatuses(prev => { const { [sid]: _, ...rest } = prev; return rest; });
+                            clearTabName(sid);
                             setMergedSessionIds(prev => {
                               const next = prev.filter(id => id !== sid);
                               return next.length < 2 ? [] : next;
@@ -1611,6 +1743,11 @@ function DesktopApp() {
                 e.preventDefault();
                 setTabMenu({ x: e.clientX, y: e.clientY, sessionId: s.id });
               }}
+              // A double-click opens the tab's menu with its name editor.
+              onDoubleClick={(e) => {
+                setTabMenu({ x: e.clientX, y: e.clientY, sessionId: s.id });
+                setTabRename(s.id);
+              }}
               // No max-width / no truncate: the user explicitly wants full
               // node names visible even when many sessions are open. The tab
               // row itself is horizontally scrollable (overflow-x-auto +
@@ -1619,7 +1756,7 @@ function DesktopApp() {
               // `whitespace-nowrap` keeps long names on a single line; without
               // it a tab with a 30-char hostname would wrap into a two-line
               // pill and break the row's height.
-              title={isMergedTab ? `${s.serverName} · split beside current view (Ctrl-click to unpair)` : s.serverName}
+              title={isMergedTab ? `${tabLabel(s)} · split beside current view (Ctrl-click to unpair)` : tabLabel(s)}
               className={`group no-drag flex items-center h-7 px-2.5 sm:px-4 rounded-full cursor-pointer transition-all shrink-0 mr-1 ${
                 activeView === s.id
                   ? 'bg-primary/15 text-primary border border-primary/40 shadow-inner shadow-primary/10'
@@ -1654,7 +1791,15 @@ function DesktopApp() {
                   the same tab pill roughly 30% more legible characters per
                   pixel (uppercase is wider per glyph) without changing the
                   strip height, which stays h-7. */}
-              <span className="text-[11px] font-semibold whitespace-nowrap tracking-tight">{s.serverName}</span>
+              {/* A button so the keyboard reaches the tab: its click bubbles
+                  to the tab's own handler (and a menu key opens its menu). */}
+              <button
+                type="button"
+                aria-current={activeView === s.id ? "page" : undefined}
+                className="text-[11px] font-semibold whitespace-nowrap tracking-tight rounded outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+              >
+                {tabLabel(s)}
+              </button>
               {/* Mobile-only actions trigger. On phone we surface the same
                   tabMenu (Reconnect / Disconnect / Close) here since there
                   is no right-click on touch — a single kebab is a cleaner
@@ -1672,14 +1817,14 @@ function DesktopApp() {
               >
                 <MoreVertical size={13} />
               </button>
-              {/* Desktop-only inline close. Hidden until hover so the tab
-                  reads clean at rest; sizing (w-5 h-5, 12 px icon) matches
-                  the terminal-tab close inside SessionView so both tab
-                  strips look like siblings. */}
+              {/* Desktop-only inline close. Hidden until hover (or keyboard
+                  focus) so the tab reads clean at rest; sizing (w-5 h-5,
+                  12 px icon) matches the terminal-tab close inside
+                  SessionView so both tab strips look like siblings. */}
               <button
                 type="button"
                 aria-label="Close session"
-                className="hidden sm:flex ml-1 h-5 w-5 items-center justify-center rounded hover:bg-white/5 shrink-0 opacity-0 group-hover:opacity-100 text-zinc-400 hover:text-red-400 transition-opacity"
+                className="hidden sm:flex ml-1 h-5 w-5 items-center justify-center rounded hover:bg-white/5 shrink-0 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 text-zinc-400 hover:text-red-400 transition-opacity"
                 onClick={async (e) => {
                   e.stopPropagation();
                   // Only confirm when there's an actual live connection to
@@ -1840,7 +1985,7 @@ function DesktopApp() {
             ? <Copy size={12} className="text-zinc-600 group-hover:text-zinc-300 scale-x-[-1]" />
             : <Square size={11} className="text-zinc-600 group-hover:text-zinc-300" />}
         </button>
-        <button onClick={() => appWindow.close()} className="w-10 h-full flex items-center justify-center hover:bg-red-500 group transition-all"><X size={14} className="text-zinc-600 group-hover:text-white" /></button>
+        <button title="Close" onClick={() => appWindow.close()} className="w-10 h-full flex items-center justify-center hover:bg-red-500 group transition-all"><X size={14} className="text-zinc-600 group-hover:text-white" /></button>
       </div>
       {tabMenu && (() => {
         const targetId = tabMenu.sessionId;
@@ -1856,11 +2001,33 @@ function DesktopApp() {
         const others = sessions.filter(s => s.id !== targetId);
         return (
         <>
-          <div className="fixed inset-0 z-[60]" onClick={() => setTabMenu(null)} onContextMenu={(e) => { e.preventDefault(); setTabMenu(null); }} />
+          <div className="fixed inset-0 z-[60]" onClick={() => { setTabMenu(null); setTabRename(null); }} onContextMenu={(e) => { e.preventDefault(); setTabMenu(null); setTabRename(null); }} />
           <div
             className="fixed z-[70] bg-[#15151a] border border-white/10 rounded-md shadow-2xl py-1 min-w-[240px] text-[11px] no-drag"
             style={{ left: Math.min(tabMenu.x, window.innerWidth - 260), top: Math.min(tabMenu.y, window.innerHeight - 380) }}
           >
+            {/* The tab's name. The editor opens inside this menu: Enter
+                keeps the name (an empty one goes back to the server's),
+                Esc goes back to the menu. */}
+            {tabRename === targetId ? (
+              <RenameInput
+                initialValue={tabNames[targetId] ?? sessions.find(s => s.id === targetId)?.serverName ?? ""}
+                placeholder="Tab name (empty: the server's)"
+                onCommit={(v) => {
+                  const name = v.trim();
+                  if (name) setTabNames(prev => ({ ...prev, [targetId]: name }));
+                  else clearTabName(targetId);
+                  setTabRename(null);
+                  setTabMenu(null);
+                }}
+                onCancel={() => setTabRename(null)}
+              />
+            ) : (
+              <button
+                className="w-full text-left px-3 py-1.5 hover:bg-primary/15 hover:text-primary text-zinc-200 flex items-center gap-2"
+                onClick={() => setTabRename(targetId)}
+              >Rename tab</button>
+            )}
             <button
               className="w-full text-left px-3 py-1.5 hover:bg-primary/15 hover:text-primary text-zinc-200 flex items-center gap-2"
               onClick={() => {
@@ -1980,7 +2147,7 @@ function DesktopApp() {
                           "bg-rose-500"
                         }`} />
                         <span className="truncate text-[11px] font-medium text-zinc-200 flex-1">
-                          {s.serverName}
+                          {tabLabel(s)}
                         </span>
                       </label>
                     );
@@ -1997,6 +2164,7 @@ function DesktopApp() {
                 invoke("disconnect_session", { sessionId: sid }).catch(() => {});
                 setSessions(prev => prev.filter(sess => sess.id !== sid));
                 setSessionStatuses(prev => { const { [sid]: _, ...rest } = prev; return rest; });
+                clearTabName(sid);
                 setMergedSessionIds(prev => {
                   const next = prev.filter(id => id !== sid);
                   return next.length < 2 ? [] : next;
@@ -2057,7 +2225,7 @@ function DesktopApp() {
         // renders at the bottom while staying first in DOM order — keyboard
         // tab-order stays intuitive and <main> grabs the full screen width
         // (terminal gains the ~50px the vertical rail used to eat).
-        <div className={`flex-1 flex ${isMobile ? 'flex-col-reverse' : ''} overflow-hidden pt-10`}>
+        <div inert={overlayOpen ? "" : undefined} className={`flex-1 flex ${isMobile ? 'flex-col-reverse' : ''} overflow-hidden pt-10`}>
           <Sidebar activeTab={activeView.startsWith('session-') ? 'nodes' : activeView} setActiveTab={setActiveView} isMobile={isMobile} onLogout={handleLogout} profileName={activeProfile} syncing={cloudSyncing} hasHome={HAS_HOME}
             treeOpen={treeOpen} onToggleTree={isMobile ? undefined : () => setTreeOpen((v) => !v)} />
           {!isMobile && treeOpen && treeSide === "left" && sessionTree}
@@ -2081,6 +2249,11 @@ function DesktopApp() {
                 // root grid's "Add server" card) stays at the empty default.
                 onAddClick={addServerIn}
                 onQuickConnect={() => setIsQuickConnectOpen(true)}
+                onAllowHeld={allowHeld}
+                keyChange={shareKeyChange}
+                onAcceptKey={acceptShareKey}
+                heldDeletions={heldDeletions}
+                onResolveDeletions={resolveHeldDeletions}
                 onRemoveServer={removeServer}
                 onRemoveFolder={removeFolder}
                 onRenameFolder={renameFolder}
@@ -2111,6 +2284,7 @@ function DesktopApp() {
               <SettingsPanel
                 settings={appSettings}
                 setSettings={setAppSettings}
+                servers={servers}
                 isMobile={isMobile}
                 onOpenLogs={() => setActiveView("logs")}
               />
@@ -2172,8 +2346,8 @@ function DesktopApp() {
                           <div key={c.id} className="bg-[#16161a] border border-white/5 rounded-xl p-3 group relative hover:border-primary/30 transition-all">
                             <div className="flex justify-between items-start mb-1">
                               <h4 className="text-[14px] font-bold text-zinc-100 truncate pr-8">{c.name}</h4>
-                              <div className="flex items-center gap-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity absolute right-3 top-3">
-                                <button onClick={async () => {
+                              <div className="flex items-center gap-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-has-[:focus-visible]:opacity-100 transition-opacity absolute right-3 top-3">
+                                <button aria-label={`Edit ${c.name}`} onClick={async () => {
                                   // Credentials list now ships `has_password` instead of plaintext;
                                   // pull the secret on demand for the edit sheet.
                                   let pw = "";
@@ -2184,7 +2358,7 @@ function DesktopApp() {
                                   setEditCredData({ ...c, password: pw });
                                   setIsCredPanelOpen(true);
                                 }} className="text-zinc-500 hover:text-white"><Edit2 size={14} /></button>
-                                <button onClick={async () => {
+                                <button aria-label={`Delete ${c.name}`} onClick={async () => {
                                   const ok = await confirm({ title: "Delete saved password?", message: `“${c.name}” will be removed. Servers using this login will lose it.`, destructive: true });
                                   if (!ok) return;
                                   invoke("delete_credential", { id: c.id }).then(() => { refreshCredentials(); bumpSync(); });
@@ -2217,8 +2391,8 @@ function DesktopApp() {
                           <div key={k.id} className="bg-[#16161a] border border-white/5 rounded-xl p-3 group relative hover:border-primary/30 transition-all">
                             <div className="flex justify-between items-start mb-1">
                               <h4 className="text-[14px] font-bold text-zinc-100 truncate pr-8">{k.name}</h4>
-                              <div className="flex items-center gap-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity absolute right-3 top-3">
-                                <button onClick={async () => {
+                              <div className="flex items-center gap-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-has-[:focus-visible]:opacity-100 transition-opacity absolute right-3 top-3">
+                                <button aria-label={`Edit ${k.name}`} onClick={async () => {
                                   // Same pattern as credentials — pull the private key + passphrase
                                   // on demand instead of leaking them in the list response.
                                   let secrets: { private_key?: string|null; passphrase?: string|null } = {};
@@ -2233,7 +2407,7 @@ function DesktopApp() {
                                   });
                                   setIsKeyPanelOpen(true);
                                 }} className="text-zinc-500 hover:text-white"><Edit2 size={14} /></button>
-                                <button onClick={async () => {
+                                <button aria-label={`Delete ${k.name}`} onClick={async () => {
                                   const ok = await confirm({ title: "Delete SSH key?", message: `“${k.name}” will be removed. This key cannot be recovered.`, destructive: true });
                                   if (!ok) return;
                                   invoke("delete_ssh_key", { id: k.id }).then(() => { refreshSshKeys(); bumpSync(); });
@@ -2288,8 +2462,12 @@ function DesktopApp() {
               const visibleIds = isTiled
                 ? mergedSessionIds.filter(id => sessions.some(s => s.id === id))
                 : (viewIsSession ? [activeView] : []);
+              // Sessions stay mounted behind the other views (and behind each
+              // other) so their terminals keep running: inert while hidden,
+              // or Tab could land in a terminal nobody can see and send what
+              // is typed next to its server.
               return (
-                <div className={`absolute inset-0 flex flex-col overflow-hidden ${!viewIsSession ? 'opacity-0 pointer-events-none' : ''}`}>
+                <div inert={viewIsSession ? undefined : ""} className={`absolute inset-0 flex flex-col overflow-hidden ${!viewIsSession ? 'opacity-0 pointer-events-none' : ''}`}>
                   <div className="flex-1 relative bg-black/40">
                     {sessions.map(sess => {
                       const idx = visibleIds.indexOf(sess.id);
@@ -2313,6 +2491,7 @@ function DesktopApp() {
                         <div
                           key={sess.id}
                           style={style}
+                          inert={isVisible ? undefined : ""}
                           onMouseDownCapture={() => {
                             // Focus shift ONLY — tile positions live in
                             // mergedSessionIds and must stay stable across
@@ -2355,7 +2534,7 @@ function DesktopApp() {
                                 'bg-rose-500'
                               }`} />
                               <span className="font-bold text-zinc-200 uppercase tracking-wider truncate flex-1">
-                                {sess.serverName}
+                                {tabLabel(sess)}
                               </span>
                               <button
                                 onClick={(e) => {
@@ -2374,15 +2553,18 @@ function DesktopApp() {
                             </div>
                           )}
                           <ErrorBoundary
-                            label={sess.serverName}
+                            label={tabLabel(sess)}
                             onReset={() => {
                               setSessions(prev => prev.filter(s => s.id !== sess.id));
+                              clearTabName(sess.id);
                               forgetSession(sess.id);
                               if (activeView === sess.id) setActiveView(START_VIEW);
                             }}
                           >
                             <SessionView
                               session={sess}
+                              profile={activeProfile}
+                              displayName={tabLabel(sess)}
                               onClose={getCloseHandler(sess.id)}
                               addLog={addLog}
                               onStatusChange={handleSessionStatus}
@@ -2578,9 +2760,9 @@ function DesktopApp() {
                           <div key={cmd.id} className="bg-[#16161a] border border-white/5 rounded-2xl p-4 flex flex-col group relative overflow-hidden shadow-inner h-[150px]">
                             <div className="flex justify-between items-start mb-2">
                               <h3 className="text-[16px] font-bold text-primary tracking-tight truncate flex-1">{cmd.title}</h3>
-                              <div className="flex items-center gap-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
-                                <button onClick={() => { setEditCommandData(cmd); setIsCommandPanelOpen(true); }} className="text-zinc-500 hover:text-white transition-colors"><Edit2 size={14} /></button>
-                                <button onClick={async () => {
+                              <div className="flex items-center gap-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-has-[:focus-visible]:opacity-100 transition-opacity">
+                                <button aria-label={`Edit ${cmd.title}`} onClick={() => { setEditCommandData(cmd); setIsCommandPanelOpen(true); }} className="text-zinc-500 hover:text-white transition-colors"><Edit2 size={14} /></button>
+                                <button aria-label={`Delete ${cmd.title}`} onClick={async () => {
                                   const ok = await confirm({ title: "Delete command?", message: `“${cmd.title}” will be removed.`, destructive: true });
                                   if (!ok) return;
                                   invoke("delete_command", { id: cmd.id }).then(() => { refreshCommands(); bumpSync(); });
@@ -2605,9 +2787,9 @@ function DesktopApp() {
                           <div key={n.id} className="bg-[#16161a] border border-white/5 rounded-2xl p-4 flex flex-col group relative overflow-hidden shadow-inner h-[170px]">
                             <div className="flex justify-between items-start mb-2 gap-2">
                               <h3 className="text-[15px] font-bold text-primary tracking-tight truncate flex-1">{n.title || "Untitled"}</h3>
-                              <div className="flex items-center gap-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity shrink-0">
-                                <button onClick={() => { setEditNoteData({ id: n.id, title: n.title || "", body: n.body || "" }); setIsNotePanelOpen(true); }} className="text-zinc-500 hover:text-white transition-colors"><Edit2 size={14} /></button>
-                                <button onClick={async () => {
+                              <div className="flex items-center gap-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-has-[:focus-visible]:opacity-100 transition-opacity shrink-0">
+                                <button aria-label={`Edit ${n.title || "Untitled"}`} onClick={() => { setEditNoteData({ id: n.id, title: n.title || "", body: n.body || "" }); setIsNotePanelOpen(true); }} className="text-zinc-500 hover:text-white transition-colors"><Edit2 size={14} /></button>
+                                <button aria-label={`Delete ${n.title || "Untitled"}`} onClick={async () => {
                                   const ok = await confirm({ title: "Delete note?", message: `“${n.title || "Untitled"}” will be removed.`, destructive: true });
                                   if (!ok) return;
                                   invoke("delete_note", { id: n.id }).then(() => { refreshNotes(); bumpSync(); });
@@ -2756,7 +2938,13 @@ function DesktopApp() {
               proxyType: newNode.proxyType || "none",
               proxyHost: newNode.proxyHost || "",
               proxyPort: newNode.proxyPort || 1080,
-              tunnels: newNode.tunnels || [],
+              // A forward's name is kept trimmed and a blank one not at all,
+              // as the Ports panel keeps it; "stopped" only when it is.
+              tunnels: (newNode.tunnels || []).map(({ name, stopped, ...t }: any) => ({
+                ...t,
+                ...(typeof name === "string" && name.trim() ? { name: name.trim() } : {}),
+                ...(stopped ? { stopped: true } : {}),
+              })),
               authType: newNode.authType,
               keyId: newNode.authType === "custom_key" && newNode.keyId ? parseInt(newNode.keyId) : null,
               autostart: !!newNode.autostart,
@@ -2833,14 +3021,16 @@ function DesktopApp() {
       />
 
 
-      <div className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isCommandPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsCommandPanelOpen(false)}>
-        <div className={`w-full max-w-[400px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col ${isCommandPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
+      {/* The slide-overs stay mounted while closed (to slide out): inert
+          then, so Tab can't reach their fields. */}
+      <div inert={isCommandPanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isCommandPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsCommandPanelOpen(false)}>
+        <div ref={commandPanelRef} tabIndex={-1} className={`w-full max-w-[400px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isCommandPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
             <h2 className="text-[15px] font-bold text-white tracking-tight flex items-center gap-2">
               <TerminalSquare size={18} className="text-primary" />
               {editCommandData.id ? "Edit command" : "New command"}
             </h2>
-            <button onClick={() => { setIsCommandPanelOpen(false); setFormError(""); }} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
+            <button aria-label="Close" onClick={() => { setIsCommandPanelOpen(false); setFormError(""); }} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
               <X size={16} />
             </button>
           </div>
@@ -2884,14 +3074,14 @@ function DesktopApp() {
         </div>
       </div>
 
-      <div className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isNotePanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsNotePanelOpen(false)}>
-        <div className={`w-full max-w-[480px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col ${isNotePanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
+      <div inert={isNotePanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isNotePanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsNotePanelOpen(false)}>
+        <div ref={notePanelRef} tabIndex={-1} className={`w-full max-w-[480px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isNotePanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
             <h2 className="text-[15px] font-bold text-white tracking-tight flex items-center gap-2">
               <StickyNote size={18} className="text-primary" />
               {editNoteData.id ? "Edit note" : "New note"}
             </h2>
-            <button onClick={() => { setIsNotePanelOpen(false); setFormError(""); }} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
+            <button aria-label="Close" onClick={() => { setIsNotePanelOpen(false); setFormError(""); }} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
               <X size={16} />
             </button>
           </div>
@@ -2935,14 +3125,14 @@ function DesktopApp() {
         </div>
       </div>
 
-      <div className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isCredPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsCredPanelOpen(false)}>
-        <div className={`w-full max-w-[400px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col ${isCredPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
+      <div inert={isCredPanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isCredPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsCredPanelOpen(false)}>
+        <div ref={credPanelRef} tabIndex={-1} className={`w-full max-w-[400px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isCredPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
             <h2 className="text-[15px] font-bold text-white tracking-tight flex items-center gap-2">
               <Shield size={18} className="text-primary" />
               {editCredData.id ? "Edit login" : "New login"}
             </h2>
-            <button onClick={() => { setIsCredPanelOpen(false); setFormError(""); }} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
+            <button aria-label="Close" onClick={() => { setIsCredPanelOpen(false); setFormError(""); }} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
               <X size={16} />
             </button>
           </div>
@@ -3038,14 +3228,14 @@ function DesktopApp() {
         </div>
       </div>
 
-      <div className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isKeyPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsKeyPanelOpen(false)}>
-        <div className={`w-full max-w-[450px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col ${isKeyPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
+      <div inert={isKeyPanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isKeyPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsKeyPanelOpen(false)}>
+        <div ref={keyPanelRef} tabIndex={-1} className={`w-full max-w-[450px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isKeyPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
             <h2 className="text-[15px] font-bold text-white tracking-tight flex items-center gap-2">
               <Key size={18} className="text-primary" />
               {editKeyData.id ? "Edit SSH key" : "New SSH key"}
             </h2>
-            <button onClick={() => { setIsKeyPanelOpen(false); setFormError(""); }} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
+            <button aria-label="Close" onClick={() => { setIsKeyPanelOpen(false); setFormError(""); }} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
               <X size={16} />
             </button>
           </div>

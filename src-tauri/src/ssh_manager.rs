@@ -54,18 +54,72 @@ pub fn plain_host_key(offered: &PublicKeyOrCertificate) -> Option<&PublicKey> {
     }
 }
 
+/// The kinds of host key (`key_type_family`) on file for host:port, so a
+/// connection can ask the server for those first (`prefer_known_host_keys`).
+pub(crate) fn known_host_families(conn: &rusqlite::Connection, host: &str, port: u16) -> Vec<String> {
+    let Ok(mut stmt) = conn.prepare("SELECT key_type FROM known_hosts WHERE host=?1 AND port=?2 AND key_type IS NOT NULL") else {
+        return Vec::new();
+    };
+    let mut families: Vec<String> = stmt
+        .query_map(rusqlite::params![host, port], |r| r.get::<_, String>(0))
+        .map(|rows| rows.filter_map(Result::ok).map(|kt| key_type_family(&kt)).collect())
+        .unwrap_or_default();
+    families.sort();
+    families.dedup();
+    families
+}
+
+/// What the keys on file for a host say about the one it offers.
+#[derive(Debug, PartialEq)]
+pub(crate) enum HostKeyVerdict {
+    /// On file: trusted.
+    Known,
+    /// Keys are on file for this host, and this isn't one of them: the
+    /// "changed" warning, with what was trusted before (each with its kind).
+    Changed { prior: Vec<String> },
+    /// Nothing on file: the first-time prompt.
+    New,
+}
+
+/// Any key on file for host:port that isn't the offered one makes it a change,
+/// whatever its kind. A connection asks for the kinds on file first
+/// (`prefer_known_host_keys`), so a server that still has its known key shows
+/// it; one that shows another kind instead has replaced it, or isn't the same
+/// server. Only the same kind used to count, so a man-in-the-middle without
+/// the pinned Ed25519 key got the ordinary first-time prompt by offering an
+/// ECDSA or RSA key.
+pub(crate) fn judge_host_key(
+    conn: &rusqlite::Connection,
+    host: &str,
+    port: u16,
+    fingerprint: &str,
+) -> rusqlite::Result<HostKeyVerdict> {
+    let mut stmt = conn.prepare("SELECT fingerprint, key_type FROM known_hosts WHERE host=?1 AND port=?2")?;
+    let rows = stmt.query_map(rusqlite::params![host, port], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+    })?;
+    let mut prior = Vec::new();
+    for row in rows {
+        let (saved_fp, saved_kt) = row?;
+        if saved_fp == fingerprint {
+            return Ok(HostKeyVerdict::Known);
+        }
+        prior.push(match saved_kt {
+            Some(kt) => format!("{saved_fp} ({kt})"),
+            None => saved_fp,
+        });
+    }
+    Ok(if prior.is_empty() { HostKeyVerdict::New } else { HostKeyVerdict::Changed { prior } })
+}
+
 /// Persist a host key the user just approved in the fingerprint prompt.
 ///
-/// When the prompt was a KEY-CHANGED warning (`replace_same_family`), every
-/// row of the same key FAMILY for this host:port — plus legacy rows with a
-/// NULL key_type, which the user is effectively re-confirming — is deleted
-/// first; otherwise the next connection would find the RETIRED fingerprint
-/// still trusted ("any row matches = trusted"), defeating the warning. The
-/// family match runs in Rust (`key_type_family`) rather than as
-/// `key_type = ?`: rows written before russh 0.63 spell an RSA key
-/// `rsa-sha2-512` / `rsa-sha2-256` while new ones say `ssh-rsa`, so an exact
-/// string match would keep the old RSA fingerprint trusted next to the new
-/// one. Trusted keys of OTHER families on this host stay put.
+/// When the prompt was a KEY-CHANGED warning (`replace`), every key on file
+/// for this host:port is deleted first, of whatever kind: the user has just
+/// said this is the server's identity now. Otherwise the next connection
+/// would find a RETIRED fingerprint still trusted ("any row matches =
+/// trusted"), defeating the warning, and a server whose old key leaked could
+/// be impersonated with it.
 ///
 /// All-or-nothing: manual BEGIN/COMMIT (we only hold `&Connection` through the
 /// mutex guard, not the `&mut Connection` rusqlite's `transaction()` needs),
@@ -78,33 +132,12 @@ fn save_approved_host_key(
     port: u16,
     fingerprint: &str,
     key_type: &str,
-    replace_same_family: bool,
+    replace: bool,
 ) -> rusqlite::Result<()> {
     let result: rusqlite::Result<()> = (|| {
         conn.execute("BEGIN", [])?;
-        if replace_same_family {
-            let family = key_type_family(key_type);
-            let stale: Vec<i64> = {
-                let mut stmt = conn.prepare("SELECT rowid, key_type FROM known_hosts WHERE host=?1 AND port=?2")?;
-                let rows = stmt.query_map(rusqlite::params![host, port], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
-                })?;
-                let mut ids = Vec::new();
-                for row in rows {
-                    let (id, saved_kt) = row?;
-                    let same_family = match saved_kt.as_deref() {
-                        Some(kt) => key_type_family(kt) == family,
-                        None => true,
-                    };
-                    if same_family {
-                        ids.push(id);
-                    }
-                }
-                ids
-            };
-            for id in stale {
-                conn.execute("DELETE FROM known_hosts WHERE rowid=?1", rusqlite::params![id])?;
-            }
+        if replace {
+            conn.execute("DELETE FROM known_hosts WHERE host=?1 AND port=?2", rusqlite::params![host, port])?;
         }
         conn.execute(
             "INSERT INTO known_hosts (host, port, fingerprint, key_type) VALUES (?1, ?2, ?3, ?4)",
@@ -126,13 +159,24 @@ pub async fn authenticate_with_key<H: client::Handler>(
     user: &str,
     key: PrivateKey,
 ) -> Result<bool, russh::Error> {
+    Ok(authenticate_with_key_result(session, user, key).await?.success())
+}
+
+/// [`authenticate_with_key`] with the server's full answer — the methods it
+/// still offers and whether the key was a partial success — so the caller can
+/// decide what to try next.
+pub async fn authenticate_with_key_result<H: client::Handler>(
+    session: &mut client::Handle<H>,
+    user: &str,
+    key: PrivateKey,
+) -> Result<client::AuthResult, russh::Error> {
     let hash_alg = if key.algorithm().is_rsa() {
         session.best_supported_rsa_hash().await?.flatten()
     } else {
         None
     };
     let key = PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg);
-    Ok(session.authenticate_publickey(user, key).await?.success())
+    session.authenticate_publickey(user, key).await
 }
 
 /// Password auth with the `bool` contract callers relied on under russh 0.40.
@@ -655,11 +699,9 @@ impl client::Handler for ClientHandler {
             self.fp_outcome.store(0, std::sync::atomic::Ordering::SeqCst);
             return Ok(false);
         };
-        // The key's own algorithm (`ssh-rsa` for any RSA key); compared with
-        // stored rows only through key_type_family.
+        // The key's own algorithm (`ssh-rsa` for any RSA key).
         let key_type = server_public_key.algorithm().to_string();
         let key_type = key_type.as_str();
-        let key_family = key_type_family(key_type);
         let fp_str = host_key_fingerprint(server_public_key);
 
         let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
@@ -667,87 +709,33 @@ impl client::Handler for ClientHandler {
             "type": "info"
         }));
 
-        // Look at every prior fingerprint we've recorded for this host:port.
-        // Outcomes:
-        //   - the offered fingerprint matches ANY stored row → trusted, proceed
-        //     (fingerprint identifies the key regardless of the algorithm label,
-        //     so this also recognizes a key offered under a different signature
-        //     name without re-prompting).
-        //   - no match, but a row for the SAME key FAMILY has a different
-        //     fingerprint → KEY CHANGED. Looks like an SSH MITM; warn loudly.
-        //     (key_type_family folds rsa-sha2-512 / rsa-sha2-256 / ssh-rsa
-        //     together: older rows carry the negotiated RSA signature name,
-        //     newer ones `ssh-rsa`, and a changed RSA key must still warn.)
-        //   - no match and only OTHER families are on file → the server no
-        //     longer offers the trusted key. A server that merely added an
-        //     ed25519 key beside its old rsa key doesn't get here: the client
-        //     asks for the trusted types first (ssh_preferred_for_host), so it
-        //     keeps presenting the old key. Prompted with the red "different
-        //     key type" warning (other_key_types), as OpenSSH warns.
-        // This mirrors OpenSSH's per-(host,keytype) known_hosts semantics.
-        let mut is_known = false;
-        let mut mismatch = false; // same key family, different fingerprint
-        let mut prior_fingerprints: Vec<String> = Vec::new();
-        // Key types trusted for this host other than the offered one's. A
-        // server that suddenly offers only a different type is rare; it is
-        // also how a man in the middle without the real key gets the mild
-        // first-time prompt instead of the CHANGED warning. OpenSSH warns
-        // about it too.
-        let mut other_key_types: Vec<String> = Vec::new();
-        // Read known_hosts in a SCOPED block — the std mutex guard mustn't
-        // cross any `.await` (the !Send guard would break the future's Send
-        // bound). A poisoned mutex sets `aborted` so we fail closed instead
-        // of silently treating it as "unknown host" (which would re-prompt
-        // the user and hide a possible MITM).
-        let mut aborted = false;
-        {
-            match self.db.lock() {
-                Ok(guard) => {
-                    if let Some(ref conn) = *guard {
-                        if let Ok(mut stmt) = conn.prepare("SELECT fingerprint, key_type FROM known_hosts WHERE host=?1 AND port=?2") {
-                            if let Ok(mut rows) = stmt.query(rusqlite::params![self.server_host, self.server_port]) {
-                                while let Some(row) = rows.next().ok().flatten() {
-                                    let saved_fp = row.get::<_, String>(0).ok();
-                                    let saved_kt = row.get::<_, Option<String>>(1).ok().flatten();
-                                    if let Some(saved_fp) = saved_fp {
-                                        if saved_fp == fp_str {
-                                            is_known = true;
-                                        } else {
-                                            // A different fingerprint is a "key CHANGED"
-                                            // event only when it's on file for the SAME
-                                            // key family. Legacy rows (NULL key_type) are
-                                            // treated as same-type so we never DOWNGRADE a
-                                            // genuine rotation of a pre-migration host to a
-                                            // benign first-time prompt.
-                                            let same_type = match saved_kt.as_deref() {
-                                                Some(kt) => key_type_family(kt) == key_family,
-                                                None => true,
-                                            };
-                                            if same_type {
-                                                mismatch = true;
-                                                prior_fingerprints.push(saved_fp);
-                                            } else if let Some(kt) = saved_kt {
-                                                if !other_key_types.contains(&kt) {
-                                                    other_key_types.push(kt);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(_) => { aborted = true; }
-            }
-        }
-        if aborted {
+        // Every key on file for this host:port (judge_host_key): the offered
+        // one among them → trusted; others on file but not it → KEY CHANGED,
+        // whatever their kind; nothing on file → the first-time prompt.
+        // Read in a SCOPED block — the std mutex guard mustn't cross any
+        // `.await` (the !Send guard would break the future's Send bound). A
+        // poisoned mutex or a failed lookup fails closed instead of silently
+        // treating the host as unknown (which would re-prompt the user and
+        // hide a possible MITM).
+        let verdict = match self.db.lock() {
+            Ok(guard) => match guard.as_ref() {
+                Some(conn) => judge_host_key(conn, &self.server_host, self.server_port, &fp_str).ok(),
+                None => Some(HostKeyVerdict::New),
+            },
+            Err(_) => None,
+        };
+        let Some(verdict) = verdict else {
             let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
-                "msg": "Host-key DB lock is poisoned — refusing connection. Restart the app.",
+                "msg": "Couldn't read the trusted host keys — refusing connection. Restart the app.",
                 "type": "error"
             }));
             return Ok(false);
-        }
+        };
+        let (is_known, mismatch, prior_fingerprints) = match verdict {
+            HostKeyVerdict::Known => (true, false, Vec::new()),
+            HostKeyVerdict::Changed { prior } => (false, true, prior),
+            HostKeyVerdict::New => (false, false, Vec::new()),
+        };
 
         if is_known {
             let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
@@ -791,14 +779,6 @@ impl client::Handler for ClientHandler {
             // SSH "REMOTE HOST IDENTIFICATION HAS CHANGED" moment.
             let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
                 "msg": "⚠ WARNING: Remote host key has CHANGED since you last connected. This could indicate a man-in-the-middle attack, or the server's host key was rotated. Verify out-of-band before accepting.",
-                "type": "error"
-            }));
-        } else if !other_key_types.is_empty() {
-            let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
-                "msg": format!(
-                    "⚠ WARNING: This host is trusted with a {} key, but now offers only a {} key. Servers rarely change key type; verify out-of-band before accepting.",
-                    other_key_types.join(" / "), key_type
-                ),
                 "type": "error"
             }));
         } else {
@@ -867,7 +847,6 @@ impl client::Handler for ClientHandler {
             "fingerprint": fp_str,
             "mismatch": mismatch,
             "priorFingerprints": prior_fingerprints,
-            "otherKeyTypes": other_key_types,
             // Frontend MUST echo this back via verify_fingerprint_response.
             // Without it the response is rejected. Defeats stale-channel /
             // session-id-guessing attacks against the TOFU prompt.
@@ -999,11 +978,26 @@ impl client::Handler for ClientHandler {
         let entry = self.forwarded_targets.lock().await.get(&connected_port).cloned();
         match entry {
             Some(entry) => {
-                // Spawn the bridge so we don't hold up russh's protocol task.
-                // `bridge_forwarded_channel` does the local connect, answers
-                // the open, then runs the always-drained bidirectional pump,
-                // plus bumps the tunnel's connection counter for the UI.
-                tokio::spawn(crate::tunnel::bridge_forwarded_channel(entry, channel, reply));
+                // Cap concurrent inbound bridges per R tunnel so a hostile or
+                // runaway server can't exhaust us (tasks, sockets, memory) by
+                // spamming forwarded-tcpip opens. try_acquire is non-blocking:
+                // at the cap we refuse the open rather than queue it (an
+                // unbounded queue is the same resource-exhaustion problem). The
+                // permit rides into the bridge and frees when the bridge ends.
+                match std::sync::Arc::clone(&entry.conn_limiter).try_acquire_owned() {
+                    Ok(permit) => {
+                        // Spawn the bridge so we don't hold up russh's protocol
+                        // task. `bridge_forwarded_channel` does the local
+                        // connect, answers the open, then runs the always-drained
+                        // bidirectional pump, plus bumps the tunnel's connection
+                        // counter for the UI.
+                        tokio::spawn(crate::tunnel::bridge_forwarded_channel(entry, channel, reply, permit));
+                    }
+                    Err(_) => {
+                        drop(channel);
+                        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+                    }
+                }
             }
             None => {
                 // No tunnel registered for this port — refuse the open. The
@@ -1013,6 +1007,91 @@ impl client::Handler for ClientHandler {
                 reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
             }
         }
+        Ok(())
+    }
+
+    // This is a client: the only channels it accepts are the ones it asked
+    // for (a shell, an exec, an SFTP subsystem) and the forwarded-tcpip opens
+    // for port forwards it set up (above). Every OTHER channel the server
+    // tries to open — a session, a direct or streamlocal forward, an X11 or
+    // agent forward, or anything unknown — is refused. russh's defaults
+    // ACCEPT these, and an accepted-then-dropped channel lets a hostile
+    // server keep opening channels the client tracks but never uses.
+    async fn server_channel_open_session(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_tcpip(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _host_to_connect: &str,
+        _port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_streamlocal(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _socket_path: &str,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_forwarded_streamlocal(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _socket_path: &str,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_x11(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_unknown(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
         Ok(())
     }
 
@@ -1247,12 +1326,12 @@ mod tests {
             .collect()
     }
 
-    /// B3: accepting a CHANGED RSA key must retire the old RSA fingerprint even
-    /// when it was pinned under a russh-0.40 signature name. The previous
-    /// `DELETE ... WHERE key_type=?3 OR key_type IS NULL` compared against
-    /// `ssh-rsa` and left the `rsa-sha2-*` rows — the old key stayed trusted.
+    /// B3: accepting a CHANGED key must retire every old fingerprint for the
+    /// host, the RSA ones pinned under a russh-0.40 signature name included
+    /// (once left trusted next to the new key) and those of other kinds: the
+    /// user has just said this is the server's identity now.
     #[test]
-    fn accepting_a_changed_rsa_key_retires_rows_pinned_under_old_rsa_names() {
+    fn accepting_a_changed_key_retires_every_key_on_file_for_the_host() {
         let conn = known_hosts_db(&[
             ("h", 22, "OLD_RSA_512", Some("rsa-sha2-512")),
             ("h", 22, "OLD_RSA_256", Some("rsa-sha2-256")),
@@ -1262,16 +1341,41 @@ mod tests {
             ("h", 2222, "OTHER_PORT", Some("ssh-rsa")),
         ]);
         save_approved_host_key(&conn, "h", 22, "NEW_RSA", "ssh-rsa", true).unwrap();
-        assert_eq!(
-            fingerprints(&conn, "h", 22),
-            vec![
-                ("ED".to_string(), Some("ssh-ed25519".to_string())),
-                ("NEW_RSA".to_string(), Some("ssh-rsa".to_string())),
-            ],
-            "same-family and NULL rows replaced, other families kept"
-        );
+        assert_eq!(fingerprints(&conn, "h", 22), vec![("NEW_RSA".to_string(), Some("ssh-rsa".to_string()))]);
         assert_eq!(fingerprints(&conn, "other", 22).len(), 1, "other hosts untouched");
         assert_eq!(fingerprints(&conn, "h", 2222).len(), 1, "other ports untouched");
+    }
+
+    // Any key on file that isn't the offered one makes it a change, whatever
+    // its kind: a man-in-the-middle without the pinned Ed25519 key used to get
+    // the first-time prompt by offering an ECDSA key. The keys trusted before
+    // come with their kinds; nothing on file is the first-time prompt.
+    #[test]
+    fn a_key_of_another_kind_is_a_change_too() {
+        let conn = known_hosts_db(&[
+            ("h", 22, "ED", Some("ssh-ed25519")),
+            ("h", 22, "LEGACY", None),
+            ("h", 2222, "OTHER_PORT", Some("ssh-rsa")),
+        ]);
+        assert_eq!(judge_host_key(&conn, "h", 22, "ED").unwrap(), HostKeyVerdict::Known);
+        assert_eq!(
+            judge_host_key(&conn, "h", 22, "ECDSA").unwrap(),
+            HostKeyVerdict::Changed { prior: vec!["ED (ssh-ed25519)".to_string(), "LEGACY".to_string()] }
+        );
+        assert_eq!(judge_host_key(&conn, "new", 22, "ECDSA").unwrap(), HostKeyVerdict::New);
+    }
+
+    #[test]
+    fn the_kinds_of_key_on_file_are_per_host_and_port() {
+        let conn = known_hosts_db(&[
+            ("h", 22, "A", Some("rsa-sha2-512")),
+            ("h", 22, "B", Some("ssh-rsa")),
+            ("h", 22, "C", Some("ecdsa-sha2-nistp256")),
+            ("h", 22, "D", None),
+            ("h", 2222, "E", Some("ssh-ed25519")),
+        ]);
+        assert_eq!(known_host_families(&conn, "h", 22), vec!["ecdsa-sha2-nistp256", "ssh-rsa"]);
+        assert!(known_host_families(&conn, "x", 22).is_empty());
     }
 
     #[test]
