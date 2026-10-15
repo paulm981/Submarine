@@ -3,9 +3,10 @@ import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { folderOptions } from "../util/folderPath";
 import { IS_ANDROID } from "../util/platform";
-import { Cpu, X, Link2, ArrowLeftRight, Shield, Key, User, FolderPlus, Download, CheckSquare, Square, History, Plus, Copy } from "lucide-react";
+import { Cpu, X, Link2, ArrowLeftRight, Shield, Key, User, FolderPlus, Download, CheckSquare, Square, History, Plus, Copy, Play } from "lucide-react";
 import PasswordField from "./PasswordField";
-import { useTextPrompt } from "../ui/confirm";
+import { useConfirm, useTextPrompt } from "../ui/confirm";
+import { useSlideOverFocus } from "../ui/slideOverFocus";
 import { SCHEMES, readSchemeId, schemeById } from "../ui/terminalThemes";
 import { SchemeSwatch } from "./TerminalSchemes";
 
@@ -96,6 +97,8 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
   const [generatedKey, setGeneratedKey] = useState<{ id: number; name: string; publicKey: string } | null>(null);
   const [publicKeyCopied, setPublicKeyCopied] = useState(false);
   const textPrompt = useTextPrompt();
+  const confirm = useConfirm();
+  const panelRef = useSlideOverFocus(isOpen);
 
   // The panel stays mounted and slides off-screen rather than unmounting, so
   // the note from the last key someone loaded would still be sitting there the
@@ -250,8 +253,31 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     const picked = importHosts.filter((h) => importSelected.has(rowKey(h)));
     const keysByPath = new Map<string, ImportedSshKey | null>();
     const keyFailures = new Map<string, string>();
+    // Key files from this computer, going into a shared profile, would sync
+    // to everyone it's shared with: ask first. The safe answer (Escape, or
+    // the focused button) imports the hosts without them.
+    const keyFiles = [
+      ...new Set(picked.flatMap((h) => [h.identity_file, h.jump_identity_file]).filter((p): p is string => !!p)),
+    ];
+    let withKeys = true;
+    if (keyFiles.length > 0) {
+      const shared = await invoke<{ current: string | null }>("share_key_state")
+        .then((s) => !!s.current)
+        .catch(() => false);
+      if (shared) {
+        withKeys = await confirm({
+          title: "Add your key files to a shared profile?",
+          message:
+            `This profile is shared. ${keyFiles.length === 1 ? "This private key" : "These private keys"} from this computer would go to everyone you share it with: ` +
+            `${keyFiles.join(", ")}. Import the hosts with ${keyFiles.length === 1 ? "it" : "them"}, or without (you can pick keys for them later)?`,
+          okLabel: "Import with keys",
+          cancelLabel: "Without keys",
+          safeDefault: true,
+        });
+      }
+    }
     const loadKey = async (path: string | null | undefined): Promise<ImportedSshKey | null> => {
-      if (!path) return null;
+      if (!path || !withKeys) return null;
       if (keysByPath.has(path)) return keysByPath.get(path) ?? null;
       let key: ImportedSshKey | null = null;
       try {
@@ -415,15 +441,17 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     }
   };
 
-  const updateTunnel = (idx: number, field: string, value: string) => {
+  const updateTunnel = (idx: number, field: string, value: string | boolean) => {
     const newT = [...newNode.tunnels];
     newT[idx][field] = value;
     setNewNode({ ...newNode, tunnels: newT });
   };
 
   return (
-    <div className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isOpen ? 'bg-black/60 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={onClose}>
-      <div className={`w-full ${isMobile ? 'max-w-full' : 'max-w-[450px]'} bg-background border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col ${isOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
+    // Mounted while closed too (to slide out): inert then, so Tab can't reach
+    // its fields.
+    <div inert={isOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isOpen ? 'bg-black/60 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={onClose}>
+      <div ref={panelRef} tabIndex={-1} className={`w-full ${isMobile ? 'max-w-full' : 'max-w-[450px]'} bg-background border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
 
         {/* Header */}
         <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
@@ -451,7 +479,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 <span className="sm:hidden">Import</span>
               </button>
             )}
-            <button onClick={onClose} className="w-8 h-8 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-xl transition-all shadow-inner">
+            <button aria-label="Close" onClick={onClose} className="w-8 h-8 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-xl transition-all shadow-inner">
               <X size={16} />
             </button>
           </div>
@@ -475,7 +503,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                     <option value="" className="bg-[#1a1a1e] text-zinc-500">-- Root --</option>
                     {folderOptions(folders || []).map((f) => <option key={f.id} value={f.id.toString()} className="bg-[#1a1a1e] text-white">{f.label}</option>)}
                   </select>
-                  <button onClick={() => setIsCreatingFolder(true)} className="w-9 h-9 bg-white/5 border border-white/10 rounded-lg text-primary hover:bg-white/10 transition-all flex items-center justify-center shrink-0">
+                  <button aria-label="New folder" onClick={() => setIsCreatingFolder(true)} className="w-9 h-9 bg-white/5 border border-white/10 rounded-lg text-primary hover:bg-white/10 transition-all flex items-center justify-center shrink-0">
                     <FolderPlus size={14} />
                   </button>
                 </div>
@@ -483,7 +511,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 <div className="flex gap-2 animate-in fade-in">
                   <input type="text" className="flex-1 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" placeholder={newNode.folderId ? "New folder inside the one picked…" : "Folder name…"} value={newFolderName} onChange={e => setNewFolderName(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleCreateFolder()} />
                   <button onClick={handleCreateFolder} className="h-9 px-3 bg-primary text-black font-bold text-[12px] rounded-lg hover:bg-primary transition-all">Add</button>
-                  <button onClick={() => setIsCreatingFolder(false)} className="w-9 h-9 bg-white/5 text-zinc-400 rounded-lg hover:bg-white/10 transition-all flex justify-center items-center shrink-0"><X size={14} /></button>
+                  <button aria-label="Cancel" onClick={() => setIsCreatingFolder(false)} className="w-9 h-9 bg-white/5 text-zinc-400 rounded-lg hover:bg-white/10 transition-all flex justify-center items-center shrink-0"><X size={14} /></button>
                 </div>
               )}
             </div>
@@ -715,45 +743,74 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                   // back to idx for legacy rows that lack it; new rows
                   // always carry rid so deletions / reorders preserve
                   // each input's focus and cursor state.
-                  <div key={t.rid ?? idx} className="flex items-center gap-2 p-2 bg-[#1a1a1e] rounded-lg border border-white/5 group transition-all hover:border-primary/30">
-                    <select
-                      className="bg-transparent text-[11px] font-black outline-none text-primary uppercase tracking-wider cursor-pointer pl-1"
-                      value={t.type}
-                      onChange={e => updateTunnel(idx, 'type', e.target.value)}
-                    >
-                      <option value="D" className="bg-[#1a1a1e] text-primary">Dynamic</option>
-                      <option value="L" className="bg-[#1a1a1e] text-primary">Local</option>
-                      <option value="R" className="bg-[#1a1a1e] text-primary">Remote</option>
-                    </select>
+                  <div key={t.rid ?? idx} className="p-2 bg-[#1a1a1e] rounded-lg border border-white/5 group transition-all hover:border-primary/30 space-y-1.5">
+                    <div className="flex items-center gap-2">
+                      <select
+                        className="bg-transparent text-[11px] font-black outline-none text-primary uppercase tracking-wider cursor-pointer pl-1"
+                        value={t.type}
+                        onChange={e => updateTunnel(idx, 'type', e.target.value)}
+                      >
+                        <option value="D" className="bg-[#1a1a1e] text-primary">Dynamic</option>
+                        <option value="L" className="bg-[#1a1a1e] text-primary">Local</option>
+                        <option value="R" className="bg-[#1a1a1e] text-primary">Remote</option>
+                      </select>
 
-                    <div className="h-4 w-px bg-white/10 mx-1" />
+                      <div className="h-4 w-px bg-white/10 mx-1" />
 
-                    <input
-                      className="flex-1 min-w-0 bg-transparent text-[12px] font-mono outline-none text-zinc-300 placeholder:text-zinc-700"
-                      placeholder={
-                        t.type === 'D' ? "Port (1080)" :
-                        t.type === 'R' ? "Server bind (8080 or 0.0.0.0:8080)" :
-                                         "Local (8080 or 0.0.0.0:8080)"
-                      }
-                      value={t.local}
-                      onChange={e => updateTunnel(idx, 'local', e.target.value)}
-                    />
+                      <input
+                        className="flex-1 min-w-0 bg-transparent text-[12px] font-mono outline-none text-zinc-300 placeholder:text-zinc-700"
+                        placeholder={
+                          t.type === 'D' ? "Port (1080)" :
+                          t.type === 'R' ? "Server bind (8080 or 0.0.0.0:8080)" :
+                                           "Local (8080 or 0.0.0.0:8080)"
+                        }
+                        value={t.local}
+                        onChange={e => updateTunnel(idx, 'local', e.target.value)}
+                      />
 
-                    {t.type !== 'D' && (
-                      <>
-                        <ArrowLeftRight size={10} className="text-zinc-700 shrink-0 mx-1" />
-                        <input
-                          className="flex-1 min-w-0 bg-transparent text-[12px] font-mono outline-none text-primary placeholder:text-zinc-700"
-                          placeholder="Remote (80)"
-                          value={t.remote}
-                          onChange={e => updateTunnel(idx, 'remote', e.target.value)}
-                        />
-                      </>
-                    )}
+                      {t.type !== 'D' && (
+                        <>
+                          <ArrowLeftRight size={10} className="text-zinc-700 shrink-0 mx-1" />
+                          <input
+                            className="flex-1 min-w-0 bg-transparent text-[12px] font-mono outline-none text-primary placeholder:text-zinc-700"
+                            placeholder="Remote (80)"
+                            value={t.remote}
+                            onChange={e => updateTunnel(idx, 'remote', e.target.value)}
+                          />
+                        </>
+                      )}
 
-                    <button onClick={() => setNewNode({ ...newNode, tunnels: newNode.tunnels.filter((_: any, i: number) => i !== idx) })} className="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 w-6 h-6 flex items-center justify-center text-red-500 hover:bg-red-500/10 rounded transition-all shrink-0">
-                      <X size={12} />
-                    </button>
+                      <button aria-label="Remove this forward" onClick={() => setNewNode({ ...newNode, tunnels: newNode.tunnels.filter((_: any, i: number) => i !== idx) })} className="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100 w-6 h-6 flex items-center justify-center text-red-500 hover:bg-red-500/10 rounded transition-all shrink-0">
+                        <X size={12} />
+                      </button>
+                    </div>
+                    {/* Its name, and whether it starts with the connection: a
+                        forward stopped in the Ports panel stays here, stopped. */}
+                    <div className="flex items-center gap-2 pl-1">
+                      <input
+                        className="flex-1 min-w-0 bg-transparent text-[11px] outline-none text-zinc-300 placeholder:text-zinc-700"
+                        placeholder="Name (optional)"
+                        aria-label="Forward name"
+                        maxLength={64}
+                        value={t.name ?? ""}
+                        onChange={e => updateTunnel(idx, 'name', e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => updateTunnel(idx, 'stopped', !t.stopped)}
+                        title={t.stopped
+                          ? "Kept, but not started on connect. Click to start it on connect."
+                          : "Started on connect. Click to keep it stopped."}
+                        className={`h-5 px-1.5 rounded text-[10px] font-bold uppercase tracking-wider flex items-center gap-1 shrink-0 transition-colors ${
+                          t.stopped
+                            ? "text-zinc-500 bg-white/5 hover:text-zinc-300"
+                            : "text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/20"
+                        }`}
+                      >
+                        {t.stopped ? <Square size={9} /> : <Play size={9} fill="currentColor" />}
+                        {t.stopped ? "Stopped" : "On connect"}
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -800,10 +857,10 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                           setNewNode({ ...newNode, mirrors: next });
                         }}
                       />
-                      <button
+                      <button aria-label="Remove this mirror"
                         type="button"
                         onClick={() => setNewNode({ ...newNode, mirrors: newNode.mirrors.filter((_: any, i: number) => i !== idx) })}
-                        className="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 w-6 h-6 flex items-center justify-center text-red-500 hover:bg-red-500/10 rounded transition-all shrink-0"
+                        className="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100 w-6 h-6 flex items-center justify-center text-red-500 hover:bg-red-500/10 rounded transition-all shrink-0"
                       >
                         <X size={12} />
                       </button>
@@ -868,6 +925,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 type="button"
                 onClick={() => setNewNode({ ...newNode, autostart: !newNode.autostart })}
                 role="switch"
+                aria-label="Autostart"
                 aria-checked={!!newNode.autostart}
                 className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${
                   newNode.autostart ? "bg-primary" : "bg-white/10"
@@ -993,7 +1051,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                   Import SSH hosts
                 </h3>
               </div>
-              <button
+              <button aria-label="Close"
                 onClick={closeImportModal}
                 disabled={importBusy}
                 className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-white/[0.04] border border-white/10 hover:bg-white/10 rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed"

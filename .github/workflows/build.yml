@@ -34,8 +34,11 @@ on:
         required: false
         default: "false"
 
+# Least privilege by default: the build and android jobs only read the repo.
+# Only the release job, which attaches artifacts to a GitHub Release, is given
+# `contents: write` (on the job itself, below).
 permissions:
-  contents: write
+  contents: read
 
 # A newer push to main replaces a build of main still running; a release
 # build is never cancelled.
@@ -102,11 +105,14 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
-      # All of main's history: the build number is its commit count
-      # (src-tauri/build.rs), and a shallow clone can't count it.
       - uses: actions/checkout@v4
+        # All of main's history: the build number is its commit count
+        # (src-tauri/build.rs), and a shallow clone can't count it. Don't
+        # leave the checkout token in .git/config where a later build step (or
+        # a compromised dependency) could use it — nothing here pushes.
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       # A build is the build of main or a release, never both: a build of
       # main marked as a release too leaves its commit out, and its update
@@ -127,13 +133,25 @@ jobs:
       # is exposed to later steps via $GITHUB_ENV.
       - name: Resolve version
         shell: bash
+        # The version comes in through the environment, not spliced into the
+        # script with ${{ }} — a value like `; rm -rf …` would otherwise run
+        # as part of this step. It's then checked against a version shape
+        # before it's used to stamp files.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           if [ "$SUBMARINE_BUILD" = "main" ]; then
             RAW="$(node -p "require('./src-tauri/tauri.conf.json').version")"
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            RAW="${{ github.event.inputs.version }}"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            RAW="$INPUT_VERSION"
           else
-            RAW="${{ github.ref_name }}"
+            RAW="$REF_NAME"
+          fi
+          if ! printf '%s' "$RAW" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]+)?$'; then
+            echo "Refusing an unexpected version string: $RAW" >&2
+            exit 1
           fi
           # Strip leading "v" — Cargo + Tauri want bare semver.
           VERSION="${RAW#v}"
@@ -378,14 +396,26 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        # Nothing here pushes — see the build job.
+        with:
+          persist-credentials: false
 
       - name: Resolve version
         shell: bash
+        # Through the environment and checked for shape — see the build job.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            RAW="${{ github.event.inputs.version }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            RAW="$INPUT_VERSION"
           else
-            RAW="${{ github.ref_name }}"
+            RAW="$REF_NAME"
+          fi
+          if ! printf '%s' "$RAW" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]+)?$'; then
+            echo "Refusing an unexpected version string: $RAW" >&2
+            exit 1
           fi
           VERSION="${RAW#v}"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
@@ -573,6 +603,10 @@ jobs:
       !cancelled() && needs.build.result == 'success'
       && (needs.android.result == 'success' || needs.android.result == 'skipped')
       && (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.publish_release == 'true')
+    # Only this job and `latest` write: they attach the built artifacts to a
+    # Release.
+    permissions:
+      contents: write
     steps:
       # Resolve the tag string used for the GitHub Release. For tag pushes
       # this is github.ref_name (already "vX.Y.Z"). For workflow_dispatch,
@@ -584,11 +618,20 @@ jobs:
       - name: Resolve release tag
         id: tag
         shell: bash
+        # Through the environment and checked for shape — see the build job.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            RAW="${{ github.event.inputs.version }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            RAW="$INPUT_VERSION"
           else
-            RAW="${{ github.ref_name }}"
+            RAW="$REF_NAME"
+          fi
+          if ! printf '%s' "$RAW" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]+)?$'; then
+            echo "Refusing an unexpected version string: $RAW" >&2
+            exit 1
           fi
           case "$RAW" in v*) TAG="$RAW";; *) TAG="v$RAW";; esac
           echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
@@ -633,11 +676,15 @@ jobs:
     # Also when another platform's build failed: the Windows build still goes
     # out. Never without it (see "Name the files").
     if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    # Replaces the latest-main pre-release (see the top: the default is read).
+    permissions:
+      contents: write
     steps:
       # For the build number, counted as build.rs counts it.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4

@@ -994,7 +994,7 @@ async fn sync_open(app: &tauri::AppHandle, db: &DbState, open: &Open) -> Result<
             if let Some(salt) = &ex.key_salt {
                 record_key_salt(db, open, salt).await?;
             }
-            Ok(SyncReport { pushed: ex.pushed, pulled: ex.pulled })
+            Ok(SyncReport { pushed: ex.pushed, pulled: ex.pulled, key_change: false })
         }
         Kind::Git => {
             let repo = Repo::for_store(app, &open.linked.store)?;
@@ -1011,7 +1011,7 @@ async fn sync_open(app: &tauri::AppHandle, db: &DbState, open: &Open) -> Result<
                         if let Some(salt) = &ex.key_salt {
                             record_key_salt(db, open, salt).await?;
                         }
-                        return Ok(SyncReport { pushed: ex.pushed, pulled });
+                        return Ok(SyncReport { pushed: ex.pushed, pulled, key_change: false });
                     }
                 }
             }
@@ -1287,14 +1287,18 @@ pub async fn store_restore_profile(
     *db_state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(local_name.clone());
     // No strength floor: the key file just proved this is the profile's
     // real password.
-    if let Err(e) = crate::setup_master_db_inner(app.clone(), password, app.state::<DbState>(), false).await {
-        crate::discard_half_built_profile(&app, &local_name);
-        return Err(e);
-    }
+    let opened = match crate::setup_master_db_inner(app.clone(), password, app.state::<DbState>(), false).await {
+        Ok(generation) => generation,
+        Err(e) => {
+            crate::discard_half_built_profile(&app, &local_name, None);
+            return Err(e);
+        }
+    };
     let res = async {
         {
             let conn_g = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
             let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
+            db_state.still_open(opened)?;
             meta_set(conn, "dek", &hex::encode(*key))?;
             link(conn, &Linked { store, profile_id })?;
         }
@@ -1305,7 +1309,7 @@ pub async fn store_restore_profile(
     }
     .await;
     if res.is_err() {
-        crate::discard_half_built_profile(&app, &local_name);
+        crate::discard_half_built_profile(&app, &local_name, Some(opened));
     }
     res
 }
