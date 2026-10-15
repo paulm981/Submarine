@@ -78,6 +78,7 @@ const TerminalView = ({
   terminalId,
   disabled = false,
   isActive = true,
+  visible,
   isActiveView = false,
   focusSignal = 0,
   containerExec,
@@ -96,6 +97,10 @@ const TerminalView = ({
   /// the parent's display/opacity change and the prompt appears garbled
   /// until the user types something.
   isActive?: boolean;
+  /// On screen, whether or not it's the one being typed in — a split pane
+  /// beside the focused one. It refits to its pane when that resizes.
+  /// Defaults to `isActive`.
+  visible?: boolean;
   /// True only when this terminal's SessionView is the frontmost server
   /// tab (DesktopApp's active view). Auto-focus is gated on this so a
   /// background session — or one shown in a Wall — never steals the
@@ -187,6 +192,10 @@ const TerminalView = ({
   useEffect(() => {
     isActiveRef.current = isActive;
   }, [isActive]);
+  const visibleRef = useRef(visible ?? isActive);
+  useEffect(() => {
+    visibleRef.current = visible ?? isActive;
+  }, [visible, isActive]);
   // While a Wall shows this terminal (src/ui/terminalDock.ts) its xterm sits
   // in the Wall's tile, on screen whatever this tab is doing — so it refits
   // to the tile even when it isn't the tab's active terminal.
@@ -423,6 +432,20 @@ const TerminalView = ({
     });
     return () => cancelAnimationFrame(id);
   }, [isActive]);
+
+  // Same repaint for a pane that came on screen without the keyboard (a
+  // split pane beside the focused one): refit and redraw, don't focus.
+  useEffect(() => {
+    if (!visible || isActive) return;
+    const id = requestAnimationFrame(() => {
+      try {
+        fitAddonRef.current?.fit();
+        const t = xtermRef.current;
+        if (t) t.refresh(0, Math.max(0, t.rows - 1));
+      } catch { /* not laid out yet — the ResizeObserver refits */ }
+    });
+    return () => cancelAnimationFrame(id);
+  }, [visible, isActive]);
 
   // Parent-driven re-focus. The effect above only fires when the ACTIVE
   // terminal CHANGES (isActive false→true); this handles the selections
@@ -995,7 +1018,7 @@ const TerminalView = ({
     // so SIGWINCH doesn't leak to background PTYs (the become-visible
     // effect refits when the tab is shown again).
     let rafId = 0;
-    const onScreen = () => isActiveRef.current || dockedRef.current;
+    const onScreen = () => isActiveRef.current || visibleRef.current || dockedRef.current;
     const resizeObserver = new ResizeObserver(() => {
       if (!xtermRef.current) return;
       if (!onScreen()) return;

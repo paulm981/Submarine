@@ -18,8 +18,8 @@ import { readClipboardText } from "../util/clipboard";
 //   • typing goes to every terminal that can take it — a hidden terminal of
 //     the Wall's own holds the keyboard and hands each key to all of them;
 //   • clicking into one tile types to that one only (to fix one, stop one,
-//     answer one); clicking the bar or the space between tiles types to all
-//     again;
+//     answer one); "Type to all" on the bar, the ✕ on that tile's "Only this
+//     one", or a click on the bar or between the tiles types to all again;
 //   • a paused terminal (its chip, or Ctrl+Shift+P) is left out until it's
 //     resumed; one that isn't connected drops out, and is back in as soon as
 //     it reconnects;
@@ -360,22 +360,19 @@ export const WallView = ({
         </button>
 
         {wall.broadcast && (
-          parked && !solo ? (
-            <button
-              onClick={backToAll}
-              title="Click to type to all of them"
-              className="text-[10.5px] font-semibold text-zinc-300 hover:text-white truncate max-w-[320px]"
-            >
-              Not typing anywhere — click a terminal, or here to type to all
-            </button>
-          ) : solo ? (
-            <button
-              onClick={backToAll}
-              title="Click to type to all of them again"
-              className="text-[10.5px] font-semibold text-primary hover:text-white truncate max-w-[320px]"
-            >
-              Typing to {soloName ?? "one terminal"} only — click here to type to all
-            </button>
+          parked || solo ? (
+            <>
+              <span className="text-[10.5px] font-semibold text-primary truncate max-w-[260px]">
+                {solo ? `Typing to ${soloName ?? "one terminal"} only` : "Not typing anywhere"}
+              </span>
+              <button
+                onClick={backToAll}
+                title="Type to all of them again"
+                className={`${btn} bg-primary/15 border-primary/40 text-primary hover:bg-primary/25 hover:text-white`}
+              >
+                <Radio size={11} /> Type to all
+              </button>
+            </>
           ) : (
             <span className="text-[10.5px] font-semibold text-orange-300/90 shrink-0" title={leftOut || undefined}>
               Typing to all · {receiving.length} of {wall.members.length}
@@ -482,6 +479,7 @@ export const WallView = ({
                     setParked(false);
                     setSolo(m.terminalId);
                   }}
+                  onBackToAll={backToAll}
                   onHover={(on) => { hoveredRef.current = on ? m.terminalId : (hoveredRef.current === m.terminalId ? null : hoveredRef.current); }}
                   onPasteToAll={pasteClipboardToAll}
                   onTogglePause={() => togglePause(m.terminalId)}
@@ -518,7 +516,7 @@ export const WallView = ({
 // waiting on a prompt — the slot is covered by what the session is doing.
 const WallTile = ({
   member, name, closes, termTitle, status, waiting, broadcast, solo, paused,
-  onFocusIn, onHover, onPasteToAll, onTogglePause, onOpen, onRemove, onReconnect,
+  onFocusIn, onBackToAll, onHover, onPasteToAll, onTogglePause, onOpen, onRemove, onReconnect,
 }: {
   member: WallMember;
   name: string;
@@ -531,6 +529,7 @@ const WallTile = ({
   solo: string | null;
   paused: boolean;
   onFocusIn: () => void;
+  onBackToAll: () => void;
   onHover: (on: boolean) => void;
   onPasteToAll: () => void;
   onTogglePause: () => void;
@@ -571,7 +570,15 @@ const WallTile = ({
         <span title={dot.title} className={`w-1.5 h-1.5 rounded-full shrink-0 ${dot.tone}`} />
         <span className="font-bold text-zinc-200 truncate" title={name}>{name}</span>
         {termTitle && <span className="text-zinc-500 truncate">· {termTitle}</span>}
-        {isSolo && <span className="shrink-0 text-[9px] font-bold uppercase tracking-wider text-primary">Only this one</span>}
+        {isSolo && (
+          <button
+            onClick={onBackToAll}
+            title="Type to all of them again"
+            className="shrink-0 h-5 pl-1.5 pr-1 rounded flex items-center gap-1 text-[9px] font-bold uppercase tracking-wider text-primary bg-primary/10 border border-primary/30 hover:bg-primary/20 hover:text-white transition-colors"
+          >
+            Only this one <X size={10} />
+          </button>
+        )}
         <div className="flex-1" />
         {broadcast && (
           <button

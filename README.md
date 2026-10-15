@@ -35,7 +35,7 @@
 
 - **One window, many tools per server** — terminal, SFTP, tunnels, folder mirror, Docker, live server info, and a per-server command library, all as tabs around the same session
 - **Watch many servers at once** — session **split view** to tile any two sessions side-by-side, plus **Walls**: grids of terminals from any servers, saved by name, a whole folder opened as one
-- **Broadcast input (MultiExec)** — on a Wall, type once and every terminal gets it; click into one to type to it alone, pause the ones to leave out, paste or send a set of commands to all (Tmux `synchronize-panes` for cross-server)
+- **Broadcast input (MultiExec)** — on a Wall, type once and every terminal gets it; click into one to type to it alone (**Type to all** on the bar, or the ✕ on its tile, goes back), pause the ones to leave out, paste or send a set of commands to all (Tmux `synchronize-panes` for cross-server)
 - **Native and cross-platform** — Windows, macOS, Linux (`.deb` / `.rpm` / Arch / AppImage), and Android — same encrypted vault everywhere
 - **Zero-knowledge cloud sync** — profiles are Argon2id + AES-256-GCM sealed on your device before upload; the server (and everyone else) only sees ciphertext. Browser dashboard at [`api.sinaxhpm.com/account`](https://api.sinaxhpm.com/account/) to manage your account and stored profiles
 - **Docker manager** — containers, logs (live tail), stats, prune, and `docker exec` shells as first-class session tabs
@@ -105,7 +105,8 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 ### Terminal
 
 - Tabbed sessions per server and multiple shells per session
-- Full xterm.js 6 — true colour, ANSI 256, mouse support, drawn with the GPU (WebGL, falling back to the DOM), Unicode 11 widths so emoji and CJK line up
+- **Split** — the button next to + opens another shell on the same server beside the one you're in (watch a log in one, work in the other); right-click it to put an open tab beside this one or to stack them top and bottom
+- Full xterm.js 6 — true colour, ANSI 256, mouse support, drawn with the GPU on Windows (WebGL; a switch in Settings, off by default on macOS and Linux), Unicode 11 widths so emoji and CJK line up
 - **Color schemes** — Submarine's own plus Campbell, One Half, Solarized, Dracula, Nord, Tokyo Night, Catppuccin and Gruvbox (Settings › Terminal, with a live preview). A server can have **its own**, which syncs with it — e.g. a light scheme for production
 - **Keep text readable** — text a program colors too close to the background is lifted to a 4.5:1 contrast, as in VS Code
 - **Clickable links** — URLs in the output and OSC 8 hyperlinks open in your browser after a prompt
@@ -144,9 +145,10 @@ A read-only inspection pane for the active session — no terminal commands requ
 - **Overview** — hostname, OS, kernel, uptime, load average, CPU count, RAM / swap meters, disk usage per mount
 - **Network** — NICs (UP-first, with IPv4/IPv6 addresses and MAC), routing table, and **firewall rules** (`iptables` chains rendered per-chain with colored ACCEPT/DROP/REJECT badges; `nftables` raw view)
 - **Ports** — listening sockets via `ss -tulnp` (or `netstat` fallback) with PID and process name, protocol + state filters
-- **Services** — `systemctl` units with **Start / Stop / Restart** buttons (auto-retries with `sudo -n` on permission denied)
+- **Services** — `systemctl` units with **Start / Stop / Restart** buttons
+- **As root with sudo or dzdo** — a service action, a kill or firewall rules that need root run through `sudo` or `dzdo` (Centrify / Delinea). Without a password when the server allows it, else the panel asks once; the password is kept in memory for that tab only, and the tab's SFTP root mode shares it
 - All tabs **lazy-load on click** so opening Info doesn't fire five probes at once
-- Sudo permission errors surface a clear, actionable banner instead of a raw stderr dump
+- sudo / dzdo errors (wrong password, not allowed, requiretty) are explained in plain words instead of a raw stderr dump
 
 ### Docker Manager
 

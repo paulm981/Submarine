@@ -4791,6 +4791,7 @@ async fn close_profile(
         ssh.forwarded_targets.lock().await.remove(sid);
         ssh.sftp_sessions.lock().await.remove(sid);
         ssh.sftp_elevation.lock().await.remove(sid);
+        ssh.root_access.lock().await.remove(sid);
         ssh.connections.lock().await.remove(sid);
         for dir in [session_sftp_dir(sid), session_drag_dir(sid)].into_iter().flatten() {
             if dir.exists() {
@@ -4829,6 +4830,7 @@ async fn close_profile(
     ssh.forwarded_targets.lock().await.clear();
     ssh.sftp_sessions.lock().await.clear();
     ssh.sftp_elevation.lock().await.clear();
+    ssh.root_access.lock().await.clear();
     // Wipe every connect-time secret the user typed this profile (issue #30).
     ssh.prompted_secrets.lock().await.clear();
     ssh.connections.lock().await.clear();
@@ -11916,6 +11918,7 @@ async fn disconnect_session(
     // the in-memory sudo password.
     state.sftp_sessions.lock().await.remove(&session_id);
     state.sftp_elevation.lock().await.remove(&session_id);
+    state.root_access.lock().await.remove(&session_id);
     state.connections.lock().await.remove(&session_id);
     // Drop any ProxyJump bastion handle for this session — closes the jump
     // connection once the target it was carrying is gone.
@@ -12518,6 +12521,7 @@ async fn ssh_iptables_chain(
     session_id: String,
     table: String,
     chain: String,
+    password: Option<String>,
 ) -> Result<String, String> {
     // Locked table allow-list; anything not here is rejected. Matches what
     // the probe script iterates over, plus `security` which some hardened
@@ -12528,18 +12532,162 @@ async fn ssh_iptables_chain(
     if !is_safe_fw_ident(&chain) {
         return Err("invalid chain name".to_string());
     }
-    // Retry with `sudo -n` when the direct call comes back empty — mirrors
-    // the semantics of the summary probe so the expand behaves consistently
-    // on hosts where only root can read the ruleset. `-v` adds the per-rule
-    // `pkts`/`bytes` match-counter columns (human-readable K/M/G suffixes) so
-    // the operator can see how much traffic each rule has actually handled.
-    let cmd = format!(
-        "OUT=$(iptables -t {t} -n -v -L {c} --line-numbers 2>/dev/null); \
-if [ -z \"$OUT\" ]; then OUT=$(sudo -n iptables -t {t} -n -v -L {c} --line-numbers 2>/dev/null); fi; \
-printf '%s' \"$OUT\"",
-        t = table, c = chain
-    );
-    run_exec_capture(&state, &session_id, &cmd, 15).await
+    // As root when the direct call comes back empty (only root can read the
+    // ruleset on most hosts): run_as_root, sudo or dzdo. `-v` adds the
+    // per-rule `pkts`/`bytes` counters so the operator can see how much
+    // traffic each rule has actually handled.
+    let args = ["iptables", "-t", table.as_str(), "-n", "-v", "-L", chain.as_str(), "--line-numbers"]
+        .map(String::from);
+    if password.is_none() {
+        let direct = format!("{} 2>/dev/null", quote_args(&args));
+        let out = run_exec_capture(&state, &session_id, &direct, 15).await?;
+        if !out.trim().is_empty() {
+            return Ok(out);
+        }
+    }
+    let (_, out, _) = run_as_root(&state, &session_id, &args, password, 15).await?;
+    Ok(out)
+}
+
+/// The Network tab's firewall summary for a host where only root can read
+/// the rules (its probe printed `FW:iptables-denied` / `FW:nft-denied`): the
+/// same `FW:` header and rows the probe prints, from the rules read as root
+/// (run_as_root: sudo or dzdo, with `password` when the tool asked for one).
+#[tauri::command]
+async fn ssh_firewall_as_root(
+    state: tauri::State<'_, SshState>,
+    session_id: String,
+    engine: String,
+    password: Option<String>,
+) -> Result<String, String> {
+    match engine.as_str() {
+        "iptables" => {
+            let mut out = String::from("FW:iptables-sudo\n");
+            let mut password = password;
+            for table in ["filter", "nat", "mangle", "raw"] {
+                let args = ["iptables", "-t", table, "-S"].map(String::from);
+                let (code, rules, _) = run_as_root(&state, &session_id, &args, password.take(), 15).await?;
+                if code != 0 {
+                    // A table the kernel doesn't have is left out, as the
+                    // probe leaves it out; without `filter` there's nothing.
+                    if table == "filter" {
+                        return Err(format!("iptables: {}", rules.trim()));
+                    }
+                    continue;
+                }
+                out.push_str(&iptables_chain_summary(table, &rules));
+            }
+            Ok(out)
+        }
+        "nft" => {
+            let args = ["nft", "list", "ruleset"].map(String::from);
+            let (code, ruleset, _) = run_as_root(&state, &session_id, &args, password, 15).await?;
+            if code != 0 {
+                return Err(format!("nft: {}", ruleset.trim()));
+            }
+            Ok(format!("FW:nft-sudo\n{}", nft_chain_summary(&ruleset)))
+        }
+        _ => Err("invalid firewall engine".to_string()),
+    }
+}
+
+/// `table|chain|policy|count` for each chain in `iptables -t <table> -S`
+/// output, as the probe's awk prints them: `-P` is a built-in chain and its
+/// policy, `-N` a chain of the user's (policy `-`), `-A` one rule.
+fn iptables_chain_summary(table: &str, rules: &str) -> String {
+    let mut order: Vec<&str> = Vec::new();
+    let mut policy: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut count: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for line in rules.lines() {
+        let mut f = line.split_whitespace();
+        let (Some(op), Some(chain)) = (f.next(), f.next()) else { continue };
+        match op {
+            "-P" => {
+                policy.insert(chain, f.next().unwrap_or("-"));
+            }
+            "-N" => {
+                policy.entry(chain).or_insert("-");
+            }
+            "-A" => {
+                *count.entry(chain).or_default() += 1;
+                policy.entry(chain).or_insert("-");
+            }
+            _ => continue,
+        }
+        if !order.contains(&chain) {
+            order.push(chain);
+        }
+    }
+    order
+        .iter()
+        .map(|c| format!("{}|{}|{}|{}\n", table, c, policy.get(c).unwrap_or(&"-"), count.get(c).unwrap_or(&0)))
+        .collect()
+}
+
+/// `family|table|chain|type|count` for each chain in `nft list ruleset`
+/// output, as the probe's awk prints them: the chain's `type` (filter, nat,
+/// ...) and how many rules it holds.
+fn nft_chain_summary(ruleset: &str) -> String {
+    struct Chain<'a> {
+        name: &'a str,
+        kind: &'a str,
+        rules: usize,
+    }
+    fn flush(out: &mut String, family: &str, table: &str, chain: &mut Option<Chain>) {
+        if let Some(c) = chain.take() {
+            out.push_str(&format!("{}|{}|{}|{}|{}\n", family, table, c.name, c.kind, c.rules));
+        }
+    }
+    let (mut family, mut table) = ("", "");
+    let mut chain: Option<Chain> = None;
+    let mut out = String::new();
+    for line in ruleset.lines() {
+        if let Some(rest) = line.strip_prefix("table ") {
+            let mut f = rest.split_whitespace();
+            family = f.next().unwrap_or("");
+            table = f.next().unwrap_or("");
+            chain = None;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("\tchain ") {
+            chain = rest.split_whitespace().next().map(|name| Chain { name, kind: "", rules: 0 });
+            continue;
+        }
+        if ["\tset ", "\tmap ", "\tflowtable ", "\tct "].iter().any(|p| line.starts_with(p)) || line.starts_with("\t}") {
+            flush(&mut out, family, table, &mut chain);
+            continue;
+        }
+        let Some(c) = chain.as_mut() else { continue };
+        let mut f = line.split_whitespace();
+        match f.next() {
+            Some("type") => c.kind = f.next().unwrap_or(""),
+            Some("hook" | "policy" | "priority" | "flags" | "device") | None => {}
+            Some(_) => c.rules += 1,
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod firewall_summary_tests {
+    #[test]
+    fn iptables_rules_become_one_row_per_chain() {
+        let rules = "-P INPUT DROP\n-P FORWARD ACCEPT\n-N web\n-A INPUT -i lo -j ACCEPT\n-A INPUT -j web\n-A web -p tcp --dport 443 -j ACCEPT\n";
+        assert_eq!(
+            super::iptables_chain_summary("filter", rules),
+            "filter|INPUT|DROP|2\nfilter|FORWARD|ACCEPT|0\nfilter|web|-|1\n"
+        );
+        assert_eq!(super::iptables_chain_summary("nat", ""), "");
+    }
+
+    #[test]
+    fn an_nft_ruleset_becomes_one_row_per_chain() {
+        let ruleset = "table inet filter {\n\tset blocked {\n\t\ttype ipv4_addr\n\t}\n\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t\tct state established,related accept\n\t\ttcp dport 22 accept\n\t}\n\n\tchain mine {\n\t}\n}\ntable ip nat {\n\tchain postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;\n\t\tmasquerade\n\t}\n}\n";
+        assert_eq!(
+            super::nft_chain_summary(ruleset),
+            "inet|filter|input|filter|2\ninet|filter|mine||0\nip|nat|postrouting|nat|1\n"
+        );
+    }
 }
 
 #[tauri::command]
@@ -12549,6 +12697,7 @@ async fn ssh_nft_chain(
     family: String,
     table: String,
     chain: String,
+    password: Option<String>,
 ) -> Result<String, String> {
     if !matches!(family.as_str(), "ip" | "ip6" | "inet" | "arp" | "bridge" | "netdev") {
         return Err("invalid family".to_string());
@@ -12556,13 +12705,16 @@ async fn ssh_nft_chain(
     if !is_safe_fw_ident(&table) || !is_safe_fw_ident(&chain) {
         return Err("invalid table or chain name".to_string());
     }
-    let cmd = format!(
-        "OUT=$(nft list chain {f} {t} {c} 2>/dev/null); \
-if [ -z \"$OUT\" ]; then OUT=$(sudo -n nft list chain {f} {t} {c} 2>/dev/null); fi; \
-printf '%s' \"$OUT\"",
-        f = family, t = table, c = chain
-    );
-    run_exec_capture(&state, &session_id, &cmd, 15).await
+    let args = ["nft", "list", "chain", family.as_str(), table.as_str(), chain.as_str()].map(String::from);
+    if password.is_none() {
+        let direct = format!("{} 2>/dev/null", quote_args(&args));
+        let out = run_exec_capture(&state, &session_id, &direct, 15).await?;
+        if !out.trim().is_empty() {
+            return Ok(out);
+        }
+    }
+    let (_, out, _) = run_as_root(&state, &session_id, &args, password, 15).await?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -12629,6 +12781,8 @@ struct SystemctlActionResult {
     stdout: String,
     stderr: String,
     used_sudo: bool,
+    /// `sudo` or `dzdo` when it ran as root.
+    root_tool: Option<String>,
 }
 
 async fn run_exec_capture(
@@ -12681,12 +12835,190 @@ fn parse_exit_marker(raw: &str) -> (i32, String) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Root for the Info panel's actions (sudo / dzdo)
+// ---------------------------------------------------------------------------
+//
+// A service action, a kill or a firewall read that needs root goes through
+// sudo or dzdo, tried as SFTP root mode tries them (ELEVATION_TOOLS):
+// without a password first, then with the one the user types when the tool
+// asks. What worked is kept for the tab (SshState::root_access) — or taken
+// from the tab's SFTP root mode — so it's asked for once. Commands are fixed
+// words plus validated arguments; the password goes to the tool's stdin.
+
+/// The arguments as single-quoted shell words (a quote inside one closes the
+/// word, adds an escaped quote and reopens it). Every caller also validates
+/// them first: unit names, PIDs, firewall identifiers.
+fn quote_args(args: &[String]) -> String {
+    args.iter()
+        .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod quote_args_tests {
+    #[test]
+    fn each_argument_is_one_shell_word() {
+        let args = ["systemctl", "restart", "a b", "it's"].map(String::from);
+        assert_eq!(super::quote_args(&args), r#"'systemctl' 'restart' 'a b' 'it'\''s'"#);
+        // What a POSIX shell (the server's) makes of them.
+        if cfg!(unix) {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf '%s|' {}", super::quote_args(&args)))
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "systemctl|restart|a b|it's|");
+        }
+    }
+}
+
+/// Can `tool` run `args` as root on this server? `tool -l <command>` asks
+/// without running it, and also answers for sudoers rules scoped to one
+/// command. `Err` is a [SUDO] code (see classify_sudo_failure).
+async fn root_probe(session_arc: &SessionHandleArc, tool: &str, password: Option<&str>, args: &[String]) -> Result<(), String> {
+    // POSIX sh, as `sh -c '<script>' sh <args>`: no single quotes inside.
+    const SCRIPT: &str = r#"if command -v "$SUB_TOOL" >/dev/null 2>&1; then :; else echo __SUB_SUDO:NO_SUDO; exit 0; fi
+if [ "$SUB_MODE" = pw ]; then OUT=$("$SUB_TOOL" -S -k -p "" -l "$@" 2>&1); else OUT=$("$SUB_TOOL" -n -l "$@" 2>&1); fi
+if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s "$OUT" | tr "\n" " ")"; fi"#;
+    let mode = if password.is_some() { "pw" } else { "n" };
+    let cmd = format!("env SUB_MODE={} SUB_TOOL={} sh -c '{}' sh {}", mode, tool, SCRIPT, quote_args(args));
+    let stdin = password.map(|p| zeroize::Zeroizing::new(format!("{}\n", p)));
+    let out = exec_with_stdin_capture(session_arc, &cmd, stdin.as_ref().map(|s| s.as_bytes()), 20).await?;
+    for line in out.lines() {
+        match line.trim().strip_prefix("__SUB_SUDO:") {
+            Some("OK") => return Ok(()),
+            Some("NO_SUDO") => return Err(SUDO_NO_SUDO.into()),
+            Some(rest) => {
+                if let Some(msg) = rest.strip_prefix("FAIL:") {
+                    return Err(classify_sudo_failure(msg));
+                }
+            }
+            None => {}
+        }
+    }
+    Err(format!("{}: unexpected reply from the server", SUDO_FAILED))
+}
+
+/// Run `args` as root with `access`: the command's exit code and output.
+async fn root_run(session_arc: &SessionHandleArc, access: &ssh_manager::RootAccess, args: &[String], timeout_secs: u64) -> Result<(i32, String), String> {
+    const SCRIPT: &str = r#"if [ "$SUB_MODE" = pw ]; then "$SUB_TOOL" -S -k -p "" "$@" 2>&1; else "$SUB_TOOL" -n "$@" 2>&1; fi; echo __SUB_EXITCODE:$?"#;
+    let tool = if ELEVATION_TOOLS.contains(&access.tool) { access.tool } else { "sudo" };
+    let mode = if access.password.is_some() { "pw" } else { "n" };
+    let cmd = format!("env SUB_MODE={} SUB_TOOL={} sh -c '{}' sh {}", mode, tool, SCRIPT, quote_args(args));
+    let stdin = access.password.as_ref().map(|p| zeroize::Zeroizing::new(format!("{}\n", p.as_str())));
+    let out = exec_with_stdin_capture(session_arc, &cmd, stdin.as_ref().map(|s| s.as_bytes()), timeout_secs).await?;
+    Ok(parse_exit_marker(&out))
+}
+
+/// How this tab gets root for `args`: what it already has (its own, else its
+/// SFTP root mode's) when that still works, else the first tool that lets it
+/// — without a password, then with `password`. Kept for the tab. `Err` is a
+/// [SUDO] code; with NEED_PASSWORD or WRONG_PASSWORD the panel asks for the
+/// password and calls again with it.
+async fn root_access_for(
+    state: &SshState,
+    session_id: &str,
+    session_arc: &SessionHandleArc,
+    args: &[String],
+    password: Option<String>,
+) -> Result<ssh_manager::RootAccess, String> {
+    use ssh_manager::RootAccess;
+    let password = password.map(zeroize::Zeroizing::new).filter(|p| !p.is_empty());
+    if let Some(p) = &password {
+        if p.contains(['\n', '\r', '\0']) {
+            return Err(format!("{}: the password contains a line break", SUDO_FAILED));
+        }
+    }
+    let keep = |a: &RootAccess| {
+        let a = a.clone();
+        async move { state.root_access.lock().await.insert(session_id.to_string(), a) }
+    };
+    // A typed password means what the tab had stopped working: start over.
+    if password.is_none() {
+        let own = state.root_access.lock().await.get(session_id).cloned();
+        let known = match own {
+            Some(a) => Some(a),
+            None => state
+                .sftp_elevation
+                .lock()
+                .await
+                .get(session_id)
+                .map(|e| RootAccess { tool: e.tool, password: e.password.clone() }),
+        };
+        if let Some(a) = known {
+            if root_probe(session_arc, a.tool, a.password.as_deref().map(|s| s.as_str()), args).await.is_ok() {
+                keep(&a).await;
+                return Ok(a);
+            }
+            // The kept password no longer works, or this tool doesn't allow
+            // this command (a sudoers rule for sftp-server only, say): forget
+            // it and look again.
+            state.root_access.lock().await.remove(session_id);
+        }
+    }
+    let mut best: Option<String> = None;
+    for tool in ELEVATION_TOOLS {
+        match root_probe(session_arc, tool, None, args).await {
+            Ok(()) => {
+                let a = RootAccess { tool, password: None };
+                keep(&a).await;
+                return Ok(a);
+            }
+            Err(e) => {
+                if best.as_deref().is_none_or(|b| elevation_error_rank(&e) > elevation_error_rank(b)) {
+                    best = Some(e);
+                }
+            }
+        }
+    }
+    let best = best.unwrap_or_else(|| SUDO_NO_SUDO.into());
+    let Some(pw) = password else { return Err(best) };
+    if best != SUDO_NEED_PASSWORD {
+        return Err(best);
+    }
+    // As SFTP root mode: a tool that isn't there or doesn't allow the user
+    // hands over to the next; a wrong password ends it (one failed attempt,
+    // not one per tool).
+    for tool in ELEVATION_TOOLS {
+        match root_probe(session_arc, tool, Some(pw.as_str()), args).await {
+            Ok(()) => {
+                let a = RootAccess { tool, password: Some(pw) };
+                keep(&a).await;
+                return Ok(a);
+            }
+            Err(e) if e == SUDO_NO_SUDO || e == SUDO_NOT_ALLOWED => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(SUDO_NOT_ALLOWED.into())
+}
+
+/// Run `args` as root on this tab's server: exit code, output, and the tool.
+async fn run_as_root(
+    state: &SshState,
+    session_id: &str,
+    args: &[String],
+    password: Option<String>,
+    timeout_secs: u64,
+) -> Result<(i32, String, &'static str), String> {
+    let session_arc = {
+        let connections = state.connections.lock().await;
+        connections.get(session_id).map(Arc::clone).ok_or_else(|| "Session not connected".to_string())?
+    };
+    let access = root_access_for(state, session_id, &session_arc, args, password).await?;
+    let (code, out) = root_run(&session_arc, &access, args, timeout_secs).await?;
+    Ok((code, out, access.tool))
+}
+
 #[tauri::command]
 async fn ssh_systemctl_action(
     state: tauri::State<'_, SshState>,
     session_id: String,
     unit: String,
     action: String,
+    password: Option<String>,
 ) -> Result<SystemctlActionResult, String> {
     // Locked allow-list. Anything not in this list is rejected outright
     // — we never want to dispatch arbitrary subcommands from the UI.
@@ -12701,40 +13033,41 @@ async fn ssh_systemctl_action(
         return Err("invalid unit name".to_string());
     }
 
-    // Try plain systemctl first (works if user is root or has polkit rules).
-    // If that fails with permission-denied semantics, retry with `sudo -n` —
-    // works on hosts that gave this user NOPASSWD sudo. The `-n` ensures we
-    // never block on a tty password prompt that nobody can answer.
-    let plain_cmd = format!("systemctl {} {} 2>&1; echo __SUB_EXITCODE:$?", action, unit);
-    let raw1 = run_exec_capture(&state, &session_id, &plain_cmd, 30).await?;
-    let (code1, out1) = parse_exit_marker(&raw1);
-    let needs_sudo = code1 != 0 && (
-        out1.contains("Interactive authentication required")
-        || out1.contains("not authorized")
-        || out1.contains("polkit")
-        || out1.to_lowercase().contains("permission denied")
-        || out1.to_lowercase().contains("access denied")
-    );
-
-    if code1 == 0 || !needs_sudo {
-        return Ok(SystemctlActionResult {
-            success: code1 == 0,
-            exit_code: code1,
-            stdout: out1,
-            stderr: String::new(),
-            used_sudo: false,
-        });
+    // Plain systemctl first (the user is root, or polkit allows it). On a
+    // permission error it runs as root (run_as_root: sudo or dzdo, asking for
+    // a password when they need one). A call with `password` is that second
+    // try, so it goes straight to root.
+    if password.is_none() {
+        let plain_cmd = format!("systemctl {} '{}' 2>&1; echo __SUB_EXITCODE:$?", action, unit);
+        let raw1 = run_exec_capture(&state, &session_id, &plain_cmd, 30).await?;
+        let (code1, out1) = parse_exit_marker(&raw1);
+        let needs_root = code1 != 0 && (
+            out1.contains("Interactive authentication required")
+            || out1.contains("not authorized")
+            || out1.contains("polkit")
+            || out1.to_lowercase().contains("permission denied")
+            || out1.to_lowercase().contains("access denied")
+        );
+        if code1 == 0 || !needs_root {
+            return Ok(SystemctlActionResult {
+                success: code1 == 0,
+                exit_code: code1,
+                stdout: out1,
+                stderr: String::new(),
+                used_sudo: false,
+                root_tool: None,
+            });
+        }
     }
-
-    let sudo_cmd = format!("sudo -n systemctl {} {} 2>&1; echo __SUB_EXITCODE:$?", action, unit);
-    let raw2 = run_exec_capture(&state, &session_id, &sudo_cmd, 30).await?;
-    let (code2, out2) = parse_exit_marker(&raw2);
+    let args = ["systemctl".to_string(), action, unit];
+    let (code, out, tool) = run_as_root(&state, &session_id, &args, password, 30).await?;
     Ok(SystemctlActionResult {
-        success: code2 == 0,
-        exit_code: code2,
-        stdout: out2,
+        success: code == 0,
+        exit_code: code,
+        stdout: out,
         stderr: String::new(),
         used_sudo: true,
+        root_tool: Some(tool.to_string()),
     })
 }
 
@@ -12749,6 +13082,7 @@ async fn ssh_kill_process(
     session_id: String,
     pid: i32,
     signal: Option<String>,
+    password: Option<String>,
 ) -> Result<SystemctlActionResult, String> {
     // Never signal PID <= 1 — that's init / the kernel and would be catastrophic.
     if pid <= 1 {
@@ -12759,34 +13093,36 @@ async fn ssh_kill_process(
         return Err(format!("invalid signal: {}", sig));
     }
 
-    let plain = format!("kill -{} {} 2>&1; echo __SUB_EXITCODE:$?", sig, pid);
-    let raw1 = run_exec_capture(&state, &session_id, &plain, 15).await?;
-    let (code1, out1) = parse_exit_marker(&raw1);
-    let low = out1.to_lowercase();
-    let needs_sudo = code1 != 0
-        && (low.contains("not permitted")
-            || low.contains("permission denied")
-            || low.contains("operation not permitted"));
-
-    if code1 == 0 || !needs_sudo {
-        return Ok(SystemctlActionResult {
-            success: code1 == 0,
-            exit_code: code1,
-            stdout: out1,
-            stderr: String::new(),
-            used_sudo: false,
-        });
+    // As ssh_systemctl_action: the user's own kill, then as root.
+    if password.is_none() {
+        let plain = format!("kill -{} {} 2>&1; echo __SUB_EXITCODE:$?", sig, pid);
+        let raw1 = run_exec_capture(&state, &session_id, &plain, 15).await?;
+        let (code1, out1) = parse_exit_marker(&raw1);
+        let low = out1.to_lowercase();
+        let needs_root = code1 != 0
+            && (low.contains("not permitted")
+                || low.contains("permission denied")
+                || low.contains("operation not permitted"));
+        if code1 == 0 || !needs_root {
+            return Ok(SystemctlActionResult {
+                success: code1 == 0,
+                exit_code: code1,
+                stdout: out1,
+                stderr: String::new(),
+                used_sudo: false,
+                root_tool: None,
+            });
+        }
     }
-
-    let sudo_cmd = format!("sudo -n kill -{} {} 2>&1; echo __SUB_EXITCODE:$?", sig, pid);
-    let raw2 = run_exec_capture(&state, &session_id, &sudo_cmd, 15).await?;
-    let (code2, out2) = parse_exit_marker(&raw2);
+    let args = ["kill".to_string(), format!("-{}", sig), pid.to_string()];
+    let (code, out, tool) = run_as_root(&state, &session_id, &args, password, 15).await?;
     Ok(SystemctlActionResult {
-        success: code2 == 0,
-        exit_code: code2,
-        stdout: out2,
+        success: code == 0,
+        exit_code: code,
+        stdout: out,
         stderr: String::new(),
         used_sudo: true,
+        root_tool: Some(tool.to_string()),
     })
 }
 
@@ -18309,7 +18645,7 @@ pub fn run() {
             local_term::local_terminal_open, local_term::local_terminal_write,
             local_term::local_terminal_resize, local_term::local_terminal_close,
             ssh_info_probe_section, ssh_systemctl_action, ssh_kill_process,
-            ssh_iptables_chain, ssh_nft_chain,
+            ssh_iptables_chain, ssh_nft_chain, ssh_firewall_as_root,
             docker::ssh_docker_container_action,
             docker::ssh_docker_inspect,
             docker::ssh_docker_stats,
