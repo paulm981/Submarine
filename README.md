@@ -203,7 +203,7 @@ To update, run the newer setup `.exe` over the installed one. Submarine tells yo
 
 Numbered versions, when there are any, are on the [releases page](https://github.com/paulm981/Submarine/releases) with versioned file names (and an `.msi` for deploying to many PCs). The Android `.apk` comes from the [original project's releases](https://github.com/sinaxhpm/submarine/releases).
 
-> Builds are currently **unsigned**. Windows SmartScreen will prompt — click "More info → Run anyway". On macOS you may need `xattr -d com.apple.quarantine /Applications/Submarine.app`. Android sideloading needs "Install unknown apps" enabled for the installer source.
+> Builds are currently **unsigned**. Windows SmartScreen will prompt — click "More info → Run anyway". On macOS (the app is ad-hoc signed, not notarized) the first open is refused: open System Settings → Privacy & Security and click **Open Anyway**; if macOS still says the app is damaged, run `xattr -dr com.apple.quarantine /Applications/Submarine.app`. Android sideloading needs "Install unknown apps" enabled for the installer source.
 
 ### Portable mode (Windows)
 

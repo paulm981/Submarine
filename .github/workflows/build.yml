@@ -743,10 +743,15 @@ jobs:
             fi
             echo
             echo "These builds aren't code-signed, so the first time Windows may say *\"Windows protected your PC\"*: click **More info → Run anyway**."
-            if has Submarine-macos-arm64.dmg; then
+            mac=()
+            has Submarine-macos-arm64.dmg && mac+=("$(link Submarine-macos-arm64.dmg Submarine-macos-arm64.dmg)")
+            has Submarine-macos-arm64.app.zip && mac+=("$(link Submarine-macos-arm64.app.zip Submarine-macos-arm64.app.zip) (unzip and run)")
+            if [ "${#mac[@]}" -gt 0 ]; then
               echo
               echo "### macOS (Apple silicon)"
-              echo "$(link Submarine-macos-arm64.dmg Submarine-macos-arm64.dmg). Unsigned: the first time, right-click the app → **Open**."
+              (IFS='|'; echo "${mac[*]}" | sed 's/|/ · /g')
+              echo
+              echo "Not notarized by Apple, so the first time macOS won't open it: open **System Settings → Privacy & Security** and click **Open Anyway** (on macOS 14 and older, right-click the app → **Open** works too)."
             fi
             linux=()
             has Submarine-linux-x86_64.AppImage && linux+=("$(link Submarine-linux-x86_64.AppImage AppImage)")
