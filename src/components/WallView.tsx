@@ -4,7 +4,7 @@ import { Terminal } from "@xterm/xterm";
 import {
   ClipboardPaste, ExternalLink, LayoutGrid, Pause, Play, Plus, Radio, RotateCw, Save, Send, X,
 } from "lucide-react";
-import { appHotkey, claimTerminal, dockedTerminal, forCursorMode, useDockVersion } from "../ui/terminalDock";
+import { appHotkey, claimTerminal, DockEntry, dockedTerminal, forCursorMode, useDockVersion } from "../ui/terminalDock";
 import { useConfirm } from "../ui/confirm";
 import { sessionDot } from "../util/sessionStatus";
 import { IS_LINUX } from "../util/platform";
@@ -23,7 +23,7 @@ import { readClipboardText } from "../util/clipboard";
 //   • a paused terminal (its chip, or Ctrl+Shift+P) is left out until it's
 //     resumed; one that isn't connected drops out, and is back in as soon as
 //     it reconnects — at the start of a line: one that starts taking input
-//     partway through a line joins at the next (see lineTargets);
+//     partway through a line joins at the next (see wallLines);
 //   • a paste — or Send, for a set of commands — goes to all, after saying
 //     how many lines into how many servers.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -57,8 +57,44 @@ const lineCount = (text: string) => text.replace(/\r\n?/g, "\n").replace(/\n$/, 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 const encode = (s: string) => Array.from(new TextEncoder().encode(s));
 
-/// Keys that end the line being typed: Enter, Ctrl+C, Ctrl+D, Ctrl+U.
-const LINE_ENDS = "\r\x03\x04\x15";
+// ── The line being typed to all ──────────────────────────────────────────────
+// A terminal that starts taking input partway through a line — it has just
+// connected (behind a jump host they log in a few at a time), reconnected,
+// been resumed, or was typed into on its own — would get only the rest of it:
+// `rm -rf *` without the `cd /old/site && ` typed before it. So a line goes on
+// only to the shells that have had all of it so far; the others join at the
+// next one. Kept per wall (Wall.id) out here, so leaving the Wall or turning
+// Broadcast off and on again doesn't forget a line half typed.
+interface WallLine {
+  /// terminalId → the shell (DockEntry.shell) that has had all of the line.
+  members: Map<string, number>;
+  /// The end of what was typed of it, to tell a line continued with `\`.
+  typed: string;
+}
+const wallLines = new Map<string, WallLine>();
+const TYPED_KEPT = 64;
+
+/// What's typed of the line open after `data` was typed (`typed`: what was
+/// before, "" at the start of a line), or null when `data` ends a line.
+/// Enter ends one, unless it follows a `\` (the line goes on below); so does
+/// Ctrl+C. Ctrl+D and Ctrl+U don't: they delete a character, or only what's
+/// before the cursor.
+const lineAfter = (typed: string, data: string): string | null => {
+  let t: string | null = typed;
+  for (const ch of data) {
+    if (ch === "\x03") t = null;
+    else if (ch === "\r" || ch === "\n") {
+      const was: string = t ?? "";
+      const slashes = was.length - was.replace(/\\+$/, "").length;
+      t = slashes % 2 === 1 ? `${was}\r` : null;
+    } else if (ch === "\x7f" || ch === "\b") t = (t ?? "").slice(0, -1);
+    else t = ((t ?? "") + ch).slice(-TYPED_KEPT);
+  }
+  return t;
+};
+
+const sameMembers = (a: Map<string, number>, b: Map<string, number>) =>
+  a.size === b.size && [...a].every(([tid, shell]) => b.get(tid) === shell);
 
 // What a confirm shows of the text about to go out.
 const preview = (text: string) => {
@@ -126,38 +162,45 @@ export const WallView = ({
       .map((m) => dockedTerminal(m.terminalId))
       .filter((e): e is NonNullable<typeof e> => !!e && e.live());
   }, []);
-  // ── The line being typed ─────────────────────────────────────────────────
-  // A terminal that starts taking input partway through a line — it has just
-  // connected (behind a jump host they log in a few at a time), reconnected,
-  // or been resumed — would get only the rest of it: `rm -rf *` without the
-  // `cd /old/site && ` typed before it. So a line goes to the terminals that
-  // were taking input when it began; the others join at the next one.
-  // null: no line has begun.
-  const lineRef = useRef<Set<string> | null>(null);
-  const [lineJoined, setLineJoined] = useState<Set<string> | null>(null);
-  const setLine = useCallback((next: Set<string> | null) => {
-    if (next === lineRef.current) return;
-    lineRef.current = next;
-    setLineJoined(next);
-  }, []);
+  // ── The line being typed (wallLines) ─────────────────────────────────────
+  // Shown again when who has the line, or whether one is open, changes.
+  const [, setLineShown] = useState(0);
+  const lineChanged = useCallback(() => setLineShown((v) => v + 1), []);
+  // Who typing reaches: those taking input that have had all of the line.
   const lineTargets = useCallback(() => {
     const now = targetsNow();
-    const joined = lineRef.current;
-    return joined ? now.filter((e) => joined.has(e.terminalId)) : now;
+    const line = wallLines.get(wallRef.current.id);
+    return line ? now.filter((e) => line.members.get(e.terminalId) === e.shell()) : now;
   }, [targetsNow]);
-  /// `data` went to `sent`: a line begins with them, goes on, or has ended.
-  const afterTyping = useCallback((data: string, sent: string[]) => {
-    let end = -1;
-    for (let i = data.length - 1; i >= 0; i--) {
-      if (LINE_ENDS.includes(data[i])) {
-        end = i;
-        break;
+  /// `data` went to `sent`: a line begins with them, goes on with them, or
+  /// has ended. After a paste (`keepOpen`) the line stays open — a shell
+  /// that asked for pastes bracketed holds the text, line breaks and all,
+  /// until Enter.
+  const afterTyping = useCallback((data: string, sent: DockEntry[], keepOpen = false) => {
+    const id = wallRef.current.id;
+    const was = wallLines.get(id);
+    const typed = lineAfter(was?.typed ?? "", data) ?? (keepOpen ? "" : null);
+    if (typed === null) {
+      if (was) {
+        wallLines.delete(id);
+        lineChanged();
       }
+      return;
     }
-    if (end === data.length - 1) setLine(null);
-    else if (end >= 0 || !lineRef.current) setLine(new Set(sent));
-  }, [setLine]);
-  const atNextLine = (tid: string) => !!lineJoined && !lineJoined.has(tid);
+    if (!was && sent.length === 0) return;
+    const members = new Map(sent.map((e) => [e.terminalId, e.shell()]));
+    wallLines.set(id, { members, typed });
+    if (!was || !sameMembers(was.members, members)) lineChanged();
+  }, [lineChanged]);
+  // Typed into on its own (clicked into): its line is its own now.
+  const leaveLine = (tid: string) => {
+    if (wallLines.get(wall.id)?.members.delete(tid)) lineChanged();
+  };
+  const line = wallLines.get(wall.id);
+  const atNextLine = (tid: string) => {
+    const e = dockedTerminal(tid);
+    return !!line && !!e && line.members.get(tid) !== e.shell();
+  };
 
   const live = wall.members.filter((m) => dockedTerminal(m.terminalId)?.live());
   const receiving = live.filter((m) => !isPaused(m.terminalId) && !atNextLine(m.terminalId));
@@ -188,13 +231,12 @@ export const WallView = ({
   const sendKeys = useCallback((data: string) => {
     if (!wallRef.current.broadcast || soloRef.current) return;
     const groups = new Map<string, string[]>();
-    const sent: string[] = [];
-    for (const e of lineTargets()) {
+    const sent = lineTargets();
+    for (const e of sent) {
       const d = forCursorMode(data, e.term.modes.applicationCursorKeysMode);
       const ids = groups.get(d);
       if (ids) ids.push(e.terminalId);
       else groups.set(d, [e.terminalId]);
-      sent.push(e.terminalId);
     }
     for (const [d, ids] of groups) {
       invoke("write_terminals_data", { terminalIds: ids, data: encode(d) }).catch(() => {});
@@ -225,15 +267,9 @@ export const WallView = ({
       focusGhost();
       if (!ok || !wallRef.current.broadcast) return;
     }
-    let n = 0;
-    const sent: string[] = [];
-    for (const e of lineTargets()) {
-      if (named.has(e.terminalId) && e.paste(text)) {
-        n++;
-        sent.push(e.terminalId);
-      }
-    }
-    afterTyping(text.replace(/\n/g, "\r"), sent);
+    const sent = lineTargets().filter((e) => named.has(e.terminalId) && e.paste(text));
+    const n = sent.length;
+    afterTyping(text.replace(/\r\n?/g, "\n"), sent, true);
     flash(n === named.size ? `Pasted into ${plural(n, "server")}.` : `Pasted into ${n} of ${plural(named.size, "server")} — the rest stopped taking input.`);
   }, [confirm, focusGhost, lineTargets, afterTyping]);
   const pasteToAllRef = useRef(pasteToAll);
@@ -287,7 +323,6 @@ export const WallView = ({
     if (!wall.broadcast) {
       if (wall.solo) onChange({ solo: null });
       setParked(false);
-      setLine(null);
       return;
     }
     if (solo) {
@@ -350,15 +385,16 @@ export const WallView = ({
   const sendToAll = (text: string, run: boolean) => {
     let body = text.replace(/\r\n?/g, "\n");
     if (run && !body.endsWith("\n")) body += "\n";
-    const ids = targetsNow().map((e) => e.terminalId);
-    if (ids.length === 0) {
+    // Into a line half typed, only to those that have the start of it.
+    const sent = lineTargets();
+    if (sent.length === 0) {
       flash("No terminal is taking input.");
       return;
     }
     const data = body.replace(/\n/g, "\r");
-    invoke("write_terminals_data", { terminalIds: ids, data: encode(data) })
-      .then(() => flash(`Sent to ${plural(ids.length, "server")}.`), (e) => flash(`Couldn't send: ${e}`));
-    afterTyping(data, ids);
+    invoke("write_terminals_data", { terminalIds: sent.map((e) => e.terminalId), data: encode(data) })
+      .then(() => flash(`Sent to ${plural(sent.length, "server")}.`), (e) => flash(`Couldn't send: ${e}`));
+    afterTyping(data, sent);
   };
 
   const cols = wall.cols || autoCols(wall.members.length);
@@ -528,6 +564,7 @@ export const WallView = ({
                   paused={isPaused(m.terminalId)}
                   nextLine={atNextLine(m.terminalId)}
                   onFocusIn={() => {
+                    leaveLine(m.terminalId);
                     if (!wallRef.current.broadcast) return;
                     setParked(false);
                     setSolo(m.terminalId);
@@ -553,7 +590,7 @@ export const WallView = ({
 
       {sendOpen && (
         <SendToAllModal
-          targets={() => targetsNow().length}
+          targets={() => lineTargets().length}
           total={wall.members.length}
           snippets={snippets}
           onSend={(text, run) => { setSendOpen(false); sendToAll(text, run); focusGhost(); }}
@@ -772,7 +809,7 @@ const SendToAllModal = ({ targets, total, snippets, onSend, onClose }: {
         <div className="p-4 flex flex-col gap-3">
           <p className="text-[11.5px] text-zinc-400 leading-relaxed">
             Typed into {n === total ? `all ${plural(n, "terminal")}` : `the ${plural(n, "terminal")} taking input`} on this wall, line by line,
-            as if you typed it there.{total - n > 0 && ` ${total - n} paused or not connected ${total - n === 1 ? "is" : "are"} left out.`}
+            as if you typed it there.{total - n > 0 && ` ${total - n} paused, not connected or joining at the next line ${total - n === 1 ? "is" : "are"} left out.`}
           </p>
           {snippets.length > 0 && (
             <select

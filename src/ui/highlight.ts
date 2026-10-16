@@ -148,7 +148,7 @@ const STANDARD_RULES: readonly Layer[] = [LAST_LOGIN, LAST_LOGIN_OK, URLS, ADDRE
 // Shell scripts (a `cat` of one, or a script printing itself as it runs).
 const SHELL_RULES: readonly SetRule[] = [
   { pattern: String.raw`(?:^|[ \t])#.*`, style: { color: "gray" } },
-  { pattern: String.raw`"(?:[^"\\\n]|\\.){0,512}"|'[^'\n]{0,512}'`, style: { color: "green" } },
+  { pattern: String.raw`"(?:[^"\\\n]|\\.){0,1024}"|'[^'\n]{0,1024}'`, style: { color: "green" } },
   { pattern: String.raw`\$(?:\{[^}\s]{1,128}\}|[A-Za-z_]\w{0,127}|[0-9#?$!@*-])`, style: { color: "cyan" } },
   {
     words: [
@@ -192,7 +192,7 @@ const NETWORK_RULES: readonly SetRule[] = [
 // phrases that are only ever SQL in lower case too.
 const SQL_RULES: readonly SetRule[] = [
   { pattern: String.raw`(?:^|[ \t])--(?:[ \t].*|$)`, style: { color: "gray" } },
-  { pattern: String.raw`'(?:[^'\\\n]|\\.|''){0,512}'`, style: { color: "green" } },
+  { pattern: String.raw`'(?:[^'\\\n]|\\.|''){0,1024}'`, style: { color: "green" } },
   {
     words: [
       "is not null", "is null", "not null", "primary key", "foreign key", "group by", "order by", "partition by",

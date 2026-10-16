@@ -27,6 +27,10 @@ export interface DockEntry {
   home: HTMLElement;
   /// Its shell is open and its session connected: input reaches it.
   live: () => boolean;
+  /// Which shell it is: a new number each time one opens (a reconnect, or
+  /// the terminal opened again), from nextShellId. A Wall keeps a line
+  /// typed to all to the shells that have had all of it.
+  shell: () => number;
   /// Paste the way the terminal's own paste does: one Enter per line break,
   /// wrapped as a bracketed paste when the program asked for that. False
   /// when it can't take input.
@@ -36,6 +40,9 @@ export interface DockEntry {
 }
 
 const entries = new Map<string, DockEntry>();
+let shellIds = 0;
+/// A number no shell had before (DockEntry.shell).
+export const nextShellId = () => ++shellIds;
 // terminalId → the Wall tile that wants it on screen.
 const claims = new Map<string, HTMLElement>();
 const listeners = new Set<() => void>();

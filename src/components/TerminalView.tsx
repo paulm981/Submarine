@@ -9,7 +9,7 @@ import { Channel, invoke } from '@tauri-apps/api/core';
 import '@xterm/xterm/css/xterm.css';
 import { useIsNarrow } from '../hooks/useViewport';
 import { MobileKeyBar, ModifiersState, ModKey, SpecialKey } from './MobileKeyBar';
-import { appHotkey, registerTerminal, terminalStateChanged } from '../ui/terminalDock';
+import { appHotkey, nextShellId, registerTerminal, terminalStateChanged } from '../ui/terminalDock';
 import { forgetTerminal, logLine, noteTerminalOutput, noteTerminalParsed, noteTerminalRenderer } from '../util/diagnostics';
 import { useConfirm } from '../ui/confirm';
 import HistorySearchOverlay from './HistorySearchOverlay';
@@ -77,11 +77,16 @@ const SHELL_READY_CAP_MS = 5000;
 // window busy for hours, and thousands of `ESC[9999S` in one batch for
 // minutes. Programs send counts up to the screen's size, so:
 //   - a count over a few screens (countLimit) is ignored, and
-//   - what one batch of output may cost is capped (COUNT_BUDGET, in lines
-//     moved: about 0.3 s of work); past that the rest of the batch's counted
-//     sequences are ignored.
+//   - what one batch of output may cost is capped, about 0.3 s of work each:
+//     LINE_BUDGET lines moved (S, T, L, M), CHAR_BUDGET characters repeated
+//     or tab stops passed (b, I, Z). Past that, the rest of the batch's
+//     counted sequences are ignored.
+// A repeat copies the whole cell before the cursor, combining marks and
+// all, so it costs the count times that cell's length; one of a cell with
+// more than a character and a mark in it is ignored.
 const COUNTED_FINALS = ['S', 'T', 'L', 'M', 'I', 'Z', 'b'] as const;
-const COUNT_BUDGET = 100_000;
+const LINE_BUDGET = 100_000;
+const CHAR_BUDGET = 1_000_000;
 const LINE_FINALS = new Set<string>(['S', 'T', 'L', 'M']);
 
 // State machine for the modifier stickies on the mobile key bar.
@@ -227,6 +232,8 @@ const TerminalView = ({
   // Its shell is open (open_terminal has answered, again after a reconnect):
   // what a Wall's broadcast checks, with `disabled`, before typing into it.
   const ptyLiveRef = useRef(false);
+  // Which shell is open (DockEntry.shell): a new number each time one opens.
+  const shellIdRef = useRef(0);
   // Mirror of isActiveView, read inside focusTerminal's rAF / signal
   // callbacks (which would otherwise close over a stale value).
   const isActiveViewRef = useRef(isActiveView);
@@ -368,7 +375,7 @@ const TerminalView = ({
     term.write('\r\n\x1b[33m── reconnected ──\x1b[0m\r\n');
     ptyLiveRef.current = false;
     terminalStateChanged();
-    const opened = () => { ptyLiveRef.current = true; terminalStateChanged(); };
+    const opened = () => { shellIdRef.current = nextShellId(); ptyLiveRef.current = true; terminalStateChanged(); };
     // As on the first open: the backend only takes resizes once the shell is
     // up, so a resize that landed while it was starting again (the window
     // was being dragged, a panel opened) is sent once more when it is. Without
@@ -630,18 +637,35 @@ const TerminalView = ({
     // otherwise xterm's own handler runs. The first one is noted in the log.
     let runawayLogged = false;
     // Refilled after each batch is processed (`processed` below).
-    let countBudget = COUNT_BUDGET;
+    let lineBudget = LINE_BUDGET;
+    let charBudget = CHAR_BUDGET;
     const countLimit = (final: string) =>
       final === 'b' ? term.rows * term.cols : LINE_FINALS.has(final) ? term.rows * 4 : term.cols * 4;
+    // The cell a repeat copies: the one before the cursor (or, after a wide
+    // character, the one before that), in code units.
+    const repeatedLength = () => {
+      const b = term.buffer.active;
+      const line = b.getLine(b.baseY + b.cursorY);
+      let cell = line?.getCell(b.cursorX - 1);
+      if (cell && cell.getWidth() === 0) cell = line?.getCell(b.cursorX - 2);
+      return Math.max(1, cell?.getChars().length ?? 1);
+    };
     for (const final of COUNTED_FINALS) {
       term.parser.registerCsiHandler({ final }, (params) => {
         const count = params[0];
         if (typeof count !== 'number' || count <= 1) return false;
-        // Lines moved; tabs and repeated characters cost a line per width.
-        const cost = LINE_FINALS.has(final) ? count : Math.ceil(count / Math.max(1, term.cols));
-        if (count <= countLimit(final) && cost <= countBudget) {
-          countBudget -= cost;
-          return false;
+        if (LINE_FINALS.has(final)) {
+          if (count <= countLimit(final) && count <= lineBudget) {
+            lineBudget -= count;
+            return false;
+          }
+        } else {
+          const len = final === 'b' ? repeatedLength() : 1;
+          const cost = count * len;
+          if (len <= 2 && count <= countLimit(final) && cost <= charBudget) {
+            charBudget -= cost;
+            return false;
+          }
         }
         if (!runawayLogged) {
           runawayLogged = true;
@@ -718,7 +742,7 @@ const TerminalView = ({
         const syncSize = () => {
           invoke(commands.resize, { terminalId, cols: term.cols, rows: term.rows }).catch(() => {});
         };
-        const opened = () => { ptyLiveRef.current = true; terminalStateChanged(); };
+        const opened = () => { shellIdRef.current = nextShellId(); ptyLiveRef.current = true; terminalStateChanged(); };
         if (local) {
           invoke<string>('local_terminal_open', {
             terminalId,
@@ -1073,7 +1097,8 @@ const TerminalView = ({
       if (bytes > 0) invoke('terminal_output_ack', { terminalId, bytes }).catch(() => {});
     };
     const processed = (bytes: number) => {
-      countBudget = COUNT_BUDGET;
+      lineBudget = LINE_BUDGET;
+      charBudget = CHAR_BUDGET;
       noteTerminalParsed(terminalId, bytes);
       unacked += bytes;
       if (unacked >= ACK_EVERY) sendAck();
@@ -1225,6 +1250,7 @@ const TerminalView = ({
       host,
       home,
       live: () => !disabledRef.current && ptyLiveRef.current,
+      shell: () => shellIdRef.current,
       paste: (text) => {
         if (disabledRef.current || !ptyLiveRef.current) return false;
         pasteText(text);

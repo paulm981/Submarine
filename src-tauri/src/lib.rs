@@ -18746,7 +18746,10 @@ async fn monitor_resume_all(
     };
     save_vault_internal(&db_state)?;
 
-    // Start (or hot-resume) each one.
+    // Start (or hot-resume) each one. One server that can't be reached as set
+    // up (its jump host was deleted, say) mustn't stop the rest from
+    // starting; it's named in the answer.
+    let mut skipped: Vec<String> = Vec::new();
     for node_id in node_ids {
         if monitor::set_paused(map.inner().clone(), node_id, false).await.is_err() {
             let (auth, metrics, customs, name) = {
@@ -18757,12 +18760,11 @@ async fn monitor_resume_all(
                 let name = fetch_node_name(conn, node_id);
                 // Commands held for this device's OK don't run (see approvals.rs).
                 let customs = approvals::without_held_metrics(conn, approvals::server_uuid(conn, node_id as i64).as_deref(), customs);
-                // One server that can't be reached as set up (its jump host
-                // was deleted, say) mustn't stop the rest from starting.
                 match resolve_node_auth_for_monitor(conn, node_id) {
                     Ok(auth) => (auth, metrics, customs, name),
                     Err(e) => {
                         crate::applog::write_line("monitor", &format!("node {}: not started ({})", node_id, e));
+                        skipped.push(name);
                         continue;
                     }
                 }
@@ -18783,7 +18785,15 @@ async fn monitor_resume_all(
             ).await;
         }
     }
-    Ok(())
+    if skipped.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Couldn't start monitoring {}: check how {} reached (the app log says why).",
+            skipped.join(", "),
+            if skipped.len() == 1 { "it's" } else { "they're" }
+        ))
+    }
 }
 
 /// The clipboard's text, for a paste into the terminal (a right-click, or
