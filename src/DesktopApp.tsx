@@ -23,6 +23,7 @@ import { HIGHLIGHT_KEY, normalizeRules, onSlowRule, readHighlightId, setCustomRu
 import { logLine } from "./util/diagnostics";
 import { USE_LOCAL_SHELL_KEY, readUseLocalShell } from "./util/terminalShell";
 import { USE_SSH_AGENT_KEY, readUseSshAgent } from "./util/sshAgent";
+import { USE_SSH_CONFIG_KEY, readUseSshConfig } from "./util/sshConfig";
 import { Sidebar } from "./components/Sidebar";
 import { NodeGrid } from "./components/NodeGrid";
 import { SessionTree, type TreeItems } from "./components/SessionTree";
@@ -378,6 +379,9 @@ function DesktopApp() {
     // On by default: logins may use keys from an ssh-agent on this computer.
     // See util/sshAgent.
     useSshAgent: readUseSshAgent(),
+    // On by default: connections use what ~/.ssh/config says about a host.
+    // See util/sshConfig.
+    useSshConfig: readUseSshConfig(),
     // Auto-sync defaults ON. Per-device (localStorage), like the other prefs.
     autoSync: localStorage.getItem('submarine-auto-sync') !== 'off',
     // Background pull cadence in minutes (min 1). Only gates the periodic
@@ -409,6 +413,8 @@ function DesktopApp() {
     localStorage.setItem(HIGHLIGHT_KEY, appSettings.terminalHighlight);
     localStorage.setItem(USE_LOCAL_SHELL_KEY, appSettings.useLocalShell ? 'on' : 'off');
     localStorage.setItem(USE_SSH_AGENT_KEY, appSettings.useSshAgent ? 'on' : 'off');
+    localStorage.setItem(USE_SSH_CONFIG_KEY, appSettings.useSshConfig ? 'on' : 'off');
+    invoke("set_use_ssh_config", { enabled: appSettings.useSshConfig }).catch(() => {});
     localStorage.setItem('submarine-auto-sync', appSettings.autoSync ? 'on' : 'off');
     localStorage.setItem('submarine-sync-interval-min', String(appSettings.syncIntervalMin));
     localStorage.setItem('submarine-detect-os', appSettings.detectOs ? 'on' : 'off');

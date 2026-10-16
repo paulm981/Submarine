@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, FileEdit, Server, Home, Scale, ArrowRight, X, KeyRound, LifeBuoy, ClipboardCopy, FolderOpen } from "lucide-react";
+import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, FileEdit, Server, Home, Scale, ArrowRight, X, KeyRound, LifeBuoy, ClipboardCopy, FolderOpen, EyeOff } from "lucide-react";
 import {
   MAX_FONT_SIZE, MIN_FONT_SIZE, clampFontSize, fontFamilyCss,
   isFontAvailable, primaryFontName, sanitizeFontFamily,
@@ -313,6 +313,80 @@ function SshAgentSetting({ settings, setSettings }: any) {
           aria-label="Use keys from an ssh-agent"
           onClick={() => setSettings((s: any) => ({ ...s, useSshAgent: !(s.useSshAgent !== false) }))}
           className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${on ? 'bg-primary' : 'bg-zinc-700'}`}
+        >
+          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${on ? 'left-[22px]' : 'left-0.5'}`} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// "Use settings from ~/.ssh/config" (util/sshConfig, src-tauri/src/ssh_config.rs).
+function SshConfigSetting({ settings, setSettings }: any) {
+  const on = settings.useSshConfig !== false;
+  return (
+    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 shadow-xl">
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-zinc-100">Use settings from ~/.ssh/config</div>
+          <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
+            Connect the way the OpenSSH client would: a server whose address is an alias in
+            ~/.ssh/config connects to its HostName and Port, takes its User when no username is
+            saved, uses the ssh-agent IdentityAgent names, and goes through its ProxyCommand (such
+            as cloudflared or tsh) unless the server has a jump host or proxy of its own. Host
+            blocks are matched against a server's address and its name; Include and Match are
+            followed, Match exec is never run. The file is only read, and nothing from it is
+            synced. Turn off to use only what's saved for each server.
+          </p>
+        </div>
+        <button
+          role="switch"
+          aria-checked={on}
+          aria-label="Use settings from ~/.ssh/config"
+          onClick={() => setSettings((s: any) => ({ ...s, useSshConfig: !(s.useSshConfig !== false) }))}
+          className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${on ? 'bg-primary' : 'bg-zinc-700'}`}
+        >
+          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${on ? 'left-[22px]' : 'left-0.5'}`} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// "Block screenshots" (Android only): FLAG_SECURE on the app's window. Kept
+// on the device by the app's Android plugin rather than in these settings, so
+// it applies from the first frame when the app starts (android_bridge.rs).
+function SecureScreenSetting() {
+  const [on, setOn] = useState<boolean | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    invoke<boolean>("get_secure_screen").then(setOn, (e) => setError(String(e)));
+  }, []);
+  const toggle = () => {
+    if (on === null) return;
+    setError(null);
+    invoke<boolean>("set_secure_screen", { enabled: !on }).then(setOn, (e) => setError(String(e)));
+  };
+  return (
+    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 shadow-xl">
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-zinc-100">Block screenshots</div>
+          <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
+            Keep Submarine out of screenshots, screen recordings and screen sharing, so passwords and
+            terminal output can't be captured, not even by an app that records the screen. You
+            can't take screenshots of it yourself while this is on. The preview in the recent
+            apps list is always hidden (Android 13 and later).
+          </p>
+          {error && <p className="text-[12px] text-rose-300 mt-2 break-words">{error}</p>}
+        </div>
+        <button
+          role="switch"
+          aria-checked={!!on}
+          aria-label="Block screenshots"
+          disabled={on === null}
+          onClick={toggle}
+          className={`relative shrink-0 w-11 h-6 rounded-full transition-colors disabled:opacity-50 ${on ? 'bg-primary' : 'bg-zinc-700'}`}
         >
           <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${on ? 'left-[22px]' : 'left-0.5'}`} />
         </button>
@@ -812,7 +886,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
           </section>
         )}
 
-        {/* Not on Android, which has no ssh-agent to use. */}
+        {/* Not on Android, which has no ssh-agent or ~/.ssh/config to use. */}
         {!IS_ANDROID && (
           <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
             <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
@@ -820,6 +894,17 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
             </div>
 
             <SshAgentSetting settings={settings} setSettings={setSettings} />
+            <SshConfigSetting settings={settings} setSettings={setSettings} />
+          </section>
+        )}
+
+        {IS_ANDROID && (
+          <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
+            <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
+              <EyeOff size={14} /> Privacy
+            </div>
+
+            <SecureScreenSetting />
           </section>
         )}
 
