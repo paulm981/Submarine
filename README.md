@@ -1,8 +1,8 @@
 <div align="center">
   <img src="src/assets/logo.png" alt="Submarine logo" width="120" />
-  <h1>Submarine — Modern SSH &amp; SFTP Client</h1>
-  <p><strong>A fast, secure SSH and SFTP client for Windows, macOS, Linux — and now Android.</strong></p>
-  <p>Manage servers, edit remote files, forward ports, and sync folders from one native window. Built with Rust and Tauri.</p>
+  <h1>Submarine — SSH Client &amp; Session Manager</h1>
+  <p><strong>A full-featured SSH and SFTP client and session manager for Windows, macOS and Linux.</strong></p>
+  <p>Organize hundreds of servers, work on many at once, edit remote files, forward ports, and sync folders from one native window. Bring your sessions over from MobaXterm, PuTTY or an OpenSSH config. Built with Rust and Tauri.</p>
   <p>
     <a href="https://github.com/paulm981/Submarine/releases/tag/latest-main"><img alt="download the latest build" src="https://img.shields.io/badge/download-latest%20build-2ea44f" /></a>
     <a href="https://github.com/paulm981/Submarine/actions/workflows/build.yml"><img alt="build" src="https://img.shields.io/github/actions/workflow/status/paulm981/Submarine/build.yml?branch=main&label=build" /></a>
@@ -13,16 +13,42 @@
   </p>
 </div>
 
-> **This is a fork.** [paulm981/Submarine](https://github.com/paulm981/Submarine) is [Submarine](https://github.com/sinaxhpm/submarine) by Sina with additions for people moving over from MobaXterm:
-> - **MultiExec on Walls**: terminals from many servers side by side. With Broadcast on, typing goes to all of them; click into one to type to it alone, pause the ones to leave out, paste or send a set of commands to all. Save walls and open a whole folder as one.
-> - **A session tree** beside the terminal that manages folders, servers and Remote Desktop links (drag and drop, rename, move).
-> - **MobaXterm session import**: nested folders, saved logins, jump hosts, startup commands such as `dzdo su -`, Remote Desktop sessions.
-> - **Syntax highlighting** in terminals: errors, warnings, OK, addresses, links and dates colored in the output, with sets for shell scripts, network devices and SQL, a set per server, and rules of your own that sync with the profile.
-> - **A Home view** of terminals on your own computer: PowerShell, Command Prompt, Git Bash and each WSL distribution by name on Windows (the default one marked, and a hint when WSL has none); the login shell and every other installed shell on macOS and Linux.
-> - **Sync through storage you own**: a folder that OneDrive, Dropbox, Nextcloud, Syncthing or a network share keeps the same on your computers, or a private git repository — no third-party service. Encrypted with the profile's password first; Remote Desktop links sync too. The original project's cloud stays off unless you turn it on.
-> - OS badges, jump hosts that let a hundred servers log in a few at a time, and hardening for Windows.
->
-> **Download:** the [latest build](https://github.com/paulm981/Submarine/releases/tag/latest-main) is made from every change to `main` — on Windows, [`Submarine-windows-x64-setup.exe`](https://github.com/paulm981/Submarine/releases/download/latest-main/Submarine-windows-x64-setup.exe) (see [Install](#install)). Builds, updates and issues for this fork live here; the original project's README follows.
+> **This is a fork.** [paulm981/Submarine](https://github.com/paulm981/Submarine) builds on [Submarine](https://github.com/sinaxhpm/submarine) by Sina. It adds what a team needs to run a large, shared set of servers from one SSH client that works the same on Windows, macOS and Linux, and an easy way in for anyone coming from MobaXterm, PuTTY or an OpenSSH config. **Download** the [latest build](https://github.com/paulm981/Submarine/releases/tag/latest-main) (on Windows, [`Submarine-windows-x64-setup.exe`](https://github.com/paulm981/Submarine/releases/download/latest-main/Submarine-windows-x64-setup.exe); see [Install](#install)). Builds, updates and issues for this fork live here.
+
+## What this fork adds
+
+**Bring your sessions with you**
+- **Session import that keeps your setup**: from MobaXterm, nested folders, saved logins, jump hosts and their keys, startup commands such as `dzdo su -`, and Remote Desktop sessions come over as they were, and a result screen says what came in. PuTTY and OpenSSH config imports are there too.
+
+**Work on many servers at once**
+- **Walls with broadcast input**: terminals from many servers side by side. With Broadcast on, typing goes to all of them. Click into one to type to it alone, pause the ones to leave out, or paste or send a set of commands to all. A server that connects or reconnects partway through a line waits for the next one, so it never gets only the end of a command. Walls can be saved by name, and a whole folder opens as one.
+- **Jump hosts at scale**: a hundred servers behind one jump host log in a few at a time (the limit is a setting), and Monitoring reaches servers through their jump host too.
+- **Split**: a second shell on the same server beside the first, to watch a log in one and work in the other.
+
+**Organize them**
+- **A session tree** beside the terminal, with search: folders, servers and Remote Desktop links, managed by drag and drop, rename, move and delete.
+- **Remote Desktop links** saved with your servers, opening in Remote Desktop Connection on Windows.
+- **OS badges** on servers, and a look of their own for Remote Desktop links.
+
+**Root when you need it**
+- **SFTP root mode and Info panel actions as root** through `sudo` or `dzdo` (Centrify / Delinea): without a password where the server allows it, including servers that only allow `dzdo su -`.
+
+**A better terminal**
+- **xterm.js 6** with color schemes (Campbell, One Half, Solarized, Dracula, Nord, Tokyo Night, Catppuccin, Gruvbox), and a scheme per server that syncs with it.
+- **Syntax highlighting**: errors, warnings, OK, addresses, links and dates colored in the output, with sets for shell scripts, network devices and SQL, a set per server, and rules of your own that sync with the profile.
+- **Fast output never freezes the window**: output is paced by what the screen has drawn, and floods of escape sequences that would lock it up are ignored.
+- **A Home view** of terminals on your own computer: PowerShell, Command Prompt, Git Bash and each WSL distribution by name on Windows (the default one marked); the login shell and every other installed shell on macOS and Linux.
+- The app's own dark right-click menus everywhere, and no right-click or F5 that reloads the app.
+
+**Your data, your storage**
+- **Sync through storage you own**: a folder that OneDrive, Dropbox, Nextcloud, Syncthing or a network share keeps the same on your computers, or a private git repository, with no third-party service. Profiles are encrypted with their password first, and Remote Desktop links sync too. The original project's hosted cloud stays off unless you turn it on.
+
+**Ready to roll out to a team**
+- **A build from every change**, with a build number in the title bar and a "Build N is out" notice when there's a newer one.
+- **Troubleshooting**: a log on your computer, a watchdog that notes when the window froze and why, and **Copy diagnostics** with server, user and host names replaced, ready to send to whoever is helping.
+- **Hardening**: Live Edit opens a file in an editor and never runs it; the Local pane asks before it runs a program; downloads are marked as from the internet; characters that disguise a file name are shown plainly; and a trusted server that shows a different kind of key is a warning, not a silent change.
+
+The original project's README follows.
 
 ---
 
@@ -36,7 +62,7 @@
 
 - **One window, many tools per server** — terminal, SFTP, tunnels, folder mirror, Docker, live server info, and a per-server command library, all as tabs around the same session
 - **Watch many servers at once** — session **split view** to tile any two sessions side-by-side, plus **Walls**: grids of terminals from any servers, saved by name, a whole folder opened as one
-- **Broadcast input (MultiExec)** — on a Wall, type once and every terminal gets it; click into one to type to it alone (**Type to all** on the bar, or the ✕ on its tile, goes back), pause the ones to leave out, paste or send a set of commands to all (Tmux `synchronize-panes` for cross-server)
+- **Broadcast input** — on a Wall, type once and every terminal gets it; click into one to type to it alone (**Type to all** on the bar, or the ✕ on its tile, goes back), pause the ones to leave out, paste or send a set of commands to all (like tmux `synchronize-panes`, across servers)
 - **Native and cross-platform** — Windows, macOS, Linux (`.deb` / `.rpm` / Arch / AppImage), and Android — same encrypted vault everywhere
 - **Zero-knowledge cloud sync** — profiles are Argon2id + AES-256-GCM sealed on your device before upload; the server (and everyone else) only sees ciphertext. Browser dashboard at [`api.sinaxhpm.com/account`](https://api.sinaxhpm.com/account/) to manage your account and stored profiles
 - **Docker manager** — containers, logs (live tail), stats, prune, and `docker exec` shells as first-class session tabs
@@ -85,7 +111,7 @@ If you're searching for one of these, Submarine is a direct fit:
 
 - a free **PuTTY alternative for macOS and Linux** (and a tabbed PuTTY replacement on Windows)
 - a **WinSCP alternative** that lives in the same window as your terminal
-- a **MobaXterm alternative** that isn't Windows-only and isn't 15-year-old GTK
+- a place to take your **MobaXterm** sessions that also runs on macOS and Linux — the import keeps folders, logins and jump hosts
 - a free **Termius alternative** without subscription gating or telemetry
 - a modern **Tabby / iTerm2 + SFTP** combo that's actually one app
 - a cross-device **Termius-style sync** without a paid plan — your encrypted profiles travel from desktop to your **Android phone** with the same master password
@@ -212,7 +238,23 @@ To update, run the newer setup `.exe` over the installed one. Submarine tells yo
 
 Numbered versions, when there are any, are on the [releases page](https://github.com/paulm981/Submarine/releases) with versioned file names (and an `.msi` for deploying to many PCs). The Android `.apk` comes from the [original project's releases](https://github.com/sinaxhpm/submarine/releases).
 
-> Builds are currently **unsigned**. Windows SmartScreen will prompt — click "More info → Run anyway". On macOS (the app is ad-hoc signed, not notarized) the first open is refused: open System Settings → Privacy & Security and click **Open Anyway**; if macOS still says the app is damaged, run `xattr -dr com.apple.quarantine /Applications/Submarine.app`. Android sideloading needs "Install unknown apps" enabled for the installer source.
+> Builds are currently **unsigned**. Windows SmartScreen will prompt — click "More info → Run anyway". Android sideloading needs "Install unknown apps" enabled for the installer source.
+
+### First open on macOS
+
+The Mac app is signed only by the build itself, not notarized by Apple, so the first time you open a downloaded copy macOS says *"Apple could not verify "Submarine.app" is free of malware…"* and offers only **Done**. To open it anyway:
+
+1. Move **Submarine** into **Applications** (drag it out of the `.dmg`, or out of the folder the `.app.zip` unpacked to).
+2. Open it once and click **Done** on that message.
+3. Open **System Settings → Privacy & Security**, scroll down to *"Submarine.app was blocked to protect your Mac"*, click **Open Anyway** and enter your password. Then click **Open Anyway** once more when macOS asks.
+
+Or, in Terminal, clear the download mark and open it normally:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Submarine.app
+```
+
+If macOS says the app *is damaged*, sign it again on your Mac and open it: `codesign --force --deep --sign - /Applications/Submarine.app`. Each new download needs this once.
 
 ### Portable mode (Windows)
 
@@ -273,9 +315,9 @@ Yes. MIT-licensed. Use it personally, use it at work, fork it, redistribute it.
 
 Yes. Cloud sync is opt-in. All profiles, mirrors, and tunnels live locally and are encrypted at rest.
 
-### How is it different from PuTTY, WinSCP, or MobaXterm?
+### I use PuTTY, WinSCP or MobaXterm today. What changes?
 
-PuTTY and WinSCP are two separate apps you alt-tab between. MobaXterm bundles them but feels dated and is Windows-only. Submarine puts terminal, SFTP, tunnels, and folder mirror in one modern tabbed window per server — and runs natively on Windows, macOS, and Linux.
+PuTTY and WinSCP are two separate apps you alt-tab between; Submarine puts terminal, SFTP, tunnels and folder mirror in one tabbed window per server. Coming from MobaXterm, import your sessions with their folders, saved logins and jump hosts, and keep working the way you do, on Windows, macOS or Linux, with one encrypted profile that syncs between them.
 
 ### Does it support keys with passphrases?
 
