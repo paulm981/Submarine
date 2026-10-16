@@ -13014,10 +13014,93 @@ if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s
     Err(format!("{}: unexpected reply from the server", SUDO_FAILED))
 }
 
+/// Root shells tried where sudo's or dzdo's rules allow only a shell — the
+/// way many people get root in a terminal, `dzdo su -` — as the words after
+/// the tool, in the order tried. Fixed text, never from input.
+const ROOT_SHELL_FORMS: &[&str] = &["su -", "su - root", "su"];
+
+/// What a root shell is given to run `script` (one line of POSIX sh): root's
+/// own shell may be csh or another, so it starts /bin/sh with the script as
+/// one single-quoted word, which they all read the same way.
+fn root_shell_line(script: &str) -> String {
+    debug_assert!(!script.contains('\n'));
+    format!("exec /bin/sh -c {}\n", quote_args(&[script.to_string()]))
+}
+
+/// Does `tool <form>` give a root shell without a password? The rules are
+/// asked first (`-l`, which doesn't run anything), then the shell is started
+/// and asked who it is.
+async fn root_shell_probe(session_arc: &SessionHandleArc, tool: &'static str, form: &'static str) -> Result<(), String> {
+    let words: Vec<String> = form.split(' ').map(String::from).collect();
+    root_probe(session_arc, tool, None, &words).await?;
+    let line = root_shell_line("echo __SUB_SU_UID:$(id -u)");
+    let out = exec_with_stdin_capture(session_arc, &format!("{} -n {}", tool, form), Some(line.as_bytes()), 20).await?;
+    if out.lines().any(|l| l.trim() == "__SUB_SU_UID:0") {
+        Ok(())
+    } else if out.contains("__SUB_SU_UID:") {
+        Err(SUDO_NOT_ALLOWED.into())
+    } else {
+        Err(classify_sudo_failure(&out))
+    }
+}
+
+/// The first of `tools` that gives a root shell (ROOT_SHELL_FORMS) without
+/// a password, and how. `tools` are the ones that refused the command itself
+/// (NOT_ALLOWED: they have rules for the user, just not that one). A tool's
+/// forms stop at the first other answer: when `-l su -` wants a password,
+/// the others do too, and every refused ask is in the server's auth log.
+async fn find_root_shell(session_arc: &SessionHandleArc, tools: &[&'static str]) -> Option<(&'static str, &'static str)> {
+    let mut tried: Vec<String> = Vec::new();
+    for &tool in tools {
+        for &form in ROOT_SHELL_FORMS {
+            match root_shell_probe(session_arc, tool, form).await {
+                Ok(()) => return Some((tool, form)),
+                Err(e) => {
+                    let stop = e != SUDO_NOT_ALLOWED;
+                    tried.push(format!("`{} {}`: {}", tool, form, e));
+                    if stop {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if !tried.is_empty() {
+        crate::applog::write_line("root", &format!("no root shell without a password ({})", tried.join("; ")));
+    }
+    None
+}
+
 /// Run `args` as root with `access`: the command's exit code and output.
 async fn root_run(session_arc: &SessionHandleArc, access: &ssh_manager::RootAccess, args: &[String], timeout_secs: u64) -> Result<(i32, String), String> {
     const SCRIPT: &str = r#"if [ "$SUB_MODE" = pw ]; then "$SUB_TOOL" -S -k -p "" "$@" 2>&1; else "$SUB_TOOL" -n "$@" 2>&1; fi; echo __SUB_EXITCODE:$?"#;
     let tool = if ELEVATION_TOOLS.contains(&access.tool) { access.tool } else { "sudo" };
+    if let Some(form) = access.shell.filter(|s| ROOT_SHELL_FORMS.contains(s)) {
+        // The root shell's own start-up (a profile that prints) comes before
+        // the start marker and isn't part of the output.
+        let flags = if access.password.is_some() { "-S -k -p ''" } else { "-n" };
+        let mut stdin = zeroize::Zeroizing::new(String::new());
+        if let Some(p) = &access.password {
+            stdin.push_str(p);
+            stdin.push('\n');
+        }
+        // The marker says who the shell is, so a kept root shell needs no
+        // check of its own before each command (run_as_root).
+        stdin.push_str(&root_shell_line(&format!(
+            "echo __SUB_ROOT_OUT__:$(id -u); {} 2>&1; echo __SUB_EXITCODE:$?",
+            quote_args(args)
+        )));
+        let out = exec_with_stdin_capture(session_arc, &format!("{} {} {}", tool, flags, form), Some(stdin.as_bytes()), timeout_secs).await?;
+        let Some(start) = out.find("__SUB_ROOT_OUT__:") else {
+            return Err(classify_sudo_failure(&out));
+        };
+        let rest = &out[start + "__SUB_ROOT_OUT__:".len()..];
+        let (uid, after) = rest.split_once('\n').unwrap_or((rest, ""));
+        if uid.trim() != "0" {
+            return Err(SUDO_NOT_ALLOWED.into());
+        }
+        return Ok(parse_exit_marker(after));
+    }
     let mode = if access.password.is_some() { "pw" } else { "n" };
     let cmd = format!("env SUB_MODE={} SUB_TOOL={} sh -c '{}' sh {}", mode, tool, SCRIPT, quote_args(args));
     let stdin = access.password.as_ref().map(|p| zeroize::Zeroizing::new(format!("{}\n", p.as_str())));
@@ -13036,6 +13119,7 @@ async fn root_access_for(
     session_arc: &SessionHandleArc,
     args: &[String],
     password: Option<String>,
+    use_known: bool,
 ) -> Result<ssh_manager::RootAccess, String> {
     use ssh_manager::RootAccess;
     let password = password.map(zeroize::Zeroizing::new).filter(|p| !p.is_empty());
@@ -13049,7 +13133,7 @@ async fn root_access_for(
         async move { state.root_access.lock().await.insert(session_id.to_string(), a) }
     };
     // A typed password means what the tab had stopped working: start over.
-    if password.is_none() {
+    if password.is_none() && use_known {
         let own = state.root_access.lock().await.get(session_id).cloned();
         let known = match own {
             Some(a) => Some(a),
@@ -13058,9 +13142,16 @@ async fn root_access_for(
                 .lock()
                 .await
                 .get(session_id)
-                .map(|e| RootAccess { tool: e.tool, password: e.password.clone() }),
+                .map(|e| RootAccess { tool: e.tool, password: e.password.clone(), shell: e.shell }),
         };
         if let Some(a) = known {
+            // A root shell runs anything, and root_run checks it's still root
+            // as it runs the command (run_as_root looks again if not); a
+            // tool's own rules are asked about this command.
+            if a.shell.is_some() {
+                keep(&a).await;
+                return Ok(a);
+            }
             if root_probe(session_arc, a.tool, a.password.as_deref().map(|s| s.as_str()), args).await.is_ok() {
                 keep(&a).await;
                 return Ok(a);
@@ -13072,18 +13163,35 @@ async fn root_access_for(
         }
     }
     let mut best: Option<String> = None;
+    let mut refused: Vec<&'static str> = Vec::new();
     for tool in ELEVATION_TOOLS {
         match root_probe(session_arc, tool, None, args).await {
             Ok(()) => {
-                let a = RootAccess { tool, password: None };
+                let a = RootAccess { tool, password: None, shell: None };
                 keep(&a).await;
                 return Ok(a);
             }
             Err(e) => {
+                if e == SUDO_NOT_ALLOWED {
+                    refused.push(tool);
+                }
+                if e != SUDO_NO_SUDO {
+                    crate::applog::write_line("root", &format!("{} may not run {} itself ({})", tool, args.first().map(String::as_str).unwrap_or(""), e));
+                }
                 if best.as_deref().is_none_or(|b| elevation_error_rank(&e) > elevation_error_rank(b)) {
                     best = Some(e);
                 }
             }
+        }
+    }
+    // As SFTP root mode: a root shell without a password before asking for
+    // one (probe_sudo_sftp).
+    if password.is_none() {
+        if let Some((tool, form)) = find_root_shell(session_arc, &refused).await {
+            crate::applog::write_line("root", &format!("as root through `{} {}`, no password", tool, form));
+            let a = RootAccess { tool, password: None, shell: Some(form) };
+            keep(&a).await;
+            return Ok(a);
         }
     }
     let best = best.unwrap_or_else(|| SUDO_NO_SUDO.into());
@@ -13097,7 +13205,7 @@ async fn root_access_for(
     for tool in ELEVATION_TOOLS {
         match root_probe(session_arc, tool, Some(pw.as_str()), args).await {
             Ok(()) => {
-                let a = RootAccess { tool, password: Some(pw) };
+                let a = RootAccess { tool, password: Some(pw), shell: None };
                 keep(&a).await;
                 return Ok(a);
             }
@@ -13120,9 +13228,22 @@ async fn run_as_root(
         let connections = state.connections.lock().await;
         connections.get(session_id).map(Arc::clone).ok_or_else(|| "Session not connected".to_string())?
     };
-    let access = root_access_for(state, session_id, &session_arc, args, password).await?;
-    let (code, out) = root_run(&session_arc, &access, args, timeout_secs).await?;
-    Ok((code, out, access.tool))
+    let access = root_access_for(state, session_id, &session_arc, args, password, true).await?;
+    match root_run(&session_arc, &access, args, timeout_secs).await {
+        // A root shell is used only when no password was typed, so the
+        // second look needs none either.
+        Err(e) if access.shell.is_some() => {
+            crate::applog::write_line("root", &format!("the root shell didn't work this time ({}); looking again", e));
+            state.root_access.lock().await.remove(session_id);
+            let access = root_access_for(state, session_id, &session_arc, args, None, false).await?;
+            let (code, out) = root_run(&session_arc, &access, args, timeout_secs).await?;
+            Ok((code, out, access.tool))
+        }
+        done => {
+            let (code, out) = done?;
+            Ok((code, out, access.tool))
+        }
+    }
 }
 
 /// Settings → Troubleshooting → "Copy diagnostics" (applog.rs): the build,
@@ -13361,7 +13482,9 @@ const ELEVATED_SFTP_READY: &str = "__SUB_SUDO_READY__";
 // makes sudo read the password from stdin; `-k` ignores a cached ticket so
 // the password is really checked. `sudo -l <cmd>` tests the exact command
 // we will run, which also works for sudoers rules scoped to sftp-server.
-const SUDO_SFTP_PROBE: &str = r#"S=
+macro_rules! sftp_server_find {
+    () => {
+        r#"S=
 for p in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/lib/ssh/sftp-server /usr/libexec/sftp-server /usr/lib/sftp-server /usr/local/libexec/sftp-server /usr/local/lib/sftp-server /usr/lib64/misc/sftp-server; do
   if [ -x "$p" ]; then S=$p; break; fi
 done
@@ -13371,10 +13494,18 @@ if [ -z "$S" ] && [ -r /etc/ssh/sshd_config ]; then
   done < /etc/ssh/sshd_config
 fi
 if [ -z "$S" ]; then echo __SUB_SUDO:NO_SFTP_SERVER; exit 0; fi
-echo "__SUB_SUDO:PATH:$S"
-if command -v "$SUB_TOOL" >/dev/null 2>&1; then :; else echo __SUB_SUDO:NO_SUDO; exit 0; fi
+echo "__SUB_SUDO:PATH:$S""#
+    };
+}
+/// Finds the server's sftp-server, for a root shell to start (find_sftp_server).
+const SFTP_SERVER_FIND: &str = sftp_server_find!();
+const SUDO_SFTP_PROBE: &str = concat!(
+    sftp_server_find!(),
+    "\n",
+    r#"if command -v "$SUB_TOOL" >/dev/null 2>&1; then :; else echo __SUB_SUDO:NO_SUDO; exit 0; fi
 if [ "$SUB_MODE" = pw ]; then OUT=$("$SUB_TOOL" -S -k -p "" -l "$S" 2>&1); else OUT=$("$SUB_TOOL" -n -l "$S" 2>&1); fi
-if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s "$OUT" | tr "\n" " ")"; fi"#;
+if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s "$OUT" | tr "\n" " ")"; fi"#
+);
 
 /// Programs that can run sftp-server as root, in the order they're tried.
 /// `dzdo` first: a host that has it is managed through it, and sudo there is
@@ -13479,20 +13610,66 @@ async fn exec_with_stdin_capture(
 /// doesn't allow the user hands over to the next, and any other answer (a
 /// wrong password above all) ends it, so a mistyped password counts as one
 /// failed attempt, not one per tool.
-async fn probe_sudo_sftp(session_arc: &SessionHandleArc, password: Option<&str>) -> Result<(String, &'static str), String> {
+///
+/// Without a password, when no tool may run sftp-server itself, a root
+/// shell is tried next (find_root_shell): `dzdo su -` with no password is
+/// how many AD-managed hosts give root, and must not end in a password
+/// prompt. Returns the root shell's words too, when that's the way in.
+async fn probe_sudo_sftp(
+    session_arc: &SessionHandleArc,
+    password: Option<&str>,
+) -> Result<(String, &'static str, Option<&'static str>), String> {
     let mut best: Option<String> = None;
+    let mut refused: Vec<&'static str> = Vec::new();
     for tool in ELEVATION_TOOLS {
         match probe_sudo_sftp_with(session_arc, password, tool).await {
-            Ok(path) => return Ok((path, tool)),
+            Ok(path) => return Ok((path, tool, None)),
+            // A fact about the server, whichever tool asked.
+            Err(e) if e == SUDO_NO_SFTP_SERVER => return Err(e),
             Err(e) if password.is_some() && e != SUDO_NO_SUDO && e != SUDO_NOT_ALLOWED => return Err(e),
             Err(e) => {
+                if e == SUDO_NOT_ALLOWED {
+                    refused.push(tool);
+                }
+                if e != SUDO_NO_SUDO {
+                    crate::applog::write_line("root", &format!("SFTP as root: {} may not run sftp-server itself ({})", tool, e));
+                }
                 if best.as_deref().is_none_or(|b| elevation_error_rank(&e) > elevation_error_rank(b)) {
                     best = Some(e);
                 }
             }
         }
     }
+    if password.is_none() {
+        if let Some((tool, form)) = find_root_shell(session_arc, &refused).await {
+            let path = find_sftp_server(session_arc).await?;
+            crate::applog::write_line("root", &format!("SFTP as root: through `{} {}`, no password", tool, form));
+            return Ok((path, tool, Some(form)));
+        }
+    }
     Err(best.unwrap_or_else(|| SUDO_NO_SUDO.into()))
+}
+
+/// The server's sftp-server, found as the login user.
+async fn find_sftp_server(session_arc: &SessionHandleArc) -> Result<String, String> {
+    let cmd = format!("sh -c '{}'", SFTP_SERVER_FIND);
+    let out = exec_with_stdin_capture(session_arc, &cmd, None, 20).await?;
+    for line in out.lines() {
+        match line.trim().strip_prefix("__SUB_SUDO:") {
+            Some("NO_SFTP_SERVER") => return Err(SUDO_NO_SFTP_SERVER.into()),
+            Some(rest) => {
+                if let Some(p) = rest.strip_prefix("PATH:") {
+                    let p = p.trim();
+                    if !is_safe_remote_exec_path(p) {
+                        return Err(format!("{}: unusual sftp-server path", SUDO_FAILED));
+                    }
+                    return Ok(p.to_string());
+                }
+            }
+            None => {}
+        }
+    }
+    Err(format!("{}: unexpected reply from the server", SUDO_FAILED))
 }
 
 async fn probe_sudo_sftp_with(session_arc: &SessionHandleArc, password: Option<&str>, tool: &str) -> Result<String, String> {
@@ -13664,7 +13841,16 @@ async fn open_elevated_sftp(
     }
     let tool = if ELEVATION_TOOLS.contains(&elevation.tool) { elevation.tool } else { "sudo" };
     let flags = if elevation.password.is_some() { "-S -k -p ''" } else { "-n" };
-    let cmd = format!("echo {}; exec {} {} {}", ELEVATED_SFTP_READY, tool, flags, elevation.server_path);
+    // Through a root shell, the shell prints the ready marker and starts
+    // sftp-server; nothing else goes to it before the marker is back.
+    let shell = elevation.shell.filter(|s| ROOT_SHELL_FORMS.contains(s));
+    let (cmd, shell_line) = match shell {
+        Some(form) => (
+            format!("{} {} {}", tool, flags, form),
+            Some(format!("echo {}; exec {}\n", ELEVATED_SFTP_READY, elevation.server_path)),
+        ),
+        None => (format!("echo {}; exec {} {} {}", ELEVATED_SFTP_READY, tool, flags, elevation.server_path), None),
+    };
     let channel = {
         let session = session_arc.lock().await;
         session.channel_open_session().await.map_err(|e| e.to_string())?
@@ -13676,6 +13862,10 @@ async fn open_elevated_sftp(
         line.extend_from_slice(pw.as_bytes());
         line.push(b'\n');
         stream.write_all(&line).await.map_err(|e| e.to_string())?;
+        stream.flush().await.map_err(|e| e.to_string())?;
+    }
+    if let Some(line) = &shell_line {
+        stream.write_all(line.as_bytes()).await.map_err(|e| e.to_string())?;
         stream.flush().await.map_err(|e| e.to_string())?;
     }
     let wait_ready = async {
@@ -13776,6 +13966,28 @@ mod elevated_sftp_tests {
         assert!(!is_safe_remote_exec_path("/usr/lib/sftp-server; rm -rf /"));
         assert!(!is_safe_remote_exec_path("/opt/my sftp/sftp-server"));
         assert!(!is_safe_remote_exec_path("/usr/lib/$(id)/sftp-server"));
+    }
+
+    #[test]
+    fn a_root_shell_gets_one_line_of_posix_sh() {
+        let line = root_shell_line("echo __SUB_ROOT_OUT__; 'systemctl' 'restart' 'it'\\''s' 2>&1; echo __SUB_EXITCODE:$?");
+        assert!(line.ends_with('\n') && line.matches('\n').count() == 1, "{line:?}");
+        // What a shell makes of it: /bin/sh gets the script as one word.
+        if cfg!(unix) {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(line.trim_end().replacen("exec /bin/sh -c", "printf %s", 1))
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "echo __SUB_ROOT_OUT__; 'systemctl' 'restart' 'it'\\''s' 2>&1; echo __SUB_EXITCODE:$?"
+            );
+        }
+        for form in ROOT_SHELL_FORMS {
+            assert!(form.chars().all(|c| c.is_ascii_lowercase() || c == ' ' || c == '-'), "{form}");
+        }
+        assert!(!SFTP_SERVER_FIND.contains('\'') && !SFTP_SERVER_FIND.contains('!'));
     }
 
     #[test]
@@ -14002,7 +14214,7 @@ async fn sftp_set_elevated(
         }
     }
     let (_, session_arc) = sftp_transport(&state, &session_id).await?;
-    let ((server_path, tool), used_password) = match probe_sudo_sftp(&session_arc, None).await {
+    let ((server_path, tool, shell), used_password) = match probe_sudo_sftp(&session_arc, None).await {
         Ok(found) => (found, None),
         Err(e) if e == SUDO_NEED_PASSWORD => {
             let Some(pw) = password else { return Err(e) };
@@ -14015,7 +14227,7 @@ async fn sftp_set_elevated(
     set_sftp_mode(
         &state,
         &session_id,
-        Some(ssh_manager::SftpElevation { server_path, tool, password: used_password }),
+        Some(ssh_manager::SftpElevation { server_path, tool, password: used_password, shell }),
     )
     .await;
     // Open it right away so a failure shows up here, not on the next click.
