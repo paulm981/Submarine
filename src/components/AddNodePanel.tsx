@@ -8,6 +8,7 @@ import PasswordField from "./PasswordField";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
 import { useSlideOverFocus } from "../ui/slideOverFocus";
 import { SCHEMES, readSchemeId, schemeById } from "../ui/terminalThemes";
+import { HIGHLIGHT_SETS, highlightSetById, readHighlightId } from "../ui/highlight";
 import { SchemeSwatch } from "./TerminalSchemes";
 
 // Compact "2h ago" style relative time for the attribution line.
@@ -1015,6 +1016,26 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 </select>
                 <SchemeSwatch scheme={schemeById(newNode.terminalTheme || readSchemeId())} className="shrink-0 h-9" />
               </div>
+            </div>
+
+            {/* Its own highlight set (synced with the server), e.g. Network
+                devices for a switch. */}
+            <div className="space-y-1.5 pt-1">
+              <label htmlFor="node-highlight" className="text-[11px] font-bold text-zinc-400 ml-1 flex items-center gap-2">
+                <span>Highlighting</span>
+                <span className="text-[10px] text-zinc-600 font-normal normal-case tracking-normal">
+                  Words and addresses colored in its output. Applies to its open terminals too.
+                </span>
+              </label>
+              <select
+                id="node-highlight"
+                value={newNode.highlight || ""}
+                onChange={(e) => setNewNode({ ...newNode, highlight: e.target.value })}
+                className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner"
+              >
+                <option value="">Same as Settings ({highlightSetById(readHighlightId()).name})</option>
+                {HIGHLIGHT_SETS.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
             </div>
           </div>
         </div>

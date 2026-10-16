@@ -15,6 +15,7 @@ import { useConfirm } from '../ui/confirm';
 import HistorySearchOverlay from './HistorySearchOverlay';
 import { DEFAULT_FONT_STACK, fontFamilyCss, readFontFamily, readFontSize } from '../util/terminalFont';
 import { MIN_CONTRAST_RATIO, readGpu, readMinContrast, schemeForServer } from '../ui/terminalThemes';
+import { HighlightStream, matcherForServer, type Matcher } from '../ui/highlight';
 import { readUseLocalShell } from '../util/terminalShell';
 import { IS_ANDROID, IS_LINUX } from '../util/platform';
 import { readClipboardText } from '../util/clipboard';
@@ -159,6 +160,8 @@ const TerminalView = ({
   // open — the first and every reconnect — passes a fresh channel to the
   // backend that hands its messages to it.
   const outputRef = useRef<((data: Uint8Array) => void) | null>(null);
+  // Syntax highlighting of the output (src/ui/highlight.ts).
+  const highlightRef = useRef<HighlightStream | null>(null);
   const outputChannel = () => new Channel<ArrayBuffer>((buf) => outputRef.current?.(new Uint8Array(buf)));
 
   // The wait for a freshly opened shell to be ready (SHELL_QUIET_MS): armed
@@ -352,6 +355,10 @@ const TerminalView = ({
     lastEpochRef.current = connectionEpoch;
     const term = xtermRef.current;
     if (!term) return;
+    // A new shell: nothing the old one set (a full-screen program, colors)
+    // carries over into highlighting.
+    const held = highlightRef.current?.reset();
+    if (held) term.write(held);
     // Visible separator. \x1b[33m = yellow, \x1b[0m = reset.
     term.write('\r\n\x1b[33m── reconnected ──\x1b[0m\r\n');
     ptyLiveRef.current = false;
@@ -1056,13 +1063,20 @@ const TerminalView = ({
       if (unacked >= ACK_EVERY) sendAck();
       else if (!ackTimer) ackTimer = window.setTimeout(sendAck, 30);
     };
+    // Highlighting: the server's own set, or this device's (applyLook
+    // follows changes to either). Off, output goes to xterm as it came.
+    const highlighter = new HighlightStream((late) => term.write(late));
+    highlightRef.current = highlighter;
+    let matcher: Matcher | null = matcherForServer(serverId);
+    highlighter.setMatcher(matcher, false);
     outputRef.current = (data: Uint8Array) => {
       const w = readyWatchRef.current;
       if (w) { window.clearTimeout(w.quiet); w.quiet = window.setTimeout(shellReady, SHELL_QUIET_MS); }
       // Counted for the freeze watchdog: received, and still to be drawn.
       // xterm buffers a multibyte sequence split across batches.
       noteTerminalOutput(terminalId, data.length);
-      term.write(data, () => processed(data.length));
+      if (highlighter.active) term.write(highlighter.push(data), () => processed(data.length));
+      else term.write(data, () => processed(data.length));
       // Keep a short tail of decoded output so command-history capture can
       // recognize a no-echo password prompt and skip the typed secret.
       try {
@@ -1107,6 +1121,12 @@ const TerminalView = ({
       const ratio = readMinContrast() ? MIN_CONTRAST_RATIO : 1;
       if (term.options.minimumContrastRatio !== ratio) term.options.minimumContrastRatio = ratio;
       setGpu(readGpu());
+      const next = matcherForServer(serverId);
+      if (next !== matcher) {
+        matcher = next;
+        const held = highlighter.setMatcher(next, term.buffer.active.type === 'alternate');
+        if (held) term.write(held);
+      }
     };
 
     // Handle Settings Change — font size and face apply live to open terminals.
@@ -1232,6 +1252,8 @@ const TerminalView = ({
       window.visualViewport?.removeEventListener('resize', onVvResize);
       if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
       outputRef.current = null;
+      highlighter.dispose();
+      if (highlightRef.current === highlighter) highlightRef.current = null;
       if (ackTimer) window.clearTimeout(ackTimer);
       searchAddon.dispose();
       searchAddonRef.current = null;

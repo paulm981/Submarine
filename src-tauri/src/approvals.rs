@@ -408,6 +408,7 @@ pub fn held_deletions(conn: &Connection) -> Vec<HeldDeletion> {
         .filter_map(|(uuid, t)| {
             let name = match t.as_str() {
                 "commands" | "notes" => "title",
+                "highlight_rules" => "pattern",
                 "monitor_configs" => "(SELECT s.name FROM servers s WHERE s.id = node_id)",
                 _ => "name",
             };

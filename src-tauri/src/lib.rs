@@ -30,6 +30,7 @@ mod sftp_remove;
 mod local_open;
 mod host_import;
 mod rdp;
+mod highlight;
 mod server_os;
 mod local_term;
 mod tree_moves;
@@ -372,7 +373,7 @@ fn save_vault_blocking(
 /// (tombstone) columns. `known_hosts`, `cmd_history`, `monitor_settings`,
 /// `walls` and `schema_meta` are intentionally device-local and NOT synced.
 const SYNCED_TABLES: &[&str] = &[
-    "folders", "ssh_keys", "credentials", "servers", "commands", "notes", "monitor_configs", "rdp_links",
+    "folders", "ssh_keys", "credentials", "servers", "commands", "notes", "monitor_configs", "rdp_links", "highlight_rules",
 ];
 
 /// Opaque 128-bit hex id for a synced row. Not RFC-4122 formatted — we only
@@ -471,6 +472,7 @@ fn backfill_identity_cols(table: &str) -> &'static [&'static str] {
         "rdp_links" => &["name", "host", "port", "username"],
         "commands" => &["title", "content"],
         "notes" => &["title"],
+        "highlight_rules" => &["pattern", "kind", "color"],
         // monitor_configs hangs off a server; its identity is that server's.
         "monitor_configs" => &[],
         _ => &[],
@@ -711,7 +713,8 @@ mod sync_trigger_tests {
              CREATE TABLE commands(id INTEGER PRIMARY KEY, title TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE notes(id INTEGER PRIMARY KEY, title TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE monitor_configs(node_id INTEGER PRIMARY KEY, enabled_metrics TEXT, custom_metrics TEXT, paused INTEGER NOT NULL DEFAULT 1, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
-             CREATE TABLE rdp_links(id INTEGER PRIMARY KEY, name TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);",
+             CREATE TABLE rdp_links(id INTEGER PRIMARY KEY, name TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
+             CREATE TABLE highlight_rules(id INTEGER PRIMARY KEY, pattern TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);",
         ).unwrap();
         let hlc = std::sync::Arc::new(hlc::Hlc::new("testnode".into(), 0));
         register_sync_functions(&conn, &hlc).unwrap();
@@ -819,7 +822,7 @@ struct EntitySpec {
 /// doesn't know the field", not "clear it" — so the merge keeps this device's
 /// value then (and leaves it NULL on a fresh insert). `position` has its own
 /// shim in apply_entity, as it is NOT NULL.
-const LATE_COLS: &[&str] = &["terminal_theme"];
+const LATE_COLS: &[&str] = &["terminal_theme", "highlight"];
 
 /// Applied in this order so most FK referents already exist on merge; the two
 /// self-referential FKs (folders.parent_id, servers.jump_host_id) are resolved
@@ -834,7 +837,7 @@ const ENTITIES: &[EntitySpec] = &[
     EntitySpec { table: "credentials", cols: &["name", "auth_type", "username", "password", "edited_by"], fks: &[Fk { key: "key_uuid", col: "key_id", ref_table: "ssh_keys", required: false }] },
     EntitySpec {
         table: "servers",
-        cols: &["name", "host", "port", "username", "password", "proxy_type", "proxy_host", "proxy_port", "tunnels", "auth_type", "autostart", "mirrors", "color", "notes", "run_on_connect", "terminal_theme", "position", "edited_by"],
+        cols: &["name", "host", "port", "username", "password", "proxy_type", "proxy_host", "proxy_port", "tunnels", "auth_type", "autostart", "mirrors", "color", "notes", "run_on_connect", "terminal_theme", "highlight", "position", "edited_by"],
         fks: &[
             Fk { key: "credential_uuid", col: "credential_id", ref_table: "credentials", required: false },
             Fk { key: "folder_uuid", col: "folder_id", ref_table: "folders", required: false },
@@ -850,6 +853,12 @@ const ENTITIES: &[EntitySpec] = &[
     },
     EntitySpec { table: "commands", cols: &["title", "content", "edited_by"], fks: &[] },
     EntitySpec { table: "notes", cols: &["title", "body", "edited_by"], fks: &[] },
+    // The user's own highlight rules (highlight.rs).
+    EntitySpec {
+        table: "highlight_rules",
+        cols: &["pattern", "kind", "match_case", "color", "bold", "underline", "enabled", "position", "edited_by"],
+        fks: &[],
+    },
     // Must come after `servers`: its node_id is resolved from the server's uuid,
     // so the server has to already be in place when this is applied.
     //
@@ -893,10 +902,12 @@ fn col_kind(table: &str, col: &str) -> ColKind {
         | ("servers", "name" | "host")
         | ("rdp_links", "name" | "host" | "username" | "notes")
         | ("commands", "title" | "content")
-        | ("notes", "title" | "body") => ColKind::RequiredText,
+        | ("notes", "title" | "body")
+        | ("highlight_rules", "pattern" | "kind" | "color") => ColKind::RequiredText,
         ("servers" | "rdp_links", "port") => ColKind::Int32,
         ("servers", "proxy_port") => ColKind::OptionalInt32,
         ("servers", "autostart" | "position") => ColKind::OptionalInt,
+        ("highlight_rules", "match_case" | "bold" | "underline" | "enabled" | "position") => ColKind::OptionalInt,
         _ => ColKind::Text,
     }
 }
@@ -3505,7 +3516,7 @@ mod sync_engine_tests {
             "CREATE TABLE folders(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, parent_id INTEGER, color TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE ssh_keys(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, public_key TEXT, private_key TEXT, passphrase TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE credentials(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, auth_type TEXT, username TEXT, password TEXT, key_id INTEGER, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT{});
-             CREATE TABLE servers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT, key_id INTEGER, autostart INTEGER, mirrors TEXT, color TEXT, notes TEXT, run_on_connect TEXT, jump_host_id INTEGER, position INTEGER NOT NULL DEFAULT 0, terminal_theme TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT{});
+             CREATE TABLE servers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT, key_id INTEGER, autostart INTEGER, mirrors TEXT, color TEXT, notes TEXT, run_on_connect TEXT, jump_host_id INTEGER, position INTEGER NOT NULL DEFAULT 0, terminal_theme TEXT, highlight TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT{});
              CREATE TABLE commands(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE notes(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE monitor_configs(node_id INTEGER PRIMARY KEY, enabled_metrics TEXT, custom_metrics TEXT, paused INTEGER, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT{});
@@ -3515,6 +3526,7 @@ mod sync_engine_tests {
             fk("FOREIGN KEY(node_id) REFERENCES servers(id) ON DELETE CASCADE"),
         ))
         .unwrap();
+        conn.execute_batch(highlight::SCHEMA).unwrap();
         let hlc = std::sync::Arc::new(hlc::Hlc::new(node.into(), 0));
         register_sync_functions(&conn, &hlc).unwrap();
         create_sync_triggers(&conn).unwrap();
@@ -3953,6 +3965,70 @@ mod sync_engine_tests {
         apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
         let theme: Option<String> = b.query_row("SELECT terminal_theme FROM servers WHERE name='prod'", [], |r| r.get(0)).unwrap();
         assert_eq!(theme, None, "a null from a peer that knows the column clears it");
+    }
+
+    #[test]
+    fn a_servers_highlight_set_syncs_and_an_older_peer_keeps_it() {
+        let (a, ha) = device("A");
+        a.execute("INSERT INTO servers(name, host, port, highlight) VALUES('core','h1',22,'network')", []).unwrap();
+        let (b, hb) = device("B");
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let set: Option<String> = b.query_row("SELECT highlight FROM servers WHERE name='core'", [], |r| r.get(0)).unwrap();
+        assert_eq!(set.as_deref(), Some("network"));
+
+        // An older peer's edit has no highlight key: the choice stays.
+        a.execute("UPDATE servers SET host='h2' WHERE name='core'", []).unwrap();
+        let mut recs = collect_local_records(&a, &KEY, "").unwrap();
+        for r in recs.iter_mut().filter(|r| r.entity_type == "servers") {
+            let plain = decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap();
+            let mut obj: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+            obj.as_object_mut().unwrap().remove("highlight");
+            r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
+            r.updated_at = ha.tick();
+        }
+        apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+        let (host, set): (String, Option<String>) = b
+            .query_row("SELECT host, highlight FROM servers WHERE name='core'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(host, "h2");
+        assert_eq!(set.as_deref(), Some("network"));
+    }
+
+    #[test]
+    fn highlight_rules_sync_edit_and_delete() {
+        let (a, ha) = device("A");
+        let rule = |pattern: &str| highlight::HighlightRule {
+            id: None,
+            pattern: pattern.into(),
+            kind: "word".into(),
+            match_case: false,
+            color: "magenta".into(),
+            bold: true,
+            underline: false,
+            enabled: true,
+        };
+        let id = highlight::save(&a, &rule("deploy")).unwrap();
+        highlight::save(&a, &rule("rollback")).unwrap();
+        let (b, hb) = device("B");
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let got = highlight::list(&b).unwrap();
+        assert_eq!(got.iter().map(|r| r.pattern.as_str()).collect::<Vec<_>>(), ["deploy", "rollback"]);
+        assert!(got[0].bold && got[0].color == "magenta");
+
+        // An edit, then a deletion, on A reach B.
+        let mut edited = rule("deployed");
+        edited.id = Some(id);
+        edited.underline = true;
+        highlight::save(&a, &edited).unwrap();
+        a.execute("DELETE FROM highlight_rules WHERE pattern='rollback'", []).unwrap();
+        let mut recs = collect_local_records(&a, &KEY, "").unwrap();
+        for r in recs.iter_mut().filter(|r| r.entity_type == "highlight_rules") {
+            r.updated_at = ha.tick();
+        }
+        apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+        let got = highlight::list(&b).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].pattern.as_str(), got[0].underline), ("deployed", true));
     }
 
     #[test]
@@ -5454,6 +5530,9 @@ async fn setup_master_db_inner(
             }
         }
     }
+    // The user's own highlight rules (highlight.rs): synced, made with their
+    // sync columns, before the backfill and triggers below.
+    conn.execute(highlight::SCHEMA, []).map_err(|e| format!("[DATABASE] HIGHLIGHT_TABLE_FAILED: {}", e))?;
     // Saved walls (multiexec.rs): device-local too, added the same way.
     conn.execute(multiexec::SCHEMA, []).map_err(|e| format!("[DATABASE] WALLS_TABLE_FAILED: {}", e))?;
     // The OS each server last reported (server_os.rs), for its badge.
@@ -5474,6 +5553,14 @@ async fn setup_master_db_inner(
         let s = e.to_string();
         if !s.contains("duplicate column name") {
             return Err(format!("[DATABASE] SERVER_THEME_MIGRATION_FAILED: {}", s));
+        }
+    }
+    // The server's own highlight set (an id from src/ui/highlight.ts); NULL =
+    // this device's. Synced and in LATE_COLS, like terminal_theme.
+    if let Err(e) = conn.execute("ALTER TABLE servers ADD COLUMN highlight TEXT", []) {
+        let s = e.to_string();
+        if !s.contains("duplicate column name") {
+            return Err(format!("[DATABASE] SERVER_HIGHLIGHT_MIGRATION_FAILED: {}", s));
         }
     }
 
@@ -5530,7 +5617,8 @@ async fn setup_master_db_inner(
                SELECT updated_at FROM servers UNION ALL SELECT updated_at FROM credentials
                UNION ALL SELECT updated_at FROM ssh_keys UNION ALL SELECT updated_at FROM folders
                UNION ALL SELECT updated_at FROM commands UNION ALL SELECT updated_at FROM notes
-               UNION ALL SELECT updated_at FROM monitor_configs UNION ALL SELECT updated_at FROM rdp_links)",
+               UNION ALL SELECT updated_at FROM monitor_configs UNION ALL SELECT updated_at FROM rdp_links
+               UNION ALL SELECT updated_at FROM highlight_rules)",
             [],
             |r| r.get::<_, String>(0),
         )
@@ -6590,6 +6678,22 @@ async fn set_server_terminal_theme(state: tauri::State<'_, DbState>, id: i32, va
     Ok(())
 }
 
+/// A server's own highlight set, or `None` for this device's. Its own
+/// command, like set_server_terminal_theme.
+#[tauri::command]
+async fn set_server_highlight(state: tauri::State<'_, DbState>, id: i32, value: Option<String>) -> Result<(), String> {
+    let value = value.as_deref().and_then(clean_scheme_id);
+    let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+    let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+    conn.execute(
+        "UPDATE servers SET highlight=?1 WHERE id=?2 AND highlight IS NOT ?1",
+        rusqlite::params![value, id],
+    ).map_err(|e| format!("[DATABASE] SERVER_HIGHLIGHT_FAILED: {}", e))?;
+    drop(conn_guard);
+    save_vault_internal(&state)?;
+    Ok(())
+}
+
 /// ProxyJump target for a node: `Some(other_server_id)` to bounce through that
 /// server, or `None` to connect directly. Written through its own command
 /// (like set_server_notes / set_server_run_on_connect) so it stays out of
@@ -6617,8 +6721,8 @@ async fn clone_server(state: tauri::State<'_, DbState>, id: i32) -> Result<i64, 
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     let affected = conn.execute(
-        "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, terminal_theme)
-         SELECT name || ' (copy)', host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, 0, mirrors, color, notes, run_on_connect, jump_host_id, terminal_theme
+        "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, terminal_theme, highlight)
+         SELECT name || ' (copy)', host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, 0, mirrors, color, notes, run_on_connect, jump_host_id, terminal_theme, highlight
          FROM servers WHERE id = ?1",
         rusqlite::params![id],
     ).map_err(|e| format!("[DATABASE] SERVER_CLONE_FAILED: {}", e))?;
@@ -6678,7 +6782,7 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
     // ORDER BY (position, id): `position` is the manual drag-to-reorder rank
     // (default 0 for never-reordered rows), and id breaks ties so the order is
     // stable and, before any reorder, identical to the old rowid order.
-    let mut stmt = conn.prepare("SELECT id, name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, updated_at, edited_by, position, os, terminal_theme, uuid FROM servers ORDER BY position, id")
+    let mut stmt = conn.prepare("SELECT id, name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, updated_at, edited_by, position, os, terminal_theme, uuid, highlight FROM servers ORDER BY position, id")
         .map_err(|e| format!("[DATABASE] PREPARE_FAILED: {}", e))?;
 
     let rows = stmt.query_map([], |row| {
@@ -6717,6 +6821,8 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
             // reused by another profile's server. Keys this device's own
             // per-server settings (see src/util/shellSync.ts).
             "uuid": row.get::<_, Option<String>>(25)?,
+            // Its own highlight set id; null = this device's.
+            "highlight": row.get::<_, Option<String>>(26).unwrap_or(None),
         }))
     }).map_err(|e| format!("[DATABASE] QUERY_MAPPING_FAILED: {}", e))?;
 
@@ -18702,7 +18808,7 @@ pub fn run() {
             accept_share, import_shared_profile, restore_personal_profile, share_set_role, share_revoke, share_leave, share_delete,
             profile_share_status, stop_sharing, profile_sync_stats, share_key_state, accept_share_key, share_replace_key, held_deletions_list, resolve_held_deletions,
             set_editor_label,
-            add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, allow_held, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_terminal_theme, set_server_jump_host, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
+            add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, allow_held, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_terminal_theme, set_server_highlight, set_server_jump_host, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
             get_credentials, generate_ssh_key,
             add_folder, rename_folder, delete_folder, get_folders,
             tree_moves::move_servers, tree_moves::move_rdp_links, tree_moves::move_folder, tree_moves::delete_tree_items,
@@ -18727,6 +18833,7 @@ pub fn run() {
             ssh_iptables_chain, ssh_nft_chain, ssh_firewall_as_root,
             applog::app_log, applog::ui_heartbeat, applog::open_log_folder, diagnostics_report,
             term_output::terminal_output_ack,
+            highlight::highlight_rules_list, highlight::highlight_rule_save, highlight::highlight_rule_delete, highlight::highlight_rules_reorder,
             docker::ssh_docker_container_action,
             docker::ssh_docker_inspect,
             docker::ssh_docker_stats,

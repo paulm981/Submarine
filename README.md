@@ -17,6 +17,7 @@
 > - **MultiExec on Walls**: terminals from many servers side by side. With Broadcast on, typing goes to all of them; click into one to type to it alone, pause the ones to leave out, paste or send a set of commands to all. Save walls and open a whole folder as one.
 > - **A session tree** beside the terminal that manages folders, servers and Remote Desktop links (drag and drop, rename, move).
 > - **MobaXterm session import**: nested folders, saved logins, jump hosts, startup commands such as `dzdo su -`, Remote Desktop sessions.
+> - **Syntax highlighting** in terminals: errors, warnings, OK, addresses, links and dates colored in the output, with sets for shell scripts, network devices and SQL, a set per server, and rules of your own that sync with the profile.
 > - **A Home view** of terminals on your own computer: PowerShell, Command Prompt, Git Bash and each WSL distribution by name on Windows (the default one marked, and a hint when WSL has none); the login shell and every other installed shell on macOS and Linux.
 > - **Sync through storage you own**: a folder that OneDrive, Dropbox, Nextcloud, Syncthing or a network share keeps the same on your computers, or a private git repository — no third-party service. Encrypted with the profile's password first; Remote Desktop links sync too. The original project's cloud stays off unless you turn it on.
 > - OS badges, jump hosts that let a hundred servers log in a few at a time, and hardening for Windows.
@@ -110,6 +111,12 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 - Full xterm.js 6 — true colour, ANSI 256, mouse support, drawn with the GPU on Windows (WebGL; a switch in Settings, off by default on macOS and Linux), Unicode 11 widths so emoji and CJK line up
 - **Color schemes** — Submarine's own plus Campbell, One Half, Solarized, Dracula, Nord, Tokyo Night, Catppuccin and Gruvbox (Settings › Terminal, with a live preview). A server can have **its own**, which syncs with it — e.g. a light scheme for production
 - **Keep text readable** — text a program colors too close to the background is lifted to a 4.5:1 contrast, as in VS Code
+- **Syntax highlighting** — words and addresses colored in what the terminal shows (Settings › Terminal › Highlighting, with a live preview and a box to paste your own output into):
+  - **Standard** (the default): errors and failures in red, warnings in yellow, OK and success in green, IP and MAC addresses, links, dates and times, and "Last login"
+  - **Shell script**, **Network devices** (interface names, up/down, permit/deny, config keywords; Cisco-style, Juniper names) and **SQL** add their own on top; **None** turns it off
+  - **A set per server** in its edit panel, which syncs with it — e.g. Network devices for the switches
+  - **Your own rules** — a whole word, text anywhere, or a regular expression, in a color with bold or underline. They sync with your profile and win where they and a set match the same text. An expression that would be slow enough to freeze the window is refused when you add it
+  - Only the screen changes: what's copied, typed or sent is untouched. Full-screen programs (vim, less, top) and text a program colored itself are left alone, and in a flood (a `cat` of a huge file) highlighting stays out of the way so the output keeps up, while the screen it ends on is still highlighted
 - **Clickable links** — URLs in the output and OSC 8 hyperlinks open in your browser after a prompt
 - **Select to copy** — release the mouse over your selection and it's in the clipboard
 - Right-click to paste
