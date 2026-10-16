@@ -11,7 +11,7 @@
 //! release), or as a numbered release. Besides releases, the check says how
 //! many commits the fork's main has that this build doesn't — to pull and
 //! rebuild, or to download the next build — and how many the original
-//! project has that the fork doesn't yet (GitHub's "Sync fork").
+//! project has that the fork doesn't yet (for a sync pull request, FORK.md).
 //!
 //! Every build of the fork carries the original project's version, so each
 //! also has a build number (build.rs: main's commit count). The Latest build
@@ -110,8 +110,7 @@ pub struct UpdateInfo {
     pub build: Option<u64>,
     pub latest_build: Option<u64>,
     /// Commits on the original project's main not yet in the fork's main
-    /// (None when that couldn't be told), and the fork's page, where GitHub
-    /// offers "Sync fork".
+    /// (None when that couldn't be told), and GitHub's view of them.
     pub upstream_ahead: Option<u64>,
     pub upstream_url: Option<String>,
 }
@@ -163,7 +162,7 @@ struct GhRelease {
 ///
 /// `watch_upstream`: also count the original project's new commits — for
 /// whoever maintains the fork (Settings › Updates), the only one who can
-/// "Sync fork"; everyone else is spared the notice and the call.
+/// bring them in; everyone else is spared the notice and the call.
 #[tauri::command]
 pub async fn check_for_updates(watch_upstream: Option<bool>) -> Result<UpdateInfo, String> {
     let current = env!("CARGO_PKG_VERSION").to_string();
@@ -195,7 +194,15 @@ pub async fn check_for_updates(watch_upstream: Option<bool>) -> Result<UpdateInf
     }
     if watch_upstream {
         info.upstream_ahead = upstream_ahead;
-        info.upstream_url = Some(format!("https://github.com/{}", GITHUB_REPO));
+        // What the original project has that the fork's main doesn't, to
+        // bring in with a sync pull request (FORK.md). Not the fork's own
+        // page: once the fork has its own commits, GitHub's Sync fork there
+        // offers to discard them.
+        let (upstream_owner, upstream_name) = UPSTREAM_REPO.split_once('/').unwrap_or((UPSTREAM_REPO, ""));
+        info.upstream_url = Some(format!(
+            "https://github.com/{}/compare/main...{}:{}:main",
+            GITHUB_REPO, upstream_owner, upstream_name
+        ));
     }
     Ok(info)
 }

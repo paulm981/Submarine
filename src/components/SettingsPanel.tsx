@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, FileEdit, Server, Home, Scale, ArrowRight, X, KeyRound, LifeBuoy, ClipboardCopy, FolderOpen } from "lucide-react";
+import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, FileEdit, Server, Home, Scale, ArrowRight, X, KeyRound, LifeBuoy, ClipboardCopy, FolderOpen, EyeOff } from "lucide-react";
 import {
   MAX_FONT_SIZE, MIN_FONT_SIZE, clampFontSize, fontFamilyCss,
   isFontAvailable, primaryFontName, sanitizeFontFamily,
@@ -19,6 +19,7 @@ import { HighlightSettings } from "./HighlightSettings";
 import LicensesDialog from "./LicensesDialog";
 import { DEFAULT_SCHEME } from "../ui/terminalThemes";
 import { windowSummary } from "../util/diagnostics";
+import { MAX_SCROLLBACK, MIN_SCROLLBACK, clampScrollback } from "../util/terminalScrollback";
 
 // Where this install keeps its data (see src-tauri/src/portable.rs). `portable`
 // means a `submarine-data` folder next to the executable is in use; `warning`
@@ -321,6 +322,80 @@ function SshAgentSetting({ settings, setSettings }: any) {
   );
 }
 
+// "Use settings from ~/.ssh/config" (util/sshConfig, src-tauri/src/ssh_config.rs).
+function SshConfigSetting({ settings, setSettings }: any) {
+  const on = settings.useSshConfig !== false;
+  return (
+    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 shadow-xl">
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-zinc-100">Use settings from ~/.ssh/config</div>
+          <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
+            Connect the way the OpenSSH client would: a server whose address is an alias in
+            ~/.ssh/config connects to its HostName and Port, takes its User when no username is
+            saved, uses the ssh-agent IdentityAgent names, and goes through its ProxyCommand (such
+            as cloudflared or tsh) unless the server has a jump host or proxy of its own. Host
+            blocks are matched against a server's address and its name; Include and Match are
+            followed, Match exec is never run. The file is only read, and nothing from it is
+            synced. Turn off to use only what's saved for each server.
+          </p>
+        </div>
+        <button
+          role="switch"
+          aria-checked={on}
+          aria-label="Use settings from ~/.ssh/config"
+          onClick={() => setSettings((s: any) => ({ ...s, useSshConfig: !(s.useSshConfig !== false) }))}
+          className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${on ? 'bg-primary' : 'bg-zinc-700'}`}
+        >
+          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${on ? 'left-[22px]' : 'left-0.5'}`} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// "Block screenshots" (Android only): FLAG_SECURE on the app's window. Kept
+// on the device by the app's Android plugin rather than in these settings, so
+// it applies from the first frame when the app starts (android_bridge.rs).
+function SecureScreenSetting() {
+  const [on, setOn] = useState<boolean | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    invoke<boolean>("get_secure_screen").then(setOn, (e) => setError(String(e)));
+  }, []);
+  const toggle = () => {
+    if (on === null) return;
+    setError(null);
+    invoke<boolean>("set_secure_screen", { enabled: !on }).then(setOn, (e) => setError(String(e)));
+  };
+  return (
+    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 shadow-xl">
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-zinc-100">Block screenshots</div>
+          <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
+            Keep Submarine out of screenshots, screen recordings and screen sharing, so passwords and
+            terminal output can't be captured, not even by an app that records the screen. You
+            can't take screenshots of it yourself while this is on. The preview in the recent
+            apps list is always hidden (Android 13 and later).
+          </p>
+          {error && <p className="text-[12px] text-rose-300 mt-2 break-words">{error}</p>}
+        </div>
+        <button
+          role="switch"
+          aria-checked={!!on}
+          aria-label="Block screenshots"
+          disabled={on === null}
+          onClick={toggle}
+          className={`relative shrink-0 w-11 h-6 rounded-full transition-colors disabled:opacity-50 ${on ? 'bg-primary' : 'bg-zinc-700'}`}
+        >
+          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${on ? 'left-[22px]' : 'left-0.5'}`} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // Terminal font face + size. Both are drafts while you type: the size field
 // can sit empty mid-edit (it used to snap back to 14 the moment it was
 // cleared, which made small sizes impossible to type on Android), and the
@@ -464,6 +539,69 @@ function TerminalFontSettings({ settings, setSettings }: any) {
           <span className="text-primary">user@server</span>:~$ ls -la{"\n"}0O 1lI | {"{}"} [] =&gt; ✓
         </pre>
       </div>
+    </div>
+  );
+}
+
+// Lines each terminal keeps to scroll back through (util/terminalScrollback).
+// A typed number applies on Enter or when the field loses focus: applied on
+// each keystroke, typing 25000 would pass through 2 and clamp to the minimum.
+const SCROLLBACK_STEP = 1000;
+const groupDigits = (n: number) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+
+function TerminalScrollbackSetting({ settings, setSettings }: any) {
+  const lines = clampScrollback(settings.terminalScrollback);
+  const [draft, setDraft] = useState(String(lines));
+  useEffect(() => setDraft(String(lines)), [lines]);
+  const set = (n: number) =>
+    setSettings((s: any) => ({ ...s, terminalScrollback: clampScrollback(n) }));
+  const commit = () => {
+    const n = parseInt(draft, 10);
+    const next = Number.isFinite(n) ? clampScrollback(n) : lines;
+    setDraft(String(next));
+    if (next !== lines) set(next);
+  };
+  return (
+    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-3 shadow-xl">
+      <div className="flex justify-between items-center gap-3">
+        <label htmlFor="term-scrollback" className="text-[11px] font-black text-zinc-500 uppercase tracking-wider">Scrollback (lines)</label>
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            aria-label="Fewer scrollback lines"
+            onClick={() => set(lines - SCROLLBACK_STEP)}
+            disabled={lines <= MIN_SCROLLBACK}
+            className="w-8 h-8 flex items-center justify-center bg-black border border-white/10 rounded-lg text-zinc-300 hover:text-white hover:border-primary/40 disabled:opacity-30 transition-colors"
+          >
+            <Minus size={14} />
+          </button>
+          <input
+            id="term-scrollback"
+            type="text"
+            inputMode="numeric"
+            pattern="[0-9]*"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value.replace(/[^0-9]/g, "").slice(0, 5))}
+            onBlur={commit}
+            onKeyDown={(e) => { if (e.key === "Enter") commit(); }}
+            className="w-20 h-8 bg-black border border-white/10 rounded-lg px-2 text-[12px] font-bold text-white focus:border-primary/50 outline-none text-center"
+          />
+          <button
+            type="button"
+            aria-label="More scrollback lines"
+            onClick={() => set(lines + SCROLLBACK_STEP)}
+            disabled={lines >= MAX_SCROLLBACK}
+            className="w-8 h-8 flex items-center justify-center bg-black border border-white/10 rounded-lg text-zinc-300 hover:text-white hover:border-primary/40 disabled:opacity-30 transition-colors"
+          >
+            <Plus size={14} />
+          </button>
+        </div>
+      </div>
+      <p className="text-[11.5px] text-zinc-500 leading-relaxed">
+        How many lines each terminal keeps to scroll back through, from {groupDigits(MIN_SCROLLBACK)} to{" "}
+        {groupDigits(MAX_SCROLLBACK)}. More lines take more memory in every open terminal. A change applies to open
+        terminals too; a smaller number drops their oldest lines.
+      </p>
     </div>
   );
 }
@@ -707,6 +845,8 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
           <TerminalColorSettings settings={settings} setSettings={setSettings} />
           <HighlightSettings settings={settings} setSettings={setSettings} onRulesChanged={onHighlightRulesChanged} />
 
+          <TerminalScrollbackSetting settings={settings} setSettings={setSettings} />
+
           <DefaultShellSetting settings={settings} setSettings={setSettings} />
 
           <ShellConfigSyncSettings servers={servers} />
@@ -777,7 +917,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
                 <div className="text-sm font-semibold text-zinc-100">Watch the original project</div>
                 <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
                   For whoever maintains the fork: also say when SinaXhpm/Submarine has changes the fork doesn't
-                  have yet, so you can use Sync fork on GitHub.
+                  have yet, to bring in with a sync pull request (FORK.md says how).
                 </p>
               </div>
               <button
@@ -812,7 +952,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
           </section>
         )}
 
-        {/* Not on Android, which has no ssh-agent to use. */}
+        {/* Not on Android, which has no ssh-agent or ~/.ssh/config to use. */}
         {!IS_ANDROID && (
           <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
             <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
@@ -820,6 +960,17 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
             </div>
 
             <SshAgentSetting settings={settings} setSettings={setSettings} />
+            <SshConfigSetting settings={settings} setSettings={setSettings} />
+          </section>
+        )}
+
+        {IS_ANDROID && (
+          <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
+            <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
+              <EyeOff size={14} /> Privacy
+            </div>
+
+            <SecureScreenSetting />
           </section>
         )}
 

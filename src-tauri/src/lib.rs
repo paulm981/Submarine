@@ -36,12 +36,16 @@ mod local_term;
 mod tree_moves;
 mod multiexec;
 mod store_sync;
+mod shell_sftp;
 mod archive;
 mod approvals;
 mod agent_auth;
 mod ssh_config;
 mod applog;
 mod term_output;
+mod proxy_command;
+#[cfg(target_os = "android")]
+mod android_bridge;
 #[cfg(test)]
 mod ssh_test_server;
 use ssh_manager::SshState;
@@ -4871,6 +4875,7 @@ async fn close_profile(
         ssh.sftp_elevation.lock().await.remove(sid);
         ssh.root_access.lock().await.remove(sid);
         ssh.docker_root.lock().await.remove(sid);
+        ssh.sftp_shell.lock().await.remove(sid);
         ssh.connections.lock().await.remove(sid);
         for dir in [session_sftp_dir(sid), session_drag_dir(sid)].into_iter().flatten() {
             if dir.exists() {
@@ -4911,6 +4916,7 @@ async fn close_profile(
     ssh.sftp_elevation.lock().await.clear();
     ssh.root_access.lock().await.clear();
     ssh.docker_root.lock().await.clear();
+    ssh.sftp_shell.lock().await.clear();
     // Wipe every connect-time secret the user typed this profile (issue #30).
     ssh.prompted_secrets.lock().await.clear();
     ssh.connections.lock().await.clear();
@@ -4963,8 +4969,8 @@ async fn delete_profile(app_handle: tauri::AppHandle, name: String) -> Result<()
 /// backed up or moved between machines. The file is already encrypted at
 /// rest — we just copy bytes; we never decrypt or re-encrypt.
 ///
-/// Returns `Some(path)` on success or `None` if the user cancels the
-/// native save dialog. Errors bubble up as `Err`.
+/// Returns `Some(path)` on success (on Android, the saved document's name) or
+/// `None` if the user cancels the save dialog. Errors bubble up as `Err`.
 #[tauri::command]
 async fn export_profile(
     app_handle: tauri::AppHandle,
@@ -4976,17 +4982,13 @@ async fn export_profile(
         return Err(format!("Profile '{}' not found on disk", name));
     }
 
-    // Android has no native save dialog: drop the (still encrypted) file into
-    // the first shared folder we can write to — Download, then Documents,
-    // then app storage — and report the exact path so the user can find it.
+    // Android: the system's "Save to" picker (android_bridge.rs). The user
+    // picks the place; nothing is left in a shared folder like Download
+    // unless they choose it, where any app with storage access could copy the
+    // vault and try passwords against it offline.
     #[cfg(target_os = "android")]
     {
-        let dir = android_export_dir(&app_handle)
-            .ok_or_else(|| "No writable folder found for the export.".to_string())?;
-        let dst = unique_file_path(&dir, &name, "submarine");
-        fs::copy(&src, &dst)
-            .map_err(|e| format!("[FILE] EXPORT_COPY_FAILED to {:?}: {}", dst, e))?;
-        return Ok(Some(dst.to_string_lossy().to_string()));
+        return android_bridge::save_export(&app_handle, &src, &format!("{}.submarine", name)).await;
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -5008,6 +5010,38 @@ async fn export_profile(
         fs::copy(&src, &dst)
             .map_err(|e| format!("[FILE] EXPORT_COPY_FAILED to {:?}: {}", dst, e))?;
         Ok(Some(dst.to_string_lossy().to_string()))
+    }
+}
+
+/// "Block screenshots" (Android only): whether the app's window is kept out
+/// of screenshots, screen recording and casting (FLAG_SECURE). Always false
+/// elsewhere.
+#[tauri::command]
+async fn get_secure_screen(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    #[cfg(target_os = "android")]
+    {
+        android_bridge::secure_screen(&app_handle, None).await
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app_handle;
+        Ok(false)
+    }
+}
+
+/// Turn "Block screenshots" on or off (Android only). It is kept on the
+/// device, outside any profile, and applies from the next frame. Returns the
+/// state now in effect.
+#[tauri::command]
+async fn set_secure_screen(app_handle: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
+    #[cfg(target_os = "android")]
+    {
+        android_bridge::secure_screen(&app_handle, Some(enabled)).await
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app_handle, enabled);
+        Err("Blocking screenshots is only available on Android.".into())
     }
 }
 
@@ -5087,36 +5121,6 @@ fn validate_vault_bytes(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// `<dir>/<stem>.<ext>`, or `<stem> (2).<ext>`, `(3)`… if that name is taken,
-/// so an export never overwrites an earlier one.
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
-fn unique_file_path(dir: &std::path::Path, stem: &str, ext: &str) -> PathBuf {
-    let first = dir.join(format!("{}.{}", stem, ext));
-    if !first.exists() {
-        return first;
-    }
-    for n in 2..1000 {
-        let candidate = dir.join(format!("{} ({}).{}", stem, n, ext));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    first
-}
-
-/// First shared folder the app can write to, for Android exports.
-#[cfg(target_os = "android")]
-fn android_export_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
-    let mut candidates = vec![
-        PathBuf::from("/storage/emulated/0/Download"),
-        PathBuf::from("/storage/emulated/0/Documents"),
-    ];
-    if let Ok(dir) = app.path().app_local_data_dir() {
-        candidates.push(dir);
-    }
-    candidates.into_iter().find(|p| is_dir_writable(p))
-}
-
 /// Import from bytes — the Android path: the WebView's system file picker
 /// hands the file to the page, which sends it here (base64). Same checks as
 /// `import_profile_save`, and it never overwrites an existing profile.
@@ -5172,18 +5176,6 @@ mod profile_import_tests {
         v[4] = VAULT_VERSION + 1;
         assert!(validate_vault_bytes(&v).is_err());
         assert!(validate_vault_bytes(&fake_vault(HEADER_LEN + 3)).is_err());
-    }
-
-    #[test]
-    fn exports_never_overwrite() {
-        let dir = std::env::temp_dir().join(format!("submarine-export-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let first = unique_file_path(&dir, "work", "submarine");
-        assert_eq!(first.file_name().unwrap(), "work.submarine");
-        std::fs::write(&first, b"x").unwrap();
-        let second = unique_file_path(&dir, "work", "submarine");
-        assert_eq!(second.file_name().unwrap(), "work (2).submarine");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -7750,17 +7742,16 @@ struct SecretPromptCtx<'a> {
 struct AgentSlot {
     looked: bool,
     agent: Option<agent_auth::AgentSession>,
-    /// What `~/.ssh/config` `Host` patterns are matched against when looking:
-    /// the host's address and the node's name.
-    names: Vec<String>,
+    /// What `IdentityAgent` in `~/.ssh/config` says for this host, if it
+    /// applies (see `ConfigTarget`).
+    identity_agent: Option<ssh_config::IdentityAgent>,
 }
 
 impl AgentSlot {
     /// `use_agent` is the device's "Use keys from an ssh-agent" setting. Off,
-    /// the slot starts as looked-and-none, so no agent is ever contacted (and
-    /// `~/.ssh/config` isn't read).
-    fn new(use_agent: bool, names: Vec<String>) -> tokio::sync::Mutex<Self> {
-        tokio::sync::Mutex::new(Self { looked: !use_agent, agent: None, names })
+    /// the slot starts as looked-and-none, so no agent is ever contacted.
+    fn new(use_agent: bool, identity_agent: Option<ssh_config::IdentityAgent>) -> tokio::sync::Mutex<Self> {
+        tokio::sync::Mutex::new(Self { looked: !use_agent, agent: None, identity_agent })
     }
 }
 
@@ -7772,14 +7763,174 @@ fn server_display_name(conn: &rusqlite::Connection, server_id: i32) -> Option<St
         .flatten()
 }
 
+/// Where one connection goes once `~/.ssh/config` has had its say: the
+/// address and port an alias stands for (`HostName`, `Port`), and its `User`
+/// for a node saved without a username. `config` keeps the rest (agent, key
+/// files, proxy) for the steps that use it; `log` says what the config
+/// changed or why something in it was skipped.
+struct ConfigTarget {
+    /// The address as saved (an alias, maybe): ProxyCommand's `%n`.
+    original: String,
+    host: String,
+    port: u16,
+    user: String,
+    config: Option<ssh_config::HostConfig>,
+    log: Vec<String>,
+}
+
+impl ConfigTarget {
+    /// `~/.ssh/config` for a connection to `host:port` as `user` (blank =
+    /// asked when connecting) for a node called `name`. Nothing changes when
+    /// the device's switch is off, there's no config, or this is Android.
+    async fn resolve(host: &str, port: u16, user: &str, name: Option<String>) -> Self {
+        let user_given = user.trim();
+        let lookup = ssh_config::Lookup {
+            address: host.to_string(),
+            name: name.filter(|n| !n.trim().is_empty()),
+            user: Some(user_given.to_string()).filter(|u| !u.is_empty()),
+        };
+        let config = ssh_config::for_host(lookup).await;
+        Self::apply(host, port, user, config)
+    }
+
+    fn apply(host: &str, port: u16, user: &str, config: Option<ssh_config::HostConfig>) -> Self {
+        let mut t = Self {
+            original: host.to_string(),
+            host: host.to_string(),
+            port,
+            user: user.to_string(),
+            config: None,
+            log: Vec::new(),
+        };
+        let Some(c) = config else { return t };
+        if let Some(h) = c.hostname.as_deref().filter(|h| !h.is_empty() && !h.eq_ignore_ascii_case(host)) {
+            t.log.push(format!("~/.ssh/config: {host} is HostName {h}."));
+            t.host = h.to_string();
+        }
+        if let Some(p) = c.port.filter(|&p| p != port) {
+            t.log.push(format!("~/.ssh/config: Port {p} (in place of {port})."));
+            t.port = p;
+        }
+        if user.trim().is_empty() {
+            if let Some(u) = c.user.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+                t.log.push(format!("~/.ssh/config: User {u}."));
+                t.user = u.to_string();
+            }
+        }
+        t.log.extend(c.notes.iter().cloned());
+        t.config = Some(c);
+        t
+    }
+
+    /// `IdentityAgent` for this host, resolved on this device.
+    fn identity_agent(&self) -> Option<ssh_config::IdentityAgent> {
+        self.config.as_ref()?.identity_agent.as_deref().map(ssh_config::resolve_identity_agent)
+    }
+
+    /// `ProxyCommand` / `ProxyJump` for this host, unless the server has its
+    /// own way there (a jump host, or a SOCKS / HTTP proxy), which wins; that
+    /// case is logged.
+    fn proxy(&mut self, own_route: Option<&str>) -> Option<ssh_config::Proxy> {
+        let proxy = self.config.as_ref()?.proxy.clone()?;
+        let kind = match &proxy {
+            ssh_config::Proxy::Command(_) => "ProxyCommand",
+            ssh_config::Proxy::Jump(_) => "ProxyJump",
+            ssh_config::Proxy::Disabled => return None,
+        };
+        if let Some(route) = own_route {
+            self.log.push(format!("~/.ssh/config: {kind} isn't used: this server goes through its own {route}."));
+            return None;
+        }
+        Some(proxy)
+    }
+}
+
+/// A jump host's transport: TCP, or a ProxyCommand.
+enum HopStream {
+    Tcp(tokio::net::TcpStream),
+    Command(proxy_command::ProxyStream),
+}
+
+impl tokio::io::AsyncRead for HopStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            HopStream::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            HopStream::Command(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for HopStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            HopStream::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            HopStream::Command(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            HopStream::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            HopStream::Command(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            HopStream::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            HopStream::Command(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Run `command` (ProxyCommand from ~/.ssh/config) for a connection to
+/// `target` and return it as the transport; its standard error goes to the
+/// connect log of `session_id` while `attempt` is current.
+fn start_proxy_command(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    attempt: &ssh_manager::ConnectAttempt,
+    command: &str,
+    target: &ConfigTarget,
+    user: &str,
+) -> Result<(proxy_command::ProxyStream, proxy_command::Watch), String> {
+    use tauri::Emitter;
+    let tokens = proxy_command::Tokens { host: &target.host, original: &target.original, port: target.port, user: user.trim() };
+    let expanded = proxy_command::expand(command, &tokens)
+        .map_err(|why| format!("ProxyCommand in ~/.ssh/config {why}, so it wasn't run."))?;
+    let app = app.clone();
+    let session_id = session_id.to_string();
+    let attempt = attempt.clone();
+    proxy_command::spawn(&expanded, move |line| {
+        println!("[LOG-{}] {}", session_id, line);
+        if attempt.is_current_now() {
+            let _ = app.emit(&format!("session-log-{}", session_id), serde_json::json!({"msg": line, "type": "info"}));
+        }
+    })
+}
+
+/// Turn the device's "Use settings from ~/.ssh/config" switch on or off. The
+/// page calls this at start and whenever the switch changes; it's on until
+/// then.
+#[tauri::command]
+fn set_use_ssh_config(enabled: bool) {
+    ssh_config::set_enabled(enabled);
+}
+
 /// Whether an ssh-agent holding at least one key is running on this device.
 /// Looks only once per login.
 async fn agent_available(ctx: &SecretPromptCtx<'_>) -> bool {
     let mut slot = ctx.agent.lock().await;
     if !slot.looked {
         slot.looked = true;
-        let names = std::mem::take(&mut slot.names);
-        slot.agent = agent_auth::find_agent_for(names, |m| ctx.log(&m, "info")).await;
+        let setting = slot.identity_agent.take();
+        slot.agent = agent_auth::find_agent_for(setting, |m| ctx.log(&m, "info")).await;
         if let Some(agent) = &slot.agent {
             let n = agent.key_count();
             ctx.log(
@@ -8362,10 +8513,40 @@ mod key_format_tests {
     // looked-and-none, so agent_available never contacts an agent.
     #[test]
     fn with_the_agent_setting_off_no_agent_is_looked_for() {
-        let off = AgentSlot::new(false, vec!["h".into()]);
+        let off = AgentSlot::new(false, None);
         let off = off.try_lock().unwrap();
         assert!(off.looked && off.agent.is_none());
-        assert!(!AgentSlot::new(true, vec!["h".into()]).try_lock().unwrap().looked);
+        assert!(!AgentSlot::new(true, None).try_lock().unwrap().looked);
+    }
+
+    fn host_config(f: impl FnOnce(&mut ssh_config::HostConfig)) -> Option<ssh_config::HostConfig> {
+        let mut c = ssh_config::HostConfig::default();
+        f(&mut c);
+        Some(c)
+    }
+
+    // ~/.ssh/config: an alias address takes HostName and Port; User only
+    // fills a blank username; every change is logged.
+    #[test]
+    fn a_config_alias_changes_where_to_connect() {
+        let c = host_config(|c| {
+            c.hostname = Some("10.0.0.5".into());
+            c.port = Some(2222);
+            c.user = Some("deploy".into());
+        });
+        let t = ConfigTarget::apply("prod", 22, "", c.clone());
+        assert_eq!((t.host.as_str(), t.port, t.user.as_str()), ("10.0.0.5", 2222, "deploy"));
+        assert_eq!(t.log.len(), 3, "{:?}", t.log);
+        let t = ConfigTarget::apply("prod", 22, "root", c);
+        assert_eq!(t.user, "root", "a saved username wins");
+        // Nothing to change: nothing logged.
+        let same = host_config(|c| {
+            c.hostname = Some("PROD".into());
+            c.port = Some(22);
+        });
+        assert!(ConfigTarget::apply("prod", 22, "u", same).log.is_empty());
+        let none = ConfigTarget::apply("h", 2200, "u", None);
+        assert_eq!((none.host.as_str(), none.port, none.config.is_none()), ("h", 2200, true));
     }
 
     // A node's name is matched against ~/.ssh/config Host patterns too.
@@ -9181,6 +9362,14 @@ const CONNECT_TIMEOUT_CAPS: ConnectTimeoutCaps = ConnectTimeoutCaps {
     hard: std::time::Duration::from_secs(15 + 90 + 5),
 };
 
+/// Through a ProxyCommand the handshake may wait on the command itself:
+/// cloudflared and tsh can open a browser to sign in first. Two minutes for
+/// that, then the same prompt window.
+const PROXY_COMMAND_TIMEOUT_CAPS: ConnectTimeoutCaps = ConnectTimeoutCaps {
+    handshake: std::time::Duration::from_secs(120),
+    hard: std::time::Duration::from_secs(120 + 90 + 5),
+};
+
 /// Which way the connect driver's deadline falls at a given elapsed time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectDeadline {
@@ -9639,6 +9828,14 @@ async fn connect_jump_host(
             None => return Err("jump host not found".into()),
         }
     };
+    // What ~/.ssh/config says about the bastion (its alias, agent, proxy).
+    let mut target = ConfigTarget::resolve(&host, port as u16, &user, jump_name).await;
+    let bastion_proxy = target.proxy(None);
+    for line in &target.log {
+        log(line, "info");
+    }
+    let identity_agent = target.identity_agent();
+    let (host, port, user) = (target.host.clone(), i32::from(target.port), target.user.clone());
     // A blank bastion username is resolved after the handshake (issue #54).
     let saved_user = user.trim().to_string();
 
@@ -9653,21 +9850,35 @@ async fn connect_jump_host(
     })
     .await?;
 
-    // 2. Direct TCP to the bastion.
-    log(&format!("Connecting to jump host {}:{}...", host, port), "info");
-    let tcp = match tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::net::TcpStream::connect((host.as_str(), port as u16)),
-    )
-    .await
-    {
-        Ok(Ok(s)) => {
-            let _ = s.set_nodelay(true);
-            apply_tcp_keepalive(&s);
-            s
+    // 2. TCP to the bastion, or the ProxyCommand ~/.ssh/config gives it.
+    let mut proxy_watch: Option<proxy_command::Watch> = None;
+    let transport = if let Some(ssh_config::Proxy::Command(command)) = &bastion_proxy {
+        log(
+            &format!("~/.ssh/config: reaching the jump host through ProxyCommand ({})...", proxy_command::program_name(command)),
+            "info",
+        );
+        let (stream, watch) = start_proxy_command(app, session_id, attempt, command, &target, &saved_user)?;
+        proxy_watch = Some(watch);
+        HopStream::Command(stream)
+    } else {
+        if let Some(ssh_config::Proxy::Jump(spec)) = &bastion_proxy {
+            log(&format!("~/.ssh/config: ProxyJump {spec} isn't used yet; connecting without it."), "info");
         }
-        Ok(Err(e)) => return Err(humanize_network_err(&e.to_string(), &host, port, "Jump host connection")),
-        Err(_) => return Err(format!("jump host {}:{} did not respond within 10 seconds", host, port)),
+        log(&format!("Connecting to jump host {}:{}...", host, port), "info");
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::net::TcpStream::connect((host.as_str(), port as u16)),
+        )
+        .await
+        {
+            Ok(Ok(s)) => {
+                let _ = s.set_nodelay(true);
+                apply_tcp_keepalive(&s);
+                HopStream::Tcp(s)
+            }
+            Ok(Err(e)) => return Err(humanize_network_err(&e.to_string(), &host, port, "Jump host connection")),
+            Err(_) => return Err(format!("jump host {}:{} did not respond within 10 seconds", host, port)),
+        }
     };
 
     // 3. Host-key round-trip: own nonce, shared fp_txs map + frontend session.
@@ -9709,12 +9920,20 @@ async fn connect_jump_host(
     // The 15s handshake cap bounds only the pre-prompt transport+kex phase;
     // once check_server_key shows a first-time fingerprint prompt the wait
     // extends to the hard cap so the 90s human window — not this timer — rules.
-    let connect_res = drive_connect_with_prompt_timeout(
-        russh::client::connect_stream(config, tcp, handler),
-        &prompt_pending_for_driver,
-        CONNECT_TIMEOUT_CAPS,
-    )
-    .await;
+    // The tab closed mid-handshake: stop (and with it the bastion's
+    // ProxyCommand, if any) instead of waiting out the timeout.
+    let connect_res = tokio::select! {
+        r = drive_connect_with_prompt_timeout(
+            russh::client::connect_stream(config, transport, handler),
+            &prompt_pending_for_driver,
+            if proxy_watch.is_some() { PROXY_COMMAND_TIMEOUT_CAPS } else { CONNECT_TIMEOUT_CAPS },
+        ) => r,
+        _ = attempt.superseded() => {
+            attempt.abandon();
+            fp_txs.lock().await.remove(&jump_nonce);
+            return Err("jump host: the connection attempt was cancelled".into());
+        }
+    };
     // Given up on: russh's handshake task may still reach the host-key check
     // later, and must not prompt for an attempt nobody is waiting on.
     if connect_res.is_err() {
@@ -9723,10 +9942,20 @@ async fn connect_jump_host(
     // The host-key prompt (if any) is resolved by now — drop the sender.
     fp_txs.lock().await.remove(&jump_nonce);
 
+    // What the bastion's ProxyCommand said, when there's one.
+    let proxy_said = async {
+        match &proxy_watch {
+            Some(w) => {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                w.describe().map(|d| format!(" {d}")).unwrap_or_default()
+            }
+            None => String::new(),
+        }
+    };
     let mut session = match connect_res {
         Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(format!("jump host handshake failed: {}", e)),
-        Err(ConnectTimeout::HandshakeStall) => return Err("jump host handshake timed out".into()),
+        Ok(Err(e)) => return Err(format!("jump host handshake failed: {}.{}", e, proxy_said.await)),
+        Err(ConnectTimeout::HandshakeStall) => return Err(format!("jump host handshake timed out.{}", proxy_said.await)),
         Err(ConnectTimeout::PromptHardCap) => {
             return Err("jump host host-key prompt timed out — reconnect and approve the fingerprint within 90 seconds".into())
         }
@@ -9754,7 +9983,7 @@ async fn connect_jump_host(
         allow_prompt,
         attempt,
         cancelled: std::sync::atomic::AtomicBool::new(false),
-        agent: AgentSlot::new(use_agent, [Some(host.clone()), jump_name].into_iter().flatten().collect()),
+        agent: AgentSlot::new(use_agent, identity_agent),
         session_unusable: std::sync::atomic::AtomicBool::new(false),
     };
     let (effective_user, user_prompted, login_cancelled) =
@@ -10200,6 +10429,33 @@ async fn initiate_connection(
         }
     };
 
+    // What ~/.ssh/config says about this host: an alias's address and port, a
+    // User for a node saved without one, the agent (and, for later steps, the
+    // rest). Host patterns see the address and the node's name.
+    let mut config_target = {
+        let name = if quick_auth.is_some() {
+            None
+        } else {
+            db_state.conn.lock().ok().and_then(|g| g.as_ref().and_then(|c| server_display_name(c, server_id)))
+        };
+        let port = u16::try_from(port).map_err(|_| format!("Port {port} isn't a valid port"))?;
+        ConfigTarget::resolve(&host, port, &user, name).await
+    };
+    // Its ProxyCommand / ProxyJump, unless the server has its own route.
+    let own_route = if jump_host_id.is_some() {
+        Some("jump host")
+    } else {
+        match proxy_type.as_str() {
+            "socks5" => Some("SOCKS5 proxy"),
+            "http" => Some("HTTP proxy"),
+            _ => None,
+        }
+    };
+    let config_proxy = config_target.proxy(own_route);
+    let config_log = config_target.log.clone();
+    let identity_agent = config_target.identity_agent();
+    let (host, port, user) = (config_target.host.clone(), i32::from(config_target.port), config_target.user.clone());
+
     // DB resolution succeeded — now register the fingerprint sender. From here
     // on the worker is always spawned, so its FpCleanupGuard guarantees this
     // entry is removed even on the failure paths.
@@ -10213,17 +10469,6 @@ async fn initiate_connection(
         "{}:{}|{}|{}|{:?}|{:?}",
         host, port, user.trim(), server_auth_type, effective_key_id, jump_host_id
     );
-
-    // What `~/.ssh/config` `Host` patterns are matched against if this login
-    // looks for an ssh-agent: the address and the node's name.
-    let agent_names: Vec<String> = {
-        let name = if quick_auth.is_some() {
-            None
-        } else {
-            db_state.conn.lock().ok().and_then(|g| g.as_ref().and_then(|c| server_display_name(c, server_id)))
-        };
-        [Some(host.clone()), name].into_iter().flatten().collect()
-    };
 
     // Shared between the handler and the connect driver so we can tell host-
     // key timeouts apart from real auth errors on the failure path. See
@@ -10307,6 +10552,9 @@ async fn initiate_connection(
         };
 
         emit_log("Initializing SSH connection process...", "info");
+        for line in &config_log {
+            emit_log(line, "info");
+        }
         // A blank username is resolved after the handshake (issue #54): from
         // this tab's cache, or asked for — see resolve_login_user.
         let saved_user = user.trim().to_string();
@@ -10369,6 +10617,9 @@ async fn initiate_connection(
         let mut jump_handle_holder: Option<russh::client::Handle<ssh_manager::ClientHandler>> = None;
         // Set by connect_jump_host when the bastion login itself failed.
         let jump_auth_failed = std::sync::atomic::AtomicBool::new(false);
+        // The ProxyCommand this connection goes through, if any: what it said
+        // when the handshake fails.
+        let mut proxy_watch: Option<proxy_command::Watch> = None;
         let stream_res: Result<Box<dyn AsyncStream>, String> = if let Some(jid) = jump_host_id {
             emit_log(&format!("ProxyJump: routing through jump host (server id {})...", jid), "info");
             match connect_jump_host(&app, &db_for_jump, &fp_txs_clone, &kbi_txs_clone, &prompted_secrets_clone, allow_kbi, &jump_auth_failed, &attempt, &session_id_clone, jid, use_agent).await {
@@ -10400,7 +10651,22 @@ async fn initiate_connection(
                 }
                 Err(e) => Err(format!("ProxyJump: {}", e)),
             }
+        } else if let Some(ssh_config::Proxy::Command(command)) = &config_proxy {
+            emit_log(
+                &format!("~/.ssh/config: connecting through ProxyCommand ({})...", proxy_command::program_name(command)),
+                "info",
+            );
+            match start_proxy_command(&app, &session_id_clone, &attempt, command, &config_target, &saved_user) {
+                Ok((stream, watch)) => {
+                    proxy_watch = Some(watch);
+                    Ok(Box::new(stream) as Box<dyn AsyncStream>)
+                }
+                Err(e) => Err(e),
+            }
         } else {
+        if let Some(ssh_config::Proxy::Jump(spec)) = &config_proxy {
+            emit_log(&format!("~/.ssh/config: ProxyJump {spec} isn't used yet; connecting without it."), "info");
+        }
         match proxy_type.as_str() {
             "socks5" => {
                 let p_host = match proxy_host.as_ref().filter(|h| !h.is_empty()) {
@@ -10544,7 +10810,20 @@ async fn initiate_connection(
         // 15s bounds only the pre-prompt handshake; a pending first-time
         // fingerprint prompt extends the wait to the hard cap (see
         // drive_connect_with_prompt_timeout) so the 90s human window governs.
-        match drive_connect_with_prompt_timeout(connect_future, &prompt_pending_for_driver, CONNECT_TIMEOUT_CAPS).await {
+        let caps = if proxy_watch.is_some() { PROXY_COMMAND_TIMEOUT_CAPS } else { CONNECT_TIMEOUT_CAPS };
+        // A tab closed (or reconnected) mid-handshake: stop waiting at once.
+        // Dropping the handshake drops its transport, which stops a
+        // ProxyCommand that would otherwise run until the timeout.
+        let connect_res = tokio::select! {
+            r = drive_connect_with_prompt_timeout(connect_future, &prompt_pending_for_driver, caps) => r,
+            _ = attempt.superseded() => {
+                attempt.abandon();
+                println!("[LOG-{}] Connection attempt cancelled during the handshake.", session_id_clone);
+                cleanup().await;
+                return;
+            }
+        };
+        match connect_res {
             Ok(Ok(mut session)) => {
                 emit_log("SSH Handshake complete. Authenticating user...", "info");
                 
@@ -10565,7 +10844,7 @@ async fn initiate_connection(
                     allow_prompt: allow_kbi,
                     attempt: &attempt,
                     cancelled: std::sync::atomic::AtomicBool::new(false),
-                    agent: AgentSlot::new(use_agent, agent_names.clone()),
+                    agent: AgentSlot::new(use_agent, identity_agent.clone()),
                     session_unusable: std::sync::atomic::AtomicBool::new(false),
                 };
 
@@ -11206,7 +11485,17 @@ async fn initiate_connection(
                     _ => {
                         let kind = classify_russh_error(&e);
                         let target = format!("{}:{}", host, port);
-                        (describe_error_kind(kind, &target), kind)
+                        // Through a ProxyCommand, what it said is the reason
+                        // (not signed in, host unknown to it, ...). Its exit
+                        // may land a moment after the stream ends.
+                        let said = match &proxy_watch {
+                            Some(w) => {
+                                tokio::time::sleep(Duration::from_millis(400)).await;
+                                w.describe()
+                            }
+                            None => None,
+                        };
+                        (said.unwrap_or_else(|| describe_error_kind(kind, &target)), kind)
                     }
                 };
                 emit_log(&format!("{} (raw: {})", reason, e), "error");
@@ -11229,10 +11518,18 @@ async fn initiate_connection(
                 // pending — the TCP socket is up but the SSH handshake never
                 // completed. Distinct enough from the auth path to deserve its
                 // own message.
-                let msg = format!(
-                    "{}:{} did not finish SSH handshake within 15 seconds — host may be filtering SSH or running a non-SSH service on this port.",
-                    host, port
-                );
+                let msg = match &proxy_watch {
+                    Some(w) => format!(
+                        "{}:{} did not finish the SSH handshake through ProxyCommand within 2 minutes.{}",
+                        host,
+                        port,
+                        w.describe().map(|d| format!(" {d}")).unwrap_or_default()
+                    ),
+                    None => format!(
+                        "{}:{} did not finish SSH handshake within 15 seconds — host may be filtering SSH or running a non-SSH service on this port.",
+                        host, port
+                    ),
+                };
                 emit_log(&msg, "error");
                 emit_connection_failed(
                     &app,
@@ -12030,6 +12327,7 @@ async fn disconnect_session(
     state.sftp_elevation.lock().await.remove(&session_id);
     state.root_access.lock().await.remove(&session_id);
     state.docker_root.lock().await.remove(&session_id);
+    state.sftp_shell.lock().await.remove(&session_id);
     state.connections.lock().await.remove(&session_id);
     // Drop any ProxyJump bastion handle for this session — closes the jump
     // connection once the target it was carrying is gone.
@@ -13601,6 +13899,8 @@ struct SftpFileEntry {
 struct SftpListResult {
     current_path: String,
     entries: Vec<SftpFileEntry>,
+    /// The server has no SFTP: files go over shell commands (`shell_sftp`).
+    via_shell: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -13866,6 +14166,44 @@ async fn probe_sudo_sftp_with(session_arc: &SessionHandleArc, password: Option<&
     Err(format!("{}: unexpected reply from the server", SUDO_FAILED))
 }
 
+// For a server without sftp-server: file operations as root run as shell
+// commands under sudo (`shell_sftp`), so sudo must allow `sh`. Same rules as
+// SUDO_SFTP_PROBE (sent as `sh -c '<script>'`).
+const SUDO_SHELL_PROBE: &str = r#"if command -v sudo >/dev/null 2>&1; then :; else echo __SUB_SUDO:NO_SUDO; exit 0; fi
+if [ "$SUB_MODE" = pw ]; then OUT=$(sudo -S -k -p "" -l sh 2>&1); else OUT=$(sudo -n -l sh 2>&1); fi
+if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s "$OUT" | tr "\n" " ")"; fi"#;
+
+/// Check sudo or dzdo for file operations as root: the sftp-server and how
+/// to run it as root (probe_sudo_sftp); or, where the server has none, `None`
+/// and shell commands under sudo instead (`shell_sftp`, sudo only for now).
+async fn probe_sudo_files(
+    session_arc: &SessionHandleArc,
+    password: Option<&str>,
+) -> Result<(Option<String>, &'static str, Option<&'static str>), String> {
+    match probe_sudo_sftp(session_arc, password).await {
+        Ok((path, tool, shell)) => return Ok((Some(path), tool, shell)),
+        Err(e) if e == SUDO_NO_SFTP_SERVER => {}
+        Err(e) => return Err(e),
+    }
+    let mode = if password.is_some() { "pw" } else { "n" };
+    let cmd = format!("env SUB_MODE={} sh -c '{}'", mode, SUDO_SHELL_PROBE);
+    let stdin = password.map(|p| zeroize::Zeroizing::new(format!("{}\n", p)));
+    let out = exec_with_stdin_capture(session_arc, &cmd, stdin.as_ref().map(|s| s.as_bytes()), 25).await?;
+    for line in out.lines() {
+        match line.trim().strip_prefix("__SUB_SUDO:") {
+            Some("OK") => return Ok((None, "sudo", None)),
+            Some("NO_SUDO") => return Err(SUDO_NO_SUDO.into()),
+            Some(rest) => {
+                if let Some(msg) = rest.strip_prefix("FAIL:") {
+                    return Err(classify_sudo_failure(msg));
+                }
+            }
+            None => {}
+        }
+    }
+    Err(format!("{}: unexpected reply from the server", SUDO_FAILED))
+}
+
 /// Settings for every SFTP session the app opens: file browser, transfers,
 /// sudo sessions and mirrors.
 ///
@@ -13924,10 +14262,17 @@ pub(crate) async fn start_sftp(
             }
         }
     };
-    tokio::time::timeout(SFTP_START_TIMEOUT, answer)
-        .await
-        .map_err(|_| "The server didn't answer the request to start SFTP.".to_string())?
-        .map_err(String::from)?;
+    let answered = match tokio::time::timeout(SFTP_START_TIMEOUT, answer).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("The server didn't answer the request to start SFTP.".to_string()),
+    };
+    if let Err(e) = answered {
+        // A dropped channel stays open on the server, and OpenSSH keeps a
+        // refused one: each would take one of its 10 sessions per connection.
+        let _ = channel.close().await;
+        return Err(e);
+    }
     let handshake = russh_sftp::client::SftpSession::new_with_config(channel.into_stream(), sftp_client_config());
     match tokio::time::timeout(SFTP_START_TIMEOUT, handshake).await {
         Ok(Ok(sftp)) => Ok(sftp),
@@ -13936,6 +14281,50 @@ pub(crate) async fn start_sftp(
         }
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err("SFTP didn't start: the server didn't answer its handshake.".to_string()),
+    }
+}
+
+/// SFTP on a connection: the server's own or, when it has none (turned down,
+/// or its SFTP program is missing), file access over shell commands
+/// (`shell_sftp`). The flag is true for the latter.
+pub(crate) async fn open_sftp(
+    session_arc: &SessionHandleArc,
+) -> Result<(russh_sftp::client::SftpSession, bool), String> {
+    let channel = {
+        let session = session_arc.lock().await;
+        session.channel_open_session().await.map_err(|e| e.to_string())?
+    };
+    match start_sftp(channel).await {
+        Ok(sftp) => Ok((sftp, false)),
+        Err(e) if e == SFTP_REFUSED || e == SFTP_ENDED => {
+            let opener = shell_sftp::opener(Arc::clone(session_arc));
+            match shell_sftp::start(opener, shell_sftp::Sudo::No).await {
+                Ok(sftp) => Ok((sftp, true)),
+                Err(why) => Err(format!("{} (File access over shell commands didn't work either: {}.)", e, why)),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// An elevated tab's SFTP: `sudo <sftp-server>`, or shell commands under sudo
+/// when the server has no sftp-server.
+async fn open_elevated(
+    session_arc: &SessionHandleArc,
+    elevation: &ssh_manager::SftpElevation,
+) -> Result<(russh_sftp::client::SftpSession, bool), String> {
+    match &elevation.server_path {
+        Some(path) => open_elevated_sftp(session_arc, path, elevation).await.map(|s| (s, false)),
+        None => {
+            let sudo = match &elevation.password {
+                Some(pw) => shell_sftp::Sudo::Password(pw.clone()),
+                None => shell_sftp::Sudo::Passwordless,
+            };
+            shell_sftp::start(shell_sftp::opener(Arc::clone(session_arc)), sudo)
+                .await
+                .map(|s| (s, true))
+                .map_err(|e| if e.starts_with("[SUDO]") { e } else { format!("{}: {}", SUDO_FAILED, e) })
+        }
     }
 }
 
@@ -13996,23 +14385,25 @@ mod sftp_config_tests {
 /// follow go to sftp-server.
 async fn open_elevated_sftp(
     session_arc: &SessionHandleArc,
+    server_path: &str,
     elevation: &ssh_manager::SftpElevation,
 ) -> Result<russh_sftp::client::SftpSession, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    if !is_safe_remote_exec_path(&elevation.server_path) {
+    if !is_safe_remote_exec_path(server_path) {
         return Err(format!("{}: unusual sftp-server path", SUDO_FAILED));
     }
     let tool = if ELEVATION_TOOLS.contains(&elevation.tool) { elevation.tool } else { "sudo" };
-    let flags = if elevation.password.is_some() { "-S -k -p ''" } else { "-n" };
+    let password = elevation.password.as_ref();
+    let flags = if password.is_some() { "-S -k -p ''" } else { "-n" };
     // Through a root shell, the shell prints the ready marker and starts
     // sftp-server; nothing else goes to it before the marker is back.
     let shell = elevation.shell.filter(|s| ROOT_SHELL_FORMS.contains(s));
     let (cmd, shell_line) = match shell {
         Some(form) => (
             format!("{} {} {}", tool, flags, form),
-            Some(format!("echo {}; exec {}\n", ELEVATED_SFTP_READY, elevation.server_path)),
+            Some(format!("echo {}; exec {}\n", ELEVATED_SFTP_READY, server_path)),
         ),
-        None => (format!("echo {}; exec {} {} {}", ELEVATED_SFTP_READY, tool, flags, elevation.server_path), None),
+        None => (format!("echo {}; exec {} {} {}", ELEVATED_SFTP_READY, tool, flags, server_path), None),
     };
     let channel = {
         let session = session_arc.lock().await;
@@ -14020,7 +14411,7 @@ async fn open_elevated_sftp(
     };
     channel.exec(true, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
     let mut stream = channel.into_stream();
-    if let Some(pw) = &elevation.password {
+    if let Some(pw) = password {
         let mut line = zeroize::Zeroizing::new(Vec::with_capacity(pw.len() + 1));
         line.extend_from_slice(pw.as_bytes());
         line.push(b'\n');
@@ -14377,11 +14768,11 @@ async fn sftp_set_elevated(
         }
     }
     let (_, session_arc) = sftp_transport(&state, &session_id).await?;
-    let ((server_path, tool, shell), used_password) = match probe_sudo_sftp(&session_arc, None).await {
+    let ((server_path, tool, shell), used_password) = match probe_sudo_files(&session_arc, None).await {
         Ok(found) => (found, None),
         Err(e) if e == SUDO_NEED_PASSWORD => {
             let Some(pw) = password else { return Err(e) };
-            let found = probe_sudo_sftp(&session_arc, Some(pw.as_str())).await?;
+            let found = probe_sudo_files(&session_arc, Some(pw.as_str())).await?;
             (found, Some(pw))
         }
         Err(e) => return Err(e),
@@ -14441,15 +14832,9 @@ pub async fn get_sftp_session(
     // Elevated tabs get `sudo <sftp-server>` instead of the plain subsystem.
     let elevation = state.sftp_elevation.lock().await.get(session_id).cloned();
     let was_elevated = elevation.is_some();
-    let sftp = match elevation {
-        Some(elev) => open_elevated_sftp(&session_arc, &elev).await?,
-        None => {
-            let channel = {
-                let session = session_arc.lock().await;
-                session.channel_open_session().await.map_err(|e| e.to_string())?
-            };
-            start_sftp(channel).await?
-        }
+    let (sftp, via_shell) = match elevation {
+        Some(elev) => open_elevated(&session_arc, &elev).await?,
+        None => open_sftp(&session_arc).await?,
     };
     let arc = Arc::new(sftp);
 
@@ -14487,6 +14872,13 @@ pub async fn get_sftp_session(
         return Err("Session reconnected while opening SFTP — try again".into());
     }
     cache.insert(session_id.to_string(), Arc::clone(&arc));
+    // For the pane's note that files go over shell commands.
+    let mut shell = state.sftp_shell.lock().await;
+    if via_shell {
+        shell.insert(session_id.to_string());
+    } else {
+        shell.remove(session_id);
+    }
     Ok(arc)
 }
 
@@ -14598,6 +14990,7 @@ async fn sftp_list_dir(
     Ok(SftpListResult {
         current_path: canonical_path,
         entries,
+        via_shell: state.sftp_shell.lock().await.contains(&session_id),
     })
 }
 
@@ -16341,14 +16734,10 @@ async fn sftp_open_remote_file(
                     // An elevated tab (file ops as root via sudo) must save
                     // back the same way, or root-owned files can't be written.
                     let elevation = elevation_clone.lock().await.get(&session_id_clone).cloned();
-                    let sftp = if let Some(elev) = elevation {
-                        open_elevated_sftp(&session_arc, &elev).await?
+                    let (sftp, _) = if let Some(elev) = elevation {
+                        open_elevated(&session_arc, &elev).await?
                     } else {
-                        let channel = {
-                            let session = session_arc.lock().await;
-                            session.channel_open_session().await.map_err(|e| e.to_string())?
-                        };
-                        start_sftp(channel).await?
+                        open_sftp(&session_arc).await?
                     };
 
                     use russh_sftp::protocol::OpenFlags;
@@ -19183,6 +19572,10 @@ pub fn run() {
     // dispatches through this so the same code path works in the desktop
     // installer AND the Android APK. Capability is granted in default.json.
     let builder = builder.plugin(tauri_plugin_opener::init());
+    // The app's own Android plugin: export through the system's "Save to"
+    // picker and the "Block screenshots" switch (android_bridge.rs).
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(android_bridge::init());
     let builder = builder
         .manage(DbState { conn: std::sync::Arc::new(StdMutex::new(None)), master_key: StdMutex::new(None), salt: StdMutex::new(None), db_path: StdMutex::new(None), active_profile: StdMutex::new(None), hlc: StdMutex::new(None), generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)), sync_cursor: StdMutex::new(None) })
         .manage(SshState::new())
@@ -19220,6 +19613,7 @@ pub fn run() {
             check_db_exists, setup_master_db, persist_vault,
             list_profiles, cloud_list_sync_profiles, cloud_delete_profile, force_push_profile, select_profile, create_profile, delete_profile, close_profile,
             export_profile, import_profile_pick, import_profile_save, import_profile_bytes,
+            get_secure_screen, set_secure_screen,
             cloud::cloud_status, cloud::cloud_signup, cloud::cloud_consume_verify_link,
             cloud::cloud_set_password, cloud::cloud_login, cloud::cloud_logout,
             cloud::cloud_request_password_reset, cloud::cloud_reset_password,
@@ -19246,7 +19640,7 @@ pub fn run() {
             add_credential, edit_credential, delete_credential,
             add_ssh_key, edit_ssh_key, delete_ssh_key,
             pick_ssh_key_file, read_ssh_key_file, import_ssh_key_file,
-            initiate_connection, verify_fingerprint_response, submit_kbi_response, disconnect_session,
+            initiate_connection, verify_fingerprint_response, submit_kbi_response, disconnect_session, set_use_ssh_config,
             start_tunnel, stop_tunnel, list_tunnels, restart_session_tunnels, persist_session_tunnels,
             list_tunnel_rules, remove_tunnel_rule, rename_tunnel_rule,
             open_terminal, local_shell, write_terminal_data, resize_terminal, close_terminal,

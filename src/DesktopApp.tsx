@@ -21,8 +21,10 @@ import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./
 import { GPU_KEY, MIN_CONTRAST_KEY, SCHEME_KEY, readGpu, readMinContrast, readSchemeId, setServerSchemes } from "./ui/terminalThemes";
 import { HIGHLIGHT_KEY, normalizeRules, onSlowRule, readHighlightId, setCustomRules, setServerHighlights } from "./ui/highlight";
 import { logLine } from "./util/diagnostics";
+import { SCROLLBACK_KEY, readScrollback } from "./util/terminalScrollback";
 import { USE_LOCAL_SHELL_KEY, readUseLocalShell } from "./util/terminalShell";
 import { USE_SSH_AGENT_KEY, readUseSshAgent } from "./util/sshAgent";
+import { USE_SSH_CONFIG_KEY, readUseSshConfig } from "./util/sshConfig";
 import { Sidebar } from "./components/Sidebar";
 import { NodeGrid } from "./components/NodeGrid";
 import { SessionTree, type TreeItems } from "./components/SessionTree";
@@ -372,12 +374,17 @@ function DesktopApp() {
     // Which highlight set terminals use (src/ui/highlight.ts), unless their
     // server has its own.
     terminalHighlight: readHighlightId(),
+    // Lines each terminal keeps above the screen. See util/terminalScrollback.
+    terminalScrollback: readScrollback(),
     // Off by default: terminals start the remote account's own shell, same
     // as before this setting existed. See util/terminalShell.
     useLocalShell: readUseLocalShell(),
     // On by default: logins may use keys from an ssh-agent on this computer.
     // See util/sshAgent.
     useSshAgent: readUseSshAgent(),
+    // On by default: connections use what ~/.ssh/config says about a host.
+    // See util/sshConfig.
+    useSshConfig: readUseSshConfig(),
     // Auto-sync defaults ON. Per-device (localStorage), like the other prefs.
     autoSync: localStorage.getItem('submarine-auto-sync') !== 'off',
     // Background pull cadence in minutes (min 1). Only gates the periodic
@@ -407,8 +414,11 @@ function DesktopApp() {
     localStorage.setItem(GPU_KEY, appSettings.terminalGpu ? 'on' : 'off');
     localStorage.setItem(MIN_CONTRAST_KEY, appSettings.terminalMinContrast ? 'on' : 'off');
     localStorage.setItem(HIGHLIGHT_KEY, appSettings.terminalHighlight);
+    localStorage.setItem(SCROLLBACK_KEY, String(appSettings.terminalScrollback));
     localStorage.setItem(USE_LOCAL_SHELL_KEY, appSettings.useLocalShell ? 'on' : 'off');
     localStorage.setItem(USE_SSH_AGENT_KEY, appSettings.useSshAgent ? 'on' : 'off');
+    localStorage.setItem(USE_SSH_CONFIG_KEY, appSettings.useSshConfig ? 'on' : 'off');
+    invoke("set_use_ssh_config", { enabled: appSettings.useSshConfig }).catch(() => {});
     localStorage.setItem('submarine-auto-sync', appSettings.autoSync ? 'on' : 'off');
     localStorage.setItem('submarine-sync-interval-min', String(appSettings.syncIntervalMin));
     localStorage.setItem('submarine-detect-os', appSettings.detectOs ? 'on' : 'off');

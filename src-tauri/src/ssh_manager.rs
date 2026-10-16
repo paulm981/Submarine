@@ -403,6 +403,9 @@ pub struct SshState {
     /// group): the Docker tab's commands go straight to root there
     /// (docker.rs). Dropped when the tab closes, like `root_access`.
     pub docker_root: Arc<Mutex<HashSet<String>>>,
+    /// Tabs whose cached SFTP session is file access over shell commands (the
+    /// server has no SFTP, see `shell_sftp`): the pane says so.
+    pub sftp_shell: Arc<Mutex<HashSet<String>>>,
     /// Secrets the user typed at connect time when the saved node / login / key
     /// had none (issue #30), keyed by the BASE session id (the tab). A reconnect
     /// or a dedicated `::sftp` / `::fwd` secondary reuses what the user already
@@ -430,9 +433,12 @@ pub struct RootAccess {
 /// never on a command line (it is written to sudo's stdin).
 #[derive(Clone)]
 pub struct SftpElevation {
-    /// Absolute path of the server's sftp-server binary (probed once).
-    pub server_path: String,
-    /// `sudo` or `dzdo`, whichever the probe found allowed.
+    /// Absolute path of the server's sftp-server binary (probed once). `None`:
+    /// the server has none, and file operations run as shell commands under
+    /// sudo (`shell_sftp`).
+    pub server_path: Option<String>,
+    /// `sudo` or `dzdo`, whichever the probe found allowed (always `sudo`
+    /// without an sftp-server).
     pub tool: &'static str,
     /// `None` = passwordless (`sudo -n` / `dzdo -n`).
     pub password: Option<zeroize::Zeroizing<String>>,
@@ -484,6 +490,7 @@ impl SshState {
             sftp_elevation: Arc::new(Mutex::new(HashMap::new())),
             root_access: Arc::new(Mutex::new(HashMap::new())),
             docker_root: Arc::new(Mutex::new(HashSet::new())),
+            sftp_shell: Arc::new(Mutex::new(HashSet::new())),
             prompted_secrets: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -672,6 +679,16 @@ impl ConnectAttempt {
             .try_lock()
             .map(|g| g.get(&self.session_id).copied().unwrap_or(0) == self.generation)
             .unwrap_or(true)
+    }
+
+    /// Resolves once the attempt is no longer current: the tab was
+    /// disconnected or closed, or a newer attempt started. Looked at twice a
+    /// second; a handshake waiting on a ProxyCommand that never answers is
+    /// given up on (and the command stopped) when this resolves.
+    pub async fn superseded(&self) {
+        while self.is_current().await {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
     }
 
     /// The connect driver stopped waiting on this attempt (its handshake timed
