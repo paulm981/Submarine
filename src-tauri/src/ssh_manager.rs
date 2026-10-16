@@ -1,6 +1,6 @@
 use russh::client;
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -399,6 +399,10 @@ pub struct SshState {
     /// firewall rules): what worked last time, so it isn't probed or asked
     /// for again. Dropped when the tab closes, like `sftp_elevation`.
     pub root_access: Arc<Mutex<HashMap<String, RootAccess>>>,
+    /// Tabs whose server refuses the user's own `docker` (not in the docker
+    /// group): the Docker tab's commands go straight to root there
+    /// (docker.rs). Dropped when the tab closes, like `root_access`.
+    pub docker_root: Arc<Mutex<HashSet<String>>>,
     /// Secrets the user typed at connect time when the saved node / login / key
     /// had none (issue #30), keyed by the BASE session id (the tab). A reconnect
     /// or a dedicated `::sftp` / `::fwd` secondary reuses what the user already
@@ -479,6 +483,7 @@ impl SshState {
             session_generation: Arc::new(Mutex::new(HashMap::new())),
             sftp_elevation: Arc::new(Mutex::new(HashMap::new())),
             root_access: Arc::new(Mutex::new(HashMap::new())),
+            docker_root: Arc::new(Mutex::new(HashSet::new())),
             prompted_secrets: Arc::new(Mutex::new(HashMap::new())),
         }
     }
