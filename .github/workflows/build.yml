@@ -751,7 +751,7 @@ jobs:
               echo "### macOS (Apple silicon)"
               (IFS='|'; echo "${mac[*]}" | sed 's/|/ · /g')
               echo
-              echo "Not notarized by Apple, so the first time macOS won't open it: open **System Settings → Privacy & Security** and click **Open Anyway** (on macOS 14 and older, right-click the app → **Open** works too)."
+              echo "Not notarized by Apple, so the first time macOS says *\"Apple could not verify…\"*: move the app into **Applications**, open it once, then open **System Settings → Privacy & Security** and click **Open Anyway** (on macOS 14 and older, right-click the app → **Open** works too). Or in Terminal: \`xattr -dr com.apple.quarantine /Applications/Submarine.app\`. [Step by step](https://github.com/$REPO#first-open-on-macos)."
             fi
             linux=()
             has Submarine-linux-x86_64.AppImage && linux+=("$(link Submarine-linux-x86_64.AppImage AppImage)")
