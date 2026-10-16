@@ -394,7 +394,7 @@ npm run tauri build        # build release bundle
 [`.github/workflows/build.yml`](.github/workflows/build.yml) builds the installers on GitHub's Windows, macOS and Linux runners:
 
 - **Every merge into `main`** replaces the [Latest build](https://github.com/paulm981/Submarine/releases/tag/latest-main) release (a pre-release, tag `latest-main`) with that commit's installers. If the Windows build fails, the previous Latest build stays up. Its build number is main's commit count along its own line (`git rev-list --count --first-parent HEAD`), so each merge adds one; `src-tauri/build.rs` stamps the same number into the app.
-- **A version tag** makes a numbered release: `git tag v0.4.0 && git push origin v0.4.0`.
+- **A version tag** makes a numbered release with the build number in its title. The fork's are tagged `v0.3.8-fork.1`, `v0.3.8-fork.2` and so on ([FORK.md](FORK.md#keeping-up-with-the-original-project) says how): `git tag v0.3.8-fork.1 <commit> && git push origin v0.3.8-fork.1`.
 - **Run workflow** on the [Actions tab](https://github.com/paulm981/Submarine/actions/workflows/build.yml) builds on demand; it only publishes when `publish_release` is set.
 
 Each run's files are also kept for 90 days under **Artifacts** on the run's page (GitHub sign-in needed there). Android is built for numbered releases only when the repository variable `BUILD_ANDROID` is `true` and the signing secrets the workflow names are set.
