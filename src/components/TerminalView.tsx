@@ -10,7 +10,7 @@ import '@xterm/xterm/css/xterm.css';
 import { useIsNarrow } from '../hooks/useViewport';
 import { MobileKeyBar, ModifiersState, ModKey, SpecialKey } from './MobileKeyBar';
 import { appHotkey, registerTerminal, terminalStateChanged } from '../ui/terminalDock';
-import { forgetTerminal, noteTerminalOutput, noteTerminalParsed, noteTerminalRenderer } from '../util/diagnostics';
+import { forgetTerminal, logLine, noteTerminalOutput, noteTerminalParsed, noteTerminalRenderer } from '../util/diagnostics';
 import { useConfirm } from '../ui/confirm';
 import HistorySearchOverlay from './HistorySearchOverlay';
 import { DEFAULT_FONT_STACK, fontFamilyCss, readFontFamily, readFontSize } from '../util/terminalFont';
@@ -68,6 +68,15 @@ const LOCAL_COMMANDS = { write: 'local_terminal_write', resize: 'local_terminal_
 const SHELL_QUIET_MS = 300;
 const SHELL_FIRST_OUTPUT_MS = 1500;
 const SHELL_READY_CAP_MS = 5000;
+
+// Escape sequences xterm.js carries out once per count, with no limit on the
+// count: scroll up/down (S, T), insert/delete lines (L, M), tab forward/back
+// (I, Z), and repeat the last character (b). `ESC[999999999S` — 15 bytes,
+// which a binary file `cat` to the screen can contain by chance — kept the
+// window busy for hours. Programs send counts up to the screen's size, so one
+// over COUNT_LIMIT is ignored.
+const COUNTED_FINALS = ['S', 'T', 'L', 'M', 'I', 'Z', 'b'] as const;
+const COUNT_LIMIT = 10_000;
 
 // State machine for the modifier stickies on the mobile key bar.
 // off → armed → locked → off (cycled by repeated taps).
@@ -605,6 +614,20 @@ const TerminalView = ({
     term.unicode.activeVersion = '11';
     // Plain URLs in the output (not only OSC 8 links) are clickable too.
     term.loadAddon(new WebLinksAddon((_event, uri) => openLink(uri)));
+    // A runaway count (COUNTED_FINALS) is handled here by doing nothing;
+    // otherwise xterm's own handler runs. The first one is noted in the log.
+    let runawayLogged = false;
+    for (const final of COUNTED_FINALS) {
+      term.parser.registerCsiHandler({ final }, (params) => {
+        const count = params[0];
+        if (typeof count !== 'number' || count <= COUNT_LIMIT) return false;
+        if (!runawayLogged) {
+          runawayLogged = true;
+          logLine('warn', `[terminal] ${terminalId}: ignored ESC[${count}${final} (a count that large would freeze the window)`);
+        }
+        return true;
+      });
+    }
     // xterm draws into a div of its own, which a Wall can borrow (see
     // src/ui/terminalDock.ts) — so the mouse, resize and focus handling
     // below is bound to it, not to this component's wrapper.

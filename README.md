@@ -106,7 +106,7 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 
 - Tabbed sessions per server and multiple shells per session
 - **Split** — the button next to + opens another shell on the same server beside the one you're in (watch a log in one, work in the other); right-click it to put an open tab beside this one or to stack them top and bottom
-- **Fast output never freezes the app** — a busy `tail -f` or a `cat` of a huge file is sent as raw bytes and paced by what the window has drawn; when a stream stays faster than the screen can show, the oldest unseen part is skipped with a note in the terminal, and Ctrl+C still answers at once
+- **Fast output never freezes the app** — a busy `tail -f` or a `cat` of a huge file is sent as raw bytes and paced by what the window has drawn; when a stream stays faster than the screen can show, the oldest unseen part is skipped with a note in the terminal, and Ctrl+C still answers at once. Escape sequences with absurd counts (`ESC[999999999S`, which a binary file can contain by chance and which xterm.js would loop on for hours) are ignored
 - Full xterm.js 6 — true colour, ANSI 256, mouse support, drawn with the GPU on Windows (WebGL; a switch in Settings, off by default on macOS and Linux), Unicode 11 widths so emoji and CJK line up
 - **Color schemes** — Submarine's own plus Campbell, One Half, Solarized, Dracula, Nord, Tokyo Night, Catppuccin and Gruvbox (Settings › Terminal, with a live preview). A server can have **its own**, which syncs with it — e.g. a light scheme for production
 - **Keep text readable** — text a program colors too close to the background is lifted to a 4.5:1 contrast, as in VS Code
@@ -120,7 +120,7 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 ### SFTP File Browser
 
 - Dual-pane (local on top, remote on bottom) with drag-and-drop between them
-- **Right-click the empty space** in a list for Refresh, New Folder, Select all and Copy folder path. A right-click anywhere in the app never shows the webview's own menu (whose Reload would restart the whole app), and F5 / Ctrl+R don't reload it either
+- **Right-click the empty space** in a list for Refresh, New Folder, Select all and Copy folder path. Every right-click menu is the app's own, dark like the rest: text fields get Cut / Copy / Paste / Select all, selected text gets Copy, and the webview's menu (whose Reload would restart the whole app) never shows. F5 / Ctrl+R don't reload the app either
 - **Tabs or Split layout** — toggle between stacked tabs (one pane visible, more screen real-estate) and the classic split, persisted per device
 - **Per-pane filter input** — type to filter the listing live with an N/M counter, Esc to clear
 - **Multi-select with Ctrl/Shift-click** plus **Select-All button and Ctrl+A** for bulk download, move, or delete
