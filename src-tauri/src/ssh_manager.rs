@@ -415,6 +415,10 @@ pub struct RootAccess {
     pub tool: &'static str,
     /// `None` = passwordless (`-n`).
     pub password: Option<zeroize::Zeroizing<String>>,
+    /// Through a root shell (`dzdo su -`, …: the words after the tool) with
+    /// the command on its stdin, where the tool's rules allow only that.
+    /// `None` = the tool runs the command itself.
+    pub shell: Option<&'static str>,
 }
 
 /// How an elevated SFTP channel is started. The sudo password (if any) lives
@@ -428,6 +432,8 @@ pub struct SftpElevation {
     pub tool: &'static str,
     /// `None` = passwordless (`sudo -n` / `dzdo -n`).
     pub password: Option<zeroize::Zeroizing<String>>,
+    /// Through a root shell, as for RootAccess.
+    pub shell: Option<&'static str>,
 }
 
 /// Connect-time secrets the user typed when a saved node / login / key had none
