@@ -7,6 +7,7 @@ import "./App.css";
 import "./util/bundledFonts";
 import { startDiagnostics } from "./util/diagnostics";
 import { tameNativeMenus } from "./util/nativeMenus";
+import { keepTypingPlain } from "./util/plainTyping";
 
 // The app's log and freeze watchdog (util/diagnostics.ts): a failure that
 // escapes React (an async reject, a listener throw), console.error, and a
@@ -15,6 +16,9 @@ import { tameNativeMenus } from "./util/nativeMenus";
 startDiagnostics();
 // No webview menu with "Reload" on a stray right-click (util/nativeMenus.ts).
 tameNativeMenus();
+// No capitals or corrections the keyboard adds in the app's fields
+// (util/plainTyping.ts).
+keepTypingPlain();
 
 // ── Android soft-keyboard sizing (visualViewport → --vv-h) ──────────────────
 // The Android on-screen keyboard covers our fixed-bottom UI (MobileKeyBar,
