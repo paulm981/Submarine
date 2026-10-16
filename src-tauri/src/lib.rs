@@ -18806,8 +18806,8 @@ async fn monitor_resume_all(
 }
 
 /// The clipboard's text, for a paste into the terminal (a right-click, or
-/// the Wall's paste). The Linux and Windows frontends ask here; macOS reads
-/// it in the page.
+/// the Wall's paste). The desktop frontends all ask here; Android reads it
+/// in the page.
 ///
 /// WebKitGTK refuses the page's `navigator.clipboard.readText()` (#89). And
 /// where the webview reads the clipboard itself (a keyboard paste, or the
@@ -18818,6 +18818,9 @@ async fn monitor_resume_all(
 /// On Windows the page's read is WebView2's to allow, behind a permission
 /// prompt: blocked or dismissed once, every right-click paste failed with
 /// "Clipboard read denied". The Win32 clipboard is read directly instead.
+///
+/// On macOS, WKWebView refuses the page's read outright ("Clipboard read
+/// denied"), so `pbpaste` reads the general pasteboard.
 ///
 /// A clipboard that is empty or holds no text gives an empty string.
 #[tauri::command]
@@ -18844,10 +18847,29 @@ async fn clipboard_read_text(app: tauri::AppHandle) -> Result<String, String> {
             .await
             .map_err(|e| e.to_string())?
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
     {
         let _ = app;
-        Err("Reading the clipboard here is only for Linux and Windows.".to_string())
+        let read = tokio::process::Command::new("/usr/bin/pbpaste")
+            // It writes the text in the encoding these name, and an app
+            // opened from the Finder or the Dock may have none set.
+            .env("LANG", "en_US.UTF-8")
+            .env("LC_ALL", "en_US.UTF-8")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(std::time::Duration::from_secs(5), read).await {
+            Ok(Ok(out)) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+            Ok(Ok(out)) => Err(format!("The clipboard could not be read (pbpaste: {}).", out.status)),
+            Ok(Err(e)) => Err(format!("The clipboard could not be read: {}", e)),
+            Err(_) => Err("The clipboard did not answer.".to_string()),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+    {
+        let _ = app;
+        Err("Reading the clipboard here is only for Linux, Windows and macOS.".to_string())
     }
 }
 
