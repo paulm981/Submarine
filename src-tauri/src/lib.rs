@@ -4870,6 +4870,7 @@ async fn close_profile(
         ssh.sftp_sessions.lock().await.remove(sid);
         ssh.sftp_elevation.lock().await.remove(sid);
         ssh.root_access.lock().await.remove(sid);
+        ssh.docker_root.lock().await.remove(sid);
         ssh.connections.lock().await.remove(sid);
         for dir in [session_sftp_dir(sid), session_drag_dir(sid)].into_iter().flatten() {
             if dir.exists() {
@@ -4909,6 +4910,7 @@ async fn close_profile(
     ssh.sftp_sessions.lock().await.clear();
     ssh.sftp_elevation.lock().await.clear();
     ssh.root_access.lock().await.clear();
+    ssh.docker_root.lock().await.clear();
     // Wipe every connect-time secret the user typed this profile (issue #30).
     ssh.prompted_secrets.lock().await.clear();
     ssh.connections.lock().await.clear();
@@ -12027,6 +12029,7 @@ async fn disconnect_session(
     state.sftp_sessions.lock().await.remove(&session_id);
     state.sftp_elevation.lock().await.remove(&session_id);
     state.root_access.lock().await.remove(&session_id);
+    state.docker_root.lock().await.remove(&session_id);
     state.connections.lock().await.remove(&session_id);
     // Drop any ProxyJump bastion handle for this session — closes the jump
     // connection once the target it was carrying is gone.
@@ -13090,7 +13093,7 @@ async fn root_run(session_arc: &SessionHandleArc, access: &ssh_manager::RootAcce
             "echo __SUB_ROOT_OUT__:$(id -u); {} 2>&1; echo __SUB_EXITCODE:$?",
             quote_args(args)
         )));
-        let out = exec_with_stdin_capture(session_arc, &format!("{} {} {}", tool, flags, form), Some(stdin.as_bytes()), timeout_secs).await?;
+        let out = exec_with_stdin_capture_upto(session_arc, &format!("{} {} {}", tool, flags, form), Some(stdin.as_bytes()), timeout_secs, ROOT_OUTPUT_MAX).await?;
         let Some(start) = out.find("__SUB_ROOT_OUT__:") else {
             return Err(classify_sudo_failure(&out));
         };
@@ -13104,8 +13107,115 @@ async fn root_run(session_arc: &SessionHandleArc, access: &ssh_manager::RootAcce
     let mode = if access.password.is_some() { "pw" } else { "n" };
     let cmd = format!("env SUB_MODE={} SUB_TOOL={} sh -c '{}' sh {}", mode, tool, SCRIPT, quote_args(args));
     let stdin = access.password.as_ref().map(|p| zeroize::Zeroizing::new(format!("{}\n", p.as_str())));
-    let out = exec_with_stdin_capture(session_arc, &cmd, stdin.as_ref().map(|s| s.as_bytes()), timeout_secs).await?;
+    let out = exec_with_stdin_capture_upto(session_arc, &cmd, stdin.as_ref().map(|s| s.as_bytes()), timeout_secs, ROOT_OUTPUT_MAX).await?;
     Ok(parse_exit_marker(&out))
+}
+
+/// What root_run keeps of a command's output: a container's logs or a
+/// firewall's rules can run long.
+const ROOT_OUTPUT_MAX: usize = 4 * 1024 * 1024;
+
+/// What a root channel's output starts after when it runs through a root
+/// shell (root_channel): the shell's own start-up comes before it. Followed
+/// by the shell's uid and a line break.
+pub(crate) const ROOT_STREAM_MARKER: &str = "__SUB_ROOT_STREAM__:";
+
+/// What the tool is asked to show as its password prompt in a terminal
+/// (root_channel): the password is sent once it shows, so it's never typed
+/// before the tool has turned the terminal's echo off.
+const ROOT_PTY_PROMPT: &str = "__SUB_ROOT_PASSWORD__:";
+
+/// A channel running `args` as root on this tab's server for as long as the
+/// command runs: a container's live logs, or (with `pty`, its size) a
+/// terminal in a container. Root is found as for run_as_root: what the tab
+/// has, else a look, with `password` when the tool asks for one. Returns
+/// the channel and, through a root shell without a terminal, the marker its
+/// output starts after (ROOT_STREAM_MARKER).
+pub(crate) async fn root_channel(
+    state: &SshState,
+    session_id: &str,
+    args: &[String],
+    password: Option<String>,
+    pty: Option<(u32, u32)>,
+) -> Result<(russh::Channel<russh::client::Msg>, Option<&'static str>), String> {
+    use russh::ChannelMsg;
+    let session_arc = {
+        let connections = state.connections.lock().await;
+        connections.get(session_id).map(Arc::clone).ok_or_else(|| "Session not connected".to_string())?
+    };
+    let access = root_access_for(state, session_id, &session_arc, args, password, true).await?;
+    let tool = if ELEVATION_TOOLS.contains(&access.tool) { access.tool } else { "sudo" };
+    let mut channel = {
+        let session = session_arc.lock().await;
+        session.channel_open_session().await.map_err(|e| e.to_string())?
+    };
+    if let Some((cols, rows)) = pty {
+        channel
+            .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let to_stderr = if pty.is_some() { "" } else { " 2>&1" };
+    let mut stdin = zeroize::Zeroizing::new(String::new());
+    let mut wait_for_prompt = false;
+    let (cmd, marker) = if let Some(form) = access.shell.filter(|s| ROOT_SHELL_FORMS.contains(s)) {
+        // root_access_for gives a root shell only without a password.
+        let script = if pty.is_some() {
+            // In a terminal the line given to the root shell shows as it's
+            // typed; the screen is cleared before the command starts.
+            format!("printf '\\033[H\\033[2J\\033[3J'; exec {}", quote_args(args))
+        } else {
+            format!("echo {}$(id -u); exec {} 2>&1", ROOT_STREAM_MARKER, quote_args(args))
+        };
+        stdin.push_str(&root_shell_line(&script));
+        (format!("{} -n {}", tool, form), pty.is_none().then_some(ROOT_STREAM_MARKER))
+    } else if let Some(p) = &access.password {
+        stdin.push_str(p);
+        stdin.push('\n');
+        if pty.is_some() {
+            // In a terminal the tool reads it from the terminal, with echo
+            // off once its prompt shows (`-S` would leave echo on).
+            wait_for_prompt = true;
+            (format!("{} -k -p '{}' {}", tool, ROOT_PTY_PROMPT, quote_args(args)), None)
+        } else {
+            (format!("{} -S -k -p '' {}{}", tool, quote_args(args), to_stderr), None)
+        }
+    } else {
+        (format!("{} -n {}{}", tool, quote_args(args), to_stderr), None)
+    };
+    channel.exec(true, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
+    if wait_for_prompt {
+        let mut seen: Vec<u8> = Vec::new();
+        let prompt = async {
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
+                        seen.extend_from_slice(data);
+                        if String::from_utf8_lossy(&seen).contains(ROOT_PTY_PROMPT) {
+                            return true;
+                        }
+                        if seen.len() > 64 * 1024 {
+                            return false;
+                        }
+                    }
+                    ChannelMsg::Close | ChannelMsg::Eof => return false,
+                    _ => {}
+                }
+            }
+            false
+        };
+        let asked = tokio::time::timeout(std::time::Duration::from_secs(20), prompt).await.unwrap_or(false);
+        if !asked {
+            return Err(classify_sudo_failure(&String::from_utf8_lossy(&seen)));
+        }
+    }
+    if !stdin.is_empty() {
+        channel.data(stdin.as_bytes()).await.map_err(|e| e.to_string())?;
+    }
+    if pty.is_none() {
+        channel.eof().await.map_err(|e| e.to_string())?;
+    }
+    Ok((channel, marker))
 }
 
 /// How this tab gets root for `args`: what it already has (its own, else its
@@ -13217,7 +13327,7 @@ async fn root_access_for(
 }
 
 /// Run `args` as root on this tab's server: exit code, output, and the tool.
-async fn run_as_root(
+pub(crate) async fn run_as_root(
     state: &SshState,
     session_id: &str,
     args: &[String],
@@ -13572,6 +13682,17 @@ async fn exec_with_stdin_capture(
     stdin: Option<&[u8]>,
     timeout_secs: u64,
 ) -> Result<String, String> {
+    exec_with_stdin_capture_upto(session_arc, cmd, stdin, timeout_secs, 64 * 1024).await
+}
+
+/// exec_with_stdin_capture keeping up to `max` bytes of the output.
+async fn exec_with_stdin_capture_upto(
+    session_arc: &SessionHandleArc,
+    cmd: &str,
+    stdin: Option<&[u8]>,
+    timeout_secs: u64,
+    max: usize,
+) -> Result<String, String> {
     use russh::ChannelMsg;
     let mut channel = {
         let session = session_arc.lock().await;
@@ -13587,7 +13708,7 @@ async fn exec_with_stdin_capture(
         while let Some(msg) = channel.wait().await {
             match msg {
                 ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
-                    if out.len() < 64 * 1024 {
+                    if out.len() < max {
                         out.extend_from_slice(data);
                     }
                 }

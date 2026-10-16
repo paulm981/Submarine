@@ -387,7 +387,25 @@ pub fn app_log(level: String, message: String) {
 #[tauri::command]
 pub fn open_log_folder() -> Result<(), String> {
     let dir = dir().ok_or("The log hasn't started")?;
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "macos")]
+    {
+        // The folder is named after the app's id (`com.submarine.app`), and a
+        // folder ending in .app is an application to macOS: `open` tries to
+        // launch it and fails. Finder shows the log file in it instead.
+        let file = dir.join(FILE_NAME);
+        let target = if file.exists() { file } else { dir.clone() };
+        let status = std::process::Command::new("/usr/bin/open")
+            .arg("-R")
+            .arg(&target)
+            .status()
+            .map_err(|e| format!("Couldn't open {}: {e}", dir.display()))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("Couldn't show {} in Finder.", target.display()))
+        }
+    }
+    #[cfg(not(any(target_os = "android", target_os = "macos")))]
     {
         open::that_detached(&dir).map_err(|e| format!("Couldn't open {}: {e}", dir.display()))
     }

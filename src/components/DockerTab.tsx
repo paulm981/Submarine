@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import { ScrollableTabs } from "./ScrollableTabs";
 import { useConfirm } from "../ui/confirm";
+import { useRootInvoke } from "../ui/rootInvoke";
 
 interface DockerTabProps {
   sessionId: string;
@@ -18,6 +19,19 @@ interface DockerTabProps {
 
 type SubTab = "containers" | "resources" | "compose" | "prune";
 type ResourceKind = "images" | "volumes" | "networks";
+
+// Docker commands run as root where the server refuses the user's own
+// `docker` (not in the docker group; docker.rs): through sudo or dzdo as
+// the Info panel's actions are, asking for the password once if the tool
+// wants one (ui/rootInvoke).
+const useDockerInvoke = () => {
+  const rootInvoke = useRootInvoke();
+  return useCallback(async <T = unknown,>(cmd: string, args: Record<string, unknown>): Promise<T> => {
+    const r = await rootInvoke<T>(cmd, args, "Docker");
+    if (r === null) throw new Error("This needs root on this server. Try again to enter the password.");
+    return r;
+  }, [rootInvoke]);
+};
 
 interface DockerActionResult { success: boolean; output: string; used_sudo: boolean; }
 interface DockerTextResult { success: boolean; data: string; used_sudo: boolean; }
@@ -155,6 +169,7 @@ interface TabState<T> { loaded: boolean; loading: boolean; error: string | null;
 function fresh<T>(): TabState<T> { return { loaded: false, loading: false, error: null, data: null }; }
 
 const DockerTab = ({ sessionId, disabled, onOpenContainerTerminal }: DockerTabProps) => {
+  const dockerInvoke = useDockerInvoke();
   const [tab, setTab] = useState<SubTab>("containers");
 
   const [containers, setContainers] = useState<TabState<Container[]>>(fresh);
@@ -173,7 +188,7 @@ const DockerTab = ({ sessionId, disabled, onOpenContainerTerminal }: DockerTabPr
       // stats` here: stats has multi-second overhead per container and the
       // user explicitly asked for a quick first paint. Stats only loads
       // when the user opens a container's Stats tab.
-      const r = await invoke<DockerTextResult>("ssh_docker_containers", { sessionId });
+      const r = await dockerInvoke<DockerTextResult>("ssh_docker_containers", { sessionId });
       if (!r.success) throw new Error(r.data || "container list failed");
       const data = parseFields<Container>(r.data, ["ID", "Image", "Names", "Status", "State", "Ports"], o => ({
         id: o.ID || "",
@@ -193,7 +208,7 @@ const DockerTab = ({ sessionId, disabled, onOpenContainerTerminal }: DockerTabPr
   const fetchImages = async () => {
     setImages(s => ({ ...s, loading: true, error: null }));
     try {
-      const r = await invoke<DockerTextResult>("ssh_docker_images_list", { sessionId });
+      const r = await dockerInvoke<DockerTextResult>("ssh_docker_images_list", { sessionId });
       if (!r.success) throw new Error(r.data || "image list failed");
       const data = parseFields<ImageRow>(r.data, ["Repository", "Tag", "ID", "Size", "CreatedSince"], o => ({
         repo: o.Repository || "<none>",
@@ -211,7 +226,7 @@ const DockerTab = ({ sessionId, disabled, onOpenContainerTerminal }: DockerTabPr
   const fetchVolumes = async () => {
     setVolumes(s => ({ ...s, loading: true, error: null }));
     try {
-      const r = await invoke<DockerTextResult>("ssh_docker_volumes_list", { sessionId });
+      const r = await dockerInvoke<DockerTextResult>("ssh_docker_volumes_list", { sessionId });
       if (!r.success) throw new Error(r.data || "volume list failed");
       const data = parseFields<VolumeRow>(r.data, ["Name", "Driver", "Mountpoint"], o => ({
         name: o.Name || "",
@@ -227,7 +242,7 @@ const DockerTab = ({ sessionId, disabled, onOpenContainerTerminal }: DockerTabPr
   const fetchNetworks = async () => {
     setNetworks(s => ({ ...s, loading: true, error: null }));
     try {
-      const r = await invoke<DockerTextResult>("ssh_docker_networks", { sessionId });
+      const r = await dockerInvoke<DockerTextResult>("ssh_docker_networks", { sessionId });
       if (!r.success) throw new Error(r.data || "network list failed");
       const data = parseFields<NetworkRow>(r.data, ["ID", "Name", "Driver", "Scope"], o => ({
         id: o.ID || "",
@@ -245,7 +260,7 @@ const DockerTab = ({ sessionId, disabled, onOpenContainerTerminal }: DockerTabPr
   const fetchCompose = async () => {
     setComposeContainers(s => ({ ...s, loading: true, error: null }));
     try {
-      const r = await invoke<DockerTextResult>("ssh_docker_compose_per_container", { sessionId });
+      const r = await dockerInvoke<DockerTextResult>("ssh_docker_compose_per_container", { sessionId });
       if (!r.success) throw new Error(r.data || "compose query failed");
       setComposeRaw(r.data);
       const data = parseComposeContainers(r.data);
@@ -372,6 +387,7 @@ const ContainersView = ({
   onOpenDetails: (c: Container) => void;
   onOpenContainerTerminal: (name: string, useSudo: boolean) => void;
 }) => {
+  const dockerInvoke = useDockerInvoke();
   const [filter, setFilter] = useState("");
   const [stateFilter, setStateFilter] = useState<"all" | "running" | "stopped">("running");
   const [busy, setBusy] = useState<Record<string, string>>({});
@@ -399,11 +415,12 @@ const ContainersView = ({
   };
 
   const doAction = async (c: Container, action: string, needsConfirm = false) => {
-    if (needsConfirm && !(await confirm({ message: `${action.toUpperCase()} ${c.names}?`, destructive: true }))) return;
+    const verb = action.charAt(0).toUpperCase() + action.slice(1);
+    if (needsConfirm && !(await confirm({ message: `${verb} ${c.names}?`, okLabel: verb, destructive: true }))) return;
     setBusy(b => ({ ...b, [c.id]: action }));
     setLastResult(r => ({ ...r, [c.id]: undefined }));
     try {
-      const r = await invoke<DockerActionResult>("ssh_docker_container_action", {
+      const r = await dockerInvoke<DockerActionResult>("ssh_docker_container_action", {
         sessionId,
         container: c.names || c.id,
         action,
@@ -412,7 +429,7 @@ const ContainersView = ({
         ...prev,
         [c.id]: {
           ok: r.success,
-          msg: r.success ? `${action} ok${r.used_sudo ? " (via sudo)" : ""}` : (r.output || `${action} failed`),
+          msg: r.success ? `${action} ok${r.used_sudo ? " (as root)" : ""}` : (r.output || `${action} failed`),
           sudo: r.used_sudo,
         },
       }));
@@ -764,6 +781,7 @@ const KindPill = ({
 );
 
 const PruneView = ({ sessionId }: { sessionId: string }) => {
+  const dockerInvoke = useDockerInvoke();
   const [busy, setBusy] = useState<string | null>(null);
   const [result, setResult] = useState<Record<string, { ok: boolean; msg: string; sudo: boolean }>>({});
   const confirm = useConfirm();
@@ -781,7 +799,7 @@ const PruneView = ({ sessionId }: { sessionId: string }) => {
     setBusy(scope);
     setResult(r => ({ ...r, [scope]: undefined as any }));
     try {
-      const r = await invoke<DockerActionResult>("ssh_docker_prune", { sessionId, scope });
+      const r = await dockerInvoke<DockerActionResult>("ssh_docker_prune", { sessionId, scope });
       setResult(prev => ({
         ...prev,
         [scope]: {
@@ -848,6 +866,7 @@ const ContainerDetailsModal = ({
   onClose: () => void;
   onOpenContainerTerminal: (name: string, useSudo: boolean) => void;
 }) => {
+  const dockerInvoke = useDockerInvoke();
   const name = container.names || container.id;
   type DetailTab = "logs" | "inspect" | "stats" | "config";
   const [tab, setTab] = useState<DetailTab>("logs");
@@ -871,7 +890,7 @@ const ContainerDetailsModal = ({
   const fetchLogs = async (tail: number) => {
     setLogsLoading(true); setLogsError(null);
     try {
-      const r = await invoke<DockerTextResult>("ssh_docker_logs", { sessionId, container: name, tail });
+      const r = await dockerInvoke<DockerTextResult>("ssh_docker_logs", { sessionId, container: name, tail });
       setLogs(r.data || "");
       // Auto-scroll on first load + each load-more / refresh.
       requestAnimationFrame(() => {
@@ -916,7 +935,7 @@ const ContainerDetailsModal = ({
         setLive(false);
         liveStreamIdRef.current = null;
       });
-      await invoke("ssh_docker_logs_start", { sessionId, streamId: sid, container: name, tail: 0 });
+      await dockerInvoke("ssh_docker_logs_start", { sessionId, streamId: sid, container: name, tail: 0 });
       // Clean up listeners when live ends or modal closes.
       const cleanup = () => {
         unlistenLine();
@@ -965,7 +984,7 @@ const ContainerDetailsModal = ({
   const fetchInspect = async () => {
     setInspect(s => ({ ...s, loading: true, error: null }));
     try {
-      const r = await invoke<DockerTextResult>("ssh_docker_inspect", { sessionId, kind: "container", name });
+      const r = await dockerInvoke<DockerTextResult>("ssh_docker_inspect", { sessionId, kind: "container", name });
       const parsed = JSON.parse(r.data);
       setInspect({ loading: false, error: null, data: Array.isArray(parsed) ? parsed[0] : parsed });
     } catch (e: any) {
@@ -980,7 +999,7 @@ const ContainerDetailsModal = ({
       // instead of the full-list stats. On a busy daemon this drops the
       // round-trip from seconds → ~80 ms and shrinks the wire response
       // to a single JSON line — a meaningful win on low-bandwidth SSH.
-      const r = await invoke<DockerTextResult>("ssh_docker_stats", { sessionId, container: name });
+      const r = await dockerInvoke<DockerTextResult>("ssh_docker_stats", { sessionId, container: name });
       const rows = parseFields<ContainerStats>(r.data, ["Name", "CPUPerc", "MemUsage", "MemPerc", "NetIO", "BlockIO", "PIDs"], o => ({
         id: o.ID || "", name: o.Name || "",
         cpuPerc: o.CPUPerc || "", memUsage: o.MemUsage || "", memPerc: o.MemPerc || "",
