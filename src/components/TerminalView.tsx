@@ -74,10 +74,15 @@ const SHELL_READY_CAP_MS = 5000;
 // count: scroll up/down (S, T), insert/delete lines (L, M), tab forward/back
 // (I, Z), and repeat the last character (b). `ESC[999999999S` — 15 bytes,
 // which a binary file `cat` to the screen can contain by chance — kept the
-// window busy for hours. Programs send counts up to the screen's size, so one
-// over COUNT_LIMIT is ignored.
+// window busy for hours, and thousands of `ESC[9999S` in one batch for
+// minutes. Programs send counts up to the screen's size, so:
+//   - a count over a few screens (countLimit) is ignored, and
+//   - what one batch of output may cost is capped (COUNT_BUDGET, in lines
+//     moved: about 0.3 s of work); past that the rest of the batch's counted
+//     sequences are ignored.
 const COUNTED_FINALS = ['S', 'T', 'L', 'M', 'I', 'Z', 'b'] as const;
-const COUNT_LIMIT = 10_000;
+const COUNT_BUDGET = 100_000;
+const LINE_FINALS = new Set<string>(['S', 'T', 'L', 'M']);
 
 // State machine for the modifier stickies on the mobile key bar.
 // off → armed → locked → off (cycled by repeated taps).
@@ -624,13 +629,23 @@ const TerminalView = ({
     // A runaway count (COUNTED_FINALS) is handled here by doing nothing;
     // otherwise xterm's own handler runs. The first one is noted in the log.
     let runawayLogged = false;
+    // Refilled after each batch is processed (`processed` below).
+    let countBudget = COUNT_BUDGET;
+    const countLimit = (final: string) =>
+      final === 'b' ? term.rows * term.cols : LINE_FINALS.has(final) ? term.rows * 4 : term.cols * 4;
     for (const final of COUNTED_FINALS) {
       term.parser.registerCsiHandler({ final }, (params) => {
         const count = params[0];
-        if (typeof count !== 'number' || count <= COUNT_LIMIT) return false;
+        if (typeof count !== 'number' || count <= 1) return false;
+        // Lines moved; tabs and repeated characters cost a line per width.
+        const cost = LINE_FINALS.has(final) ? count : Math.ceil(count / Math.max(1, term.cols));
+        if (count <= countLimit(final) && cost <= countBudget) {
+          countBudget -= cost;
+          return false;
+        }
         if (!runawayLogged) {
           runawayLogged = true;
-          logLine('warn', `[terminal] ${terminalId}: ignored ESC[${count}${final} (a count that large would freeze the window)`);
+          logLine('warn', `[terminal] ${terminalId}: ignored ESC[${count}${final} and others like it (counts that large, or that many, would freeze the window)`);
         }
         return true;
       });
@@ -1058,6 +1073,7 @@ const TerminalView = ({
       if (bytes > 0) invoke('terminal_output_ack', { terminalId, bytes }).catch(() => {});
     };
     const processed = (bytes: number) => {
+      countBudget = COUNT_BUDGET;
       noteTerminalParsed(terminalId, bytes);
       unacked += bytes;
       if (unacked >= ACK_EVERY) sendAck();

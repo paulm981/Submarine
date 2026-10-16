@@ -7,6 +7,7 @@ import {
   HIGHLIGHT_MINE,
   HIGHLIGHT_NONE,
   HIGHLIGHT_SETS,
+  REGEX_RULES_ON,
   buildMatcher,
   highlightSetById,
   normalizeRules,
@@ -63,6 +64,8 @@ const KINDS: { id: RuleKind; name: string }[] = [
   { id: "text", name: "Anywhere" },
   { id: "regex", name: "Regular expression" },
 ];
+// The kinds a rule can be given here (see REGEX_RULES_ON).
+const PICKABLE = KINDS.filter((k) => k.id !== "regex" || REGEX_RULES_ON);
 
 const blankRule = (): CustomRule => ({
   pattern: "",
@@ -182,7 +185,8 @@ function RuleEditor({
           aria-label="How it matches"
           className="h-8 bg-black border border-white/10 rounded-lg px-2 text-[12px] text-white outline-none focus:border-primary/50"
         >
-          {KINDS.map((k) => <option key={k.id} value={k.id}>{k.name}</option>)}
+          {PICKABLE.map((k) => <option key={k.id} value={k.id}>{k.name}</option>)}
+          {!PICKABLE.some((k) => k.id === rule.kind) && <option value={rule.kind} disabled>{KINDS.find((k) => k.id === rule.kind)?.name ?? rule.kind}</option>}
         </select>
       </div>
       <div className="flex flex-wrap items-center gap-1.5" role="radiogroup" aria-label="Color">
@@ -399,6 +403,7 @@ export function HighlightSettings({ settings, setSettings, onRulesChanged }: any
                   </span>
                   <span className="text-[10.5px] text-zinc-500">
                     {KINDS.find((k) => k.id === r.kind)?.name}
+                    {r.kind === "regex" && !REGEX_RULES_ON ? " (off in this build)" : ""}
                     {r.matchCase ? ", match case" : ""}
                   </span>
                 </span>

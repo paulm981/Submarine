@@ -15978,7 +15978,9 @@ fn safe_temp_leaf_name(remote_path: &str) -> Result<String, String> {
         .and_then(|n| n.to_str())
         .unwrap_or("");
     let bad = |c: char| matches!(c, '/' | '\\' | ':' | '\0');
-    if raw.is_empty() || raw == "." || raw == ".." || raw.contains(bad) {
+    // As for downloads: on Windows also no device name (`COM1`, `nul.txt`),
+    // which would send the file's bytes to a device instead of a copy.
+    if raw.is_empty() || raw == "." || raw == ".." || raw.contains(bad) || !is_safe_dir_entry_name(raw) {
         return Err(format!("refusing file with unsafe name: {:?}", raw));
     }
     Ok(raw.to_string())
@@ -18755,7 +18757,15 @@ async fn monitor_resume_all(
                 let name = fetch_node_name(conn, node_id);
                 // Commands held for this device's OK don't run (see approvals.rs).
                 let customs = approvals::without_held_metrics(conn, approvals::server_uuid(conn, node_id as i64).as_deref(), customs);
-                (resolve_node_auth_for_monitor(conn, node_id)?, metrics, customs, name)
+                // One server that can't be reached as set up (its jump host
+                // was deleted, say) mustn't stop the rest from starting.
+                match resolve_node_auth_for_monitor(conn, node_id) {
+                    Ok(auth) => (auth, metrics, customs, name),
+                    Err(e) => {
+                        crate::applog::write_line("monitor", &format!("node {}: not started ({})", node_id, e));
+                        continue;
+                    }
+                }
             };
             let db_arc = std::sync::Arc::clone(&db_state.conn);
             let settings_arc: SharedSettings = (*settings.inner()).clone();

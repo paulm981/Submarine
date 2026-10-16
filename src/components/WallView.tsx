@@ -22,7 +22,8 @@ import { readClipboardText } from "../util/clipboard";
 //     one", or a click on the bar or between the tiles types to all again;
 //   • a paused terminal (its chip, or Ctrl+Shift+P) is left out until it's
 //     resumed; one that isn't connected drops out, and is back in as soon as
-//     it reconnects;
+//     it reconnects — at the start of a line: one that starts taking input
+//     partway through a line joins at the next (see lineTargets);
 //   • a paste — or Send, for a set of commands — goes to all, after saying
 //     how many lines into how many servers.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -55,6 +56,9 @@ const autoCols = (n: number) => (n <= 1 ? 1 : n <= 4 ? 2 : n <= 9 ? 3 : n <= 16 
 const lineCount = (text: string) => text.replace(/\r\n?/g, "\n").replace(/\n$/, "").split("\n").length;
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 const encode = (s: string) => Array.from(new TextEncoder().encode(s));
+
+/// Keys that end the line being typed: Enter, Ctrl+C, Ctrl+D, Ctrl+U.
+const LINE_ENDS = "\r\x03\x04\x15";
 
 // What a confirm shows of the text about to go out.
 const preview = (text: string) => {
@@ -122,14 +126,49 @@ export const WallView = ({
       .map((m) => dockedTerminal(m.terminalId))
       .filter((e): e is NonNullable<typeof e> => !!e && e.live());
   }, []);
+  // ── The line being typed ─────────────────────────────────────────────────
+  // A terminal that starts taking input partway through a line — it has just
+  // connected (behind a jump host they log in a few at a time), reconnected,
+  // or been resumed — would get only the rest of it: `rm -rf *` without the
+  // `cd /old/site && ` typed before it. So a line goes to the terminals that
+  // were taking input when it began; the others join at the next one.
+  // null: no line has begun.
+  const lineRef = useRef<Set<string> | null>(null);
+  const [lineJoined, setLineJoined] = useState<Set<string> | null>(null);
+  const setLine = useCallback((next: Set<string> | null) => {
+    if (next === lineRef.current) return;
+    lineRef.current = next;
+    setLineJoined(next);
+  }, []);
+  const lineTargets = useCallback(() => {
+    const now = targetsNow();
+    const joined = lineRef.current;
+    return joined ? now.filter((e) => joined.has(e.terminalId)) : now;
+  }, [targetsNow]);
+  /// `data` went to `sent`: a line begins with them, goes on, or has ended.
+  const afterTyping = useCallback((data: string, sent: string[]) => {
+    let end = -1;
+    for (let i = data.length - 1; i >= 0; i--) {
+      if (LINE_ENDS.includes(data[i])) {
+        end = i;
+        break;
+      }
+    }
+    if (end === data.length - 1) setLine(null);
+    else if (end >= 0 || !lineRef.current) setLine(new Set(sent));
+  }, [setLine]);
+  const atNextLine = (tid: string) => !!lineJoined && !lineJoined.has(tid);
+
   const live = wall.members.filter((m) => dockedTerminal(m.terminalId)?.live());
-  const receiving = live.filter((m) => !isPaused(m.terminalId));
+  const receiving = live.filter((m) => !isPaused(m.terminalId) && !atNextLine(m.terminalId));
   const leftOut = (() => {
     const p = wall.members.filter((m) => isPaused(m.terminalId)).length;
     const off = wall.members.length - live.length;
+    const next = live.filter((m) => !isPaused(m.terminalId) && atNextLine(m.terminalId)).length;
     const parts = [];
     if (p) parts.push(`${p} paused`);
     if (off) parts.push(`${off} not connected`);
+    if (next) parts.push(`${next} at the next line`);
     return parts.join(" · ");
   })();
 
@@ -149,16 +188,19 @@ export const WallView = ({
   const sendKeys = useCallback((data: string) => {
     if (!wallRef.current.broadcast || soloRef.current) return;
     const groups = new Map<string, string[]>();
-    for (const e of targetsNow()) {
+    const sent: string[] = [];
+    for (const e of lineTargets()) {
       const d = forCursorMode(data, e.term.modes.applicationCursorKeysMode);
       const ids = groups.get(d);
       if (ids) ids.push(e.terminalId);
       else groups.set(d, [e.terminalId]);
+      sent.push(e.terminalId);
     }
     for (const [d, ids] of groups) {
       invoke("write_terminals_data", { terminalIds: ids, data: encode(d) }).catch(() => {});
     }
-  }, [targetsNow]);
+    afterTyping(data, sent);
+  }, [lineTargets, afterTyping]);
 
   // A paste into all of them goes through each terminal's own paste, so each
   // gets it the way pasting into it alone would (bracketed for vim and
@@ -167,7 +209,7 @@ export const WallView = ({
   // when it's answered), and not at all if Broadcast went off meanwhile.
   const pasteToAll = useCallback(async (text: string) => {
     if (!text || !wallRef.current.broadcast) return;
-    const first = targetsNow();
+    const first = lineTargets();
     if (first.length === 0) {
       flash("No terminal is taking input.");
       return;
@@ -177,16 +219,23 @@ export const WallView = ({
       const skipped = wallRef.current.members.length - first.length;
       const ok = await confirm({
         title: `Paste ${plural(lineCount(text), "line")} into ${plural(first.length, "server")}?`,
-        message: preview(text) + (skipped ? `\n\n${plural(skipped, "terminal")} paused or not connected won't get it.` : ""),
+        message: preview(text) + (skipped ? `\n\n${plural(skipped, "terminal")} paused, not connected or joining at the next line won't get it.` : ""),
         okLabel: "Paste",
       });
       focusGhost();
       if (!ok || !wallRef.current.broadcast) return;
     }
     let n = 0;
-    for (const e of targetsNow()) if (named.has(e.terminalId) && e.paste(text)) n++;
+    const sent: string[] = [];
+    for (const e of lineTargets()) {
+      if (named.has(e.terminalId) && e.paste(text)) {
+        n++;
+        sent.push(e.terminalId);
+      }
+    }
+    afterTyping(text.replace(/\n/g, "\r"), sent);
     flash(n === named.size ? `Pasted into ${plural(n, "server")}.` : `Pasted into ${n} of ${plural(named.size, "server")} — the rest stopped taking input.`);
-  }, [confirm, focusGhost, targetsNow]);
+  }, [confirm, focusGhost, lineTargets, afterTyping]);
   const pasteToAllRef = useRef(pasteToAll);
   pasteToAllRef.current = pasteToAll;
 
@@ -238,6 +287,7 @@ export const WallView = ({
     if (!wall.broadcast) {
       if (wall.solo) onChange({ solo: null });
       setParked(false);
+      setLine(null);
       return;
     }
     if (solo) {
@@ -305,8 +355,10 @@ export const WallView = ({
       flash("No terminal is taking input.");
       return;
     }
-    invoke("write_terminals_data", { terminalIds: ids, data: encode(body.replace(/\n/g, "\r")) })
+    const data = body.replace(/\n/g, "\r");
+    invoke("write_terminals_data", { terminalIds: ids, data: encode(data) })
       .then(() => flash(`Sent to ${plural(ids.length, "server")}.`), (e) => flash(`Couldn't send: ${e}`));
+    afterTyping(data, ids);
   };
 
   const cols = wall.cols || autoCols(wall.members.length);
@@ -474,6 +526,7 @@ export const WallView = ({
                   broadcast={wall.broadcast}
                   solo={solo}
                   paused={isPaused(m.terminalId)}
+                  nextLine={atNextLine(m.terminalId)}
                   onFocusIn={() => {
                     if (!wallRef.current.broadcast) return;
                     setParked(false);
@@ -515,7 +568,7 @@ export const WallView = ({
 // (claimTerminal); while there's no terminal yet — still connecting, or
 // waiting on a prompt — the slot is covered by what the session is doing.
 const WallTile = ({
-  member, name, closes, termTitle, status, waiting, broadcast, solo, paused,
+  member, name, closes, termTitle, status, waiting, broadcast, solo, paused, nextLine,
   onFocusIn, onBackToAll, onHover, onPasteToAll, onTogglePause, onOpen, onRemove, onReconnect,
 }: {
   member: WallMember;
@@ -528,6 +581,8 @@ const WallTile = ({
   broadcast: boolean;
   solo: string | null;
   paused: boolean;
+  /// Taking input, but joins the broadcast at the next line (lineTargets).
+  nextLine: boolean;
   onFocusIn: () => void;
   onBackToAll: () => void;
   onHover: (on: boolean) => void;
@@ -547,11 +602,13 @@ const WallTile = ({
   const entry = dockedTerminal(member.terminalId);
   const isLive = !!entry?.live();
   const isSolo = solo === member.terminalId;
-  const receiving = broadcast && !solo && isLive && !paused;
+  const joinsNext = broadcast && !solo && isLive && !paused && nextLine;
+  const receiving = broadcast && !solo && isLive && !paused && !nextLine;
   const dot = sessionDot(status, waiting);
   const border =
     isSolo ? "border-primary shadow-[0_0_0_1px_rgb(var(--primary)/0.5)]" :
     broadcast && paused ? "border-dashed border-zinc-600" :
+    joinsNext ? "border-dashed border-orange-400/40" :
     receiving ? "border-orange-400/50" :
     "border-white/10";
 
@@ -578,6 +635,14 @@ const WallTile = ({
           >
             Only this one <X size={10} />
           </button>
+        )}
+        {joinsNext && (
+          <span
+            title="It started taking input partway through the line being typed, so it gets the next line, not the rest of this one."
+            className="shrink-0 h-5 px-1.5 rounded flex items-center text-[9px] font-bold uppercase tracking-wider text-orange-300/90 border border-orange-400/30"
+          >
+            Next line
+          </span>
         )}
         <div className="flex-1" />
         {broadcast && (
