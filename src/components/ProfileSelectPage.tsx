@@ -1099,7 +1099,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
           {/* Newer commits on the fork's main: a newer build to download
               (the workflow's build of main), or to pull and rebuild (built
               from source). Newer commits on the original project mean the
-              fork wants a Sync fork on GitHub first. */}
+              fork wants a sync pull request first (FORK.md). */}
           {update && newerBuild(update) != null && update.main_url && (
             <NewsButton
               onClick={() => openLink(update.main_url!)}
@@ -1117,8 +1117,8 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
           {(update?.upstream_ahead ?? 0) > 0 && update?.upstream_url && (
             <NewsButton
               onClick={() => openLink(update.upstream_url!)}
-              title="Open the fork on GitHub and use Sync fork to bring them in"
-              label={<>The original project has {changes(update.upstream_ahead!)} — Sync fork on GitHub</>}
+              title="See them on GitHub, then bring them in with a sync pull request (FORK.md says how)"
+              label={<>The original project has {changes(update.upstream_ahead!)} — see them on GitHub</>}
             />
           )}
         </footer>

@@ -17,6 +17,31 @@
 
 ## What this fork adds
 
+The tour with more pictures is in [FORK.md](FORK.md), along with where the fork differs from the original project and how it keeps up with it. What changed in each build is in [CHANGELOG.md](CHANGELOG.md).
+
+<table>
+  <tr>
+    <td width="50%" valign="top" align="center">
+      <a href="FORK.md#work-on-many-servers-at-once"><img src="docs/screenshots/fork/wall-broadcast.png" alt="A Wall of six terminals behind one jump host, Broadcast on, one paused" /></a>
+      <br/><sub><b>Walls</b>: type to many servers at once, with some paused</sub>
+    </td>
+    <td width="50%" valign="top" align="center">
+      <a href="FORK.md#organize-them"><img src="docs/screenshots/fork/highlighting-and-tree.png" alt="The session tree beside a terminal with highlighted log output" /></a>
+      <br/><sub><b>Session tree and highlighting</b>: folders, servers and Remote Desktop links; errors, warnings and addresses colored</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top" align="center">
+      <a href="FORK.md#a-better-terminal"><img src="docs/screenshots/fork/color-schemes.png" alt="Color schemes in Settings with a preview" /></a>
+      <br/><sub><b>Color schemes</b>, one for the app and one per server if you like</sub>
+    </td>
+    <td width="50%" valign="top" align="center">
+      <a href="FORK.md#your-data-your-storage"><img src="docs/screenshots/fork/own-storage-sync.png" alt="Sync through a private git repository" /></a>
+      <br/><sub><b>Sync through storage you own</b>: a synced folder or a private git repository</sub>
+    </td>
+  </tr>
+</table>
+
 **Bring your sessions with you**
 - **Session import that keeps your setup**: from MobaXterm, nested folders, saved logins, jump hosts and their keys, startup commands such as `dzdo su -`, and Remote Desktop sessions come over as they were, and a result screen says what came in. PuTTY and OpenSSH config imports are there too.
 
@@ -46,7 +71,8 @@
 **Ready to roll out to a team**
 - **A build from every change**, with a build number in the title bar and a "Build N is out" notice when there's a newer one.
 - **Troubleshooting**: a log on your computer, a watchdog that notes when the window froze and why, and **Copy diagnostics** with server, user and host names replaced, ready to send to whoever is helping.
-- **Hardening**: Live Edit opens a file in an editor and never runs it; the Local pane asks before it runs a program; downloads are marked as from the internet; characters that disguise a file name are shown plainly; and a trusted server that shows a different kind of key is a warning, not a silent change.
+- **Hardening**: characters that disguise a file name are shown plainly, and a trusted server that shows a different kind of key is a warning, not a silent change. On Windows, Live Edit also opens a file in an editor and never runs it, the Local pane asks before it runs a program, and downloads are marked as from the internet.
+- **Close to the original project**: its changes come in through regular sync pull requests, and [FORK.md](FORK.md) lists where the fork differs and what it hasn't taken yet.
 
 The original project's README follows.
 

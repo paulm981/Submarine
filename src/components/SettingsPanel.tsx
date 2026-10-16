@@ -917,7 +917,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
                 <div className="text-sm font-semibold text-zinc-100">Watch the original project</div>
                 <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
                   For whoever maintains the fork: also say when SinaXhpm/Submarine has changes the fork doesn't
-                  have yet, so you can use Sync fork on GitHub.
+                  have yet, to bring in with a sync pull request (FORK.md says how).
                 </p>
               </div>
               <button
