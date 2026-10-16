@@ -5,6 +5,16 @@ This changelog lists the builds of [paulm981/Submarine](https://github.com/paulm
 - Each build is one merge to main, and its number is in the title bar.
 - Sections called **From the original project** list what came in from [SinaXhpm/Submarine](https://github.com/SinaXhpm/submarine), with that project's pull request numbers.
 - [FORK.md](FORK.md) explains what the fork does differently, and which of the original project's changes it hasn't taken yet.
+- A fork release, such as `v0.3.8-fork.1`, gets a heading of its own above the builds it covers.
+
+## Build 241
+
+- **Fork releases.** A tag such as `v0.3.8-fork.1` publishes a release with its build number in the title. [FORK.md](FORK.md#keeping-up-with-the-original-project) says how to make one.
+- **Update notices** for releases go by build number:
+  - Someone on a release is told about a newer release.
+  - Someone on a later Latest build isn't told to "update" to an older release.
+  - On Windows, a release shows and checks its whole version, `0.3.8-fork.1`, not the installer's `0.3.8`.
+- **Pull requests** get a short checklist: a changelog line, and whether the change differs from the original project or could go back to it.
 
 ## Build 240
 

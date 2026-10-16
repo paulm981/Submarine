@@ -35,6 +35,10 @@ const BUILD_KIND: &str = env!("SUBMARINE_BUILD_KIND");
 /// The fork's build number (build.rs): main's commit count, so a higher one
 /// is newer. Empty when it couldn't be counted.
 const BUILD_NUMBER: &str = env!("SUBMARINE_BUILD_NUMBER");
+/// This build's version (build.rs): a release's whole tag, such as
+/// "0.3.8-fork.1", even where the installer's own version can't carry the
+/// "-fork.1" (Windows MSI), and otherwise Cargo's.
+const VERSION: &str = env!("SUBMARINE_VERSION");
 
 fn build_number() -> Option<u64> {
     BUILD_NUMBER.parse().ok()
@@ -59,7 +63,7 @@ pub struct AppInfo {
 /// "0.3.8, build 231 (main, 23d8806)": which build this is, for the log and
 /// "Copy diagnostics".
 pub fn build_label() -> String {
-    let mut label = env!("CARGO_PKG_VERSION").to_string();
+    let mut label = VERSION.to_string();
     if let Some(n) = build_number() {
         label.push_str(&format!(", build {n}"));
     }
@@ -73,7 +77,7 @@ pub fn build_label() -> String {
 #[tauri::command]
 pub fn app_info() -> AppInfo {
     AppInfo {
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: VERSION.to_string(),
         github_repo_url: format!("https://github.com/{}", GITHUB_REPO),
         github_releases_url: format!("https://github.com/{}/releases", GITHUB_REPO),
         commit: BUILD_COMMIT.get(..7).map(str::to_string),
@@ -88,10 +92,10 @@ pub struct UpdateInfo {
     /// Latest release tag on GitHub, with "v" stripped to match `current`.
     /// `None` if the API call failed or no release exists.
     pub latest: Option<String>,
-    /// True when the highest published, non-prerelease release on GitHub is a
-    /// strictly newer semver than the running build (per-component NUMERIC
-    /// compare — see `semver_greater`). Frontend uses this to colour the
-    /// banner (green = up-to-date, amber = update available).
+    /// True when the newest published, non-prerelease release on GitHub is
+    /// newer than the running build (see `release_is_newer`). Frontend uses
+    /// this to colour the banner (green = up-to-date, amber = update
+    /// available).
     pub has_update: bool,
     /// Direct link to the latest release page. Frontend shows an "Open
     /// release notes" button when has_update is true.
@@ -165,7 +169,7 @@ struct GhRelease {
 /// bring them in; everyone else is spared the notice and the call.
 #[tauri::command]
 pub async fn check_for_updates(watch_upstream: Option<bool>) -> Result<UpdateInfo, String> {
-    let current = env!("CARGO_PKG_VERSION").to_string();
+    let current = VERSION.to_string();
     let url = format!("https://api.github.com/repos/{}/releases?per_page=100", GITHUB_REPO);
 
     // Build a fresh client per call rather than holding state — this is
@@ -233,9 +237,10 @@ async fn latest_release(client: &reqwest::Client, url: &str, current: String) ->
         .await
         .map_err(|e| format!("[UPDATE] BAD_JSON: {}", e))?;
 
-    // Highest published, non-prerelease semver wins. Drafts are only visible
-    // with auth (we're anonymous) but we skip them defensively all the same.
-    let mut best: Option<(String, String)> = None; // (clean_version, html_url)
+    // Highest published, non-prerelease version wins; between two of the same
+    // version, the later build. Drafts are only visible with auth (we're
+    // anonymous) but we skip them defensively all the same.
+    let mut best: Option<(String, Option<u64>, String)> = None; // (clean_version, build, html_url)
     let mut latest_build = None;
     for r in releases {
         // The Latest build release is a pre-release, so it never counts as a
@@ -247,19 +252,24 @@ async fn latest_release(client: &reqwest::Client, url: &str, current: String) ->
             continue;
         }
         let clean = r.tag_name.strip_prefix('v').unwrap_or(&r.tag_name).to_string();
+        // A fork release's title carries its build number, as the Latest
+        // build's does: "Submarine v0.3.8-fork.1 · build 240".
+        let build = r.name.as_deref().and_then(build_in_title);
         let wins = match &best {
             None => true,
-            Some((cur_best, _)) => semver_greater(&clean, cur_best),
+            Some((cur_best, cur_build, _)) => {
+                semver_greater(&clean, cur_best) || (!semver_greater(cur_best, &clean) && build > *cur_build)
+            }
         };
         if wins {
-            best = Some((clean, r.html_url));
+            best = Some((clean, build, r.html_url));
         }
     }
 
     let mut info = match best {
         None => UpdateInfo::none(current),
-        Some((latest_clean, html_url)) => {
-            let has_update = semver_greater(&latest_clean, &current);
+        Some((latest_clean, release_build, html_url)) => {
+            let has_update = release_is_newer(&latest_clean, release_build, &current, build_number());
             UpdateInfo {
                 latest: Some(latest_clean),
                 has_update,
@@ -272,8 +282,8 @@ async fn latest_release(client: &reqwest::Client, url: &str, current: String) ->
     Ok(info)
 }
 
-/// The build number in the Latest build release's title, which the workflow
-/// writes as "Latest build (main) · build 225".
+/// The build number in a release's title, which the workflow writes as
+/// "Latest build (main) · build 225" or "Submarine v0.3.8-fork.1 · build 240".
 fn build_in_title(title: &str) -> Option<u64> {
     let (_, rest) = title.rsplit_once("build ")?;
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -322,17 +332,31 @@ async fn commit_counts(client: &reqwest::Client, watch_upstream: bool) -> (Optio
     tokio::join!(main, upstream)
 }
 
-/// True when `a > b` under dotted-number compare (ignores any non-numeric
-/// suffix like "-beta"). Robust enough for our semver-tagged releases:
-/// "0.2.0" > "0.1.5", "1.0.0" > "0.9.9". A pre-release suffix on `a`
-/// makes it sort EQUAL to the same base — preferring stable over pre.
+/// Whether a release (its version, and its build number when its title has
+/// one) is newer than this build. When both have a build number, that
+/// decides: every build of the fork carries the original project's version,
+/// so a build of main made after a release has the same version, and must
+/// not be told to "update" to it. Otherwise, by version.
+fn release_is_newer(release: &str, release_build: Option<u64>, current: &str, current_build: Option<u64>) -> bool {
+    match (release_build, current_build) {
+        (Some(r), Some(c)) => r > c,
+        _ => semver_greater(release, current),
+    }
+}
+
+/// True when `a > b` under dotted-number compare: "0.2.0" > "0.1.5",
+/// "1.0.0" > "0.9.9". The fork's releases of a version come after it, in
+/// order: "0.3.8" < "0.3.8-fork.1" < "0.3.8-fork.2" < "0.3.9". Any other
+/// suffix, like "-beta", sorts EQUAL to its base — preferring stable over
+/// pre.
 fn semver_greater(a: &str, b: &str) -> bool {
-    let strip = |s: &str| s.split(['-', '+']).next().unwrap_or(s).to_string();
-    let parse = |s: String| -> Vec<u64> {
-        s.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect()
+    let parse = |s: &str| -> (Vec<u64>, u64) {
+        let (base, suffix) = s.split_once(['-', '+']).unwrap_or((s, ""));
+        let parts = base.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect();
+        let fork = suffix.strip_prefix("fork.").and_then(|n| n.parse().ok()).unwrap_or(0);
+        (parts, fork)
     };
-    let aa = parse(strip(a));
-    let bb = parse(strip(b));
+    let ((aa, a_fork), (bb, b_fork)) = (parse(a), parse(b));
     for i in 0..aa.len().max(bb.len()) {
         let av = aa.get(i).copied().unwrap_or(0);
         let bv = bb.get(i).copied().unwrap_or(0);
@@ -340,7 +364,7 @@ fn semver_greater(a: &str, b: &str) -> bool {
             return av > bv;
         }
     }
-    false
+    a_fork > b_fork
 }
 
 /// Open a URL in the user's default browser. URL must be http(s) — we
@@ -364,12 +388,43 @@ pub fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests {
-    use super::build_in_title;
+    use super::{build_in_title, release_is_newer, semver_greater};
 
     #[test]
     fn the_latest_build_title_gives_its_number() {
         assert_eq!(build_in_title("Latest build (main) · build 225"), Some(225));
         assert_eq!(build_in_title("Latest build (main)"), None);
         assert_eq!(build_in_title("Latest build (main) · build"), None);
+        assert_eq!(build_in_title("Submarine v0.3.8-fork.1 · build 240"), Some(240));
+        assert_eq!(build_in_title("Submarine v0.3.8-fork.1"), None);
+    }
+
+    #[test]
+    fn fork_releases_come_after_their_version_in_order() {
+        assert!(semver_greater("0.3.8-fork.1", "0.3.8"));
+        assert!(semver_greater("0.3.8-fork.2", "0.3.8-fork.1"));
+        assert!(semver_greater("0.3.8-fork.10", "0.3.8-fork.9"));
+        assert!(semver_greater("0.3.9", "0.3.8-fork.5"));
+        assert!(!semver_greater("0.3.8-fork.1", "0.3.8-fork.1"));
+        assert!(!semver_greater("0.3.8", "0.3.8-fork.1"));
+        // Other suffixes still sort equal to their base.
+        assert!(!semver_greater("0.3.8-beta", "0.3.8"));
+        assert!(!semver_greater("0.3.8", "0.3.8-beta"));
+        assert!(semver_greater("0.10.0", "0.9.9"));
+    }
+
+    #[test]
+    fn a_release_is_newer_by_build_number_when_both_have_one() {
+        // A build of main made after the release: same version, no update.
+        assert!(!release_is_newer("0.3.8-fork.1", Some(240), "0.3.8", Some(245)));
+        // A build of main from before it.
+        assert!(release_is_newer("0.3.8-fork.1", Some(240), "0.3.8", Some(238)));
+        // The release itself, on Windows too, where the installer says 0.3.8.
+        assert!(!release_is_newer("0.3.8-fork.1", Some(240), "0.3.8-fork.1", Some(240)));
+        assert!(!release_is_newer("0.3.8-fork.1", Some(240), "0.3.8", Some(240)));
+        assert!(release_is_newer("0.3.8-fork.2", Some(250), "0.3.8-fork.1", Some(240)));
+        // Without a number on either side, by version.
+        assert!(release_is_newer("0.3.8-fork.2", None, "0.3.8-fork.1", Some(240)));
+        assert!(!release_is_newer("0.3.8-fork.1", Some(240), "0.3.8-fork.1", None));
     }
 }

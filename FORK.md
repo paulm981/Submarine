@@ -140,7 +140,7 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 
 ## Keeping up with the original project
 
-**Seeing what's new.** In Settings › Updates, turn on **Watch the original project**. The profile screen then says when the original project has changes the fork doesn't have yet, and links to GitHub's view of them. Don't use GitHub's **Sync fork** button: the fork has commits of its own, and Sync fork offers to discard them.
+**Seeing what's new.** In Settings › Updates, turn on **Watch the original project**. The profile screen then says when the original project has changes the fork doesn't have yet, and links to GitHub's view of them. The maintainer also gets a weekly check, Monday mornings, that lists them with a recommendation for each. Don't use GitHub's **Sync fork** button: the fork has commits of its own, and Sync fork offers to discard them.
 
 **Bringing it in.** A sync pull request, the same way every time:
 
@@ -158,5 +158,25 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 - **The version** is the original project's (0.3.8 now). The fork doesn't change it, so it always says which of the original project's releases a build is based on.
 - **The build number** is the fork's own. It goes up by one with every merge to main, and the title bar shows it, as in `v0.3.8 · build 240`. A higher build is newer.
 - When the original project releases 0.3.9 and it's merged, the version becomes 0.3.9, and the build numbers keep rising.
+
+**Two ways to get builds.**
+
+- **Latest build** has every merge to main. Whoever uses it is told when there's a newer build.
+- **Fork releases** are builds picked out for a team to settle on. They are tagged with the original project's version and a count, `v0.3.8-fork.1`, `v0.3.8-fork.2`, then `v0.3.9-fork.1` once 0.3.9 is in. Whoever installed a release is told only about newer releases.
+
+**Making a fork release.**
+
+1. Pick a build of main that has been in use for a while without trouble.
+2. Tag its merge commit and push the tag:
+
+   ```
+   git tag v0.3.8-fork.1 <commit>
+   git push origin v0.3.8-fork.1
+   ```
+
+3. GitHub builds the installers and publishes them as "Submarine v0.3.8-fork.1 · build 240".
+4. Add a heading for the release in [CHANGELOG.md](CHANGELOG.md) above the builds it covers.
+
+The update check goes by the build number in the release's title. So a build of main made after the release isn't told to "update" to it, and on Windows, whose installer can only say 0.3.8, the release still knows it is fork.1.
 
 **Giving back.** Fixes that apply to the original project too go back to it as pull requests.

@@ -55,6 +55,19 @@ fn main() {
         })
         .unwrap_or_default();
     println!("cargo:rustc-env=SUBMARINE_BUILD_NUMBER={}", number);
+    // The version to show and compare (about.rs): the workflow's whole
+    // release version, such as "0.3.8-fork.1". The Windows installer is
+    // stamped "0.3.8", since an MSI version can't carry "-fork.1", so
+    // Cargo's version alone would make that release look older than itself.
+    println!("cargo:rerun-if-env-changed=SUBMARINE_VERSION");
+    let version = std::env::var("SUBMARINE_VERSION")
+        .ok()
+        .filter(|v| {
+            v.starts_with(|c: char| c.is_ascii_digit())
+                && v.chars().all(|c| c.is_ascii_alphanumeric() || ".+-".contains(c))
+        })
+        .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap_or_default());
+    println!("cargo:rustc-env=SUBMARINE_VERSION={}", version);
     // Rebuild when HEAD moves. Asked of git rather than assumed to be under
     // ../.git, which is a file in a worktree or a submodule. Only paths that
     // exist: cargo reruns a build script on every build when one it watches
