@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { markTyped } from "../ui/terminalDock";
 import { Play, RefreshCw, Search, X, Terminal, StickyNote, ClipboardCopy, ChevronDown, ChevronRight, Pencil, Check, Server } from "lucide-react";
 
 // Side panel that opens from a terminal session and surfaces *both* the
@@ -209,6 +210,7 @@ export const CmdsPanel = ({ activeTab, onClose, headerActions, serverId, serverN
         ? (text.endsWith("\n") || text.endsWith("\r") ? text : text + "\r")
         : text;
       const dataBytes = Array.from(new TextEncoder().encode(payload));
+      markTyped(activeTab);
       await invoke("write_terminal_data", { terminalId: activeTab, data: dataBytes });
     } catch (e) {
       console.error("Failed to write to terminal:", e);

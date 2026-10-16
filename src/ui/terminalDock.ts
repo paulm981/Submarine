@@ -36,6 +36,18 @@ export interface DockEntry {
 }
 
 const entries = new Map<string, DockEntry>();
+// terminalId → a number that changes whenever its line may have changed
+// under a Wall: its shell opened (again), or something was typed into it.
+// A Wall keeps a line typed to all to the terminals whose number is still
+// the one it saw after typing the start of it.
+const marks = new Map<string, number>();
+let lastMark = 0;
+/// Typed into, or opened: by the terminal itself, a panel, or a Wall
+/// (which reads the new number after it types, terminalMark).
+export const markTyped = (...terminalIds: string[]) => {
+  for (const id of terminalIds) marks.set(id, ++lastMark);
+};
+export const terminalMark = (terminalId: string) => marks.get(terminalId) ?? 0;
 // terminalId → the Wall tile that wants it on screen.
 const claims = new Map<string, HTMLElement>();
 const listeners = new Set<() => void>();

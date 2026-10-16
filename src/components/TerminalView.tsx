@@ -9,7 +9,7 @@ import { Channel, invoke } from '@tauri-apps/api/core';
 import '@xterm/xterm/css/xterm.css';
 import { useIsNarrow } from '../hooks/useViewport';
 import { MobileKeyBar, ModifiersState, ModKey, SpecialKey } from './MobileKeyBar';
-import { appHotkey, registerTerminal, terminalStateChanged } from '../ui/terminalDock';
+import { appHotkey, markTyped, registerTerminal, terminalStateChanged } from '../ui/terminalDock';
 import { forgetTerminal, logLine, noteTerminalOutput, noteTerminalParsed, noteTerminalRenderer } from '../util/diagnostics';
 import { useConfirm } from '../ui/confirm';
 import HistorySearchOverlay from './HistorySearchOverlay';
@@ -74,10 +74,20 @@ const SHELL_READY_CAP_MS = 5000;
 // count: scroll up/down (S, T), insert/delete lines (L, M), tab forward/back
 // (I, Z), and repeat the last character (b). `ESC[999999999S` — 15 bytes,
 // which a binary file `cat` to the screen can contain by chance — kept the
-// window busy for hours. Programs send counts up to the screen's size, so one
-// over COUNT_LIMIT is ignored.
+// window busy for hours, and thousands of `ESC[9999S` in one batch for
+// minutes. Programs send counts up to the screen's size, so:
+//   - a count over a few screens (countLimit) is ignored, and
+//   - what one batch of output may cost is capped, about 0.3 s of work each:
+//     LINE_BUDGET lines moved (S, T, L, M), CHAR_BUDGET characters repeated
+//     or tab stops passed (b, I, Z). Past that, the rest of the batch's
+//     counted sequences are ignored.
+// A repeat copies the whole cell before the cursor, combining marks and
+// all, so it costs the count times that cell's length; one of a cell with
+// more than a character and a mark in it is ignored.
 const COUNTED_FINALS = ['S', 'T', 'L', 'M', 'I', 'Z', 'b'] as const;
-const COUNT_LIMIT = 10_000;
+const LINE_BUDGET = 100_000;
+const CHAR_BUDGET = 1_000_000;
+const LINE_FINALS = new Set<string>(['S', 'T', 'L', 'M']);
 
 // State machine for the modifier stickies on the mobile key bar.
 // off → armed → locked → off (cycled by repeated taps).
@@ -340,6 +350,7 @@ const TerminalView = ({
         bytes = [0x09];
       }
     }
+    markTyped(terminalId);
     invoke(commands.write, { terminalId, data: bytes }).catch(console.error);
     if (consumes) consumeArmedModifiers();
   };
@@ -363,7 +374,7 @@ const TerminalView = ({
     term.write('\r\n\x1b[33m── reconnected ──\x1b[0m\r\n');
     ptyLiveRef.current = false;
     terminalStateChanged();
-    const opened = () => { ptyLiveRef.current = true; terminalStateChanged(); };
+    const opened = () => { markTyped(terminalId); ptyLiveRef.current = true; terminalStateChanged(); };
     // As on the first open: the backend only takes resizes once the shell is
     // up, so a resize that landed while it was starting again (the window
     // was being dragged, a panel opened) is sent once more when it is. Without
@@ -624,13 +635,42 @@ const TerminalView = ({
     // A runaway count (COUNTED_FINALS) is handled here by doing nothing;
     // otherwise xterm's own handler runs. The first one is noted in the log.
     let runawayLogged = false;
+    // Refilled after each batch is processed (`processed` below).
+    let lineBudget = LINE_BUDGET;
+    let charBudget = CHAR_BUDGET;
+    const countLimit = (final: string) =>
+      final === 'b' ? term.rows * term.cols : LINE_FINALS.has(final) ? term.rows * 4 : term.cols * 4;
+    // The cell a repeat copies, in code units: the one the last character
+    // went into, by its width back from the cursor — 1, 2 (wide), or 0 when
+    // it didn't fit at the edge with wrapping off. Which one isn't public,
+    // so the longest of the three.
+    const repeatedLength = () => {
+      const b = term.buffer.active;
+      const line = b.getLine(b.baseY + b.cursorY);
+      let len = 1;
+      for (let x = b.cursorX - 2; x <= b.cursorX; x++) len = Math.max(len, line?.getCell(x)?.getChars().length ?? 0);
+      return len;
+    };
     for (const final of COUNTED_FINALS) {
       term.parser.registerCsiHandler({ final }, (params) => {
         const count = params[0];
-        if (typeof count !== 'number' || count <= COUNT_LIMIT) return false;
+        if (typeof count !== 'number' || count <= 1) return false;
+        if (LINE_FINALS.has(final)) {
+          if (count <= countLimit(final) && count <= lineBudget) {
+            lineBudget -= count;
+            return false;
+          }
+        } else {
+          const len = final === 'b' ? repeatedLength() : 1;
+          const cost = count * len;
+          if (len <= 2 && count <= countLimit(final) && cost <= charBudget) {
+            charBudget -= cost;
+            return false;
+          }
+        }
         if (!runawayLogged) {
           runawayLogged = true;
-          logLine('warn', `[terminal] ${terminalId}: ignored ESC[${count}${final} (a count that large would freeze the window)`);
+          logLine('warn', `[terminal] ${terminalId}: ignored ESC[${count}${final} and others like it (counts that large, or that many, would freeze the window)`);
         }
         return true;
       });
@@ -703,7 +743,7 @@ const TerminalView = ({
         const syncSize = () => {
           invoke(commands.resize, { terminalId, cols: term.cols, rows: term.rows }).catch(() => {});
         };
-        const opened = () => { ptyLiveRef.current = true; terminalStateChanged(); };
+        const opened = () => { markTyped(terminalId); ptyLiveRef.current = true; terminalStateChanged(); };
         if (local) {
           invoke<string>('local_terminal_open', {
             terminalId,
@@ -754,6 +794,9 @@ const TerminalView = ({
     // forwarded verbatim because we can't sensibly "Ctrl" a phrase.
     const handleData = (data: string) => {
       if (disabledRef.current) return;
+      // A Wall's line isn't this one's whole any more — unless this is only
+      // the terminal saying it got or lost the focus (for vim, tmux).
+      if (data !== '\x1b[I' && data !== '\x1b[O') markTyped(terminalId);
       // A paste: our right-click path, or xterm's own keyboard paste, which
       // starts with the bracketed-paste marker when the remote program asked
       // for one. Never run through the armed modifiers or into history.
@@ -1058,6 +1101,8 @@ const TerminalView = ({
       if (bytes > 0) invoke('terminal_output_ack', { terminalId, bytes }).catch(() => {});
     };
     const processed = (bytes: number) => {
+      lineBudget = LINE_BUDGET;
+      charBudget = CHAR_BUDGET;
       noteTerminalParsed(terminalId, bytes);
       unacked += bytes;
       if (unacked >= ACK_EVERY) sendAck();
@@ -1371,6 +1416,7 @@ const TerminalView = ({
           if (disabledRef.current) return;
           const payload = execute ? command + "\r" : command;
           const bytes = Array.from(new TextEncoder().encode(payload));
+          markTyped(terminalId);
           invoke(commands.write, { terminalId, data: bytes }).catch(console.error);
           // Mirror the inserted command into the local buffer so the next
           // Enter (if the user typed one manually) still logs correctly.

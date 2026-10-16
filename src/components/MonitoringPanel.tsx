@@ -377,7 +377,9 @@ const MonitoringPanel = ({ servers, addLog }: Props) => {
   const pauseNode = (nodeId: number) => wrap(() => invoke("monitor_pause", { nodeId }));
   const resumeNode = (nodeId: number) => wrap(() => invoke("monitor_resume", { nodeId }));
   const pauseAll = () => wrap(() => invoke("monitor_pause_all"));
-  const resumeAll = () => wrap(() => invoke("monitor_resume_all"));
+  // It names the servers it couldn't start; the rest did, so the list is
+  // read again either way.
+  const resumeAll = () => wrap(() => invoke("monitor_resume_all").finally(() => reload()));
   const setMetrics = (nodeId: number, metrics: string[]) =>
     wrap(() => invoke("monitor_set_metrics", { nodeId, metrics }));
   const setCustoms = (nodeId: number, customs: CustomMetric[]) =>
