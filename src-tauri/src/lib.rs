@@ -13129,16 +13129,16 @@ const ROOT_PTY_PROMPT: &str = "__SUB_ROOT_PASSWORD__:";
 /// command runs: a container's live logs, or (with `pty`, its size) a
 /// terminal in a container. Root is found as for run_as_root: what the tab
 /// has, else a look, with `password` when the tool asks for one. Returns
-/// the channel and, through a root shell without a terminal, the marker its
-/// output starts after (ROOT_STREAM_MARKER).
+/// the channel; through a root shell without a terminal, the marker its
+/// output starts after (ROOT_STREAM_MARKER); and in a terminal, what the
+/// command already wrote while the tool's password prompt was looked for.
 pub(crate) async fn root_channel(
     state: &SshState,
     session_id: &str,
     args: &[String],
     password: Option<String>,
     pty: Option<(u32, u32)>,
-) -> Result<(russh::Channel<russh::client::Msg>, Option<&'static str>), String> {
-    use russh::ChannelMsg;
+) -> Result<(russh::Channel<russh::client::Msg>, Option<&'static str>, Vec<u8>), String> {
     let session_arc = {
         let connections = state.connections.lock().await;
         connections.get(session_id).map(Arc::clone).ok_or_else(|| "Session not connected".to_string())?
@@ -13168,7 +13168,9 @@ pub(crate) async fn root_channel(
             format!("echo {}$(id -u); exec {} 2>&1", ROOT_STREAM_MARKER, quote_args(args))
         };
         stdin.push_str(&root_shell_line(&script));
-        (format!("{} -n {}", tool, form), pty.is_none().then_some(ROOT_STREAM_MARKER))
+        // Without a terminal, what the tool says when it refuses comes on
+        // stderr, which a stream doesn't read.
+        (format!("{} -n {}{}", tool, form, to_stderr), pty.is_none().then_some(ROOT_STREAM_MARKER))
     } else if let Some(p) = &access.password {
         stdin.push_str(p);
         stdin.push('\n');
@@ -13184,38 +13186,69 @@ pub(crate) async fn root_channel(
         (format!("{} -n {}{}", tool, quote_args(args), to_stderr), None)
     };
     channel.exec(true, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
-    if wait_for_prompt {
-        let mut seen: Vec<u8> = Vec::new();
-        let prompt = async {
-            while let Some(msg) = channel.wait().await {
-                match msg {
-                    ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
-                        seen.extend_from_slice(data);
-                        if String::from_utf8_lossy(&seen).contains(ROOT_PTY_PROMPT) {
-                            return true;
-                        }
-                        if seen.len() > 64 * 1024 {
-                            return false;
-                        }
-                    }
-                    ChannelMsg::Close | ChannelMsg::Eof => return false,
-                    _ => {}
-                }
-            }
-            false
-        };
-        let asked = tokio::time::timeout(std::time::Duration::from_secs(20), prompt).await.unwrap_or(false);
-        if !asked {
-            return Err(classify_sudo_failure(&String::from_utf8_lossy(&seen)));
+    // From here a failure closes the channel: a dropped one stays open on the
+    // server, with whatever the tool started in it.
+    match root_channel_start(&mut channel, wait_for_prompt, &stdin, pty.is_none()).await {
+        Ok(early) => Ok((channel, marker, early)),
+        Err(e) => {
+            let _ = channel.close().await;
+            Err(e)
         }
+    }
+}
+
+/// root_channel's last steps: the password once the tool asks for it (in a
+/// terminal), what goes on stdin, and its end (without a terminal). Returns
+/// what came out before (see root_channel).
+async fn root_channel_start(
+    channel: &mut russh::Channel<russh::client::Msg>,
+    wait_for_prompt: bool,
+    stdin: &str,
+    end_stdin: bool,
+) -> Result<Vec<u8>, String> {
+    use russh::ChannelMsg;
+    use std::time::{Duration, Instant};
+    if wait_for_prompt {
+        // The tool's prompt, then the password goes; or the command's own
+        // output, when the tool let it run without one (a NOPASSWD rule for
+        // it): then the password isn't given, or the command would get it.
+        // What comes first may be split, or follow sudo's first-use lecture,
+        // so a little more is waited for before deciding.
+        let has_prompt = |seen: &[u8]| seen.windows(ROOT_PTY_PROMPT.len()).position(|w| w == ROOT_PTY_PROMPT.as_bytes());
+        let mut seen: Vec<u8> = Vec::new();
+        let start = Instant::now();
+        let mut decide_by: Option<Instant> = None;
+        loop {
+            let until = decide_by.unwrap_or(start + Duration::from_secs(20));
+            let left = until.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(left, channel.wait()).await {
+                Ok(Some(ChannelMsg::Data { ref data })) | Ok(Some(ChannelMsg::ExtendedData { ref data, .. })) => {
+                    seen.extend_from_slice(data);
+                    if let Some(at) = has_prompt(&seen) {
+                        seen.drain(..at + ROOT_PTY_PROMPT.len());
+                        break;
+                    }
+                    decide_by.get_or_insert_with(|| Instant::now() + Duration::from_millis(500));
+                }
+                Ok(Some(ChannelMsg::Close | ChannelMsg::Eof)) | Ok(None) => {
+                    return Err(classify_sudo_failure(&String::from_utf8_lossy(&seen)));
+                }
+                Ok(Some(_)) => {}
+                // Output and no prompt: it runs without the password.
+                Err(_) if !seen.is_empty() => return Ok(seen),
+                Err(_) => return Err(format!("{}: the server didn't answer", SUDO_FAILED)),
+            }
+        }
+        channel.data(stdin.as_bytes()).await.map_err(|e| e.to_string())?;
+        return Ok(seen);
     }
     if !stdin.is_empty() {
         channel.data(stdin.as_bytes()).await.map_err(|e| e.to_string())?;
     }
-    if pty.is_none() {
+    if end_stdin {
         channel.eof().await.map_err(|e| e.to_string())?;
     }
-    Ok((channel, marker))
+    Ok(Vec::new())
 }
 
 /// How this tab gets root for `args`: what it already has (its own, else its
@@ -13274,7 +13307,12 @@ async fn root_access_for(
     }
     let mut best: Option<String> = None;
     let mut refused: Vec<&'static str> = Vec::new();
-    for tool in ELEVATION_TOOLS {
+    // A typed password means the tools were tried without one: `-l` can say
+    // yes without a password where another of the user's rules has NOPASSWD
+    // (sudo's `listpw`), even for a command that needs one, so asking again
+    // without it would skip the password.
+    let tools_without_password: &[&'static str] = if password.is_some() { &[] } else { ELEVATION_TOOLS };
+    for &tool in tools_without_password {
         match root_probe(session_arc, tool, None, args).await {
             Ok(()) => {
                 let a = RootAccess { tool, password: None, shell: None };
@@ -13306,9 +13344,6 @@ async fn root_access_for(
     }
     let best = best.unwrap_or_else(|| SUDO_NO_SUDO.into());
     let Some(pw) = password else { return Err(best) };
-    if best != SUDO_NEED_PASSWORD {
-        return Err(best);
-    }
     // As SFTP root mode: a tool that isn't there or doesn't allow the user
     // hands over to the next; a wrong password ends it (one failed attempt,
     // not one per tool).
@@ -13351,6 +13386,13 @@ pub(crate) async fn run_as_root(
         }
         done => {
             let (code, out) = done?;
+            // `-l` answers without a password where any of the user's rules
+            // has NOPASSWD (sudo's `listpw`), even for a command that needs
+            // one; running it says so. Then the tab asks for the password.
+            if code != 0 && access.password.is_none() && access.shell.is_none() && classify_sudo_failure(&out) == SUDO_NEED_PASSWORD {
+                state.root_access.lock().await.remove(session_id);
+                return Err(SUDO_NEED_PASSWORD.into());
+            }
             Ok((code, out, access.tool))
         }
     }

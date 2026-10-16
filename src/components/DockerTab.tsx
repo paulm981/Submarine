@@ -168,8 +168,15 @@ const subTabActive = "bg-primary/15 text-primary border border-primary/30 shadow
 interface TabState<T> { loaded: boolean; loading: boolean; error: string | null; data: T | null; }
 function fresh<T>(): TabState<T> { return { loaded: false, loading: false, error: null, data: null }; }
 
-const DockerTab = ({ sessionId, disabled, onOpenContainerTerminal }: DockerTabProps) => {
+const DockerTab = ({ sessionId, disabled, onOpenContainerTerminal: openTerminal }: DockerTabProps) => {
   const dockerInvoke = useDockerInvoke();
+  // A terminal can't ask for the sudo / dzdo password, so where docker needs
+  // root, it's settled first (asking if need be), then the terminal opens
+  // with it. What goes wrong otherwise shows in the terminal itself.
+  const onOpenContainerTerminal = async (name: string, sudo: boolean) => {
+    try { await dockerInvoke<DockerTextResult>("ssh_docker_inspect", { sessionId, kind: "container", name }); } catch {}
+    openTerminal(name, sudo);
+  };
   const [tab, setTab] = useState<SubTab>("containers");
 
   const [containers, setContainers] = useState<TabState<Container[]>>(fresh);

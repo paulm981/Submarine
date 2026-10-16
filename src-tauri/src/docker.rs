@@ -169,18 +169,18 @@ impl Cmd {
     }
 }
 
-/// The daemon refused the user (its socket is root's and the docker
-/// group's): root may do it.
+/// The daemon's socket refused the user (it's root's and the docker
+/// group's): root may do it. Only that: a daemon that's down, or a
+/// "permission denied" from inside a container, isn't root's to fix.
 fn daemon_refused(out: &str) -> bool {
     let lower = out.to_lowercase();
-    lower.contains("permission denied")
-        || lower.contains("cannot connect to the docker daemon")
-        || lower.contains("dial unix /var/run/docker.sock")
-        || lower.contains("/var/run/docker.sock: connect: permission")
+    lower.contains("permission denied while trying to connect to the docker")
+        || lower.contains("docker.sock: connect: permission denied")
 }
 
 /// Run a docker command as the user, or as root where the server refuses
-/// the user's own (and from then on for this tab). Returns (success,
+/// the user's own (and, once root has worked, from then on for this tab,
+/// SshState::docker_root). Returns (success,
 /// output, as root); output is stdout and stderr together. `Err` with a
 /// [SUDO] code when root needs a password (the tab asks for it and calls
 /// again with `password`) or isn't allowed.
@@ -197,7 +197,6 @@ async fn run_docker_smart(
         if code == 0 || !daemon_refused(&out) {
             return Ok((code == 0, out, false));
         }
-        state.docker_root.lock().await.insert(session_id.to_string());
     }
     let root = |args: Vec<String>, password: Option<String>| async move {
         crate::run_as_root(state, session_id, &args, password, timeout)
@@ -215,6 +214,7 @@ async fn run_docker_smart(
             }
         }
     };
+    state.docker_root.lock().await.insert(session_id.to_string());
     Ok((code == 0, out, true))
 }
 
@@ -407,7 +407,7 @@ pub async fn ssh_docker_volumes_list(
 // Compose plugin first (`docker compose`); fall back to legacy script if
 // the plugin isn't installed. Caller never has to care which is present.
 fn compose_prefix() -> &'static str {
-    "( docker compose version >/dev/null 2>&1 && CCMD='docker compose' ) || CCMD='docker-compose'; $CCMD"
+    "if docker compose version >/dev/null 2>&1; then CCMD='docker compose'; else CCMD='docker-compose'; fi; $CCMD"
 }
 
 #[tauri::command]
@@ -597,13 +597,12 @@ pub async fn ssh_docker_logs_start(
     if !as_root {
         let probe = format!("docker inspect --type=container {} 2>&1", shq(&container));
         let (code, out) = run_capture(&state, &session_id, &probe, 10).await.unwrap_or((1, String::new()));
-        if code != 0 && daemon_refused(&out) {
-            state.docker_root.lock().await.insert(session_id.clone());
-            as_root = true;
-        }
+        as_root = code != 0 && daemon_refused(&out);
     }
     let (channel, marker) = if as_root {
-        crate::root_channel(&state, &session_id, &args, password, None).await?
+        let (channel, marker, _) = crate::root_channel(&state, &session_id, &args, password, None).await?;
+        state.docker_root.lock().await.insert(session_id.clone());
+        (channel, marker)
     } else {
         let session_arc = {
             let connections = state.connections.lock().await;
@@ -633,6 +632,10 @@ pub async fn ssh_docker_logs_start(
     let event_name = format!("docker-logs-{}", stream_id_clone);
     let close_event = format!("docker-logs-closed-{}", stream_id_clone);
     let streams_map = streams.streams.clone();
+    // A root shell that no longer gives root is forgotten, so the next try
+    // looks again (as run_as_root does).
+    let root_access = state.root_access.clone();
+    let root_session = session_id.clone();
 
     // tokio::spawn (not tauri::async_runtime::spawn) so we get a native
     // JoinHandle and its `.abort_handle()` — we want to be able to stop
@@ -688,10 +691,20 @@ pub async fn ssh_docker_logs_start(
         // Through a root shell, the logs start after its marker line (the
         // shell's own start-up comes first), which says who it is.
         let mut head: Option<Vec<u8>> = marker.map(|_| Vec::new());
+        let no_root = |said: &[u8]| {
+            let said = String::from_utf8_lossy(said);
+            let said: String = said.trim().chars().take(500).collect();
+            format!("Couldn't get root for the logs{}{}\n", if said.is_empty() { "." } else { ": " }, said)
+        };
         loop {
             tokio::select! {
                 r = stream.read(&mut buf) => {
                     match r {
+                        Ok(0) | Err(_) if head.is_some() => {
+                            let _ = app_clone.emit(&event_name, no_root(head.as_deref().unwrap_or_default()));
+                            root_access.lock().await.remove(&root_session);
+                            break;
+                        }
                         Ok(0) => { flush_logs(&mut out, true); break; }
                         Ok(n) => {
                             if let (Some(h), Some(m)) = (head.as_mut(), marker) {
@@ -702,7 +715,8 @@ pub async fn ssh_docker_logs_start(
                                 };
                                 let Some(nl) = h[at..].iter().position(|&b| b == b'\n') else { continue };
                                 if String::from_utf8_lossy(&h[at + m.len()..at + nl]).trim() != "0" {
-                                    let _ = app_clone.emit(&event_name, "Couldn't get root for the logs.\n".to_string());
+                                    let _ = app_clone.emit(&event_name, no_root(&[]));
+                                    root_access.lock().await.remove(&root_session);
                                     break;
                                 }
                                 let rest = h.split_off(at + nl + 1);
@@ -780,8 +794,9 @@ pub async fn open_container_terminal(
     };
     // As root as this tab's other docker commands are (run_docker_smart).
     let as_root = use_sudo || state.docker_root.lock().await.contains(&session_id);
-    let channel = if as_root {
-        crate::root_channel(&state, &session_id, &args, None, Some((cols, rows))).await?.0
+    let (channel, early) = if as_root {
+        let (channel, _, early) = crate::root_channel(&state, &session_id, &args, None, Some((cols, rows))).await?;
+        (channel, early)
     } else {
         let session_arc = {
             let connections = state.connections.lock().await;
@@ -805,7 +820,7 @@ pub async fn open_container_terminal(
             .exec(true, Cmd::Docker(args).shell().as_bytes())
             .await
             .map_err(|e| e.to_string())?;
-        channel
+        (channel, Vec::new())
     };
 
     let (tx, rx) = tokio::sync::mpsc::channel::<TerminalCommand>(32);
@@ -829,6 +844,11 @@ pub async fn open_container_terminal(
     // whose read side is always drained — required by russh's channel
     // backpressure.
     let output = crate::term_output::OutputSink::open(&terminal_id, on_output);
+    // What the container's shell wrote while the password prompt was
+    // looked for (root_channel) comes first.
+    if !early.is_empty() {
+        output.push(&mut early.clone());
+    }
     tauri::async_runtime::spawn(crate::ssh_manager::run_pty_pump(
         app.clone(),
         terminal_id.clone(),
@@ -879,6 +899,9 @@ mod cmd_tests {
         assert!(daemon_refused("permission denied while trying to connect to the docker API at unix:///var/run/docker.sock"));
         assert!(daemon_refused("Got permission denied while trying to connect to the Docker daemon socket"));
         assert!(!daemon_refused("Error response from daemon: No such container: web"));
+        // Not root's to fix: the daemon is down, or a container's own error.
+        assert!(!daemon_refused("Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"));
+        assert!(!daemon_refused("OCI runtime create failed: runc create failed: exec: \"/app/run.sh\": permission denied: unknown"));
     }
 }
 
