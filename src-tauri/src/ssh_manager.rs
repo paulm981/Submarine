@@ -204,45 +204,28 @@ pub struct PtySize {
     pub rows: u32,
 }
 
-/// Flush a coalesced batch of PTY output as one `terminal-output-{id}` event.
-///
-/// The read loops accumulate channel bytes and call this on an ~8ms timer or a
-/// size cap instead of emitting once per SSH packet. Two problems that fixes:
-/// a firehose (`cat` of a big file) used to emit thousands of tiny events —
-/// each a Tauri IPC dispatch the WebView main thread had to service — and each
-/// `Vec<u8>` payload serialized as a JSON number array (`[104,105,...]`),
-/// roughly 4x the bytes. Together they saturated the main thread and froze the
-/// whole terminal tab until it was closed. Batching cuts the event count, and
-/// base64 (~1.33x) keeps each payload compact. Bytes are sent (not a decoded
-/// string) so xterm can buffer a multibyte sequence split across batches.
-pub fn emit_terminal_batch(app: &AppHandle, terminal_id: &str, buf: &mut Vec<u8>) {
-    if buf.is_empty() {
-        return;
-    }
-    use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
-    let _ = app.emit(&format!("terminal-output-{}", terminal_id), b64);
-    buf.clear();
-}
-
 /// Drive an interactive PTY channel — an SSH shell (`open_terminal`) or a
 /// `docker exec -it` (`docker::open_container_terminal`) — for the life of the
-/// tab: output → coalesced `terminal-output-{id}` events, keystrokes /
-/// resizes → the channel, then `terminal-closed-{id}`. See `pty_pump`.
+/// tab: output → coalesced batches into `output` (term_output.rs: the page's
+/// channel, paced by what it has drawn), keystrokes / resizes → the channel,
+/// then, once the last output is out, `terminal-closed-{id}`. See `pty_pump`.
 pub async fn run_pty_pump(
     app: AppHandle,
     terminal_id: String,
     channel: russh::Channel<client::Msg>,
     rx: mpsc::Receiver<TerminalCommand>,
     resize_rx: tokio::sync::watch::Receiver<PtySize>,
+    output: crate::term_output::OutputSink,
 ) {
-    pty_pump(channel, rx, resize_rx, |buf| emit_terminal_batch(&app, &terminal_id, buf)).await;
-    let _ = app.emit(&format!("terminal-closed-{}", terminal_id), serde_json::json!({}));
+    pty_pump(channel, rx, resize_rx, |buf| output.push(buf)).await;
+    output.finish(move || {
+        let _ = app.emit(&format!("terminal-closed-{}", terminal_id), serde_json::json!({}));
+    });
 }
 
 /// The pump behind `run_pty_pump`, with the output sink abstracted (`flush`
 /// gets each coalesced batch and must leave the buffer empty, as
-/// `emit_terminal_batch` does) so tests can run it against a real connection.
+/// `OutputSink::push` does) so tests can run it against a real connection.
 ///
 /// The channel is SPLIT so its read side is drained continuously, whatever the
 /// write side is doing. Since russh 0.50 every channel has a bounded queue and
@@ -302,12 +285,10 @@ async fn pty_pump<F>(
     });
 
     // Coalesce PTY output: accumulate channel bytes and flush at most every
-    // ~8ms, or sooner once a burst passes FLUSH_CAP. Emitting one event per
-    // SSH packet (each a ~4x-bloated JSON byte array) flooded the WebView
-    // main thread on large output and froze the whole tab; batching + the
-    // base64 payload in emit_terminal_batch keeps the UI responsive under a
-    // firehose. 8ms (measured from the FIRST buffered byte) is imperceptible
-    // for interactive echo.
+    // ~8ms, or sooner once a burst passes FLUSH_CAP, instead of one message
+    // per SSH packet. 8ms (measured from the FIRST buffered byte) is
+    // imperceptible for interactive echo. The sink then paces what reaches
+    // the page (term_output.rs).
     const FLUSH_CAP: usize = 256 * 1024;
     const FLUSH_WINDOW: std::time::Duration = std::time::Duration::from_millis(8);
     let mut out_buf: Vec<u8> = Vec::new();

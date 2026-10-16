@@ -665,9 +665,10 @@ pub async fn ssh_docker_logs_stop(
 
 // Opens a PTY-backed exec channel running `docker exec -it <name> <shell>`
 // with shell auto-detect: try bash → sh. Wires into the same terminal-IO
-// pipeline (`terminal-output-<id>` events + write/resize/close commands)
+// pipeline (output over the page's channel, term_output.rs, + write/resize/close commands)
 // the regular shell terminal uses, so xterm.js on the frontend works
 // without any branch — just a different exec target.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn open_container_terminal(
     app: tauri::AppHandle,
@@ -678,6 +679,7 @@ pub async fn open_container_terminal(
     cols: u32,
     rows: u32,
     use_sudo: bool,
+    on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Result<(), String> {
     use crate::ssh_manager::TerminalCommand;
 
@@ -734,15 +736,18 @@ pub async fn open_container_terminal(
         .await
         .insert(terminal_id.clone(), resize_tx);
 
-    // Same pump as the SSH terminal (see open_terminal): coalesced output
-    // (~8ms / size cap, base64 batches) and a split read/write channel whose
-    // read side is always drained — required by russh's channel backpressure.
+    // Same pump as the SSH terminal (see open_terminal): coalesced output,
+    // paced to the page (term_output.rs), and a split read/write channel
+    // whose read side is always drained — required by russh's channel
+    // backpressure.
+    let output = crate::term_output::OutputSink::open(&terminal_id, on_output);
     tauri::async_runtime::spawn(crate::ssh_manager::run_pty_pump(
         app.clone(),
         terminal_id.clone(),
         channel,
         rx,
         resize_rx,
+        output,
     ));
 
     Ok(())

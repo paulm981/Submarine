@@ -5,12 +5,12 @@ import { SearchAddon, ISearchOptions } from '@xterm/addon-search';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { WebglAddon } from '@xterm/addon-webgl';
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { Channel, invoke } from '@tauri-apps/api/core';
 import '@xterm/xterm/css/xterm.css';
 import { useIsNarrow } from '../hooks/useViewport';
 import { MobileKeyBar, ModifiersState, ModKey, SpecialKey } from './MobileKeyBar';
 import { appHotkey, registerTerminal, terminalStateChanged } from '../ui/terminalDock';
+import { forgetTerminal, noteTerminalOutput, noteTerminalParsed, noteTerminalRenderer } from '../util/diagnostics';
 import { useConfirm } from '../ui/confirm';
 import HistorySearchOverlay from './HistorySearchOverlay';
 import { DEFAULT_FONT_STACK, fontFamilyCss, readFontFamily, readFontSize } from '../util/terminalFont';
@@ -55,8 +55,9 @@ const SEARCH_OPTIONS: ISearchOptions = {
 };
 
 // The backend commands behind a terminal: an SSH shell's, or a shell on this
-// computer's (src-tauri/src/local_term.rs). Both stream output as the same
-// `terminal-output-{id}` events, so only the commands differ.
+// computer's (src-tauri/src/local_term.rs). Both send output the same way
+// (over the channel the terminal is opened with, src-tauri/src/term_output.rs),
+// so only the commands differ.
 const SSH_COMMANDS = { write: 'write_terminal_data', resize: 'resize_terminal', close: 'close_terminal' };
 const LOCAL_COMMANDS = { write: 'local_terminal_write', resize: 'local_terminal_resize', close: 'local_terminal_close' };
 
@@ -144,6 +145,12 @@ const TerminalView = ({
   onShellReady?: () => void;
 }) => {
   const commands = local ? LOCAL_COMMANDS : SSH_COMMANDS;
+
+  // What draws this terminal's output (set up with its xterm, below). Each
+  // open — the first and every reconnect — passes a fresh channel to the
+  // backend that hands its messages to it.
+  const outputRef = useRef<((data: Uint8Array) => void) | null>(null);
+  const outputChannel = () => new Channel<ArrayBuffer>((buf) => outputRef.current?.(new Uint8Array(buf)));
 
   // The wait for a freshly opened shell to be ready (SHELL_QUIET_MS): armed
   // when open_terminal returns, pushed back by each output batch. Refs only,
@@ -358,6 +365,7 @@ const TerminalView = ({
         cols: term.cols || 80,
         rows: term.rows || 24,
         useSudo: ce.useSudo,
+        onOutput: outputChannel(),
       }).then(() => { syncSize(); opened(); }, e => {
         term.writeln(`\x1b[31mReconnect into container failed: ${e}\x1b[0m`);
       });
@@ -368,6 +376,7 @@ const TerminalView = ({
         cols: term.cols || 80,
         rows: term.rows || 24,
         useLocalShell: readUseLocalShell(),
+        onOutput: outputChannel(),
       }).then(() => { syncSize(); opened(); watchForShellReady(); }, e => {
         term.writeln(`\x1b[31mReconnect failed: ${e}\x1b[0m`);
       });
@@ -621,6 +630,7 @@ const TerminalView = ({
       if (!on) {
         webgl?.dispose();
         webgl = null;
+        noteTerminalRenderer(terminalId, "dom");
         return;
       }
       try {
@@ -629,13 +639,17 @@ const TerminalView = ({
           addon.dispose();
           if (webgl === addon) webgl = null;
           gpuLost = true;
+          noteTerminalRenderer(terminalId, "dom");
+          console.warn(`[terminal] ${terminalId} lost its GPU context; drawing without the GPU`);
         });
         term.loadAddon(addon);
         webgl = addon;
+        noteTerminalRenderer(terminalId, "gpu");
       } catch {
         // No WebGL here: don't try again on every settings change.
         webgl = null;
         gpuLost = true;
+        noteTerminalRenderer(terminalId, "dom");
       }
     };
     setGpu(readGpu());
@@ -666,6 +680,7 @@ const TerminalView = ({
             shell: local.shell,
             cols: term.cols || 80,
             rows: term.rows || 24,
+            onOutput: outputChannel(),
           }).then((label) => {
             syncSize();
             local.onOpened?.(label);
@@ -680,6 +695,7 @@ const TerminalView = ({
             cols: term.cols || 80,
             rows: term.rows || 24,
             useSudo: containerExec.useSudo,
+            onOutput: outputChannel(),
           }).then(() => { syncSize(); opened(); }, e => {
             term.writeln(`\x1b[31mFailed to attach to container: ${e}\x1b[0m`);
           });
@@ -690,6 +706,7 @@ const TerminalView = ({
             cols: term.cols || 80,
             rows: term.rows || 24,
             useLocalShell: readUseLocalShell(),
+            onOutput: outputChannel(),
           }).then(() => { syncSize(); opened(); watchForShellReady(); }, e => {
             term.writeln(`\x1b[31mFailed to open terminal: ${e}\x1b[0m`);
           });
@@ -989,22 +1006,40 @@ const TerminalView = ({
     host.addEventListener('contextmenu', onContextMenu);
 
     // Handle Resize
+    // Refused until the shell is open (NOT_OPEN); the size is sent again
+    // once it is (syncSize), so that's not worth an error in the log.
     const onResizeDisposable = term.onResize(({ cols, rows }) => {
-      invoke(commands.resize, { terminalId, cols, rows }).catch(console.error);
+      invoke(commands.resize, { terminalId, cols, rows }).catch(() => {});
     });
 
-    // Handle Output with proper async cleanup for StrictMode
-    const unlistenPromise = listen(`terminal-output-${terminalId}`, (event: any) => {
-      // The backend now coalesces output and sends it base64-encoded (was a raw
-      // JSON byte array — ~4x larger and one event per SSH packet, which flooded
-      // this main-thread handler and froze the tab on big output). Decode back
-      // to bytes; xterm buffers any multibyte sequence split across batches.
+    // Output: raw bytes over the channel the terminal was opened with. Once
+    // xterm has processed a batch it's acknowledged, which is what lets the
+    // backend send more (src-tauri/src/term_output.rs): a stream faster than
+    // this window can draw waits there instead of piling up here. Acks are
+    // grouped, at most one per ACK_EVERY bytes or 30ms.
+    const ACK_EVERY = 128 * 1024;
+    let unacked = 0;
+    let ackTimer = 0;
+    const sendAck = () => {
+      if (ackTimer) window.clearTimeout(ackTimer);
+      ackTimer = 0;
+      const bytes = unacked;
+      unacked = 0;
+      if (bytes > 0) invoke('terminal_output_ack', { terminalId, bytes }).catch(() => {});
+    };
+    const processed = (bytes: number) => {
+      noteTerminalParsed(terminalId, bytes);
+      unacked += bytes;
+      if (unacked >= ACK_EVERY) sendAck();
+      else if (!ackTimer) ackTimer = window.setTimeout(sendAck, 30);
+    };
+    outputRef.current = (data: Uint8Array) => {
       const w = readyWatchRef.current;
       if (w) { window.clearTimeout(w.quiet); w.quiet = window.setTimeout(shellReady, SHELL_QUIET_MS); }
-      const bin = atob(event.payload as string);
-      const data = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) data[i] = bin.charCodeAt(i);
-      term.write(data);
+      // Counted for the freeze watchdog: received, and still to be drawn.
+      // xterm buffers a multibyte sequence split across batches.
+      noteTerminalOutput(terminalId, data.length);
+      term.write(data, () => processed(data.length));
       // Keep a short tail of decoded output so command-history capture can
       // recognize a no-echo password prompt and skip the typed secret.
       try {
@@ -1012,7 +1047,7 @@ const TerminalView = ({
         const combined = recentOutputRef.current + txt;
         recentOutputRef.current = combined.length > 512 ? combined.slice(-512) : combined;
       } catch { /* decode hiccup on a split multibyte chunk — ignore */ }
-    });
+    };
 
     // Coalesce resize bursts via rAF, and skip the refit on hidden tabs
     // so SIGWINCH doesn't leak to background PTYs (the become-visible
@@ -1173,10 +1208,12 @@ const TerminalView = ({
       window.removeEventListener('blur', onWindowBlur);
       window.visualViewport?.removeEventListener('resize', onVvResize);
       if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
-      unlistenPromise.then(unlisten => unlisten());
+      outputRef.current = null;
+      if (ackTimer) window.clearTimeout(ackTimer);
       searchAddon.dispose();
       searchAddonRef.current = null;
       webgl?.dispose();
+      forgetTerminal(terminalId);
       term.dispose();
       host.remove();
       invoke(commands.close, { terminalId }).catch(console.error);

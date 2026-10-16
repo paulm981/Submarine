@@ -1,8 +1,8 @@
 //! Terminals on this computer, for the Home view: a shell in a pseudo-terminal
 //! (ConPTY on Windows, openpty elsewhere), started in the user's home folder.
-//! Output reaches the page the way an SSH terminal's does — coalesced,
-//! base64 `terminal-output-{id}` events, then `terminal-closed-{id}` — so the
-//! same TerminalView draws both.
+//! Output reaches the page the way an SSH terminal's does — coalesced, over
+//! the page's channel and paced by what it has drawn (term_output.rs), then
+//! `terminal-closed-{id}` — so the same TerminalView draws both.
 //!
 //! The page only ever names a shell by id from [`shells`]: what each id runs
 //! is decided here. The one free choice, a program of the user's own, is made
@@ -541,11 +541,20 @@ mod pty {
     const FLUSH_CAP: usize = 256 * 1024;
     const FLUSH_WINDOW: Duration = Duration::from_millis(8);
 
-    /// Open a terminal for the page: output as `terminal-output-{id}`
-    /// events, then a line saying the shell has ended and
-    /// `terminal-closed-{id}`.
-    pub fn open(app: &tauri::AppHandle, terms: &LocalTerms, id: &str, shell: &Shell, cols: u16, rows: u16) -> Result<(), String> {
-        let (out_app, out_id) = (app.clone(), id.to_string());
+    /// Open a terminal for the page: output to `on_output`, paced by what
+    /// the page has drawn (term_output.rs), then a line saying the shell has
+    /// ended and `terminal-closed-{id}`.
+    pub fn open(
+        app: &tauri::AppHandle,
+        terms: &LocalTerms,
+        id: &str,
+        shell: &Shell,
+        cols: u16,
+        rows: u16,
+        on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+    ) -> Result<(), String> {
+        let output = std::sync::Arc::new(crate::term_output::OutputSink::open(id, on_output));
+        let end_output = output.clone();
         let (end_app, end_id) = (app.clone(), id.to_string());
         spawn(
             terms,
@@ -553,14 +562,14 @@ mod pty {
             shell,
             app.path().home_dir().ok(),
             (cols, rows),
-            move |batch| crate::ssh_manager::emit_terminal_batch(&out_app, &out_id, batch),
+            move |batch| output.push(batch),
             move || {
-                crate::ssh_manager::emit_terminal_batch(
-                    &end_app,
-                    &end_id,
+                end_output.push(
                     &mut b"\r\n\x1b[2m[The shell has ended. Close this tab, or open a new one with +.]\x1b[0m\r\n".to_vec(),
                 );
-                let _ = end_app.emit(&format!("terminal-closed-{}", end_id), serde_json::json!({}));
+                end_output.finish(move || {
+                    let _ = end_app.emit(&format!("terminal-closed-{}", end_id), serde_json::json!({}));
+                });
             },
         )
     }
@@ -780,10 +789,11 @@ pub async fn local_terminal_open(
     shell: Option<String>,
     cols: u16,
     rows: u16,
+    on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Result<String, String> {
     #[cfg(target_os = "android")]
     {
-        let _ = (&app, &terms, terminal_id, shell, cols, rows);
+        let _ = (&app, &terms, terminal_id, shell, cols, rows, on_output);
         Err("Local terminals aren't available on Android.".into())
     }
     #[cfg(not(target_os = "android"))]
@@ -796,7 +806,7 @@ pub async fn local_terminal_open(
                 None => default_shell(&config),
             }
             .ok_or("That shell isn't on this computer.")?;
-            pty::open(&app, &terms, &terminal_id, &chosen, cols, rows)?;
+            pty::open(&app, &terms, &terminal_id, &chosen, cols, rows, on_output)?;
             Ok(chosen.label)
         })
         .await

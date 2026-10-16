@@ -106,6 +106,7 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 
 - Tabbed sessions per server and multiple shells per session
 - **Split** — the button next to + opens another shell on the same server beside the one you're in (watch a log in one, work in the other); right-click it to put an open tab beside this one or to stack them top and bottom
+- **Fast output never freezes the app** — a busy `tail -f` or a `cat` of a huge file is sent as raw bytes and paced by what the window has drawn; when a stream stays faster than the screen can show, the oldest unseen part is skipped with a note in the terminal, and Ctrl+C still answers at once
 - Full xterm.js 6 — true colour, ANSI 256, mouse support, drawn with the GPU on Windows (WebGL; a switch in Settings, off by default on macOS and Linux), Unicode 11 widths so emoji and CJK line up
 - **Color schemes** — Submarine's own plus Campbell, One Half, Solarized, Dracula, Nord, Tokyo Night, Catppuccin and Gruvbox (Settings › Terminal, with a live preview). A server can have **its own**, which syncs with it — e.g. a light scheme for production
 - **Keep text readable** — text a program colors too close to the background is lifted to a 4.5:1 contrast, as in VS Code
@@ -119,6 +120,7 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 ### SFTP File Browser
 
 - Dual-pane (local on top, remote on bottom) with drag-and-drop between them
+- **Right-click the empty space** in a list for Refresh, New Folder, Select all and Copy folder path. A right-click anywhere in the app never shows the webview's own menu (whose Reload would restart the whole app), and F5 / Ctrl+R don't reload it either
 - **Tabs or Split layout** — toggle between stacked tabs (one pane visible, more screen real-estate) and the classic split, persisted per device
 - **Per-pane filter input** — type to filter the listing live with an N/M counter, Esc to clear
 - **Multi-select with Ctrl/Shift-click** plus **Select-All button and Ctrl+A** for bulk download, move, or delete
@@ -284,9 +286,13 @@ Smaller installer (around 10 MB vs ~100 MB for an Electron equivalent), lower RA
 
 In a single encrypted file under your OS app-data directory — or in the `submarine-data` folder when you run in [portable mode](#portable-mode-windows). Nothing in plaintext. Nothing in a global Keychain or registry hive.
 
+### Something went wrong — how do I find out what?
+
+Settings → **Troubleshooting**. Submarine keeps a log on your computer (`submarine.log` in its log folder, at most 4 MB): connection steps, errors, crashes, and when the window froze, for how long and which terminal was receiving the most output then. **Copy diagnostics** puts the build, the system and the end of the log on the clipboard with server, folder and user names, host names and addresses replaced by placeholders, ready to paste to whoever is helping. **Open log folder** shows the files themselves.
+
 ### Does Submarine collect telemetry or analytics?
 
-No. There's no analytics SDK, no crash reporter that sends data home, no "phone home" call on launch. The only outbound network call beyond your SSH targets is the optional cloud-sync endpoint at `api.sinaxhpm.com`, and that endpoint only ever receives opaque ciphertext.
+No. There's no analytics SDK, no crash reporter that sends data home, no "phone home" call on launch. The log under Troubleshooting stays on your computer unless you copy it yourself. The only outbound network call beyond your SSH targets is the optional cloud-sync endpoint at `api.sinaxhpm.com`, and that endpoint only ever receives opaque ciphertext.
 
 ### Can I use Submarine on my Android phone with the same servers as my desktop?
 

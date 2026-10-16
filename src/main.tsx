@@ -5,16 +5,16 @@ import ErrorBoundary from "./components/ErrorBoundary";
 import "./App.css";
 // Registers the bundled terminal fonts (@font-face) before any terminal mounts.
 import "./util/bundledFonts";
+import { startDiagnostics } from "./util/diagnostics";
+import { tameNativeMenus } from "./util/nativeMenus";
 
-// Last-resort global handlers so a failure that escapes React (an async reject,
-// a listener throw) is at least recorded instead of vanishing silently. The
-// ErrorBoundary below covers render-time throws; these cover everything else.
-window.addEventListener("unhandledrejection", (e) => {
-  console.error("[app] unhandled promise rejection:", e.reason);
-});
-window.addEventListener("error", (e) => {
-  console.error("[app] uncaught error:", e.error ?? e.message);
-});
+// The app's log and freeze watchdog (util/diagnostics.ts): a failure that
+// escapes React (an async reject, a listener throw), console.error, and a
+// window that stops answering all end up in the log file. The ErrorBoundary
+// below covers render-time throws.
+startDiagnostics();
+// No webview menu with "Reload" on a stray right-click (util/nativeMenus.ts).
+tameNativeMenus();
 
 // ── Android soft-keyboard sizing (visualViewport → --vv-h) ──────────────────
 // The Android on-screen keyboard covers our fixed-bottom UI (MobileKeyBar,

@@ -566,8 +566,8 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   };
 
   // Terminal IDs MUST be unique across every open session, not just within
-  // this one — the backend dispatches `terminal-output-<id>` events globally
-  // and any collision means two tabs end up reading from the same PTY.
+  // this one — the backend keys each terminal's input, size and output pacing
+  // by its id, and any collision means two tabs end up on the same PTY.
   // Scoping the id by `session.id` ensures Server A's "term-0" never clashes
   // with Server B's "term-0".
   // A terminal slot is either a regular login shell (the default) or a

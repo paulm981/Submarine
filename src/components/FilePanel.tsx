@@ -329,6 +329,10 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
   const filterInputRef = useRef<HTMLInputElement | null>(null);
 
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; entry: FileEntry } | null>(null);
+  // The menu for a right-click on the list's empty space: Refresh and the
+  // like (the webview's own menu, whose Reload restarts the whole app, is
+  // turned off; see util/nativeMenus.ts).
+  const [areaMenu, setAreaMenu] = useState<{ x: number; y: number } | null>(null);
   // `orig`: the mode and owner the Properties dialog opened with, so Save
   // only sends what the user changed.
   // "archive": v1 is the name without its extension, v2 the format, `items`
@@ -342,6 +346,7 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
   const paneRef = useRef<HTMLDivElement | null>(null);
   const dropTargetRef = useRef<HTMLDivElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const areaMenuRef = useRef<HTMLDivElement | null>(null);
   const currentPathRef = useRef(currentPath);
   useEffect(() => { currentPathRef.current = currentPath; }, [currentPath]);
 
@@ -707,9 +712,39 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
     };
   }, [contextMenu]);
 
+  useEffect(() => {
+    if (!areaMenu) return;
+    const onWindowMouseDown = (ev: MouseEvent) => {
+      const target = ev.target as Node | null;
+      if (target && areaMenuRef.current?.contains(target)) return;
+      setAreaMenu(null);
+    };
+    const timer = setTimeout(() => window.addEventListener("mousedown", onWindowMouseDown), 50);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener("mousedown", onWindowMouseDown);
+    };
+  }, [areaMenu]);
+  useLayoutEffect(() => {
+    const el = areaMenuRef.current;
+    if (!areaMenu || !el) return;
+    const { width, height } = el.getBoundingClientRect();
+    const x = Math.max(4, Math.min(areaMenu.x, window.innerWidth - width - 4));
+    const y = Math.max(4, Math.min(areaMenu.y, window.innerHeight - height - 4));
+    if (x !== areaMenu.x || y !== areaMenu.y) setAreaMenu({ x, y });
+  }, [areaMenu]);
+  const openAreaMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (disabled) return;
+    setContextMenu(null);
+    setAreaMenu({ x: e.clientX, y: e.clientY });
+  };
+
   const openMenu = (e: React.MouseEvent, entry: FileEntry) => {
     e.preventDefault();
     e.stopPropagation();
+    setAreaMenu(null);
     // Right-click on a row that isn't already part of the selection should
     // switch focus to it (Explorer/Finder behaviour), out of selection mode
     // too, so the menu acts on that row alone. Right-click on a row that IS
@@ -1562,8 +1597,9 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
     // A row's options button keeps Enter and Space for itself.
     if (e.target !== e.currentTarget && (e.key === "Enter" || e.key === " ")) return;
     // A key closes the row menu; Esc does only that.
-    if (contextMenu) {
+    if (contextMenu || areaMenu) {
       setContextMenu(null);
+      setAreaMenu(null);
       if (e.key === "Escape") { e.preventDefault(); return; }
     }
     const at = sortedEntries.findIndex((x) => x.path === (cursor ?? lastSelectedPathRef.current));
@@ -2099,6 +2135,7 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
           ref={listRef}
           className={`flex-1 p-1 font-mono text-[11px] ${selectedEntries.length > 0 ? "pb-16" : ""}`}
           onClick={(e) => { if (e.target === e.currentTarget) clearSelection(); }}
+          onContextMenu={openAreaMenu}
         >
           {loading && sortedEntries.length === 0 ? (
             <div className="text-center py-14 text-zinc-400">Loading…</div>
@@ -2196,6 +2233,32 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
           part of a multi-selection, actions like Download / Move / Delete
           apply to the whole set; per-item actions (Rename, Properties,
           Edit) only show when exactly one row is selected. */}
+      {areaMenu && createPortal(
+        <div ref={areaMenuRef}
+          style={{ top: areaMenu.y, left: areaMenu.x }}
+          className="fixed z-[9999] min-w-[180px] bg-[#0c0c0e] border border-white/10 rounded-lg shadow-2xl p-1 backdrop-blur-md font-mono text-[11.5px] text-zinc-200">
+          <button onClick={() => { setAreaMenu(null); fetch(currentPath); }}
+            className="w-full flex items-center gap-2 p-1.5 rounded hover:bg-white/10 text-left hover:text-white">
+            <RefreshCw size={11} className="text-indigo-300" /><span>Refresh</span>
+          </button>
+          <button onClick={() => { setAreaMenu(null); setModal({ type: "mkdir", v1: "" }); }}
+            className="w-full flex items-center gap-2 p-1.5 rounded hover:bg-white/10 text-left hover:text-white">
+            <Plus size={11} className="text-indigo-300" /><span>New Folder</span>
+          </button>
+          {sortedEntries.length > 0 && !allSelected && (
+            <button onClick={() => { setAreaMenu(null); selectAllVisible(); }}
+              className="w-full flex items-center gap-2 p-1.5 rounded hover:bg-white/10 text-left hover:text-white">
+              <CheckSquare size={11} className="text-indigo-300" /><span>Select all</span>
+            </button>
+          )}
+          <div className="h-px bg-white/5 my-1" />
+          <button onClick={() => { setAreaMenu(null); copyText(currentPath, "folder path"); }}
+            className="w-full flex items-center gap-2 p-1.5 rounded hover:bg-white/10 text-left hover:text-white">
+            <Copy size={11} /><span>Copy folder path</span>
+          </button>
+        </div>,
+        document.body,
+      )}
       {contextMenu && createPortal((() => {
         const acting = selectedEntries.length > 0 ? selectedEntries : [contextMenu.entry];
         const multi = acting.length > 1;
