@@ -19,6 +19,8 @@ import { forgetServerBookmarks } from "./util/sftpBookmarks";
 import { useIsNarrow } from "./hooks/useViewport";
 import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./util/terminalFont";
 import { GPU_KEY, MIN_CONTRAST_KEY, SCHEME_KEY, readGpu, readMinContrast, readSchemeId, setServerSchemes } from "./ui/terminalThemes";
+import { HIGHLIGHT_KEY, normalizeRules, onSlowRule, readHighlightId, setCustomRules, setServerHighlights } from "./ui/highlight";
+import { logLine } from "./util/diagnostics";
 import { USE_LOCAL_SHELL_KEY, readUseLocalShell } from "./util/terminalShell";
 import { USE_SSH_AGENT_KEY, readUseSshAgent } from "./util/sshAgent";
 import { Sidebar } from "./components/Sidebar";
@@ -332,6 +334,8 @@ function DesktopApp() {
     runOnConnect: "" as string,
     // The server's own terminal color scheme id; "" = the app's.
     terminalTheme: "" as string,
+    // The server's own highlight set id (src/ui/highlight.ts); "" = the app's.
+    highlight: "" as string,
     // ProxyJump: id (as a string, like credentialId/folderId) of another node
     // to bounce through. Empty = connect directly. parseInt'd to a number (or
     // null) at save time.
@@ -365,6 +369,9 @@ function DesktopApp() {
     terminalScheme: readSchemeId(),
     terminalGpu: readGpu(),
     terminalMinContrast: readMinContrast(),
+    // Which highlight set terminals use (src/ui/highlight.ts), unless their
+    // server has its own.
+    terminalHighlight: readHighlightId(),
     // Off by default: terminals start the remote account's own shell, same
     // as before this setting existed. See util/terminalShell.
     useLocalShell: readUseLocalShell(),
@@ -399,6 +406,7 @@ function DesktopApp() {
     localStorage.setItem(SCHEME_KEY, appSettings.terminalScheme);
     localStorage.setItem(GPU_KEY, appSettings.terminalGpu ? 'on' : 'off');
     localStorage.setItem(MIN_CONTRAST_KEY, appSettings.terminalMinContrast ? 'on' : 'off');
+    localStorage.setItem(HIGHLIGHT_KEY, appSettings.terminalHighlight);
     localStorage.setItem(USE_LOCAL_SHELL_KEY, appSettings.useLocalShell ? 'on' : 'off');
     localStorage.setItem(USE_SSH_AGENT_KEY, appSettings.useSshAgent ? 'on' : 'off');
     localStorage.setItem('submarine-auto-sync', appSettings.autoSync ? 'on' : 'off');
@@ -412,10 +420,12 @@ function DesktopApp() {
     window.dispatchEvent(new CustomEvent('submarine-settings-changed'));
   }, [appSettings]);
 
-  // Servers' own terminal colors: open terminals recolor when one changes
-  // (an edit here, or one that came in with a sync).
+  // Servers' own terminal colors and highlighting: open terminals follow
+  // when one changes (an edit here, or one that came in with a sync).
   useEffect(() => {
-    if (setServerSchemes(servers)) window.dispatchEvent(new CustomEvent('submarine-settings-changed'));
+    const schemes = setServerSchemes(servers);
+    const highlights = setServerHighlights(servers);
+    if (schemes || highlights) window.dispatchEvent(new CustomEvent('submarine-settings-changed'));
   }, [servers]);
 
   useEffect(() => {
@@ -526,8 +536,25 @@ function DesktopApp() {
     try { setNotes((await invoke("get_notes")) as any[]); }
     catch (e) { addLog(`SYNC_NOTES: ${e}`, "error"); }
   };
+  // The user's own highlight rules (synced with the profile): open terminals
+  // pick up a change.
+  const refreshHighlightRules = useCallback(async () => {
+    try {
+      if (setCustomRules(normalizeRules(await invoke("highlight_rules_list")))) {
+        window.dispatchEvent(new CustomEvent('submarine-settings-changed'));
+      }
+    } catch (e) { addLog(`SYNC_HIGHLIGHT_RULES: ${e}`, "error"); }
+  }, [addLog]);
+  useEffect(() => {
+    onSlowRule((label) => {
+      const msg = `The highlight rule "${label}" was too slow on this output, so it's off until Submarine restarts.`;
+      addLog(msg, "warn");
+      logLine("warn", `[highlight] ${msg}`);
+    });
+  }, [addLog]);
   const refreshAll = async () => {
     await Promise.all([
+      refreshHighlightRules(),
       refreshServers(),
       refreshCredentials(),
       refreshSshKeys(),
@@ -1390,6 +1417,7 @@ function DesktopApp() {
       notes: server.notes || "",
       runOnConnect: server.run_on_connect || "",
       terminalTheme: server.terminal_theme || "",
+      highlight: server.highlight || "",
       jumpHostId: server.jump_host_id?.toString() || "",
       // Attribution (read-only display): who last edited + the HLC stamp.
       editedBy: server.edited_by ?? null,
@@ -2287,6 +2315,7 @@ function DesktopApp() {
                 servers={servers}
                 isMobile={isMobile}
                 onOpenLogs={() => setActiveView("logs")}
+                onHighlightRulesChanged={() => { void refreshHighlightRules(); bumpSync(); }}
               />
             )}
 
@@ -2980,6 +3009,11 @@ function DesktopApp() {
               await invoke("set_server_terminal_theme", { id: savedId, value: newNode.terminalTheme || null });
             } catch (e) {
               addLog(`SAVE_TERMINAL_THEME_FAILED: ${e}`, "error");
+            }
+            try {
+              await invoke("set_server_highlight", { id: savedId, value: newNode.highlight || null });
+            } catch (e) {
+              addLog(`SAVE_HIGHLIGHT_FAILED: ${e}`, "error");
             }
             // ProxyJump target — same separate-write pattern. Empty string
             // means "no jump host" → store NULL.

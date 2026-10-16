@@ -15,6 +15,7 @@ import FontPicker from "./FontPicker";
 import { loadInstalledFonts } from "../util/systemFonts";
 import { IS_ANDROID, IS_WINDOWS } from "../util/platform";
 import { TerminalColorSettings } from "./TerminalSchemes";
+import { HighlightSettings } from "./HighlightSettings";
 import LicensesDialog from "./LicensesDialog";
 import { DEFAULT_SCHEME } from "../ui/terminalThemes";
 import { windowSummary } from "../util/diagnostics";
@@ -579,7 +580,7 @@ function ShellConfigSyncSettings({ servers }: { servers: any[] }) {
   );
 }
 
-const SettingsPanel = ({ settings, setSettings, onOpenLogs, servers = [] }: any) => {
+const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChanged, servers = [] }: any) => {
   const accentColors = [
     { name: 'Light Blue', value: '#60a5fa' },
     { name: 'Sky', value: '#38bdf8' },
@@ -704,6 +705,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, servers = [] }: any)
 
           <TerminalFontSettings settings={settings} setSettings={setSettings} />
           <TerminalColorSettings settings={settings} setSettings={setSettings} />
+          <HighlightSettings settings={settings} setSettings={setSettings} onRulesChanged={onHighlightRulesChanged} />
 
           <DefaultShellSetting settings={settings} setSettings={setSettings} />
 
