@@ -16,6 +16,7 @@ import { readUseLocalShell } from "../util/terminalShell";
 import { readUseSshAgent } from "../util/sshAgent";
 import { useSlideOverFocus } from "../ui/slideOverFocus";
 import { useConfirm } from "../ui/confirm";
+import { markTyped } from "../ui/terminalDock";
 
 // What the shell-config push commands answer (mirror.rs' ShellSync* types).
 type ShellSyncShells = { remote_shell: string; local_shell: string; shell_mismatch: boolean };
@@ -603,6 +604,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           const cmds = startupCommands.join('\n') + '\n';
           const typeThem = () => {
             const bytes = Array.from(new TextEncoder().encode(cmds));
+            markTyped(terminalId);
             invoke('write_terminal_data', { terminalId, data: bytes }).catch(() => {});
           };
           if (!session.runOnConnectHeld) {

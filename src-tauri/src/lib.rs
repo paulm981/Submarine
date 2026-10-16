@@ -18748,8 +18748,8 @@ async fn monitor_resume_all(
 
     // Start (or hot-resume) each one. One server that can't be reached as set
     // up (its jump host was deleted, say) mustn't stop the rest from
-    // starting; it's named in the answer.
-    let mut skipped: Vec<String> = Vec::new();
+    // starting; it stays paused, and is named in the answer.
+    let mut skipped: Vec<(i32, String)> = Vec::new();
     for node_id in node_ids {
         if monitor::set_paused(map.inner().clone(), node_id, false).await.is_err() {
             let (auth, metrics, customs, name) = {
@@ -18764,7 +18764,7 @@ async fn monitor_resume_all(
                     Ok(auth) => (auth, metrics, customs, name),
                     Err(e) => {
                         crate::applog::write_line("monitor", &format!("node {}: not started ({})", node_id, e));
-                        skipped.push(name);
+                        skipped.push((node_id, name));
                         continue;
                     }
                 }
@@ -18786,14 +18786,23 @@ async fn monitor_resume_all(
         }
     }
     if skipped.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Couldn't start monitoring {}: check how {} reached (the app log says why).",
-            skipped.join(", "),
-            if skipped.len() == 1 { "it's" } else { "they're" }
-        ))
+        return Ok(());
     }
+    {
+        let guard = db_state.conn.lock().map_err(|_| "lock")?;
+        let conn = guard.as_ref().ok_or("db not ready")?;
+        for (node_id, _) in &skipped {
+            conn.execute("UPDATE monitor_configs SET paused = 1 WHERE node_id = ?1", [node_id])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    save_vault_internal(&db_state)?;
+    let names: Vec<&str> = skipped.iter().map(|(_, name)| name.as_str()).collect();
+    Err(format!(
+        "Couldn't start monitoring {}: check how {} reached (the app log says why).",
+        names.join(", "),
+        if names.len() == 1 { "it's" } else { "they're" }
+    ))
 }
 
 /// The clipboard's text, for a paste into the terminal (a right-click, or

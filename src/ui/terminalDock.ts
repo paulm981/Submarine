@@ -27,10 +27,6 @@ export interface DockEntry {
   home: HTMLElement;
   /// Its shell is open and its session connected: input reaches it.
   live: () => boolean;
-  /// Which shell it is: a new number each time one opens (a reconnect, or
-  /// the terminal opened again), from nextShellId. A Wall keeps a line
-  /// typed to all to the shells that have had all of it.
-  shell: () => number;
   /// Paste the way the terminal's own paste does: one Enter per line break,
   /// wrapped as a bracketed paste when the program asked for that. False
   /// when it can't take input.
@@ -40,9 +36,18 @@ export interface DockEntry {
 }
 
 const entries = new Map<string, DockEntry>();
-let shellIds = 0;
-/// A number no shell had before (DockEntry.shell).
-export const nextShellId = () => ++shellIds;
+// terminalId → a number that changes whenever its line may have changed
+// under a Wall: its shell opened (again), or something was typed into it.
+// A Wall keeps a line typed to all to the terminals whose number is still
+// the one it saw after typing the start of it.
+const marks = new Map<string, number>();
+let lastMark = 0;
+/// Typed into, or opened: by the terminal itself, a panel, or a Wall
+/// (which reads the new number after it types, terminalMark).
+export const markTyped = (...terminalIds: string[]) => {
+  for (const id of terminalIds) marks.set(id, ++lastMark);
+};
+export const terminalMark = (terminalId: string) => marks.get(terminalId) ?? 0;
 // terminalId → the Wall tile that wants it on screen.
 const claims = new Map<string, HTMLElement>();
 const listeners = new Set<() => void>();

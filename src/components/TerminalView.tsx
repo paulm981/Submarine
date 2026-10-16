@@ -9,7 +9,7 @@ import { Channel, invoke } from '@tauri-apps/api/core';
 import '@xterm/xterm/css/xterm.css';
 import { useIsNarrow } from '../hooks/useViewport';
 import { MobileKeyBar, ModifiersState, ModKey, SpecialKey } from './MobileKeyBar';
-import { appHotkey, nextShellId, registerTerminal, terminalStateChanged } from '../ui/terminalDock';
+import { appHotkey, markTyped, registerTerminal, terminalStateChanged } from '../ui/terminalDock';
 import { forgetTerminal, logLine, noteTerminalOutput, noteTerminalParsed, noteTerminalRenderer } from '../util/diagnostics';
 import { useConfirm } from '../ui/confirm';
 import HistorySearchOverlay from './HistorySearchOverlay';
@@ -232,8 +232,6 @@ const TerminalView = ({
   // Its shell is open (open_terminal has answered, again after a reconnect):
   // what a Wall's broadcast checks, with `disabled`, before typing into it.
   const ptyLiveRef = useRef(false);
-  // Which shell is open (DockEntry.shell): a new number each time one opens.
-  const shellIdRef = useRef(0);
   // Mirror of isActiveView, read inside focusTerminal's rAF / signal
   // callbacks (which would otherwise close over a stale value).
   const isActiveViewRef = useRef(isActiveView);
@@ -352,6 +350,7 @@ const TerminalView = ({
         bytes = [0x09];
       }
     }
+    markTyped(terminalId);
     invoke(commands.write, { terminalId, data: bytes }).catch(console.error);
     if (consumes) consumeArmedModifiers();
   };
@@ -375,7 +374,7 @@ const TerminalView = ({
     term.write('\r\n\x1b[33m── reconnected ──\x1b[0m\r\n');
     ptyLiveRef.current = false;
     terminalStateChanged();
-    const opened = () => { shellIdRef.current = nextShellId(); ptyLiveRef.current = true; terminalStateChanged(); };
+    const opened = () => { markTyped(terminalId); ptyLiveRef.current = true; terminalStateChanged(); };
     // As on the first open: the backend only takes resizes once the shell is
     // up, so a resize that landed while it was starting again (the window
     // was being dragged, a panel opened) is sent once more when it is. Without
@@ -641,14 +640,16 @@ const TerminalView = ({
     let charBudget = CHAR_BUDGET;
     const countLimit = (final: string) =>
       final === 'b' ? term.rows * term.cols : LINE_FINALS.has(final) ? term.rows * 4 : term.cols * 4;
-    // The cell a repeat copies: the one before the cursor (or, after a wide
-    // character, the one before that), in code units.
+    // The cell a repeat copies, in code units: the one the last character
+    // went into, by its width back from the cursor — 1, 2 (wide), or 0 when
+    // it didn't fit at the edge with wrapping off. Which one isn't public,
+    // so the longest of the three.
     const repeatedLength = () => {
       const b = term.buffer.active;
       const line = b.getLine(b.baseY + b.cursorY);
-      let cell = line?.getCell(b.cursorX - 1);
-      if (cell && cell.getWidth() === 0) cell = line?.getCell(b.cursorX - 2);
-      return Math.max(1, cell?.getChars().length ?? 1);
+      let len = 1;
+      for (let x = b.cursorX - 2; x <= b.cursorX; x++) len = Math.max(len, line?.getCell(x)?.getChars().length ?? 0);
+      return len;
     };
     for (const final of COUNTED_FINALS) {
       term.parser.registerCsiHandler({ final }, (params) => {
@@ -742,7 +743,7 @@ const TerminalView = ({
         const syncSize = () => {
           invoke(commands.resize, { terminalId, cols: term.cols, rows: term.rows }).catch(() => {});
         };
-        const opened = () => { shellIdRef.current = nextShellId(); ptyLiveRef.current = true; terminalStateChanged(); };
+        const opened = () => { markTyped(terminalId); ptyLiveRef.current = true; terminalStateChanged(); };
         if (local) {
           invoke<string>('local_terminal_open', {
             terminalId,
@@ -793,6 +794,9 @@ const TerminalView = ({
     // forwarded verbatim because we can't sensibly "Ctrl" a phrase.
     const handleData = (data: string) => {
       if (disabledRef.current) return;
+      // A Wall's line isn't this one's whole any more — unless this is only
+      // the terminal saying it got or lost the focus (for vim, tmux).
+      if (data !== '\x1b[I' && data !== '\x1b[O') markTyped(terminalId);
       // A paste: our right-click path, or xterm's own keyboard paste, which
       // starts with the bracketed-paste marker when the remote program asked
       // for one. Never run through the armed modifiers or into history.
@@ -1250,7 +1254,6 @@ const TerminalView = ({
       host,
       home,
       live: () => !disabledRef.current && ptyLiveRef.current,
-      shell: () => shellIdRef.current,
       paste: (text) => {
         if (disabledRef.current || !ptyLiveRef.current) return false;
         pasteText(text);
@@ -1413,6 +1416,7 @@ const TerminalView = ({
           if (disabledRef.current) return;
           const payload = execute ? command + "\r" : command;
           const bytes = Array.from(new TextEncoder().encode(payload));
+          markTyped(terminalId);
           invoke(commands.write, { terminalId, data: bytes }).catch(console.error);
           // Mirror the inserted command into the local buffer so the next
           // Enter (if the user typed one manually) still logs correctly.

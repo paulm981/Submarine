@@ -4,7 +4,10 @@ import { Terminal } from "@xterm/xterm";
 import {
   ClipboardPaste, ExternalLink, LayoutGrid, Pause, Play, Plus, Radio, RotateCw, Save, Send, X,
 } from "lucide-react";
-import { appHotkey, claimTerminal, DockEntry, dockedTerminal, forCursorMode, useDockVersion } from "../ui/terminalDock";
+import {
+  appHotkey, claimTerminal, DockEntry, dockedTerminal, forCursorMode, markTyped, terminalMark, useDockVersion,
+} from "../ui/terminalDock";
+import { lineAfter, TYPED_KEPT } from "../ui/wallLine";
 import { useConfirm } from "../ui/confirm";
 import { sessionDot } from "../util/sessionStatus";
 import { IS_LINUX } from "../util/platform";
@@ -60,39 +63,19 @@ const encode = (s: string) => Array.from(new TextEncoder().encode(s));
 // ── The line being typed to all ──────────────────────────────────────────────
 // A terminal that starts taking input partway through a line — it has just
 // connected (behind a jump host they log in a few at a time), reconnected,
-// been resumed, or was typed into on its own — would get only the rest of it:
-// `rm -rf *` without the `cd /old/site && ` typed before it. So a line goes on
-// only to the shells that have had all of it so far; the others join at the
-// next one. Kept per wall (Wall.id) out here, so leaving the Wall or turning
-// Broadcast off and on again doesn't forget a line half typed.
+// been resumed, or was typed into some other way — would get only the rest
+// of it: `rm -rf *` without the `cd /old/site && ` typed before it. So a line
+// goes on only to the terminals that have had all of it so far (their
+// terminalMark unchanged since); the others join at the next one. Kept per
+// wall (Wall.id) out here, so leaving the Wall or turning Broadcast off and
+// on again doesn't forget a line half typed.
 interface WallLine {
-  /// terminalId → the shell (DockEntry.shell) that has had all of the line.
+  /// terminalId → its terminalMark after it was last typed to here.
   members: Map<string, number>;
-  /// The end of what was typed of it, to tell a line continued with `\`.
+  /// What was typed of it, as far as can be followed (lineAfter).
   typed: string;
 }
 const wallLines = new Map<string, WallLine>();
-const TYPED_KEPT = 64;
-
-/// What's typed of the line open after `data` was typed (`typed`: what was
-/// before, "" at the start of a line), or null when `data` ends a line.
-/// Enter ends one, unless it follows a `\` (the line goes on below); so does
-/// Ctrl+C. Ctrl+D and Ctrl+U don't: they delete a character, or only what's
-/// before the cursor.
-const lineAfter = (typed: string, data: string): string | null => {
-  let t: string | null = typed;
-  for (const ch of data) {
-    if (ch === "\x03") t = null;
-    else if (ch === "\r" || ch === "\n") {
-      const was: string = t ?? "";
-      const slashes = was.length - was.replace(/\\+$/, "").length;
-      t = slashes % 2 === 1 ? `${was}\r` : null;
-    } else if (ch === "\x7f" || ch === "\b") t = (t ?? "").slice(0, -1);
-    else t = ((t ?? "") + ch).slice(-TYPED_KEPT);
-  }
-  return t;
-};
-
 const sameMembers = (a: Map<string, number>, b: Map<string, number>) =>
   a.size === b.size && [...a].every(([tid, shell]) => b.get(tid) === shell);
 
@@ -170,16 +153,17 @@ export const WallView = ({
   const lineTargets = useCallback(() => {
     const now = targetsNow();
     const line = wallLines.get(wallRef.current.id);
-    return line ? now.filter((e) => line.members.get(e.terminalId) === e.shell()) : now;
+    return line ? now.filter((e) => line.members.get(e.terminalId) === terminalMark(e.terminalId)) : now;
   }, [targetsNow]);
-  /// `data` went to `sent`: a line begins with them, goes on with them, or
-  /// has ended. After a paste (`keepOpen`) the line stays open — a shell
+  /// `data` went to `sent` (none, when nobody was taking input: a line
+  /// begun then goes on to nobody): a line begins with them, goes on with
+  /// them, or has ended. A paste (`pasted`) leaves the line open — a shell
   /// that asked for pastes bracketed holds the text, line breaks and all,
   /// until Enter.
-  const afterTyping = useCallback((data: string, sent: DockEntry[], keepOpen = false) => {
+  const afterTyping = useCallback((data: string, sent: DockEntry[], pasted = false) => {
     const id = wallRef.current.id;
     const was = wallLines.get(id);
-    const typed = lineAfter(was?.typed ?? "", data) ?? (keepOpen ? "" : null);
+    const typed = pasted ? ((was?.typed ?? "") + data).slice(-TYPED_KEPT) : lineAfter(was?.typed ?? null, data);
     if (typed === null) {
       if (was) {
         wallLines.delete(id);
@@ -187,19 +171,14 @@ export const WallView = ({
       }
       return;
     }
-    if (!was && sent.length === 0) return;
-    const members = new Map(sent.map((e) => [e.terminalId, e.shell()]));
+    const members = new Map(sent.map((e) => [e.terminalId, terminalMark(e.terminalId)]));
     wallLines.set(id, { members, typed });
     if (!was || !sameMembers(was.members, members)) lineChanged();
   }, [lineChanged]);
-  // Typed into on its own (clicked into): its line is its own now.
-  const leaveLine = (tid: string) => {
-    if (wallLines.get(wall.id)?.members.delete(tid)) lineChanged();
-  };
   const line = wallLines.get(wall.id);
   const atNextLine = (tid: string) => {
     const e = dockedTerminal(tid);
-    return !!line && !!e && line.members.get(tid) !== e.shell();
+    return !!line && !!e && line.members.get(tid) !== terminalMark(tid);
   };
 
   const live = wall.members.filter((m) => dockedTerminal(m.terminalId)?.live());
@@ -239,6 +218,7 @@ export const WallView = ({
       else groups.set(d, [e.terminalId]);
     }
     for (const [d, ids] of groups) {
+      markTyped(...ids);
       invoke("write_terminals_data", { terminalIds: ids, data: encode(d) }).catch(() => {});
     }
     afterTyping(data, sent);
@@ -392,7 +372,9 @@ export const WallView = ({
       return;
     }
     const data = body.replace(/\n/g, "\r");
-    invoke("write_terminals_data", { terminalIds: sent.map((e) => e.terminalId), data: encode(data) })
+    const ids = sent.map((e) => e.terminalId);
+    markTyped(...ids);
+    invoke("write_terminals_data", { terminalIds: ids, data: encode(data) })
       .then(() => flash(`Sent to ${plural(sent.length, "server")}.`), (e) => flash(`Couldn't send: ${e}`));
     afterTyping(data, sent);
   };
@@ -564,7 +546,6 @@ export const WallView = ({
                   paused={isPaused(m.terminalId)}
                   nextLine={atNextLine(m.terminalId)}
                   onFocusIn={() => {
-                    leaveLine(m.terminalId);
                     if (!wallRef.current.broadcast) return;
                     setParked(false);
                     setSolo(m.terminalId);
@@ -675,7 +656,7 @@ const WallTile = ({
         )}
         {joinsNext && (
           <span
-            title="It started taking input partway through the line being typed, so it gets the next line, not the rest of this one."
+            title="It started taking input partway through the line being typed, so it gets the next line (after Enter, or Ctrl+C), not the rest of this one."
             className="shrink-0 h-5 px-1.5 rounded flex items-center text-[9px] font-bold uppercase tracking-wider text-orange-300/90 border border-orange-400/30"
           >
             Next line
