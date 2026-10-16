@@ -168,6 +168,15 @@ fontdb = "0.24"
 # not on Android, which has no shells to offer.
 portable-pty = "0.9"
 
+# The app's log (applog.rs) routes standard output and error into its file
+# through a pipe: libc's pipe/dup2 on Unix, CreatePipe/SetStdHandle on
+# Windows. Both are in the build already through other crates.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Pipes"] }
+
 # ---------------------------------------------------------------------------
 # Linux-only. GTK's own crates, already in the build through Tauri (same
 # versions, nothing new to download). lib.rs reads the clipboard through

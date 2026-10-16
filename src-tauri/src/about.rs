@@ -56,6 +56,18 @@ pub struct AppInfo {
     pub build: Option<u64>,
 }
 
+/// "0.3.8, build 231 (main, 23d8806)": which build this is, for the log and
+/// "Copy diagnostics".
+pub fn build_label() -> String {
+    let mut label = env!("CARGO_PKG_VERSION").to_string();
+    if let Some(n) = build_number() {
+        label.push_str(&format!(", build {n}"));
+    }
+    let commit = BUILD_COMMIT.get(..7).unwrap_or("");
+    label.push_str(&format!(" ({}{}{})", BUILD_KIND, if commit.is_empty() { "" } else { ", " }, commit));
+    label
+}
+
 /// Static info bundled with the binary. Version comes from CARGO_PKG_VERSION
 /// which Cargo + tauri-action set from the git tag during release builds.
 #[tauri::command]

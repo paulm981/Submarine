@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, FileEdit, Server, Home, Scale, ArrowRight, X, KeyRound } from "lucide-react";
+import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, FileEdit, Server, Home, Scale, ArrowRight, X, KeyRound, LifeBuoy, ClipboardCopy, FolderOpen } from "lucide-react";
 import {
   MAX_FONT_SIZE, MIN_FONT_SIZE, clampFontSize, fontFamilyCss,
   isFontAvailable, primaryFontName, sanitizeFontFamily,
@@ -17,6 +17,7 @@ import { IS_ANDROID, IS_WINDOWS } from "../util/platform";
 import { TerminalColorSettings } from "./TerminalSchemes";
 import LicensesDialog from "./LicensesDialog";
 import { DEFAULT_SCHEME } from "../ui/terminalThemes";
+import { windowSummary } from "../util/diagnostics";
 
 // Where this install keeps its data (see src-tauri/src/portable.rs). `portable`
 // means a `submarine-data` folder next to the executable is in use; `warning`
@@ -885,6 +886,9 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, servers = [] }: any)
           </div>
         </section>
 
+        {/* Troubleshooting */}
+        <TroubleshootingSettings />
+
         {/* Maintenance Section */}
         <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
           <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
@@ -950,6 +954,62 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, servers = [] }: any)
       </div>
       {licensesOpen && <LicensesDialog onClose={() => setLicensesOpen(false)} />}
     </div>
+  );
+};
+
+// Settings → Troubleshooting: the app's log (src-tauri/src/applog.rs) and a
+// copy of what's needed to look into a problem, with the servers' names,
+// hosts and addresses replaced.
+const TroubleshootingSettings = () => {
+  const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const say = (ok: boolean, text: string) => {
+    setStatus({ ok, text });
+    window.setTimeout(() => setStatus((s) => (s?.text === text ? null : s)), 8000);
+  };
+  const copy = async () => {
+    setBusy(true);
+    try {
+      const report = await invoke<string>("diagnostics_report", { ui: windowSummary() });
+      await navigator.clipboard.writeText(report);
+      say(true, `Copied ${report.split("\n").length} lines. Paste them to whoever is helping you.`);
+    } catch (e) {
+      say(false, `Couldn't copy: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const openFolder = () => {
+    invoke("open_log_folder").catch((e) => say(false, String(e)));
+  };
+  const btn = "px-4 h-9 bg-zinc-900 border border-white/5 text-zinc-300 rounded-xl text-xs font-bold uppercase hover:bg-white/5 transition-all flex-1 flex items-center justify-center gap-2 disabled:opacity-50";
+  return (
+    <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
+      <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
+        <LifeBuoy size={14} /> Troubleshooting
+      </div>
+      <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
+        <p className="text-sm text-zinc-400 leading-relaxed">
+          Submarine keeps a log on this computer: connections, errors, and when the window freezes and which
+          terminal was busy then. If something goes wrong, click <span className="text-zinc-200">Copy diagnostics</span>{" "}
+          soon after and paste it to whoever is helping you. Server, folder and user names, host names and
+          addresses are replaced with placeholders.
+        </p>
+        <div className="flex flex-col sm:flex-row gap-2">
+          <button onClick={copy} disabled={busy} className={btn}>
+            <ClipboardCopy size={13} /> Copy diagnostics
+          </button>
+          {!IS_ANDROID && (
+            <button onClick={openFolder} className={btn}>
+              <FolderOpen size={13} /> Open log folder
+            </button>
+          )}
+        </div>
+        {status && (
+          <p className={`text-[11.5px] leading-relaxed ${status.ok ? "text-emerald-300/90" : "text-rose-300"}`}>{status.text}</p>
+        )}
+      </div>
+    </section>
   );
 };
 

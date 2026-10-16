@@ -39,6 +39,8 @@ mod archive;
 mod approvals;
 mod agent_auth;
 mod ssh_config;
+mod applog;
+mod term_output;
 #[cfg(test)]
 mod ssh_test_server;
 use ssh_manager::SshState;
@@ -12022,8 +12024,10 @@ async fn server_runs_login_shell(session_arc: &SessionHandleArc, shell: &str) ->
     )
 }
 
+// A command's arguments are what the page sends; there's no struct to group.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
-async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>, session_id: String, terminal_id: String, cols: u32, rows: u32, use_local_shell: bool) -> Result<(), String> {
+async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>, session_id: String, terminal_id: String, cols: u32, rows: u32, use_local_shell: bool, on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) -> Result<(), String> {
     use std::sync::Arc;
     use crate::ssh_manager::TerminalCommand;
 
@@ -12071,13 +12075,16 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
     // Output coalescing, keystroke / resize forwarding and the split,
     // always-draining read/write pump (required by russh's channel
     // backpressure) live in ssh_manager::run_pty_pump — shared with the
-    // docker exec terminal.
+    // docker exec terminal. The output goes to the page's channel, paced by
+    // what it has drawn (term_output.rs).
+    let output = term_output::OutputSink::open(&terminal_id, on_output);
     tauri::async_runtime::spawn(crate::ssh_manager::run_pty_pump(
         app.clone(),
         terminal_id.clone(),
         channel,
         rx,
         resize_rx,
+        output,
     ));
 
     Ok(())
@@ -13010,6 +13017,74 @@ async fn run_as_root(
     let access = root_access_for(state, session_id, &session_arc, args, password).await?;
     let (code, out) = root_run(&session_arc, &access, args, timeout_secs).await?;
     Ok((code, out, access.tool))
+}
+
+/// Settings → Troubleshooting → "Copy diagnostics" (applog.rs): the build,
+/// the system, what the page says about itself (`ui`: its settings and the
+/// freezes it saw) and the end of the log. The open profile's server, folder,
+/// login and key names, its host and user names, IPv4 and e-mail addresses
+/// and the home folder are replaced with placeholders, so it can be pasted to
+/// whoever is helping without giving the servers away.
+#[tauri::command]
+async fn diagnostics_report(db_state: tauri::State<'_, DbState>, ui: String) -> Result<String, String> {
+    let names = diagnostic_names(&db_state);
+    let webview = tauri::webview_version().unwrap_or_else(|_| "unknown".into());
+    let text = format!(
+        "Submarine diagnostics, {}\n\
+         Build: {}\n\
+         System: {} {}, webview {}, portable: {}\n\
+         Names, hosts and addresses: {}\n\
+         Window: {}\n\
+         \n--- The end of the log ---\n{}\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M"),
+        about::build_label(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        webview,
+        if portable::current().is_portable() { "yes" } else { "no" },
+        if names.is_some() {
+            "replaced with placeholders"
+        } else {
+            "NOT replaced (no profile is open): check the text before sharing it"
+        },
+        ui.trim(),
+        applog::tail(400),
+    );
+    let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok();
+    Ok(applog::redact(&text, names.as_deref().unwrap_or(&[]), home.as_deref()))
+}
+
+/// What "Copy diagnostics" hides: every name, host and user name in the open
+/// profile, each with what it is. None when no profile is open.
+fn diagnostic_names(db_state: &DbState) -> Option<Vec<(String, &'static str)>> {
+    let guard = db_state.conn.lock().ok()?;
+    let conn = guard.as_ref()?;
+    let mut out: Vec<(String, &'static str)> = Vec::new();
+    let mut add = |sql: &str, kinds: &[&'static str]| {
+        let Ok(mut stmt) = conn.prepare(sql) else { return };
+        let Ok(rows) = stmt.query_map([], |r| {
+            (0..kinds.len()).map(|i| r.get::<_, Option<String>>(i)).collect::<rusqlite::Result<Vec<_>>>()
+        }) else {
+            return;
+        };
+        for row in rows.flatten() {
+            for (value, kind) in row.into_iter().zip(kinds) {
+                if let Some(v) = value.filter(|v| !v.trim().is_empty()) {
+                    out.push((v, kind));
+                }
+            }
+        }
+    };
+    add("SELECT name, host, username, proxy_host FROM servers", &["server", "host", "user", "host"]);
+    add("SELECT name, host, username FROM rdp_links", &["server", "host", "user"]);
+    add("SELECT name FROM folders", &["folder"]);
+    add("SELECT name, username FROM credentials", &["login", "user"]);
+    add("SELECT name FROM ssh_keys", &["key"]);
+    drop(guard);
+    if let Some(profile) = db_state.active_profile.lock().ok().and_then(|g| g.clone()) {
+        out.push((profile, "profile"));
+    }
+    Some(out)
 }
 
 #[tauri::command]
@@ -18601,6 +18676,10 @@ pub fn run() {
         // is the earliest hook we get an AppHandle, so initialise it there and
         // `manage` it for commands.
         .setup(|app| {
+            // The log file first, so the rest of the start is in it (applog.rs).
+            if let Ok(dir) = app.path().app_log_dir() {
+                applog::start(dir);
+            }
             let cloud_state = cloud::CloudState::new(&app.handle());
             app.manage(cloud_state);
             Ok(())
@@ -18646,6 +18725,8 @@ pub fn run() {
             local_term::local_terminal_resize, local_term::local_terminal_close,
             ssh_info_probe_section, ssh_systemctl_action, ssh_kill_process,
             ssh_iptables_chain, ssh_nft_chain, ssh_firewall_as_root,
+            applog::app_log, applog::ui_heartbeat, applog::open_log_folder, diagnostics_report,
+            term_output::terminal_output_ack,
             docker::ssh_docker_container_action,
             docker::ssh_docker_inspect,
             docker::ssh_docker_stats,
