@@ -47,6 +47,9 @@ pub(crate) struct TestServer {
     kill: std::collections::HashMap<ChannelId, Arc<tokio::sync::Notify>>,
     /// Commands started, then still running (shared with their tasks).
     pub running: Arc<AtomicUsize>,
+    /// After an `open-back` exec: each kind of channel the server tried to
+    /// open towards the client, and whether the client accepted it.
+    pub opened_back: Arc<std::sync::Mutex<Vec<(&'static str, bool)>>>,
 }
 
 /// How the test server runs `exec` commands with the local `sh` (unix only).
@@ -291,6 +294,23 @@ impl server::Handler for TestServer {
         }
         if command == "echo" {
             self.echo.insert(channel);
+        } else if command == "open-back" {
+            // A hostile server: open one channel of each kind towards the
+            // client, which never asked for any of them.
+            let handle = session.handle();
+            let log = Arc::clone(&self.opened_back);
+            tokio::spawn(async move {
+                let tries = vec![
+                    ("session", handle.channel_open_session().await.is_ok()),
+                    ("x11", handle.channel_open_x11("127.0.0.1", 6010).await.is_ok()),
+                    ("agent", handle.channel_open_agent().await.is_ok()),
+                    ("direct-tcpip", handle.channel_open_direct_tcpip("127.0.0.1", 22, "127.0.0.1", 40000).await.is_ok()),
+                    ("forwarded-tcpip", handle.channel_open_forwarded_tcpip("127.0.0.1", 8080, "127.0.0.1", 40001).await.is_ok()),
+                    ("direct-streamlocal", handle.channel_open_direct_streamlocal("/tmp/s").await.is_ok()),
+                    ("forwarded-streamlocal", handle.channel_open_forwarded_streamlocal("/tmp/s").await.is_ok()),
+                ];
+                *log.lock().unwrap() = tries;
+            });
         } else if let Some(total) = command
             .strip_prefix("flood ")
             .and_then(|n| n.trim().parse::<usize>().ok())

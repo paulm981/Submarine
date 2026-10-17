@@ -121,11 +121,11 @@ const COLUMN_LEAD: ColumnWidths = { size: 0, modified: 6, permissions: 6, owner:
 // longer than the sample is cut short and shows in full on hover.
 const COLUMN_SAMPLE: Record<MetaColumn, [string, number]> = {
   size: ["1023.9 KB", 10.5],
-  modified: ["0000-00-00 00:00", 9.5],
+  modified: ["0000-00-00 00:00:00", 9.5],
   permissions: ["drwxr-xr-x", 10.5],
   owner: ["deployuser", 10.5],
 };
-const COLUMN_FALLBACK: ColumnWidths = { size: 56, modified: 98, permissions: 70, owner: 72 };
+const COLUMN_FALLBACK: ColumnWidths = { size: 56, modified: 116, permissions: 70, owner: 72 };
 const SORT_ARROW = 15;  // the heading's arrow and its margin
 const NAME_MIN = 128;
 const NAME_MAX = 340;
@@ -443,7 +443,8 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
     if (!ts) return "-";
     const d = new Date(ts * 1000);
     const pad = (n: number) => n.toString().padStart(2, "0");
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    // With seconds, so two saves in the same minute (Live Edit) look different.
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   };
 
   const formatSize = (bytes: number) => {
@@ -1506,6 +1507,16 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
   };
   const selectedEntries = sortedEntries.filter(e => selected.has(e.path));
 
+  // The status line under the list: what the folder holds (as filtered) and
+  // what the selection weighs. Only files count towards a size: a listing
+  // doesn't say what a folder holds.
+  const countOf = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
+  const shownFolders = sortedEntries.filter((e) => e.isDir).length;
+  const shownFiles = sortedEntries.length - shownFolders;
+  const shownBytes = sortedEntries.reduce((total, e) => total + (e.isDir ? 0 : e.size || 0), 0);
+  const selectedFiles = selectedEntries.filter((e) => !e.isDir);
+  const selectedBytes = selectedFiles.reduce((total, e) => total + (e.size || 0), 0);
+
   // While the selection bar is up, the message and the running jobs at the
   // pane's bottom right sit above it: a long job's row must not cover the
   // bar's buttons. The bar wraps to two rows in a narrow pane, so its top is
@@ -1753,7 +1764,7 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
         // entries on a short pane. Bottom keeps the file list visible.
         // Running archive jobs stack above the message, each with its own
         // Cancel, so a later message can't hide that one is still going.
-        <div className="absolute bottom-3 right-3 z-50 max-w-[calc(100%-1.5rem)] flex flex-col items-end gap-1.5 pointer-events-none"
+        <div className="absolute bottom-7 right-3 z-50 max-w-[calc(100%-1.5rem)] flex flex-col items-end gap-1.5 pointer-events-none"
           style={noticeLift > 0 ? { bottom: noticeLift + 6 } : undefined}>
           {jobs.map((job) => (
             <div key={job.id} className="pointer-events-auto max-w-full flex items-center gap-2 pl-3 pr-1 py-1 rounded-lg border text-[11px] font-mono shadow-2xl backdrop-blur-md bg-indigo-950/90 border-indigo-500/30 text-indigo-300">
@@ -2034,7 +2045,7 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
           Centred by its margins, so it may grow to the pane's width before it
           wraps (a left: 50% would leave it half of that). */}
       {selectedEntries.length > 0 && (
-        <div ref={selBarRef} className="absolute bottom-3 inset-x-2 mx-auto w-fit z-20 flex flex-wrap items-center justify-center gap-1.5 px-2.5 py-1.5 bg-indigo-950/95 border border-indigo-500/40 rounded-lg shadow-2xl shadow-black/50 backdrop-blur-md text-[10.5px] text-indigo-100 font-mono">
+        <div ref={selBarRef} className="absolute bottom-7 inset-x-2 mx-auto w-fit z-20 flex flex-wrap items-center justify-center gap-1.5 px-2.5 py-1.5 bg-indigo-950/95 border border-indigo-500/40 rounded-lg shadow-2xl shadow-black/50 backdrop-blur-md text-[10.5px] text-indigo-100 font-mono">
           <span className="font-bold uppercase tracking-wider text-[9.5px] text-indigo-300 shrink-0">
             {selectedEntries.length} selected
           </span>
@@ -2240,6 +2251,23 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
             })
           )}
         </div>
+      </div>
+
+      {/* Always there, blank while a folder first loads, so the list above
+          doesn't change height. */}
+      <div className="shrink-0 h-3.5 -mt-0.5 px-1.5 flex items-center gap-2 font-mono text-[9.5px] text-zinc-500 min-w-0">
+        {!(loading && sortedEntries.length === 0) && (
+          <span className="truncate">
+            {countOf(shownFolders, "folder")} · {countOf(shownFiles, "file")} · {formatSize(shownBytes)}
+            {filteredOut > 0 && ` · ${filteredOut} hidden by the filter`}
+          </span>
+        )}
+        {selectedEntries.length > 0 && (
+          <span className="ml-auto shrink-0 text-indigo-300/80">
+            Selected: {countOf(selectedFiles.length, "file")}, {formatSize(selectedBytes)}
+            {selectedFiles.length < selectedEntries.length && ` + ${countOf(selectedEntries.length - selectedFiles.length, "folder")}`}
+          </span>
+        )}
       </div>
 
       {/* Context menu (portal) — bulk-aware. When the right-click anchor is

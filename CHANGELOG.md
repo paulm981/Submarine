@@ -7,6 +7,14 @@ This changelog lists the builds of [paulm981/Submarine](https://github.com/paulm
 - [FORK.md](FORK.md) explains what the fork does differently, and which of the original project's changes it hasn't taken yet.
 - A fork release, such as `v0.3.8-fork.1`, gets a heading of its own above the builds it covers.
 
+## Build 242
+
+- **Servers grid.** The **Add folder** button is back, at the top level and inside a folder. A merge of the original project had dropped it.
+- **Monitoring.** It refuses connections a server tries to open back to your computer, as terminals and file transfers already did.
+- **SFTP:**
+  - File times show seconds, so two saves in the same minute look different.
+  - A line under the file list counts the folders and files and adds up their sizes. With a selection, it also shows the selection's size. Only files count towards a size, since a listing doesn't say what a folder holds.
+
 ## Build 241
 
 - **Fork releases.** A tag such as `v0.3.8-fork.1` publishes a release with its build number in the title. [FORK.md](FORK.md#keeping-up-with-the-original-project) says how to make one.
