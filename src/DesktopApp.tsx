@@ -1671,14 +1671,14 @@ function DesktopApp() {
           <div
             onClick={() => setActiveView("home")}
             title="Home — terminals on this computer"
-            className={`no-drag flex items-center gap-1.5 h-7 px-3 rounded-full cursor-pointer transition-all shrink-0 mr-1 ${
+            aria-label="Home"
+            className={`no-drag flex items-center justify-center h-7 w-9 rounded-full cursor-pointer transition-all shrink-0 mr-1 ${
               activeView === "home"
                 ? 'bg-primary/15 text-primary border border-primary/40 shadow-inner shadow-primary/10'
                 : 'bg-white/[0.06] text-zinc-300 border border-white/10 hover:bg-white/[0.1] hover:border-white/20 hover:text-white'
             }`}
           >
-            <Home size={12} className="shrink-0" />
-            <span className="text-[11px] font-semibold whitespace-nowrap tracking-tight">Home</span>
+            <Home size={14} className="shrink-0" />
           </div>
         )}
         {/* Walls come next: each is one tab however many servers it shows.
