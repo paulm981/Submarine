@@ -2295,6 +2295,8 @@ function DesktopApp() {
                 onRemoveServer={removeServer}
                 onRemoveFolder={removeFolder}
                 onRenameFolder={renameFolder}
+                onCreateFolder={(name: string, parentId: number | null) =>
+                  createFolder(name, parentId).catch((e) => { addLog(`Couldn't create the folder: ${e}`, "error"); throw e; })}
                 onCloneServer={(id: number) => cloneServer(id).catch(() => {})}
                 onReorderServers={async (ids: number[]) => {
                   // Rethrow on failure so NodeGrid drops its optimistic order

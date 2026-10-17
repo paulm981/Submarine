@@ -677,6 +677,101 @@ impl client::Handler for MonitorHandler {
         }
         Ok(ok)
     }
+
+    // A monitor connection only opens its own exec channels, so every
+    // channel the server tries to open is refused, as ClientHandler does
+    // (ssh_manager.rs). russh's defaults accept them.
+    async fn server_channel_open_session(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_tcpip(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _host_to_connect: &str,
+        _port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _connected_address: &str,
+        _connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_streamlocal(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _socket_path: &str,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_forwarded_streamlocal(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _socket_path: &str,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_x11(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_unknown(
+        &mut self,
+        _channel: russh::Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+        Ok(())
+    }
 }
 
 /// Trait-object wrapper so we can hand russh's `connect_stream` either a
@@ -1668,6 +1763,34 @@ mod jump_host_tests {
         })
         .await
         .expect("the bytes must reach the server behind the jump host");
+    }
+
+    #[tokio::test]
+    async fn monitoring_refuses_channels_the_server_opens() {
+        let server = TestServer::default();
+        let back = Arc::clone(&server.opened_back);
+        let port = listen(server).await;
+        let db = known_hosts(&[("127.0.0.1", port)]);
+        let conn = connect_for_monitor(&db, &node("127.0.0.1", port, None), Duration::from_secs(10))
+            .await
+            .expect("a monitor session");
+        let channel = conn.session.channel_open_session().await.unwrap();
+        channel.exec(true, "open-back").await.unwrap();
+        let tries = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let tries = back.lock().unwrap().clone();
+                if !tries.is_empty() {
+                    return tries;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the server's attempts must finish");
+        assert_eq!(tries.len(), 7);
+        let accepted: Vec<_> = tries.iter().filter(|(_, ok)| *ok).map(|(kind, _)| *kind).collect();
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+        assert!(!conn.is_closed(), "refusing them keeps the session up");
     }
 
     #[tokio::test]
