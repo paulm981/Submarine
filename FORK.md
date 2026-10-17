@@ -11,7 +11,7 @@ This page covers:
 
 What changed in each build is in [CHANGELOG.md](CHANGELOG.md).
 
-The fork is based on the original project's **0.3.8**, with every change up to [#173](https://github.com/SinaXhpm/submarine/pull/173) brought in or recorded as not taken yet.
+The fork is based on the original project's **0.3.8**, with every change up to [#177](https://github.com/SinaXhpm/submarine/pull/177) brought in or recorded as not taken yet.
 
 ## What this fork adds
 
@@ -129,6 +129,7 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | Paste | The webview's clipboard | Read by the app itself, since the webviews on Windows, macOS and Linux refuse the page |
 | Text fields on macOS | Capitalize and correct what's typed | Keep exactly what's typed |
 | Closing a connected session | Always asks | Asks, unless you turn that off in Settings |
+| On-connect commands | Typed once the terminal is open, on the first connect ([#175](https://github.com/SinaXhpm/submarine/pull/175)) | Typed once the shell has printed its login banner, on the first connect and after a reconnect |
 
 ## Changes in the original project not taken yet
 

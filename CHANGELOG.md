@@ -7,6 +7,20 @@ This changelog lists the builds of [paulm981/Submarine](https://github.com/paulm
 - [FORK.md](FORK.md) explains what the fork does differently, and which of the original project's changes it hasn't taken yet.
 - A fork release, such as `v0.3.8-fork.1`, gets a heading of its own above the builds it covers.
 
+## Build 244
+
+### From the original project
+
+- **Connecting.** A connect that times out, or a server that can't be reached yet, is tried again every 5 seconds, the first connect too ([#176](https://github.com/SinaXhpm/submarine/pull/176)).
+  - The connect screen counts down to the next try, and **Cancel** stops it.
+  - A rejected login, or a host key that wasn't accepted, isn't tried again.
+  - Behind one of the fork's jump hosts, it tries again when the jump host couldn't be reached, not when logging in to it failed.
+- **Phones.** The reconnect banner stays on one line ([#176](https://github.com/SinaXhpm/submarine/pull/176)).
+- **Android.** `/` and `-` on the key bar ([#177](https://github.com/SinaXhpm/submarine/pull/177)).
+- **README.** A section about Echoes ([#160](https://github.com/SinaXhpm/submarine/pull/160)).
+
+Not taken: [#175](https://github.com/SinaXhpm/submarine/pull/175) types the on-connect commands once the terminal is open. The fork already waits until the shell has printed its login banner, which is later, so it keeps its own way.
+
 ## Build 243
 
 - **Title bar.** The Home tab is a house icon, without the word "Home". Hovering over it still says what it is.
