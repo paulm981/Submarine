@@ -321,11 +321,11 @@ const TerminalView = ({
   // keys. An arrow sends what xterm sends for the real key: `ESC [ A` (or
   // `ESC O A` once the program asked for application cursor keys, as vim and
   // less do), and with modifiers armed `ESC [ 1 ; <m> A`, where m is 1 plus
-  // Shift 1, Alt 2, Ctrl 4. `|` and `~` are typed characters, so the handler
-  // applies the armed modifiers to them itself.
+  // Shift 1, Alt 2, Ctrl 4. The symbols (| ~ / -) are typed characters, so the
+  // handler applies the armed modifiers to them itself.
   const sendSpecialKey = (key: SpecialKey) => {
     if (disabledRef.current) return;
-    if (key === "|" || key === "~") {
+    if (key === "|" || key === "~" || key === "/" || key === "-") {
       inputRef.current?.(key);
       return;
     }
@@ -1438,10 +1438,14 @@ const TerminalView = ({
           source via `disabledRef` in the onData callback — no input reaches
           a dead PTY. `pointer-events-none` keeps the badge from eating the
           select-drag that starts under it. */}
+      {/* One line: centred like this it only gets half the width, and wrapped
+          it covered two lines of the terminal on a phone, where the banner
+          above already says the session is down. */}
       {disabled && (
         <div className="absolute top-2 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
-          <span className="px-2.5 py-1 rounded text-[10.5px] font-mono uppercase tracking-wider border bg-rose-500/15 border-rose-500/30 text-rose-300 shadow-lg">
-            Disconnected — buffer is read-only
+          <span className="whitespace-nowrap px-2.5 py-1 rounded text-[10.5px] font-mono uppercase tracking-wider border bg-rose-500/15 border-rose-500/30 text-rose-300 shadow-lg">
+            <span className="sm:hidden">Read-only</span>
+            <span className="hidden sm:inline">Disconnected — buffer is read-only</span>
           </span>
         </div>
       )}
