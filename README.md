@@ -331,6 +331,13 @@ Your data is encrypted on your machine before anything leaves it. Submarine and 
 - TOFU host keys with per-connection nonce binding (resists prompt-race attacks)
 - Strict Content Security Policy, minimal Tauri permission ACL, no shell or filesystem plugins exposed to the UI
 
+### Code signing policy
+
+Windows installers are signed. Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+- Committers and reviewers: [paulm981](https://github.com/paulm981)
+- Approvers: [paulm981](https://github.com/paulm981)
+
 ## FAQ
 
 ### Is Submarine free?
