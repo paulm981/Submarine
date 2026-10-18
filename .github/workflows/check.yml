@@ -1,0 +1,132 @@
+name: Check
+
+# Checks every pull request before it can be merged — and every merge to main
+# is a release (build.yml), so this is what keeps a broken change from
+# reaching the team:
+#
+#   • rust (Linux and Windows): the Rust tests.
+#   • rust (Linux) also runs clippy: an error fails the check, and so does a
+#     rise in the number of warnings over .github/clippy-warnings. Most of
+#     today's warnings are in the original project's code, and fixing them
+#     there would make every sync conflict, so the count only has to not
+#     grow. Lower the number in that file when warnings are fixed.
+#   • frontend: the TypeScript check and a build of the page.
+#
+# Not `cargo fmt --check`, for the same reason: the original project's code
+# isn't rustfmt-formatted, and formatting it would rewrite its files.
+#
+# No path filters: a required check that doesn't run leaves the pull request
+# waiting for it forever.
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same pull request replaces a check still running.
+concurrency:
+  group: check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: "always"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os_name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            os_name: linux
+          - platform: windows-latest
+            os_name: windows
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 40
+    steps:
+      # Nothing here pushes — keep the token out of .git/config.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # What Tauri links on Linux (the same as build.yml, without the
+      # packaging tools).
+      - name: Install Linux deps
+        if: matrix.os_name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev
+
+      # The Rust code bundles the built page from ../dist; the tests don't use
+      # it, so a stand-in is enough here (the frontend job builds the real one).
+      - name: Stand-in for the built page
+        shell: bash
+        run: |
+          mkdir -p dist
+          [ -f dist/index.html ] || echo '<!doctype html><title>Submarine</title>' > dist/index.html
+
+      - name: Tests
+        working-directory: src-tauri
+        run: cargo test --locked
+
+      - name: Clippy, and no new warnings
+        if: matrix.os_name == 'linux'
+        working-directory: src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --lib 2>&1 | tee clippy.log
+          COUNT="$(grep -oE 'generated [0-9]+ warnings?' clippy.log | grep -oE '[0-9]+' | head -1 || true)"
+          COUNT="${COUNT:-0}"
+          ALLOWED="$(tr -dc '0-9' < ../.github/clippy-warnings)"
+          echo "Clippy warnings: $COUNT (allowed: $ALLOWED)"
+          if [ "$COUNT" -gt "$ALLOWED" ]; then
+            echo "::error::Clippy has $COUNT warnings, more than the $ALLOWED allowed in .github/clippy-warnings. Fix the new ones."
+            exit 1
+          fi
+          if [ "$COUNT" -lt "$ALLOWED" ]; then
+            echo "::notice::Clippy has $COUNT warnings, fewer than $ALLOWED: lower the number in .github/clippy-warnings to $COUNT."
+          fi
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install npm deps
+        run: npm ci
+
+      # The licence notices, the TypeScript check and the page, as a release
+      # builds them.
+      - name: TypeScript check and build
+        run: npm run build

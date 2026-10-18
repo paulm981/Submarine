@@ -149,7 +149,7 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 2. Resolve conflicts by keeping both sides. Where the fork does something differently, keep the fork's way and say so in the table above.
 3. Anything not taken goes in the table above with the reason, and gets a backlog item. Record it in git so the next merge doesn't bring it in unseen: `git merge -s ours <its commit>`, with a message saying why. That takes no changes, and the update check stops counting it. To take it later, cherry-pick it.
 4. Check it:
-   - the tests, clippy and the TypeScript check;
+   - the pull request's checks: the tests on Linux and Windows, clippy, and the TypeScript check and page build. They run by themselves, and main only takes a pull request that passes them;
    - the app itself, against a test server: terminal, SFTP and SFTP root mode, a Wall behind a jump host, and Monitoring;
    - lines in [CHANGELOG.md](CHANGELOG.md).
 5. Merge it. GitHub publishes it as the next release.
