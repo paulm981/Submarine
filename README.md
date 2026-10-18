@@ -337,6 +337,13 @@ Windows installers will be signed. Free code signing provided by [SignPath.io](h
 
 Until the first signed release, the installers aren't signed, and [Install](#install) says how to open them.
 
+**Team roles:**
+
+- Committers and reviewers: [paulm981](https://github.com/paulm981)
+- Approvers: [paulm981](https://github.com/paulm981)
+
+Every release is built by GitHub Actions from this repository's `main` branch, which only takes changes through pull requests.
+
 **Privacy policy:** This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
 
 What Submarine connects to:
