@@ -9,7 +9,10 @@ name: Check
 #     rise in the number of warnings over .github/clippy-warnings. Most of
 #     today's warnings are in the original project's code, and fixing them
 #     there would make every sync conflict, so the count only has to not
-#     grow. Lower the number in that file when warnings are fixed.
+#     grow. Lower the number in that file when warnings are fixed. Clippy
+#     runs on a fixed Rust version (CLIPPY_RUST), since each Rust release
+#     adds lints that would raise the count on every pull request at once;
+#     move the version and the count together.
 #   • frontend: the TypeScript check and a build of the page.
 #
 # Not `cargo fmt --check`, for the same reason: the original project's code
@@ -31,6 +34,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  CLIPPY_RUST: "1.97.0"
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: "always"
   RUST_BACKTRACE: "1"
@@ -56,8 +60,10 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+
+      - name: Install Rust for clippy
+        if: matrix.os_name == 'linux'
+        run: rustup toolchain install "$CLIPPY_RUST" --profile minimal --component clippy
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -96,7 +102,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo clippy --locked --lib 2>&1 | tee clippy.log
+          cargo "+$CLIPPY_RUST" clippy --locked --lib 2>&1 | tee clippy.log
           COUNT="$(grep -oE 'generated [0-9]+ warnings?' clippy.log | grep -oE '[0-9]+' | head -1 || true)"
           COUNT="${COUNT:-0}"
           ALLOWED="$(tr -dc '0-9' < ../.github/clippy-warnings)"
