@@ -245,13 +245,13 @@ function DesktopApp() {
   }, []);
 
   // Version for the title bar, from the build itself (about::app_info) rather
-  // than hardcoded so it can never drift from the real build. Every build of
-  // the fork has the original project's version, so the fork's build number
-  // goes beside it, and the commit in the tooltip. Shown faded next to the
-  // brand name; renders nothing if the call ever fails.
-  const [appVersion, setAppVersion] = useState<{ version: string; build: number | null; commit: string | null } | null>(null);
+  // than hardcoded so it can never drift from the real build: a release's
+  // whole version (v0.3.8-fork.2), and the commit in the tooltip when built
+  // from source. Shown faded next to the brand name; renders nothing if the
+  // call ever fails.
+  const [appVersion, setAppVersion] = useState<{ version: string; commit: string | null } | null>(null);
   useEffect(() => {
-    invoke<{ version: string; build: number | null; commit: string | null }>("app_info").then(setAppVersion).catch(() => {});
+    invoke<{ version: string; commit: string | null }>("app_info").then(setAppVersion).catch(() => {});
   }, []);
 
   // Persist the user's current folder across NodeGrid unmount/remount cycles.
@@ -1477,7 +1477,7 @@ function DesktopApp() {
             title={appVersion.commit ? `Built from commit ${appVersion.commit}` : undefined}
             className="text-[11px] text-zinc-500/60 tracking-tight tabular-nums"
           >
-            v{appVersion.version}{appVersion.build != null && <> · build {appVersion.build}</>}
+            v{appVersion.version}
           </span>
         )}
       </div>

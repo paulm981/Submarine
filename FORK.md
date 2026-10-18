@@ -7,9 +7,9 @@ This page covers:
 - [What this fork adds](#what-this-fork-adds), with pictures
 - [Where it behaves differently](#where-it-behaves-differently) from the original
 - [Changes in the original project not taken yet](#changes-in-the-original-project-not-taken-yet), and why
-- [How it keeps up with the original project](#keeping-up-with-the-original-project), and how versions and builds are numbered
+- [How it keeps up with the original project](#keeping-up-with-the-original-project), and how releases are numbered
 
-What changed in each build is in [CHANGELOG.md](CHANGELOG.md).
+What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
 The fork is based on the original project's **0.3.8**, with every change up to [#177](https://github.com/SinaXhpm/submarine/pull/177) brought in or recorded as not taken yet.
 
@@ -102,7 +102,7 @@ No third-party service is involved. Profiles are encrypted with their password b
 <img src="docs/screenshots/fork/troubleshooting.png" alt="Troubleshooting in Settings: Copy diagnostics and Open log folder" width="600" />
 
 - **Troubleshooting.** The app keeps a log on your computer, and a watchdog notes when the window froze and why. **Copy diagnostics** copies the log with server, user and host names replaced, ready to send to whoever is helping.
-- **A build from every change**, with a build number in the title bar and a "Build N is out" notice when there's a newer one.
+- **A release from every change**, numbered like `v0.3.8-fork.2` and shown in the title bar, with a notice when there's a newer one.
 - **Hardening.** On every system:
   - characters that disguise a file name are shown plainly;
   - a trusted server that shows a different kind of key is a warning, not a silent change.
@@ -121,7 +121,7 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | Area | The original project | This fork |
 |---|---|---|
 | Profile sync | Its hosted cloud, `api.sinaxhpm.com` | A folder or git repository you own. The hosted cloud is off unless you turn it on. |
-| Updates | Releases of the original project | Builds of this fork, numbered, from "Latest build" |
+| Updates | Releases of the original project | Releases of this fork, one for every change: `v0.3.8-fork.1`, `v0.3.8-fork.2`, … |
 | Live Edit (Windows) | Opens the file with its default app | Opens the file in an editor, never runs it |
 | Root | `sudo` | `sudo` or `dzdo`, and `dzdo su -`. A server without an sftp-server uses the original project's shell file access, under `sudo` only. |
 | Docker | As the user | As the user, or through root where only root may use Docker |
@@ -152,32 +152,14 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
    - the tests, clippy and the TypeScript check;
    - the app itself, against a test server: terminal, SFTP and SFTP root mode, a Wall behind a jump host, and Monitoring;
    - lines in [CHANGELOG.md](CHANGELOG.md).
-5. Merge it. GitHub builds it as the next "Latest build".
+5. Merge it. GitHub publishes it as the next release.
 
-**Versions and build numbers.**
+**Versions.**
 
-- **The version** is the original project's (0.3.8 now). The fork doesn't change it, so it always says which of the original project's releases a build is based on.
-- **The build number** is the fork's own. It goes up by one with every merge to main, and the title bar shows it, as in `v0.3.8 · build 240`. A higher build is newer.
-- When the original project releases 0.3.9 and it's merged, the version becomes 0.3.9, and the build numbers keep rising.
-
-**Two ways to get builds.**
-
-- **Latest build** has every merge to main. Whoever uses it is told when there's a newer build.
-- **Fork releases** are builds picked out for a team to settle on. They are tagged with the original project's version and a count, `v0.3.8-fork.1`, `v0.3.8-fork.2`, then `v0.3.9-fork.1` once 0.3.9 is in. Whoever installed a release is told only about newer releases.
-
-**Making a fork release.**
-
-1. Pick a build of main that has been in use for a while without trouble.
-2. Tag its merge commit and push the tag:
-
-   ```
-   git tag v0.3.8-fork.1 <commit>
-   git push origin v0.3.8-fork.1
-   ```
-
-3. GitHub builds the installers and publishes them as "Submarine v0.3.8-fork.1 · build 240".
-4. Add a heading for the release in [CHANGELOG.md](CHANGELOG.md) above the builds it covers.
-
-The update check goes by the build number in the release's title. So a build of main made after the release isn't told to "update" to it, and on Windows, whose installer can only say 0.3.8, the release still knows it is fork.1.
+- **Every merge to main is a release.** GitHub builds it and publishes it, tagged with the original project's version and the fork's count: `v0.3.8-fork.1`, `v0.3.8-fork.2`, and so on. A higher count is newer. There's nothing to tag by hand.
+- **The title bar shows it,** as in `v0.3.8-fork.2`, and the profile screen says when there's a newer release.
+- **When the original project releases 0.3.9** and it's merged, the count starts again: `v0.3.9-fork.1`.
+- **The installers keep the same names** in every release, so a link to the latest release's `Submarine-windows-x64-setup.exe` always gets the newest. On Windows the installer itself can only say `0.3.8`; the app still knows it's `0.3.8-fork.2`.
+- **Before `v0.3.8-fork.1`,** the fork numbered its builds instead (build 244 was the last). Those builds are told about the new releases.
 
 **Giving back.** Fixes that apply to the original project too go back to it as pull requests.

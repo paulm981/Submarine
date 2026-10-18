@@ -2,49 +2,44 @@ name: Build
 
 # Builds Submarine's installers on GitHub's runners (Windows, macOS, Linux):
 #
-#   • Every push to main (a merged pull request) → the "Latest build (main)"
-#     release, tag `latest-main`, replaced each time: the newest installers
-#     under fixed names, for anyone to download without building. The app
-#     knows it's such a build (src-tauri/build.rs) and says when there's a
-#     newer one to download.
-#   • A tag like v0.4.0 → a numbered release with versioned installers:
-#       git tag v0.4.0 && git push origin v0.4.0
-#   • Run workflow (Actions tab) → builds; publishes a numbered release only
-#     when `publish_release` is true.
+#   • Every push to main (a merged pull request) → a release of the fork,
+#     tagged with the original project's version and the fork's count:
+#     v0.3.8-fork.1, v0.3.8-fork.2, …, then v0.3.9-fork.1 once 0.3.9 is in
+#     (the version job). Its installers have the same names in every
+#     release, so a link to releases/latest/download/<name> always gets the
+#     newest. The app shows its version and says when there's a newer one.
+#   • Run workflow (Actions tab) → builds the version typed in, as a test;
+#     nothing is published.
 #
 # Android is built only when the repository variable BUILD_ANDROID is
 # "true" and the signing secrets are set (see the android job).
 on:
   push:
     branches: [main]
-    tags:
-      - "v*"
-    # A change to the docs alone isn't a new build. (Not checked for tags.)
+    # A change to the docs alone isn't a new release.
     paths-ignore:
       - "**/*.md"
       - "LICENSE"
   workflow_dispatch:
     inputs:
       version:
-        description: "Version tag (e.g. v0.1.0)"
+        description: "Version to build as a test (e.g. v0.0.0-test); nothing is published"
         required: true
         default: "v0.0.0-test"
-      publish_release:
-        description: "Attach artifacts to a GitHub Release"
-        required: false
-        default: "false"
 
-# Least privilege by default: the build and android jobs only read the repo.
-# Only the release job, which attaches artifacts to a GitHub Release, is given
+# Least privilege by default: the version, build and android jobs only read
+# the repo. Only the release job, which publishes the release, is given
 # `contents: write` (on the job itself, below).
 permissions:
   contents: read
 
-# A newer push to main replaces a build of main still running; a release
-# build is never cancelled.
+# One run of main at a time, never cancelled: every run of main is a release,
+# and the next one's number comes from the tags the one before made. A push
+# that comes while one runs waits; when several do, GitHub keeps only the
+# newest waiting, which has the others' changes too.
 concurrency:
   group: build-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+  cancel-in-progress: false
 
 # Faster, cheaper CI builds. Incremental compilation costs time + disk in
 # clean-checkout environments where there's nothing to be incremental
@@ -54,27 +49,71 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: "always"
   RUST_BACKTRACE: "1"
-  # Which kind of build (src-tauri/build.rs): the build of main, whose users
-  # update by downloading the next one — it knows its commit, to say when
-  # main has moved on — or a release, whose users update by release. The
-  # one not used is left empty. Each is written `cond && 'value' || ''`:
-  # with '' in the middle (`cond && '' || '1'`) the expression always gives
-  # '1', as '' counts as false — which made every build of main a release
-  # build that didn't know its commit and never saw a newer build.
-  SUBMARINE_BUILD: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'main' || '' }}
-  SUBMARINE_RELEASE: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') && '1' || '' }}
+  # A release build (src-tauri/build.rs): its users update by release, so it
+  # doesn't carry its commit. A manual test build is built the same way.
+  SUBMARINE_RELEASE: "1"
 
 jobs:
+  # The release this run makes: the original project's version (from
+  # tauri.conf.json) and the fork's count, one more than its newest release
+  # of that version. A manual run takes the version typed in.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      version: ${{ steps.pick.outputs.version }}
+    steps:
+      # All of history, for the tags. Nothing here pushes.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pick the version
+        id: pick
+        shell: bash
+        # The typed-in version comes in through the environment, not spliced
+        # into the script with ${{ }} — a value like `; rm -rf …` would
+        # otherwise run as part of this step. Either way the result is checked
+        # against a version shape before it's used.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            RAW="$INPUT_VERSION"
+          else
+            BASE="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+            if ! printf '%s' "$BASE" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::Unexpected version in tauri.conf.json: $BASE"
+              exit 1
+            fi
+            LAST="$(git tag -l "v$BASE-fork.*" | sed "s/^v$BASE-fork\.//" | grep -E '^[0-9]+$' | sort -n | tail -1 || true)"
+            RAW="v$BASE-fork.$(( ${LAST:-0} + 1 ))"
+          fi
+          if ! printf '%s' "$RAW" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]+)?$'; then
+            echo "Refusing an unexpected version string: $RAW" >&2
+            exit 1
+          fi
+          VERSION="${RAW#v}"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "This run's version: $VERSION"
+
   build:
+    needs: version
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Windows: ships .msi (WiX) and .exe (NSIS). Both let the user
-          # double-click to install with no extra friction.
+          # Windows: the setup .exe (NSIS), which installs over any earlier
+          # one. No .msi: every release of a version has the same installer
+          # version (see "Stamp version"), and Windows won't install an MSI
+          # over one of the same version.
           - platform: windows-latest
             os_name: windows
-            bundles: "msi,nsis"
+            bundles: "nsis"
             rust_target: x86_64-pc-windows-msvc
 
           # macOS Apple Silicon. We produce both:
@@ -105,87 +144,44 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
+      # Don't leave the checkout token in .git/config where a later build
+      # step (or a compromised dependency) could use it — nothing here pushes.
       - uses: actions/checkout@v4
-        # All of main's history: the build number is its commit count
-        # (src-tauri/build.rs), and a shallow clone can't count it. Don't
-        # leave the checkout token in .git/config where a later build step (or
-        # a compromised dependency) could use it — nothing here pushes.
         with:
-          fetch-depth: 0
           persist-credentials: false
 
-      # A build is the build of main or a release, never both: a build of
-      # main marked as a release too leaves its commit out, and its update
-      # check then never sees a newer build.
-      - name: Check the build kind
-        shell: bash
-        run: |
-          echo "SUBMARINE_BUILD='$SUBMARINE_BUILD' SUBMARINE_RELEASE='$SUBMARINE_RELEASE'"
-          if [ -n "$SUBMARINE_BUILD" ] && [ -n "$SUBMARINE_RELEASE" ]; then
-            echo "::error::Both SUBMARINE_BUILD and SUBMARINE_RELEASE are set."
-            exit 1
-          fi
-
-      # Compute the version string we'll stamp into Cargo.toml and
-      # tauri.conf.json. For tag pushes we use the tag (strip the leading
-      # 'v'); for manual runs we use the workflow input; a build of main
-      # keeps the version in tauri.conf.json (and isn't stamped). The result
-      # is exposed to later steps via $GITHUB_ENV.
+      # The version job's pick, exposed to later steps via $GITHUB_ENV.
       - name: Resolve version
         shell: bash
-        # The version comes in through the environment, not spliced into the
-        # script with ${{ }} — a value like `; rm -rf …` would otherwise run
-        # as part of this step. It's then checked against a version shape
-        # before it's used to stamp files.
+        # Through the environment and checked for shape — see the version job.
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_VERSION: ${{ github.event.inputs.version }}
-          REF_NAME: ${{ github.ref_name }}
+          RAW: ${{ needs.version.outputs.version }}
         run: |
-          if [ "$SUBMARINE_BUILD" = "main" ]; then
-            RAW="$(node -p "require('./src-tauri/tauri.conf.json').version")"
-          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            RAW="$INPUT_VERSION"
-          else
-            RAW="$REF_NAME"
-          fi
           if ! printf '%s' "$RAW" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]+)?$'; then
             echo "Refusing an unexpected version string: $RAW" >&2
             exit 1
           fi
-          # Strip leading "v" — Cargo + Tauri want bare semver.
           VERSION="${RAW#v}"
           # Strict-semver form: everything from the first '-' stripped.
-          # Windows MSI (WiX) rejects non-numeric pre-release identifiers
-          # (`optional pre-release identifier in app version must be
-          # numeric-only`), and Arch's makepkg rejects hyphens in pkgver
-          # outright. Both fall back to this shortened string for
-          # stamping / pkgver; the other targets (Android, macOS, .deb,
-          # .rpm, AppImage, NSIS) still see the full string so a dev
-          # build's artefacts self-identify as e.g. "0.2.37-dev".
+          # Windows installers want a numeric version, and Arch's makepkg
+          # rejects hyphens in pkgver outright. Both fall back to this
+          # shortened string for stamping / pkgver; the other targets
+          # (Android, macOS, .deb, .rpm, AppImage) see the full string.
           VERSION_STRICT="${VERSION%%-*}"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "VERSION_STRICT=$VERSION_STRICT" >> "$GITHUB_ENV"
           # The whole version for the app to show and compare (build.rs),
           # on Windows too, where the manifests get the strict form.
           echo "SUBMARINE_VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "Resolved release version: $VERSION (strict: $VERSION_STRICT)"
+          echo "Resolved version: $VERSION (strict: $VERSION_STRICT)"
 
-      # Stamp the version into Cargo.toml and tauri.conf.json so the
-      # bundled binary's about/version metadata matches the git tag.
-      # Without this, a v0.2.0 tag would still produce installers
-      # showing "0.1.0" inside Windows Add/Remove Programs and macOS's
-      # Get Info pane. Uses Node to avoid the cross-platform sed/awk
-      # quoting maze.
       - name: Stamp version into manifests
-        if: env.SUBMARINE_BUILD != 'main'
         shell: bash
         run: |
-          # Windows bundles MSI in the same job as NSIS; MSI requires
-          # a strict semver (no non-numeric pre-release) so we stamp
-          # the sanitised form for the whole Windows job. Other
+          # Windows gets the strict form (see "Resolve version"); the app
+          # still knows its whole version from SUBMARINE_VERSION. Other
           # platforms keep the full string.
-          if [[ "${{ matrix.bundles }}" == *msi* ]]; then
+          if [ "${{ matrix.os_name }}" = "windows" ]; then
             STAMP="$VERSION_STRICT"
           else
             STAMP="$VERSION"
@@ -390,12 +386,12 @@ jobs:
   # secret is missing, the build still runs but Gradle will produce an
   # unsigned release APK — the keystore secrets are gating, not blocking.
   #
-  # Optional in this fork: only for a release, and only when the repository
-  # variable BUILD_ANDROID is "true" (Settings › Secrets and variables ›
-  # Actions › Variables) — so a release never waits on secrets that aren't
-  # there.
+  # Optional in this fork: only when the repository variable BUILD_ANDROID
+  # is "true" (Settings › Secrets and variables › Actions › Variables) — so
+  # a release never waits on secrets that aren't there.
   android:
-    if: vars.BUILD_ANDROID == 'true' && !(github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: version
+    if: vars.BUILD_ANDROID == 'true'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -405,17 +401,10 @@ jobs:
 
       - name: Resolve version
         shell: bash
-        # Through the environment and checked for shape — see the build job.
+        # Through the environment and checked for shape — see the version job.
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_VERSION: ${{ github.event.inputs.version }}
-          REF_NAME: ${{ github.ref_name }}
+          RAW: ${{ needs.version.outputs.version }}
         run: |
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            RAW="$INPUT_VERSION"
-          else
-            RAW="$REF_NAME"
-          fi
           if ! printf '%s' "$RAW" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]+)?$'; then
             echo "Refusing an unexpected version string: $RAW" >&2
             exit 1
@@ -596,130 +585,35 @@ jobs:
           path: artifacts/*
           if-no-files-found: error
 
-  # Gather every platform's artifacts and attach them to a GitHub Release.
-  # Skips when triggered via workflow_dispatch unless `publish_release=true`.
-  # Android, when it isn't built, doesn't hold the release up.
+  # Publishes this run's release: the installers under names that are the
+  # same in every release (so releases/latest/download/<name> always gets
+  # the newest), with notes on installing them. Only for a push to main; a
+  # manual run publishes nothing. Also when another platform's build failed:
+  # the Windows build still goes out. Never without it (see "Name the files").
   release:
-    needs: [build, android]
+    needs: [version, build, android]
     runs-on: ubuntu-latest
     if: >-
-      !cancelled() && needs.build.result == 'success'
-      && (needs.android.result == 'success' || needs.android.result == 'skipped')
-      && (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.publish_release == 'true')
-    # Only this job and `latest` write: they attach the built artifacts to a
-    # Release.
+      !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && needs.version.result == 'success'
+    # Only this job writes: it publishes the release.
     permissions:
       contents: write
     steps:
-      # Resolve the tag string used for the GitHub Release. For tag pushes
-      # this is github.ref_name (already "vX.Y.Z"). For workflow_dispatch,
-      # github.ref_name resolves to the BRANCH ("main"), which would
-      # produce a "Submarine main" release and move the `main` tag — so
-      # fall back to the user-supplied version input. Normalize to a
-      # leading `v` so the tag/name is uniform regardless of what the
-      # user typed.
-      - name: Resolve release tag
-        id: tag
-        shell: bash
-        # Through the environment and checked for shape — see the build job.
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_VERSION: ${{ github.event.inputs.version }}
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            RAW="$INPUT_VERSION"
-          else
-            RAW="$REF_NAME"
-          fi
-          if ! printf '%s' "$RAW" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]+)?$'; then
-            echo "Refusing an unexpected version string: $RAW" >&2
-            exit 1
-          fi
-          case "$RAW" in v*) TAG="$RAW";; *) TAG="v$RAW";; esac
-          echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Resolved release tag: $TAG"
-
-      # The build number of the commit released, counted as build.rs counts
-      # it, for the release's title: the app compares it with its own
-      # (about.rs), as every build of the fork has the same version.
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Count the build number
-        id: build
-        shell: bash
-        run: echo "NUMBER=$(git rev-list --count --first-parent HEAD)" >> "$GITHUB_OUTPUT"
-
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
 
-      - name: Flatten into a single folder
-        run: |
-          mkdir -p release-files
-          find dist -type f \( \
-            -name "*.msi" -o -name "*.exe" -o -name "*-portable.zip" \
-            -o -name "*.dmg" -o -name "*.app.zip" \
-            -o -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" \
-            -o -name "*.pkg.tar.zst" \
-            -o -name "*.apk" \
-            \) -exec cp {} release-files/ \;
-          ls -la release-files/
-
-      # Published straight away (the fork's owner tags deliberately); the
-      # app's update check only sees published releases.
-      - name: Create / update GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.TAG }}
-          name: Submarine ${{ steps.tag.outputs.TAG }} · build ${{ steps.build.outputs.NUMBER }}
-          draft: false
-          generate_release_notes: true
-          files: release-files/*
-
-  # The build of main: replaces the "Latest build (main)" release with this
-  # commit's installers, under names that don't change from one build to
-  # the next — so a link to the Windows installer always gets the newest.
-  # A pre-release, so the app's update check (which goes by numbered
-  # releases) doesn't take it for one.
-  latest:
-    needs: build
-    runs-on: ubuntu-latest
-    # Also when another platform's build failed: the Windows build still goes
-    # out. Never without it (see "Name the files").
-    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    # Replaces the latest-main pre-release (see the top: the default is read).
-    permissions:
-      contents: write
-    steps:
-      # For the build number, counted as build.rs counts it.
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-
-      # The MSI is left out: Windows won't install an MSI over one of the same
-      # version, and every build of main has the same version. The setup .exe
-      # installs over any earlier one. No Windows installer, no new release —
-      # the previous one stays up.
       - name: Name the files
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p latest
+          mkdir -p release-files
           pick() { # pick <pattern> <name>
             local f
             f="$(find dist -type f -name "$1" | head -1)"
-            if [ -n "$f" ]; then cp "$f" "latest/$2"; else echo "::warning::no $1 in this build"; fi
+            if [ -n "$f" ]; then cp "$f" "release-files/$2"; else echo "::warning::no $1 in this build"; fi
           }
           pick "*-setup.exe"       "Submarine-windows-x64-setup.exe"
           pick "*-portable.zip"    "Submarine-windows-x64-portable.zip"
@@ -729,28 +623,27 @@ jobs:
           pick "*.deb"             "Submarine-linux-amd64.deb"
           pick "*.rpm"             "Submarine-linux-x86_64.rpm"
           pick "*.pkg.tar.zst"     "Submarine-linux-x86_64.pkg.tar.zst"
-          ls -la latest/
-          if [ ! -f latest/Submarine-windows-x64-setup.exe ]; then
-            echo "::error::The Windows build didn't finish, so the Latest build release is left as it was."
+          # Android, when it's built, keeps its per-ABI names.
+          find dist -type f -name "*.apk" -exec cp {} release-files/ \;
+          ls -la release-files/
+          if [ ! -f release-files/Submarine-windows-x64-setup.exe ]; then
+            echo "::error::The Windows build didn't finish, so no release is made; the next merge makes one."
             exit 1
           fi
 
-      - name: Replace the Latest build release
+      - name: Write the notes
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          SHORT="${SHA:0:7}"
-          BUILD="$(git rev-list --count --first-parent "$SHA")"
-          WHEN="$(date -u '+%Y-%m-%d %H:%M UTC')"
-          DL="https://github.com/$REPO/releases/download/latest-main"
-          has() { [ -f "latest/$1" ]; }
+          DL="https://github.com/$REPO/releases/download/$TAG"
+          has() { [ -f "release-files/$1" ]; }
           link() { echo "[$2]($DL/$1)"; }
           {
-            echo "The newest build of \`main\`: **build $BUILD**, commit [\`$SHORT\`](https://github.com/$REPO/commit/$SHA), built $WHEN. This page is replaced every time something is merged into \`main\`; numbered versions are the other releases. Submarine shows its build number in the title bar and on the profile screen."
+            echo "Built from commit [\`${SHA:0:7}\`](https://github.com/$REPO/commit/$SHA). What changed is in [CHANGELOG.md](https://github.com/$REPO/blob/main/CHANGELOG.md). Submarine shows its version in the title bar, and the profile screen says when there's a newer release."
             echo
             echo "### Windows"
             echo "- **$(link Submarine-windows-x64-setup.exe Submarine-windows-x64-setup.exe)**: installs Submarine, or updates it — run a newer one over it. Your profiles and settings are kept."
@@ -780,14 +673,35 @@ jobs:
               (IFS='|'; echo "${linux[*]}" | sed 's/|/ · /g')
             fi
             echo
-            echo "Submarine says when there's a newer build: the profile screen shows *\"Build N is out — download it\"*."
           } > notes.md
-          # Deleting it (and its tag) and making it again moves the tag to this
-          # commit and drops the previous build's files.
-          gh release delete latest-main --repo "$REPO" --cleanup-tag --yes || true
-          gh release create latest-main latest/* \
-            --repo "$REPO" \
-            --target "$SHA" \
-            --title "Latest build (main) · build $BUILD" \
-            --notes-file notes.md \
-            --prerelease
+
+      # Published straight away: the app's update check only sees published
+      # releases. GitHub's list of merged pull requests goes after the notes.
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Submarine ${{ needs.version.outputs.tag }}
+          body_path: notes.md
+          draft: false
+          prerelease: false
+          make_latest: "true"
+          generate_release_notes: true
+          files: release-files/*
+
+      # The old "Latest build" page, which builds up to 244 still point to:
+      # it now sends people to the releases. Its title is left as it was, so
+      # those builds don't announce a "newer build" there; they announce the
+      # release instead.
+      - name: Point the old Latest build page at the releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          printf '%s\n' \
+            "**This page isn't updated any more.** Every change to Submarine is now a release, numbered like v0.3.8-fork.2: get the newest from **[Releases](https://github.com/$REPO/releases/latest)**." \
+            "" \
+            "Builds up to 244 say there's a new version and link to it." > moved.md
+          gh release edit latest-main --repo "$REPO" --notes-file moved.md || echo "::notice::No Latest build page to update."

@@ -1,11 +1,20 @@
 # Changelog
 
-This changelog lists the builds of [paulm981/Submarine](https://github.com/paulm981/Submarine), newest first.
+This changelog lists the releases of [paulm981/Submarine](https://github.com/paulm981/Submarine), newest first.
 
-- Each build is one merge to main, and its number is in the title bar.
+- Each release is one merge to main, numbered with the original project's version and the fork's count, such as `v0.3.8-fork.2`. The title bar shows it.
+- Before `v0.3.8-fork.1`, merges were numbered builds instead, down to build 236 and the summary below it.
 - Sections called **From the original project** list what came in from [SinaXhpm/Submarine](https://github.com/SinaXhpm/submarine), with that project's pull request numbers.
 - [FORK.md](FORK.md) explains what the fork does differently, and which of the original project's changes it hasn't taken yet.
-- A fork release, such as `v0.3.8-fork.1`, gets a heading of its own above the builds it covers.
+
+## v0.3.8-fork.1
+
+- **Releases instead of build numbers.** Every change merged into main is now a release, numbered `v0.3.8-fork.1`, `v0.3.8-fork.2` and so on, shown in the title bar.
+  - When the original project's version changes, the count starts again, as in `v0.3.9-fork.1`.
+  - The profile screen says when there's a newer release. Builds up to 244 are told about it too.
+  - The installers keep the same names in every release, so links to the latest release's files always get the newest.
+- **No `.msi` any more.** Windows won't install an MSI over one with the same version, and every release of 0.3.8 has that version. The setup `.exe` installs over any earlier one, and runs silently with `/S` for installing on many PCs.
+- **The "Latest build" page** isn't updated any more; it points to the releases.
 
 ## Build 244
 
