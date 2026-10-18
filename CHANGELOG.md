@@ -7,6 +7,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - Sections called **From the original project** list what came in from [SinaXhpm/Submarine](https://github.com/SinaXhpm/submarine), with that project's pull request numbers.
 - [FORK.md](FORK.md) explains what the fork does differently, and which of the original project's changes it hasn't taken yet.
 
+## v0.3.8-fork.2
+
+- **Every pull request is checked** before it can be merged: the Rust tests on Linux and Windows, clippy (no new warnings), and the TypeScript check and page build. Since every merge is a release, a change that breaks any of them doesn't reach the team.
+
 ## v0.3.8-fork.1
 
 - **Releases instead of build numbers.** Every change merged into main is now a release, numbered `v0.3.8-fork.1`, `v0.3.8-fork.2` and so on, shown in the title bar.

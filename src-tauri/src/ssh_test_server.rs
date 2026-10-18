@@ -467,7 +467,14 @@ pub(crate) async fn connect_with_client(
     client_config: client::Config,
     client: TestClient,
 ) -> Result<client::Handle<TestClient>, russh::Error> {
-    let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+    // Room for everything both ends may have in flight at once. Unlike a real
+    // server (OpenSSH, Dropbear), which keeps reading while it waits to write,
+    // russh at both ends stops reading while a write waits: with a pipe
+    // smaller than the SSH windows (the client's is 8 MiB), a download and an
+    // upload at once could leave each end waiting on the other for good
+    // (shell_sftp's downloads_at_once_stay_apart stalled on a busy machine).
+    // The pipe only takes memory for what's in it.
+    let (client_io, server_io) = tokio::io::duplex(32 * 1024 * 1024);
     serve(server, tweak, server_io);
     client_over(client_io, client_config, client).await
 }
