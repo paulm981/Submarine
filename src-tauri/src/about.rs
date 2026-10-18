@@ -6,17 +6,12 @@
 //! the user pick whether to grab it (auto-update infrastructure is a
 //! separate, bigger problem involving signed updates).
 //!
-//! The fork is used three ways (build.rs): built from source, downloaded as
-//! the workflow's build of the latest commit on main (the "Latest build"
-//! release), or as a numbered release. Besides releases, the check says how
-//! many commits the fork's main has that this build doesn't — to pull and
-//! rebuild, or to download the next build — and how many the original
-//! project has that the fork doesn't yet (for a sync pull request, FORK.md).
-//!
-//! Every build of the fork carries the original project's version, so each
-//! also has a build number (build.rs: main's commit count). The Latest build
-//! release names its own in its title, and a higher one there is a newer
-//! build to download.
+//! The fork is used two ways (build.rs): as a release, which every merge to
+//! main is (v0.3.8-fork.1, v0.3.8-fork.2, …: the original project's version
+//! and a count), or built from source. Besides releases, the check says how
+//! many commits the fork's main has that a build from source doesn't — to
+//! pull and rebuild — and how many the original project has that the fork
+//! doesn't yet (for a sync pull request, FORK.md).
 
 use serde::Serialize;
 
@@ -30,22 +25,12 @@ pub const UPSTREAM_REPO: &str = "SinaXhpm/Submarine";
 /// The commit this build was made from (build.rs); empty when it wasn't
 /// built from a git checkout, and in a release build.
 const BUILD_COMMIT: &str = env!("SUBMARINE_GIT_SHA");
-/// "source", "main" or "release" (build.rs).
+/// "source" or "release" (build.rs).
 const BUILD_KIND: &str = env!("SUBMARINE_BUILD_KIND");
-/// The fork's build number (build.rs): main's commit count, so a higher one
-/// is newer. Empty when it couldn't be counted.
-const BUILD_NUMBER: &str = env!("SUBMARINE_BUILD_NUMBER");
 /// This build's version (build.rs): a release's whole tag, such as
 /// "0.3.8-fork.1", even where the installer's own version can't carry the
-/// "-fork.1" (Windows MSI), and otherwise Cargo's.
+/// "-fork.1" (Windows), and otherwise Cargo's.
 const VERSION: &str = env!("SUBMARINE_VERSION");
-
-fn build_number() -> Option<u64> {
-    BUILD_NUMBER.parse().ok()
-}
-/// The tag of the release the workflow keeps for the latest build of main
-/// (.github/workflows/build.yml).
-pub const LATEST_MAIN_TAG: &str = "latest-main";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AppInfo {
@@ -53,20 +38,14 @@ pub struct AppInfo {
     pub github_repo_url: String,
     pub github_releases_url: String,
     /// The first 7 characters of the commit it was built from, when known —
-    /// so two builds of the same version can be told apart.
+    /// so two builds from source of the same version can be told apart.
     pub commit: Option<String>,
-    /// The fork's build number, when known: every build of the fork has the
-    /// original project's version, and this is what tells them apart.
-    pub build: Option<u64>,
 }
 
-/// "0.3.8, build 231 (main, 23d8806)": which build this is, for the log and
+/// "0.3.8-fork.3 (source, 23d8806)": which build this is, for the log and
 /// "Copy diagnostics".
 pub fn build_label() -> String {
     let mut label = VERSION.to_string();
-    if let Some(n) = build_number() {
-        label.push_str(&format!(", build {n}"));
-    }
     let commit = BUILD_COMMIT.get(..7).unwrap_or("");
     label.push_str(&format!(" ({}{}{})", BUILD_KIND, if commit.is_empty() { "" } else { ", " }, commit));
     label
@@ -81,7 +60,6 @@ pub fn app_info() -> AppInfo {
         github_repo_url: format!("https://github.com/{}", GITHUB_REPO),
         github_releases_url: format!("https://github.com/{}/releases", GITHUB_REPO),
         commit: BUILD_COMMIT.get(..7).map(str::to_string),
-        build: build_number(),
     }
 }
 
@@ -93,26 +71,19 @@ pub struct UpdateInfo {
     /// `None` if the API call failed or no release exists.
     pub latest: Option<String>,
     /// True when the newest published, non-prerelease release on GitHub is
-    /// newer than the running build (see `release_is_newer`). Frontend uses
+    /// newer than the running build (see `semver_greater`). Frontend uses
     /// this to colour the banner (green = up-to-date, amber = update
     /// available).
     pub has_update: bool,
     /// Direct link to the latest release page. Frontend shows an "Open
     /// release notes" button when has_update is true.
     pub release_url: Option<String>,
-    /// Commits on the fork's main that this build doesn't have — None when
-    /// that couldn't be told (a build not made from a pushed commit, GitHub
-    /// unreachable) — and the GitHub page comparing them, whenever the build
-    /// knows its commit.
+    /// Commits on the fork's main that this build from source doesn't have —
+    /// None when that couldn't be told (a release, a build not made from a
+    /// pushed commit, GitHub unreachable) — and the GitHub page comparing
+    /// them, whenever the build knows its commit.
     pub main_ahead: Option<u64>,
     pub main_url: Option<String>,
-    /// This is the workflow's build of main: newer commits mean a newer build
-    /// to download (main_url is then its release page), not one to make.
-    pub main_build: bool,
-    /// This build's number, and the Latest build release's (read from its
-    /// title), when known: a higher one there is a newer build to download.
-    pub build: Option<u64>,
-    pub latest_build: Option<u64>,
     /// Commits on the original project's main not yet in the fork's main
     /// (None when that couldn't be told), and GitHub's view of them.
     pub upstream_ahead: Option<u64>,
@@ -144,8 +115,6 @@ async fn ahead_by(client: &reqwest::Client, base: &str, head: &str) -> Option<u6
 struct GhRelease {
     #[serde(default)]
     tag_name: String,
-    #[serde(default)]
-    name: Option<String>,
     #[serde(default)]
     html_url: String,
     #[serde(default)]
@@ -189,12 +158,7 @@ pub async fn check_for_updates(watch_upstream: Option<bool>) -> Result<UpdateInf
     let mut info = info?;
     if !BUILD_COMMIT.is_empty() {
         info.main_ahead = main_ahead;
-        info.main_build = BUILD_KIND == "main";
-        info.main_url = Some(if info.main_build {
-            format!("https://github.com/{}/releases/tag/{}", GITHUB_REPO, LATEST_MAIN_TAG)
-        } else {
-            format!("https://github.com/{}/compare/{}...main", GITHUB_REPO, BUILD_COMMIT)
-        });
+        info.main_url = Some(format!("https://github.com/{}/compare/{}...main", GITHUB_REPO, BUILD_COMMIT));
     }
     if watch_upstream {
         info.upstream_ahead = upstream_ahead;
@@ -237,57 +201,33 @@ async fn latest_release(client: &reqwest::Client, url: &str, current: String) ->
         .await
         .map_err(|e| format!("[UPDATE] BAD_JSON: {}", e))?;
 
-    // Highest published, non-prerelease version wins; between two of the same
-    // version, the later build. Drafts are only visible with auth (we're
-    // anonymous) but we skip them defensively all the same.
-    let mut best: Option<(String, Option<u64>, String)> = None; // (clean_version, build, html_url)
-    let mut latest_build = None;
+    Ok(match newest_release(releases) {
+        None => UpdateInfo::none(current),
+        Some((latest_clean, html_url)) => UpdateInfo {
+            has_update: semver_greater(&latest_clean, &current),
+            latest: Some(latest_clean),
+            release_url: if html_url.is_empty() { None } else { Some(html_url) },
+            ..UpdateInfo::none(current)
+        },
+    })
+}
+
+/// The highest published, non-prerelease version, without its "v", and its
+/// page. Drafts are only visible with auth (we're anonymous) but we skip them
+/// defensively all the same. The old "Latest build" release (tag
+/// latest-main) is a pre-release, so it never counts.
+fn newest_release(releases: Vec<GhRelease>) -> Option<(String, String)> {
+    let mut best: Option<(String, String)> = None;
     for r in releases {
-        // The Latest build release is a pre-release, so it never counts as a
-        // version; its title carries its build number.
-        if r.tag_name == LATEST_MAIN_TAG {
-            latest_build = r.name.as_deref().and_then(build_in_title);
-        }
         if r.draft || r.prerelease || r.tag_name.is_empty() {
             continue;
         }
         let clean = r.tag_name.strip_prefix('v').unwrap_or(&r.tag_name).to_string();
-        // A fork release's title carries its build number, as the Latest
-        // build's does: "Submarine v0.3.8-fork.1 · build 240".
-        let build = r.name.as_deref().and_then(build_in_title);
-        let wins = match &best {
-            None => true,
-            Some((cur_best, cur_build, _)) => {
-                semver_greater(&clean, cur_best) || (!semver_greater(cur_best, &clean) && build > *cur_build)
-            }
-        };
-        if wins {
-            best = Some((clean, build, r.html_url));
+        if best.as_ref().is_none_or(|(cur_best, _)| semver_greater(&clean, cur_best)) {
+            best = Some((clean, r.html_url));
         }
     }
-
-    let mut info = match best {
-        None => UpdateInfo::none(current),
-        Some((latest_clean, release_build, html_url)) => {
-            let has_update = release_is_newer(&latest_clean, release_build, &current, build_number());
-            UpdateInfo {
-                latest: Some(latest_clean),
-                has_update,
-                release_url: if html_url.is_empty() { None } else { Some(html_url) },
-                ..UpdateInfo::none(current)
-            }
-        }
-    };
-    info.latest_build = latest_build;
-    Ok(info)
-}
-
-/// The build number in a release's title, which the workflow writes as
-/// "Latest build (main) · build 225" or "Submarine v0.3.8-fork.1 · build 240".
-fn build_in_title(title: &str) -> Option<u64> {
-    let (_, rest) = title.rsplit_once("build ")?;
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
+    best
 }
 
 impl UpdateInfo {
@@ -299,9 +239,6 @@ impl UpdateInfo {
             release_url: None,
             main_ahead: None,
             main_url: None,
-            main_build: false,
-            build: build_number(),
-            latest_build: None,
             upstream_ahead: None,
             upstream_url: None,
         }
@@ -330,18 +267,6 @@ async fn commit_counts(client: &reqwest::Client, watch_upstream: bool) -> (Optio
         }
     };
     tokio::join!(main, upstream)
-}
-
-/// Whether a release (its version, and its build number when its title has
-/// one) is newer than this build. When both have a build number, that
-/// decides: every build of the fork carries the original project's version,
-/// so a build of main made after a release has the same version, and must
-/// not be told to "update" to it. Otherwise, by version.
-fn release_is_newer(release: &str, release_build: Option<u64>, current: &str, current_build: Option<u64>) -> bool {
-    match (release_build, current_build) {
-        (Some(r), Some(c)) => r > c,
-        _ => semver_greater(release, current),
-    }
 }
 
 /// True when `a > b` under dotted-number compare: "0.2.0" > "0.1.5",
@@ -388,15 +313,24 @@ pub fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests {
-    use super::{build_in_title, release_is_newer, semver_greater};
+    use super::{newest_release, semver_greater, GhRelease};
+
+    fn release(tag: &str, prerelease: bool) -> GhRelease {
+        GhRelease { tag_name: tag.into(), html_url: format!("page/{tag}"), draft: false, prerelease }
+    }
 
     #[test]
-    fn the_latest_build_title_gives_its_number() {
-        assert_eq!(build_in_title("Latest build (main) · build 225"), Some(225));
-        assert_eq!(build_in_title("Latest build (main)"), None);
-        assert_eq!(build_in_title("Latest build (main) · build"), None);
-        assert_eq!(build_in_title("Submarine v0.3.8-fork.1 · build 240"), Some(240));
-        assert_eq!(build_in_title("Submarine v0.3.8-fork.1"), None);
+    fn the_newest_fork_release_wins_and_latest_build_never_counts() {
+        let releases = vec![
+            release("latest-main", true),
+            release("v0.3.8-fork.2", false),
+            release("v0.3.8-fork.10", false),
+            release("v0.3.8-fork.9", false),
+        ];
+        assert_eq!(newest_release(releases), Some(("0.3.8-fork.10".into(), "page/v0.3.8-fork.10".into())));
+        assert_eq!(newest_release(vec![release("latest-main", true)]), None);
+        // A build up to 244 says "0.3.8": the first fork release is newer.
+        assert!(semver_greater("0.3.8-fork.1", "0.3.8"));
     }
 
     #[test]
@@ -411,20 +345,5 @@ mod tests {
         assert!(!semver_greater("0.3.8-beta", "0.3.8"));
         assert!(!semver_greater("0.3.8", "0.3.8-beta"));
         assert!(semver_greater("0.10.0", "0.9.9"));
-    }
-
-    #[test]
-    fn a_release_is_newer_by_build_number_when_both_have_one() {
-        // A build of main made after the release: same version, no update.
-        assert!(!release_is_newer("0.3.8-fork.1", Some(240), "0.3.8", Some(245)));
-        // A build of main from before it.
-        assert!(release_is_newer("0.3.8-fork.1", Some(240), "0.3.8", Some(238)));
-        // The release itself, on Windows too, where the installer says 0.3.8.
-        assert!(!release_is_newer("0.3.8-fork.1", Some(240), "0.3.8-fork.1", Some(240)));
-        assert!(!release_is_newer("0.3.8-fork.1", Some(240), "0.3.8", Some(240)));
-        assert!(release_is_newer("0.3.8-fork.2", Some(250), "0.3.8-fork.1", Some(240)));
-        // Without a number on either side, by version.
-        assert!(release_is_newer("0.3.8-fork.2", None, "0.3.8-fork.1", Some(240)));
-        assert!(!release_is_newer("0.3.8-fork.1", Some(240), "0.3.8-fork.1", None));
     }
 }

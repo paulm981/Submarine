@@ -4,7 +4,7 @@
 
 ## Checklist
 
-- [ ] CHANGELOG.md has a line for it, under the next build.
+- [ ] CHANGELOG.md has a line for it, under the next release.
 - [ ] If the original project does this differently, FORK.md says so in "Where it behaves differently".
 - [ ] It was tested in the app, not only by the tests.
 

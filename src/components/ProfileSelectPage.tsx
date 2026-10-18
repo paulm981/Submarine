@@ -36,26 +36,17 @@ interface CloudStatus { signed_in: boolean; email: string | null; }
 interface CloudProfile { profile: string; name: string; records: number; live_records: number; last_updated: string; }
 // Result of the GitHub release check (backend: about::check_for_updates).
 // `has_update` is true only when `latest` is a strictly newer semver than the
-// running build. `main_ahead`: commits on the fork's main this build lacks
-// (`main_build`: this is the workflow's build of main, so they come as a
-// newer build to download); `upstream_ahead`: commits on the original
-// project's main the fork lacks. Null when GitHub couldn't tell.
-// `build` / `latest_build`: this build's number and the Latest build
-// release's (about.rs), when known.
+// running build. `main_ahead`: commits on the fork's main a build from
+// source lacks (a release has none: its updates are releases);
+// `upstream_ahead`: commits on the original project's main the fork lacks.
+// Null when GitHub couldn't tell.
 interface UpdateInfo {
   current: string; latest: string | null; has_update: boolean; release_url: string | null;
-  main_ahead: number | null; main_url: string | null; main_build: boolean;
-  build: number | null; latest_build: number | null;
+  main_ahead: number | null; main_url: string | null;
   upstream_ahead: number | null; upstream_url: string | null;
 }
-// On a Latest build whose number and the newest one's are both known, the
-// numbers say whether there's a newer build — the commit count alone also
-// counts a merge whose build hasn't finished yet.
-const byNumber = (u: UpdateInfo) => u.main_build && u.build != null && u.latest_build != null;
-const newerBuild = (u: UpdateInfo) => (byNumber(u) && u.latest_build! > u.build! ? u.latest_build : null);
-const mainAhead = (u: UpdateInfo) => (byNumber(u) ? 0 : u.main_ahead ?? 0);
 // Whether the check found anything to announce.
-const hasNews = (u: UpdateInfo) => (u.has_update && !!u.latest) || newerBuild(u) != null || mainAhead(u) > 0 || (u.upstream_ahead ?? 0) > 0;
+const hasNews = (u: UpdateInfo) => (u.has_update && !!u.latest) || (u.main_ahead ?? 0) > 0 || (u.upstream_ahead ?? 0) > 0;
 const changes = (n: number) => `${n} new change${n === 1 ? "" : "s"}`;
 // The silent check's answer, kept for the rest of this run of the app: the
 // picker comes back on every lock, and each check is up to three
@@ -361,7 +352,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
         setUpdate(u);
         setCheck("idle");
       } else {
-        setCheck(u.latest || byNumber(u) || u.main_ahead === 0 ? "latest" : "none");
+        setCheck(u.latest || u.main_ahead === 0 ? "latest" : "none");
       }
     } catch (e) {
       setCheckError(cleanErr(e));
@@ -1077,7 +1068,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
               <>
                 <FooterDot />
                 <span className="px-1.5 font-mono text-[11px] text-zinc-600 select-text" title={appInfo.commit ? `Built from commit ${appInfo.commit}` : undefined}>
-                  v{appInfo.version}{appInfo.build != null && <> · build {appInfo.build}</>}{appInfo.commit && <span className="text-zinc-700"> · {appInfo.commit}</span>}
+                  v{appInfo.version}{appInfo.commit && <span className="text-zinc-700"> · {appInfo.commit}</span>}
                 </span>
               </>
             )}
@@ -1096,22 +1087,14 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
               label={<>New version <span className="font-mono font-semibold">v{update.latest}</span> available</>}
             />
           )}
-          {/* Newer commits on the fork's main: a newer build to download
-              (the workflow's build of main), or to pull and rebuild (built
-              from source). Newer commits on the original project mean the
+          {/* Built from source: newer commits on the fork's main, to pull
+              and rebuild. Newer commits on the original project mean the
               fork wants a sync pull request first (FORK.md). */}
-          {update && newerBuild(update) != null && update.main_url && (
+          {(update?.main_ahead ?? 0) > 0 && update?.main_url && (
             <NewsButton
               onClick={() => openLink(update.main_url!)}
-              title="Open the latest build's download page"
-              label={<>Build {newerBuild(update)} is out (this is {update.build}) — download it</>}
-            />
-          )}
-          {update && mainAhead(update) > 0 && update.main_url && (
-            <NewsButton
-              onClick={() => openLink(update.main_url!)}
-              title={update.main_build ? "Open the latest build's download page" : "See the new changes on GitHub, then pull them and rebuild"}
-              label={<>{changes(update.main_ahead!)} on main — {update.main_build ? "download the latest build" : "pull and rebuild"}</>}
+              title="See the new changes on GitHub, then pull them and rebuild"
+              label={<>{changes(update.main_ahead!)} on main — pull and rebuild</>}
             />
           )}
           {(update?.upstream_ahead ?? 0) > 0 && update?.upstream_url && (
