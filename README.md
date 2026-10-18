@@ -331,6 +331,22 @@ Your data is encrypted on your machine before anything leaves it. Submarine and 
 - TOFU host keys with per-connection nonce binding (resists prompt-race attacks)
 - Strict Content Security Policy, minimal Tauri permission ACL, no shell or filesystem plugins exposed to the UI
 
+## Code signing policy
+
+Windows installers will be signed. Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+Until the first signed release, the installers aren't signed, and [Install](#install) says how to open them.
+
+**Privacy policy:** This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
+
+What Submarine connects to:
+
+- the servers you connect to;
+- the folder or git repository you sync profiles through, if you set one up;
+- the original project's hosted sync, only if you turn it on.
+
+On its own, it makes one call: when the profile screen opens, it asks GitHub's public API whether there's a newer release. That call carries the app's version, and nothing about you or your servers.
+
 ## FAQ
 
 ### Is Submarine free?
@@ -367,7 +383,7 @@ Settings → **Troubleshooting**. Submarine keeps a log on your computer (`subma
 
 ### Does Submarine collect telemetry or analytics?
 
-No. There's no analytics SDK, no crash reporter that sends data home, no "phone home" call on launch. The log under Troubleshooting stays on your computer unless you copy it yourself. The only outbound network call beyond your SSH targets is the optional cloud-sync endpoint at `api.sinaxhpm.com`, and that endpoint only ever receives opaque ciphertext.
+No. There's no analytics SDK, and no crash reporter that sends data home. The log under Troubleshooting stays on your computer unless you copy it yourself. Beyond your servers and the sync storage you set up, the app makes one call by itself: a check on GitHub for a newer release (see [Code signing policy](#code-signing-policy)). The original project's hosted sync is off unless you turn it on, and it only ever receives opaque ciphertext.
 
 ### Can I use Submarine on my Android phone with the same servers as my desktop?
 
