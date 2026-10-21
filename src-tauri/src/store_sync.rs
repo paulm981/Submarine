@@ -67,6 +67,44 @@ const META_KEY_SALT: &str = "store_key_salt";
 /// store share the git working copy.
 static STORE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// How long a store operation waits for another Submarine window's.
+const STORE_TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// A store operation's turn: this window's (`STORE_LOCK`), and, since each
+/// open profile has a window of its own now, the other windows' too. They
+/// share the git working copies under `sync-git` (a pull there removes
+/// git's lock files and resets the copy) and this computer's own file in a
+/// synced folder, so a held lock on `sync-store.lock` in the app's data folder
+/// keeps them taking turns. The system lets go of it when a window ends,
+/// however it ends.
+struct StoreTurn {
+    _here: tokio::sync::MutexGuard<'static, ()>,
+    _file: Option<std::fs::File>,
+}
+
+async fn store_turn(app: &tauri::AppHandle) -> Result<StoreTurn, String> {
+    let here = STORE_LOCK.lock().await;
+    let Ok(dir) = app.path().app_data_dir() else { return Ok(StoreTurn { _here: here, _file: None }) };
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(file) = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(dir.join("sync-store.lock")) else {
+        // A folder that can't hold a lock: nothing guards it, nothing stops it.
+        return Ok(StoreTurn { _here: here, _file: None });
+    };
+    let deadline = tokio::time::Instant::now() + STORE_TURN_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(StoreTurn { _here: here, _file: Some(file) }),
+            Err(std::fs::TryLockError::WouldBlock) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err("[STORE] Another Submarine window has been syncing for a long time. Try again once it's done.".into());
+            }
+            Err(std::fs::TryLockError::Error(_)) => return Ok(StoreTurn { _here: here, _file: None }),
+        }
+    }
+}
+
 // ── Where ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -408,6 +446,10 @@ fn is_plain_file(e: &std::fs::DirEntry) -> bool {
     e.file_type().is_ok_and(|t| t.is_file())
 }
 
+/// The most one computer's file in the store may be: as much as the cloud
+/// sync takes in one answer (cloud::MAX_SYNC_ANSWER).
+const MAX_DEVICE_FILE: u64 = crate::cloud::MAX_SYNC_ANSWER as u64;
+
 fn read_profile(dir: &Path, key: &[u8; 32], node: &str) -> Result<Seen, String> {
     let mut seen = Seen::default();
     refuse_links(dir)?;
@@ -427,10 +469,24 @@ fn read_profile(dir: &Path, key: &[u8; 32], node: &str) -> Result<Seen, String> 
         if !name.ends_with(DEVICE_EXT) || name.starts_with('.') || !is_plain_file(&entry) {
             continue;
         }
-        let file = match std::fs::read(entry.path()).map_err(|e| e.to_string()).and_then(|b| unseal(key, &b)) {
+        // Looked at before it's read: a file far bigger than any profile (a
+        // sync tool's mistake, or someone who can write to the store) would
+        // otherwise be read whole into memory on every sync.
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        let read = if size > MAX_DEVICE_FILE {
+            Err(format!(
+                "it's {} MB, more than the {} MB a sync file can be, so it wasn't read",
+                size / (1024 * 1024),
+                MAX_DEVICE_FILE / (1024 * 1024)
+            ))
+        } else {
+            std::fs::read(entry.path()).map_err(|e| e.to_string())
+        };
+        let file = match read.and_then(|b| unseal(key, &b)) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("[STORE] skipped {name}: {e}");
+                crate::applog::write_line("sync", &format!("skipped {name}: {e}"));
                 seen.unreadable.push(name);
                 continue;
             }
@@ -1051,7 +1107,7 @@ async fn sync_open(app: &tauri::AppHandle, db: &DbState, open: &Open) -> Result<
 /// `sync_now` for a profile that syncs through the user's own storage; None
 /// for one that doesn't.
 pub(crate) async fn sync_if_linked(app: &tauri::AppHandle, db: &DbState) -> Result<Option<SyncReport>, String> {
-    let _turn = STORE_LOCK.lock().await;
+    let _turn = store_turn(app).await?;
     let Some(open) = open_profile(db)? else { return Ok(None) };
     sync_open(app, db, &open).await.map(Some)
 }
@@ -1077,7 +1133,7 @@ pub(crate) struct Peek {
 }
 
 pub(crate) async fn peek(app: &tauri::AppHandle, db: &DbState) -> Result<Option<Peek>, String> {
-    let _turn = STORE_LOCK.lock().await;
+    let _turn = store_turn(app).await?;
     let Some(open) = open_profile(db)? else { return Ok(None) };
     let root = reach(app, &open.linked.store).await?;
     let dir = data_dir(&root).join(&open.linked.profile_id);
@@ -1182,7 +1238,7 @@ pub async fn store_setup(
     location: String,
     branch: Option<String>,
 ) -> Result<SyncReport, String> {
-    let _turn = STORE_LOCK.lock().await;
+    let _turn = store_turn(&app).await?;
     let store = Store::new(&kind, &location, branch.as_deref())?;
     let key = {
         let conn_g = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
@@ -1255,7 +1311,7 @@ pub async fn store_find_profiles(
     password: String,
 ) -> Result<Vec<FoundProfile>, String> {
     let password = Zeroizing::new(password);
-    let _turn = STORE_LOCK.lock().await;
+    let _turn = store_turn(&app).await?;
     let store = Store::new(&kind, &location, branch.as_deref())?;
     let data = data_dir(&reach(&app, &store).await?);
     let dirs = profile_dirs(&data);
@@ -1296,7 +1352,7 @@ pub async fn store_restore_profile(
     local_name: String,
     password: String,
 ) -> Result<SyncReport, String> {
-    let _turn = STORE_LOCK.lock().await;
+    let _turn = store_turn(&app).await?;
     let store = Store::new(&kind, &location, branch.as_deref())?;
     crate::validate_profile_name(&local_name)?;
     if password.is_empty() {
@@ -1425,6 +1481,19 @@ mod tests {
         let titles: Vec<String> = st.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(titles, ["one", "two"]);
         assert!(!copy.exists(), "a merged conflict copy is removed");
+    }
+
+    #[test]
+    fn a_file_far_bigger_than_any_profile_is_not_read() {
+        let dir = tmp("huge").join("p");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A sparse file: the size is what's looked at, nothing is written.
+        let f = std::fs::File::create(dir.join("dddddddddddddddd.subdev")).unwrap();
+        f.set_len(MAX_DEVICE_FILE + 1).unwrap();
+        drop(f);
+        let seen = read_profile(&dir, &KEY, "aaaaaaaaaaaaaaaa").unwrap();
+        assert_eq!(seen.unreadable, ["dddddddddddddddd.subdev"]);
+        assert!(seen.records.is_empty());
     }
 
     #[test]
