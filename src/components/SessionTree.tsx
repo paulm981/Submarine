@@ -196,7 +196,9 @@ export const SessionTree = ({
       if (hits.has(id)) return hits.get(id)!;
       const c = contents.get(id);
       const own = !!c && (c.servers.some((s) => serverOk(s) && matchesServer(s)) || (!openOnly && c.links.some(matchesLink)));
-      const r = own || (index.children.get(id) ?? []).some((f) => matchesFolder(f.name) || hasHit(f.id));
+      // A subfolder counts only if it shows: with "show only open", one with
+      // nothing open is left out, name match or not.
+      const r = own || (index.children.get(id) ?? []).some((f) => (!openOnly || hasOpen(f.id)) && (matchesFolder(f.name) || hasHit(f.id)));
       hits.set(id, r);
       return r;
     };
@@ -895,7 +897,7 @@ export const SessionTree = ({
             const host = r.kind === "server" ? r.server.host : r.link.host;
             return (
               <>
-                <button className={menuItem} onClick={run(() => (pickedCount > 1 && selected.has(r.key) ? openSelected() : r.kind === "server" ? onOpenServers([r.server]) : openRdp(r.link)))}>
+                <button className={menuItem} onClick={run(() => (pickedCount > 1 && selected.has(r.key) ? openSelected() : r.kind === "server" ? openServer(r.server) : openRdp(r.link)))}>
                   <Play size={13} className={menuIcon} /> {pickedCount > 1 && selected.has(r.key) ? `Open ${pickedCount} selected` : r.kind === "server" ? "Open" : "Open in Remote Desktop"}
                 </button>
                 {pickedCount > 1 && selected.has(r.key) && picked.list.length > 1 && (

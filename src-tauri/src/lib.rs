@@ -7876,6 +7876,59 @@ impl ConfigTarget {
     }
 }
 
+/// How a connection reaches its target. Chosen in one place for the connect
+/// and for the check under a failed one (`diagnose_connect`), so the check
+/// looks at what the connect dials.
+#[derive(Debug, PartialEq)]
+enum ConnectRoute {
+    /// Through the server's jump host (its id).
+    Jump(i32),
+    /// Through the server's SOCKS5 or HTTP proxy. A missing host is the
+    /// connect's error to report; a missing port is the usual one.
+    Proxy { socks5: bool, host: Option<String>, port: u16 },
+    /// Through the ProxyCommand ~/.ssh/config gives the host.
+    Command(String),
+    /// Straight there. `unused_jump` is a ProxyJump from ~/.ssh/config,
+    /// which isn't used yet.
+    Direct { unused_jump: Option<String> },
+}
+
+/// The route for a server saved with this jump host and proxy, and the
+/// ~/.ssh/config `target` its address resolved to. The server's own jump
+/// host or proxy wins over the config's (`ConfigTarget::proxy` logs that).
+fn connect_route(
+    jump_host_id: Option<i32>,
+    proxy_type: &str,
+    proxy_host: Option<String>,
+    proxy_port: Option<i32>,
+    target: &mut ConfigTarget,
+) -> ConnectRoute {
+    let own_route = if jump_host_id.is_some() {
+        Some("jump host")
+    } else {
+        match proxy_type {
+            "socks5" => Some("SOCKS5 proxy"),
+            "http" => Some("HTTP proxy"),
+            _ => None,
+        }
+    };
+    let config_proxy = target.proxy(own_route);
+    if let Some(id) = jump_host_id {
+        return ConnectRoute::Jump(id);
+    }
+    let host = proxy_host.filter(|h| !h.is_empty());
+    match proxy_type {
+        "socks5" => return ConnectRoute::Proxy { socks5: true, host, port: proxy_port.map_or(1080, |p| p as u16) },
+        "http" => return ConnectRoute::Proxy { socks5: false, host, port: proxy_port.map_or(8080, |p| p as u16) },
+        _ => {}
+    }
+    match config_proxy {
+        Some(ssh_config::Proxy::Command(command)) => ConnectRoute::Command(command),
+        Some(ssh_config::Proxy::Jump(spec)) => ConnectRoute::Direct { unused_jump: Some(spec) },
+        _ => ConnectRoute::Direct { unused_jump: None },
+    }
+}
+
 /// A jump host's transport: TCP, or a ProxyCommand.
 enum HopStream {
     Tcp(tokio::net::TcpStream),
@@ -10231,70 +10284,99 @@ async fn teardown_connection_key(state: &SshState, mirrors: &MirrorMap, key: &st
     }
 }
 
+/// A Quick Connect target, for `diagnose_connect`: where it goes and as whom,
+/// without the password or key the connect itself is sent.
+#[derive(serde::Deserialize)]
+struct QuickTarget {
+    host: String,
+    port: i32,
+    #[serde(default)]
+    username: String,
+}
+
 /// What a failed connect to server `server_id` (or a Quick Connect target)
 /// can say about why: whether the name resolves and the port answers, at a
 /// proxy's or jump host's address when there is one (see `diagnose`). The tab
 /// runs it beside the retry countdown and shows the lines under the error.
+/// The route is the connect's own (`connect_route`), and ~/.ssh/config is
+/// asked with the same name and user.
 #[tauri::command]
 async fn diagnose_connect(
     db_state: tauri::State<'_, DbState>,
     server_id: i32,
-    quick_auth: Option<QuickAuth>,
+    quick_target: Option<QuickTarget>,
 ) -> Result<Vec<String>, String> {
-    // name, host, port, proxy type / host / port, jump host's name / host / port
-    type Row = (String, String, i32, String, Option<String>, Option<i32>, Option<(String, String, i32)>);
-    let row: Row = if let Some(q) = quick_auth {
-        (q.host.clone(), q.host, q.port, "none".into(), None, None, None)
+    // The user a server logs in as: its credential's in vault mode, its own
+    // otherwise (as in initiate_connection and resolve_jump_auth).
+    const USER: &str = "CASE WHEN COALESCE({s}.auth_type, 'vault') = 'vault' THEN {c}.username ELSE {s}.username END";
+    struct Hop { name: Option<String>, host: String, port: i32, user: Option<String> }
+    struct Row {
+        name: Option<String>, host: String, port: i32, user: Option<String>,
+        proxy_type: String, proxy_host: Option<String>, proxy_port: Option<i32>,
+        jump_id: Option<i32>, jump: Option<Hop>,
+    }
+    let row = if let Some(q) = quick_target {
+        // Quick Connect has no name, proxy or jump host.
+        Row {
+            name: None, host: q.host, port: q.port, user: Some(q.username),
+            proxy_type: "none".into(), proxy_host: None, proxy_port: None, jump_id: None, jump: None,
+        }
     } else {
         let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
         let conn = guard.as_ref().ok_or("Database is not open")?;
-        conn.query_row(
-            "SELECT s.name, s.host, s.port, s.proxy_type, s.proxy_host, s.proxy_port, j.name, j.host, j.port
-             FROM servers s LEFT JOIN servers j ON j.id = s.jump_host_id WHERE s.id=?1",
-            [server_id],
-            |r| {
-                let jump = match (r.get::<_, Option<String>>(7)?, r.get::<_, Option<i32>>(8)?) {
-                    (Some(host), Some(port)) => {
-                        Some((r.get::<_, Option<String>>(6)?.unwrap_or_else(|| host.clone()), host, port))
-                    }
-                    _ => None,
-                };
-                Ok((
-                    r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get::<_, Option<String>>(3)?.unwrap_or_else(|| "none".into()),
-                    r.get(4)?,
-                    r.get(5)?,
-                    jump,
-                ))
-            },
-        )
+        let sql = format!(
+            "SELECT s.name, s.host, s.port, {}, s.proxy_type, s.proxy_host, s.proxy_port, s.jump_host_id,
+                    j.name, j.host, j.port, {}
+             FROM servers s LEFT JOIN credentials c ON c.id = s.credential_id
+             LEFT JOIN servers j ON j.id = s.jump_host_id LEFT JOIN credentials jc ON jc.id = j.credential_id
+             WHERE s.id=?1",
+            USER.replace("{s}", "s").replace("{c}", "c"),
+            USER.replace("{s}", "j").replace("{c}", "jc"),
+        );
+        conn.query_row(&sql, [server_id], |r| {
+            let jump = match (r.get::<_, Option<String>>(9)?, r.get::<_, Option<i32>>(10)?) {
+                (Some(host), Some(port)) => Some(Hop { name: r.get(8)?, host, port, user: r.get(11)? }),
+                _ => None,
+            };
+            Ok(Row {
+                name: r.get(0)?,
+                host: r.get(1)?,
+                port: r.get(2)?,
+                user: r.get(3)?,
+                proxy_type: r.get::<_, Option<String>>(4)?.unwrap_or_else(|| "none".into()),
+                proxy_host: r.get(5)?,
+                proxy_port: r.get(6)?,
+                jump_id: r.get(7)?,
+                jump,
+            })
+        })
         .map_err(|_| "Server not found".to_string())?
     };
-    let (name, host, port, proxy_type, proxy_host, proxy_port, jump) = row;
-    let port = u16::try_from(port).map_err(|_| format!("Port {port} isn't a valid port"))?;
+    let port = u16::try_from(row.port).map_err(|_| format!("Port {} isn't a valid port", row.port))?;
 
     // The address an alias in ~/.ssh/config stands for, as the connect uses it.
-    let mut target = ConfigTarget::resolve(&host, port, "", Some(name)).await;
-    let own_route = if jump.is_some() {
-        Some("jump host")
-    } else if proxy_type == "socks5" || proxy_type == "http" {
-        Some("proxy")
-    } else {
-        None
-    };
-    let proxy = proxy_host.filter(|h| !h.is_empty()).zip(proxy_port.and_then(|p| u16::try_from(p).ok()));
-    let route = if let Some((jump_name, jump_host, jump_port)) = jump {
-        let jump_port = u16::try_from(jump_port).map_err(|_| format!("Port {jump_port} isn't a valid port"))?;
-        let hop = ConfigTarget::resolve(&jump_host, jump_port, "", Some(jump_name.clone())).await;
-        diagnose::Route::Jump { name: jump_name, host: hop.host, port: hop.port }
-    } else if let (Some((host, port)), true) = (proxy, own_route.is_some()) {
-        diagnose::Route::Proxy { kind: if proxy_type == "socks5" { "SOCKS5" } else { "HTTP" }, host, port }
-    } else if matches!(target.proxy(own_route), Some(ssh_config::Proxy::Command(_))) {
-        diagnose::Route::Command
-    } else {
-        diagnose::Route::Direct
+    let mut target = ConfigTarget::resolve(&row.host, port, row.user.as_deref().unwrap_or(""), row.name).await;
+    let route = match connect_route(row.jump_id, &row.proxy_type, row.proxy_host, row.proxy_port, &mut target) {
+        ConnectRoute::Jump(_) => {
+            // The connect fails on its own when the jump host is gone.
+            let Some(hop) = row.jump else { return Ok(Vec::new()) };
+            let jump_port = u16::try_from(hop.port).map_err(|_| format!("Port {} isn't a valid port", hop.port))?;
+            let label = hop.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| hop.host.clone());
+            let mut resolved = ConfigTarget::resolve(&hop.host, jump_port, hop.user.as_deref().unwrap_or(""), hop.name).await;
+            // connect_jump_host takes the jump host's ProxyCommand when it has one.
+            if matches!(resolved.proxy(None), Some(ssh_config::Proxy::Command(_))) {
+                diagnose::Route::Command
+            } else {
+                diagnose::Route::Jump { name: label, host: resolved.host, port: resolved.port }
+            }
+        }
+        ConnectRoute::Proxy { socks5, host: Some(host), port } => {
+            diagnose::Route::Proxy { kind: if socks5 { "SOCKS5" } else { "HTTP" }, host, port }
+        }
+        // No proxy address to check: the connect says the proxy host is empty.
+        ConnectRoute::Proxy { host: None, .. } => return Ok(Vec::new()),
+        ConnectRoute::Command(_) => diagnose::Route::Command,
+        ConnectRoute::Direct { .. } => diagnose::Route::Direct,
     };
     Ok(diagnose::diagnose(&target.host, target.port, route).await)
 }
@@ -10630,17 +10712,8 @@ async fn initiate_connection(
         let port = u16::try_from(port).map_err(|_| format!("Port {port} isn't a valid port"))?;
         ConfigTarget::resolve(&host, port, &user, name).await
     };
-    // Its ProxyCommand / ProxyJump, unless the server has its own route.
-    let own_route = if jump_host_id.is_some() {
-        Some("jump host")
-    } else {
-        match proxy_type.as_str() {
-            "socks5" => Some("SOCKS5 proxy"),
-            "http" => Some("HTTP proxy"),
-            _ => None,
-        }
-    };
-    let config_proxy = config_target.proxy(own_route);
+    // Its jump host, proxy or ProxyCommand (see connect_route).
+    let route = connect_route(jump_host_id, &proxy_type, proxy_host, proxy_port, &mut config_target);
     let config_log = config_target.log.clone();
     let identity_agent = config_target.identity_agent();
     let (host, port, user) = (config_target.host.clone(), i32::from(config_target.port), config_target.user.clone());
@@ -10818,7 +10891,7 @@ async fn initiate_connection(
         // The ProxyCommand this connection goes through, if any: what it said
         // when the handshake fails.
         let mut proxy_watch: Option<proxy_command::Watch> = None;
-        let stream_res: Result<Box<dyn AsyncStream>, String> = if let Some(jid) = jump_host_id {
+        let stream_res: Result<Box<dyn AsyncStream>, String> = if let ConnectRoute::Jump(jid) = route {
             emit_log(&format!("ProxyJump: routing through jump host (server id {})...", jid), "info");
             match connect_jump_host(&app, &db_for_jump, &fp_txs_clone, &kbi_txs_clone, &prompted_secrets_clone, allow_kbi, &jump_auth_failed, &jump_network_failed, &attempt, &session_id_clone, jid, use_agent).await {
                 Ok(jump_handle) => {
@@ -10855,7 +10928,7 @@ async fn initiate_connection(
                     Err(format!("ProxyJump: {}", e))
                 }
             }
-        } else if let Some(ssh_config::Proxy::Command(command)) = &config_proxy {
+        } else if let ConnectRoute::Command(command) = &route {
             emit_log(
                 &format!("~/.ssh/config: connecting through ProxyCommand ({})...", proxy_command::program_name(command)),
                 "info",
@@ -10868,16 +10941,17 @@ async fn initiate_connection(
                 Err(e) => Err(e),
             }
         } else {
-        if let Some(ssh_config::Proxy::Jump(spec)) = &config_proxy {
+        if let ConnectRoute::Direct { unused_jump: Some(spec) } = &route {
             emit_log(&format!("~/.ssh/config: ProxyJump {spec} isn't used yet; connecting without it."), "info");
         }
         // Any failure below is the network's: the proxy or the server didn't
         // answer, refused, or couldn't be reached. (An empty proxy host is
         // reported on its own.)
         reach_retry = true;
-        match proxy_type.as_str() {
-            "socks5" => {
-                let p_host = match proxy_host.as_ref().filter(|h| !h.is_empty()) {
+        match &route {
+            ConnectRoute::Proxy { socks5: true, host: p_host, port: p_port } => {
+                let p_port = *p_port;
+                let p_host = match p_host {
                     Some(h) => h,
                     None => {
                         let err_msg = "SOCKS5 Proxy Host is empty";
@@ -10887,7 +10961,6 @@ async fn initiate_connection(
                         return;
                     }
                 };
-                let p_port = proxy_port.unwrap_or(1080) as u16;
                 emit_log(&format!("Connecting via SOCKS5 Proxy {}:{}...", p_host, p_port), "info");
                 
                 let proxy_addr = format!("{}:{}", p_host, p_port);
@@ -10910,8 +10983,9 @@ async fn initiate_connection(
                     }
                 }
             }
-            "http" => {
-                let p_host = match proxy_host.as_ref().filter(|h| !h.is_empty()) {
+            ConnectRoute::Proxy { socks5: false, host: p_host, port: p_port } => {
+                let p_port = *p_port;
+                let p_host = match p_host {
                     Some(h) => h,
                     None => {
                         let err_msg = "HTTP Proxy Host is empty";
@@ -10921,7 +10995,6 @@ async fn initiate_connection(
                         return;
                     }
                 };
-                let p_port = proxy_port.unwrap_or(8080) as u16;
                 emit_log(&format!("Connecting via HTTP Proxy {}:{}...", p_host, p_port), "info");
 
                 let proxy_addr = format!("{}:{}", p_host, p_port);
@@ -20210,6 +20283,46 @@ mod remote_write_lock_tests {
         drop(locks.acquire("s1", "/srv/a", &no_cancel).await);
         drop(locks.acquire("s1", "/srv/b", &no_cancel).await);
         assert_eq!(locks.map.lock().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod connect_route_tests {
+    use super::*;
+
+    /// `web` as ~/.ssh/config would give it, with this proxy line.
+    fn target(proxy: Option<ssh_config::Proxy>) -> ConfigTarget {
+        ConfigTarget::apply("web", 22, "", Some(ssh_config::HostConfig { proxy, ..Default::default() }))
+    }
+
+    fn command() -> Option<ssh_config::Proxy> {
+        Some(ssh_config::Proxy::Command("nc %h %p".into()))
+    }
+
+    #[test]
+    fn a_proxy_without_a_port_takes_the_usual_one() {
+        let socks = connect_route(None, "socks5", Some("p".into()), None, &mut target(None));
+        assert_eq!(socks, ConnectRoute::Proxy { socks5: true, host: Some("p".into()), port: 1080 });
+        let http = connect_route(None, "http", Some("p".into()), None, &mut target(None));
+        assert_eq!(http, ConnectRoute::Proxy { socks5: false, host: Some("p".into()), port: 8080 });
+        let empty = connect_route(None, "http", Some(String::new()), Some(3128), &mut target(None));
+        assert_eq!(empty, ConnectRoute::Proxy { socks5: false, host: None, port: 3128 });
+    }
+
+    #[test]
+    fn the_servers_own_route_wins_over_a_proxy_command() {
+        assert_eq!(connect_route(Some(7), "socks5", Some("p".into()), None, &mut target(command())), ConnectRoute::Jump(7));
+        let mut t = target(command());
+        assert!(matches!(connect_route(None, "socks5", Some("p".into()), Some(1), &mut t), ConnectRoute::Proxy { .. }));
+        assert!(t.log.iter().any(|l| l.contains("ProxyCommand isn't used")), "{:?}", t.log);
+    }
+
+    #[test]
+    fn otherwise_the_config_decides() {
+        assert_eq!(connect_route(None, "none", None, None, &mut target(command())), ConnectRoute::Command("nc %h %p".into()));
+        let jump = Some(ssh_config::Proxy::Jump("bastion".into()));
+        assert_eq!(connect_route(None, "none", None, None, &mut target(jump)), ConnectRoute::Direct { unused_jump: Some("bastion".into()) });
+        assert_eq!(connect_route(None, "none", None, None, &mut target(None)), ConnectRoute::Direct { unused_jump: None });
     }
 }
 
