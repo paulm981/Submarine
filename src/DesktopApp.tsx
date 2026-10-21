@@ -55,6 +55,7 @@ import TelnetSessionView from "./components/TelnetSessionView";
 import VncSessionView from "./components/VncSessionView";
 import MonitoringPanel from "./components/MonitoringPanel";
 import { ErrorBoundary } from "./ui/ErrorBoundary";
+import { parseObjectList } from "./util/serverJson";
 
 const appWindow = getCurrentWindow();
 
@@ -1615,11 +1616,9 @@ function DesktopApp() {
       proxyType: server.proxy_type || "none",
       proxyHost: server.proxy_host || "",
       proxyPort: server.proxy_port || 1080,
-      tunnels: server.tunnels ? JSON.parse(server.tunnels) : [],
+      tunnels: parseObjectList(server.tunnels),
       autostart: !!server.autostart,
-      mirrors: (() => {
-        try { return JSON.parse(server.mirrors || "[]"); } catch { return []; }
-      })(),
+      mirrors: parseObjectList(server.mirrors),
       color: server.color ?? null,
       notes: server.notes || "",
       runOnConnect: server.run_on_connect || "",
