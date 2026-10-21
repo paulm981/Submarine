@@ -7,6 +7,15 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - Sections called **From the original project** list what came in from [SinaXhpm/Submarine](https://github.com/SinaXhpm/submarine), with that project's pull request numbers.
 - [FORK.md](FORK.md) explains what the fork does differently, and which of the original project's changes it hasn't taken yet.
 
+## v0.3.8-fork.4
+
+- **AI tools, first test** ([#32](https://github.com/paulm981/Submarine/issues/32), steps 1 and 2 of the MVP). Off by default: Settings › AI tools.
+  - On, Home's menu lists **Claude Code** under AI tools when it's installed. It opens in a Home tab already connected to Submarine, through `submarine --mcp` over a local channel only: a socket only you can open on macOS and Linux, a named pipe locked to your account on Windows, and a token for each AI tab.
+  - **Share with AI** on a server tab's toolbar lets that AI tab ask to run commands there. Each one waits in the **AI panel** (the title bar's AI button) until you click Allow or Deny; the keyboard can't approve anything. A command with sudo, dzdo, su, doas or pkexec is marked as asking for root.
+  - Submarine runs it on its own SSH channel, with no terminal, a timeout and a 1 MB output cap. The AI gets the output with known secrets hidden; you see all of it, and how much was hidden.
+  - Every request and decision goes in `ai-audit.log` in the log folder.
+  - Sharing ends when you stop it, or when the AI tab or the server's tab closes or reconnects.
+
 ## v0.3.8-fork.2
 
 - **Every pull request is checked** before it can be merged: the Rust tests on Linux and Windows, clippy (no new warnings), and the TypeScript check and page build. Since every merge is a release, a change that breaks any of them doesn't reach the team.

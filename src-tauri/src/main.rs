@@ -10,5 +10,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    // `submarine --mcp` (an AI tool started from Home): the MCP helper, with
+    // no window, before anything else, so its stdout stays MCP's.
+    if std::env::args_os().nth(1).is_some_and(|a| a == "--mcp") {
+        std::process::exit(submarine_lib::mcp_helper());
+    }
     submarine_lib::run();
 }

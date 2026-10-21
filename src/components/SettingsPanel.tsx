@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, FileEdit, Server, Home, Scale, ArrowRight, X, KeyRound, LifeBuoy, ClipboardCopy, FolderOpen, EyeOff } from "lucide-react";
+import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, FileEdit, Server, Home, Scale, ArrowRight, X, KeyRound, LifeBuoy, ClipboardCopy, FolderOpen, EyeOff, Bot } from "lucide-react";
 import {
   MAX_FONT_SIZE, MIN_FONT_SIZE, clampFontSize, fontFamilyCss,
   isFontAvailable, primaryFontName, sanitizeFontFamily,
@@ -246,6 +246,65 @@ function HomeTerminalSettings() {
           </button>
         )}
       </div>
+      {error && <p className="text-[11.5px] text-red-400">{error}</p>}
+    </div>
+  );
+}
+
+// AI tools (#32, src-tauri/src/ai): off by default, on this device only.
+// On, Home's menu lists Claude Code under AI tools, started already connected
+// to Submarine; off, nothing listens and every AI tab's access ends.
+interface AiSettings { enabled: boolean; claude: string | null; available: boolean }
+function AiToolsSettings() {
+  const [info, setInfo] = useState<AiSettings | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    invoke<AiSettings>("ai_settings").then(setInfo).catch((e) => setError(String(e)));
+  }, []);
+  const toggle = () => {
+    if (!info) return;
+    setError(null);
+    invoke<AiSettings>("ai_set_enabled", { enabled: !info.enabled }).then(setInfo).catch((e) => setError(String(e)));
+  };
+  if (!info) return error ? <p className="text-[11.5px] text-red-400">{error}</p> : null;
+  return (
+    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-3 shadow-xl">
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-zinc-100">AI tools</div>
+          <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
+            Let an AI tool started from Home ask Submarine to run commands on server tabs you share with it.
+            It never gets a key or a password, and never connects to a server itself: Submarine runs each command
+            on its own connection, only after you click Allow in the AI panel. Each AI tab only reaches the tabs
+            shared with it, and closing it ends its access.
+          </p>
+        </div>
+        <button
+          role="switch"
+          aria-checked={info.enabled}
+          aria-label="AI tools"
+          onClick={toggle}
+          className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${info.enabled ? 'bg-primary' : 'bg-zinc-700'}`}
+        >
+          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${info.enabled ? 'left-[22px]' : 'left-0.5'}`} />
+        </button>
+      </div>
+      <p className="text-[12px] text-zinc-400 leading-relaxed">
+        {info.claude ? (
+          <>Claude Code is installed: <span className="font-mono text-[11.5px] text-zinc-300 break-all select-text">{info.claude}</span>.{" "}
+            {info.enabled ? "Start it from Home: the arrow beside +, then AI tools." : "Turn this on to find it in Home's menu."}</>
+        ) : (
+          <>Claude Code isn't installed on this computer. Install it, then open this again.</>
+        )}
+      </p>
+      <p className="text-[11.5px] text-zinc-500 leading-relaxed">
+        What the AI gets back is filtered: private keys, password and token values, password hashes, access keys and
+        passwords in URLs are replaced with [hidden by Submarine]. The filter catches common shapes, not everything.
+        The AI tool runs as you on this computer, so it could read files such as ~/.ssh by itself: in Claude Code's own
+        settings (~/.claude/settings.json), deny that with{" "}
+        <span className="font-mono text-zinc-400 select-text">{'"permissions": { "deny": ["Read(~/.ssh/**)"] }'}</span>.
+        Every request and decision is logged on this computer, in ai-audit.log in the log folder (Troubleshooting).
+      </p>
       {error && <p className="text-[11.5px] text-red-400">{error}</p>}
     </div>
   );
@@ -939,6 +998,16 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
               <Home size={14} /> Home Terminal
             </div>
             <HomeTerminalSettings />
+          </section>
+        )}
+
+        {/* AI Tools Section */}
+        {!IS_ANDROID && (
+          <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
+            <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
+              <Bot size={14} /> AI Tools
+            </div>
+            <AiToolsSettings />
           </section>
         )}
 

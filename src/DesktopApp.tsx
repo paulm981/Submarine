@@ -5,7 +5,7 @@ import {
   Plus, X, RefreshCw, Terminal, Key, Trash2,
   ArrowLeftRight, Shield, User, Cpu, TerminalSquare, List, Edit2,
   StickyNote, Search, Square, Copy, ChevronLeft, MoreVertical, Radio,
-  ChevronDown, Columns, LayoutGrid, Home, Pause
+  ChevronDown, Columns, LayoutGrid, Home, Pause, Bot
 } from "lucide-react";
 
 import ProfileSelectPage from "./components/ProfileSelectPage";
@@ -29,6 +29,8 @@ import { Sidebar } from "./components/Sidebar";
 import { NodeGrid } from "./components/NodeGrid";
 import { SessionTree, type TreeItems } from "./components/SessionTree";
 import HomePane from "./components/HomePane";
+import AiPanel from "./components/AiPanel";
+import { useAi, sharedWith } from "./util/ai";
 import { IS_ANDROID } from "./util/platform";
 import type { RdpLink } from "./components/RdpLinkModal";
 import { folderTree } from "./util/folderTree";
@@ -87,6 +89,10 @@ function DesktopApp() {
   const [homeShown, setHomeShown] = useState(false);
   useEffect(() => { if (activeView === "home") setHomeShown(true); }, [activeView]);
   const [sessions, setSessions] = useState<Session[]>([]);
+  // AI help (#32, src-tauri/src/ai): what every AI tab has and asks for, and
+  // whether the AI panel is open (the title bar's AI button).
+  const ai = useAi();
+  const [aiOpen, setAiOpen] = useState(false);
   // Tracks the live status of each open session ('connecting' | 'connected'
   // | 'failed' | 'disconnected'). Updated via the callback every SessionView
   // fires on its own status change — single source of truth for the dot
@@ -1822,6 +1828,17 @@ function DesktopApp() {
               {isMergedTab && (
                 <Columns size={9} className="text-primary/70 mr-1 shrink-0" />
               )}
+              {/* Shared with an AI tab; lit while one is doing something here. */}
+              {(() => {
+                const with_ = sharedWith(ai, s.id);
+                if (with_.length === 0) return null;
+                const busy = ai.running.some(r => r.session_id === s.id) || ai.pending.some(p => p.session_id === s.id);
+                return (
+                  <span title={`Shared with ${with_.map(t => t.label).join(", ")}`} aria-label="Shared with AI" className={`mr-1 shrink-0 flex ${busy ? "text-primary animate-pulse" : "text-zinc-400"}`}>
+                    <Bot size={10} />
+                  </span>
+                );
+              })()}
               {/* Node name display. Was 10 px + uppercase on desktop — that
                   combination gave the smallest, hardest-to-read name in the
                   whole title bar even though it's the ID users need most.
@@ -1963,6 +1980,30 @@ function DesktopApp() {
               onDismiss={() => setWallsMenuOpen(false)}
             />
           )}
+        </div>
+      )}
+      {/* AI: opens the AI panel; counts the requests waiting for you. */}
+      {isUnlocked && ai.enabled && (
+        <div className="relative no-drag shrink-0 mx-1">
+          <button
+            type="button"
+            onClick={() => setAiOpen(o => !o)}
+            title={ai.pending.length ? `AI: ${ai.pending.length} waiting for you` : "AI panel"}
+            aria-label="AI panel"
+            aria-pressed={aiOpen}
+            className={`relative flex items-center justify-center w-7 h-7 rounded-full transition-all ${
+              aiOpen || ai.pending.length
+                ? "bg-primary/15 border border-primary/40 text-primary"
+                : "bg-white/[0.06] border border-white/10 text-zinc-400 hover:bg-white/[0.1] hover:text-white"
+            }`}
+          >
+            <Bot size={13} />
+            {ai.pending.length > 0 && (
+              <span className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-1 rounded-full bg-primary text-[9px] font-bold text-black flex items-center justify-center leading-none" aria-hidden="true">
+                {ai.pending.length}
+              </span>
+            )}
+          </button>
         </div>
       )}
       {/* Broadcast — MultiExec. Click (or Ctrl+Shift+B): on a Wall, its
@@ -2936,6 +2977,13 @@ function DesktopApp() {
 
           </main>
           {!isMobile && treeOpen && treeSide === "right" && sessionTree}
+          {aiOpen && ai.enabled && (
+            <AiPanel
+              snap={ai}
+              onClose={() => setAiOpen(false)}
+              onGoToServer={(sid) => { if (sessions.some(x => x.id === sid)) setActiveView(sid); }}
+            />
+          )}
         </div>
       )}
 

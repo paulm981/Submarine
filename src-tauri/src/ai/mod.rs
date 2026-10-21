@@ -1,0 +1,923 @@
+//! AI help on open sessions, without sharing keys (#32). An AI tool started
+//! from Home's menu reaches Submarine over a local channel (channel.rs,
+//! through `submarine --mcp`, helper.rs) and asks it to run commands on the
+//! servers you've shared with that AI tab. Submarine shows each request in
+//! the AI panel, runs it only once you click Allow, on its own SSH channel
+//! (exec.rs), and gives back the output with known secrets hidden
+//! (filter.rs). Every request and decision goes in the audit log (audit.rs).
+//!
+//! The AI never gets a key or a password, and never connects to a server.
+//!
+//! - **Off by default** (Settings › AI tools). Off, nothing listens, Home
+//!   lists no AI tools, and turning it off ends every AI tab's access.
+//! - **Each AI tab has its own token,** in its tool's environment only.
+//!   Servers are shared with one AI tab, checked on every request.
+//! - **Access ends** when the AI tab closes, when the server's tab closes or
+//!   reconnects, when you stop sharing, or when Submarine quits; anything
+//!   still waiting for approval is cancelled and anything running stopped.
+
+mod audit;
+mod channel;
+mod claude;
+mod exec;
+mod filter;
+pub mod helper;
+mod mcp;
+
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::{oneshot, watch};
+use zeroize::Zeroizing;
+
+use mcp::ToolResult;
+
+/// Kept with the Home terminal's settings (local_open::read_setting), on
+/// this device only: AI settings never sync.
+const SETTINGS_FILE: &str = "ai_tools.json";
+
+/// The id Home's menu names Claude Code by.
+pub(crate) const CLAUDE_ID: &str = "ai:claude";
+
+// The limits (#32 row 11).
+const MAX_COMMAND: usize = 16 * 1024;
+const DEFAULT_TIMEOUT: u64 = 60;
+pub(crate) const MAX_TIMEOUT: u64 = 600;
+/// What's read from the server, and shown to you, at most; the command is
+/// stopped past it.
+const OUTPUT_CAP: usize = 1024 * 1024;
+/// What the AI gets at most: the start and the end of the filtered output.
+const AI_HEAD: usize = 32 * 1024;
+const AI_TAIL: usize = 32 * 1024;
+/// Requests an AI tab may make in a minute, and have waiting at once.
+const RATE_MAX: usize = 20;
+const RATE_WINDOW: Duration = Duration::from_secs(60);
+const MAX_WAITING: usize = 3;
+/// Finished requests the panel keeps.
+const HISTORY: usize = 20;
+/// The panel's event.
+const CHANGED: &str = "ai-changed";
+
+#[derive(Serialize, Deserialize, Default)]
+struct Settings {
+    #[serde(default)]
+    enabled: bool,
+}
+
+type ExecFuture = Pin<Box<dyn Future<Output = Result<exec::Exec, String>> + Send>>;
+/// Runs a command on a session's connection: the real one over SshState, or
+/// a test server's.
+type Executor = Arc<dyn Fn(String, String, Duration) -> ExecFuture + Send + Sync>;
+
+/// A server shared with an AI tab.
+#[derive(Serialize, Clone, Debug)]
+struct SharedServer {
+    session_id: String,
+    /// What the AI calls it: the tab's name, made unique for this AI tab.
+    name: String,
+}
+
+struct Tab {
+    id: String,
+    label: String,
+    token: Zeroizing<String>,
+    servers: Vec<SharedServer>,
+    /// When it last asked, for the rate limit.
+    asked: VecDeque<Instant>,
+    /// Set when its access ends: its connections close.
+    closed: watch::Sender<bool>,
+}
+
+#[derive(Serialize, Clone)]
+struct PendingView {
+    id: u64,
+    tab_id: String,
+    tab_label: String,
+    session_id: String,
+    server: String,
+    command: String,
+    root: bool,
+    timeout_secs: u64,
+    asked_at: String,
+}
+
+struct Pending {
+    view: PendingView,
+    decide: oneshot::Sender<bool>,
+}
+
+#[derive(Serialize, Clone)]
+struct RunningView {
+    id: u64,
+    tab_label: String,
+    session_id: String,
+    server: String,
+    command: String,
+    started_at: String,
+}
+
+struct Running {
+    view: RunningView,
+    tab_id: String,
+    session_id: String,
+    abort: tokio::task::AbortHandle,
+}
+
+/// A finished request, for the panel: everything you see, and what the AI
+/// was given. The outputs are fetched one at a time (`ai_output`), when you
+/// open the row, not sent with every change.
+#[derive(Serialize, Clone)]
+struct Done {
+    id: u64,
+    tab_label: String,
+    server: String,
+    command: String,
+    root: bool,
+    /// denied, cancelled, done, failed, stopped.
+    outcome: &'static str,
+    exit_code: Option<i64>,
+    /// The whole output, up to OUTPUT_CAP.
+    #[serde(skip)]
+    output: String,
+    /// What the AI got.
+    #[serde(skip)]
+    ai_output: String,
+    output_bytes: usize,
+    hidden: usize,
+    cut: bool,
+    timed_out: bool,
+    error: Option<String>,
+    at: String,
+}
+
+#[derive(Serialize, Clone)]
+struct TabView {
+    id: String,
+    label: String,
+    servers: Vec<SharedServer>,
+}
+
+/// The AI panel's view of everything.
+#[derive(Serialize, Clone)]
+pub(crate) struct Snapshot {
+    enabled: bool,
+    tabs: Vec<TabView>,
+    pending: Vec<PendingView>,
+    running: Vec<RunningView>,
+    history: Vec<Done>,
+    audit_log: Option<String>,
+}
+
+#[derive(Default)]
+struct Shared {
+    enabled: bool,
+    tabs: Vec<Tab>,
+    pending: Vec<Pending>,
+    running: Vec<Running>,
+    history: VecDeque<Done>,
+    next_id: u64,
+}
+
+struct Inner {
+    shared: Mutex<Shared>,
+    listener: Mutex<Option<channel::Listener>>,
+    exec: Executor,
+    changed: Box<dyn Fn() + Send + Sync>,
+    audit: audit::AuditLog,
+}
+
+#[derive(Clone)]
+pub struct AiState(Arc<Inner>);
+
+fn now() -> String {
+    chrono::Local::now().to_rfc3339()
+}
+
+/// A command that asks for root: one of the tools that give it, as a word
+/// of its own (`sudo x`, `/usr/bin/sudo`, `(su -)`), anywhere in it.
+pub(crate) fn asks_for_root(command: &str) -> bool {
+    use std::sync::LazyLock;
+    static RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r#"(?:^|[\s;|&(){}`'"/!])(?:sudo|dzdo|su|doas|pkexec)(?:$|[\s;|&(){}`'"])"#).unwrap());
+    RE.is_match(command)
+}
+
+/// Equal without saying where they differ.
+fn same_token(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// The start and the end of `text` when it's longer than the AI is given.
+fn shorten_for_ai(text: &str) -> String {
+    if text.len() <= AI_HEAD + AI_TAIL {
+        return text.to_string();
+    }
+    let mut head = AI_HEAD;
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len() - AI_TAIL;
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}\n… [{} bytes left out by Submarine] …\n{}", &text[..head], tail - head, &text[tail..])
+}
+
+/// A name for `wanted` that no other server of this AI tab has.
+fn unique_name(servers: &[SharedServer], wanted: &str) -> String {
+    let wanted = wanted.trim();
+    let base = if wanted.is_empty() { "server" } else { wanted };
+    if !servers.iter().any(|s| s.name == base) {
+        return base.to_string();
+    }
+    (2..).map(|n| format!("{base} ({n})")).find(|n| !servers.iter().any(|s| &s.name == n)).unwrap()
+}
+
+impl AiState {
+    fn new(exec: Executor, changed: Box<dyn Fn() + Send + Sync>, audit_dir: Option<PathBuf>) -> AiState {
+        AiState(Arc::new(Inner {
+            shared: Mutex::new(Shared::default()),
+            listener: Mutex::new(None),
+            exec,
+            changed,
+            audit: audit::AuditLog::new(audit_dir),
+        }))
+    }
+
+    /// The app's: commands run over SshState's connections, and the page
+    /// hears of each change.
+    pub(crate) fn for_app(app: &tauri::AppHandle) -> AiState {
+        use tauri::{Emitter, Manager};
+        let exec_app = app.clone();
+        let exec: Executor = Arc::new(move |session_id, command, limit| {
+            let app = exec_app.clone();
+            Box::pin(async move {
+                let state = app.state::<crate::ssh_manager::SshState>();
+                let handle = state.connections.lock().await.get(&session_id).cloned();
+                let handle = handle.ok_or("That server's tab isn't connected right now.")?;
+                exec::run(&handle, &command, limit, OUTPUT_CAP).await
+            })
+        });
+        let emit_app = app.clone();
+        let changed = Box::new(move || {
+            let _ = emit_app.emit(CHANGED, ());
+        });
+        let state = AiState::new(exec, changed, app.path().app_log_dir().ok());
+        let settings: Settings = crate::local_open::read_setting(app, SETTINGS_FILE).unwrap_or_default();
+        if settings.enabled {
+            let s = state.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = s.turn_on() {
+                    crate::applog::write_line("ai", &format!("AI tools couldn't start: {e}"));
+                }
+            });
+        }
+        state
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Shared> {
+        self.0.shared.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn changed(&self) {
+        (self.0.changed)();
+    }
+
+    fn audit(&self, entry: audit::Entry) {
+        self.0.audit.write(&entry);
+    }
+
+    /// Start listening. In a tokio runtime.
+    fn turn_on(&self) -> Result<(), String> {
+        let mut listener = self.0.listener.lock().unwrap_or_else(|e| e.into_inner());
+        if listener.is_none() {
+            let state = self.clone();
+            let on: channel::OnConnect = Arc::new(move |stream| {
+                let state = state.clone();
+                tokio::spawn(async move { state.serve(stream).await });
+            });
+            *listener = Some(channel::listen(on).map_err(|e| format!("Couldn't open the local channel: {e}"))?);
+        }
+        drop(listener);
+        self.lock().enabled = true;
+        self.changed();
+        Ok(())
+    }
+
+    /// Stop listening, and end every AI tab's access.
+    fn turn_off(&self) {
+        let ids: Vec<String> = self.lock().tabs.iter().map(|t| t.id.clone()).collect();
+        for id in ids {
+            self.end_tab(&id);
+        }
+        *self.0.listener.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.lock().enabled = false;
+        self.changed();
+    }
+
+    pub(crate) fn enabled(&self) -> bool {
+        self.lock().enabled
+    }
+
+    /// The listener's address while AI tools are on.
+    fn addr(&self) -> Option<String> {
+        self.0.listener.lock().ok()?.as_ref().map(|l| l.addr().to_string())
+    }
+
+    // -- AI tabs ------------------------------------------------------------
+
+    /// A new AI tab, `id` being its Home terminal's: its label, and the
+    /// variables its tool starts with (the channel's address and its token).
+    pub(crate) fn start_tab(&self, id: &str, short: &str) -> Result<(String, Vec<(String, String)>), String> {
+        let addr = self.addr().ok_or("AI tools are off. Turn them on in Settings › AI tools.")?;
+        let token = Zeroizing::new(channel::random_hex(32));
+        let mut s = self.lock();
+        if s.tabs.iter().any(|t| t.id == id) {
+            return Err("That AI tab is already open.".into());
+        }
+        let label = (1..)
+            .map(|n| if n == 1 { short.to_string() } else { format!("{short} {n}") })
+            .find(|l| !s.tabs.iter().any(|t| &t.label == l))
+            .unwrap();
+        let env = vec![(channel::ENV_ADDR.to_string(), addr), (channel::ENV_TOKEN.to_string(), token.to_string())];
+        s.tabs.push(Tab { id: id.to_string(), label: label.clone(), token, servers: Vec::new(), asked: VecDeque::new(), closed: watch::channel(false).0 });
+        drop(s);
+        self.audit(audit::Entry::new("ai_tab_started", &label));
+        self.changed();
+        Ok((label, env))
+    }
+
+    /// The AI tab closed (or its tool ended): its token stops working, its
+    /// connections close, what it asked for is cancelled. Nothing for a tab
+    /// that isn't an AI tab.
+    pub(crate) fn end_tab(&self, id: &str) {
+        let tab = {
+            let mut s = self.lock();
+            let Some(at) = s.tabs.iter().position(|t| t.id == id) else { return };
+            s.tabs.remove(at)
+        };
+        let _ = tab.closed.send(true);
+        self.cancel_where(|tab_id, _| tab_id == id);
+        self.audit(audit::Entry::new("ai_tab_ended", &tab.label));
+        self.changed();
+    }
+
+    /// The tab whose token this is, and its "access ended" signal.
+    fn tab_for_token(&self, token: &str) -> Option<(String, watch::Receiver<bool>)> {
+        let s = self.lock();
+        if !s.enabled {
+            return None;
+        }
+        // Every token compared, so the time taken says nothing.
+        let mut found = None;
+        for t in &s.tabs {
+            if same_token(&t.token, token) {
+                found = Some((t.id.clone(), t.closed.subscribe()));
+            }
+        }
+        found
+    }
+
+    // -- Sharing -----------------------------------------------------------
+
+    fn share(&self, tab_id: &str, session_id: &str, name: &str) -> Result<(), String> {
+        let mut s = self.lock();
+        let tab = s.tabs.iter_mut().find(|t| t.id == tab_id).ok_or("That AI tab isn't open any more.")?;
+        if tab.servers.iter().any(|x| x.session_id == session_id) {
+            return Ok(());
+        }
+        let name = unique_name(&tab.servers, name);
+        tab.servers.push(SharedServer { session_id: session_id.to_string(), name: name.clone() });
+        let label = tab.label.clone();
+        drop(s);
+        let mut e = audit::Entry::new("shared", &label);
+        e.server = Some(name);
+        self.audit(e);
+        self.changed();
+        Ok(())
+    }
+
+    /// Stop sharing `session_id` with `tab_id`, or with every AI tab.
+    fn unshare(&self, session_id: &str, tab_id: Option<&str>, why: &str) {
+        let mut gone = Vec::new();
+        {
+            let mut s = self.lock();
+            for t in s.tabs.iter_mut().filter(|t| tab_id.is_none_or(|id| id == t.id)) {
+                if let Some(at) = t.servers.iter().position(|x| x.session_id == session_id) {
+                    gone.push((t.id.clone(), t.label.clone(), t.servers.remove(at).name));
+                }
+            }
+        }
+        if gone.is_empty() {
+            return;
+        }
+        for (id, label, name) in gone {
+            self.cancel_where(|tab, session| tab == id && session == session_id);
+            let mut e = audit::Entry::new("unshared", &label);
+            e.server = Some(name);
+            e.note = Some(why.to_string());
+            self.audit(e);
+        }
+        self.changed();
+    }
+
+    /// The server's tab closed, or connects again: it's no longer shared.
+    pub(crate) fn session_gone(&self, session_id: &str, why: &str) {
+        self.unshare(session_id, None, why);
+    }
+
+    /// Stop: everything shared with this AI tab, and what it's asked for.
+    fn stop_tab(&self, tab_id: &str) {
+        let sessions: Vec<String> = self
+            .lock()
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .map(|t| t.servers.iter().map(|x| x.session_id.clone()).collect())
+            .unwrap_or_default();
+        for s in sessions {
+            self.unshare(&s, Some(tab_id), "stopped");
+        }
+        self.cancel_where(|tab, _| tab == tab_id);
+        self.changed();
+    }
+
+    /// Cancel the waiting requests, and stop the running ones, for which
+    /// `which(tab_id, session_id)` holds.
+    fn cancel_where(&self, which: impl Fn(&str, &str) -> bool) {
+        let (pending, running) = {
+            let mut s = self.lock();
+            let (gone, keep): (Vec<Pending>, Vec<Pending>) = s.pending.drain(..).partition(|p| which(&p.view.tab_id, &p.view.session_id));
+            s.pending = keep;
+            let (stop, run): (Vec<Running>, Vec<Running>) = s.running.drain(..).partition(|r| which(&r.tab_id, &r.session_id));
+            s.running = run;
+            (gone, stop)
+        };
+        // Dropping a request's sender is what cancels it.
+        drop(pending);
+        for r in running {
+            r.abort.abort();
+        }
+    }
+
+    fn decide(&self, id: u64, allow: bool) -> Result<(), String> {
+        let p = {
+            let mut s = self.lock();
+            let at = s.pending.iter().position(|p| p.view.id == id).ok_or("That request isn't waiting any more.")?;
+            s.pending.remove(at)
+        };
+        let _ = p.decide.send(allow);
+        self.changed();
+        Ok(())
+    }
+
+    pub(crate) fn snapshot(&self) -> Snapshot {
+        let s = self.lock();
+        Snapshot {
+            enabled: s.enabled,
+            tabs: s.tabs.iter().map(|t| TabView { id: t.id.clone(), label: t.label.clone(), servers: t.servers.clone() }).collect(),
+            pending: s.pending.iter().map(|p| p.view.clone()).collect(),
+            running: s.running.iter().map(|r| r.view.clone()).collect(),
+            history: s.history.iter().rev().cloned().collect(),
+            audit_log: self.0.audit.path().map(|p| p.to_string_lossy().into_owned()),
+        }
+    }
+
+    fn remember(&self, done: Done) {
+        let mut s = self.lock();
+        s.history.push_back(done);
+        while s.history.len() > HISTORY {
+            s.history.pop_front();
+        }
+    }
+
+    // -- The channel and MCP --------------------------------------------------
+
+    /// One connection from a helper: its hello first, then MCP for its tab.
+    async fn serve(&self, stream: Box<dyn channel::Stream>) {
+        use tokio::io::AsyncWriteExt;
+        let (r, mut w) = tokio::io::split(stream);
+        let mut r = tokio::io::BufReader::new(r);
+        let hello = tokio::time::timeout(Duration::from_secs(5), channel::read_line(&mut r, 4096)).await;
+        let token = hello
+            .ok()
+            .and_then(|l| l.ok().flatten())
+            .and_then(|l| serde_json::from_str::<channel::Hello>(&l).ok())
+            .filter(|h| h.submarine_ai == channel::PROTOCOL)
+            .map(|h| Zeroizing::new(h.token));
+        let tab = token.as_deref().and_then(|t| self.tab_for_token(t));
+        let welcome = match &tab {
+            Some(_) => channel::Welcome { ok: true, error: None },
+            None => channel::Welcome {
+                ok: false,
+                error: Some("Submarine doesn't know this AI tab: its access has ended, or it wasn't started from Submarine's Home menu.".into()),
+            },
+        };
+        let mut line = serde_json::to_string(&welcome).unwrap_or_default();
+        line.push('\n');
+        if w.write_all(line.as_bytes()).await.is_err() {
+            return;
+        }
+        let _ = w.flush().await;
+        let Some((tab_id, closed)) = tab else { return };
+        mcp::serve(self.clone(), tab_id, closed, r, w).await;
+    }
+
+    async fn call_tool(&self, tab_id: &str, name: &str, args: &serde_json::Value, cancel: watch::Receiver<bool>) -> ToolResult {
+        match name {
+            "list_shared" => self.list_shared(tab_id),
+            "run_command" => {
+                let server = args.get("server").and_then(|v| v.as_str()).unwrap_or("");
+                let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                let timeout = args.get("timeout_seconds").and_then(|v| v.as_u64());
+                self.run_command(tab_id, server, command, timeout, cancel).await
+            }
+            _ => ToolResult::err(format!("Submarine has no tool called {name}.")),
+        }
+    }
+
+    fn list_shared(&self, tab_id: &str) -> ToolResult {
+        let s = self.lock();
+        let Some(tab) = s.tabs.iter().find(|t| t.id == tab_id) else {
+            return ToolResult::err("This AI tab's access has ended.");
+        };
+        if tab.servers.is_empty() {
+            return ToolResult::ok(
+                "No servers are shared with you yet. Ask the user to open the server's tab in Submarine and click Share with AI on its toolbar.",
+            );
+        }
+        let names: Vec<&str> = tab.servers.iter().map(|x| x.name.as_str()).collect();
+        ToolResult::ok(serde_json::json!({ "servers": names }).to_string())
+    }
+
+    /// Refused before it reaches you: logged, and the AI told why.
+    fn refuse(&self, label: &str, server: &str, command: &str, why: String) -> ToolResult {
+        let mut e = audit::Entry::new("request", label);
+        e.request = Some("run_command");
+        e.server = Some(server.to_string()).filter(|s| !s.is_empty());
+        e.command = Some(command.to_string());
+        e.decision = Some("refused");
+        e.by = Some("Submarine");
+        e.note = Some(why.clone());
+        self.audit(e);
+        ToolResult::err(why)
+    }
+
+    async fn run_command(&self, tab_id: &str, server: &str, command: &str, timeout: Option<u64>, mut cancel: watch::Receiver<bool>) -> ToolResult {
+        // Checked before anything is shown to you.
+        let (label, session_id, server, id, rx) = {
+            let mut s = self.lock();
+            let next_id = s.next_id + 1;
+            let waiting = s.pending.iter().filter(|p| p.view.tab_id == tab_id).count();
+            let Some(tab) = s.tabs.iter_mut().find(|t| t.id == tab_id) else {
+                return ToolResult::err("This AI tab's access has ended.");
+            };
+            let label = tab.label.clone();
+            let refuse = |why: String| (label.clone(), why);
+            let checked: Result<SharedServer, (String, String)> = (|| {
+                if command.trim().is_empty() {
+                    return Err(refuse("No command was given.".into()));
+                }
+                if command.len() > MAX_COMMAND || command.contains('\0') {
+                    return Err(refuse(format!("The command is longer than {} KB, or has a NUL character.", MAX_COMMAND / 1024)));
+                }
+                if timeout.is_some_and(|t| t == 0 || t > MAX_TIMEOUT) {
+                    return Err(refuse(format!("timeout_seconds must be from 1 to {MAX_TIMEOUT}.")));
+                }
+                let Some(found) = tab.servers.iter().find(|x| x.name == server) else {
+                    let names: Vec<&str> = tab.servers.iter().map(|x| x.name.as_str()).collect();
+                    return Err(refuse(if names.is_empty() {
+                        format!("{server} isn't shared with you, and no server is. Ask the user to click Share with AI on its tab.")
+                    } else {
+                        format!("{server} isn't shared with you. Shared: {}. Ask the user to click Share with AI on its tab.", names.join(", "))
+                    }));
+                };
+                let found = found.clone();
+                let cutoff = Instant::now() - RATE_WINDOW;
+                while tab.asked.front().is_some_and(|t| *t < cutoff) {
+                    tab.asked.pop_front();
+                }
+                if tab.asked.len() >= RATE_MAX {
+                    return Err(refuse(format!("Too many requests: at most {RATE_MAX} a minute. Wait a moment.")));
+                }
+                if waiting >= MAX_WAITING {
+                    return Err(refuse(format!("{MAX_WAITING} requests are already waiting for the user. Wait for them first.")));
+                }
+                tab.asked.push_back(Instant::now());
+                Ok(found)
+            })();
+            let found = match checked {
+                Ok(f) => f,
+                Err((label, why)) => {
+                    drop(s);
+                    return self.refuse(&label, server, command, why);
+                }
+            };
+            s.next_id = next_id;
+            let (tx, rx) = oneshot::channel();
+            s.pending.push(Pending {
+                view: PendingView {
+                    id: next_id,
+                    tab_id: tab_id.to_string(),
+                    tab_label: label.clone(),
+                    session_id: found.session_id.clone(),
+                    server: found.name.clone(),
+                    command: command.to_string(),
+                    root: asks_for_root(command),
+                    timeout_secs: timeout.unwrap_or(DEFAULT_TIMEOUT),
+                    asked_at: now(),
+                },
+                decide: tx,
+            });
+            (label, found.session_id, found.name, next_id, rx)
+        };
+        self.changed();
+        let root = asks_for_root(command);
+        let limit = Duration::from_secs(timeout.unwrap_or(DEFAULT_TIMEOUT));
+        let entry = || {
+            let mut e = audit::Entry::new("request", &label);
+            e.request = Some("run_command");
+            e.server = Some(server.clone());
+            e.command = Some(command.to_string());
+            e.root = root;
+            e
+        };
+        let done = |outcome: &'static str| Done {
+            id,
+            tab_label: label.clone(),
+            server: server.clone(),
+            command: command.to_string(),
+            root,
+            outcome,
+            exit_code: None,
+            output: String::new(),
+            ai_output: String::new(),
+            output_bytes: 0,
+            hidden: 0,
+            cut: false,
+            timed_out: false,
+            error: None,
+            at: now(),
+        };
+
+        // Waiting for you.
+        let decision = tokio::select! {
+            d = rx => d.ok(),
+            _ = cancel.wait_for(|c| *c) => None,
+        };
+        let allowed = match decision {
+            Some(a) => a,
+            None => {
+                // Cancelled: by the AI, or its access ended. Gone from the
+                // waiting list either way.
+                let was_waiting = {
+                    let mut s = self.lock();
+                    let before = s.pending.len();
+                    s.pending.retain(|p| p.view.id != id);
+                    before != s.pending.len()
+                };
+                let mut e = entry();
+                e.decision = Some("cancelled");
+                e.note = Some(if was_waiting { "cancelled by the AI tool" } else { "access ended" }.into());
+                self.audit(e);
+                self.remember(done("cancelled"));
+                self.changed();
+                return ToolResult::err("Cancelled before the user decided: the server isn't shared any more, or the request was withdrawn.");
+            }
+        };
+        if !allowed {
+            let mut e = entry();
+            e.decision = Some("denied");
+            e.by = Some("you");
+            self.audit(e);
+            self.remember(done("denied"));
+            self.changed();
+            return ToolResult::err("Denied by the user.");
+        }
+
+        // Allowed: run it, stoppable by an end of access.
+        let exec = (self.0.exec)(session_id.clone(), command.to_string(), limit);
+        let task = tokio::spawn(exec);
+        self.lock().running.push(Running {
+            view: RunningView { id, tab_label: label.clone(), session_id: session_id.clone(), server: server.clone(), command: command.to_string(), started_at: now() },
+            tab_id: tab_id.to_string(),
+            session_id: session_id.clone(),
+            abort: task.abort_handle(),
+        });
+        self.changed();
+        let abort = task.abort_handle();
+        // None: stopped before it finished.
+        let result: Option<Result<exec::Exec, String>> = tokio::select! {
+            r = task => r.ok(),
+            _ = cancel.wait_for(|c| *c) => {
+                abort.abort();
+                None
+            }
+        };
+        self.lock().running.retain(|r| r.view.id != id);
+
+        let mut e = entry();
+        e.decision = Some("allowed");
+        e.by = Some("you");
+        let mut d = done("done");
+        let answer = match result {
+            Some(Ok(out)) => {
+                let text = String::from_utf8_lossy(&out.output).into_owned();
+                let f = filter::filter(&text);
+                let ai = shorten_for_ai(&f.text);
+                let exit = out.exit_status.map(i64::from);
+                let mut head = match (exit, &out.exit_signal) {
+                    (Some(c), _) => format!("Exit code: {c}\n"),
+                    (None, Some(sig)) => format!("Ended by signal {sig}\n"),
+                    (None, None) => "Exit code: unknown\n".to_string(),
+                };
+                if out.timed_out {
+                    head.push_str(&format!("Stopped by Submarine after {} seconds.\n", limit.as_secs()));
+                }
+                if out.cut {
+                    head.push_str(&format!("Stopped by Submarine after {} MB of output.\n", OUTPUT_CAP / (1024 * 1024)));
+                }
+                if f.hidden > 0 {
+                    head.push_str(&format!(
+                        "Submarine hid {} item{} that looked like secrets (shown as {}).\n",
+                        f.hidden,
+                        if f.hidden == 1 { "" } else { "s" },
+                        filter::HIDDEN
+                    ));
+                }
+                let answer = format!("{head}--- output ---\n{ai}");
+                e.exit_code = exit;
+                e.bytes_returned = Some(ai.len());
+                e.items_hidden = Some(f.hidden);
+                if out.timed_out {
+                    e.note = Some("timed out".into());
+                } else if out.cut {
+                    e.note = Some("output cap reached".into());
+                }
+                d.exit_code = exit;
+                d.output_bytes = out.output.len();
+                d.output = text;
+                d.ai_output = ai;
+                d.hidden = f.hidden;
+                d.cut = out.cut;
+                d.timed_out = out.timed_out;
+                ToolResult::ok(answer)
+            }
+            Some(Err(err)) => {
+                e.note = Some(err.clone());
+                d.outcome = "failed";
+                d.error = Some(err.clone());
+                ToolResult::err(format!("Couldn't run it: {err}"))
+            }
+            None => {
+                e.note = Some("stopped: access ended".into());
+                d.outcome = "stopped";
+                ToolResult::err("Stopped: the server isn't shared any more, or the request was withdrawn.")
+            }
+        };
+        self.audit(e);
+        self.remember(d);
+        self.changed();
+        answer
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tauri commands
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct AiSettings {
+    enabled: bool,
+    /// Where Claude Code is, when it's installed.
+    claude: Option<String>,
+    available: bool,
+}
+
+fn settings_view(state: &AiState) -> AiSettings {
+    AiSettings {
+        enabled: state.enabled(),
+        claude: claude::find().map(|p| p.to_string_lossy().into_owned()),
+        available: cfg!(not(target_os = "android")),
+    }
+}
+
+#[tauri::command]
+pub async fn ai_settings(state: tauri::State<'_, AiState>) -> Result<AiSettings, String> {
+    Ok(settings_view(&state))
+}
+
+#[tauri::command]
+pub async fn ai_set_enabled(app: tauri::AppHandle, state: tauri::State<'_, AiState>, enabled: bool) -> Result<AiSettings, String> {
+    if cfg!(target_os = "android") {
+        return Err("AI tools aren't available on Android.".into());
+    }
+    crate::local_open::write_setting(&app, SETTINGS_FILE, &Settings { enabled }, "the AI tools setting")?;
+    if enabled {
+        state.turn_on()?;
+    } else {
+        state.turn_off();
+    }
+    Ok(settings_view(&state))
+}
+
+#[tauri::command]
+pub async fn ai_state(state: tauri::State<'_, AiState>) -> Result<Snapshot, String> {
+    Ok(state.snapshot())
+}
+
+/// Share a server's tab with an AI tab. `name`: the tab's name, which the
+/// AI will call it by.
+#[tauri::command]
+pub async fn ai_share(state: tauri::State<'_, AiState>, ssh: tauri::State<'_, crate::ssh_manager::SshState>, tab_id: String, session_id: String, name: String) -> Result<(), String> {
+    if session_id.contains("::") || !ssh.connections.lock().await.contains_key(&session_id) {
+        return Err("That server's tab isn't connected.".into());
+    }
+    state.share(&tab_id, &session_id, &name)
+}
+
+/// Stop sharing a server: with one AI tab, or (no `tab_id`) with any.
+#[tauri::command]
+pub async fn ai_unshare(state: tauri::State<'_, AiState>, session_id: String, tab_id: Option<String>) -> Result<(), String> {
+    state.unshare(&session_id, tab_id.as_deref(), "stopped sharing");
+    Ok(())
+}
+
+/// The panel's Stop for an AI tab.
+#[tauri::command]
+pub async fn ai_stop(state: tauri::State<'_, AiState>, tab_id: String) -> Result<(), String> {
+    state.stop_tab(&tab_id);
+    Ok(())
+}
+
+#[derive(Serialize)]
+pub struct DoneOutput {
+    output: String,
+    ai_output: String,
+}
+
+/// A finished request's whole output, and what the AI got.
+#[tauri::command]
+pub async fn ai_output(state: tauri::State<'_, AiState>, id: u64) -> Result<DoneOutput, String> {
+    let s = state.lock();
+    let d = s.history.iter().find(|d| d.id == id).ok_or("That request's output is no longer kept.")?;
+    Ok(DoneOutput { output: d.output.clone(), ai_output: d.ai_output.clone() })
+}
+
+#[tauri::command]
+pub async fn ai_decide(state: tauri::State<'_, AiState>, id: u64, allow: bool) -> Result<(), String> {
+    state.decide(id, allow)
+}
+
+// ---------------------------------------------------------------------------
+// Home's menu
+// ---------------------------------------------------------------------------
+
+/// An AI tool Home's menu can start, while AI tools are on and it's installed.
+pub(crate) fn home_tools(state: &AiState) -> Vec<(String, String, PathBuf)> {
+    if !state.enabled() {
+        return Vec::new();
+    }
+    claude::find().map(|p| (CLAUDE_ID.to_string(), claude::LABEL.to_string(), p)).into_iter().collect()
+}
+
+/// The program an AI tool runs as `submarine --mcp`: this one, or on Linux
+/// the AppImage it came in (its own folder is a mount that needs the
+/// AppImage's start-up to find its libraries).
+fn helper_path() -> Result<PathBuf, String> {
+    #[cfg(target_os = "linux")]
+    if let Some(image) = std::env::var_os("APPIMAGE").map(PathBuf::from).filter(|p| p.is_absolute() && p.is_file()) {
+        return Ok(image);
+    }
+    std::env::current_exe().map_err(|e| format!("Couldn't find Submarine itself: {e}"))
+}
+
+/// What Home starts for an AI tool, and the tab's label.
+pub(crate) struct HomeLaunch {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub label: String,
+}
+
+/// What Home starts for the AI tool `id` in the terminal `tab_id`.
+pub(crate) fn home_launch(app: &tauri::AppHandle, state: &AiState, id: &str, tab_id: &str) -> Result<HomeLaunch, String> {
+    use tauri::Manager;
+    if id != CLAUDE_ID {
+        return Err("Submarine doesn't know that AI tool.".into());
+    }
+    let path = claude::find().ok_or("Claude Code isn't installed on this computer.")?;
+    let helper = helper_path()?;
+    let data = app.path().app_data_dir().ok();
+    let launch = claude::launch(&path, &helper, data.as_deref())?;
+    let (label, mut env) = state.start_tab(tab_id, claude::SHORT)?;
+    env.extend(launch.env);
+    Ok(HomeLaunch { program: launch.program, args: launch.args, env, label })
+}
+
+#[cfg(test)]
+mod tests;

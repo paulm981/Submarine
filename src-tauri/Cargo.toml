@@ -175,7 +175,9 @@ portable-pty = "0.9"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Pipes"] }
+# The AI channel's named pipe (ai/channel.rs) is locked to your account:
+# Security_Authorization for its access rules, Threading for your SID.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 # ---------------------------------------------------------------------------
 # Linux-only. GTK's own crates, already in the build through Tauri (same

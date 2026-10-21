@@ -7,6 +7,11 @@
 //! The page only ever names a shell by id from [`shells`]: what each id runs
 //! is decided here. The one free choice, a program of the user's own, is made
 //! in a native dialog (as Live Edit's editor is), never passed in by the page.
+//!
+//! The AI tools heading (#32) lists the AI tools Home can start, connected to
+//! Submarine, while AI tools are on in Settings (ai/mod.rs): an AI tab is a
+//! Home terminal whose program is the AI tool, started with its channel's
+//! address and its own token in its environment.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -57,6 +62,7 @@ const GROUP_SYSTEM: &str = "This computer";
 #[cfg(windows)]
 const GROUP_WSL: &str = "WSL";
 const GROUP_CUSTOM: &str = "Your choice";
+const GROUP_AI: &str = "AI tools";
 
 /// A shell the Home view can start.
 #[derive(Serialize, Clone, Debug)]
@@ -72,10 +78,13 @@ pub struct Shell {
     program: PathBuf,
     #[serde(skip)]
     args: Vec<String>,
+    /// Added to its environment: an AI tab's address and token.
+    #[serde(skip)]
+    env: Vec<(String, String)>,
 }
 
 fn shell(id: impl Into<String>, label: impl Into<String>, group: &'static str, program: PathBuf, args: &[&str]) -> Shell {
-    Shell { id: id.into(), label: label.into(), group, detail: None, program, args: args.iter().map(|a| a.to_string()).collect() }
+    Shell { id: id.into(), label: label.into(), group, detail: None, program, args: args.iter().map(|a| a.to_string()).collect(), env: Vec::new() }
 }
 
 impl Shell {
@@ -387,6 +396,21 @@ pub struct LocalShells {
     /// gone (moved or uninstalled), so Settings can say so.
     custom: Option<String>,
     custom_missing: bool,
+    /// The AI tools heading: what's installed, while AI tools are on. Never
+    /// a default shell.
+    ai_tools: Vec<Shell>,
+}
+
+fn ai_tools(app: &tauri::AppHandle) -> Vec<Shell> {
+    use tauri::Manager;
+    let Some(state) = app.try_state::<crate::ai::AiState>() else { return Vec::new() };
+    crate::ai::home_tools(&state)
+        .into_iter()
+        .map(|(id, label, path)| {
+            let shown = path.display().to_string();
+            shell(id, label, GROUP_AI, path, &[]).detail(shown)
+        })
+        .collect()
 }
 
 fn local_shells_info(app: &tauri::AppHandle) -> LocalShells {
@@ -405,7 +429,7 @@ fn local_shells_info(app: &tauri::AppHandle) -> LocalShells {
         .or_else(|| shells.first().map(|s| s.id.clone()))
         .unwrap_or_default();
     let custom_missing = config.custom.is_some() && custom_program(&config).is_none();
-    LocalShells { shells, notes, default_id, custom: config.custom, custom_missing }
+    LocalShells { shells, notes, default_id, custom: config.custom, custom_missing, ai_tools: ai_tools(app) }
 }
 
 /// local_shells_info off the async runtime: listing WSL waits on wsl.exe.
@@ -556,6 +580,7 @@ mod pty {
         let output = std::sync::Arc::new(crate::term_output::OutputSink::open(id, on_output));
         let end_output = output.clone();
         let (end_app, end_id) = (app.clone(), id.to_string());
+        let ai_app = app.clone();
         spawn(
             terms,
             id,
@@ -564,6 +589,10 @@ mod pty {
             (cols, rows),
             move |batch| output.push(batch),
             move || {
+                // An AI tab's access ends with its tool.
+                if let Some(ai) = ai_app.try_state::<crate::ai::AiState>() {
+                    ai.end_tab(&end_id);
+                }
                 end_output.push(
                     &mut b"\r\n\x1b[2m[The shell has ended. Close this tab, or open a new one with +.]\x1b[0m\r\n".to_vec(),
                 );
@@ -675,6 +704,9 @@ mod pty {
         }
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        for (k, v) in &shell.env {
+            cmd.env(k, v);
+        }
         // An app started from Finder gets no locale, and zsh then shows any
         // non-ASCII text as escapes.
         #[cfg(target_os = "macos")]
@@ -800,6 +832,9 @@ pub async fn local_terminal_open(
     {
         let terms = terms.inner().clone();
         tauri::async_runtime::spawn_blocking(move || {
+            if let Some(tool) = shell.as_deref().filter(|id| id.starts_with("ai:")) {
+                return open_ai_tool(&app, &terms, &terminal_id, tool, cols, rows, on_output);
+            }
             let config = read_config(&app);
             let chosen = match shell {
                 Some(id) => find_shell(&config, &id),
@@ -812,6 +847,34 @@ pub async fn local_terminal_open(
         .await
         .map_err(|e| format!("[LOCAL_TERM] OPEN_FAILED: {}", e))?
     }
+}
+
+/// An AI tool from the AI tools heading, connected: its label in the AI
+/// panel is the tab's.
+#[cfg(not(target_os = "android"))]
+fn open_ai_tool(
+    app: &tauri::AppHandle,
+    terms: &LocalTerms,
+    terminal_id: &str,
+    tool: &str,
+    cols: u16,
+    rows: u16,
+    on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+) -> Result<String, String> {
+    use tauri::Manager;
+    if !valid_id(terminal_id) {
+        return Err("[LOCAL_TERM] BAD_ID".into());
+    }
+    let ai = app.state::<crate::ai::AiState>();
+    let launch = crate::ai::home_launch(app, &ai, tool, terminal_id)?;
+    let mut s = shell(tool, launch.label.clone(), GROUP_AI, launch.program, &[]);
+    s.args = launch.args;
+    s.env = launch.env;
+    if let Err(e) = pty::open(app, terms, terminal_id, &s, cols, rows, on_output) {
+        ai.end_tab(terminal_id);
+        return Err(e);
+    }
+    Ok(launch.label)
 }
 
 #[tauri::command]
@@ -841,7 +904,13 @@ pub async fn local_terminal_resize(terms: tauri::State<'_, LocalTerms>, terminal
 }
 
 #[tauri::command]
-pub async fn local_terminal_close(terms: tauri::State<'_, LocalTerms>, terminal_id: String) -> Result<(), String> {
+pub async fn local_terminal_close(
+    terms: tauri::State<'_, LocalTerms>,
+    ai: tauri::State<'_, crate::ai::AiState>,
+    terminal_id: String,
+) -> Result<(), String> {
+    // Closing an AI tab ends its access at once, before its tool has gone.
+    ai.end_tab(&terminal_id);
     #[cfg(target_os = "android")]
     {
         let _ = (&terms, terminal_id);
