@@ -9,7 +9,7 @@ import { OsBadge } from "./OsBadge";
 import { HeldReview } from "./HeldReview";
 import { HeldDeletions } from "./HeldDeletions";
 
-export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFolderIdProp, onActiveFolderChange, onOpenServer, onEditServer, onAddClick, onQuickConnect, onRemoveServer, onRemoveFolder, onRenameFolder, onCreateFolder, onCloneServer, onReorderServers, onOpenRdp, onSaveRdp, onRemoveRdp, onAllowHeld, keyChange, onAcceptKey, heldDeletions, onResolveDeletions, isMobile }: any) => {
+export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFolderIdProp, onActiveFolderChange, onOpenServer, onEditServer, onAddClick, onQuickConnect, onRemoveServer, onRemoveFolder, onRenameFolder, onCreateFolder, onCloneServer, onReorderServers, onOpenRdp, onSaveRdp, onRemoveRdp, onAllowHeld, onKeepSsh, keyChange, onAcceptKey, heldDeletions, onResolveDeletions, isMobile }: any) => {
   const [search, setSearch] = useState("");
   // Changes someone else made in a shared profile that this device holds
   // back until its user allows them (see HeldReview).
@@ -611,7 +611,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
         </div>
       )}
       {reviewOpen && onAllowHeld && (
-        <HeldReview servers={servers || []} onAllow={onAllowHeld} onClose={closeReview} />
+        <HeldReview servers={servers || []} onAllow={onAllowHeld} onKeepSsh={onKeepSsh} onClose={closeReview} />
       )}
       {deletionCount > 0 && onResolveDeletions && (
         <div role="status" className="max-w-xl w-full mx-auto -mt-3 mb-5 shrink-0 flex items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.06] px-3 py-2 text-[12px] text-amber-100/90">

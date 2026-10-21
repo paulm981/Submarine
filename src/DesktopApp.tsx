@@ -564,6 +564,16 @@ function DesktopApp() {
     }
     await refreshServers();
   }, [addLog, refreshServers]);
+  // Decline a held switch to telnet or VNC: the server stays SSH, and the
+  // other computers get it back as SSH with the next sync.
+  const keepServerSsh = useCallback(async (serverId: number) => {
+    try {
+      if (await invoke<boolean>("keep_server_ssh", { serverId })) addLog("Kept it an SSH server.", "success");
+    } catch (e) {
+      addLog(`KEEP_SSH_FAILED: ${e}`, "error");
+    }
+    await refreshServers();
+  }, [addLog, refreshServers]);
   const refreshCredentials = useCallback(async () => {
     try { setCredentials((await invoke("get_credentials")) as any[]); }
     catch (e) { addLog(`SYNC_CREDENTIALS: ${e}`, "error"); }
@@ -2601,6 +2611,7 @@ function DesktopApp() {
                 onAddClick={addServerIn}
                 onQuickConnect={() => setIsQuickConnectOpen(true)}
                 onAllowHeld={allowHeld}
+                onKeepSsh={keepServerSsh}
                 keyChange={shareKeyChange}
                 onAcceptKey={acceptShareKey}
                 heldDeletions={heldDeletions}
