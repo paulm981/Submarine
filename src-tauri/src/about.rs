@@ -105,7 +105,9 @@ async fn ahead_by(client: &reqwest::Client, base: &str, head: &str) -> Option<u6
     if !resp.status().is_success() {
         return None;
     }
-    resp.json::<GhCompare>().await.ok().map(|c| c.ahead_by)
+    // One commit's worth of JSON; read no more than 1 MB of it (cloud.rs).
+    let bytes = crate::cloud::read_capped(resp, 1024 * 1024).await.ok()?;
+    serde_json::from_slice::<GhCompare>(&bytes).ok().map(|c| c.ahead_by)
 }
 
 /// Subset of GitHub's `/releases/latest` JSON we actually care about.
