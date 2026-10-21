@@ -1216,19 +1216,21 @@ function DesktopApp() {
 
   // Close sessions by id (All tabs ▾), asking first when any is connected.
   // Unmounting a SessionView disconnects it.
-  const closeSessions = async (ids: string[]) => {
-    if (ids.length === 0) return;
+  // False when the user said no.
+  const closeSessions = async (ids: string[]): Promise<boolean> => {
+    if (ids.length === 0) return true;
     const connected = ids.filter(id => sessionStatuses[id] === "connected").length;
     if (connected > 0) {
       const ok = ids.length === 1 ? await askCloseSession() : await confirm({
         title: `Close ${ids.length} sessions?`,
-        message: connected === 1 ? "Its SSH connection will be dropped." : `${connected} SSH connections will be dropped.`,
+        message: connected === 1 ? "1 of them is connected; its SSH connection will be dropped." : `${connected} of them are connected; ${connected} SSH connections will be dropped.`,
         okLabel: "Close",
         destructive: true,
       });
-      if (!ok) return;
+      if (!ok) return false;
     }
     const closing = new Set(ids);
+    for (const id of closing) clearTabName(id);
     setSessions(prev => prev.filter(s => !closing.has(s.id)));
     setSessionStatuses(prev => {
       const next = { ...prev };
@@ -1241,6 +1243,24 @@ function DesktopApp() {
     });
     for (const id of closing) forgetSession(id);
     setActiveView(prev => (closing.has(prev) ? START_VIEW : prev));
+    return true;
+  };
+
+  // A tab's right-click menu: close tabs other than it, after it, the
+  // disconnected ones, or every session — Walls too, as nothing is left on
+  // them. Tabs are the sessions with a tab of their own, in title-bar order.
+  const closeTabs = async (which: "others" | "right" | "dead" | "all", targetId: string) => {
+    const tabs = sessions.filter(s => !s.wallId).map(s => s.id);
+    const at = tabs.indexOf(targetId);
+    const ids =
+      which === "others" ? tabs.filter(id => id !== targetId) :
+      which === "right" ? tabs.slice(at + 1) :
+      which === "dead" ? tabs.filter(id => ["failed", "disconnected"].includes(sessionStatuses[id] ?? "connecting")) :
+      sessions.map(s => s.id);
+    if (!(await closeSessions(ids)) || which !== "all") return;
+    const wallIds = new Set(walls.map(w => w.id));
+    setWalls([]);
+    setActiveView(prev => (wallIds.has(prev) ? START_VIEW : prev));
   };
 
   const saveSavedWall = async (w: SavedWall, open: boolean) => {
@@ -2212,6 +2232,28 @@ function DesktopApp() {
                 setTabMenu(null);
               }}
             >Close tab</button>
+            {(() => {
+              const tabs = sessions.filter(s => !s.wallId).map(s => s.id);
+              const at = tabs.indexOf(targetId);
+              const others = tabs.length - (at >= 0 ? 1 : 0);
+              const right = at >= 0 ? tabs.length - at - 1 : 0;
+              const dead = tabs.filter(id => ["failed", "disconnected"].includes(sessionStatuses[id] ?? "connecting")).length;
+              const item = (label: string, n: number, which: "others" | "right" | "dead" | "all") => (
+                <button
+                  disabled={n === 0}
+                  className="w-full text-left px-3 py-1.5 hover:bg-rose-500/15 hover:text-rose-300 text-zinc-200 disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-zinc-200"
+                  onClick={() => { setTabMenu(null); void closeTabs(which, targetId); }}
+                >{label} ({n})</button>
+              );
+              return (
+                <>
+                  {item("Close other tabs", others, "others")}
+                  {item("Close tabs to the right", right, "right")}
+                  {item("Close disconnected tabs", dead, "dead")}
+                  {item(walls.length ? "Close all tabs and walls" : "Close all tabs", sessions.length, "all")}
+                </>
+              );
+            })()}
           </div>
         </>
         );
