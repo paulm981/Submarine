@@ -19666,40 +19666,82 @@ fn unsent_edits_dir() -> Option<PathBuf> {
         .or_else(|| LIVE_EDIT_APP.get().and_then(|a| a.path().app_data_dir().ok()).map(|p| p.join(NAME)))
 }
 
-/// A name in `dir` that isn't taken: `name`, then `name (2)`, `name (3)`, …
-/// before the extension.
-fn free_name_in(dir: &Path, name: &str) -> PathBuf {
-    let first = dir.join(name);
-    if !first.exists() {
-        return first;
-    }
+/// The names a kept copy may take in its folder: `name`, then `name (2)`,
+/// `name (3)`, … before the extension.
+fn kept_names(name: &str) -> impl Iterator<Item = String> + '_ {
     let (stem, ext) = match name.rsplit_once('.') {
         Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
         _ => (name, String::new()),
     };
-    (2..10_000)
-        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
-        .find(|p| !p.exists())
-        .unwrap_or(first)
+    std::iter::once(name.to_string()).chain((2..10_000).map(move |n| format!("{stem} ({n}){ext}")))
 }
 
-/// Before Live Edit copies are deleted (their session ends, the profile is
-/// locked, or the watcher stops), the ones under `under` with edits that were
-/// never uploaded are moved to `unsent_edits_dir`, and the page is told
+/// Moves `src` into `dir` under the first of `kept_names` that's free, and
+/// returns where it went. A name is claimed in one step, so nothing that is
+/// there, or appears meanwhile (another sweep keeping a copy of the same
+/// name), is replaced or written through: a hard link, which fails when the
+/// name is taken; or, where there are no hard links between the two folders,
+/// a new file that must not exist yet, which a link already there also makes
+/// fail.
+fn move_to_free_name(src: &Path, dir: &Path, name: &str) -> Option<PathBuf> {
+    use std::io::ErrorKind;
+    for candidate in kept_names(name) {
+        let dest = dir.join(candidate);
+        if std::fs::symlink_metadata(&dest).is_ok() {
+            continue;
+        }
+        match std::fs::hard_link(src, &dest) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(src);
+                return Some(dest);
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(_) => {}
+        }
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&dest) {
+            Ok(mut out) => {
+                let copied = std::fs::File::open(src).and_then(|mut from| std::io::copy(&mut from, &mut out)).is_ok();
+                drop(out);
+                if copied {
+                    let _ = std::fs::remove_file(src);
+                    return Some(dest);
+                }
+                let _ = std::fs::remove_file(&dest);
+                return None;
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// Before Live Edit copies are deleted, the ones under `under` with edits
+/// that were never uploaded (their content isn't what was last uploaded, or
+/// downloaded) are moved to `unsent_edits_dir`, and the page is told
 /// (`live-edit-kept`). The rest are left to be deleted. Returns the folder
 /// when anything was kept there.
-fn keep_unsent_edits(under: &Path) -> Option<PathBuf> {
+///
+/// `sweep`: the session's temp folder is about to go (its session ended, the
+/// profile is locked), so the copies' entries go too. Otherwise (a watcher
+/// stopped) the entry stays: the editor may still have the file open, and a
+/// save after this is kept at the sweep, not deleted with the folder.
+fn keep_unsent_edits(under: &Path, sweep: bool) -> Option<PathBuf> {
     use sha2::{Digest, Sha256};
     let unsent: Vec<PathBuf> = {
         let mut copies = live_edit_copies().lock().unwrap_or_else(|e| e.into_inner());
         let found: Vec<PathBuf> = copies
             .iter()
             .filter(|(path, synced)| {
-                path.starts_with(under) && std::fs::read(path).is_ok_and(|c| Sha256::digest(&c).as_slice() != synced.as_slice())
+                path.starts_with(under)
+                    && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+                    && std::fs::read(path).is_ok_and(|c| Sha256::digest(&c).as_slice() != synced.as_slice())
             })
             .map(|(path, _)| path.clone())
             .collect();
-        copies.retain(|path, _| !path.starts_with(under));
+        if sweep {
+            copies.retain(|path, _| !path.starts_with(under));
+        }
         found
     };
     if unsent.is_empty() {
@@ -19710,16 +19752,7 @@ fn keep_unsent_edits(under: &Path) -> Option<PathBuf> {
     let mut kept = Vec::new();
     for path in unsent {
         let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
-        let dest = free_name_in(&folder, &name);
-        // A rename, or a copy where the temp folder is on another drive.
-        let moved = std::fs::rename(&path, &dest).is_ok() || {
-            let copied = std::fs::copy(&path, &dest).is_ok();
-            if copied {
-                let _ = std::fs::remove_file(&path);
-            }
-            copied
-        };
-        if moved {
+        if let Some(dest) = move_to_free_name(&path, &folder, &name) {
             kept.push(dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name));
         }
     }
@@ -19736,21 +19769,54 @@ fn keep_unsent_edits(under: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod unsent_edits_tests {
-    #[test]
-    fn a_kept_copy_never_takes_the_name_of_one_kept_before() {
-        let dir = std::env::temp_dir().join(format!("submarine-unsent-{}", std::process::id()));
+    use super::{kept_names, move_to_free_name};
+
+    fn fresh(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("submarine-unsent-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(super::free_name_in(&dir, "index.php"), dir.join("index.php"));
-        std::fs::write(dir.join("index.php"), "a").unwrap();
-        assert_eq!(super::free_name_in(&dir, "index.php"), dir.join("index (2).php"));
-        std::fs::write(dir.join("index (2).php"), "b").unwrap();
-        assert_eq!(super::free_name_in(&dir, "index.php"), dir.join("index (3).php"));
-        std::fs::write(dir.join("Makefile"), "c").unwrap();
-        assert_eq!(super::free_name_in(&dir, "Makefile"), dir.join("Makefile (2)"));
-        std::fs::write(dir.join(".bashrc"), "d").unwrap();
-        assert_eq!(super::free_name_in(&dir, ".bashrc"), dir.join(".bashrc (2)"));
-        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn the_names_a_kept_copy_may_take() {
+        let first = |n: &str| kept_names(n).take(3).collect::<Vec<_>>();
+        assert_eq!(first("index.php"), ["index.php", "index (2).php", "index (3).php"]);
+        assert_eq!(first("Makefile"), ["Makefile", "Makefile (2)", "Makefile (3)"]);
+        assert_eq!(first(".bashrc"), [".bashrc", ".bashrc (2)", ".bashrc (3)"]);
+    }
+
+    #[test]
+    fn a_kept_copy_never_replaces_one_kept_before() {
+        let (src_dir, kept) = (fresh("src"), fresh("kept"));
+        std::fs::write(kept.join("index.php"), "earlier").unwrap();
+        std::fs::write(kept.join("index (2).php"), "earlier 2").unwrap();
+        let src = src_dir.join("index.php");
+        std::fs::write(&src, "mine").unwrap();
+        let dest = move_to_free_name(&src, &kept, "index.php").unwrap();
+        assert_eq!(dest, kept.join("index (3).php"));
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "mine");
+        assert_eq!(std::fs::read_to_string(kept.join("index.php")).unwrap(), "earlier");
+        assert_eq!(std::fs::read_to_string(kept.join("index (2).php")).unwrap(), "earlier 2");
+        assert!(!src.exists(), "moved, not copied");
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&kept);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_where_the_copy_would_go_is_not_written_through() {
+        let (src_dir, kept, elsewhere) = (fresh("src2"), fresh("kept2"), fresh("elsewhere"));
+        let target = elsewhere.join("victim");
+        std::os::unix::fs::symlink(&target, kept.join("notes.txt")).unwrap();
+        let src = src_dir.join("notes.txt");
+        std::fs::write(&src, "mine").unwrap();
+        let dest = move_to_free_name(&src, &kept, "notes.txt").unwrap();
+        assert_eq!(dest, kept.join("notes (2).txt"));
+        assert!(!target.exists(), "nothing was written where the link leads");
+        for d in [src_dir, kept, elsewhere] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }
 
@@ -19759,7 +19825,7 @@ mod unsent_edits_tests {
 fn sweep_session_temp(session_id: &str) {
     for dir in [session_sftp_dir(session_id), session_drag_dir(session_id)].into_iter().flatten() {
         if dir.exists() {
-            keep_unsent_edits(&dir);
+            keep_unsent_edits(&dir, true);
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -20017,7 +20083,7 @@ async fn sftp_open_remote_file(
             std::fs::read(&temp_file_path_clone).map(|c| Sha256::digest(&c).to_vec() != synced_hash).unwrap_or(false)
         };
         // Moved out of the temp folder, which a disconnect or a lock wipes.
-        let kept_in = keep_unsent_edits(&temp_file_path_clone);
+        let kept_in = keep_unsent_edits(&temp_file_path_clone, false);
         if unsynced || idle_end {
             let message = if unsynced {
                 match &kept_in {
