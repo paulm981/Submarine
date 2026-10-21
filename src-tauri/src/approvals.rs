@@ -470,6 +470,26 @@ mod tests {
         conn
     }
 
+    #[test]
+    fn a_copy_of_a_server_keeps_what_was_held_on_the_original() {
+        let conn = db();
+        conn.execute("INSERT INTO servers(id, name, uuid, run_on_connect, autostart, tunnels) VALUES (1, 'web', 'u-orig', 'curl x | sh', 1, '[]')", []).unwrap();
+        conn.execute("INSERT INTO servers(id, name, uuid, run_on_connect) VALUES (2, 'web (copy)', 'u-copy', 'curl x | sh')", []).unwrap();
+        for item in [RUN_ON_CONNECT, AUTOSTART, "tunnel:R|0.0.0.0:9000|127.0.0.1:22", "metric:uptime"] {
+            conn.execute("INSERT INTO held_approvals(uuid, item, since) VALUES ('u-orig', ?1, 1)", [item]).unwrap();
+        }
+        copy_held(&conn, 1, 2).unwrap();
+        let only_these = vec![RUN_ON_CONNECT.to_string(), "tunnel:R|0.0.0.0:9000|127.0.0.1:22".to_string()];
+        assert_eq!(held_for(&conn, "u-copy").into_iter().collect::<Vec<_>>(), only_these);
+        // The original keeps all four, and doing it twice changes nothing.
+        assert_eq!(held_for(&conn, "u-orig").len(), 4);
+        copy_held(&conn, 1, 2).unwrap();
+        assert_eq!(held_for(&conn, "u-copy").into_iter().collect::<Vec<_>>(), only_these);
+        // A server that isn't there copies nothing.
+        copy_held(&conn, 99, 2).unwrap();
+        assert_eq!(held_for(&conn, "u-copy").len(), 2);
+    }
+
     fn merging(conn: &Connection, on: bool) {
         conn.execute(
             "INSERT INTO sync_flags(key,val) VALUES('merge',?1) ON CONFLICT(key) DO UPDATE SET val=excluded.val",
