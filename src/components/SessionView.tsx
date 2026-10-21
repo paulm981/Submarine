@@ -1147,6 +1147,16 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
       // or a setting stops the cycle; Reconnect is still there.
       if (event.payload?.retry === true) {
         scheduleReconnect(reconnectAttemptRef.current + 1);
+        // Say what got through (name, port, jump host) under the error. It
+        // runs beside the countdown, and is dropped if that moved on (the next
+        // attempt started, or Cancel) before the answer came back.
+        const waiting = reconnectAttemptRef.current;
+        invoke<string[]>("diagnose_connect", { serverId: session.serverId, quickAuth: session.quickAuth || null })
+          .then((lines) => {
+            if (reconnectAttemptRef.current !== waiting || !reconnectTimerRef.current) return;
+            lines.forEach((msg) => pushLog({ msg, type: 'info' }));
+          })
+          .catch(() => {});
       } else {
         cancelReconnect();
       }
@@ -1421,11 +1431,9 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                                the old fingerprints we used to trust */}
       {fingerprintPrompt && (() => {
         const isMismatch = !!fingerprintPrompt.mismatch;
-        // Trusted before under another key type, and now offering only this
-        // one: as alarming as a changed key (see check_server_key).
-        const otherTypes: string[] = Array.isArray(fingerprintPrompt.otherKeyTypes) ? fingerprintPrompt.otherKeyTypes : [];
-        const isOtherType = !isMismatch && otherTypes.length > 0;
-        const alarming = isMismatch || isOtherType;
+        // A key trusted before under another type counts as a changed key
+        // too (judge_host_key), so it arrives as a mismatch.
+        const alarming = isMismatch;
         const hostLabel = fingerprintPrompt.port && fingerprintPrompt.port !== 22
           ? `${fingerprintPrompt.host}:${fingerprintPrompt.port}`
           : fingerprintPrompt.host;
@@ -1442,7 +1450,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
             <ShieldAlert className={`${accent} mt-1`} size={20} />
             <div>
               <h3 className={`text-sm font-bold ${accent} uppercase tracking-widest`}>
-                {isMismatch ? "Host key has CHANGED" : isOtherType ? "Different key type than before" : "Unknown host fingerprint"}
+                {isMismatch ? "Host key has CHANGED" : "Unknown host fingerprint"}
               </h3>
               {isMismatch ? (
                 <p className="text-zinc-300 mt-2 mb-4 leading-relaxed">
@@ -1454,12 +1462,6 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                     </span>
                   )}
                   <span className="block mt-3 text-red-300 text-[12px]">Verify the new fingerprint out-of-band (call the admin, check the server console) before accepting.</span>
-                </p>
-              ) : isOtherType ? (
-                <p className="text-zinc-300 mt-2 mb-4 leading-relaxed">
-                  You already trust a {otherTypes.join(" / ")} key for '{hostLabel}', but it now offers only a {fingerprintPrompt.keyType} key. Servers rarely change key type; this is also what a man-in-the-middle without the real key looks like.<br/><br/>
-                  {fingerprintPrompt.keyType} key fingerprint: <span className="text-white font-bold break-all">{fingerprintPrompt.fingerprint}</span>
-                  <span className="block mt-3 text-red-300 text-[12px]">Check it on the server (<span className="font-mono">ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub</span>) or with its admin before accepting.</span>
                 </p>
               ) : (
                 <p className="text-zinc-400 mt-2 mb-4 leading-relaxed">

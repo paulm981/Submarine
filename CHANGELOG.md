@@ -7,7 +7,7 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - Sections called **From the original project** list what came in from [SinaXhpm/Submarine](https://github.com/SinaXhpm/submarine), with that project's pull request numbers.
 - [FORK.md](FORK.md) explains what the fork does differently, and which of the original project's changes it hasn't taken yet.
 
-## v0.3.8-fork.4
+## v0.3.8-fork.6
 
 - **AI tools, first test** ([#32](https://github.com/paulm981/Submarine/issues/32), steps 1 and 2 of the MVP). Off by default: Settings › AI tools.
   - On, Home's menu lists **Claude Code** under AI tools when it's installed. It opens in a Home tab already connected to Submarine, through `submarine --mcp` over a local channel only: a socket only you can open on macOS and Linux, a named pipe locked to your account on Windows, and a token for each AI tab.
@@ -15,6 +15,30 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
   - Submarine runs it on its own SSH channel, with no terminal, a timeout and a 1 MB output cap. The AI gets the output with known secrets hidden; you see all of it, and how much was hidden.
   - Every request and decision goes in `ai-audit.log` in the log folder.
   - Sharing ends when you stop it, or when the AI tab or the server's tab closes or reconnects.
+
+## v0.3.8-fork.5
+
+- **Getting around many tabs** ([#75](https://github.com/paulm981/Submarine/issues/75)):
+  - **Ctrl+Shift+K** opens All tabs with its search ready: type part of a name and press Enter to go there. Up and Down move through the matches.
+  - **Ctrl+Tab** and **Ctrl+Shift+Tab** go to the next and previous tab, in the order the title bar shows them.
+  - **Show only open** (the eye button in the session tree) hides the servers you don't have open, keeping their folders. In that view, double-clicking a server takes you to its tab, or to the Wall it's on.
+- **A failed connect says why** ([#35](https://github.com/paulm981/Submarine/issues/35)). When a connect fails in a way that waiting can fix, Submarine checks whether the name resolves and the port answers, and says what it found under the error. Behind a jump host or a proxy it checks that instead; a ProxyCommand can't be checked. It runs beside the retry countdown, and not for a rejected login or host key.
+
+## v0.3.8-fork.4
+
+- **Two uploads to the same file no longer corrupt it** ([#45](https://github.com/paulm981/Submarine/issues/45)). An upload to a server file that another upload is still writing waits for the first to finish, at 0% until its turn. Cancel still stops it while it waits.
+- **Small fixes** ([#53](https://github.com/paulm981/Submarine/issues/53)):
+  - A server's OS badge no longer shows the old system after you change its port.
+  - The Servers page goes back to the top when the folder you were in is deleted, here or on another computer.
+  - **Save & open** on a saved Wall that is already open adds the servers you just added to it.
+  - When the window asking about a new host key goes away, the other connections waiting on it still get the full 90 seconds to answer.
+  - Duplicating a server in a shared profile no longer lets the copy run on-connect commands or port forwards that were still waiting for your approval on the original. The copy waits for its own approval.
+
+## v0.3.8-fork.3
+
+- **Pause several terminals on a Wall at once** ([#73](https://github.com/paulm981/Submarine/issues/73)). With Broadcast on, Ctrl-click (⌘-click on a Mac) terminal titles to pick several, or Shift-click for a run of them. The bar then offers **Pause** and **Resume** for the ones picked.
+  - **Pause all** sits beside **Resume all**, so you can pause everything and resume just the few you want.
+- **Close many tabs at once** from a tab's right-click menu ([#74](https://github.com/paulm981/Submarine/issues/74)): **Close other tabs**, **Close tabs to the right**, **Close disconnected tabs** and **Close all tabs**. With Walls open, the last one closes them too. One question first, saying how many are connected.
 
 ## v0.3.8-fork.2
 

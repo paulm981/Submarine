@@ -62,12 +62,40 @@ fn parse_os(out: &str) -> Option<String> {
     }
 }
 
+/// Remember `os` for the server, if the row still has the `host` and `port`
+/// the probe was made with. True when the stored value changed.
+fn store_os(conn: &rusqlite::Connection, server_id: i32, host: &str, port: i64, os: &str) -> Result<bool, String> {
+    let current: Option<Option<String>> = conn
+        .query_row(
+            "SELECT os FROM servers WHERE id=?1 AND host=?2 AND port=?3",
+            params![server_id, host, port],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("[DATABASE] SERVER_OS_QUERY_FAILED: {}", e))?;
+    match current {
+        // Gone, or no longer that host and port: nothing to store.
+        None => Ok(false),
+        Some(current) if current.as_deref() == Some(os) => Ok(false),
+        Some(_) => {
+            // Held back from the sync triggers: what the server reports
+            // is not an edit to push.
+            crate::with_merge_flag(conn, |c| {
+                c.execute("UPDATE servers SET os=?1 WHERE id=?2", params![os, server_id])
+                    .map_err(|e| format!("[DATABASE] SERVER_OS_UPDATE_FAILED: {}", e))
+            })?;
+            Ok(true)
+        }
+    }
+}
+
 /// Read the OS of the server behind `session_id` and remember it. Returns the
 /// OS ID, or None when the server's answer said nothing usable.
 ///
-/// `host` is the server's host as the page knew it when it asked: the answer
-/// is stored only while the row still has it, so a server edited (or a
-/// profile switched) during the probe doesn't take another host's OS.
+/// `host` and `port` are the server's as the page knew them when it asked:
+/// the answer is stored only while the row still has both, so a server edited
+/// (or a profile switched) during the probe doesn't take another host's or
+/// port's OS.
 #[tauri::command]
 pub async fn detect_server_os(
     ssh: tauri::State<'_, SshState>,
@@ -75,30 +103,14 @@ pub async fn detect_server_os(
     session_id: String,
     server_id: i32,
     host: String,
+    port: i64,
 ) -> Result<Option<String>, String> {
     let out = crate::run_exec_capture(&ssh, &session_id, PROBE, 15).await?;
     let Some(os) = parse_os(&out) else { return Ok(None) };
     let changed = {
         let conn_guard = db.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-        let current: Option<Option<String>> = conn
-            .query_row("SELECT os FROM servers WHERE id=?1 AND host=?2", params![server_id, host], |r| r.get(0))
-            .optional()
-            .map_err(|e| format!("[DATABASE] SERVER_OS_QUERY_FAILED: {}", e))?;
-        match current {
-            // Gone, or no longer that host: nothing to store.
-            None => false,
-            Some(current) if current.as_deref() == Some(os.as_str()) => false,
-            Some(_) => {
-                // Held back from the sync triggers: what the server reports
-                // is not an edit to push.
-                crate::with_merge_flag(conn, |c| {
-                    c.execute("UPDATE servers SET os=?1 WHERE id=?2", params![os, server_id])
-                        .map_err(|e| format!("[DATABASE] SERVER_OS_UPDATE_FAILED: {}", e))
-                })?;
-                true
-            }
-        }
+        store_os(conn, server_id, &host, port, &os)?
     };
     if changed {
         crate::save_vault_internal(&db)?;
@@ -108,7 +120,7 @@ pub async fn detect_server_os(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_os, RESET_TRIGGER};
+    use super::{parse_os, store_os, RESET_TRIGGER};
     use rusqlite::Connection;
 
     #[test]
@@ -127,6 +139,26 @@ mod tests {
         conn.execute("UPDATE servers SET os = 'rocky'", []).unwrap();
         conn.execute("UPDATE servers SET port = 2222", []).unwrap();
         assert_eq!(os(), None);
+    }
+
+    #[test]
+    fn a_probe_of_another_port_is_not_stored() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE servers(id INTEGER PRIMARY KEY, host TEXT, port INTEGER, os TEXT);
+             CREATE TABLE sync_flags(key TEXT PRIMARY KEY, val INTEGER);
+             INSERT INTO servers VALUES (1, 'a.example', 2222, NULL);",
+        )
+        .unwrap();
+        let os = || conn.query_row("SELECT os FROM servers WHERE id = 1", [], |r| r.get::<_, Option<String>>(0)).unwrap();
+        // Asked while the server was on port 22; it has moved since.
+        assert_eq!(store_os(&conn, 1, "a.example", 22, "ubuntu"), Ok(false));
+        assert_eq!(os(), None);
+        assert_eq!(store_os(&conn, 1, "b.example", 2222, "ubuntu"), Ok(false));
+        assert_eq!(os(), None);
+        assert_eq!(store_os(&conn, 1, "a.example", 2222, "ubuntu"), Ok(true));
+        assert_eq!(os().as_deref(), Some("ubuntu"));
+        assert_eq!(store_os(&conn, 1, "a.example", 2222, "ubuntu"), Ok(false), "already stored");
     }
 
     #[test]

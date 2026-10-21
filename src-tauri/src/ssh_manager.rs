@@ -628,6 +628,11 @@ pub struct ClientHandler {
     /// extends to cover the human window instead of killing the prompt with a
     /// misleading "handshake stalled" error. See `drive_connect_with_prompt_timeout`.
     pub prompt_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Counts the times this attempt started its own 90s prompt window. A
+    /// session that waited on another's prompt and then had to ask itself
+    /// starts a fresh window, so the connect driver restarts its hard cap
+    /// when this moves instead of counting from the connect's start.
+    pub prompt_epoch: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// False for the dedicated `::sftp` / `::fwd` connections: the tab only
     /// shows the primary connection's fingerprint prompt, so they refuse an
     /// unknown or changed key at once instead of waiting on a prompt nobody
@@ -865,6 +870,7 @@ impl client::Handler for ClientHandler {
         // reads this to keep its 15s handshake timeout from killing the human
         // approval window below — the timeout bounds only the pre-prompt phase.
         self.prompt_pending.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.prompt_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _ = self.app.emit(&format!("fingerprint-prompt-{}", self.session_id), serde_json::json!({
             "host": self.server_host,
             "port": self.server_port,

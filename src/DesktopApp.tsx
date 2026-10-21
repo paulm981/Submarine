@@ -57,7 +57,7 @@ const appWindow = getCurrentWindow();
 // has no tab of its own until it's popped out of the Wall.
 // `serverUuid` is the saved server's sync id, which keys this device's own
 // per-server settings (the Shell button, see util/shellSync.ts).
-type Session = { id: string; serverId: number; serverName: string; serverUuid?: string | null; host?: string; mirrors?: string; runOnConnect?: string; runOnConnectHeld?: boolean; quickAuth?: QuickAuth | null; wallId?: string };
+type Session = { id: string; serverId: number; serverName: string; serverUuid?: string | null; host?: string; port?: number; mirrors?: string; runOnConnect?: string; runOnConnectHeld?: boolean; quickAuth?: QuickAuth | null; wallId?: string };
 
 // The Home view (HomePane): terminals on this computer, where the app opens
 // and where closing the last session tab goes back to. Android has no shells
@@ -1036,10 +1036,13 @@ function DesktopApp() {
       if (s.serverId <= 0 || !s.host || sessionStatuses[s.id] !== "connected") continue;
       const server = servers.find((x: any) => x.id === s.serverId);
       if (!server || server.os) continue;
-      const key = `${server.id}|${s.host}|${server.port}`;
+      // The port the session connected to, like its host: the server may
+      // have been edited since it opened.
+      const port = s.port ?? server.port;
+      const key = `${server.id}|${s.host}|${port}`;
       if (osChecked.current.has(key)) continue;
       osChecked.current.add(key);
-      invoke<string | null>("detect_server_os", { sessionId: s.id, serverId: s.serverId, host: s.host })
+      invoke<string | null>("detect_server_os", { sessionId: s.id, serverId: s.serverId, host: s.host, port })
         .then((os) => { if (os) refreshServers(); })
         .catch(() => {});
     }
@@ -1053,6 +1056,7 @@ function DesktopApp() {
     serverId: server.id,
     serverName: server.name,
     host: server.host,
+    port: server.port,
     // Pass the raw mirrors JSON through to SessionView so the
     // MirrorsPanel can pre-populate "Saved on this node" without
     // another round-trip to the backend.
@@ -1079,12 +1083,29 @@ function DesktopApp() {
   // Open servers as one Wall instead of a tab each: the ones not open yet
   // connect inside the Wall (no tab of their own until popped out); ones
   // already open join with the terminal on screen in their tab. A saved wall
-  // that's open already is just shown.
-  const openServersAsWall = (list: any[], name: string, opts: { broadcast?: boolean; cols?: number; savedId?: number | null } = {}) => {
+  // that's open already is just shown — plus, when it was just saved
+  // (addMissing), the servers it has now and the open one lacks.
+  const openServersAsWall = (list: any[], name: string, opts: { broadcast?: boolean; cols?: number; savedId?: number | null; addMissing?: boolean } = {}) => {
     if (opts.savedId != null) {
       const open = walls.find(w => w.savedId === opts.savedId);
       if (open) {
         if (opts.broadcast && !open.broadcast) updateWall(open.id, { broadcast: true });
+        if (opts.addMissing) {
+          const onWall = new Set(open.members.map(m => m.sessionId));
+          const openIds = new Set(sessions.map(s => s.id));
+          const missing = list.filter(server => !onWall.has(`session-${server.id}`));
+          setSessions((prev: Session[]) => {
+            const seen = new Set(prev.map((p) => p.id));
+            const fresh = missing
+              .filter((server) => !seen.has(`session-${server.id}`))
+              .map((server) => ({ ...sessionFor(server), wallId: open.id }));
+            return fresh.length ? [...prev, ...fresh] : prev;
+          });
+          addToWall(open.id, missing.map(server => {
+            const sid = `session-${server.id}`;
+            return { sessionId: sid, terminalId: openIds.has(sid) ? terminalOf(sid) : `${sid}-term-0` };
+          }));
+        }
         setMergedSessionIds([]);
         setActiveView(open.id);
         return;
@@ -1109,13 +1130,13 @@ function DesktopApp() {
     newWall(name, members, { ...opts, id });
   };
 
-  const openSavedWall = (sw: SavedWall, broadcast = false) => {
+  const openSavedWall = (sw: SavedWall, broadcast = false, addMissing = false) => {
     const list = sw.server_ids.map(id => servers.find((s: any) => s.id === id)).filter(Boolean);
     if (list.length === 0) {
       void confirm({ title: `"${sw.name}" is empty`, message: "None of its servers exist any more. Edit it to pick some.", okLabel: "OK", cancelLabel: "Close" });
       return;
     }
-    openServersAsWall(list, sw.name, { broadcast, cols: sw.cols, savedId: sw.id });
+    openServersAsWall(list, sw.name, { broadcast, cols: sw.cols, savedId: sw.id, addMissing });
   };
 
   // Save a Wall's servers as a saved wall, or update the one it came from.
@@ -1222,19 +1243,21 @@ function DesktopApp() {
 
   // Close sessions by id (All tabs ▾), asking first when any is connected.
   // Unmounting a SessionView disconnects it.
-  const closeSessions = async (ids: string[]) => {
-    if (ids.length === 0) return;
+  // False when the user said no.
+  const closeSessions = async (ids: string[]): Promise<boolean> => {
+    if (ids.length === 0) return true;
     const connected = ids.filter(id => sessionStatuses[id] === "connected").length;
     if (connected > 0) {
       const ok = ids.length === 1 ? await askCloseSession() : await confirm({
         title: `Close ${ids.length} sessions?`,
-        message: connected === 1 ? "Its SSH connection will be dropped." : `${connected} SSH connections will be dropped.`,
+        message: connected === 1 ? "1 of them is connected; its SSH connection will be dropped." : `${connected} of them are connected; ${connected} SSH connections will be dropped.`,
         okLabel: "Close",
         destructive: true,
       });
-      if (!ok) return;
+      if (!ok) return false;
     }
     const closing = new Set(ids);
+    for (const id of closing) clearTabName(id);
     setSessions(prev => prev.filter(s => !closing.has(s.id)));
     setSessionStatuses(prev => {
       const next = { ...prev };
@@ -1247,6 +1270,24 @@ function DesktopApp() {
     });
     for (const id of closing) forgetSession(id);
     setActiveView(prev => (closing.has(prev) ? START_VIEW : prev));
+    return true;
+  };
+
+  // A tab's right-click menu: close tabs other than it, after it, the
+  // disconnected ones, or every session — Walls too, as nothing is left on
+  // them. Tabs are the sessions with a tab of their own, in title-bar order.
+  const closeTabs = async (which: "others" | "right" | "dead" | "all", targetId: string) => {
+    const tabs = sessions.filter(s => !s.wallId).map(s => s.id);
+    const at = tabs.indexOf(targetId);
+    const ids =
+      which === "others" ? tabs.filter(id => id !== targetId) :
+      which === "right" ? tabs.slice(at + 1) :
+      which === "dead" ? tabs.filter(id => ["failed", "disconnected"].includes(sessionStatuses[id] ?? "connecting")) :
+      sessions.map(s => s.id);
+    if (!(await closeSessions(ids)) || which !== "all") return;
+    const wallIds = new Set(walls.map(w => w.id));
+    setWalls([]);
+    setActiveView(prev => (wallIds.has(prev) ? START_VIEW : prev));
   };
 
   const saveSavedWall = async (w: SavedWall, open: boolean) => {
@@ -1254,7 +1295,7 @@ function DesktopApp() {
       const id = await invoke<number>("wall_save", { wall: w });
       setWallEditor(null);
       await refreshSavedWalls();
-      if (open) openSavedWall({ ...w, id }, false);
+      if (open) openSavedWall({ ...w, id }, false, true);
     } catch (e) {
       await confirm({ title: "Couldn't save the wall", message: String(e), okLabel: "OK", cancelLabel: "Close" });
     }
@@ -1326,6 +1367,44 @@ function DesktopApp() {
       // Not under a dialog: a paste confirm, say, is about the Wall as it is.
       if (document.querySelector('[aria-modal="true"]')) return;
       toggleBroadcastRef.current();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Ctrl+Shift+K opens All tabs ▾ to jump by name (its search is focused);
+  // Ctrl+Tab / Ctrl+Shift+Tab step through the title bar left to right:
+  // Home, the Walls, then the server tabs. From a view that isn't a tab
+  // (Settings, the vault…) they go to the first or last tab. preventDefault
+  // keeps the webview from doing anything of its own with Ctrl+Tab.
+  const tabOrderRef = useRef<string[]>([]);
+  tabOrderRef.current = [
+    ...(HAS_HOME && isUnlocked ? ["home"] : []),
+    ...walls.map(w => w.id),
+    ...sessions.filter(s => !s.wallId).map(s => s.id),
+  ];
+  const stepTabRef = useRef((_dir: 1 | -1) => {});
+  stepTabRef.current = (dir) => {
+    const order = tabOrderRef.current;
+    if (order.length === 0) return;
+    const at = order.indexOf(activeView);
+    const next = at < 0 ? (dir > 0 ? 0 : order.length - 1) : (at + dir + order.length) % order.length;
+    // Leaves a split the way a plain click on a tab does.
+    setMergedSessionIds([]);
+    setActiveView(order[next]);
+  };
+  const canJumpRef = useRef(false);
+  canJumpRef.current = isUnlocked && sessions.length > 0;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const k = appHotkey(e);
+      if (k !== "jump" && k !== "next" && k !== "prev") return;
+      e.preventDefault();
+      if (e.repeat && k === "jump") return;
+      // Not under a dialog, as for broadcast.
+      if (document.querySelector('[aria-modal="true"]')) return;
+      if (k === "jump") { if (canJumpRef.current) setAllTabsOpen(true); }
+      else stepTabRef.current(k === "next" ? 1 : -1);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -1911,7 +1990,7 @@ function DesktopApp() {
           <button
             type="button"
             onClick={() => setAllTabsOpen(v => !v)}
-            title={`All sessions (${sessions.length})`}
+            title={`All sessions (${sessions.length}) — Ctrl+Shift+K to jump by name`}
             aria-label="All sessions"
             className={`relative flex items-center justify-center w-7 h-7 rounded-full transition-all ${
               allTabsOpen
@@ -2253,6 +2332,28 @@ function DesktopApp() {
                 setTabMenu(null);
               }}
             >Close tab</button>
+            {(() => {
+              const tabs = sessions.filter(s => !s.wallId).map(s => s.id);
+              const at = tabs.indexOf(targetId);
+              const others = tabs.length - (at >= 0 ? 1 : 0);
+              const right = at >= 0 ? tabs.length - at - 1 : 0;
+              const dead = tabs.filter(id => ["failed", "disconnected"].includes(sessionStatuses[id] ?? "connecting")).length;
+              const item = (label: string, n: number, which: "others" | "right" | "dead" | "all") => (
+                <button
+                  disabled={n === 0}
+                  className="w-full text-left px-3 py-1.5 hover:bg-rose-500/15 hover:text-rose-300 text-zinc-200 disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-zinc-200"
+                  onClick={() => { setTabMenu(null); void closeTabs(which, targetId); }}
+                >{label} ({n})</button>
+              );
+              return (
+                <>
+                  {item("Close other tabs", others, "others")}
+                  {item("Close tabs to the right", right, "right")}
+                  {item("Close disconnected tabs", dead, "dead")}
+                  {item(walls.length ? "Close all tabs and walls" : "Close all tabs", sessions.length, "all")}
+                </>
+              );
+            })()}
           </div>
         </>
         );
@@ -2277,6 +2378,12 @@ function DesktopApp() {
       waiting={promptSessions}
       activeSessionId={activeView}
       onOpenServers={openServers}
+      onShowSession={(sid) => {
+        // On a Wall, its tile's Wall; else its tab.
+        const wallId = sessions.find(s => s.id === sid)?.wallId;
+        setMergedSessionIds([]);
+        setActiveView(wallId ?? sid);
+      }}
       onOpenAsWall={(list, name) => openServersAsWall(list, name)}
       onOpenRdp={openRdp}
       onEditServer={handleEditNode}
