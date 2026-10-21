@@ -392,9 +392,10 @@ pub async fn connect_through(route: &[russh::client::Handle<ClientHandler>], hos
 
 /// Drives a tab's telnet connection for its life: the server's text →
 /// coalesced batches to the page (`output`), keys and resizes → the server,
-/// then `terminal-closed-{id}` (with the connection's `generation`); and
-/// `session-disconnected-{session}` when the
-/// server (or the route) ended it rather than the tab. The reader and the
+/// then `terminal-closed-{id}`; and `session-disconnected-{session}` when the
+/// server (or the route) ended it rather than the tab. Both carry the
+/// connection's `generation`, so the tab can tell a connection a Reconnect
+/// replaced from the live one. The reader and the
 /// writer are separate tasks, so the reader is drained whatever the writer
 /// waits on (a channel through an SSH server stalls its whole connection
 /// otherwise; see `ssh_manager::pty_pump`).
@@ -520,7 +521,10 @@ pub async fn run_pump(
         } else {
             "The telnet server closed the connection."
         };
-        let _ = app.emit(&format!("session-disconnected-{session_id}"), serde_json::json!({ "reason": reason }));
+        let _ = app.emit(
+            &format!("session-disconnected-{session_id}"),
+            serde_json::json!({ "reason": reason, "generation": generation }),
+        );
     }
     drop(route);
 }

@@ -111,8 +111,11 @@ export default function TelnetSessionView({ session, displayName, onClose, onSta
         setReason(String(e.payload?.reason ?? "The connection failed."));
         setStatus("failed");
       }),
-      // The server or the route ended it (with why), or a Disconnect.
+      // The server or the route ended it (with why), or a Disconnect. One
+      // about a connection a Reconnect replaced carries its old generation.
       listen(`session-disconnected-${id}`, (e: any) => {
+        const gen = e.payload?.generation;
+        if (typeof gen === "number" && gen !== generationRef.current) return;
         const why = String(e.payload?.reason ?? "The connection closed.");
         pushLog({ msg: why, type: "error" });
         setReason(why);
