@@ -139,6 +139,7 @@ const TerminalView = ({
   serverName = "",
   local,
   onShellReady,
+  telnet = false,
 }: {
   sessionId: string;
   terminalId: string;
@@ -174,6 +175,10 @@ const TerminalView = ({
   /// Docker tab in InfoPanel to open an interactive session inside a
   /// specific container without leaving the app.
   containerExec?: { container: string; useSudo: boolean };
+  /// A telnet server's terminal (#179): it opens the connection its tab
+  /// made (`telnet_open_terminal`) instead of a shell over SSH. The rest —
+  /// keys, sizes, the saved-password button — works the same.
+  telnet?: boolean;
   /// Bumped by the parent SessionView on every successful reconnect.
   /// When the value changes we re-open a fresh PTY against the new SSH
   /// handle WITHOUT disposing xterm — the user keeps their scroll-back
@@ -427,7 +432,17 @@ const TerminalView = ({
       invoke('resize_terminal', { terminalId, cols: term.cols, rows: term.rows }).catch(() => {});
     };
     const ce = containerExecRef.current;
-    if (ce) {
+    if (telnet) {
+      invoke('telnet_open_terminal', {
+        sessionId,
+        terminalId,
+        cols: term.cols || 80,
+        rows: term.rows || 24,
+        onOutput: outputChannel(),
+      }).then(() => { syncSize(); opened(); }, e => {
+        term.writeln(`\x1b[31mReconnect failed: ${e}\x1b[0m`);
+      });
+    } else if (ce) {
       invoke('open_container_terminal', {
         sessionId,
         terminalId,
@@ -851,7 +866,17 @@ const TerminalView = ({
           invoke(commands.resize, { terminalId, cols: term.cols, rows: term.rows }).catch(() => {});
         };
         const opened = () => { markTyped(terminalId); ptyLiveRef.current = true; terminalStateChanged(); };
-        if (local) {
+        if (telnet) {
+          invoke('telnet_open_terminal', {
+            sessionId,
+            terminalId,
+            cols: term.cols || 80,
+            rows: term.rows || 24,
+            onOutput: outputChannel(),
+          }).then(() => { syncSize(); opened(); }, e => {
+            term.writeln(`\x1b[31mFailed to open terminal: ${e}\x1b[0m`);
+          });
+        } else if (local) {
           invoke<string>('local_terminal_open', {
             terminalId,
             shell: local.shell,
