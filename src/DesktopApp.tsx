@@ -926,6 +926,9 @@ function DesktopApp() {
         serverId: s.id,
         serverName: s.name,
         host: s.host,
+        // The port it was opened with, so the OS check below asks that one
+        // rather than whatever the server's port is by then.
+        port: s.port,
         mirrors: s.mirrors,
         serverUuid: s.uuid ?? null,
       }));
@@ -1456,8 +1459,10 @@ function DesktopApp() {
     if (order.length === 0) return;
     const at = order.indexOf(activeView);
     const next = at < 0 ? (dir > 0 ? 0 : order.length - 1) : (at + dir + order.length) % order.length;
-    // Leaves a split the way a plain click on a tab does.
-    setMergedSessionIds([]);
+    // Leaves a split the way a plain click on a tab does: only for a tab
+    // that isn't part of it. (Set anew each render, so this is the current
+    // split.)
+    if (!mergedSessionIds.includes(order[next])) setMergedSessionIds([]);
     setActiveView(order[next]);
   };
   const canJumpRef = useRef(false);

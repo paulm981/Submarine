@@ -12,8 +12,10 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
-/// How long the name lookup and the TCP connect each get. Short, because the
-/// connect's own retry runs alongside and the answer is only a hint.
+/// How long the check waits for the name lookup, and for the TCP connects.
+/// Short, because the connect's own retry runs alongside and the answer is
+/// only a hint. (A lookup that outlasts it is left to finish on its own: the
+/// system resolver can't be stopped, only no longer waited for.)
 const STEP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How many resolved addresses a line lists before it says "and N more".
@@ -53,8 +55,9 @@ struct Probe {
 }
 
 /// Look `host` up (unless it is an address) and try a TCP connect to what
-/// comes back, in order, within one overall `STEP_TIMEOUT`. The first
-/// address that answers wins; otherwise the last failure is reported.
+/// comes back, in order. The lookup gets `STEP_TIMEOUT`, and the connects
+/// share another. The first address that answers wins; otherwise the last
+/// failure is reported.
 async fn probe(host: &str, port: u16) -> Probe {
     let literal = host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>().ok();
     let addresses: Vec<IpAddr> = match literal {
@@ -69,7 +72,9 @@ async fn probe(host: &str, port: u16) -> Probe {
                 }
                 list
             }
-            Ok(Err(_)) => return unresolved(host, port, "name not found"),
+            // The resolver's own words, as a name that doesn't exist and a
+            // lookup that couldn't be made (no DNS server, say) differ.
+            Ok(Err(e)) => return unresolved(host, port, &lookup_error(&e)),
             Err(_) => return unresolved(host, port, "the lookup timed out"),
         },
     };
@@ -97,6 +102,14 @@ async fn probe(host: &str, port: u16) -> Probe {
         addresses: if literal.is_some() { Vec::new() } else { addresses },
         outcome: Ok(last),
     }
+}
+
+/// A failed lookup's message without the "failed to lookup address
+/// information:" every one of them starts with.
+fn lookup_error(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    let why = text.strip_prefix("failed to lookup address information:").unwrap_or(&text).trim();
+    if why.is_empty() { "the lookup failed".to_string() } else { why.to_string() }
 }
 
 fn unresolved(host: &str, port: u16, why: &str) -> Probe {
@@ -192,6 +205,8 @@ mod tests {
         let p = probe("nothing-here.invalid", 22).await;
         assert!(p.outcome.is_err(), "{p:?}");
         assert!(describe(&p).starts_with("nothing-here.invalid doesn't resolve"));
+        // What the resolver said, not a guess at it.
+        assert!(!describe(&p).contains("failed to lookup address information"), "{p:?}");
     }
 
     #[tokio::test]

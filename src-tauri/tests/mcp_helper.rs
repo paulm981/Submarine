@@ -62,8 +62,13 @@ fn listen() -> (String, tokio::task::JoinHandle<()>) {
     (name, task)
 }
 
-fn rand_suffix() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64
+/// A name part no other test in this run has: the clock alone isn't enough,
+/// since tests run at once and macOS's clock ticks in microseconds.
+fn rand_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    format!("{}-{}", nanos, NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
 fn helper(addr: Option<&str>, token: Option<&str>) -> std::process::Child {

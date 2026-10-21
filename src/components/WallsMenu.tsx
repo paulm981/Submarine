@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ExternalLink, LayoutGrid, Pencil, Plus, Radio, Search, TerminalSquare, Trash2, X,
 } from "lucide-react";
@@ -150,13 +150,18 @@ export const AllTabsMenu = ({
   const order = [...tabs, ...inWalls.flatMap((g) => g.list)];
   const at = Math.min(hi, order.length - 1);
   const go = (s: SessionRow) => (s.wallId ? onShowWall(s.wallId) : onShowSession(s.id));
+  // The highlighted row is kept in view when ↑/↓ (or the search) move the
+  // highlight, not on every render.
+  const hiRow = useRef<HTMLButtonElement | null>(null);
+  const hiId = order[at]?.id;
+  useEffect(() => { hiRow.current?.scrollIntoView({ block: "nearest" }); }, [hiId]);
 
   const row = (s: SessionRow, walled: boolean) => {
     const dot = sessionDot(statuses[s.id] ?? "connecting", waiting.has(s.id));
     return (
       <div key={s.id} className="flex items-center gap-0.5">
         <button
-          ref={(el) => { if (el && order[at]?.id === s.id) el.scrollIntoView({ block: "nearest" }); }}
+          ref={hiId === s.id ? hiRow : undefined}
           onClick={() => (walled && s.wallId ? onShowWall(s.wallId) : onShowSession(s.id))}
           title={walled ? "Show its wall" : "Show its tab"}
           className={`${menuItem} flex-1 min-w-0 ${activeView === s.id ? "bg-primary/15 text-primary" : "text-zinc-200 hover:bg-white/[0.06]"} ${order[at]?.id === s.id ? "ring-1 ring-inset ring-primary/40" : ""}`}

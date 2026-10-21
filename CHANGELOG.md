@@ -9,6 +9,21 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Two uploads to the same file:** the second one now asks before overwriting what the first one put there ([#84](https://github.com/paulm981/Submarine/issues/84)).
+- **Duplicating a server that fails** no longer leaves a "deleted" record that syncs to your other devices.
+- **Servers that open on launch** have their operating system checked on the port they connected to.
+- **The check under a failed connection** ([#84](https://github.com/paulm981/Submarine/issues/84)):
+  - a proxy saved without a port is checked at its usual port (1080 or 8080);
+  - a jump host reached through a ProxyCommand isn't probed directly;
+  - a name that doesn't resolve shows the reason the system gave;
+  - lines from an old check no longer appear after the next attempt has started.
+
+  The connect and the check now choose the route the same way.
+- **Session tree:** with **Show only open** and a search, empty folders no longer show. Right-click › Open goes to an already-open server instead of opening it again.
+- **Ctrl+Tab** to a tab that's part of a split keeps the split, as clicking it does.
+
+## v0.3.8-fork.7
+
 - **Broadcast takes your tabs into its Wall** ([#73](https://github.com/paulm981/Submarine/issues/73)). The title bar shows the Wall instead of a copy of every server as well. **Back to tabs** on the Wall's bar puts them back where they were, and closing the Wall asks whether to put them back as tabs or close them all. Connections stay up either way.
   - A terminal's ✕ on that Wall gives it its tab back instead of closing it.
 - **A dot on a tab with new output** ([#70](https://github.com/paulm981/Submarine/issues/70)). A terminal you aren't looking at shows a dot on its tab, and on its server's tab (or its Wall's tab), when it prints something. The dot goes away when you look at it. Prompt redraws and the first second after you leave a tab don't count.

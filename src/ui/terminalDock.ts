@@ -116,9 +116,9 @@ export const useDockVersion = (): number => useSyncExternalStore(subscribe, () =
 /// turn Ctrl+Shift+B into Ctrl+B for the shell): Ctrl+Shift+B turns
 /// broadcast on or off, Ctrl+Shift+P pauses a terminal in a broadcast,
 /// Ctrl+Shift+K jumps to a session by name, Ctrl+Tab and Ctrl+Shift+Tab
-/// go to the next and previous tab. Ctrl+Tab is no shell key (a terminal
-/// sends nothing for it), and the shifted letters are free for the same
-/// reason as the others: the shell only ever sees the plain Ctrl+letter.
+/// go to the next and previous tab. For those two xterm would send the shell
+/// Tab and back-tab, which it still gets from Tab and Shift+Tab. The shifted
+/// letters are free: the shell only ever sees the plain Ctrl+letter.
 export type AppHotkey = "broadcast" | "pause" | "jump" | "next" | "prev";
 export const appHotkey = (e: KeyboardEvent): AppHotkey | null => {
   if (!e.ctrlKey || e.altKey || e.metaKey) return null;

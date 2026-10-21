@@ -1159,7 +1159,11 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
         // runs beside the countdown, and is dropped if that moved on (the next
         // attempt started, or Cancel) before the answer came back.
         const waiting = reconnectAttemptRef.current;
-        invoke<string[]>("diagnose_connect", { serverId: session.serverId, quickAuth: session.quickAuth || null })
+        // A Quick Connect target goes without its password or key: the check
+        // only needs where it goes (and the user, for ~/.ssh/config).
+        const q = session.quickAuth;
+        const quickTarget = q ? { host: q.host, port: q.port, username: q.username } : null;
+        invoke<string[]>("diagnose_connect", { serverId: session.serverId, quickTarget })
           .then((lines) => {
             if (reconnectAttemptRef.current !== waiting || !reconnectTimerRef.current) return;
             lines.forEach((msg) => pushLog({ msg, type: 'info' }));
@@ -1251,6 +1255,9 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
     updateAttempt(attempt);
     setNextReconnectAt(Date.now() + delay);
     reconnectTimerRef.current = setTimeout(() => {
+      // Fired: no countdown is waiting any more, so a diagnosis that comes
+      // back from here on is about an attempt that's over (see above).
+      reconnectTimerRef.current = null;
       setNextReconnectAt(null);
       setStatus('connecting');
       // Seen in the connect view while a first connect is being retried.
