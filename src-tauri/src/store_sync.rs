@@ -491,6 +491,26 @@ fn local_stamps(conn: &Connection) -> Result<HashMap<String, String>, String> {
     Ok(out)
 }
 
+/// Before a merge deletes rows here (items deleted on another computer, or
+/// by whoever can write to the folder or repository), the profile file is
+/// kept as it stands, as the cloud sync does (vault_backup.rs): the file on
+/// disk is still the state from before this merge. How many rows it will
+/// delete, and the copy's file name when one was made.
+fn keep_before_deleting(app: &tauri::AppHandle, profile: &str, conn: &Connection, seen: &Seen) -> (usize, Option<String>) {
+    let removed = crate::rows_to_delete(conn, &seen.records);
+    if removed == 0 {
+        return (0, None);
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    match crate::profile_path(app, profile).and_then(|p| crate::vault_backup::keep(&p, now)) {
+        Ok(name) => (removed, name),
+        Err(e) => {
+            crate::applog::write_line("sync", &format!("no copy of the profile before a merge that deletes: {e}"));
+            (removed, None)
+        }
+    }
+}
+
 /// Merge what the store holds into the vault; returns this computer's
 /// records after it, and how many items the merge changed here.
 fn merge(conn: &Connection, key: &[u8; 32], hlc: &crate::hlc::Hlc, seen: &Seen) -> Result<(Vec<SyncRecord>, usize), String> {
@@ -928,6 +948,9 @@ fn still_open(db: &DbState, conn: &Connection, open: &Open) -> Result<(), String
 struct Exchanged {
     pushed: usize,
     pulled: usize,
+    /// Rows the merge deleted here, and the copy of the profile kept first.
+    removed: usize,
+    backup: Option<String>,
     /// The salt `profile.key` was just sealed with, to record once the key
     /// is really in the store (for git, once it's pushed).
     key_salt: Option<String>,
@@ -954,11 +977,13 @@ async fn exchange(app: &tauri::AppHandle, db: &DbState, dir: PathBuf, open: &Ope
         .await
         .map_err(|e| format!("[STORE] JOIN: {e}"))??;
 
-    let (records, pulled) = {
+    let (records, pulled, removed, backup) = {
         let conn_g = db.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
         let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
         still_open(db, conn, open)?;
-        merge(conn, &key, &open.hlc, &seen)?
+        let (removed, backup) = keep_before_deleting(app, &open.profile, conn, &seen);
+        let (records, pulled) = merge(conn, &key, &open.hlc, &seen)?;
+        (records, pulled, removed, backup)
     };
 
     // Sealed again when it's missing, or when this vault's password (its
@@ -981,7 +1006,7 @@ async fn exchange(app: &tauri::AppHandle, db: &DbState, dir: PathBuf, open: &Ope
         crate::save_vault_async(db).await?;
     }
     let key_salt = if wrote_key { open.escrow.as_ref().map(|(_, salt)| salt.clone()) } else { None };
-    Ok(Exchanged { pushed, pulled, key_salt })
+    Ok(Exchanged { pushed, pulled, removed, backup, key_salt })
 }
 
 /// Sync the open profile with its store. Runs under `STORE_LOCK`.
@@ -994,24 +1019,27 @@ async fn sync_open(app: &tauri::AppHandle, db: &DbState, open: &Open) -> Result<
             if let Some(salt) = &ex.key_salt {
                 record_key_salt(db, open, salt).await?;
             }
-            Ok(SyncReport { pushed: ex.pushed, pulled: ex.pulled, key_change: false })
+            Ok(SyncReport { pushed: ex.pushed, pulled: ex.pulled, key_change: false, removed: ex.removed, backup: ex.backup })
         }
         Kind::Git => {
             let repo = Repo::for_store(app, &open.linked.store)?;
             let mut pulled = 0;
+            let (mut removed, mut backup) = (0, None);
             // A push refused because another computer pushed first starts
             // over from its commit, which this merge then includes.
             for _ in 0..4 {
                 let base = repo.pull().await?;
                 let ex = exchange(app, db, data_dir(&repo.dir).join(id), open).await?;
                 pulled += ex.pulled;
+                removed += ex.removed;
+                backup = ex.backup.or(backup);
                 match repo.push(base.as_deref()).await? {
                     Pushed::Stale => continue,
                     Pushed::Unchanged | Pushed::Sent => {
                         if let Some(salt) = &ex.key_salt {
                             record_key_salt(db, open, salt).await?;
                         }
-                        return Ok(SyncReport { pushed: ex.pushed, pulled, key_change: false });
+                        return Ok(SyncReport { pushed: ex.pushed, pulled, key_change: false, removed, backup });
                     }
                 }
             }
