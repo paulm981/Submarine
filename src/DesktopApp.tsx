@@ -5,7 +5,7 @@ import {
   Plus, X, RefreshCw, Terminal, Key, Trash2,
   ArrowLeftRight, Shield, User, Cpu, TerminalSquare, List, Edit2,
   StickyNote, Search, Square, Copy, ChevronLeft, MoreVertical, Radio,
-  ChevronDown, Columns, LayoutGrid, Home, Pause, Bot
+  ChevronDown, Columns, LayoutGrid, Home, Pause, Bot, Server
 } from "lucide-react";
 
 import ProfileSelectPage from "./components/ProfileSelectPage";
@@ -18,7 +18,10 @@ import { RenameInput } from "./ui/renameInput";
 import { forgetServerBookmarks } from "./util/sftpBookmarks";
 import { useIsNarrow } from "./hooks/useViewport";
 import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./util/terminalFont";
-import { GPU_KEY, MIN_CONTRAST_KEY, SCHEME_KEY, readGpu, readMinContrast, readSchemeId, setServerSchemes } from "./ui/terminalThemes";
+import {
+  BOLD_BRIGHT_KEY, CUSTOM_SCHEME_KEY, GPU_KEY, MIN_CONTRAST_KEY, SCHEME_KEY,
+  readBoldBright, readGpu, readMinContrast, readSchemeId, setServerSchemes,
+} from "./ui/terminalThemes";
 import { HIGHLIGHT_KEY, normalizeRules, onSlowRule, readHighlightId, setCustomRules, setServerHighlights } from "./ui/highlight";
 import { logLine } from "./util/diagnostics";
 import { SCROLLBACK_KEY, readScrollback } from "./util/terminalScrollback";
@@ -34,6 +37,8 @@ import { useAi, sharedWith } from "./util/ai";
 import { IS_ANDROID } from "./util/platform";
 import type { RdpLink } from "./components/RdpLinkModal";
 import { folderTree } from "./util/folderTree";
+import { CommandScope, describeScope, parseCommandScope, scopeToJson } from "./util/commandScope";
+import CommandScopePicker from "./components/CommandScopePicker";
 import type { HeldDeletion } from "./components/HeldDeletions";
 import AddNodePanel from "./components/AddNodePanel";
 import WallView, { type Wall, type WallMember } from "./components/WallView";
@@ -302,7 +307,8 @@ function DesktopApp() {
   const [commands, setCommands] = useState<any[]>([]);
   const [logs, setLogs] = useState<{ msg: string, type: string, time: string }[]>([]);
   const [isCommandPanelOpen, setIsCommandPanelOpen] = useState(false);
-  const [editCommandData, setEditCommandData] = useState<{ id: number | null, title: string, content: string }>({ id: null, title: "", content: "" });
+  // `scope`: which servers it's for (util/commandScope); null for all of them.
+  const [editCommandData, setEditCommandData] = useState<{ id: number | null, title: string, content: string, scope: CommandScope | null }>({ id: null, title: "", content: "", scope: null });
 
   const [notes, setNotes] = useState<any[]>([]);
   const [isNotePanelOpen, setIsNotePanelOpen] = useState(false);
@@ -383,6 +389,11 @@ function DesktopApp() {
     terminalScheme: readSchemeId(),
     terminalGpu: readGpu(),
     terminalMinContrast: readMinContrast(),
+    // A scheme of this device's own, pasted as Windows Terminal JSON ("" for
+    // none; the scheme "custom"), and bold text in bright colors. Both from
+    // the original project (#183).
+    terminalCustomScheme: (() => { try { return localStorage.getItem(CUSTOM_SCHEME_KEY) || ""; } catch { return ""; } })(),
+    terminalBoldBright: readBoldBright(),
     // Which highlight set terminals use (src/ui/highlight.ts), unless their
     // server has its own.
     terminalHighlight: readHighlightId(),
@@ -425,7 +436,11 @@ function DesktopApp() {
     localStorage.setItem('submarine-bg-color', appSettings.backgroundColor);
     localStorage.setItem(FONT_SIZE_KEY, appSettings.terminalFontSize.toString());
     localStorage.setItem(FONT_FAMILY_KEY, appSettings.terminalFontFamily);
+    // The scheme of this device's own first, so "custom" finds it.
+    if (appSettings.terminalCustomScheme) localStorage.setItem(CUSTOM_SCHEME_KEY, appSettings.terminalCustomScheme);
+    else localStorage.removeItem(CUSTOM_SCHEME_KEY);
     localStorage.setItem(SCHEME_KEY, appSettings.terminalScheme);
+    localStorage.setItem(BOLD_BRIGHT_KEY, appSettings.terminalBoldBright ? 'on' : 'off');
     localStorage.setItem(GPU_KEY, appSettings.terminalGpu ? 'on' : 'off');
     localStorage.setItem(MIN_CONTRAST_KEY, appSettings.terminalMinContrast ? 'on' : 'off');
     localStorage.setItem(HIGHLIGHT_KEY, appSettings.terminalHighlight);
@@ -1619,9 +1634,10 @@ function DesktopApp() {
         // expectations on Windows/macOS/KDE. Tauri's drag region itself
         // doesn't dispatch this for us, so we wire it explicitly. Skip
         // when the click landed on an interactive child (tabs, buttons)
-        // since those mark themselves with `no-drag`.
+        // since those mark themselves with `no-drag`. Android's window
+        // can't be maximized.
         const target = e.target as HTMLElement;
-        if (target.closest('.no-drag')) return;
+        if (IS_ANDROID || target.closest('.no-drag')) return;
         toggleMaximize();
       }}
       className="h-10 bg-[#0d0d10] border-b border-white/5 flex items-center justify-between px-3 select-none shrink-0 z-50 drag absolute top-0 left-0 right-0"
@@ -2202,27 +2218,31 @@ function DesktopApp() {
           </div>
         );
       })()}
-      {/* Window controls: desktop only. Android has its own gesture nav /
-          system back button, and the WebView window has no minimise or
-          maximise affordance to surface — so we hide the whole cluster on
-          phone and reclaim ~120 px of titlebar for the tab strip. */}
-      <div className="hidden sm:flex items-center h-full gap-1 no-drag">
-        <button
-          onClick={() => appWindow.minimize()}
-          title="Minimize"
-          className="w-10 h-full flex items-center justify-center hover:bg-white/5 transition-colors"
-        ><div className="w-3.5 h-[1.5px] bg-zinc-600" /></button>
-        <button
-          onClick={toggleMaximize}
-          title={isMaximized ? "Restore" : "Maximize"}
-          className="w-10 h-full flex items-center justify-center hover:bg-white/5 transition-colors group"
-        >
-          {isMaximized
-            ? <Copy size={12} className="text-zinc-600 group-hover:text-zinc-300 scale-x-[-1]" />
-            : <Square size={11} className="text-zinc-600 group-hover:text-zinc-300" />}
-        </button>
-        <button title="Close" onClick={() => appWindow.close()} className="w-10 h-full flex items-center justify-center hover:bg-red-500 group transition-all"><X size={14} className="text-zinc-600 group-hover:text-white" /></button>
-      </div>
+      {/* Window controls: desktop only, at any window width (the window has
+          no frame of its own, so a narrow one still needs them). Android has
+          its own gesture nav / system back button, and the WebView window has
+          no minimise or maximise affordance to surface — so the phone never
+          shows the cluster, not even turned sideways, when it is as wide as a
+          desktop window. */}
+      {!IS_ANDROID && (
+        <div className="flex items-center h-full gap-1 no-drag">
+          <button
+            onClick={() => appWindow.minimize()}
+            title="Minimize"
+            className="w-10 h-full flex items-center justify-center hover:bg-white/5 transition-colors"
+          ><div className="w-3.5 h-[1.5px] bg-zinc-600" /></button>
+          <button
+            onClick={toggleMaximize}
+            title={isMaximized ? "Restore" : "Maximize"}
+            className="w-10 h-full flex items-center justify-center hover:bg-white/5 transition-colors group"
+          >
+            {isMaximized
+              ? <Copy size={12} className="text-zinc-600 group-hover:text-zinc-300 scale-x-[-1]" />
+              : <Square size={11} className="text-zinc-600 group-hover:text-zinc-300" />}
+          </button>
+          <button title="Close" onClick={() => appWindow.close()} className="w-10 h-full flex items-center justify-center hover:bg-red-500 group transition-all"><X size={14} className="text-zinc-600 group-hover:text-white" /></button>
+        </div>
+      )}
       {tabMenu && (() => {
         const targetId = tabMenu.sessionId;
         // Build the "Split view with" picker: every OTHER open session is
@@ -2971,7 +2991,7 @@ function DesktopApp() {
               const addLabel = onCommandsTab ? "Add Command" : "Add Note";
               const openAdd = () => {
                 if (onCommandsTab) {
-                  setEditCommandData({ id: null, title: "", content: "" });
+                  setEditCommandData({ id: null, title: "", content: "", scope: null });
                   setIsCommandPanelOpen(true);
                 } else {
                   setEditNoteData({ id: null, title: "", body: "" });
@@ -3061,7 +3081,7 @@ function DesktopApp() {
                             <div className="flex justify-between items-start mb-2">
                               <h3 className="text-[16px] font-bold text-primary tracking-tight truncate flex-1">{cmd.title}</h3>
                               <div className="flex items-center gap-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-has-[:focus-visible]:opacity-100 transition-opacity">
-                                <button aria-label={`Edit ${cmd.title}`} onClick={() => { setEditCommandData(cmd); setIsCommandPanelOpen(true); }} className="text-zinc-500 hover:text-white transition-colors"><Edit2 size={14} /></button>
+                                <button aria-label={`Edit ${cmd.title}`} onClick={() => { setEditCommandData({ id: cmd.id, title: cmd.title, content: cmd.content, scope: parseCommandScope(cmd.scope) }); setIsCommandPanelOpen(true); }} className="text-zinc-500 hover:text-white transition-colors"><Edit2 size={14} /></button>
                                 <button aria-label={`Delete ${cmd.title}`} onClick={async () => {
                                   const ok = await confirm({ title: "Delete command?", message: `“${cmd.title}” will be removed.`, destructive: true });
                                   if (!ok) return;
@@ -3072,6 +3092,12 @@ function DesktopApp() {
                             <div className="bg-black/30 rounded-xl p-3 border border-white/5 flex-1 relative group-hover:border-primary/20 transition-colors overflow-hidden">
                               <pre className="text-[12px] text-zinc-400 font-mono whitespace-pre-wrap leading-relaxed line-clamp-3">{cmd.content}</pre>
                             </div>
+                            {parseCommandScope(cmd.scope) && (
+                              <div className="mt-2 flex items-center gap-1.5 text-[11px] text-zinc-400 min-w-0" data-command-scope>
+                                <Server size={11} className="shrink-0 text-zinc-500" />
+                                <span className="truncate">For {describeScope(parseCommandScope(cmd.scope), servers, folders)}</span>
+                              </div>
+                            )}
                           </div>
                         ))
                       )}
@@ -3356,6 +3382,14 @@ function DesktopApp() {
               <label className="text-[12px] font-bold text-zinc-400 ml-1">Command</label>
               <textarea className="w-full flex-1 bg-black rounded-lg p-3 text-[13px] text-zinc-300 font-mono border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner custom-scrollbar resize-none" placeholder="sudo apt update && sudo apt upgrade -y" value={editCommandData.content} onChange={e => setEditCommandData({ ...editCommandData, content: e.target.value })} />
             </div>
+            {/* Remounted per command opened, so it starts from that command's choice. */}
+            <CommandScopePicker
+              key={`${isCommandPanelOpen}-${editCommandData.id ?? "new"}`}
+              scope={editCommandData.scope}
+              onChange={(scope) => setEditCommandData((d) => ({ ...d, scope }))}
+              servers={servers}
+              folders={folders}
+            />
           </div>
           <div className="p-6 border-t border-white/5 shrink-0">
             <button 
@@ -3364,11 +3398,19 @@ function DesktopApp() {
                   addLog("Title and Content are required.", "error");
                   return;
                 }
+                const scope = editCommandData.scope;
+                if (scope && !scope.servers.length && !scope.folders.length) {
+                  setFormError("Tick at least one server or folder, or choose All servers.");
+                  return;
+                }
                 try {
-                  const action = editCommandData.id 
-                    ? invoke("edit_command", { id: editCommandData.id, title: editCommandData.title, content: editCommandData.content })
-                    : invoke("add_command", { title: editCommandData.title, content: editCommandData.content });
-                  await action;
+                  if (editCommandData.id) {
+                    await invoke("edit_command", { id: editCommandData.id, title: editCommandData.title, content: editCommandData.content });
+                    await invoke("set_command_scope", { id: editCommandData.id, scope: scopeToJson(scope) });
+                  } else {
+                    await invoke("add_command", { title: editCommandData.title, content: editCommandData.content, scope: scopeToJson(scope) });
+                  }
+                  setFormError("");
                   setIsCommandPanelOpen(false);
                   refreshCommands();
                   bumpSync();

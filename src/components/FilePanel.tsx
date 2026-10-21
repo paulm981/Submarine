@@ -13,7 +13,8 @@ import {
   ARCHIVE_FORMATS, ArchiveFormat, JOB_CANCELLED, archiveFileName, archiveKind, cancelArchiveJob,
   extractFolderName, newArchiveJobId, suggestArchiveBase,
 } from "../fs/archive";
-import { localDir, localJoin } from "../fs/localPath";
+import { localDir, localJoin, pathCrumbs } from "../fs/localPath";
+import { COMPARE_LABEL, CompareMark, compareListings } from "../fs/compare";
 import { useConfirm, useOverwritePrompt, OverwriteChoice } from "../ui/confirm";
 import { visibleName } from "../util/fileName";
 import { IS_ANDROID } from "../util/platform";
@@ -241,7 +242,23 @@ export interface FilePanelProps {
   bookmarksKey?: string;
   /** Why archive and extract can't run in this pane right now (remote: sudo root mode). None: they can. */
   archiveOff?: string;
+  /** Compare (#18): the other pane's listing, to mark this one's rows against (fs/compare). None: compare is off. */
+  compareWith?: FileEntry[] | null;
+  /** While comparing: leave out the files that look the same on both sides. Folders on both sides stay, to open. */
+  hideSame?: boolean;
+  /** This pane's listing whenever it changes, for the other pane to compare with. */
+  onEntriesChange?: (entries: FileEntry[]) => void;
 }
+
+// How a compare mark shows on its row (fs/compare): the edge and a tint, as
+// in the legend; what it means is in the row's tooltip.
+const COMPARE_ROW: Record<CompareMark, string> = {
+  only: "border-amber-400 bg-amber-500/[0.08]",
+  type: "border-rose-400 bg-rose-500/[0.08]",
+  size: "border-rose-400 bg-rose-500/[0.08]",
+  newer: "border-emerald-400 bg-emerald-500/[0.08]",
+  older: "border-zinc-500 bg-white/[0.03]",
+};
 
 // The format last picked in the archive dialog, one per side: `zip` is a
 // good default on the desktop, `tar.gz` on a server, where `zip` is often
@@ -273,6 +290,9 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
   rootMode = false,
   bookmarksKey,
   archiveOff,
+  compareWith = null,
+  hideSame = false,
+  onEntriesChange,
 }, ref) => {
   const [currentPath, setCurrentPath] = useState("");
   // The server has no SFTP: the remote pane works over shell commands.
@@ -318,6 +338,11 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
   const [tempInput, setTempInput] = useState("");
   const [inputFocused, setInputFocused] = useState(false);
   const [activeSuggestion, setActiveSuggestion] = useState(-1);
+  // The path box shows the folders as buttons until it's clicked or tabbed
+  // into, then the path as text to edit.
+  const pathInputRef = useRef<HTMLInputElement | null>(null);
+  const crumbsRef = useRef<HTMLDivElement | null>(null);
+  const pathBlurTimerRef = useRef<number | null>(null);
   // Name filter applied AFTER sort — case-insensitive substring, or a `*` /
   // `?` wildcard pattern for the whole name (util/nameFilter). Kept separate
   // from the path bar so the user can leave a filter active while
@@ -700,6 +725,22 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
     if (e.isDir) fetch(e.path);
     setInputFocused(false);
   };
+
+  // ---- path bar folders ---------------------------------------------------------
+
+  const crumbs = useMemo(
+    () => (provider.id === "local" || currentPath.startsWith("/") ? pathCrumbs(currentPath) : []),
+    [currentPath, provider.id],
+  );
+  // A long path scrolls inside the bar: keep its end, the folder open now, in
+  // view.
+  useEffect(() => {
+    const el = crumbsRef.current;
+    if (el) el.scrollLeft = el.scrollWidth;
+  }, [currentPath, inputFocused]);
+  useEffect(() => () => {
+    if (pathBlurTimerRef.current != null) window.clearTimeout(pathBlurTimerRef.current);
+  }, []);
 
   // ---- context menu auto-close ------------------------------------------------
 
@@ -1447,6 +1488,14 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
   const ownerName = (entry: FileEntry) =>
     entry.uid === undefined ? "" : owners.get(entry.uid) ?? String(entry.uid);
 
+  // ---- compare (#18) ------------------------------------------------------------
+
+  useEffect(() => { onEntriesChange?.(entries); }, [entries]); // eslint-disable-line react-hooks/exhaustive-deps
+  const compareMarks = useMemo(
+    () => (compareWith ? compareListings(entries, compareWith) : null),
+    [entries, compareWith],
+  );
+
   // ---- sorting ----------------------------------------------------------------
 
   const sortedEntries = (() => {
@@ -1465,9 +1514,10 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
       return 0;
     });
     const matches = nameFilterMatcher(nameFilter);
-    return matches ? sorted.filter(e => matches(e.name)) : sorted;
+    const named = matches ? sorted.filter(e => matches(e.name)) : sorted;
+    return compareMarks && hideSame ? named.filter((e) => e.isDir || compareMarks.has(e.path)) : named;
   })();
-  const filteredOut = nameFilter.trim() ? entries.length - sortedEntries.length : 0;
+  const filteredOut = nameFilter.trim() || (compareMarks && hideSame) ? entries.length - sortedEntries.length : 0;
 
   // As wide as the folder's longest name needs (see NAME_MIN). Measured on
   // the whole listing, so the columns hold still while a filter is typed.
@@ -1915,12 +1965,31 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
         </div>
         {headerNote}
         <div className="relative flex items-center gap-1">
+          <div className="relative flex-1 min-w-0 h-6">
           <input
+            ref={pathInputRef}
             type="text"
             value={tempInput}
             onChange={(e) => { setTempInput(e.target.value); setActiveSuggestion(-1); }}
-            onFocus={() => setInputFocused(true)}
-            onBlur={() => setTimeout(() => setInputFocused(false), 250)}
+            onFocus={(e) => {
+              if (pathBlurTimerRef.current != null) {
+                window.clearTimeout(pathBlurTimerRef.current);
+                pathBlurTimerRef.current = null;
+              }
+              if (!inputFocused) {
+                // From the folder buttons: the path open now, caret at its end.
+                setTempInput(currentPath);
+                const el = e.currentTarget;
+                requestAnimationFrame(() => el.setSelectionRange(el.value.length, el.value.length));
+              }
+              setInputFocused(true);
+            }}
+            onBlur={() => {
+              pathBlurTimerRef.current = window.setTimeout(() => {
+                pathBlurTimerRef.current = null;
+                setInputFocused(false);
+              }, 250);
+            }}
             onKeyDown={(e) => {
               if (e.key === "Enter") {
                 e.preventDefault();
@@ -1945,11 +2014,50 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
                 e.preventDefault(); setActiveSuggestion((p) => (p + 1) % suggestions.length);
               } else if (e.key === "ArrowUp" && suggestions.length > 0) {
                 e.preventDefault(); setActiveSuggestion((p) => (p - 1 + suggestions.length) % suggestions.length);
-              } else if (e.key === "Escape") setInputFocused(false);
+              } else if (e.key === "Escape") {
+                setInputFocused(false);
+                e.currentTarget.blur();
+              }
             }}
             placeholder="Path…"
-            className="flex-1 min-w-0 h-6 px-2 bg-white/[0.04] border border-white/10 rounded text-[11px] text-zinc-100 font-mono focus:outline-none focus:border-indigo-400/50 focus:bg-white/10"
+            className={`w-full h-full px-2 bg-white/[0.04] border border-white/10 rounded text-[11px] font-mono focus:outline-none focus:border-indigo-400/50 focus:bg-white/10 ${inputFocused ? "text-zinc-100" : "text-transparent placeholder:text-transparent"}`}
           />
+          {!inputFocused && (
+            // Each folder opens with a click; the rest of the box edits the
+            // path as text.
+            <div
+              ref={crumbsRef}
+              onClick={(e) => { if (!(e.target as HTMLElement).closest("button")) pathInputRef.current?.focus(); }}
+              // A vertical wheel doesn't scroll sideways on its own, and the
+              // start of a long path would be out of reach.
+              onWheel={(e) => { if (!e.deltaX) e.currentTarget.scrollLeft += e.deltaY; }}
+              className="absolute inset-0 flex items-center px-2 text-[11px] font-mono overflow-x-auto no-scrollbar cursor-text"
+            >
+              {crumbs.length === 0 && (
+                <span className="shrink-0 whitespace-nowrap text-zinc-500">{currentPath || "Path…"}</span>
+              )}
+              {crumbs.map((c, i) => (
+                <React.Fragment key={c.path}>
+                  {i > 0 && crumbs[i - 1].label !== "/" && (
+                    <span className="shrink-0 px-px text-zinc-600">{provider.pathSep}</span>
+                  )}
+                  {i < crumbs.length - 1 ? (
+                    <button
+                      type="button"
+                      onClick={() => fetch(c.path)}
+                      title={visibleName(c.path)}
+                      className="shrink-0 whitespace-nowrap px-0.5 rounded text-zinc-300 hover:text-indigo-200 hover:bg-white/10 focus:outline-none focus-visible:ring-1 focus-visible:ring-indigo-400/60"
+                    >
+                      {visibleName(c.label)}
+                    </button>
+                  ) : (
+                    <span className="shrink-0 whitespace-nowrap px-0.5 text-zinc-100">{visibleName(c.label)}</span>
+                  )}
+                </React.Fragment>
+              ))}
+            </div>
+          )}
+          </div>
           {bookmarksKey && (
             <button
               onClick={() => toggleBookmark(currentPath)}
@@ -2165,13 +2273,16 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
             <div className="text-center py-14 text-zinc-400">Loading…</div>
           ) : sortedEntries.length === 0 ? (
             <div className="text-center py-14 px-3 text-zinc-500 break-words">
-              {filteredOut ? `No names match “${nameFilter.trim()}”` : "Empty"}
+              {filteredOut && nameFilter.trim()
+                ? `No names match “${nameFilter.trim()}”`
+                : filteredOut ? "Every file here looks the same on the other side" : "Empty"}
             </div>
           ) : (
             sortedEntries.map((entry) => {
               const isSel = selected.has(entry.path);
               const isCursor = entry.path === cursor;
               const moved = movedColumns.map((c) => columnText(c, entry)).filter(Boolean).join(" · ");
+              const mark = compareMarks?.get(entry.path);
               return (
               <div
                 key={entry.path}
@@ -2188,8 +2299,12 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
                 } ${
                   isSel
                     ? "bg-indigo-500/15 border-indigo-400 text-indigo-100"
-                    : "border-transparent text-zinc-200 hover:bg-white/5 hover:text-white"
+                    : mark
+                      ? `${COMPARE_ROW[mark]} text-zinc-200 hover:bg-white/5 hover:text-white`
+                      : "border-transparent text-zinc-200 hover:bg-white/5 hover:text-white"
                 } ${keyNav && isCursor ? "ring-1 ring-inset ring-indigo-400/60" : ""}`}
+                title={mark ? COMPARE_LABEL[mark] : undefined}
+                data-fs-compare={mark}
               >
                 {/* Selection mode only. A click anywhere on the row does what
                     a click on its box would. */}
@@ -2216,6 +2331,7 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
                     )}
                   </span>
                   <div title={visibleName(entry.name)} className={`min-w-0 flex-1 truncate text-[11px] ${entry.brokenLink ? "text-zinc-400 line-through decoration-rose-400/50" : "text-zinc-100"}`}>{visibleName(entry.name)}</div>
+                  {mark && <span className="sr-only">{COMPARE_LABEL[mark]}</span>}
                 </div>
                 {shownColumns.map((c) => (
                   <div key={c} className={`truncate ${COLUMN_CELL[c]}`} title={c === "owner" ? columnText(c, entry) : undefined}>{columnText(c, entry)}</div>
