@@ -340,6 +340,9 @@ mod tests {
         assert!(semver_greater("0.3.8-fork.2", "0.3.8-fork.1"));
         assert!(semver_greater("0.3.8-fork.10", "0.3.8-fork.9"));
         assert!(semver_greater("0.3.9", "0.3.8-fork.5"));
+        // The count starts again with the original project's next version.
+        assert!(semver_greater("0.4.0-fork.1", "0.3.8-fork.10"));
+        assert!(!semver_greater("0.3.8-fork.10", "0.4.0-fork.1"));
         assert!(!semver_greater("0.3.8-fork.1", "0.3.8-fork.1"));
         assert!(!semver_greater("0.3.8", "0.3.8-fork.1"));
         // Other suffixes still sort equal to their base.

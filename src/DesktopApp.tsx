@@ -274,7 +274,7 @@ function DesktopApp() {
 
   // Version for the title bar, from the build itself (about::app_info) rather
   // than hardcoded so it can never drift from the real build: a release's
-  // whole version (v0.3.8-fork.2), and the commit in the tooltip when built
+  // whole version (v0.4.0-fork.2), and the commit in the tooltip when built
   // from source. Shown faded next to the brand name; renders nothing if the
   // call ever fails.
   const [appVersion, setAppVersion] = useState<{ version: string; commit: string | null } | null>(null);

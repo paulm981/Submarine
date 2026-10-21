@@ -4,7 +4,7 @@ name: Build
 #
 #   • Every push to main (a merged pull request) → a release of the fork,
 #     tagged with the original project's version and the fork's count:
-#     v0.3.8-fork.1, v0.3.8-fork.2, …, then v0.3.9-fork.1 once 0.3.9 is in
+#     v0.4.0-fork.1, v0.4.0-fork.2, …, then v0.4.1-fork.1 once 0.4.1 is in
 #     (the version job). Its installers have the same names in every
 #     release, so a link to releases/latest/download/<name> always gets the
 #     newest. The app shows its version and says when there's a newer one.
@@ -721,7 +721,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           printf '%s\n' \
-            "**This page isn't updated any more.** Every change to Submarine is now a release, numbered like v0.3.8-fork.2: get the newest from **[Releases](https://github.com/$REPO/releases/latest)**." \
+            "**This page isn't updated any more.** Every change to Submarine is now a release, numbered like v0.4.0-fork.2: get the newest from **[Releases](https://github.com/$REPO/releases/latest)**." \
             "" \
             "Builds up to 244 say there's a new version and link to it." > moved.md
           gh release edit latest-main --repo "$REPO" --notes-file moved.md || echo "::notice::No Latest build page to update."
