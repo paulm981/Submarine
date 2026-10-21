@@ -2,7 +2,7 @@
 
 This changelog lists the releases of [paulm981/Submarine](https://github.com/paulm981/Submarine), newest first.
 
-- Each release is one merge to main, numbered with the original project's version and the fork's count, such as `v0.3.8-fork.2`. The title bar shows it.
+- Each release is one merge to main, numbered with the original project's version and the fork's count, such as `v0.4.0-fork.2`. The title bar shows it.
 - Before `v0.3.8-fork.1`, merges were numbered builds instead, down to build 236 and the summary below it.
 - Sections called **From the original project** list what came in from [SinaXhpm/Submarine](https://github.com/SinaXhpm/submarine), with that project's pull request numbers.
 - [FORK.md](FORK.md) explains what the fork does differently, and which of the original project's changes it hasn't taken yet.
@@ -46,7 +46,7 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
   - a hostile server can't keep a login, a telnet or an RDP connect going forever, or slip a second request into an HTTP proxy's ([#209](https://github.com/SinaXhpm/submarine/pull/209));
   - a mirror's folder on this computer can't be a network share ([#210](https://github.com/SinaXhpm/submarine/pull/210));
   - a copy of a server keeps waiting for your OK where the original was waiting. The fork already did this ([#211](https://github.com/SinaXhpm/submarine/pull/211)).
-- **Release builds** ([#221](https://github.com/SinaXhpm/submarine/pull/221)). The actions they use are pinned to exact versions, and the Android app, when it's built, is signed in a step of its own that runs nothing else.
+- **Release builds** ([#221](https://github.com/SinaXhpm/submarine/pull/221)). The actions they use are pinned to exact versions, and the Android app, when it's built, is signed by a separate job that runs nothing else.
 
 ## v0.3.8-fork.10
 

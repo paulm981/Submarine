@@ -24,13 +24,13 @@ fn main() {
         .unwrap_or_default();
     println!("cargo:rustc-env=SUBMARINE_GIT_SHA={}", commit);
     // What kind of build, for the update check: "release" (every merge to
-    // main is one, v0.3.8-fork.N, built by the workflow) or "source" (built
+    // main is one, v0.4.0-fork.N, built by the workflow) or "source" (built
     // from a clone, updated by pull and rebuild).
     let kind = if env_set("SUBMARINE_RELEASE") { "release" } else { "source" };
     println!("cargo:rustc-env=SUBMARINE_BUILD_KIND={}", kind);
     // The version to show and compare (about.rs): the workflow's whole
-    // release version, such as "0.3.8-fork.1". The Windows installer is
-    // stamped "0.3.8", since its version can't carry "-fork.1", so Cargo's
+    // release version, such as "0.4.0-fork.1". The Windows installer is
+    // stamped "0.4.0", since its version can't carry "-fork.1", so Cargo's
     // version alone would make that release look older than itself. Built
     // from source, it's the newest fork release in the clone's history, and
     // otherwise Cargo's.

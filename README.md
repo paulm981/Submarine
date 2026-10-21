@@ -75,7 +75,7 @@ The tour with more pictures is in [FORK.md](FORK.md), along with where the fork 
 **Ready to roll out to a team**
 - **A release from every change**, numbered like `v0.4.0-fork.2` and shown in the title bar, with a notice when there's a newer one.
 - **Troubleshooting**: a log on your computer, a watchdog that notes when the window froze and why, and **Copy diagnostics** with server, user and host names replaced, ready to send to whoever is helping. When a connect fails, Submarine says whether the name resolved and the port answered.
-- **Hardening**: characters that disguise a file name are shown plainly, and a trusted server that shows a different kind of key is a warning, not a silent change. On Windows, Live Edit also opens a file in an editor and never runs it, the Local pane asks before it runs a program, and downloads are marked as from the internet.
+- **Hardening**: characters that disguise a file name are shown plainly, and a trusted server that shows a different kind of key is a warning, not a silent change. Live Edit opens a file in an editor and never runs it, and the Local pane asks before it opens a file that would run, on Windows, macOS and Linux. Downloads are marked as from the internet on Windows and macOS. As in the original project, a program on a server isn't opened from the file pane at all.
 - **Close to the original project**: its changes come in through regular sync pull requests, and [FORK.md](FORK.md) lists where the fork differs and what it hasn't taken yet.
 
 The original project's README follows.

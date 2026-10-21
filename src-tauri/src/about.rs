@@ -7,7 +7,7 @@
 //! separate, bigger problem involving signed updates).
 //!
 //! The fork is used two ways (build.rs): as a release, which every merge to
-//! main is (v0.3.8-fork.1, v0.3.8-fork.2, …: the original project's version
+//! main is (v0.4.0-fork.1, v0.4.0-fork.2, …: the original project's version
 //! and a count), or built from source. Besides releases, the check says how
 //! many commits the fork's main has that a build from source doesn't — to
 //! pull and rebuild — and how many the original project has that the fork
@@ -28,7 +28,7 @@ const BUILD_COMMIT: &str = env!("SUBMARINE_GIT_SHA");
 /// "source" or "release" (build.rs).
 const BUILD_KIND: &str = env!("SUBMARINE_BUILD_KIND");
 /// This build's version (build.rs): a release's whole tag, such as
-/// "0.3.8-fork.1", even where the installer's own version can't carry the
+/// "0.4.0-fork.1", even where the installer's own version can't carry the
 /// "-fork.1" (Windows), and otherwise Cargo's.
 const VERSION: &str = env!("SUBMARINE_VERSION");
 
@@ -42,7 +42,7 @@ pub struct AppInfo {
     pub commit: Option<String>,
 }
 
-/// "0.3.8-fork.3 (source, 23d8806)": which build this is, for the log and
+/// "0.4.0-fork.3 (source, 23d8806)": which build this is, for the log and
 /// "Copy diagnostics".
 pub fn build_label() -> String {
     let mut label = VERSION.to_string();
