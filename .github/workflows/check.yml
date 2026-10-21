@@ -5,6 +5,11 @@ name: Check
 # reaching the team:
 #
 #   • rust (Linux and Windows): the Rust tests.
+#   • rust (macOS): the AI bridge's tests only (#32): the local channel and
+#     `submarine --mcp`, which work differently on each system.
+#   • rust (Windows) also runs `submarine --mcp`'s test as a release build:
+#     there Submarine is a windowed program, and the helper's stdin and stdout
+#     have to work all the same.
 #   • rust (Linux) also runs clippy: an error fails the check, and so does a
 #     rise in the number of warnings over .github/clippy-warnings. Most of
 #     today's warnings are in the original project's code, and fixing them
@@ -50,6 +55,8 @@ jobs:
             os_name: linux
           - platform: windows-latest
             os_name: windows
+          - platform: macos-latest
+            os_name: macos
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 40
     steps:
@@ -93,8 +100,21 @@ jobs:
           [ -f dist/index.html ] || echo '<!doctype html><title>Submarine</title>' > dist/index.html
 
       - name: Tests
+        if: matrix.os_name != 'macos'
         working-directory: src-tauri
         run: cargo test --locked
+
+      - name: AI bridge tests
+        if: matrix.os_name == 'macos'
+        working-directory: src-tauri
+        run: |
+          cargo test --locked --lib ai::
+          cargo test --locked --test mcp_helper
+
+      - name: The MCP helper as a windowed program
+        if: matrix.os_name == 'windows'
+        working-directory: src-tauri
+        run: cargo test --locked --release --test mcp_helper
 
       - name: Clippy, and no new warnings
         if: matrix.os_name == 'linux'

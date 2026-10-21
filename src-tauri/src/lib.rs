@@ -45,6 +45,7 @@ mod applog;
 mod term_output;
 mod proxy_command;
 mod diagnose;
+mod ai;
 #[cfg(target_os = "android")]
 mod android_bridge;
 #[cfg(test)]
@@ -10318,6 +10319,13 @@ async fn initiate_connection(
         .unwrap_or_else(|| "primary".to_string());
     let is_secondary = role != "primary";
     let separate = separate_sessions.unwrap_or(false);
+    // A tab that connects again (a reconnect) is no longer shared with an AI
+    // tab: it's shared again by hand (#32, open question 11).
+    if !is_secondary {
+        if let Some(ai) = app.try_state::<ai::AiState>() {
+            ai.session_gone(&session_id, "reconnected");
+        }
+    }
     // Only the PRIMARY drives interactive keyboard-interactive (2FA) auth. A
     // secondary connection that hit a 2FA challenge would emit a `kbi-prompt`
     // the UI isn't wired to answer for the suffixed session id, so it would just
@@ -12540,6 +12548,10 @@ async fn disconnect_session(
     // this IS a primary id (no `::` suffix) — a direct disconnect of a secondary
     // must not recurse into non-existent grandchildren.
     if !session_id.contains("::") {
+        // The tab is gone: no AI tab can reach it any more.
+        if let Some(ai) = app.try_state::<ai::AiState>() {
+            ai.session_gone(&session_id, "tab closed");
+        }
         teardown_connection_key(state.inner(), mirrors.inner(), &format!("{}::sftp", session_id)).await;
         teardown_connection_key(state.inner(), mirrors.inner(), &format!("{}::fwd", session_id)).await;
         // Explicitly disconnecting a whole tab also forgets any connect-time
@@ -19738,6 +19750,13 @@ fn windows_clipboard_text() -> Result<String, String> {
     Ok(text)
 }
 
+/// `submarine --mcp`: the helper an AI tool started from Home runs as its
+/// MCP server (ai/helper.rs). main.rs calls it before anything else and exits
+/// with what it returns.
+pub fn mcp_helper() -> i32 {
+    ai::helper::main()
+}
+
 /// Library entrypoint shared by both the desktop `bin/main.rs` shim and
 /// Tauri's Android entry-point macro. Everything that builds the
 /// `tauri::Builder`, registers plugins/state/commands, and finally calls
@@ -19863,6 +19882,8 @@ pub fn run() {
             }
             let cloud_state = cloud::CloudState::new(&app.handle());
             app.manage(cloud_state);
+            // AI tools (#32): listening already when they were left on.
+            app.manage(ai::AiState::for_app(app.handle()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -19906,6 +19927,7 @@ pub fn run() {
             local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
             local_term::local_terminal_open, local_term::local_terminal_write,
             local_term::local_terminal_resize, local_term::local_terminal_close,
+            ai::ai_settings, ai::ai_set_enabled, ai::ai_state, ai::ai_share, ai::ai_unshare, ai::ai_stop, ai::ai_decide, ai::ai_output,
             ssh_info_probe_section, ssh_systemctl_action, ssh_kill_process,
             ssh_iptables_chain, ssh_nft_chain, ssh_firewall_as_root,
             applog::app_log, applog::ui_heartbeat, applog::open_log_folder, diagnostics_report,

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
-import { ChevronDown, Plus, TerminalSquare, X } from "lucide-react";
+import { Bot, ChevronDown, Plus, TerminalSquare, X } from "lucide-react";
 import TerminalView from "./TerminalView";
 
 // The Home view: terminals on this computer (src-tauri/src/local_term.rs),
@@ -11,6 +11,11 @@ import TerminalView from "./TerminalView";
 // terminal. Not server sessions: they never join the session tabs, a
 // broadcast or the Wall, and they stay open while the user works elsewhere
 // (DesktopApp keeps this pane mounted once it has been shown).
+//
+// The menu's AI tools heading (#32) lists the AI tools Home can start —
+// Claude Code — while AI tools are on in Settings and it's installed. Picked,
+// it opens in a tab of its own, already connected to Submarine; closing the
+// tab ends its access.
 
 // A shell Home can start (local_term.rs): `group` is the heading it's listed
 // under — "Windows" and "WSL" on Windows, "This computer" elsewhere, "Your
@@ -20,7 +25,7 @@ export interface LocalShell { id: string; label: string; group: string; detail: 
 // `notes`: what to say under a heading with nothing to list (WSL not
 // installed, or no Linux in it yet).
 export interface ShellNote { group: string; text: string; }
-export interface LocalShells { shells: LocalShell[]; notes: ShellNote[]; default_id: string; custom: string | null; custom_missing: boolean; }
+export interface LocalShells { shells: LocalShell[]; notes: ShellNote[]; default_id: string; custom: string | null; custom_missing: boolean; ai_tools: LocalShell[]; }
 
 export interface ShellGroup { name: string; shells: LocalShell[]; notes: string[]; }
 
@@ -62,7 +67,8 @@ export const HomePane = ({ visible, onLiveShells }: { visible: boolean; onLiveSh
     invoke<LocalShells>("list_local_shells").then(setShells).catch(() => setShells(null));
 
   const openShell = (shell: string | null) => {
-    const label = shell ? (shells?.shells.find((s) => s.id === shell)?.label ?? "Terminal") : "Terminal";
+    const known = shell ? [...(shells?.shells ?? []), ...(shells?.ai_tools ?? [])].find((s) => s.id === shell) : undefined;
+    const label = known?.label ?? "Terminal";
     const id = newId();
     setTabs((prev) => [...prev, { id, shell, label, ended: false }]);
     setActive(id);
@@ -137,7 +143,7 @@ export const HomePane = ({ visible, onLiveShells }: { visible: boolean; onLiveSh
                     : "text-zinc-300 bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/20 hover:text-white"
                 } ${t.ended ? "opacity-60" : ""}`}
               >
-                <TerminalSquare size={14} />
+                {t.shell?.startsWith("ai:") ? <Bot size={14} /> : <TerminalSquare size={14} />}
                 {t.label}
               </button>
               <button
@@ -247,6 +253,25 @@ export const HomePane = ({ visible, onLiveShells }: { visible: boolean; onLiveSh
                 </div>
               ));
             })()}
+            {shells && shells.ai_tools?.length > 0 && (
+              <div className="mt-1 pt-1 border-t border-white/5">
+                <div className="px-3 pt-1 pb-0.5 text-[9.5px] font-bold uppercase tracking-wider text-zinc-500">AI tools</div>
+                {shells.ai_tools.map((s) => (
+                  <button
+                    key={s.id}
+                    onClick={() => openShell(s.id)}
+                    title={`${s.label}, connected to Submarine — ${s.detail ?? ""}`}
+                    className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left"
+                  >
+                    <Bot size={13} className="text-zinc-500 shrink-0" />
+                    <span className="flex-1 min-w-0">
+                      <span className="block truncate">{s.label}</span>
+                      {s.detail && <span className="block truncate text-[10px] text-zinc-500">{s.detail}</span>}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
             {!shells && <div className="px-3 py-1.5 text-zinc-500">Looking for shells…</div>}
           </div>
         </>,

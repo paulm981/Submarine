@@ -2,7 +2,7 @@ import { useState, useEffect, useLayoutEffect, useRef, useCallback, memo, type C
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { TerminalSquare, Folder, FolderUp, Network, AlertTriangle, Check, X, ShieldAlert, KeyRound, Play, Library, Info, Container, Plus, SplitSquareHorizontal, Columns, Rows, RotateCw, Loader2, CircleSlash, PanelRight, PanelLeft, PanelBottom, PanelTop, Maximize2, Minimize2, UploadCloud } from "lucide-react";
+import { TerminalSquare, Folder, FolderUp, Network, AlertTriangle, Check, X, ShieldAlert, KeyRound, Play, Library, Info, Container, Plus, SplitSquareHorizontal, Columns, Rows, RotateCw, Loader2, CircleSlash, PanelRight, PanelLeft, PanelBottom, PanelTop, Maximize2, Minimize2, UploadCloud, Bot } from "lucide-react";
 import TerminalView from "./TerminalView";
 import SftpWorkspace, { type SftpView } from "./SftpWorkspace";
 import TunnelsPanel from "./TunnelsPanel";
@@ -10,6 +10,7 @@ import InfoPanel from "./InfoPanel";
 import { CmdsPanel } from "./CmdsPanel";
 import { RenameInput } from "../ui/renameInput";
 import { useIsCompact } from "../hooks/useViewport";
+import { useAi, sharedWith } from "../util/ai";
 import { fontFamilyCss, readFontFamily, readFontSize } from "../util/terminalFont";
 import { readShellSyncPairs, useShellSyncServer, type ShellSyncPair } from "../util/shellSync";
 import { readUseLocalShell } from "../util/terminalShell";
@@ -923,6 +924,19 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   });
   // Anchor of the open "Panel position" menu, if any.
   const [dockMenu, setDockMenu] = useState<{ x: number; y: number } | null>(null);
+  // Share with AI (#32): this tab, with one AI tab; the menu picks which
+  // when more than one is open. Stopping takes it from every AI tab.
+  const ai = useAi();
+  const aiSharedWith = sharedWith(ai, session.id);
+  const [aiMenu, setAiMenu] = useState<{ x: number; y: number } | null>(null);
+  const shareWithAi = (tabId: string) => {
+    setAiMenu(null);
+    invoke("ai_share", { tabId, sessionId: session.id, name: displayName ?? session.serverName })
+      .catch((e) => addLog(`AI_SHARE: ${e}`, "error"));
+  };
+  const stopSharingWithAi = () => {
+    invoke("ai_unshare", { sessionId: session.id }).catch((e) => addLog(`AI_UNSHARE: ${e}`, "error"));
+  };
   // SFTP pane: the file browser or Mirror (the button in its title bar).
   const [sftpView, setSftpView] = useState<SftpView>("files");
   const mainAreaRef = useRef<HTMLDivElement | null>(null);
@@ -1884,6 +1898,38 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               <span className="hidden md:inline text-[11px] font-semibold tracking-tight">Shell</span>
             </button>
           )}
+          {/* Share with AI: while AI tools are on (Settings › AI tools). Lit
+              while shared; a click then stops sharing. */}
+          {ai.enabled && (
+            <button
+              onClick={(e) => {
+                if (aiSharedWith.length > 0) return stopSharingWithAi();
+                if (ai.tabs.length === 1) return shareWithAi(ai.tabs[0].id);
+                const r = e.currentTarget.getBoundingClientRect();
+                setAiMenu({ x: r.right, y: r.bottom + 4 });
+              }}
+              disabled={aiSharedWith.length === 0 && (status !== 'connected' || ai.tabs.length === 0)}
+              title={aiSharedWith.length > 0
+                ? `Shared with ${aiSharedWith.map(t => t.label).join(", ")} — click to stop sharing`
+                : ai.tabs.length === 0
+                  ? "Share with AI: start an AI tool from Home's menu first"
+                  : status !== 'connected'
+                    ? "Share with AI: once this tab is connected"
+                    : "Share with AI: let an AI tab ask to run commands here, each one only after you allow it"}
+              aria-label="Share with AI"
+              aria-pressed={aiSharedWith.length > 0}
+              className={`h-10 sm:h-8 px-2.5 rounded-lg flex items-center gap-1.5 transition-all disabled:opacity-40 disabled:pointer-events-none ${
+                aiSharedWith.length > 0
+                  ? 'bg-primary/10 text-primary border border-primary/20 shadow-inner'
+                  : 'text-zinc-300 bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/20 hover:text-white'
+              }`}
+            >
+              <Bot size={14} className={`shrink-0 ${ai.running.some(r => r.session_id === session.id) ? 'animate-pulse' : ''}`} />
+              <span className="hidden md:inline text-[11px] font-semibold tracking-tight">
+                {aiSharedWith.length > 0 ? `Shared with ${aiSharedWith.map(t => t.label).join(", ")}` : "Share with AI"}
+              </span>
+            </button>
+          )}
           {/* Where the tool pane sits around the terminal. Compact windows
               show the tool full screen, so there is nothing to place. */}
           {!isCompact && (
@@ -2018,6 +2064,30 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
         document.body
       )}
 
+      {aiMenu && createPortal(
+        <>
+          <div className="fixed inset-0 z-[9998]" onClick={() => setAiMenu(null)} onContextMenu={(e) => { e.preventDefault(); setAiMenu(null); }} />
+          <div
+            role="menu"
+            style={{ left: Math.max(8, aiMenu.x - 220), top: aiMenu.y }}
+            className="fixed z-[9999] w-[220px] bg-[#15151a] border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
+          >
+            <div className="px-3 pt-1 pb-0.5 text-[9.5px] font-bold uppercase tracking-wider text-zinc-500">Share {displayName ?? session.serverName} with</div>
+            {ai.tabs.map((t) => (
+              <button
+                key={t.id}
+                role="menuitem"
+                onClick={() => shareWithAi(t.id)}
+                className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left"
+              >
+                <Bot size={13} className="text-zinc-500 shrink-0" />
+                <span className="flex-1 truncate">{t.label}</span>
+              </button>
+            ))}
+          </div>
+        </>,
+        document.body,
+      )}
       {dockMenu && createPortal(
         <>
           <div

@@ -1,0 +1,269 @@
+import { ReactNode, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { Bot, Check, ChevronDown, ChevronRight, Loader2, ShieldAlert, Square, X } from "lucide-react";
+import { AiDone, AiSnapshot } from "../util/ai";
+import { HIDDEN_CONTROLS } from "../util/fileName";
+
+// The AI panel (#32): one for the whole app, docked on the right and opened
+// from the title bar's AI button. It holds what every AI tab does, on every
+// server: who has what shared (and Stop), the requests waiting for you, what
+// is running, and what ran — the exit code, all of the output, and what the
+// AI was given.
+//
+// A request never takes the keyboard: nothing here takes focus, the buttons
+// can't be reached with Tab, and only a click (never Enter or Space) allows
+// or denies, so typing in a terminal can't approve anything.
+
+/// A click with the mouse (or a tap), not a key: a keyboard "click" has no
+/// detail count.
+const byPointer = (e: React.MouseEvent) => e.detail > 0;
+
+// What would hide or reorder text, shown plainly: the controls file names
+// are checked for (HIDDEN_CONTROLS), and the other control characters but
+// tab and newline.
+const OTHER_CONTROLS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g;
+
+/// `text` with every hidden or control character shown as its code, marked.
+export const showPlainly = (text: string): ReactNode[] => {
+  const re = new RegExp(`${HIDDEN_CONTROLS.source}|${OTHER_CONTROLS.source}`, "g");
+  const out: ReactNode[] = [];
+  let last = 0;
+  for (const m of text.matchAll(re)) {
+    const at = m.index ?? 0;
+    if (at > last) out.push(text.slice(last, at));
+    const code = m[0].codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0");
+    out.push(
+      <span key={at} className="px-0.5 mx-px rounded bg-amber-500/20 text-amber-300 font-bold" title="A hidden or control character">
+        ⟨U+{code}⟩
+      </span>,
+    );
+    last = at + m[0].length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+};
+
+const hasHidden = (text: string) => new RegExp(`${HIDDEN_CONTROLS.source}|${OTHER_CONTROLS.source}`).test(text);
+
+const time = (iso: string) => {
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? "" : d.toLocaleTimeString();
+};
+
+const NoFocusButton = ({ onPick, className, children, title }: { onPick: () => void; className: string; children: ReactNode; title?: string }) => (
+  <button
+    type="button"
+    tabIndex={-1}
+    title={title}
+    onMouseDown={(e) => e.preventDefault()}
+    onClick={(e) => { if (byPointer(e)) onPick(); }}
+    onKeyDown={(e) => e.preventDefault()}
+    className={className}
+  >
+    {children}
+  </button>
+);
+
+const outcomeLabel = (d: AiDone) => {
+  switch (d.outcome) {
+    case "denied": return "denied by you";
+    case "cancelled": return "cancelled";
+    case "stopped": return "stopped";
+    case "failed": return "couldn't run";
+    default: return d.timed_out ? "timed out" : d.exit_code === null ? "ended" : `exit ${d.exit_code}`;
+  }
+};
+
+const DoneRow = ({ d }: { d: AiDone }) => {
+  const [open, setOpen] = useState(false);
+  const [aiView, setAiView] = useState(false);
+  // Fetched when the row is first opened (ai_output).
+  const [outputs, setOutputs] = useState<{ output: string; ai_output: string } | null>(null);
+  const [outputError, setOutputError] = useState<string | null>(null);
+  const toggle = () => {
+    if (!open && !outputs && d.outcome === "done") {
+      invoke<{ output: string; ai_output: string }>("ai_output", { id: d.id }).then(setOutputs).catch((e) => setOutputError(String(e)));
+    }
+    setOpen((o) => !o);
+  };
+  const ok = d.outcome === "done" && d.exit_code === 0;
+  const ran = d.outcome === "done";
+  return (
+    <div className="border-t border-white/5">
+      <NoFocusButton
+        onPick={toggle}
+        className="w-full flex items-start gap-2 px-3 py-2 text-left hover:bg-white/[0.03]"
+      >
+        {open ? <ChevronDown size={12} className="mt-0.5 shrink-0 text-zinc-500" /> : <ChevronRight size={12} className="mt-0.5 shrink-0 text-zinc-500" />}
+        <span className="flex-1 min-w-0">
+          <span className="flex items-center gap-2 text-[10.5px] text-zinc-500">
+            <span className="font-semibold text-zinc-300">{d.tab_label}</span>
+            <span>{d.server}</span>
+            <span className="ml-auto">{time(d.at)}</span>
+          </span>
+          <span className="block font-mono text-[11px] text-zinc-200 truncate">{d.command}</span>
+          <span className={`block text-[10.5px] ${ok ? "text-emerald-400" : ran ? "text-amber-300" : "text-zinc-500"}`}>
+            {outcomeLabel(d)}
+            {d.hidden > 0 && <span className="text-sky-300"> · {d.hidden} hidden from the AI</span>}
+            {d.cut && <span> · stopped at 1 MB</span>}
+          </span>
+        </span>
+      </NoFocusButton>
+      {open && (
+        <div className="px-3 pb-3 space-y-2">
+          {d.error && <p className="text-[11px] text-red-400 break-words">{d.error}</p>}
+          {outputError && <p className="text-[11px] text-red-400 break-words">{outputError}</p>}
+          {ran && (
+            <>
+              <div className="flex gap-1 text-[10px] font-bold uppercase tracking-wider">
+                <NoFocusButton onPick={() => setAiView(false)} className={`px-2 py-0.5 rounded ${!aiView ? "bg-white/10 text-white" : "text-zinc-500 hover:text-zinc-300"}`}>
+                  Full output
+                </NoFocusButton>
+                <NoFocusButton onPick={() => setAiView(true)} className={`px-2 py-0.5 rounded ${aiView ? "bg-white/10 text-white" : "text-zinc-500 hover:text-zinc-300"}`}>
+                  What the AI got
+                </NoFocusButton>
+              </div>
+              {/* Text only, never HTML. */}
+              <pre className="max-h-72 overflow-auto custom-scrollbar whitespace-pre-wrap break-all rounded-lg bg-black/40 border border-white/5 p-2 font-mono text-[10.5px] text-zinc-300 select-text">
+                {outputs ? ((aiView ? outputs.ai_output : outputs.output) || "(no output)") : "…"}
+              </pre>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onClose: () => void; onGoToServer: (sessionId: string) => void }) => {
+  const [error, setError] = useState<string | null>(null);
+  const run = (cmd: string, args: Record<string, unknown>) => {
+    setError(null);
+    invoke(cmd, args).catch((e) => setError(String(e)));
+  };
+  return (
+    <aside
+      aria-label="AI panel"
+      className="w-[380px] shrink-0 min-h-0 flex flex-col bg-[#111114] border-l border-white/10 text-[12px]"
+    >
+      <div className="h-11 shrink-0 px-3 flex items-center gap-2 border-b border-white/5">
+        <Bot size={15} className="text-primary" />
+        <span className="font-bold text-zinc-100 tracking-wide">AI</span>
+        <span className="flex-1" />
+        <NoFocusButton onPick={onClose} title="Close the panel" className="w-7 h-7 flex items-center justify-center rounded hover:bg-white/10 text-zinc-400 hover:text-white">
+          <X size={14} />
+        </NoFocusButton>
+      </div>
+
+      <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar">
+        {!snap.enabled && (
+          <p className="p-4 text-zinc-500 leading-relaxed">AI tools are off. Turn them on in Settings › AI tools.</p>
+        )}
+        {snap.enabled && snap.tabs.length === 0 && (
+          <p className="p-4 text-zinc-500 leading-relaxed">
+            No AI tab is open. Start Claude Code from Home's menu (the arrow beside +), under AI tools.
+          </p>
+        )}
+
+        {/* The AI tabs, what each has, and Stop. */}
+        {snap.tabs.map((t) => (
+          <div key={t.id} className="px-3 py-2 border-b border-white/5 flex items-start gap-2">
+            <Bot size={13} className="mt-0.5 shrink-0 text-zinc-400" />
+            <div className="flex-1 min-w-0">
+              <div className="font-semibold text-zinc-200">{t.label}</div>
+              <div className="text-[11px] text-zinc-500 flex flex-wrap gap-x-2">
+                {t.servers.length === 0 ? "nothing shared" : (
+                  <>
+                    <span>shared:</span>
+                    {t.servers.map((s) => (
+                      <span key={s.session_id} className="inline-flex items-center gap-0.5">
+                        <NoFocusButton onPick={() => onGoToServer(s.session_id)} className="text-zinc-300 hover:text-white hover:underline">{s.name}</NoFocusButton>
+                        <NoFocusButton
+                          onPick={() => run("ai_unshare", { sessionId: s.session_id, tabId: t.id })}
+                          title={`Stop sharing ${s.name} with ${t.label}`}
+                          className="text-zinc-600 hover:text-red-400"
+                        >
+                          <X size={10} />
+                        </NoFocusButton>
+                      </span>
+                    ))}
+                  </>
+                )}
+              </div>
+            </div>
+            <NoFocusButton
+              onPick={() => run("ai_stop", { tabId: t.id })}
+              title={`Stop: share nothing more with ${t.label}, and cancel what it asked for`}
+              className="shrink-0 h-6 px-2 rounded border border-white/10 text-[10px] font-bold uppercase tracking-wider text-zinc-300 hover:border-red-400/50 hover:text-red-300 flex items-center gap-1"
+            >
+              <Square size={9} /> Stop
+            </NoFocusButton>
+          </div>
+        ))}
+
+        {/* Waiting for you. */}
+        {snap.pending.map((p) => (
+          <div key={p.id} className="m-2 rounded-xl border border-primary/30 bg-primary/[0.06] p-3 space-y-2">
+            <div className="text-[11.5px] text-zinc-300">
+              <span className="font-bold text-white">{p.tab_label}</span> wants to run on{" "}
+              <NoFocusButton onPick={() => onGoToServer(p.session_id)} className="font-bold text-white hover:underline">{p.server}</NoFocusButton>
+              {p.timeout_secs !== 60 && <span className="text-zinc-500"> · stops after {p.timeout_secs}s</span>}
+            </div>
+            {p.root && (
+              <div className="flex items-start gap-1.5 text-[11px] text-amber-300">
+                <ShieldAlert size={13} className="shrink-0 mt-px" />
+                <span>Asks for root (sudo, dzdo, su, doas or pkexec). Where those need no password, it runs as root.</span>
+              </div>
+            )}
+            {hasHidden(p.command) && (
+              <div className="flex items-start gap-1.5 text-[11px] text-amber-300">
+                <ShieldAlert size={13} className="shrink-0 mt-px" />
+                <span>It has hidden or control characters, shown below as ⟨U+…⟩.</span>
+              </div>
+            )}
+            {/* The whole command, never cut off. */}
+            <pre className="whitespace-pre-wrap break-all rounded-lg bg-black/50 border border-white/10 p-2 font-mono text-[11.5px] text-zinc-100 select-text">
+              {showPlainly(p.command)}
+            </pre>
+            <div className="flex gap-2">
+              <NoFocusButton
+                onPick={() => run("ai_decide", { id: p.id, allow: true })}
+                className="flex-1 h-8 rounded-lg bg-primary/15 border border-primary/40 text-primary text-[11px] font-bold uppercase tracking-wider hover:bg-primary hover:text-zinc-950 flex items-center justify-center gap-1.5"
+              >
+                <Check size={13} /> Allow
+              </NoFocusButton>
+              <NoFocusButton
+                onPick={() => run("ai_decide", { id: p.id, allow: false })}
+                className="flex-1 h-8 rounded-lg bg-zinc-900 border border-white/10 text-zinc-300 text-[11px] font-bold uppercase tracking-wider hover:border-red-400/50 hover:text-red-300 flex items-center justify-center gap-1.5"
+              >
+                <X size={13} /> Deny
+              </NoFocusButton>
+            </div>
+          </div>
+        ))}
+
+        {/* Running now. */}
+        {snap.running.map((r) => (
+          <div key={r.id} className="px-3 py-2 border-t border-white/5 flex items-start gap-2">
+            <Loader2 size={12} className="mt-0.5 shrink-0 animate-spin text-primary" />
+            <span className="flex-1 min-w-0">
+              <span className="block text-[10.5px] text-zinc-500"><span className="font-semibold text-zinc-300">{r.tab_label}</span> {r.server} · running</span>
+              <span className="block font-mono text-[11px] text-zinc-200 truncate">{r.command}</span>
+            </span>
+          </div>
+        ))}
+
+        {snap.history.map((d) => <DoneRow key={d.id} d={d} />)}
+      </div>
+
+      {error && <p className="shrink-0 px-3 py-2 text-[11px] text-red-400 border-t border-white/5">{error}</p>}
+      <p className="shrink-0 px-3 py-2 text-[10px] text-zinc-600 leading-snug border-t border-white/5">
+        The AI gets output with known secrets hidden: private keys, password and token values, password hashes, access keys,
+        passwords in URLs. The filter catches common shapes, not everything.
+        {snap.audit_log && <> Every request is logged in {snap.audit_log}.</>}
+      </p>
+    </aside>
+  );
+};
+
+export default AiPanel;
