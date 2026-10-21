@@ -926,6 +926,9 @@ function DesktopApp() {
         serverId: s.id,
         serverName: s.name,
         host: s.host,
+        // The port it was opened with, so the OS check below asks that one
+        // rather than whatever the server's port is by then.
+        port: s.port,
         mirrors: s.mirrors,
         serverUuid: s.uuid ?? null,
       }));

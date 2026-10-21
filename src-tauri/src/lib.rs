@@ -6716,36 +6716,56 @@ async fn set_server_jump_host(state: tauri::State<'_, DbState>, id: i32, value: 
 async fn clone_server(state: tauri::State<'_, DbState>, id: i32) -> Result<i64, String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-    let affected = conn.execute(
-        "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, terminal_theme, highlight)
-         SELECT name || ' (copy)', host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, 0, mirrors, color, notes, run_on_connect, jump_host_id, terminal_theme, highlight
-         FROM servers WHERE id = ?1",
-        rusqlite::params![id],
-    ).map_err(|e| format!("[DATABASE] SERVER_CLONE_FAILED: {}", e))?;
-    if affected == 0 {
-        return Err(format!("[DATABASE] SERVER_CLONE_FAILED: no row with id {}", id));
-    }
-    let new_id = conn.last_insert_rowid();
-    // Place the clone at the bottom of its folder's manual order (the INSERT
-    // above doesn't copy `position`, so without this it would default to 0 and
-    // jump to the top). Same append logic as add_server, folder taken from the
-    // clone's own row.
-    let _ = conn.execute(
-        "UPDATE servers SET position = COALESCE((SELECT MAX(position) FROM servers s2 WHERE s2.id != servers.id AND s2.folder_id IS servers.folder_id), -1) + 1 WHERE id = ?1",
-        rusqlite::params![new_id],
-    );
-    // What the original wasn't allowed to run yet (a shared profile's held
-    // commands and forwards) stays held on the copy, so duplicating isn't a
-    // way around the approval. See approvals::copy_held.
-    // The copy is taken out again when that fails: a duplicate that came
-    // without its held entries would run what the original couldn't.
-    if let Err(e) = approvals::copy_held(conn, id as i64, new_id) {
-        let _ = conn.execute("DELETE FROM servers WHERE id = ?1", rusqlite::params![new_id]);
-        return Err(e);
-    }
+    let new_id = clone_server_row(conn, id)?;
     drop(conn_guard);
     save_vault_internal(&state)?;
     Ok(new_id)
+}
+
+/// The copy itself, all or nothing: when any step fails nothing of it stays.
+/// Undone in a savepoint rather than by deleting the copy afterwards, as a
+/// delete would leave a sync tombstone for a server no other device ever saw.
+fn clone_server_row(conn: &rusqlite::Connection, id: i32) -> Result<i64, String> {
+    conn.execute("SAVEPOINT clone_server", [])
+        .map_err(|e| format!("[DATABASE] SERVER_CLONE_FAILED: {}", e))?;
+    let result = (|| {
+        let affected = conn.execute(
+            "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, terminal_theme, highlight)
+             SELECT name || ' (copy)', host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, 0, mirrors, color, notes, run_on_connect, jump_host_id, terminal_theme, highlight
+             FROM servers WHERE id = ?1",
+            rusqlite::params![id],
+        ).map_err(|e| format!("[DATABASE] SERVER_CLONE_FAILED: {}", e))?;
+        if affected == 0 {
+            return Err(format!("[DATABASE] SERVER_CLONE_FAILED: no row with id {}", id));
+        }
+        let new_id = conn.last_insert_rowid();
+        // Place the clone at the bottom of its folder's manual order (the INSERT
+        // above doesn't copy `position`, so without this it would default to 0 and
+        // jump to the top). Same append logic as add_server, folder taken from the
+        // clone's own row.
+        let _ = conn.execute(
+            "UPDATE servers SET position = COALESCE((SELECT MAX(position) FROM servers s2 WHERE s2.id != servers.id AND s2.folder_id IS servers.folder_id), -1) + 1 WHERE id = ?1",
+            rusqlite::params![new_id],
+        );
+        // What the original wasn't allowed to run yet (a shared profile's held
+        // commands and forwards) stays held on the copy, so duplicating isn't a
+        // way around the approval. See approvals::copy_held. A duplicate that
+        // came without its held entries would run what the original couldn't,
+        // so a failure here takes the copy back too.
+        approvals::copy_held(conn, id as i64, new_id)?;
+        Ok(new_id)
+    })();
+    match result {
+        Ok(new_id) => {
+            conn.execute("RELEASE clone_server", [])
+                .map_err(|e| format!("[DATABASE] SERVER_CLONE_FAILED: {}", e))?;
+            Ok(new_id)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO clone_server; RELEASE clone_server;");
+            Err(e)
+        }
+    }
 }
 
 #[tauri::command]
@@ -15985,11 +16005,17 @@ async fn sftp_upload_file(
     // Another upload to this same remote file would interleave with ours, so
     // wait for it to finish first (the card shows 0% meanwhile). What the file
     // looks like is asked again: the upload ahead may have just created it.
-    let Some(_write_turn) = remote_write_locks().acquire(&session_id, &remote_path, &cancel).await else {
+    let Some((_write_turn, _)) = remote_write_locks().acquire(&session_id, &remote_path, &cancel).await else {
         emit_progress(0, "cancelled", None);
         return Err("cancelled".into());
     };
     let existed = sftp.metadata(&remote_path).await.is_ok();
+    // The upload ahead may have made the file this one was told isn't there:
+    // ask first, as the check at the top would have.
+    if existed && overwrite != Some(true) {
+        emit_progress(0, "error", Some(format!("{name} is already on the server.")));
+        return Err(format!("EXISTS:{}", remote_path));
+    }
 
     // Stream the file from disk in chunks rather than slurping the whole thing
     // into a Vec — keeps memory bounded for multi-GB transfers and lets us
@@ -16063,19 +16089,25 @@ impl RemoteWriteLocks {
     }
 
     /// Wait for the file's turn. Gives up with `None` if the user cancels
-    /// while it is queued, so a stuck first upload can't trap the second.
+    /// before or while it is queued, so a stuck first upload can't trap the
+    /// second. The flag says whether it had to wait: another upload was
+    /// writing the file meanwhile, so it may be there now.
     async fn acquire(
         &self,
         session_id: &str,
         remote_path: &str,
         cancel: &std::sync::atomic::AtomicBool,
-    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    ) -> Option<(tokio::sync::OwnedMutexGuard<()>, bool)> {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) { return None; }
         let lock = self.lock_for(session_id, remote_path);
+        if let Ok(guard) = Arc::clone(&lock).try_lock_owned() {
+            return Some((guard, false));
+        }
         let acquire = lock.lock_owned();
         tokio::pin!(acquire);
         loop {
             tokio::select! {
-                guard = &mut acquire => return Some(guard),
+                guard = &mut acquire => return Some((guard, true)),
                 _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
                     if cancel.load(std::sync::atomic::Ordering::Relaxed) { return None; }
                 }
@@ -16327,10 +16359,18 @@ async fn sftp_upload_dir(
         // the file it was writing; files already sent and the folders made
         // for them stay.
         // Wait if another upload is writing this same remote file.
-        let Some(_write_turn) = remote_write_locks().acquire(&session_id, &remote_full, &cancel).await else {
+        let Some((_write_turn, waited)) = remote_write_locks().acquire(&session_id, &remote_full, &cancel).await else {
             emit_progress(transferred, total_bytes, "cancelled", None);
             return Err("cancelled".into());
         };
+        // The folder wasn't there when this upload began, so a file in it
+        // that's there now came from the upload it just waited for: ask
+        // before overwriting it, as for the folder itself.
+        if waited && overwrite != Some(true) && sftp.metadata(&remote_full).await.is_ok() {
+            emit_progress(transferred, total_bytes, "error",
+                Some(format!("{}/{} is already on the server.", folder_name, rel)));
+            return Err(format!("EXISTS:{}", remote_root));
+        }
         let (mut remote_file, created) = match open_upload_target(&sftp, &remote_full, false).await {
             Ok(opened) => opened,
             Err(e) => {
@@ -20144,11 +20184,88 @@ mod remote_write_lock_tests {
     }
 
     #[tokio::test]
+    async fn a_cancel_before_queueing_takes_no_turn() {
+        let locks = RemoteWriteLocks::default();
+        let cancel = AtomicBool::new(true);
+        assert!(locks.acquire("s1", "/srv/a", &cancel).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn says_whether_it_had_to_wait() {
+        let locks = Arc::new(RemoteWriteLocks::default());
+        let no_cancel = Arc::new(AtomicBool::new(false));
+        let (first, waited) = locks.acquire("s1", "/srv/a", &no_cancel).await.unwrap();
+        assert!(!waited);
+        let (l, c) = (Arc::clone(&locks), Arc::clone(&no_cancel));
+        let second = tokio::spawn(async move { l.acquire("s1", "/srv/a", &c).await.map(|(_, w)| w) });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(first);
+        assert_eq!(second.await.unwrap(), Some(true));
+    }
+
+    #[tokio::test]
     async fn finished_files_are_forgotten() {
         let locks = RemoteWriteLocks::default();
         let no_cancel = AtomicBool::new(false);
         drop(locks.acquire("s1", "/srv/a", &no_cancel).await);
         drop(locks.acquire("s1", "/srv/b", &no_cancel).await);
         assert_eq!(locks.map.lock().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod clone_server_tests {
+    use super::*;
+
+    /// The servers columns the copy reads, a stand-in for the sync triggers
+    /// (a uuid on insert, a tombstone on delete), and held entries whose copy
+    /// can be made to fail.
+    fn db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT,
+                credential_id INTEGER, folder_id INTEGER, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER, tunnels TEXT,
+                auth_type TEXT, key_id INTEGER, autostart INTEGER NOT NULL DEFAULT 0, mirrors TEXT, color TEXT, notes TEXT,
+                run_on_connect TEXT NOT NULL DEFAULT '', jump_host_id INTEGER, terminal_theme TEXT, highlight TEXT,
+                position INTEGER NOT NULL DEFAULT 0, uuid TEXT);
+             CREATE TABLE sync_tombstones(uuid TEXT PRIMARY KEY);
+             CREATE TRIGGER s_ai AFTER INSERT ON servers WHEN NEW.uuid IS NULL
+               BEGIN UPDATE servers SET uuid = 'u' || NEW.id WHERE id = NEW.id; END;
+             CREATE TRIGGER s_ad AFTER DELETE ON servers BEGIN INSERT INTO sync_tombstones VALUES (OLD.uuid); END;
+             CREATE TABLE held_approvals(uuid TEXT NOT NULL, item TEXT NOT NULL, since INTEGER NOT NULL, PRIMARY KEY (uuid, item));
+             INSERT INTO servers(id, name, host) VALUES (1, 'web', 'example.com');
+             INSERT INTO held_approvals VALUES ('u1', 'run_on_connect', 0);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn copies_the_server_and_what_it_has_held() {
+        let conn = db();
+        let new_id = clone_server_row(&conn, 1).unwrap();
+        let name: String = conn.query_row("SELECT name FROM servers WHERE id = ?1", [new_id], |r| r.get(0)).unwrap();
+        assert_eq!(name, "web (copy)");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM held_approvals"), 2);
+        assert!(conn.is_autocommit());
+    }
+
+    #[test]
+    fn a_failed_copy_leaves_nothing_behind() {
+        let conn = db();
+        conn.execute_batch(
+            "CREATE TRIGGER held_fails BEFORE INSERT ON held_approvals BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        )
+        .unwrap();
+        assert!(clone_server_row(&conn, 1).is_err());
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM servers"), 1);
+        // Taken back, not deleted: no tombstone for other devices to see.
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM sync_tombstones"), 0);
+        // And nothing is left open: the next change commits as usual.
+        assert!(conn.is_autocommit());
     }
 }
