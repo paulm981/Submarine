@@ -1608,7 +1608,8 @@ function DesktopApp() {
       port: server.port || 22,
       username: server.username || "",
       password: revealedPassword,
-      authType: server.auth_type || (server.credential_id ? "vault" : "custom_pass"),
+      // A VNC server never uses a saved login (see the save below).
+      authType: server.protocol === "vnc" ? "custom_pass" : server.auth_type || (server.credential_id ? "vault" : "custom_pass"),
       credentialId: server.credential_id?.toString() || "",
       folderId: server.folder_id?.toString() || "",
       keyId: server.key_id?.toString() || "",
@@ -3295,7 +3296,7 @@ function DesktopApp() {
             addLog("Name and Host are required.", "error");
             return;
           }
-          if (newNode.authType === "vault" && !newNode.credentialId) {
+          if (newNode.authType === "vault" && !newNode.credentialId && newNode.protocol !== "vnc") {
             setFormError("Please pick a saved login.");
             addLog("Please pick a saved login.", "error");
             return;
@@ -3317,24 +3318,28 @@ function DesktopApp() {
             // go through; nothing that runs over SSH (forwards, mirrors,
             // autostart, a proxy, a key). An RDP server's saved password isn't
             // touched: the RDP app asks. A telnet server's is kept, for the
-            // terminal's password button; a VNC server's, for its login.
+            // terminal's password button; a VNC server's, for its login. A
+            // VNC server never has a saved login: VNC sends its password with
+            // weak protection and doesn't check the server's identity, so a
+            // shared login's password would be open to anyone on the path.
             const isRdp = newNode.protocol === "rdp";
             const isTelnet = newNode.protocol === "telnet";
             const isVnc = newNode.protocol === "vnc";
             const keepsPassword = isTelnet || isVnc;
+            const savedLogin = newNode.authType === "vault" && !isVnc;
             const payload = isRdp || isTelnet || isVnc ? {
               name: newNode.name,
               host: newNode.host,
               port: newNode.port,
               username: isInline && !isVnc ? (newNode.username?.trim() || null) : null,
-              password: keepsPassword && newNode.authType === "custom_pass" ? (newNode.password || null) : null,
-              credentialId: (newNode.authType === "vault" && newNode.credentialId) ? parseInt(newNode.credentialId) : null,
+              password: keepsPassword && !savedLogin ? (newNode.password || null) : null,
+              credentialId: (savedLogin && newNode.credentialId) ? parseInt(newNode.credentialId) : null,
               folderId: newNode.folderId ? parseInt(newNode.folderId) : null,
               proxyType: "none",
               proxyHost: "",
               proxyPort: 1080,
               tunnels: [],
-              authType: newNode.authType === "vault" ? "vault" : "custom_pass",
+              authType: savedLogin ? "vault" : "custom_pass",
               keyId: null,
               autostart: false,
               mirrors: [],

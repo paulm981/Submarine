@@ -13834,9 +13834,11 @@ async fn telnet_open_terminal(
 /// its SSH server over a direct-tcpip channel (no local port), whose login
 /// asks through this tab's usual prompts. The screen goes to the page over
 /// `frames`; mouse, keyboard and size come back through `vnc_input` /
-/// `vnc_resize`. The VNC password is the server's saved one (or its saved
-/// login's), else asked for in the tab when the server wants one; it stays
-/// here.
+/// `vnc_resize`. The VNC password is the server's own saved one, else asked
+/// for in the tab when the server wants one; it stays here. A saved login's
+/// password is never used: VNC's password check is a DES challenge and
+/// answer in the clear, with no check of the server's identity, so anyone on
+/// the path could take a shared login's password from it.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn vnc_open(
@@ -13866,15 +13868,18 @@ async fn vnc_open(
     };
     let attempt = ssh_manager::ConnectAttempt::new(Arc::clone(&state.session_generation), session_id.clone(), generation);
 
-    let (name, host, port, password, protocol, jump_id, jump_name) = {
+    // Only the server's own password (see above): with a saved login chosen,
+    // none is used, and the tab asks for the VNC password when the server
+    // wants one.
+    let (name, host, port, password, protocol, jump_id, jump_name, uses_saved_login) = {
         let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
         conn.query_row(
             "SELECT s.name, s.host, s.port,
-                    CASE WHEN COALESCE(s.auth_type, 'vault') = 'vault' THEN c.password ELSE s.password END,
-                    s.protocol, s.jump_host_id, j.name
+                    CASE WHEN COALESCE(s.auth_type, 'vault') = 'vault' THEN NULL ELSE s.password END,
+                    s.protocol, s.jump_host_id, j.name,
+                    COALESCE(s.auth_type, 'vault') = 'vault' AND s.credential_id IS NOT NULL
              FROM servers s
-             LEFT JOIN credentials c ON s.credential_id = c.id
              LEFT JOIN servers j ON j.id = s.jump_host_id
              WHERE s.id = ?1",
             [server_id],
@@ -13887,6 +13892,7 @@ async fn vnc_open(
                     r.get::<_, Option<String>>(4)?,
                     r.get::<_, Option<i32>>(5)?,
                     r.get::<_, Option<String>>(6)?,
+                    r.get::<_, bool>(7)?,
                 ))
             },
         )
@@ -13923,6 +13929,12 @@ async fn vnc_open(
         };
         let target = telnet::address(&host, port);
         log(&format!("Opening the VNC server {target} in this tab..."), "info");
+        if uses_saved_login {
+            log(
+                "A VNC server doesn't use saved logins: VNC sends its password with weak protection and doesn't check the server's identity. Type the VNC password when asked, or save it on the server.",
+                "warning",
+            );
+        }
 
         // The way there: straight, or a channel through the SSH server. The
         // task that carries the bytes is kept: it ends with the session.

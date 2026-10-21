@@ -99,8 +99,13 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     // The usual port of the new kind, unless another was typed.
     const usual: Record<string, number> = { ssh: 22, rdp: 3389, telnet: 23, vnc: 5900 };
     const port = !newNode.port || Object.values(usual).includes(newNode.port) ? usual[protocol] : newNode.port;
-    const authType = protocol !== "ssh" && newNode.authType === "custom_key" ? "custom_pass" : newNode.authType;
-    setNewNode({ ...newNode, protocol, port, authType });
+    // No SSH key outside SSH, and no saved login for VNC: VNC sends its
+    // password with weak protection and doesn't check the server's identity,
+    // so a shared login's password would be open to anyone on the path.
+    const dropsLogin = (protocol !== "ssh" && newNode.authType === "custom_key") || (protocol === "vnc" && newNode.authType === "vault");
+    const authType = dropsLogin ? "custom_pass" : newNode.authType;
+    const credentialId = protocol === "vnc" ? "" : newNode.credentialId;
+    setNewNode({ ...newNode, protocol, port, authType, credentialId });
   };
   const [newFolderName, setNewFolderName] = useState("");
   // Set while the native key picker is open so the Browse button can't be
@@ -612,7 +617,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 value={newNode.authType}
                 onChange={(e) => setNewNode({ ...newNode, authType: e.target.value })}
               >
-                <option value="vault" className="bg-[#121215] text-primary">Use a saved login</option>
+                {!isVnc && <option value="vault" className="bg-[#121215] text-primary">Use a saved login</option>}
                 <option value="custom_pass" className="bg-[#121215] text-primary">{isRdp ? "Type a user name" : "Type a password"}</option>
                 {isSsh && <option value="custom_key" className="bg-[#121215] text-primary">Use an SSH key</option>}
               </select>
