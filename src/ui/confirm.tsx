@@ -66,6 +66,12 @@ export const useFocusTrap = (openId: number | null, panelRef: React.RefObject<HT
   }, [openId, panelRef]);
 };
 
+// Whether a key event's target is one of a prompt panel's own controls (a
+// button, a box, a field). Those handle Enter themselves.
+const isPanelControl = (target: EventTarget | null, panel: HTMLElement | null) =>
+  !!panel && target instanceof Element && panel.contains(target) &&
+  !!target.closest('button, input, select, textarea, a[href], [role="button"], [role="checkbox"]');
+
 // Themed replacement for the browser-native `confirm()` dialog. Anywhere in
 // the tree, `useConfirm()` returns a function that opens the modal and
 // resolves to true / false. Cross-platform (pure React + CSS), no native
@@ -190,8 +196,6 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
   // determine "inside vs outside" for the Tab-cycle logic.
   const owPanelRef = useRef<HTMLDivElement | null>(null);
   const confirmPanelRef = useRef<HTMLDivElement | null>(null);
-  const confirmOkRef = useRef<HTMLButtonElement | null>(null);
-  const confirmAltRef = useRef<HTMLButtonElement | null>(null);
   const tpPanelRef = useRef<HTMLDivElement | null>(null);
   useFocusTrap(owState?.id ?? null, owPanelRef);
   useFocusTrap(state?.id ?? null, confirmPanelRef);
@@ -281,20 +285,21 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
 
   // Esc cancels, Enter confirms — matches the native dialog conventions so
   // muscle memory keeps working. A key still held down from before (auto
-  // repeat) answers nothing: it was not pressed for this prompt. In a prompt
-  // whose default is Cancel (`safeDefault`), Enter does what the focused
-  // button does, so an Enter alone never says yes.
+  // repeat) answers nothing: it was not pressed for this prompt. When focus
+  // is on one of the panel's own controls (Cancel, ✕, a third button, the
+  // "Don't ask again" box), Enter does what that control does natively, so
+  // tabbing to Cancel and pressing Enter cancels. Only an Enter with focus on
+  // none of them takes the default: OK, or Cancel in a prompt whose default
+  // is Cancel (`safeDefault`), so an Enter alone never says yes there.
   useEffect(() => {
     if (!state) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") { e.preventDefault(); if (!e.repeat) close(null); }
       if (e.key === "Enter")  {
+        if (e.repeat) { e.preventDefault(); return; }
+        if (isPanelControl(e.target, confirmPanelRef.current)) return;
         e.preventDefault();
-        if (e.repeat) return;
-        const focused = document.activeElement;
-        if (!state.opts.safeDefault || focused === confirmOkRef.current) close("ok");
-        else if (confirmAltRef.current && focused === confirmAltRef.current) close("alt");
-        else close(null);
+        close(state.opts.safeDefault ? null : "ok");
       }
     };
     window.addEventListener("keydown", onKey);
@@ -303,12 +308,19 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
   }, [state]);
 
   // Same Esc/Enter wiring for the overwrite modal. Esc cancels the whole
-  // batch; Enter picks "Overwrite" (the most common "yes I meant it" path).
+  // batch; Enter picks "Overwrite" (the most common "yes I meant it" path),
+  // unless focus is on one of its buttons: then Enter presses that one, so
+  // Enter on Skip skips.
   useEffect(() => {
     if (!owState) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") { e.preventDefault(); if (!e.repeat) closeOverwrite("cancel"); }
-      if (e.key === "Enter")  { e.preventDefault(); if (!e.repeat) closeOverwrite("overwrite"); }
+      if (e.key === "Enter")  {
+        if (e.repeat) { e.preventDefault(); return; }
+        if (isPanelControl(e.target, owPanelRef.current)) return;
+        e.preventDefault();
+        closeOverwrite("overwrite");
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -435,7 +447,7 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
                 {state.opts.cancelLabel || "Cancel"}
               </button>
               {state.opts.altLabel && (
-                <button onClick={() => close("alt")} ref={confirmAltRef}
+                <button onClick={() => close("alt")}
                         className={`px-3 h-8 rounded text-[11px] font-bold uppercase tracking-wider border ${
                           state.opts.altDestructive
                             ? "bg-rose-500/15 border-rose-500/40 text-rose-300 hover:bg-rose-500/25"
@@ -444,7 +456,7 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
                   {state.opts.altLabel}
                 </button>
               )}
-              <button onClick={() => close("ok")} ref={confirmOkRef}
+              <button onClick={() => close("ok")}
                       data-default-focus={state.opts.safeDefault ? undefined : true}
                       className={`px-3 h-8 rounded text-[11px] font-bold uppercase tracking-wider border ${
                         state.opts.destructive
