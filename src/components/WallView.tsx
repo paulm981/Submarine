@@ -340,6 +340,33 @@ export const WallView = ({
   const togglePauseRef = useRef(togglePause);
   togglePauseRef.current = togglePause;
 
+  // Terminals picked to pause or resume together: Ctrl-click (⌘ on a Mac) a
+  // title to add or drop one, Shift-click to take the run from the last one
+  // picked, in tile order — as the session tree picks servers. Kept here, not
+  // on the Wall: a pick is for the next button press, not something to keep.
+  const [picked, setPicked] = useState<string[]>([]);
+  const anchor = useRef<string | null>(null);
+  const pickedNow = picked.filter((t) => wall.members.some((m) => m.terminalId === t));
+  const pick = (tid: string, e: React.MouseEvent) => {
+    const order = wall.members.map((m) => m.terminalId);
+    const from = anchor.current ? order.indexOf(anchor.current) : -1;
+    if (e.shiftKey && from >= 0) {
+      const to = order.indexOf(tid);
+      const run = order.slice(Math.min(from, to), Math.max(from, to) + 1);
+      setPicked((prev) => [...new Set([...prev, ...run])]);
+      return;
+    }
+    anchor.current = tid;
+    setPicked((prev) => (prev.includes(tid) ? prev.filter((t) => t !== tid) : [...prev, tid]));
+  };
+  const setPausedFor = (tids: string[], pause: boolean) => {
+    const next = pause
+      ? [...new Set([...wall.paused, ...tids])]
+      : wall.paused.filter((t) => !tids.includes(t));
+    onChange({ paused: next });
+    setPicked([]);
+  };
+
   // Ctrl+Shift+P pauses (or resumes) the tile being typed to, else the one
   // under the mouse.
   useEffect(() => {
@@ -451,13 +478,51 @@ export const WallView = ({
           )
         )}
 
-        {wall.broadcast && wall.paused.length > 0 && (
-          <button
-            onClick={() => onChange({ paused: [] })}
-            className={`${btn} bg-white/[0.04] border-white/10 text-zinc-300 hover:bg-white/[0.08] hover:text-white`}
-          >
-            <Play size={11} /> Resume all
-          </button>
+        {wall.broadcast && pickedNow.length > 0 ? (
+          <>
+            <span className="text-[10.5px] font-semibold text-sky-300 shrink-0">{pickedNow.length} picked</span>
+            <button
+              onClick={() => setPausedFor(pickedNow, true)}
+              title="Leave the picked terminals out of the broadcast"
+              className={`${btn} bg-white/[0.04] border-white/10 text-zinc-300 hover:bg-white/[0.08] hover:text-white`}
+            >
+              <Pause size={11} /> Pause {pickedNow.length}
+            </button>
+            <button
+              onClick={() => setPausedFor(pickedNow, false)}
+              title="Let the picked terminals take the broadcast again"
+              className={`${btn} bg-white/[0.04] border-white/10 text-zinc-300 hover:bg-white/[0.08] hover:text-white`}
+            >
+              <Play size={11} /> Resume {pickedNow.length}
+            </button>
+            <button
+              onClick={() => setPicked([])}
+              title="Pick none"
+              className={`${btn} bg-white/[0.04] border-white/10 text-zinc-400 hover:bg-white/[0.08] hover:text-white`}
+            >
+              <X size={11} /> Clear
+            </button>
+          </>
+        ) : wall.broadcast && (
+          <>
+            {wall.paused.length < wall.members.length && (
+              <button
+                onClick={() => setPausedFor(wall.members.map((m) => m.terminalId), true)}
+                title="Leave every terminal out, then resume the ones you want. Ctrl-click (⌘-click) titles to pick several, Shift-click for a run."
+                className={`${btn} bg-white/[0.04] border-white/10 text-zinc-300 hover:bg-white/[0.08] hover:text-white`}
+              >
+                <Pause size={11} /> Pause all
+              </button>
+            )}
+            {wall.paused.length > 0 && (
+              <button
+                onClick={() => onChange({ paused: [] })}
+                className={`${btn} bg-white/[0.04] border-white/10 text-zinc-300 hover:bg-white/[0.08] hover:text-white`}
+              >
+                <Play size={11} /> Resume all
+              </button>
+            )}
+          </>
         )}
         {wall.broadcast && (
           <>
@@ -544,6 +609,8 @@ export const WallView = ({
                   broadcast={wall.broadcast}
                   solo={solo}
                   paused={isPaused(m.terminalId)}
+                  picked={wall.broadcast && pickedNow.includes(m.terminalId)}
+                  onPick={wall.broadcast ? (e) => pick(m.terminalId, e) : undefined}
                   nextLine={atNextLine(m.terminalId)}
                   onFocusIn={() => {
                     if (!wallRef.current.broadcast) return;
@@ -586,7 +653,7 @@ export const WallView = ({
 // (claimTerminal); while there's no terminal yet — still connecting, or
 // waiting on a prompt — the slot is covered by what the session is doing.
 const WallTile = ({
-  member, name, closes, termTitle, status, waiting, broadcast, solo, paused, nextLine,
+  member, name, closes, termTitle, status, waiting, broadcast, solo, paused, picked, onPick, nextLine,
   onFocusIn, onBackToAll, onHover, onPasteToAll, onTogglePause, onOpen, onRemove, onReconnect,
 }: {
   member: WallMember;
@@ -599,6 +666,10 @@ const WallTile = ({
   broadcast: boolean;
   solo: string | null;
   paused: boolean;
+  /// Picked, to pause or resume with others.
+  picked: boolean;
+  /// A Ctrl-, ⌘- or Shift-click on the title (Broadcast on only).
+  onPick?: (e: React.MouseEvent) => void;
   /// Taking input, but joins the broadcast at the next line (lineTargets).
   nextLine: boolean;
   onFocusIn: () => void;
@@ -638,9 +709,15 @@ const WallTile = ({
       onMouseLeave={() => onHover(false)}
     >
       <div
-        className="h-7 shrink-0 flex items-center gap-2 px-2 border-b border-white/5 bg-[#141418] text-[10.5px] select-none"
+        className={`h-7 shrink-0 flex items-center gap-2 px-2 border-b border-white/5 text-[10.5px] select-none ${picked ? "bg-sky-500/20" : "bg-[#141418]"}`}
         // Header buttons leave the keyboard where it was.
         onMouseDown={(e) => e.preventDefault()}
+        onClick={(e) => {
+          if (!onPick || !(e.ctrlKey || e.metaKey || e.shiftKey)) return;
+          if ((e.target as HTMLElement).closest("button")) return;
+          onPick(e);
+        }}
+        title={onPick ? "Ctrl-click (⌘-click) to pick several, Shift-click for a run" : undefined}
       >
         <span title={dot.title} className={`w-1.5 h-1.5 rounded-full shrink-0 ${dot.tone}`} />
         <span className="font-bold text-zinc-200 truncate" title={name}>{name}</span>

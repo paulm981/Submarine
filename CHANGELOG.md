@@ -7,6 +7,12 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - Sections called **From the original project** list what came in from [SinaXhpm/Submarine](https://github.com/SinaXhpm/submarine), with that project's pull request numbers.
 - [FORK.md](FORK.md) explains what the fork does differently, and which of the original project's changes it hasn't taken yet.
 
+## v0.3.8-fork.3
+
+- **Pause several terminals on a Wall at once** ([#73](https://github.com/paulm981/Submarine/issues/73)). With Broadcast on, Ctrl-click (⌘-click on a Mac) terminal titles to pick several, or Shift-click for a run of them. The bar then offers **Pause** and **Resume** for the ones picked.
+  - **Pause all** sits beside **Resume all**, so you can pause everything and resume just the few you want.
+- **Close many tabs at once** from a tab's right-click menu ([#74](https://github.com/paulm981/Submarine/issues/74)): **Close other tabs**, **Close tabs to the right**, **Close disconnected tabs** and **Close all tabs**. With Walls open, the last one closes them too. One question first, saying how many are connected.
+
 ## v0.3.8-fork.2
 
 - **Every pull request is checked** before it can be merged: the Rust tests on Linux and Windows, clippy (no new warnings), and the TypeScript check and page build. Since every merge is a release, a change that breaks any of them doesn't reach the team.
