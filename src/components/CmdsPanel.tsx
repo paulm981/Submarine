@@ -223,12 +223,19 @@ export const CmdsPanel = ({ activeTab, onClose, headerActions, serverId, serverN
     if (!activeTab) return;
     const text = withoutPasteControls(raw);
     if (!text) return;
-    const entry = dockedTerminal(activeTab);
-    if (!execute && entry) {
+    if (!execute) {
+      // Only into a terminal that pastes the way its own paste does; there's
+      // no raw fallback that would skip the question below.
+      const entry = dockedTerminal(activeTab);
+      if (!entry) return;
+      // Paste never presses Enter: one line break at the end goes, so a
+      // single command waits for you to run it.
+      const pasted = text.replace(/(\r\n|\r|\n)$/, "");
+      if (!pasted) return;
       // Bracketed when the program asked for that, so nothing runs by itself.
       // Without it every line would run as it lands: say so first, as the
       // terminal's own paste does.
-      const lines = text.replace(/(\r\n|\r|\n)$/, "").split(/\r\n|\r|\n/);
+      const lines = pasted.split(/\r\n|\r|\n/);
       if (lines.length > 1 && !entry.term.modes.bracketedPasteMode) {
         const preview = lines.slice(0, 4).map((l) => (l.length > 70 ? `${l.slice(0, 70)}…` : l)).join("\n");
         const ok = await confirm({
@@ -240,13 +247,11 @@ export const CmdsPanel = ({ activeTab, onClose, headerActions, serverId, serverN
         if (!ok) return;
       }
       markTyped(activeTab);
-      entry.paste(text);
+      entry.paste(pasted);
       return;
     }
     try {
-      const payload = execute
-        ? (text.endsWith("\n") || text.endsWith("\r") ? text : text + "\r")
-        : text;
+      const payload = text.endsWith("\n") || text.endsWith("\r") ? text : text + "\r";
       const dataBytes = Array.from(new TextEncoder().encode(payload));
       markTyped(activeTab);
       await invoke("write_terminal_data", { terminalId: activeTab, data: dataBytes });
