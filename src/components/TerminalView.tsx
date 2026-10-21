@@ -10,6 +10,7 @@ import '@xterm/xterm/css/xterm.css';
 import { useIsNarrow } from '../hooks/useViewport';
 import { MobileKeyBar, ModifiersState, ModKey, SpecialKey } from './MobileKeyBar';
 import { appHotkey, markTyped, registerTerminal, terminalStateChanged } from '../ui/terminalDock';
+import { noteOutput, setLooking, watchTerminal } from '../ui/terminalActivity';
 import { forgetTerminal, logLine, noteTerminalOutput, noteTerminalParsed, noteTerminalRenderer } from '../util/diagnostics';
 import { useConfirm } from '../ui/confirm';
 import HistorySearchOverlay from './HistorySearchOverlay';
@@ -102,6 +103,7 @@ const TerminalView = ({
   isActive = true,
   visible,
   isActiveView = false,
+  inView,
   focusSignal = 0,
   containerExec,
   connectionEpoch = 0,
@@ -128,6 +130,10 @@ const TerminalView = ({
   /// background session — or one shown in a Wall — never steals the
   /// keyboard while the user is typing in the visible one.
   isActiveView?: boolean;
+  /// This terminal's server is on screen (in front, or a tile of a split):
+  /// with `visible`, you are looking at it, so it has no activity mark.
+  /// Defaults to isActiveView.
+  inView?: boolean;
   /// Monotonic counter the parent SessionView bumps to pull keyboard focus
   /// into the active terminal for selections that DON'T change which
   /// terminal is active (re-clicking the current tab, re-selecting this
@@ -230,6 +236,10 @@ const TerminalView = ({
   // in the Wall's tile, on screen whatever this tab is doing — so it refits
   // to the tile even when it isn't the tab's active terminal.
   const dockedRef = useRef(false);
+  // Activity mark (src/ui/terminalActivity.ts): looking = shown in a server
+  // tab that is on screen, or in a Wall tile.
+  const inViewRef = useRef(inView ?? isActiveView);
+  const lookingNow = () => (visibleRef.current && inViewRef.current) || dockedRef.current;
   // Its shell is open (open_terminal has answered, again after a reconnect):
   // what a Wall's broadcast checks, with `disabled`, before typing into it.
   const ptyLiveRef = useRef(false);
@@ -237,6 +247,10 @@ const TerminalView = ({
   // callbacks (which would otherwise close over a stale value).
   const isActiveViewRef = useRef(isActiveView);
   useEffect(() => { isActiveViewRef.current = isActiveView; }, [isActiveView]);
+  useEffect(() => {
+    inViewRef.current = inView ?? isActiveView;
+    setLooking(terminalId, lookingNow());
+  }, [terminalId, visible, isActive, isActiveView, inView]);
   // Mirror of containerExec for the reconnect effect — same reason as
   // isActiveRef. The reconnect effect is keyed on `connectionEpoch`
   // alone (the parent re-creates the containerExec object every render
@@ -1122,6 +1136,7 @@ const TerminalView = ({
       // Counted for the freeze watchdog: received, and still to be drawn.
       // xterm buffers a multibyte sequence split across batches.
       noteTerminalOutput(terminalId, data.length);
+      if (!local) noteOutput(terminalId, data);
       if (highlighter.active) term.write(highlighter.push(data), () => processed(data.length));
       else term.write(data, () => processed(data.length));
       // Keep a short tail of decoded output so command-history capture can
@@ -1267,6 +1282,7 @@ const TerminalView = ({
       },
       moved: (docked) => {
         dockedRef.current = docked;
+        setLooking(terminalId, lookingNow());
         // Moving the element can take the keyboard from it without a blur
         // event, so xterm would go on drawing the cursor of a terminal being
         // typed in. Only then: xterm tells a program that asked (vim, tmux)
@@ -1283,7 +1299,11 @@ const TerminalView = ({
       },
     });
 
+    const unwatch = local ? null : watchTerminal(terminalId, sessionId);
+    setLooking(terminalId, lookingNow());
+
     return () => {
+      unwatch?.();
       unregister?.();
       term.textarea?.removeEventListener('focus', onTextFocus);
       term.textarea?.removeEventListener('blur', onTextBlur);

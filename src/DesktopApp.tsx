@@ -39,6 +39,8 @@ import AddNodePanel from "./components/AddNodePanel";
 import WallView, { type Wall, type WallMember } from "./components/WallView";
 import WallsMenu, { AllTabsMenu, WallEditorModal, WallPicker, type SavedWall } from "./components/WallsMenu";
 import { appHotkey } from "./ui/terminalDock";
+import { sessionHasNews, useActivityVersion } from "./ui/terminalActivity";
+import { reorderById, useTabDrag } from "./ui/tabDrag";
 import SettingsPanel from "./components/SettingsPanel";
 import ProfilePanel from "./components/ProfilePanel";
 import { SessionView } from "./components/SessionView";
@@ -203,6 +205,12 @@ function DesktopApp() {
   // The tab strip scrolls the tab on screen into view — with dozens open, a
   // tab popped out of a Wall or picked from All tabs lands past the edge.
   const tabStripRef = useRef<HTMLDivElement>(null);
+  // Dragging a server tab to a new place reorders `sessions` itself, so
+  // Ctrl+Tab (tabOrderRef) and All tabs follow it.
+  const sessionDrag = useTabDrag("sessions", (dragId, overId, after) =>
+    setSessions(prev => reorderById(prev, dragId, overId, after)));
+  // Re-render when a terminal gets or loses news (the dot on its server's tab).
+  useActivityVersion();
   useEffect(() => {
     const strip = tabStripRef.current;
     if (!strip) return;
@@ -405,6 +413,9 @@ function DesktopApp() {
     // Ask before closing a tab whose session is connected (Settings ›
     // Servers, or "Don't ask again" in the prompt). Defaults ON.
     confirmCloseSession: localStorage.getItem('submarine-confirm-close') !== 'off',
+    // Flat tabs that touch, instead of pills (title bar and each server's
+    // terminal tabs). Per-device; defaults OFF.
+    compactTabs: localStorage.getItem('submarine-compact-tabs') === 'on',
   });
 
   useEffect(() => {
@@ -430,6 +441,7 @@ function DesktopApp() {
     localStorage.setItem('submarine-detect-os', appSettings.detectOs ? 'on' : 'off');
     localStorage.setItem('submarine-watch-upstream', appSettings.watchUpstream ? 'on' : 'off');
     localStorage.setItem('submarine-confirm-close', appSettings.confirmCloseSession ? 'on' : 'off');
+    localStorage.setItem('submarine-compact-tabs', appSettings.compactTabs ? 'on' : 'off');
     // Tell already-mounted terminals to re-fit with the new font size / face.
     // Without this dispatch the listener in TerminalView is dead code and
     // users have to close+reopen every terminal to see a size change.
@@ -1789,7 +1801,7 @@ function DesktopApp() {
       <div
         data-tauri-drag-region
         ref={tabStripRef}
-        className={`${isMobile ? 'hidden' : 'flex'} flex-1 gap-1 overflow-x-auto no-scrollbar h-full items-end pb-1`}
+        className={`${isMobile ? 'hidden' : 'flex'} flex-1 ${appSettings.compactTabs ? 'gap-0 pb-0' : 'gap-1 pb-1'} overflow-x-auto no-scrollbar h-full items-end`}
         onWheel={(e) => { e.currentTarget.scrollLeft += e.deltaY; }}
       >
         {/* Home stays first, like MobaXterm's home tab: always there to go
@@ -1876,10 +1888,17 @@ function DesktopApp() {
           const isPausedTarget = isBroadcastTarget && broadcasting.every(w =>
             w.members.every(m => m.sessionId !== s.id || w.paused.includes(m.terminalId)));
           const isMergedTab = mergedSessionIds.includes(s.id);
+          // Compact tabs: flat, touching, a thin underline for the one in
+          // front; long names are cut (the full one is the hover title).
+          const compact = appSettings.compactTabs;
+          const news = sessionHasNews(s.id);
+          const drag = sessionDrag.tabMark(s.id);
           return (
             <div
               key={s.id}
               data-tab={s.id}
+              {...sessionDrag.tabProps(s.id)}
+              style={drag.style}
               onClick={(e) => {
                 // Ctrl/⌘-click toggles this tab in the split beside the
                 // currently-active session view — a quick keyboard-free
@@ -1923,19 +1942,38 @@ function DesktopApp() {
               // it a tab with a 30-char hostname would wrap into a two-line
               // pill and break the row's height.
               title={isMergedTab ? `${tabLabel(s)} · split beside current view (Ctrl-click to unpair)` : tabLabel(s)}
-              className={`group no-drag flex items-center h-7 px-2.5 sm:px-4 rounded-full cursor-pointer transition-all shrink-0 mr-1 ${
-                activeView === s.id
-                  ? 'bg-primary/15 text-primary border border-primary/40 shadow-inner shadow-primary/10'
-                  : isMergedTab
-                    ? 'bg-primary/[0.05] text-primary/80 border border-primary/25 hover:bg-primary/10'
-                    : 'bg-white/[0.06] text-zinc-300 border border-white/10 hover:bg-white/[0.1] hover:border-white/20 hover:text-white'
+              className={`group no-drag select-none flex items-center h-7 cursor-pointer transition-all shrink-0 ${drag.dim ? 'opacity-50' : ''} ${
+                compact
+                  ? `px-2 border-b-2 border-r border-r-white/5 rounded-none ${
+                      activeView === s.id
+                        ? 'text-primary border-b-primary bg-primary/[0.07]'
+                        : isMergedTab
+                          ? 'text-primary/80 border-b-primary/40 hover:bg-white/[0.06]'
+                          : 'text-zinc-400 border-b-transparent hover:bg-white/[0.06] hover:text-white'
+                    }`
+                  : `px-2.5 sm:px-4 rounded-full mr-1 ${
+                      activeView === s.id
+                        ? 'bg-primary/15 text-primary border border-primary/40 shadow-inner shadow-primary/10'
+                        : isMergedTab
+                          ? 'bg-primary/[0.05] text-primary/80 border border-primary/25 hover:bg-primary/10'
+                          : 'bg-white/[0.06] text-zinc-300 border border-white/10 hover:bg-white/[0.1] hover:border-white/20 hover:text-white'
+                    }`
               }`}
             >
               <span
                 title={dotTitle}
-                className={`w-2 h-2 rounded-full mr-2 shrink-0 ${dotTone}`}
+                className={`w-2 h-2 rounded-full ${compact ? 'mr-1.5' : 'mr-2'} shrink-0 ${dotTone}`}
                 aria-label={dotTitle}
               />
+              {/* Something printed in one of its terminals while you weren't
+                  looking; clears when you look at that terminal. */}
+              {news && (
+                <span
+                  title="New output in a terminal"
+                  aria-label="New output in a terminal"
+                  className="w-1.5 h-1.5 rounded-full mr-1.5 shrink-0 bg-primary ring-2 ring-primary/30"
+                />
+              )}
               {isPausedTarget ? (
                 <span title="Paused in the broadcast" aria-label="Paused in the broadcast" className="mr-1.5 shrink-0 text-zinc-400 flex">
                   <Pause size={9} />
@@ -1973,7 +2011,7 @@ function DesktopApp() {
               <button
                 type="button"
                 aria-current={activeView === s.id ? "page" : undefined}
-                className="text-[11px] font-semibold whitespace-nowrap tracking-tight rounded outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+                className={`text-[11px] font-semibold whitespace-nowrap tracking-tight rounded outline-none focus-visible:ring-2 focus-visible:ring-primary/60 ${compact ? 'max-w-[9rem] truncate' : ''}`}
               >
                 {tabLabel(s)}
               </button>
@@ -2001,7 +2039,8 @@ function DesktopApp() {
               <button
                 type="button"
                 aria-label="Close session"
-                className="hidden sm:flex ml-1 h-5 w-5 items-center justify-center rounded hover:bg-white/5 shrink-0 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 text-zinc-400 hover:text-red-400 transition-opacity"
+                data-no-tab-drag
+                className={`hidden sm:flex ml-1 ${compact ? 'h-4 w-4' : 'h-5 w-5'} items-center justify-center rounded hover:bg-white/5 shrink-0 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 text-zinc-400 hover:text-red-400 transition-opacity`}
                 onClick={async (e) => {
                   e.stopPropagation();
                   // Only confirm when there's an actual live connection to
@@ -2018,7 +2057,7 @@ function DesktopApp() {
                   setActiveView(prev => (prev === s.id ? START_VIEW : prev));
                 }}
               >
-                <X size={12} />
+                <X size={compact ? 10 : 12} />
               </button>
             </div>
           );
@@ -2803,6 +2842,7 @@ function DesktopApp() {
                               onTerminalsChange={handleTerminalsChange}
                               chromeless={isVisible && isTiled && !isFocused}
                               isActiveView={isFocused}
+                              compactTabs={appSettings.compactTabs}
                               onPromptChange={handlePromptChange}
                             />
                           </ErrorBoundary>
