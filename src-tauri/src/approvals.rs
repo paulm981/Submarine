@@ -9,6 +9,18 @@
 //! that comes in through sync in a shared profile is held here until the user
 //! allows it, or changes that value themselves.
 //!
+//! One more is held for what it would send rather than run: a server switched
+//! from SSH to telnet or VNC. Telnet sends the password as plain text, and VNC
+//! answers its password check with weak protection and doesn't check the
+//! server's identity, so the switch could take the server's saved password
+//! somewhere it could be read. Unlike the others, this device keeps the old
+//! value in the row until it's allowed (`hold_changes` puts it back, and
+//! `before_merge` brings the synced one back for the next record to merge
+//! over); what it pushes still carries the synced value (`held_protocol`), so
+//! the hold never undoes the change for everyone else. RDP isn't held: its
+//! password is only sent after the server's certificate is checked, as an SSH
+//! password is after its host key.
+//!
 //! Held items are device-local: the table isn't synced, and nobody else's
 //! "allow" counts here. Personal profiles sync only between the user's own
 //! devices and never get an entry, and neither does anything that was already
@@ -16,7 +28,7 @@
 //!
 //! An entry is (server uuid, item), the item being one of
 //!   `run_on_connect`, `autostart`, `tunnel:<type>|<local>|<remote>`,
-//!   `metric:<command>`.
+//!   `metric:<command>`, `protocol:<telnet|vnc>`.
 //!
 //! Deletions are held the same way when one sync would take out much of a
 //! shared profile at once, or an SSH key (see `hold_deletions`).
@@ -29,6 +41,19 @@ use crate::tunnel::TunnelSpec;
 
 pub const RUN_ON_CONNECT: &str = "run_on_connect";
 pub const AUTOSTART: &str = "autostart";
+/// A held switch of protocol: `protocol:telnet` or `protocol:vnc`.
+pub const PROTOCOL_PREFIX: &str = "protocol:";
+
+/// NULL (or "ssh") is an SSH server.
+fn is_ssh(protocol: Option<&str>) -> bool {
+    matches!(protocol, None | Some("") | Some("ssh"))
+}
+
+/// The protocols a switch to from SSH is held for: they'd send the server's
+/// saved password where it could be read.
+fn sends_password_weakly(protocol: Option<&str>) -> bool {
+    matches!(protocol, Some("telnet") | Some("vnc"))
+}
 
 /// The same guard the sync stamp triggers use: true unless the merge engine is
 /// applying remote records.
@@ -72,6 +97,8 @@ pub fn create_schema(conn: &Connection) -> Result<(), String> {
              AND (NEW.autostart IS NOT OLD.autostart OR COALESCE(NEW.autostart, 0) = 0);
            DELETE FROM held_approvals WHERE uuid = NEW.uuid AND item LIKE 'tunnel:%'
              AND item NOT IN ({NEW_TUNNEL_ITEMS});
+           DELETE FROM held_approvals WHERE uuid = NEW.uuid AND item LIKE '{PROTOCOL_PREFIX}%'
+             AND NEW.protocol IS NOT OLD.protocol;
          END;
          CREATE TRIGGER servers_held_ad AFTER DELETE ON servers FOR EACH ROW WHEN OLD.uuid IS NOT NULL
          BEGIN DELETE FROM held_approvals WHERE uuid = OLD.uuid; END;
@@ -111,7 +138,7 @@ pub fn watches(table: &str) -> bool {
 /// What a row would set off by itself, read just before and just after the
 /// merge engine applies a record to it.
 pub enum Snapshot {
-    Server { run_on_connect: String, autostart: bool, tunnels: BTreeSet<String> },
+    Server { run_on_connect: String, autostart: bool, tunnels: BTreeSet<String>, protocol: Option<String> },
     Monitor { server_uuid: Option<String>, metrics: BTreeSet<String> },
 }
 
@@ -139,17 +166,18 @@ pub fn snapshot(conn: &Connection, table: &str, uuid: &str) -> Option<Snapshot> 
     match table {
         "servers" => conn
             .query_row(
-                "SELECT COALESCE(run_on_connect, ''), COALESCE(autostart, 0), COALESCE(tunnels, '[]') FROM servers WHERE uuid = ?1",
+                "SELECT COALESCE(run_on_connect, ''), COALESCE(autostart, 0), COALESCE(tunnels, '[]'), protocol FROM servers WHERE uuid = ?1",
                 [uuid],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?)),
             )
             .optional()
             .ok()
             .flatten()
-            .map(|(roc, auto, tunnels)| Snapshot::Server {
+            .map(|(roc, auto, tunnels, protocol)| Snapshot::Server {
                 run_on_connect: roc,
                 autostart: auto != 0,
                 tunnels: tunnel_items_of(&tunnels),
+                protocol,
             }),
         "monitor_configs" => conn
             .query_row(
@@ -191,19 +219,58 @@ fn release_missing(conn: &Connection, uuid: &str, prefix: &str, keep: &BTreeSet<
     Ok(())
 }
 
+/// The protocol a server's held switch is to (telnet or VNC): the value the
+/// shared profile has for it, which this device hasn't taken yet.
+pub fn held_protocol(conn: &Connection, uuid: &str) -> Option<String> {
+    held_for(conn, uuid)
+        .into_iter()
+        .find_map(|item| item.strip_prefix(PROTOCOL_PREFIX).map(str::to_string))
+}
+
+/// Just before the merge engine applies a record: the row as this device has
+/// it (for `hold_changes`), and a held switch of protocol put back in the row,
+/// so the record merges over the shared profile's value rather than the one
+/// this device kept. `hold_changes` keeps this device's again afterwards if
+/// the switch is still there. Run with the merge flag on, like the merge.
+pub fn before_merge(conn: &Connection, table: &str, uuid: &str) -> Result<Option<Snapshot>, String> {
+    let before = snapshot(conn, table, uuid);
+    if table == "servers" {
+        if let Some(protocol) = held_protocol(conn, uuid) {
+            conn.execute("UPDATE servers SET protocol = ?1 WHERE uuid = ?2", params![protocol, uuid])
+                .map_err(|e| format!("[SYNC] HELD_PROTOCOL: {e}"))?;
+        }
+    }
+    Ok(before)
+}
+
 /// After the merge engine applied a record (`before` is the row as it was, or
 /// None for a new row): hold whatever the record newly turned on, and drop
 /// held entries for what it turned off or removed. A record that changed
 /// nothing on these fields leaves everything as it was.
+///
+/// An existing SSH server the record makes a telnet or VNC one stays an SSH
+/// one here: the old protocol goes back in the row and the switch is held. A
+/// new server isn't held: the user sees what it is before opening it.
 pub fn hold_changes(conn: &Connection, table: &str, uuid: &str, before: Option<&Snapshot>) -> Result<(), String> {
     match (table, snapshot(conn, table, uuid)) {
-        ("servers", Some(Snapshot::Server { run_on_connect, autostart, tunnels })) => {
+        ("servers", Some(Snapshot::Server { run_on_connect, autostart, tunnels, protocol })) => {
             let (b_roc, b_auto, b_tunnels) = match before {
-                Some(Snapshot::Server { run_on_connect, autostart, tunnels }) => {
+                Some(Snapshot::Server { run_on_connect, autostart, tunnels, .. }) => {
                     (Some(run_on_connect.as_str()), *autostart, Some(tunnels))
                 }
                 _ => (None, false, None),
             };
+            if let Some(Snapshot::Server { protocol: b_protocol, .. }) = before {
+                if is_ssh(b_protocol.as_deref()) && sends_password_weakly(protocol.as_deref()) {
+                    let item = format!("{PROTOCOL_PREFIX}{}", protocol.as_deref().unwrap_or_default());
+                    release_missing(conn, uuid, PROTOCOL_PREFIX, &BTreeSet::from([item.clone()]))?;
+                    hold(conn, uuid, &item)?;
+                    conn.execute("UPDATE servers SET protocol = ?1 WHERE uuid = ?2", params![b_protocol, uuid])
+                        .map_err(|e| format!("[SYNC] HOLD_PROTOCOL: {e}"))?;
+                } else {
+                    release_missing(conn, uuid, PROTOCOL_PREFIX, &BTreeSet::new())?;
+                }
+            }
             if run_on_connect.trim().is_empty() {
                 release(conn, uuid, RUN_ON_CONNECT)?;
             } else if b_roc != Some(run_on_connect.as_str()) {
@@ -258,8 +325,19 @@ pub fn held_by_server(conn: &Connection) -> HashMap<String, Vec<String>> {
 }
 
 /// Allow some of a server's held items, or all of them when `items` is empty.
-/// Returns how many were let go.
+/// Returns how many were let go. An allowed switch of protocol is made now,
+/// as the merge would have made it: not as this device's own edit, since it's
+/// what the shared profile has already.
 pub fn allow(conn: &Connection, uuid: &str, items: &[String]) -> Result<usize, String> {
+    let protocol = held_protocol(conn, uuid)
+        .filter(|p| items.is_empty() || items.iter().any(|i| i.strip_prefix(PROTOCOL_PREFIX) == Some(p.as_str())));
+    if let Some(protocol) = protocol {
+        crate::with_merge_flag(conn, |c| {
+            c.execute("UPDATE servers SET protocol = ?1 WHERE uuid = ?2", params![protocol, uuid])
+                .map(|_| ())
+                .map_err(|e| format!("[SYNC] ALLOW: {e}"))
+        })?;
+    }
     if items.is_empty() {
         return conn
             .execute("DELETE FROM held_approvals WHERE uuid = ?1", [uuid])
@@ -430,11 +508,11 @@ pub fn server_uuid(conn: &Connection, server_id: i64) -> Option<String> {
 }
 
 /// A duplicate of a server starts with what the original had not yet been
-/// allowed to do: its on-connect commands and forwards are copied along with
-/// their held entries, so the copy can't run what the original couldn't.
-/// (Autostart isn't copied at all, and the monitor config isn't either.)
-/// Nothing to do for a server with nothing held, which is every server in a
-/// personal profile.
+/// allowed to do: its on-connect commands, forwards and switch of protocol
+/// are copied along with their held entries, so the copy can't run or send
+/// what the original couldn't. (Autostart isn't copied at all, and the
+/// monitor config isn't either.) Nothing to do for a server with nothing
+/// held, which is every server in a personal profile.
 pub fn copy_held(conn: &Connection, from_id: i64, to_id: i64) -> Result<(), String> {
     if !ready(conn) {
         return Ok(());
@@ -443,8 +521,8 @@ pub fn copy_held(conn: &Connection, from_id: i64, to_id: i64) -> Result<(), Stri
     conn.execute(
         "INSERT OR IGNORE INTO held_approvals (uuid, item, since)
          SELECT ?2, item, since FROM held_approvals
-          WHERE uuid = ?1 AND (item = ?3 OR item LIKE 'tunnel:%')",
-        params![from, to, RUN_ON_CONNECT],
+          WHERE uuid = ?1 AND (item = ?3 OR item LIKE 'tunnel:%' OR item LIKE ?4 || '%')",
+        params![from, to, RUN_ON_CONNECT, PROTOCOL_PREFIX],
     )
     .map(|_| ())
     .map_err(|e| format!("[SYNC] COPY_HELD: {e}"))
@@ -460,7 +538,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, tunnels TEXT, autostart INTEGER NOT NULL DEFAULT 0,
-                                  run_on_connect TEXT NOT NULL DEFAULT '', position INTEGER NOT NULL DEFAULT 0, uuid TEXT);
+                                  run_on_connect TEXT NOT NULL DEFAULT '', position INTEGER NOT NULL DEFAULT 0, uuid TEXT,
+                                  protocol TEXT);
              CREATE TABLE monitor_configs(node_id INTEGER PRIMARY KEY, enabled_metrics TEXT, custom_metrics TEXT, paused INTEGER NOT NULL DEFAULT 1, uuid TEXT);
              CREATE TABLE sync_flags(key TEXT PRIMARY KEY, val INTEGER NOT NULL);
              CREATE TABLE sync_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
@@ -675,6 +754,107 @@ mod tests {
         // The user removes it on this device.
         set(r#"[{"id":"a","name":"a","command":"uptime","parse":"text"}]"#, false);
         assert!(held_for(&conn, "u7").is_empty());
+    }
+
+    /// What the merge engine does for a server record that sets `protocol`:
+    /// a new row when there's none.
+    fn merge_protocol(conn: &Connection, uuid: &str, protocol: Option<&str>) {
+        merging(conn, true);
+        let before = before_merge(conn, "servers", uuid).unwrap();
+        let updated = conn.execute("UPDATE servers SET protocol=?1 WHERE uuid=?2", params![protocol, uuid]).unwrap();
+        if updated == 0 {
+            conn.execute("INSERT INTO servers(name, protocol, uuid) VALUES('s', ?1, ?2)", params![protocol, uuid]).unwrap();
+        }
+        hold_changes(conn, "servers", uuid, before.as_ref()).unwrap();
+        merging(conn, false);
+    }
+
+    /// A record whose stamp loses to this device's: the row isn't written.
+    fn merge_skipped(conn: &Connection, uuid: &str) {
+        merging(conn, true);
+        let before = before_merge(conn, "servers", uuid).unwrap();
+        hold_changes(conn, "servers", uuid, before.as_ref()).unwrap();
+        merging(conn, false);
+    }
+
+    fn protocol_of(conn: &Connection, uuid: &str) -> Option<String> {
+        conn.query_row("SELECT protocol FROM servers WHERE uuid=?1", [uuid], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn a_synced_switch_from_ssh_to_telnet_or_vnc_is_held_and_the_old_protocol_kept() {
+        let conn = db();
+        merge_protocol(&conn, "u1", None);
+        merge_protocol(&conn, "u1", Some("vnc"));
+        assert_eq!(protocol_of(&conn, "u1"), None, "still SSH here");
+        assert_eq!(held_protocol(&conn, "u1").as_deref(), Some("vnc"));
+        // A later record that still says VNC (or one that loses LWW) keeps it held.
+        merge_protocol(&conn, "u1", Some("vnc"));
+        merge_skipped(&conn, "u1");
+        assert_eq!(protocol_of(&conn, "u1"), None);
+        assert_eq!(held_for(&conn, "u1").into_iter().collect::<Vec<_>>(), vec!["protocol:vnc".to_string()]);
+        // Switched on to telnet: the held switch is to telnet now.
+        merge_protocol(&conn, "u1", Some("telnet"));
+        assert_eq!(held_for(&conn, "u1").into_iter().collect::<Vec<_>>(), vec!["protocol:telnet".to_string()]);
+        assert_eq!(protocol_of(&conn, "u1"), None);
+        // Back to SSH: nothing to hold.
+        merge_protocol(&conn, "u1", None);
+        assert!(held_for(&conn, "u1").is_empty());
+        assert_eq!(protocol_of(&conn, "u1"), None);
+        // An explicit "ssh" counts as SSH too.
+        conn.execute("UPDATE servers SET protocol='ssh' WHERE uuid='u1'", []).unwrap();
+        merge_protocol(&conn, "u1", Some("telnet"));
+        assert_eq!(protocol_of(&conn, "u1").as_deref(), Some("ssh"));
+        assert_eq!(held_protocol(&conn, "u1").as_deref(), Some("telnet"));
+    }
+
+    #[test]
+    fn a_new_server_rdp_and_a_switch_between_others_are_not_held() {
+        let conn = db();
+        merge_protocol(&conn, "u1", Some("vnc"));
+        assert_eq!(protocol_of(&conn, "u1").as_deref(), Some("vnc"), "a new server comes as it is");
+        merge_protocol(&conn, "u1", Some("telnet"));
+        assert_eq!(protocol_of(&conn, "u1").as_deref(), Some("telnet"), "it wasn't an SSH server");
+        merge_protocol(&conn, "u2", None);
+        merge_protocol(&conn, "u2", Some("rdp"));
+        assert_eq!(protocol_of(&conn, "u2").as_deref(), Some("rdp"));
+        assert!(held_by_server(&conn).is_empty());
+    }
+
+    #[test]
+    fn allowing_a_held_switch_makes_it_and_the_users_own_change_releases_it() {
+        let conn = db();
+        merge_protocol(&conn, "u1", None);
+        merge_protocol(&conn, "u1", Some("vnc"));
+        // Allowing another item leaves it.
+        allow(&conn, "u1", &["protocol:telnet".to_string()]).unwrap();
+        assert_eq!(protocol_of(&conn, "u1"), None);
+        allow(&conn, "u1", &[]).unwrap();
+        assert_eq!(protocol_of(&conn, "u1").as_deref(), Some("vnc"));
+        assert!(held_for(&conn, "u1").is_empty());
+        let merge_flag: i64 = conn.query_row("SELECT val FROM sync_flags WHERE key='merge'", [], |r| r.get(0)).unwrap();
+        assert_eq!(merge_flag, 0, "the merge flag is off again");
+
+        merge_protocol(&conn, "u2", None);
+        merge_protocol(&conn, "u2", Some("telnet"));
+        // Saving the same protocol back (the form does) is not an OK.
+        conn.execute("UPDATE servers SET protocol=NULL WHERE uuid='u2'", []).unwrap();
+        assert!(held_for(&conn, "u2").contains("protocol:telnet"));
+        // Choosing one on this device is.
+        conn.execute("UPDATE servers SET protocol='rdp' WHERE uuid='u2'", []).unwrap();
+        assert!(held_for(&conn, "u2").is_empty());
+        assert_eq!(protocol_of(&conn, "u2").as_deref(), Some("rdp"));
+    }
+
+    #[test]
+    fn a_duplicate_keeps_a_held_switch_of_protocol() {
+        let conn = db();
+        merge_protocol(&conn, "u1", None);
+        merge_protocol(&conn, "u1", Some("vnc"));
+        conn.execute("INSERT INTO servers(name, protocol, uuid) SELECT name, protocol, 'u2' FROM servers WHERE uuid = 'u1'", []).unwrap();
+        copy_held(&conn, 1, 2).unwrap();
+        assert_eq!(protocol_of(&conn, "u2"), None);
+        assert_eq!(held_protocol(&conn, "u2").as_deref(), Some("vnc"));
     }
 
     #[test]

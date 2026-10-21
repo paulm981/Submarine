@@ -15,9 +15,10 @@ type HeldServer = {
   held?: string[];
 };
 
-/** Commands first (they run in a shell), then autostart, forwards, monitor commands. */
+/** A switch of protocol first (it changes what the server is), then commands
+ *  (they run in a shell), autostart, forwards, monitor commands. */
 const rank = (item: string) =>
-  item === "run_on_connect" ? 0 : item === "autostart" ? 1 : item.startsWith("tunnel:") ? 2 : 3;
+  item.startsWith("protocol:") ? -1 : item === "run_on_connect" ? 0 : item === "autostart" ? 1 : item.startsWith("tunnel:") ? 2 : 3;
 const byRank = (a: string, b: string) => rank(a) - rank(b) || a.localeCompare(b);
 
 /** One held item, in words, with the text it would run when there is one. */
@@ -27,6 +28,18 @@ function describe(item: string, server: HeldServer): { what: string; detail?: st
   }
   if (item === "autostart") {
     return { what: "Connects by itself when you unlock this profile" };
+  }
+  if (item === "protocol:vnc") {
+    return {
+      what: "Another computer changed this server to VNC. VNC sends its password with weak protection and doesn't check the server's identity.",
+      detail: "Until you allow it, it stays an SSH server here.",
+    };
+  }
+  if (item === "protocol:telnet") {
+    return {
+      what: "Another computer changed this server to telnet. Telnet sends everything, passwords too, as plain text.",
+      detail: "Until you allow it, it stays an SSH server here.",
+    };
   }
   if (item.startsWith("tunnel:")) {
     const [kind, local, remote] = item.slice("tunnel:".length).split("|");
@@ -92,8 +105,8 @@ export function HeldReview({ servers, onAllow, onClose }: {
         </div>
         <p className="px-4 pb-3 text-[12px] text-zinc-400 leading-relaxed">
           Someone you share this profile with made these changes. Until you allow one, it doesn't run on this
-          device: commands aren't typed, forwards stay stopped, autostart doesn't connect and monitor commands
-          don't run. Allowing counts for this device only.
+          device: commands aren't typed, forwards stay stopped, autostart doesn't connect, monitor commands
+          don't run, and a server changed to telnet or VNC stays an SSH server. Allowing counts for this device only.
         </p>
         <div className="flex-1 overflow-y-auto custom-scrollbar px-4 pb-2 space-y-3">
           {held.map((s) => (

@@ -1009,7 +1009,17 @@ fn collect_local_records(conn: &Connection, key: &[u8; 32], since: &str) -> Resu
             .query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
             .map_err(|e| format!("[SYNC] SER_QUERY {}: {e}", spec.table))?;
         for row in rows {
-            let (uuid, updated_at, payload) = row.map_err(|e| format!("[SYNC] SER_ROW {}: {e}", spec.table))?;
+            let (uuid, updated_at, mut payload) = row.map_err(|e| format!("[SYNC] SER_ROW {}: {e}", spec.table))?;
+            // A server whose switch to telnet or VNC this device holds still
+            // has that protocol everywhere else: an edit here mustn't undo it
+            // (approvals::held_protocol).
+            if spec.table == "servers" {
+                if let Some(protocol) = approvals::held_protocol(conn, &uuid) {
+                    let mut obj: serde_json::Value = serde_json::from_str(&payload).map_err(|e| format!("[SYNC] SER_ROW {}: {e}", spec.table))?;
+                    obj["protocol"] = serde_json::Value::String(protocol);
+                    payload = obj.to_string();
+                }
+            }
             out.push(SyncRecord {
                 uuid,
                 entity_type: spec.table.to_string(),
@@ -1143,14 +1153,18 @@ fn apply_remote_inner(
     for spec in ENTITIES {
         let watch = shared && approvals::watches(spec.table);
         for rec in records.iter().filter(|r| !r.deleted && r.entity_type == spec.table) {
-            let before = if watch { approvals::snapshot(&tx, spec.table, &rec.uuid) } else { None };
-            if let Err(e) = apply_entity(&tx, key, spec, rec, &mut fk_fixups) {
+            // A server's held switch of protocol goes back in the row for the
+            // record to merge over, and hold_changes keeps this device's
+            // protocol again after it, whether the record applied or not.
+            let before = if watch { approvals::before_merge(&tx, spec.table, &rec.uuid)? } else { None };
+            let applied = apply_entity(&tx, key, spec, rec, &mut fk_fixups);
+            if watch {
+                approvals::hold_changes(&tx, spec.table, &rec.uuid, before.as_ref())?;
+            }
+            if let Err(e) = applied {
                 skipped += 1;
                 eprintln!("[SYNC] skipped record uuid={} type={}: {}", rec.uuid, rec.entity_type, e);
                 continue;
-            }
-            if watch {
-                approvals::hold_changes(&tx, spec.table, &rec.uuid, before.as_ref())?;
             }
         }
     }
@@ -3499,6 +3513,48 @@ mod sync_engine_tests {
         approvals::create_schema(&c).unwrap();
         apply_remote_records(&c, &KEY, &recs, &hc).unwrap();
         assert!(approvals::held_by_server(&c).is_empty(), "a personal profile holds nothing");
+    }
+
+    // A co-member switching an SSH server to VNC (or telnet) is held: this
+    // device keeps it an SSH server until its user allows the switch, and an
+    // edit made here meanwhile doesn't switch it back for everyone else.
+    #[test]
+    fn a_shared_profile_holds_a_switch_from_ssh_to_vnc() {
+        let (a, ha) = device("A");
+        a.execute("INSERT INTO servers(name,host,port) VALUES('web','h',22)", []).unwrap();
+        let (b, hb) = device("B");
+        approvals::create_schema(&b).unwrap();
+        b.execute("INSERT INTO sync_meta(key,value) VALUES('share_id','s1')", []).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let uuid: String = b.query_row("SELECT uuid FROM servers WHERE name='web'", [], |r| r.get(0)).unwrap();
+        let proto = |c: &Connection| -> Option<String> { c.query_row("SELECT protocol FROM servers WHERE name LIKE 'web%'", [], |r| r.get(0)).unwrap() };
+        assert!(approvals::held_for(&b, &uuid).is_empty(), "an SSH server arrives as it is");
+
+        a.execute("UPDATE servers SET protocol='vnc' WHERE name='web'", []).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        assert_eq!(proto(&b), None, "this device keeps it an SSH server");
+        assert_eq!(approvals::held_for(&b, &uuid).into_iter().collect::<Vec<_>>(), vec!["protocol:vnc".to_string()]);
+
+        // An edit here pushes the shared profile's protocol, not this device's.
+        b.execute("UPDATE servers SET name='web2' WHERE name='web'", []).unwrap();
+        let recs = collect_local_records(&b, &KEY, "").unwrap();
+        apply_remote_records(&a, &KEY, &recs, &ha).unwrap();
+        assert_eq!(proto(&a).as_deref(), Some("vnc"), "the other device's switch stays");
+        let srv = recs.iter().find(|r| r.entity_type == "servers").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&decrypt_entity(srv.blob.as_ref().unwrap(), &KEY).unwrap()).unwrap();
+        assert_eq!(v["protocol"], "vnc");
+
+        // The other device's next edit, which still says VNC, stays held.
+        a.execute("UPDATE servers SET host='h2' WHERE name='web2'", []).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let host: String = b.query_row("SELECT host FROM servers WHERE name='web2'", [], |r| r.get(0)).unwrap();
+        assert_eq!((host.as_str(), proto(&b)), ("h2", None));
+        assert!(approvals::held_for(&b, &uuid).contains("protocol:vnc"));
+
+        // Allowed: now a VNC server here too.
+        approvals::allow(&b, &uuid, &["protocol:vnc".to_string()]).unwrap();
+        assert_eq!(proto(&b).as_deref(), Some("vnc"));
+        assert!(approvals::held_for(&b, &uuid).is_empty());
     }
 
     #[test]
@@ -7046,6 +7102,7 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
 /// forwards are no longer stopped in the server's session, so the next
 /// connect starts them (as does the Start button now). Autostart counts from
 /// the next unlock; the frontend types allowed on-connect commands itself.
+/// An allowed switch to telnet or VNC is made at once (approvals::allow).
 #[tauri::command]
 async fn allow_held(
     db_state: tauri::State<'_, DbState>,
