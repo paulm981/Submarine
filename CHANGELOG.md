@@ -7,6 +7,14 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - Sections called **From the original project** list what came in from [SinaXhpm/Submarine](https://github.com/SinaXhpm/submarine), with that project's pull request numbers.
 - [FORK.md](FORK.md) explains what the fork does differently, and which of the original project's changes it hasn't taken yet.
 
+## v0.3.8-fork.5
+
+- **Getting around many tabs** ([#75](https://github.com/paulm981/Submarine/issues/75)):
+  - **Ctrl+Shift+K** opens All tabs with its search ready: type part of a name and press Enter to go there. Up and Down move through the matches.
+  - **Ctrl+Tab** and **Ctrl+Shift+Tab** go to the next and previous tab, in the order the title bar shows them.
+  - **Show only open** (the eye button in the session tree) hides the servers you don't have open, keeping their folders. In that view, double-clicking a server takes you to its tab, or to the Wall it's on.
+- **A failed connect says why** ([#35](https://github.com/paulm981/Submarine/issues/35)). When a connect fails in a way that waiting can fix, Submarine checks whether the name resolves and the port answers, and says what it found under the error. Behind a jump host or a proxy it checks that instead; a ProxyCommand can't be checked. It runs beside the retry countdown, and not for a rejected login or host key.
+
 ## v0.3.8-fork.4
 
 - **Two uploads to the same file no longer corrupt it** ([#45](https://github.com/paulm981/Submarine/issues/45)). An upload to a server file that another upload is still writing waits for the first to finish, at 0% until its turn. Cancel still stops it while it waits.
