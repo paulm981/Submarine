@@ -38,6 +38,25 @@ const looksLikePasswordPrompt = (out: string): boolean => {
   return /(?:password|passphrase)\b[^:\n]*:\s*$/i.test(tail);
 };
 
+// The user a password prompt asks about, when it names one, so a saved
+// password is only offered for that user (#182 in the original project):
+// "[sudo] password for bob:", "[dzdo] password for bob:", "bob@web1's
+// password:", "Password for bob@CORP.EXAMPLE:". Null when it names nobody,
+// as su's "Password:" doesn't.
+const passwordPromptUser = (out: string): string | null => {
+  const clean = out
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/[\r\n]+/g, "\n");
+  const line = clean.slice(-160).trimEnd().split("\n").pop() ?? "";
+  const m = /password for ([^\s:]+)\s*:\s*$/i.exec(line)
+    ?? /([^\s:']+)'s password\s*:\s*$/i.exec(line);
+  return m ? sameUser(m[1]) : null;
+};
+// A user name without its host or domain ("bob@web1", "CORP\\bob" and
+// "bob@corp.example" are all "bob"), lowercased, to compare by.
+const sameUser = (name: string): string => name.replace(/^.*\\/, "").replace(/@.*$/, "").toLowerCase();
+
 // Shared search options — highlight all matches in yellow, the active
 // match in orange. `decorations` uses the marker overlay so the highlight
 // survives scrollback and repaints (the addon's built-in selection-based
@@ -632,26 +651,33 @@ const TerminalView = ({
   };
   type SavedPassword = { label: string; detail: string; serverId?: number; credentialId?: number };
   const [passwordMenu, setPasswordMenu] = useState<SavedPassword[] | null>(null);
+  // Which saved passwords are offered (the fork's rule, FORK.md): this
+  // server's own password and the saved login it uses, when the prompt asks
+  // for their user or names nobody (su); another saved login only when the
+  // prompt names its user. So a prompt a server prints can't fish for the
+  // password of a login it has nothing to do with.
   const openPasswordMenu = async () => {
     try {
       const [servers, logins] = await Promise.all([
         invoke<any[]>('get_servers'),
         invoke<any[]>('get_credentials'),
       ]);
+      const asked = passwordPromptUser(recentOutputRef.current);
       const server = serverId > 0 ? servers.find((s) => s.id === serverId) : undefined;
+      const ownLogin = server?.credential_id != null ? logins.find((c) => c.id === server.credential_id) : undefined;
       const items: SavedPassword[] = [];
-      if (server?.has_password) {
-        items.push({ label: "This server's password", detail: server.username || server.name, serverId: server.id });
+      const serverUser = server ? (server.username || ownLogin?.username || "") : "";
+      if (server?.has_password && (asked === null || sameUser(serverUser) === asked)) {
+        items.push({ label: "This server's password", detail: serverUser || server.name, serverId: server.id });
       }
-      // Its own saved login first, then the others.
-      const withPassword = logins.filter((c) => c.has_password);
-      withPassword.sort((a, b) => Number(b.id === server?.credential_id) - Number(a.id === server?.credential_id));
-      for (const c of withPassword) {
-        items.push({
-          label: c.name,
-          detail: c.id === server?.credential_id ? `${c.username} · this server's login` : c.username,
-          credentialId: c.id,
-        });
+      if (ownLogin?.has_password && (asked === null || sameUser(ownLogin.username) === asked)) {
+        items.push({ label: ownLogin.name, detail: `${ownLogin.username} · this server's login`, credentialId: ownLogin.id });
+      }
+      if (asked !== null) {
+        for (const c of logins) {
+          if (c.id === ownLogin?.id || !c.has_password || sameUser(c.username) !== asked) continue;
+          items.push({ label: c.name, detail: c.username, credentialId: c.id });
+        }
       }
       setPasswordMenu(items);
     } catch (e) {
@@ -1489,7 +1515,7 @@ const TerminalView = ({
           </button>
         </div>
       )}
-      {atPasswordPrompt && !disabled && !showSearch && (
+      {atPasswordPrompt && !local && !disabled && !showSearch && (
         <div className="absolute top-2 right-2 z-20 flex flex-col items-end gap-1 max-w-[calc(100%-1rem)]">
           <button
             type="button"
@@ -1511,7 +1537,7 @@ const TerminalView = ({
             >
               {passwordMenu.length === 0 ? (
                 <div className="px-2 py-1.5 text-[11px] text-zinc-400">
-                  No saved passwords. Save one with the server or under Logins.
+                  No saved password for this prompt. This server's own password, or a saved login for the user it asks about, can be typed here.
                 </div>
               ) : passwordMenu.map((p) => (
                 <button
