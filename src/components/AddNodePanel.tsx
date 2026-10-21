@@ -1134,7 +1134,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
             {/* On-connect commands — auto-typed into the FIRST terminal once
                 its shell is up, on connecting and again after a reconnect
                 (not on extra shells you open later). One command per line. */}
-            {isSsh && (<>
+            {isSsh && (
             <div className="space-y-1.5 pt-1">
               <label className="text-[11px] font-bold text-zinc-400 ml-1 flex items-center gap-2">
                 <span>Run on connect</span>
@@ -1151,7 +1151,11 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 className="w-full bg-[#1a1a1e] rounded-lg p-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner font-mono leading-relaxed resize-y"
               />
             </div>
+            )}
 
+            {/* A telnet server's tab is a terminal too, so it takes its own
+                colors and highlighting like an SSH server's. */}
+            {(isSsh || isTelnet) && (<>
             {/* Its own terminal colors (synced with the server), e.g. a light
                 scheme for production so it's never mistaken for the rest. */}
             <div className="space-y-1.5 pt-1">
