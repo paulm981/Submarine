@@ -9,16 +9,13 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Files from a server don't run on macOS and Linux either.** Live Edit opens a file in your default text editor on macOS; on Linux, a file of a type that could run opens in the editor for plain text. The Local pane asks before it opens such a file (on macOS a `.terminal` or `.command` file too), and downloads on macOS are marked as from the internet. ([#84](https://github.com/paulm981/Submarine/issues/84))
+- **A jump host that stops answering no longer keeps a tab connecting.** Reaching the server behind it has 15 seconds, and logging in to it 5 minutes, prompts included. Other servers behind it stop waiting for their turn. ([#84](https://github.com/paulm981/Submarine/issues/84))
+- **Home terminals and AI tabs** leave out escape sequences that would freeze the window, as SSH terminals do. So does a container's terminal opened as root. ([#84](https://github.com/paulm981/Submarine/issues/84))
+- **Two windows syncing through the same folder or git repository take turns**, now that each profile can have a window of its own. A file in that storage that's far too big is skipped, and the log says why. ([#84](https://github.com/paulm981/Submarine/issues/84))
+
 ### From the original project ([#41](https://github.com/paulm981/Submarine/issues/41))
 
-- **RDP servers** ([#173](https://github.com/SinaXhpm/submarine/pull/173)). Add server has a **Type**: SSH, RDP, Telnet or VNC. An RDP server opens in this computer's Remote Desktop app (Remote Desktop Connection on Windows, Remmina or FreeRDP on Linux), straight or through an SSH server. The app asks for the password itself. Window size and what's shared are kept on this computer. Your Remote Desktop links stay as they are, beside RDP servers; joining the two comes next ([#42](https://github.com/paulm981/Submarine/issues/42)).
-- **A built-in RDP client, experimental** ([#199](https://github.com/SinaXhpm/submarine/pull/199)). An RDP server can instead show its desktop in its own tab: choose **Open in** on the server. Your password and the server's certificate check stay in the app; the certificate is remembered like an SSH host key. It's off unless you choose it.
-- **Telnet servers** ([#192](https://github.com/SinaXhpm/submarine/pull/192)) open in a terminal tab, for older network devices. Telnet isn't encrypted: anything you type, passwords too, crosses the network as plain text, and the form, the list and the tab say so. Going through an SSH server keeps the part up to that server encrypted.
-- **VNC servers** ([#193](https://github.com/SinaXhpm/submarine/pull/193)) show their screen in the tab, straight or through an SSH server, with touch, zoom and a keyboard on a phone. Plain VNC isn't encrypted either.
-- RDP, telnet and VNC servers don't go on Walls or into Broadcast, and can't be shared with AI tools: those work with SSH terminals.
-- **Unlock a profile with Windows Hello** ([#195](https://github.com/SinaXhpm/submarine/pull/195)), or a fingerprint on Android. Turn it on for a profile in the profile panel, with its password once. The password isn't kept: a key locked by Windows Hello is, on this computer only, and it never syncs. Not offered on macOS or Linux.
-- **Security updates** ([#198](https://github.com/SinaXhpm/submarine/pull/198)): the TLS library behind sync and the update check, with four advisories fixed, and the zip library.
-- **The Android build**, when this fork's builds turn it on, uses the NDK it installs ([#196](https://github.com/SinaXhpm/submarine/pull/196)).
 - **Version 0.4.0** ([#220](https://github.com/SinaXhpm/submarine/pull/220)). The original project is at 0.4.0, so the fork's releases are now numbered `v0.4.0-fork.1` and on.
 - **One window per profile** ([#204](https://github.com/SinaXhpm/submarine/pull/204)). A profile open in one Submarine window can't be opened in a second one, so two windows no longer save over each other's changes. Other profiles still open, and a profile open elsewhere can't be deleted.
 - **Locking a profile locks sharing too** ([#223](https://github.com/SinaXhpm/submarine/pull/223)). The sharing passphrase is asked for again after a lock. Locking also ends the AI tabs' access to the profile's servers.
@@ -47,6 +44,27 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
   - a mirror's folder on this computer can't be a network share ([#210](https://github.com/SinaXhpm/submarine/pull/210));
   - a copy of a server keeps waiting for your OK where the original was waiting. The fork already did this ([#211](https://github.com/SinaXhpm/submarine/pull/211)).
 - **Release builds** ([#221](https://github.com/SinaXhpm/submarine/pull/221)). The actions they use are pinned to exact versions, and the Android app, when it's built, is signed by a separate job that runs nothing else.
+- **A mirror's folder must be on a drive letter**, on Windows. Some ways of writing a network share still got past the check from #210 and were looked up on the network. ([#41](https://github.com/paulm981/Submarine/issues/41))
+- **Paste in the Library works like a paste.** A command's or note's **Paste** leaves out control characters, keeps several lines together where the program takes a paste as one block, and asks first where each line would run. **Run** works as before. ([#41](https://github.com/paulm981/Submarine/issues/41))
+- **Unsent Live Edit changes are kept when you disconnect or lock the profile.** A copy with changes that never reached the server is moved to **Submarine unsent edits** in your Downloads folder, and the window says so, with a button to show it. ([#41](https://github.com/paulm981/Submarine/issues/41))
+
+## v0.3.8-fork.11
+
+### From the original project ([#41](https://github.com/paulm981/Submarine/issues/41))
+
+- **RDP servers** ([#173](https://github.com/SinaXhpm/submarine/pull/173)). Add server has a **Type**: SSH, RDP, Telnet or VNC. An RDP server opens in this computer's Remote Desktop app (Remote Desktop Connection on Windows, Remmina or FreeRDP on Linux), straight or through an SSH server. The app asks for the password itself. Window size and what's shared are kept on this computer. Your Remote Desktop links stay as they are, beside RDP servers; joining the two comes next ([#42](https://github.com/paulm981/Submarine/issues/42)).
+- **A built-in RDP client, experimental** ([#199](https://github.com/SinaXhpm/submarine/pull/199)). An RDP server can instead show its desktop in its own tab: choose **Open in** on the server. Your password and the server's certificate check stay in the app; the certificate is remembered like an SSH host key. It's off unless you choose it.
+- **Telnet servers** ([#192](https://github.com/SinaXhpm/submarine/pull/192)) open in a terminal tab, for older network devices. Telnet isn't encrypted: anything you type, passwords too, crosses the network as plain text, and the form, the list and the tab say so. Going through an SSH server keeps the part up to that server encrypted.
+- **VNC servers** ([#193](https://github.com/SinaXhpm/submarine/pull/193)) show their screen in the tab, straight or through an SSH server, with touch, zoom and a keyboard on a phone. Plain VNC isn't encrypted either.
+- **A VNC server never uses a saved login.** VNC sends its password with weak protection and doesn't check the server's identity, so a login you also use elsewhere could be read on the way. Save the VNC password on the server itself, or type it when the tab asks. ([#41](https://github.com/paulm981/Submarine/issues/41))
+- **A server another computer switches from SSH to telnet or VNC stays SSH here until you choose**, in a shared profile. Both would send its saved password where it could be read. The switch waits in **Waiting for your OK**, with the other held changes. Until then the server keeps its old port here too.
+  - **Allow** makes the switch here as well.
+  - **Keep it SSH** changes it back to SSH on the other computers too. ([#41](https://github.com/paulm981/Submarine/issues/41))
+- **RDP servers and Remote Desktop links look different.** In the session tree, RDP, telnet and VNC servers show their type, as in the server list, and a telnet server its not-encrypted mark. Remote Desktop links say **LINK**, in the tree and the list. ([#41](https://github.com/paulm981/Submarine/issues/41))
+- RDP, telnet and VNC servers don't go on Walls or into Broadcast, and can't be shared with AI tools: those work with SSH terminals.
+- **Unlock a profile with Windows Hello** ([#195](https://github.com/SinaXhpm/submarine/pull/195)), or a fingerprint on Android. Turn it on for a profile in the profile panel, with its password once. The password isn't kept: a key locked by Windows Hello is, on this computer only, and it never syncs. Not offered on macOS or Linux.
+- **Security updates** ([#198](https://github.com/SinaXhpm/submarine/pull/198)): the TLS library behind sync and the update check, with four advisories fixed, and the zip library.
+- **The Android build**, when this fork's builds turn it on, uses the NDK it installs ([#196](https://github.com/SinaXhpm/submarine/pull/196)).
 
 ## v0.3.8-fork.10
 

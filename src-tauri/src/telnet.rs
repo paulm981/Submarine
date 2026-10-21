@@ -335,6 +335,10 @@ pub struct Conn {
     pub route: Vec<russh::client::Handle<ClientHandler>>,
     /// Whether it's the telnet port: then the options are asked first.
     pub telnet_port: bool,
+    /// The connect attempt it came from (the session's generation). Its
+    /// `terminal-closed` carries it, so the tab can tell the end of the
+    /// connection a Reconnect replaced from the end of the live one.
+    pub generation: u64,
 }
 
 /// Connections waiting for their tab's terminal, by session id.
@@ -375,22 +379,23 @@ pub async fn connect_direct(host: &str, port: u16) -> Result<Box<dyn Duplex>, St
 /// Through the last SSH server of `route`, which is kept with the stream.
 pub async fn connect_through(route: &[russh::client::Handle<ClientHandler>], host: &str, port: u16) -> Result<Box<dyn Duplex>, String> {
     let last = route.last().ok_or("no SSH server to go through")?;
-    // A server that never answers the channel open would leave the tab on
-    // "Connecting" for good (VNC and RDP give it the same 15 seconds).
-    let channel = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        last.channel_open_direct_tcpip(host.trim().to_string(), u32::from(port), "127.0.0.1".to_string(), 0),
-    )
-    .await
-    .map_err(|_| format!("The SSH server didn't answer within 15 seconds when asked to reach {}", address(host, port)))?
-    .map_err(|e| format!("The SSH server couldn't reach {}: {e}", address(host, port)))?;
+    // Bounded, like VNC's and RDP's: an SSH server that never answers the
+    // request would keep the tab connecting forever.
+    let open = last.channel_open_direct_tcpip(host.trim().to_string(), u32::from(port), "127.0.0.1".to_string(), 0);
+    let channel = match tokio::time::timeout(std::time::Duration::from_secs(15), open).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(format!("The SSH server couldn't reach {}: {e}", address(host, port))),
+        Err(_) => return Err(format!("The SSH server didn't reach {} within 15 seconds", address(host, port))),
+    };
     Ok(Box::new(channel.into_stream()))
 }
 
 /// Drives a tab's telnet connection for its life: the server's text →
 /// coalesced batches to the page (`output`), keys and resizes → the server,
 /// then `terminal-closed-{id}`; and `session-disconnected-{session}` when the
-/// server (or the route) ended it rather than the tab. The reader and the
+/// server (or the route) ended it rather than the tab. Both carry the
+/// connection's `generation`, so the tab can tell a connection a Reconnect
+/// replaced from the live one. The reader and the
 /// writer are separate tasks, so the reader is drained whatever the writer
 /// waits on (a channel through an SSH server stalls its whole connection
 /// otherwise; see `ssh_manager::pty_pump`).
@@ -404,7 +409,7 @@ pub async fn run_pump(
     mut rx: mpsc::Receiver<TerminalCommand>,
     mut resize_rx: watch::Receiver<PtySize>,
 ) {
-    let Conn { stream, route, telnet_port } = conn;
+    let Conn { stream, route, telnet_port, generation } = conn;
     let size = *resize_rx.borrow();
     let telnet = Arc::new(std::sync::Mutex::new(Telnet::new(size.cols, size.rows)));
     let (mut read_half, mut write_half) = tokio::io::split(stream);
@@ -511,7 +516,7 @@ pub async fn run_pump(
     {
         let app = app.clone();
         output.finish(move || {
-            let _ = app.emit(&format!("terminal-closed-{terminal_id}"), serde_json::json!({}));
+            let _ = app.emit(&format!("terminal-closed-{terminal_id}"), serde_json::json!({ "generation": generation }));
         });
     }
     if server_ended {
@@ -520,7 +525,10 @@ pub async fn run_pump(
         } else {
             "The telnet server closed the connection."
         };
-        let _ = app.emit(&format!("session-disconnected-{session_id}"), serde_json::json!({ "reason": reason }));
+        let _ = app.emit(
+            &format!("session-disconnected-{session_id}"),
+            serde_json::json!({ "reason": reason, "generation": generation }),
+        );
     }
     drop(route);
 }

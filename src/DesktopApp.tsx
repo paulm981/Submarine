@@ -578,6 +578,16 @@ function DesktopApp() {
     }
     await refreshServers();
   }, [addLog, refreshServers]);
+  // Decline a held switch to telnet or VNC: the server stays SSH, and the
+  // other computers get it back as SSH with the next sync.
+  const keepServerSsh = useCallback(async (serverId: number) => {
+    try {
+      if (await invoke<boolean>("keep_server_ssh", { serverId })) addLog("Kept it an SSH server.", "success");
+    } catch (e) {
+      addLog(`KEEP_SSH_FAILED: ${e}`, "error");
+    }
+    await refreshServers();
+  }, [addLog, refreshServers]);
   const refreshCredentials = useCallback(async () => {
     try { setCredentials((await invoke("get_credentials")) as any[]); }
     catch (e) { addLog(`SYNC_CREDENTIALS: ${e}`, "error"); }
@@ -1218,6 +1228,17 @@ function DesktopApp() {
       void confirm({ title: `"${sw.name}" is empty`, message: "None of its servers exist any more. Edit it to pick some.", okLabel: "OK", cancelLabel: "Close" });
       return;
     }
+    // A Wall shows SSH terminals only, so a saved wall whose servers have all
+    // become RDP, telnet or VNC ones has nothing to show (unless it's open).
+    if (!list.some(isSshServer) && !walls.some(w => w.savedId === sw.id)) {
+      void confirm({
+        title: `"${sw.name}" has no SSH servers`,
+        message: "A wall shows SSH terminals only, and its servers are RDP, telnet or VNC ones now. Open them from the server list, or edit the wall to pick SSH servers.",
+        okLabel: "OK",
+        cancelLabel: "Close",
+      });
+      return;
+    }
     openServersAsWall(list, sw.name, { broadcast, cols: sw.cols, savedId: sw.id, addMissing });
   };
 
@@ -1642,7 +1663,8 @@ function DesktopApp() {
       port: server.port || 22,
       username: server.username || "",
       password: revealedPassword,
-      authType: server.auth_type || (server.credential_id ? "vault" : "custom_pass"),
+      // A VNC server never uses a saved login (see the save below).
+      authType: server.protocol === "vnc" ? "custom_pass" : server.auth_type || (server.credential_id ? "vault" : "custom_pass"),
       credentialId: server.credential_id?.toString() || "",
       folderId: server.folder_id?.toString() || "",
       keyId: server.key_id?.toString() || "",
@@ -2621,6 +2643,7 @@ function DesktopApp() {
                 onAddClick={addServerIn}
                 onQuickConnect={() => setIsQuickConnectOpen(true)}
                 onAllowHeld={allowHeld}
+                onKeepSsh={keepServerSsh}
                 keyChange={shareKeyChange}
                 onAcceptKey={acceptShareKey}
                 heldDeletions={heldDeletions}
@@ -3327,7 +3350,7 @@ function DesktopApp() {
             addLog("Name and Host are required.", "error");
             return;
           }
-          if (newNode.authType === "vault" && !newNode.credentialId) {
+          if (newNode.authType === "vault" && !newNode.credentialId && newNode.protocol !== "vnc") {
             setFormError("Please pick a saved login.");
             addLog("Please pick a saved login.", "error");
             return;
@@ -3349,24 +3372,28 @@ function DesktopApp() {
             // go through; nothing that runs over SSH (forwards, mirrors,
             // autostart, a proxy, a key). An RDP server's saved password isn't
             // touched: the RDP app asks. A telnet server's is kept, for the
-            // terminal's password button; a VNC server's, for its login.
+            // terminal's password button; a VNC server's, for its login. A
+            // VNC server never has a saved login: VNC sends its password with
+            // weak protection and doesn't check the server's identity, so a
+            // shared login's password would be open to anyone on the path.
             const isRdp = newNode.protocol === "rdp";
             const isTelnet = newNode.protocol === "telnet";
             const isVnc = newNode.protocol === "vnc";
             const keepsPassword = isTelnet || isVnc;
+            const savedLogin = newNode.authType === "vault" && !isVnc;
             const payload = isRdp || isTelnet || isVnc ? {
               name: newNode.name,
               host: newNode.host,
               port: newNode.port,
               username: isInline && !isVnc ? (newNode.username?.trim() || null) : null,
-              password: keepsPassword && newNode.authType === "custom_pass" ? (newNode.password || null) : null,
-              credentialId: (newNode.authType === "vault" && newNode.credentialId) ? parseInt(newNode.credentialId) : null,
+              password: keepsPassword && !savedLogin ? (newNode.password || null) : null,
+              credentialId: (savedLogin && newNode.credentialId) ? parseInt(newNode.credentialId) : null,
               folderId: newNode.folderId ? parseInt(newNode.folderId) : null,
               proxyType: "none",
               proxyHost: "",
               proxyPort: 1080,
               tunnels: [],
-              authType: newNode.authType === "vault" ? "vault" : "custom_pass",
+              authType: savedLogin ? "vault" : "custom_pass",
               keyId: null,
               autostart: false,
               mirrors: [],

@@ -10,15 +10,24 @@ import { useFocusTrap } from "../ui/confirm";
 type HeldServer = {
   id: number;
   name: string;
+  port?: number;
   run_on_connect?: string;
   edited_by?: string | null;
   held?: string[];
 };
 
-/** Commands first (they run in a shell), then autostart, forwards, monitor commands. */
+/** A switch of protocol first (it changes what the server is), then commands
+ *  (they run in a shell), autostart, forwards, monitor commands. */
 const rank = (item: string) =>
-  item === "run_on_connect" ? 0 : item === "autostart" ? 1 : item.startsWith("tunnel:") ? 2 : 3;
+  item.startsWith("protocol:") ? -1 : item === "run_on_connect" ? 0 : item === "autostart" ? 1 : item.startsWith("tunnel:") ? 2 : 3;
 const byRank = (a: string, b: string) => rank(a) - rank(b) || a.localeCompare(b);
+
+/** A held switch to telnet or VNC: `protocol:<telnet|vnc>|<port>`. */
+function switchOf(item: string): { protocol: string; label: string; port: string } | null {
+  if (!item.startsWith("protocol:")) return null;
+  const [protocol, port = ""] = item.slice("protocol:".length).split("|");
+  return { protocol, label: protocol === "vnc" ? "VNC" : "telnet", port };
+}
 
 /** One held item, in words, with the text it would run when there is one. */
 function describe(item: string, server: HeldServer): { what: string; detail?: string } {
@@ -27,6 +36,17 @@ function describe(item: string, server: HeldServer): { what: string; detail?: st
   }
   if (item === "autostart") {
     return { what: "Connects by itself when you unlock this profile" };
+  }
+  const sw = switchOf(item);
+  if (sw) {
+    const why = sw.protocol === "vnc"
+      ? "VNC sends its password with weak protection and doesn't check the server's identity."
+      : "Telnet sends everything, passwords too, as plain text.";
+    const to = `${sw.label}${sw.port ? ` on port ${sw.port}` : ""}`;
+    return {
+      what: `Another computer changed this server to ${sw.label}. ${why}`,
+      detail: `Until you choose, it stays SSH here${server.port ? `, on port ${server.port}` : ""}. Allow makes it ${to} here too. Keep it SSH changes it back to SSH on the other computers as well.`,
+    };
   }
   if (item.startsWith("tunnel:")) {
     const [kind, local, remote] = item.slice("tunnel:".length).split("|");
@@ -41,9 +61,11 @@ function describe(item: string, server: HeldServer): { what: string; detail?: st
   return { what: item };
 }
 
-export function HeldReview({ servers, onAllow, onClose }: {
+export function HeldReview({ servers, onAllow, onKeepSsh, onClose }: {
   servers: HeldServer[];
   onAllow: (serverId: number, items: string[]) => Promise<void>;
+  /** A held switch to telnet or VNC, declined: the server stays SSH, everywhere. */
+  onKeepSsh?: (serverId: number) => Promise<void>;
   onClose: () => void;
 }) {
   const panelRef = useRef<HTMLDivElement | null>(null);
@@ -67,6 +89,11 @@ export function HeldReview({ servers, onAllow, onClose }: {
   const allow = async (serverId: number, items: string[]) => {
     setBusy(true);
     try { await onAllow(serverId, items); } finally { setBusy(false); }
+  };
+  const keepSsh = async (serverId: number) => {
+    if (!onKeepSsh) return;
+    setBusy(true);
+    try { await onKeepSsh(serverId); } finally { setBusy(false); }
   };
 
   return createPortal(
@@ -92,8 +119,8 @@ export function HeldReview({ servers, onAllow, onClose }: {
         </div>
         <p className="px-4 pb-3 text-[12px] text-zinc-400 leading-relaxed">
           Someone you share this profile with made these changes. Until you allow one, it doesn't run on this
-          device: commands aren't typed, forwards stay stopped, autostart doesn't connect and monitor commands
-          don't run. Allowing counts for this device only.
+          device: commands aren't typed, forwards stay stopped, autostart doesn't connect, monitor commands
+          don't run, and a server changed to telnet or VNC stays an SSH server. Allowing counts for this device only.
         </p>
         <div className="flex-1 overflow-y-auto custom-scrollbar px-4 pb-2 space-y-3">
           {held.map((s) => (
@@ -128,14 +155,26 @@ export function HeldReview({ servers, onAllow, onClose }: {
                           )
                         )}
                       </div>
-                      <button
-                        disabled={busy}
-                        onClick={() => allow(s.id, [item])}
-                        aria-label={`Allow: ${d.what}`}
-                        className="shrink-0 px-2.5 h-7 rounded text-[10.5px] font-bold uppercase tracking-wider bg-primary/15 border border-primary/40 text-primary hover:bg-primary/25 disabled:opacity-50"
-                      >
-                        Allow
-                      </button>
+                      <div className="shrink-0 flex flex-col items-stretch gap-1">
+                        <button
+                          disabled={busy}
+                          onClick={() => allow(s.id, [item])}
+                          aria-label={`Allow: ${d.what}`}
+                          className="px-2.5 h-7 rounded text-[10.5px] font-bold uppercase tracking-wider bg-primary/15 border border-primary/40 text-primary hover:bg-primary/25 disabled:opacity-50"
+                        >
+                          Allow
+                        </button>
+                        {switchOf(item) && onKeepSsh && (
+                          <button
+                            disabled={busy}
+                            onClick={() => keepSsh(s.id)}
+                            aria-label={`Keep ${s.name} an SSH server`}
+                            className="px-2.5 h-7 rounded text-[10.5px] font-bold uppercase tracking-wider bg-white/[0.04] border border-white/10 text-zinc-300 hover:bg-white/[0.08] hover:text-white disabled:opacity-50"
+                          >
+                            Keep it SSH
+                          </button>
+                        )}
+                      </div>
                     </li>
                   );
                 })}

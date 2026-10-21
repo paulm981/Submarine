@@ -100,8 +100,13 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     // The usual port of the new kind, unless another was typed.
     const usual: Record<string, number> = { ssh: 22, rdp: 3389, telnet: 23, vnc: 5900 };
     const port = !newNode.port || Object.values(usual).includes(newNode.port) ? usual[protocol] : newNode.port;
-    const authType = protocol !== "ssh" && newNode.authType === "custom_key" ? "custom_pass" : newNode.authType;
-    setNewNode({ ...newNode, protocol, port, authType });
+    // No SSH key outside SSH, and no saved login for VNC: VNC sends its
+    // password with weak protection and doesn't check the server's identity,
+    // so a shared login's password would be open to anyone on the path.
+    const dropsLogin = (protocol !== "ssh" && newNode.authType === "custom_key") || (protocol === "vnc" && newNode.authType === "vault");
+    const authType = dropsLogin ? "custom_pass" : newNode.authType;
+    const credentialId = protocol === "vnc" ? "" : newNode.credentialId;
+    setNewNode({ ...newNode, protocol, port, authType, credentialId });
   };
   const [newFolderName, setNewFolderName] = useState("");
   // Set while the native key picker is open so the Browse button can't be
@@ -627,7 +632,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 value={newNode.authType}
                 onChange={(e) => setNewNode({ ...newNode, authType: e.target.value })}
               >
-                <option value="vault" className="bg-[#121215] text-primary">Use a saved login</option>
+                {!isVnc && <option value="vault" className="bg-[#121215] text-primary">Use a saved login</option>}
                 <option value="custom_pass" className="bg-[#121215] text-primary">{isRdp ? "Type a user name" : "Type a password"}</option>
                 {isSsh && <option value="custom_key" className="bg-[#121215] text-primary">Use an SSH key</option>}
               </select>
@@ -1167,7 +1172,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
             {/* On-connect commands — auto-typed into the FIRST terminal once
                 its shell is up, on connecting and again after a reconnect
                 (not on extra shells you open later). One command per line. */}
-            {isSsh && (<>
+            {isSsh && (
             <div className="space-y-1.5 pt-1">
               <label className="text-[11px] font-bold text-zinc-400 ml-1 flex items-center gap-2">
                 <span>Run on connect</span>
@@ -1184,7 +1189,11 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 className="w-full bg-[#1a1a1e] rounded-lg p-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner font-mono leading-relaxed resize-y"
               />
             </div>
+            )}
 
+            {/* A telnet server's tab is a terminal too, so it takes its own
+                colors and highlighting like an SSH server's. */}
+            {(isSsh || isTelnet) && (<>
             {/* Its own terminal colors (synced with the server), e.g. a light
                 scheme for production so it's never mistaken for the rest. */}
             <div className="space-y-1.5 pt-1">
