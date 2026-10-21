@@ -11005,6 +11005,12 @@ async fn connect_jump_chain(
 /// under the target's `session_id`, keyed by a distinct nonce), and it supports
 /// the full key → password → keyboard-interactive auth ladder.
 #[allow(clippy::too_many_arguments)]
+/// How long a jump host's login may take, prompts included (connect_jump_host).
+const JUMP_LOGIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// How long a jump host may take to open the channel to the server behind it,
+/// as for telnet through an SSH server.
+const JUMP_CHANNEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 async fn connect_jump_host(
     app: &tauri::AppHandle,
     db: &std::sync::Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
@@ -11247,52 +11253,69 @@ async fn connect_jump_host(
     // For a jump host that asks for the password through keyboard-interactive
     // (#145).
     let kbi_password = password.clone().map(Zeroizing::new);
-    let mut auth_res = if login_cancelled {
-        Ok(false)
-    } else if let Some((private_key, passphrase, key_name)) = key_data {
-        log("Jump host: private key authentication...", "info");
-        let key_label = key_name
-            .filter(|n| !n.trim().is_empty())
-            .unwrap_or_else(|| format!("{}@{}", effective_user.as_str(), host));
-        authenticate_key_prompting(
-            &mut session,
-            &effective_user,
-            &private_key,
-            &key_label,
-            passphrase.map(Zeroizing::new),
-            SecretSlot::JumpPassphrase,
-            &prompt_ctx,
-        )
-        .await
-    } else {
-        log("Jump host: password authentication...", "info");
-        authenticate_password_prompting(
-            &mut session,
-            &effective_user,
-            &host,
-            None,
-            password.map(Zeroizing::new),
-            SecretSlot::JumpPassword,
-            &prompt_ctx,
-        )
-        .await
-    };
+    // The whole login has a deadline, as the monitor's has: a jump host that
+    // took the connection and stops answering would otherwise hold this
+    // attempt, and its turn in the jump host's login queue, for good. It's
+    // long enough for the prompts in it (90 s for a key's passphrase, 120 s
+    // for a code) to be answered one after another.
+    let ladder = async {
+        let mut auth_res = if login_cancelled {
+            Ok(false)
+        } else if let Some((private_key, passphrase, key_name)) = key_data {
+            log("Jump host: private key authentication...", "info");
+            let key_label = key_name
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| format!("{}@{}", effective_user.as_str(), host));
+            authenticate_key_prompting(
+                &mut session,
+                &effective_user,
+                &private_key,
+                &key_label,
+                passphrase.map(Zeroizing::new),
+                SecretSlot::JumpPassphrase,
+                &prompt_ctx,
+            )
+            .await
+        } else {
+            log("Jump host: password authentication...", "info");
+            authenticate_password_prompting(
+                &mut session,
+                &effective_user,
+                &host,
+                None,
+                password.map(Zeroizing::new),
+                SecretSlot::JumpPassword,
+                &prompt_ctx,
+            )
+            .await
+        };
 
-    // A declined prompt ends the hop — don't fall back to asking again. Nor
-    // after an agent signature failed: the session can't run anything else.
-    if !matches!(auth_res, Ok(true))
-        && !prompt_ctx.cancelled.load(std::sync::atomic::Ordering::Relaxed)
-        && !prompt_ctx.session_unusable.load(std::sync::atomic::Ordering::Relaxed)
-    {
-        if let Some(kbi_res) =
-            run_keyboard_interactive(&mut session, &effective_user, app, session_id, &jump_nonce, kbi_txs, attempt, kbi_password.as_ref().map(|p| p.as_str())).await
+        // A declined prompt ends the hop — don't fall back to asking again. Nor
+        // after an agent signature failed: the session can't run anything else.
+        if !matches!(auth_res, Ok(true))
+            && !prompt_ctx.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+            && !prompt_ctx.session_unusable.load(std::sync::atomic::Ordering::Relaxed)
         {
-            auth_res = kbi_res;
+            if let Some(kbi_res) =
+                run_keyboard_interactive(&mut session, &effective_user, app, session_id, &jump_nonce, kbi_txs, attempt, kbi_password.as_ref().map(|p| p.as_str())).await
+            {
+                auth_res = kbi_res;
+            }
         }
-    }
+        auth_res
+    };
+    let ladder_res = tokio::time::timeout(JUMP_LOGIN_DEADLINE, ladder).await;
     release_agent(&prompt_ctx).await;
     // Belt-and-suspenders: no dangling interactive sender for this hop.
     kbi_txs.lock().await.remove(&jump_nonce);
+    let Ok(auth_res) = ladder_res else {
+        return Err(network_error(format!(
+            "jump host {}:{} didn't finish the login within {} minutes",
+            host,
+            port,
+            JUMP_LOGIN_DEADLINE.as_secs() / 60
+        )));
+    };
 
     if user_prompted && matches!(auth_res, Ok(true)) {
         cache_store_secret(cache, &base_id, SecretSlot::JumpUsername, effective_user.clone()).await;
@@ -11994,9 +12017,12 @@ async fn initiate_connection(
                 Ok(jump_handle) => {
                     // Originator address is cosmetic (logged by the bastion); the
                     // pair below is what OpenSSH sends for a -J hop.
-                    match jump_handle
-                        .channel_open_direct_tcpip(host.clone(), port as u32, "127.0.0.1", 0)
-                        .await
+                    match tokio::time::timeout(
+                        JUMP_CHANNEL_TIMEOUT,
+                        jump_handle.channel_open_direct_tcpip(host.clone(), port as u32, "127.0.0.1", 0),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(russh::Error::ConnectionTimeout))
                     {
                         Ok(channel) => {
                             emit_log(&format!("ProxyJump: opened tunnel to {}:{} through the jump host.", host, port), "success");
