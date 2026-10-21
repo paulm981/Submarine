@@ -14,7 +14,7 @@
 //!   same host, port and user, or saved as a new one with its key, and every
 //!   host behind it is linked to it. Submarine jumps through one host only,
 //!   so a chain of several is reported and left for the user;
-//! - an RDP session becomes a Remote Desktop link (rdp.rs) in its folder;
+//! - an RDP session becomes a Remote Desktop link (rdp_links.rs) in its folder;
 //! - a server already saved with the same name, host, port and folder is
 //!   left alone, so importing the same file twice adds nothing.
 
@@ -48,7 +48,7 @@ pub(crate) struct ImportReport {
     pub jump_linked: usize,
     /// Hosts whose jump chain has more than one hop: imported without one.
     pub multi_hop: Vec<String>,
-    /// Remote Desktop sessions added as RDP links (rdp.rs).
+    /// Remote Desktop sessions added as RDP links (rdp_links.rs).
     pub rdp_added: usize,
     /// Remote Desktop sessions left out, with why ("name: reason").
     pub rdp_skipped: Vec<String>,
@@ -226,7 +226,7 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
             }
             // A saved-login name says nothing about the Windows user; leave
             // it for Remote Desktop to ask (and remember).
-            let link = crate::rdp::RdpLink {
+            let link = crate::rdp_links::RdpLink {
                 id: None,
                 name: name.to_string(),
                 host: host.to_string(),
@@ -237,11 +237,11 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
             };
             // A host Remote Desktop can't take is reported; a database
             // error still fails the import.
-            if let Err(why) = crate::rdp::validate(&link) {
+            if let Err(why) = crate::rdp_links::validate(&link) {
                 report.rdp_skipped.push(format!("{}: {}", name, why));
                 continue;
             }
-            crate::rdp::save(conn, &link)?;
+            crate::rdp_links::save(conn, &link)?;
             report.rdp_added += 1;
             continue;
         }
@@ -434,7 +434,7 @@ mod tests {
              INSERT INTO ssh_keys(name, private_key) VALUES ('id_jump', 'k1'), ('own', 'k2');",
         )
         .unwrap();
-        conn.execute_batch(crate::rdp::SCHEMA).unwrap();
+        conn.execute_batch(crate::rdp_links::SCHEMA).unwrap();
         conn
     }
 
@@ -457,7 +457,7 @@ mod tests {
         let r = import_rows(&conn, std::slice::from_ref(&rdp)).unwrap();
         assert_eq!((r.rdp_added, r.added), (1, 0));
         assert!(r.logins_created.is_empty(), "no Login for an RDP session");
-        let links = crate::rdp::list(&conn).unwrap();
+        let links = crate::rdp_links::list(&conn).unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!((links[0].name.as_str(), links[0].host.as_str(), links[0].port, links[0].username.as_str()), ("desk (GUI)", "desk.example", 3389, ""));
         let folder: String = conn.query_row("SELECT name FROM folders WHERE id = ?1", [links[0].folder_id.unwrap()], |r| r.get(0)).unwrap();

@@ -29,7 +29,7 @@ mod webkit_sandbox;
 mod sftp_remove;
 mod local_open;
 mod host_import;
-mod rdp;
+mod rdp_links;
 mod highlight;
 mod server_os;
 mod local_term;
@@ -851,7 +851,7 @@ const ENTITIES: &[EntitySpec] = &[
             Fk { key: "jump_uuid", col: "jump_host_id", ref_table: "servers", required: false },
         ],
     },
-    // Remote Desktop links (rdp.rs); after `folders`, which they sit in.
+    // Remote Desktop links (rdp_links.rs); after `folders`, which they sit in.
     EntitySpec {
         table: "rdp_links",
         cols: &["name", "host", "port", "username", "notes", "edited_by"],
@@ -1173,7 +1173,7 @@ fn apply_remote_inner(
             eprintln!("[SYNC] fk fixup skipped {}.{} uuid={}: {}", f.table, f.fk_col, f.uuid, e);
         }
     }
-    // A Remote Desktop link's folder has no foreign key (rdp.rs), so a folder
+    // A Remote Desktop link's folder has no foreign key (rdp_links.rs), so a folder
     // this batch deleted can leave a link pointing at nothing: one this device
     // made in it since it last synced. It goes to the top level, not nowhere.
     tx.execute(
@@ -5560,11 +5560,11 @@ async fn setup_master_db_inner(
         ).map_err(|e| format!("[DATABASE] SCHEMA_CREATION_FAILED: {}", e))?;
     }
 
-    // Remote Desktop links (rdp.rs), for existing and fresh vaults alike: one
+    // Remote Desktop links (rdp_links.rs), for existing and fresh vaults alike: one
     // `CREATE TABLE IF NOT EXISTS` here instead of a copy in each branch
     // above, which is how a fresh vault once went without it. Additive, like
     // run_on_connect: an older build simply doesn't see it.
-    conn.execute(rdp::SCHEMA, []).map_err(|e| format!("[DATABASE] RDP_TABLE_FAILED: {}", e))?;
+    conn.execute(rdp_links::SCHEMA, []).map_err(|e| format!("[DATABASE] RDP_TABLE_FAILED: {}", e))?;
     // Its sync columns came later (links sync like servers do); links made
     // before them get their ids from the backfill below.
     for stmt in [
@@ -17695,7 +17695,7 @@ struct ImportedHost {
     #[serde(default)]
     jump_credential: Option<String>,
     /// A Remote Desktop session (MobaXterm's RDP): imported as an RDP link
-    /// (rdp.rs), not a server.
+    /// (rdp_links.rs), not a server.
     #[serde(default)]
     rdp: bool,
 }
@@ -20324,7 +20324,7 @@ pub fn run() {
             about::app_info, about::check_for_updates, about::open_external_url,
             portable::get_storage_info,
             local_open::live_edit_editor_get, local_open::live_edit_editor_pick, local_open::live_edit_editor_reset,
-            rdp::rdp_list, rdp::rdp_save, rdp::rdp_delete, rdp::rdp_open,
+            rdp_links::rdp_list, rdp_links::rdp_save, rdp_links::rdp_delete, rdp_links::rdp_open,
             multiexec::wall_list, multiexec::wall_save, multiexec::wall_delete,
             multiexec::get_jump_login_limit, multiexec::set_jump_login_limit,
             server_os::detect_server_os,

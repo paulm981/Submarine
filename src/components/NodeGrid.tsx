@@ -89,7 +89,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
   const allFolders: FolderRow[] = folders || [];
   const folderIndex = useMemo(() => indexFolders(allFolders), [folders]);
   const serverCounts = useMemo(() => subtreeCounts(folderIndex, (servers || []).map((s: any) => s.folder_id)), [folderIndex, servers]);
-  // Remote Desktop links open a desktop client (rdp.rs), which Android has
+  // Remote Desktop links open a desktop client (rdp_links.rs), which Android has
   // no counterpart for here: links that came with a profile stay hidden
   // there rather than show and fail.
   const shownRdp: RdpLink[] = IS_ANDROID ? [] : (rdpLinks || []);

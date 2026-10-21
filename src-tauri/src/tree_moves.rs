@@ -226,7 +226,7 @@ mod tests {
              INSERT INTO servers VALUES (10, 'web1', 1, 0), (11, 'web2', 1, 1), (12, 'db1', 2, 0), (13, 'tool', NULL, 0);",
         )
         .unwrap();
-        conn.execute_batch(crate::rdp::SCHEMA).unwrap();
+        conn.execute_batch(crate::rdp_links::SCHEMA).unwrap();
         conn.execute("INSERT INTO rdp_links (id, name, host, port, username, folder_id, notes) VALUES (20, 'desk', 'desk.example', 3389, '', 1, '')", [])
             .unwrap();
         conn

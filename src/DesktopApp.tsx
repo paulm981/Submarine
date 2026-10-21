@@ -284,7 +284,7 @@ function DesktopApp() {
   const [credentials, setCredentials] = useState<any[]>([]);
   const [sshKeys, setSshKeys] = useState<any[]>([]);
   const [folders, setFolders] = useState<any[]>([]);
-  // Remote Desktop links (src-tauri/src/rdp.rs): shown with the servers, open
+  // Remote Desktop links (src-tauri/src/rdp_links.rs): shown with the servers, open
   // the system's Remote Desktop client.
   const [rdpLinks, setRdpLinks] = useState<RdpLink[]>([]);
   // The servers asked for their OS this run, by server, host and port (the
