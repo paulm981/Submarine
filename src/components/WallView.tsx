@@ -12,6 +12,7 @@ import { useConfirm } from "../ui/confirm";
 import { sessionDot } from "../util/sessionStatus";
 import { IS_LINUX } from "../util/platform";
 import { readClipboardText } from "../util/clipboard";
+import { withoutPasteControls } from "../util/pasteText";
 import { rangePick } from "../util/rangePick";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -241,7 +242,10 @@ export const WallView = ({
   // modern shells). Anything with a line break runs something, so it asks.
   // It goes only to the servers the confirm named (those still taking input
   // when it's answered), and not at all if Broadcast went off meanwhile.
-  const pasteToAll = useCallback(async (text: string) => {
+  const pasteToAll = useCallback(async (raw: string) => {
+    // No escape sequence or other control character gets through (pasteText.ts).
+    const text = withoutPasteControls(raw);
+    const cleaned = text !== raw;
     if (!text || !wallRef.current.broadcast) return;
     const first = lineTargets();
     if (first.length === 0) {
@@ -262,7 +266,10 @@ export const WallView = ({
     const sent = lineTargets().filter((e) => named.has(e.terminalId) && e.paste(text));
     const n = sent.length;
     afterTyping(text.replace(/\r\n?/g, "\n"), sent, true);
-    flash(n === named.size ? `Pasted into ${plural(n, "server")}.` : `Pasted into ${n} of ${plural(named.size, "server")} — the rest stopped taking input.`);
+    flash(
+      (n === named.size ? `Pasted into ${plural(n, "server")}.` : `Pasted into ${n} of ${plural(named.size, "server")} — the rest stopped taking input.`) +
+        (cleaned ? " Control characters were left out." : ""),
+    );
   }, [confirm, focusGhost, lineTargets, afterTyping]);
   const pasteToAllRef = useRef(pasteToAll);
   pasteToAllRef.current = pasteToAll;
