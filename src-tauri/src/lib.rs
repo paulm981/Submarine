@@ -6732,6 +6732,15 @@ async fn clone_server(state: tauri::State<'_, DbState>, id: i32) -> Result<i64, 
         "UPDATE servers SET position = COALESCE((SELECT MAX(position) FROM servers s2 WHERE s2.id != servers.id AND s2.folder_id IS servers.folder_id), -1) + 1 WHERE id = ?1",
         rusqlite::params![new_id],
     );
+    // What the original wasn't allowed to run yet (a shared profile's held
+    // commands and forwards) stays held on the copy, so duplicating isn't a
+    // way around the approval. See approvals::copy_held.
+    // The copy is taken out again when that fails: a duplicate that came
+    // without its held entries would run what the original couldn't.
+    if let Err(e) = approvals::copy_held(conn, id as i64, new_id) {
+        let _ = conn.execute("DELETE FROM servers WHERE id = ?1", rusqlite::params![new_id]);
+        return Err(e);
+    }
     drop(conn_guard);
     save_vault_internal(&state)?;
     Ok(new_id)
@@ -9449,6 +9458,7 @@ enum ConnectTimeout {
 async fn drive_connect_with_prompt_timeout<F, T>(
     connect_future: F,
     prompt_pending: &std::sync::atomic::AtomicBool,
+    prompt_epoch: &std::sync::atomic::AtomicU32,
     caps: ConnectTimeoutCaps,
 ) -> Result<T, ConnectTimeout>
 where
@@ -9462,6 +9472,11 @@ where
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await; // the first tick is immediate — consume it
     let mut prompt_seen = false;
+    // A session that took over a prompt another one let go starts its own 90s
+    // window: the hard cap then counts from there (as if the handshake cap had
+    // just ended), not from the connect's start.
+    let mut epoch = prompt_epoch.load(Ordering::SeqCst);
+    let mut window_start = start;
     loop {
         tokio::select! {
             // Biased: always prefer a resolved handshake over a tick, so a
@@ -9471,7 +9486,14 @@ where
             out = &mut connect_future => return Ok(out),
             _ = ticker.tick() => {
                 prompt_seen |= prompt_pending.load(Ordering::SeqCst);
-                match connect_deadline_elapsed(prompt_seen, start.elapsed(), caps) {
+                let now_epoch = prompt_epoch.load(Ordering::SeqCst);
+                if now_epoch != epoch {
+                    epoch = now_epoch;
+                    if let Some(t) = tokio::time::Instant::now().checked_sub(caps.handshake) {
+                        window_start = t;
+                    }
+                }
+                match connect_deadline_elapsed(prompt_seen, window_start.elapsed(), caps) {
                     ConnectDeadline::Continue => {}
                     ConnectDeadline::HandshakeStall => return Err(ConnectTimeout::HandshakeStall),
                     ConnectDeadline::PromptHardCap => return Err(ConnectTimeout::PromptHardCap),
@@ -9491,6 +9513,27 @@ mod connect_timeout_tests {
         handshake: Duration::from_secs(15),
         hard: Duration::from_secs(110),
     };
+
+    // A session that waited on another's prompt and then asks itself gets its
+    // own full window, not what is left of the connect's first 110s.
+    #[tokio::test]
+    async fn a_prompt_taken_over_gets_a_fresh_window() {
+        use super::{drive_connect_with_prompt_timeout, ConnectTimeout};
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let caps = ConnectTimeoutCaps { handshake: Duration::from_millis(100), hard: Duration::from_millis(500) };
+        let pending = AtomicBool::new(true);
+        let epoch = AtomicU32::new(0);
+        let start = std::time::Instant::now();
+        let bump = async {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            epoch.fetch_add(1, Ordering::SeqCst);
+        };
+        let driven = drive_connect_with_prompt_timeout(std::future::pending::<()>(), &pending, &epoch, caps);
+        let (res, _) = tokio::join!(driven, bump);
+        assert!(matches!(res, Err(ConnectTimeout::PromptHardCap)));
+        // Counted from the takeover (350ms) plus the window (400ms), not from the start.
+        assert!(start.elapsed() >= Duration::from_millis(700), "cut short after {:?}", start.elapsed());
+    }
 
     #[test]
     fn no_prompt_holds_the_handshake_cap() {
@@ -9927,6 +9970,8 @@ async fn connect_jump_host(
     // first-time key prompt on the bastion — see the direct path's rationale.
     let prompt_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let prompt_pending_for_driver = std::sync::Arc::clone(&prompt_pending);
+    let prompt_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let prompt_epoch_for_driver = std::sync::Arc::clone(&prompt_epoch);
 
     let handler = ssh_manager::ClientHandler {
         app: app.clone(),
@@ -9939,6 +9984,7 @@ async fn connect_jump_host(
         forwarded_targets: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         fp_outcome,
         prompt_pending,
+        prompt_epoch,
         // Dedicated `::sftp` / `::fwd` connections carry a `::` suffix and
         // have no prompt of their own (see ClientHandler::prompt_allowed).
         prompt_allowed: !session_id.contains("::"),
@@ -9959,6 +10005,7 @@ async fn connect_jump_host(
         r = drive_connect_with_prompt_timeout(
             russh::client::connect_stream(config, transport, handler),
             &prompt_pending_for_driver,
+            &prompt_epoch_for_driver,
             if proxy_watch.is_some() { PROXY_COMMAND_TIMEOUT_CAPS } else { CONNECT_TIMEOUT_CAPS },
         ) => r,
         _ = attempt.superseded() => {
@@ -10525,6 +10572,8 @@ async fn initiate_connection(
     // to cover the human approval window instead of killing the prompt.
     let prompt_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let prompt_pending_for_driver = std::sync::Arc::clone(&prompt_pending);
+    let prompt_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let prompt_epoch_for_driver = std::sync::Arc::clone(&prompt_epoch);
     // Stamped by the handler whenever the server sends something; read by the
     // session watcher below.
     let last_heard = ssh_manager::LastHeard::default();
@@ -10543,6 +10592,7 @@ async fn initiate_connection(
         forwarded_targets: Arc::clone(&session_forwarded_targets),
         fp_outcome: std::sync::Arc::clone(&fp_outcome),
         prompt_pending: std::sync::Arc::clone(&prompt_pending),
+        prompt_epoch,
         prompt_allowed: !is_secondary,
         attempt: attempt.clone(),
         last_heard: last_heard.clone(),
@@ -10878,7 +10928,7 @@ async fn initiate_connection(
         // Dropping the handshake drops its transport, which stops a
         // ProxyCommand that would otherwise run until the timeout.
         let connect_res = tokio::select! {
-            r = drive_connect_with_prompt_timeout(connect_future, &prompt_pending_for_driver, caps) => r,
+            r = drive_connect_with_prompt_timeout(connect_future, &prompt_pending_for_driver, &prompt_epoch_for_driver, caps) => r,
             _ = attempt.superseded() => {
                 attempt.abandon();
                 println!("[LOG-{}] Connection attempt cancelled during the handshake.", session_id_clone);
@@ -15851,6 +15901,15 @@ async fn sftp_upload_file(
 
     emit_progress(0, "progress", None);
 
+    // Another upload to this same remote file would interleave with ours, so
+    // wait for it to finish first (the card shows 0% meanwhile). What the file
+    // looks like is asked again: the upload ahead may have just created it.
+    let Some(_write_turn) = remote_write_locks().acquire(&session_id, &remote_path, &cancel).await else {
+        emit_progress(0, "cancelled", None);
+        return Err("cancelled".into());
+    };
+    let existed = sftp.metadata(&remote_path).await.is_ok();
+
     // Stream the file from disk in chunks rather than slurping the whole thing
     // into a Vec — keeps memory bounded for multi-GB transfers and lets us
     // emit progress along the way.
@@ -15902,6 +15961,52 @@ async fn sftp_upload_file(
         .map_err(|e| { emit_progress(transferred, "error", Some(e.to_string())); format!("Failed to close remote file: {}", e) })?;
     emit_progress(transferred, "done", None);
     Ok(())
+}
+
+/// Remote files an upload is writing right now, one lock per (session, path).
+/// Two uploads to the same remote file would interleave their writes and leave
+/// a mix of both, so the second one waits here until the first has closed the
+/// file (it then overwrites it whole, as it would have a moment later anyway).
+#[derive(Default)]
+struct RemoteWriteLocks {
+    map: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl RemoteWriteLocks {
+    /// The lock for this file. Entries nobody holds or waits on any more are
+    /// dropped here, so the map doesn't grow with every file ever uploaded.
+    fn lock_for(&self, session_id: &str, remote_path: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, l| Arc::strong_count(l) > 1);
+        Arc::clone(map.entry(format!("{session_id}\0{remote_path}")).or_default())
+    }
+
+    /// Wait for the file's turn. Gives up with `None` if the user cancels
+    /// while it is queued, so a stuck first upload can't trap the second.
+    async fn acquire(
+        &self,
+        session_id: &str,
+        remote_path: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let lock = self.lock_for(session_id, remote_path);
+        let acquire = lock.lock_owned();
+        tokio::pin!(acquire);
+        loop {
+            tokio::select! {
+                guard = &mut acquire => return Some(guard),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+                }
+            }
+        }
+    }
+}
+
+static REMOTE_WRITE_LOCKS: std::sync::OnceLock<RemoteWriteLocks> = std::sync::OnceLock::new();
+
+fn remote_write_locks() -> &'static RemoteWriteLocks {
+    REMOTE_WRITE_LOCKS.get_or_init(RemoteWriteLocks::default)
 }
 
 /// Open an upload's remote file for writing, and tell whether this upload
@@ -16140,6 +16245,11 @@ async fn sftp_upload_dir(
         // EXCL alone tells a file this upload created. A cancel deletes only
         // the file it was writing; files already sent and the folders made
         // for them stay.
+        // Wait if another upload is writing this same remote file.
+        let Some(_write_turn) = remote_write_locks().acquire(&session_id, &remote_full, &cancel).await else {
+            emit_progress(transferred, total_bytes, "cancelled", None);
+            return Err("cancelled".into());
+        };
         let (mut remote_file, created) = match open_upload_target(&sftp, &remote_full, false).await {
             Ok(opened) => opened,
             Err(e) => {
@@ -19906,5 +20016,47 @@ mod tests {
         assert_eq!(skipped_names_note(0), None);
         assert!(skipped_names_note(1).unwrap().starts_with("1 item skipped"));
         assert!(skipped_names_note(7).unwrap().starts_with("7 items skipped"));
+    }
+}
+
+#[cfg(test)]
+mod remote_write_lock_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[tokio::test]
+    async fn second_upload_to_the_same_file_waits_for_the_first() {
+        let locks = RemoteWriteLocks::default();
+        let no_cancel = AtomicBool::new(false);
+        let first = locks.acquire("s1", "/srv/a", &no_cancel).await.unwrap();
+        // Same file: has to wait. A different file or session goes straight in.
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            locks.acquire("s1", "/srv/a", &no_cancel),
+        )
+        .await;
+        assert!(waited.is_err());
+        assert!(locks.acquire("s1", "/srv/b", &no_cancel).await.is_some());
+        assert!(locks.acquire("s2", "/srv/a", &no_cancel).await.is_some());
+        drop(first);
+        assert!(locks.acquire("s1", "/srv/a", &no_cancel).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_frees_a_queued_upload() {
+        let locks = RemoteWriteLocks::default();
+        let no_cancel = AtomicBool::new(false);
+        let _first = locks.acquire("s1", "/srv/a", &no_cancel).await.unwrap();
+        let cancel = AtomicBool::new(true);
+        assert!(locks.acquire("s1", "/srv/a", &cancel).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn finished_files_are_forgotten() {
+        let locks = RemoteWriteLocks::default();
+        let no_cancel = AtomicBool::new(false);
+        drop(locks.acquire("s1", "/srv/a", &no_cancel).await);
+        drop(locks.acquire("s1", "/srv/b", &no_cancel).await);
+        assert_eq!(locks.map.lock().unwrap().len(), 1);
     }
 }

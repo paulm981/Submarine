@@ -7,6 +7,16 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - Sections called **From the original project** list what came in from [SinaXhpm/Submarine](https://github.com/SinaXhpm/submarine), with that project's pull request numbers.
 - [FORK.md](FORK.md) explains what the fork does differently, and which of the original project's changes it hasn't taken yet.
 
+## v0.3.8-fork.4
+
+- **Two uploads to the same file no longer corrupt it** ([#45](https://github.com/paulm981/Submarine/issues/45)). An upload to a server file that another upload is still writing waits for the first to finish, at 0% until its turn. Cancel still stops it while it waits.
+- **Small fixes** ([#53](https://github.com/paulm981/Submarine/issues/53)):
+  - A server's OS badge no longer shows the old system after you change its port.
+  - The Servers page goes back to the top when the folder you were in is deleted, here or on another computer.
+  - **Save & open** on a saved Wall that is already open adds the servers you just added to it.
+  - When the window asking about a new host key goes away, the other connections waiting on it still get the full 90 seconds to answer.
+  - Duplicating a server in a shared profile no longer lets the copy run on-connect commands or port forwards that were still waiting for your approval on the original. The copy waits for its own approval.
+
 ## v0.3.8-fork.3
 
 - **Pause several terminals on a Wall at once** ([#73](https://github.com/paulm981/Submarine/issues/73)). With Broadcast on, Ctrl-click (⌘-click on a Mac) terminal titles to pick several, or Shift-click for a run of them. The bar then offers **Pause** and **Resume** for the ones picked.
