@@ -379,10 +379,14 @@ pub async fn connect_direct(host: &str, port: u16) -> Result<Box<dyn Duplex>, St
 /// Through the last SSH server of `route`, which is kept with the stream.
 pub async fn connect_through(route: &[russh::client::Handle<ClientHandler>], host: &str, port: u16) -> Result<Box<dyn Duplex>, String> {
     let last = route.last().ok_or("no SSH server to go through")?;
-    let channel = last
-        .channel_open_direct_tcpip(host.trim().to_string(), u32::from(port), "127.0.0.1".to_string(), 0)
-        .await
-        .map_err(|e| format!("The SSH server couldn't reach {}: {e}", address(host, port)))?;
+    // Bounded, like VNC's and RDP's: an SSH server that never answers the
+    // request would keep the tab connecting forever.
+    let open = last.channel_open_direct_tcpip(host.trim().to_string(), u32::from(port), "127.0.0.1".to_string(), 0);
+    let channel = match tokio::time::timeout(std::time::Duration::from_secs(15), open).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(format!("The SSH server couldn't reach {}: {e}", address(host, port))),
+        Err(_) => return Err(format!("The SSH server didn't reach {} within 15 seconds", address(host, port))),
+    };
     Ok(Box::new(channel.into_stream()))
 }
 
