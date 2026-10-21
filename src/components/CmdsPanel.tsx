@@ -1,7 +1,9 @@
 import { Fragment, useState, useEffect, useRef } from "react";
 import { parseCommandScope, scopeMatches, serverScopeIds } from "../util/commandScope";
 import { invoke } from "@tauri-apps/api/core";
-import { markTyped } from "../ui/terminalDock";
+import { dockedTerminal, markTyped } from "../ui/terminalDock";
+import { useConfirm } from "../ui/confirm";
+import { withoutPasteControls } from "../util/pasteText";
 import { Play, RefreshCw, Search, X, Terminal, StickyNote, ClipboardCopy, ChevronDown, ChevronRight, Pencil, Check, Server } from "lucide-react";
 
 // Side panel that opens from a terminal session and surfaces *both* the
@@ -60,6 +62,7 @@ export const CmdsPanel = ({ activeTab, onClose, headerActions, serverId, serverN
   useEffect(() => { nodeDraftRef.current = nodeDraft; }, [nodeDraft]);
 
   const [edit, setEdit] = useState<EditTarget | null>(null);
+  const confirm = useConfirm();
   const [saving, setSaving] = useState(false);
   // Ref mirror of the edit slot so the cleanup logic in tab-switch /
   // refresh / unmount can read the latest draft without re-binding the
@@ -210,10 +213,36 @@ export const CmdsPanel = ({ activeTab, onClose, headerActions, serverId, serverN
   };
 
   // Write `text` into the active PTY. `execute=true` appends a CR so the
-  // shell runs the line immediately; false leaves the cursor at the end so
-  // the user can review / edit before pressing Enter themselves.
-  const writeToTerminal = async (text: string, execute: boolean) => {
+  // shell runs the line immediately; false pastes it the way the terminal's
+  // own paste does, so the user can review / edit before pressing Enter.
+  // Either way no escape sequence or other control character goes in (tab
+  // and line breaks stay): a command or note can come from whoever shares the
+  // profile, and one could end a bracketed paste and run what follows
+  // (pasteText.ts).
+  const writeToTerminal = async (raw: string, execute: boolean) => {
     if (!activeTab) return;
+    const text = withoutPasteControls(raw);
+    if (!text) return;
+    const entry = dockedTerminal(activeTab);
+    if (!execute && entry) {
+      // Bracketed when the program asked for that, so nothing runs by itself.
+      // Without it every line would run as it lands: say so first, as the
+      // terminal's own paste does.
+      const lines = text.replace(/(\r\n|\r|\n)$/, "").split(/\r\n|\r|\n/);
+      if (lines.length > 1 && !entry.term.modes.bracketedPasteMode) {
+        const preview = lines.slice(0, 4).map((l) => (l.length > 70 ? `${l.slice(0, 70)}…` : l)).join("\n");
+        const ok = await confirm({
+          title: `Paste ${lines.length} lines?`,
+          message: `The program here doesn't take a paste as one block, so each line runs as soon as it lands:\n\n${preview}${lines.length > 4 ? `\n… and ${lines.length - 4} more` : ""}`,
+          okLabel: "Paste",
+          safeDefault: true,
+        });
+        if (!ok) return;
+      }
+      markTyped(activeTab);
+      entry.paste(text);
+      return;
+    }
     try {
       const payload = execute
         ? (text.endsWith("\n") || text.endsWith("\r") ? text : text + "\r")
