@@ -38,6 +38,10 @@ export function AuthPrompts({
       // A key trusted before under another type counts as a changed key
       // too (judge_host_key), so it arrives as a mismatch.
       const isMismatch = !!fingerprintPrompt.mismatch;
+      // An RDP server proves itself with a certificate, an SSH server with a key.
+      const isCert = fingerprintPrompt.keyType === "RDP certificate";
+      const what = isCert ? "certificate" : "key";
+      // The port too when it isn't SSH's usual one.
       const hostLabel = fingerprintPrompt.port && fingerprintPrompt.port !== 22
         ? `${fingerprintPrompt.host}:${fingerprintPrompt.port}`
         : fingerprintPrompt.host;
@@ -51,14 +55,14 @@ export function AuthPrompts({
       return (
       <div className={`mt-6 p-4 border ${tone} rounded-xl animate-in fade-in slide-in-from-bottom-4`}>
         <div className="flex items-start gap-3">
-          <ShieldAlert className={`${accent} mt-1`} size={20} />
-          <div>
+          <ShieldAlert className={`${accent} mt-1 shrink-0`} size={20} />
+          <div className="flex-1 min-w-0">
             <h3 className={`text-sm font-bold ${accent} uppercase tracking-widest`}>
-              {isMismatch ? "Host key has CHANGED" : "Unknown host fingerprint"}
+              {isMismatch ? (isCert ? "Certificate has CHANGED" : "Host key has CHANGED") : "Unknown host fingerprint"}
             </h3>
             {isMismatch ? (
               <p className="text-zinc-300 mt-2 mb-4 leading-relaxed">
-                The host '{hostLabel}' is presenting a different key than the one you trusted before. This is what a man-in-the-middle attack looks like — but it can also mean the server admin rotated the key.<br/><br/>
+                The host '{hostLabel}' is presenting a different {what} than the one you trusted before. This is what a man-in-the-middle attack looks like — but it can also mean the server admin {isCert ? "renewed the certificate" : "rotated the key"}.<br/><br/>
                 New {fingerprintPrompt.keyType} fingerprint: <span className="text-white font-bold break-all">{fingerprintPrompt.fingerprint}</span><br/>
                 {Array.isArray(fingerprintPrompt.priorFingerprints) && fingerprintPrompt.priorFingerprints.length > 0 && (
                   <span className="block mt-1 text-zinc-500 text-[11px]">
@@ -70,20 +74,22 @@ export function AuthPrompts({
             ) : (
               <p className="text-zinc-400 mt-2 mb-4 leading-relaxed">
                 The authenticity of host '{hostLabel}' can't be established.<br/>
-                {fingerprintPrompt.keyType} key fingerprint is <span className="text-white font-bold break-all">{fingerprintPrompt.fingerprint}</span>.<br/>
+                {fingerprintPrompt.keyType}{isCert ? "" : " key"} fingerprint is <span className="text-white font-bold break-all">{fingerprintPrompt.fingerprint}</span>.<br/>
                 Are you sure you want to continue connecting?
               </p>
             )}
-            <div className="flex gap-3">
+            {/* On a phone the two share the row, or each takes a full row
+                when they don't fit — never a label broken over two lines. */}
+            <div className="flex flex-wrap gap-2 sm:gap-3">
               <button
                 onClick={() => handleFingerprintResponse(true)}
-                className={`px-6 py-2 ${acceptBtn} font-bold text-xs uppercase tracking-wider rounded-lg transition-colors flex items-center gap-2`}
+                className={`flex-1 sm:flex-none px-4 sm:px-6 py-2 ${acceptBtn} font-bold text-xs uppercase tracking-wider whitespace-nowrap rounded-lg transition-colors flex items-center justify-center gap-2`}
               >
-                <Check size={14} /> {isMismatch ? "Accept new key" : "Accept & save"}
+                <Check size={14} /> {isMismatch ? `Accept new ${what}` : "Accept & save"}
               </button>
               <button
                 onClick={() => handleFingerprintResponse(false)}
-                className="px-6 py-2 bg-white/5 text-zinc-300 font-bold text-xs uppercase tracking-wider rounded-lg hover:bg-white/10 transition-colors flex items-center gap-2"
+                className="flex-1 sm:flex-none px-4 sm:px-6 py-2 bg-white/5 text-zinc-300 font-bold text-xs uppercase tracking-wider whitespace-nowrap rounded-lg hover:bg-white/10 transition-colors flex items-center justify-center gap-2"
               >
                 <X size={14} /> {isMismatch ? "Abort" : "Reject"}
               </button>
@@ -102,7 +108,7 @@ export function AuthPrompts({
     {kbiPrompt && (
       <div className="mt-6 p-4 border border-primary/30 bg-primary/5 rounded-xl animate-in fade-in slide-in-from-bottom-4">
         <div className="flex items-start gap-3">
-          <KeyRound className="text-primary mt-1" size={20} />
+          <KeyRound className="text-primary mt-1 shrink-0" size={20} />
           <div className="flex-1 min-w-0">
             <h3 className="text-sm font-bold text-primary uppercase tracking-widest">
               {kbiPrompt.name && String(kbiPrompt.name).trim() ? kbiPrompt.name : "Verification required"}
@@ -145,16 +151,16 @@ export function AuthPrompts({
                 </div>
               ))}
             </div>
-            <div className="flex gap-3 mt-4">
+            <div className="flex flex-wrap gap-2 sm:gap-3 mt-4">
               <button
                 onClick={handleKbiSubmit}
-                className="px-6 py-2 bg-primary text-black font-bold text-xs uppercase tracking-wider rounded-lg hover:bg-primary/80 transition-colors flex items-center gap-2"
+                className="flex-1 sm:flex-none px-4 sm:px-6 py-2 bg-primary text-black font-bold text-xs uppercase tracking-wider whitespace-nowrap rounded-lg hover:bg-primary/80 transition-colors flex items-center justify-center gap-2"
               >
                 <Check size={14} /> Submit
               </button>
               <button
                 onClick={handleKbiCancel}
-                className="px-6 py-2 bg-white/5 text-zinc-300 font-bold text-xs uppercase tracking-wider rounded-lg hover:bg-white/10 transition-colors flex items-center gap-2"
+                className="flex-1 sm:flex-none px-4 sm:px-6 py-2 bg-white/5 text-zinc-300 font-bold text-xs uppercase tracking-wider whitespace-nowrap rounded-lg hover:bg-white/10 transition-colors flex items-center justify-center gap-2"
               >
                 <X size={14} /> Cancel
               </button>
