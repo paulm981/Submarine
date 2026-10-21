@@ -2045,13 +2045,13 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
                     <button
                       type="button"
                       onClick={() => fetch(c.path)}
-                      title={c.path}
+                      title={visibleName(c.path)}
                       className="shrink-0 whitespace-nowrap px-0.5 rounded text-zinc-300 hover:text-indigo-200 hover:bg-white/10 focus:outline-none focus-visible:ring-1 focus-visible:ring-indigo-400/60"
                     >
-                      {c.label}
+                      {visibleName(c.label)}
                     </button>
                   ) : (
-                    <span className="shrink-0 whitespace-nowrap px-0.5 text-zinc-100">{c.label}</span>
+                    <span className="shrink-0 whitespace-nowrap px-0.5 text-zinc-100">{visibleName(c.label)}</span>
                   )}
                 </React.Fragment>
               ))}
