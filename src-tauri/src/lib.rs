@@ -15154,6 +15154,7 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
         rx,
         resize_rx,
         output,
+        Vec::new(),
     ));
 
     Ok(())

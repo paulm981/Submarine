@@ -581,13 +581,21 @@ mod pty {
         let end_output = output.clone();
         let (end_app, end_id) = (app.clone(), id.to_string());
         let ai_app = app.clone();
+        // A number past four digits in a control sequence can freeze the
+        // page; it's cut down here as for an SSH terminal (term_filter.rs).
+        let mut limiter = crate::term_filter::CsiLimiter::default();
+        let mut cut: Vec<u8> = Vec::new();
         spawn(
             terms,
             id,
             shell,
             app.path().home_dir().ok(),
             (cols, rows),
-            move |batch| output.push(batch),
+            move |batch: &mut Vec<u8>| {
+                limiter.filter(batch, &mut cut);
+                batch.clear();
+                output.push(&mut cut);
+            },
             move || {
                 // An AI tab's access ends with its tool.
                 if let Some(ai) = ai_app.try_state::<crate::ai::AiState>() {

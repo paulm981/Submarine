@@ -845,10 +845,8 @@ pub async fn open_container_terminal(
     // backpressure.
     let output = crate::term_output::OutputSink::open(&terminal_id, on_output);
     // What the container's shell wrote while the password prompt was
-    // looked for (root_channel) comes first.
-    if !early.is_empty() {
-        output.push(&mut early.clone());
-    }
+    // looked for (root_channel) comes first, through the pump's own filter
+    // (term_filter.rs), so a sequence split across the two is cut down too.
     tauri::async_runtime::spawn(crate::ssh_manager::run_pty_pump(
         app.clone(),
         terminal_id.clone(),
@@ -856,6 +854,7 @@ pub async fn open_container_terminal(
         rx,
         resize_rx,
         output,
+        early,
     ));
 
     Ok(())
