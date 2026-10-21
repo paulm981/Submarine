@@ -196,10 +196,9 @@ async fn latest_release(client: &reqwest::Client, url: &str, current: String) ->
     }
 
     // An empty repo returns `[]` (200), not 404 — handled naturally below.
-    let releases: Vec<GhRelease> = resp
-        .json()
-        .await
-        .map_err(|e| format!("[UPDATE] BAD_JSON: {}", e))?;
+    // The list of releases is a few hundred KB at most; read no more than 8 MB.
+    let bytes = crate::cloud::read_capped(resp, 8 * 1024 * 1024).await.map_err(|e| format!("[UPDATE] {}", e))?;
+    let releases: Vec<GhRelease> = serde_json::from_slice(&bytes).map_err(|e| format!("[UPDATE] BAD_JSON: {}", e))?;
 
     Ok(match newest_release(releases) {
         None => UpdateInfo::none(current),
