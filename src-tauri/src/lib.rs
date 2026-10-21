@@ -51,6 +51,7 @@ mod ai;
 mod rdp;
 mod quick_unlock;
 mod rdp_client;
+mod term_filter;
 #[cfg(target_os = "android")]
 mod android_bridge;
 #[cfg(test)]
