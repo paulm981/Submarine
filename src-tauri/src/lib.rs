@@ -11186,6 +11186,12 @@ async fn connect_jump_chain(
     .map(|handle| vec![handle])
 }
 
+/// How long a jump host's login may take, prompts included (connect_jump_host).
+const JUMP_LOGIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// How long a jump host may take to open the channel to the server behind it,
+/// as for telnet through an SSH server.
+const JUMP_CHANNEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Establish + authenticate an SSH connection to a ProxyJump intermediate
 /// ("bastion") host and return its live `Handle`. The caller opens a
 /// `direct-tcpip` channel over this handle to reach the real target, then keeps
@@ -11198,12 +11204,6 @@ async fn connect_jump_chain(
 /// under the target's `session_id`, keyed by a distinct nonce), and it supports
 /// the full key → password → keyboard-interactive auth ladder.
 #[allow(clippy::too_many_arguments)]
-/// How long a jump host's login may take, prompts included (connect_jump_host).
-const JUMP_LOGIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-/// How long a jump host may take to open the channel to the server behind it,
-/// as for telnet through an SSH server.
-const JUMP_CHANNEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
 async fn connect_jump_host(
     app: &tauri::AppHandle,
     db: &std::sync::Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
