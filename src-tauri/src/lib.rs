@@ -6735,7 +6735,12 @@ async fn clone_server(state: tauri::State<'_, DbState>, id: i32) -> Result<i64, 
     // What the original wasn't allowed to run yet (a shared profile's held
     // commands and forwards) stays held on the copy, so duplicating isn't a
     // way around the approval. See approvals::copy_held.
-    approvals::copy_held(conn, id as i64, new_id)?;
+    // The copy is taken out again when that fails: a duplicate that came
+    // without its held entries would run what the original couldn't.
+    if let Err(e) = approvals::copy_held(conn, id as i64, new_id) {
+        let _ = conn.execute("DELETE FROM servers WHERE id = ?1", rusqlite::params![new_id]);
+        return Err(e);
+    }
     drop(conn_guard);
     save_vault_internal(&state)?;
     Ok(new_id)
