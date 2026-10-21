@@ -429,6 +429,27 @@ pub fn server_uuid(conn: &Connection, server_id: i64) -> Option<String> {
         .flatten()
 }
 
+/// A duplicate of a server starts with what the original had not yet been
+/// allowed to do: its on-connect commands and forwards are copied along with
+/// their held entries, so the copy can't run what the original couldn't.
+/// (Autostart isn't copied at all, and the monitor config isn't either.)
+/// Nothing to do for a server with nothing held, which is every server in a
+/// personal profile.
+pub fn copy_held(conn: &Connection, from_id: i64, to_id: i64) -> Result<(), String> {
+    if !ready(conn) {
+        return Ok(());
+    }
+    let (Some(from), Some(to)) = (server_uuid(conn, from_id), server_uuid(conn, to_id)) else { return Ok(()) };
+    conn.execute(
+        "INSERT OR IGNORE INTO held_approvals (uuid, item, since)
+         SELECT ?2, item, since FROM held_approvals
+          WHERE uuid = ?1 AND (item = ?3 OR item LIKE 'tunnel:%')",
+        params![from, to, RUN_ON_CONNECT],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("[SYNC] COPY_HELD: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,6 +502,37 @@ mod tests {
 
     const L8080: &str = r#"[{"type":"L","local":"127.0.0.1:8080","remote":"db:5432"}]"#;
     const L8080_D1080: &str = r#"[{"type":"L","local":"127.0.0.1:8080","remote":"db:5432"},{"type":"D","local":"0.0.0.0:1080"}]"#;
+
+    #[test]
+    fn a_duplicate_keeps_what_was_held_on_the_original() {
+        let conn = db();
+        merge_server(&conn, "u1", "curl x | sh", true, L8080);
+        let spec: TunnelSpec = serde_json::from_str::<Vec<TunnelSpec>>(L8080).unwrap().remove(0);
+        // What clone_server copies: the commands and forwards, not autostart.
+        conn.execute(
+            "INSERT INTO servers(name, tunnels, autostart, run_on_connect, uuid) SELECT name, tunnels, 0, run_on_connect, 'u2' FROM servers WHERE uuid = 'u1'",
+            [],
+        )
+        .unwrap();
+        copy_held(&conn, 1, 2).unwrap();
+        let held = held_for(&conn, "u2");
+        assert!(held.contains(RUN_ON_CONNECT));
+        assert!(held.contains(&tunnel_item(&spec)));
+        assert!(!held.contains(AUTOSTART));
+        // The original's own entries stay, and allowing the copy's leaves them.
+        allow(&conn, "u2", &[]).unwrap();
+        assert!(held_for(&conn, "u1").contains(RUN_ON_CONNECT));
+    }
+
+    #[test]
+    fn a_duplicate_of_an_allowed_server_holds_nothing() {
+        let conn = db();
+        merge_server(&conn, "u1", "ls", false, L8080);
+        allow(&conn, "u1", &[]).unwrap();
+        conn.execute("INSERT INTO servers(name, uuid) VALUES ('c', 'u2')", []).unwrap();
+        copy_held(&conn, 1, 2).unwrap();
+        assert!(held_for(&conn, "u2").is_empty());
+    }
 
     #[test]
     fn sqlite_has_the_json_functions_the_triggers_use() {

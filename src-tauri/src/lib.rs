@@ -6732,6 +6732,10 @@ async fn clone_server(state: tauri::State<'_, DbState>, id: i32) -> Result<i64, 
         "UPDATE servers SET position = COALESCE((SELECT MAX(position) FROM servers s2 WHERE s2.id != servers.id AND s2.folder_id IS servers.folder_id), -1) + 1 WHERE id = ?1",
         rusqlite::params![new_id],
     );
+    // What the original wasn't allowed to run yet (a shared profile's held
+    // commands and forwards) stays held on the copy, so duplicating isn't a
+    // way around the approval. See approvals::copy_held.
+    approvals::copy_held(conn, id as i64, new_id)?;
     drop(conn_guard);
     save_vault_internal(&state)?;
     Ok(new_id)
@@ -9449,6 +9453,7 @@ enum ConnectTimeout {
 async fn drive_connect_with_prompt_timeout<F, T>(
     connect_future: F,
     prompt_pending: &std::sync::atomic::AtomicBool,
+    prompt_epoch: &std::sync::atomic::AtomicU32,
     caps: ConnectTimeoutCaps,
 ) -> Result<T, ConnectTimeout>
 where
@@ -9462,6 +9467,11 @@ where
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await; // the first tick is immediate — consume it
     let mut prompt_seen = false;
+    // A session that took over a prompt another one let go starts its own 90s
+    // window: the hard cap then counts from there (as if the handshake cap had
+    // just ended), not from the connect's start.
+    let mut epoch = prompt_epoch.load(Ordering::SeqCst);
+    let mut window_start = start;
     loop {
         tokio::select! {
             // Biased: always prefer a resolved handshake over a tick, so a
@@ -9471,7 +9481,14 @@ where
             out = &mut connect_future => return Ok(out),
             _ = ticker.tick() => {
                 prompt_seen |= prompt_pending.load(Ordering::SeqCst);
-                match connect_deadline_elapsed(prompt_seen, start.elapsed(), caps) {
+                let now_epoch = prompt_epoch.load(Ordering::SeqCst);
+                if now_epoch != epoch {
+                    epoch = now_epoch;
+                    if let Some(t) = tokio::time::Instant::now().checked_sub(caps.handshake) {
+                        window_start = t;
+                    }
+                }
+                match connect_deadline_elapsed(prompt_seen, window_start.elapsed(), caps) {
                     ConnectDeadline::Continue => {}
                     ConnectDeadline::HandshakeStall => return Err(ConnectTimeout::HandshakeStall),
                     ConnectDeadline::PromptHardCap => return Err(ConnectTimeout::PromptHardCap),
@@ -9491,6 +9508,27 @@ mod connect_timeout_tests {
         handshake: Duration::from_secs(15),
         hard: Duration::from_secs(110),
     };
+
+    // A session that waited on another's prompt and then asks itself gets its
+    // own full window, not what is left of the connect's first 110s.
+    #[tokio::test]
+    async fn a_prompt_taken_over_gets_a_fresh_window() {
+        use super::{drive_connect_with_prompt_timeout, ConnectTimeout};
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let caps = ConnectTimeoutCaps { handshake: Duration::from_millis(100), hard: Duration::from_millis(500) };
+        let pending = AtomicBool::new(true);
+        let epoch = AtomicU32::new(0);
+        let start = std::time::Instant::now();
+        let bump = async {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            epoch.fetch_add(1, Ordering::SeqCst);
+        };
+        let driven = drive_connect_with_prompt_timeout(std::future::pending::<()>(), &pending, &epoch, caps);
+        let (res, _) = tokio::join!(driven, bump);
+        assert!(matches!(res, Err(ConnectTimeout::PromptHardCap)));
+        // Counted from the takeover (350ms) plus the window (400ms), not from the start.
+        assert!(start.elapsed() >= Duration::from_millis(700), "cut short after {:?}", start.elapsed());
+    }
 
     #[test]
     fn no_prompt_holds_the_handshake_cap() {
@@ -9927,6 +9965,8 @@ async fn connect_jump_host(
     // first-time key prompt on the bastion — see the direct path's rationale.
     let prompt_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let prompt_pending_for_driver = std::sync::Arc::clone(&prompt_pending);
+    let prompt_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let prompt_epoch_for_driver = std::sync::Arc::clone(&prompt_epoch);
 
     let handler = ssh_manager::ClientHandler {
         app: app.clone(),
@@ -9939,6 +9979,7 @@ async fn connect_jump_host(
         forwarded_targets: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         fp_outcome,
         prompt_pending,
+        prompt_epoch,
         // Dedicated `::sftp` / `::fwd` connections carry a `::` suffix and
         // have no prompt of their own (see ClientHandler::prompt_allowed).
         prompt_allowed: !session_id.contains("::"),
@@ -9959,6 +10000,7 @@ async fn connect_jump_host(
         r = drive_connect_with_prompt_timeout(
             russh::client::connect_stream(config, transport, handler),
             &prompt_pending_for_driver,
+            &prompt_epoch_for_driver,
             if proxy_watch.is_some() { PROXY_COMMAND_TIMEOUT_CAPS } else { CONNECT_TIMEOUT_CAPS },
         ) => r,
         _ = attempt.superseded() => {
@@ -10525,6 +10567,8 @@ async fn initiate_connection(
     // to cover the human approval window instead of killing the prompt.
     let prompt_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let prompt_pending_for_driver = std::sync::Arc::clone(&prompt_pending);
+    let prompt_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let prompt_epoch_for_driver = std::sync::Arc::clone(&prompt_epoch);
     // Stamped by the handler whenever the server sends something; read by the
     // session watcher below.
     let last_heard = ssh_manager::LastHeard::default();
@@ -10543,6 +10587,7 @@ async fn initiate_connection(
         forwarded_targets: Arc::clone(&session_forwarded_targets),
         fp_outcome: std::sync::Arc::clone(&fp_outcome),
         prompt_pending: std::sync::Arc::clone(&prompt_pending),
+        prompt_epoch,
         prompt_allowed: !is_secondary,
         attempt: attempt.clone(),
         last_heard: last_heard.clone(),
@@ -10878,7 +10923,7 @@ async fn initiate_connection(
         // Dropping the handshake drops its transport, which stops a
         // ProxyCommand that would otherwise run until the timeout.
         let connect_res = tokio::select! {
-            r = drive_connect_with_prompt_timeout(connect_future, &prompt_pending_for_driver, caps) => r,
+            r = drive_connect_with_prompt_timeout(connect_future, &prompt_pending_for_driver, &prompt_epoch_for_driver, caps) => r,
             _ = attempt.superseded() => {
                 attempt.abandon();
                 println!("[LOG-{}] Connection attempt cancelled during the handshake.", session_id_clone);

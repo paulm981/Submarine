@@ -95,6 +95,12 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
   const shownRdp: RdpLink[] = IS_ANDROID ? [] : (rdpLinks || []);
   const rdpCounts = useMemo(() => subtreeCounts(folderIndex, shownRdp.map((l) => l.folder_id)), [folderIndex, rdpLinks]);
   const canRdp = !!onSaveRdp && !IS_ANDROID;
+  // The open folder was deleted (here, or by a sync from another device):
+  // back to the top level instead of an empty grid inside a folder that isn't
+  // there. Only once the folder list is known, so a slow load doesn't reset it.
+  useEffect(() => {
+    if (activeFolderId != null && Array.isArray(folders) && !folderIndex.byId.has(activeFolderId)) setActiveFolderId(null);
+  }, [folders, activeFolderId]);
   const crumbs = folderPath(folderIndex, activeFolderId);
   const parentFolderId = activeFolderId != null ? (folderIndex.parent.get(activeFolderId) ?? null) : null;
   // A server or link whose folder is gone shows at the top level.

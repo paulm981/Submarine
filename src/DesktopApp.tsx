@@ -55,7 +55,7 @@ const appWindow = getCurrentWindow();
 // has no tab of its own until it's popped out of the Wall.
 // `serverUuid` is the saved server's sync id, which keys this device's own
 // per-server settings (the Shell button, see util/shellSync.ts).
-type Session = { id: string; serverId: number; serverName: string; serverUuid?: string | null; host?: string; mirrors?: string; runOnConnect?: string; runOnConnectHeld?: boolean; quickAuth?: QuickAuth | null; wallId?: string };
+type Session = { id: string; serverId: number; serverName: string; serverUuid?: string | null; host?: string; port?: number; mirrors?: string; runOnConnect?: string; runOnConnectHeld?: boolean; quickAuth?: QuickAuth | null; wallId?: string };
 
 // The Home view (HomePane): terminals on this computer, where the app opens
 // and where closing the last session tab goes back to. Android has no shells
@@ -1030,10 +1030,13 @@ function DesktopApp() {
       if (s.serverId <= 0 || !s.host || sessionStatuses[s.id] !== "connected") continue;
       const server = servers.find((x: any) => x.id === s.serverId);
       if (!server || server.os) continue;
-      const key = `${server.id}|${s.host}|${server.port}`;
+      // The port the session connected to, like its host: the server may
+      // have been edited since it opened.
+      const port = s.port ?? server.port;
+      const key = `${server.id}|${s.host}|${port}`;
       if (osChecked.current.has(key)) continue;
       osChecked.current.add(key);
-      invoke<string | null>("detect_server_os", { sessionId: s.id, serverId: s.serverId, host: s.host })
+      invoke<string | null>("detect_server_os", { sessionId: s.id, serverId: s.serverId, host: s.host, port })
         .then((os) => { if (os) refreshServers(); })
         .catch(() => {});
     }
@@ -1047,6 +1050,7 @@ function DesktopApp() {
     serverId: server.id,
     serverName: server.name,
     host: server.host,
+    port: server.port,
     // Pass the raw mirrors JSON through to SessionView so the
     // MirrorsPanel can pre-populate "Saved on this node" without
     // another round-trip to the backend.
@@ -1073,12 +1077,29 @@ function DesktopApp() {
   // Open servers as one Wall instead of a tab each: the ones not open yet
   // connect inside the Wall (no tab of their own until popped out); ones
   // already open join with the terminal on screen in their tab. A saved wall
-  // that's open already is just shown.
-  const openServersAsWall = (list: any[], name: string, opts: { broadcast?: boolean; cols?: number; savedId?: number | null } = {}) => {
+  // that's open already is just shown — plus, when it was just saved
+  // (addMissing), the servers it has now and the open one lacks.
+  const openServersAsWall = (list: any[], name: string, opts: { broadcast?: boolean; cols?: number; savedId?: number | null; addMissing?: boolean } = {}) => {
     if (opts.savedId != null) {
       const open = walls.find(w => w.savedId === opts.savedId);
       if (open) {
         if (opts.broadcast && !open.broadcast) updateWall(open.id, { broadcast: true });
+        if (opts.addMissing) {
+          const onWall = new Set(open.members.map(m => m.sessionId));
+          const openIds = new Set(sessions.map(s => s.id));
+          const missing = list.filter(server => !onWall.has(`session-${server.id}`));
+          setSessions((prev: Session[]) => {
+            const seen = new Set(prev.map((p) => p.id));
+            const fresh = missing
+              .filter((server) => !seen.has(`session-${server.id}`))
+              .map((server) => ({ ...sessionFor(server), wallId: open.id }));
+            return fresh.length ? [...prev, ...fresh] : prev;
+          });
+          addToWall(open.id, missing.map(server => {
+            const sid = `session-${server.id}`;
+            return { sessionId: sid, terminalId: openIds.has(sid) ? terminalOf(sid) : `${sid}-term-0` };
+          }));
+        }
         setMergedSessionIds([]);
         setActiveView(open.id);
         return;
@@ -1103,13 +1124,13 @@ function DesktopApp() {
     newWall(name, members, { ...opts, id });
   };
 
-  const openSavedWall = (sw: SavedWall, broadcast = false) => {
+  const openSavedWall = (sw: SavedWall, broadcast = false, addMissing = false) => {
     const list = sw.server_ids.map(id => servers.find((s: any) => s.id === id)).filter(Boolean);
     if (list.length === 0) {
       void confirm({ title: `"${sw.name}" is empty`, message: "None of its servers exist any more. Edit it to pick some.", okLabel: "OK", cancelLabel: "Close" });
       return;
     }
-    openServersAsWall(list, sw.name, { broadcast, cols: sw.cols, savedId: sw.id });
+    openServersAsWall(list, sw.name, { broadcast, cols: sw.cols, savedId: sw.id, addMissing });
   };
 
   // Save a Wall's servers as a saved wall, or update the one it came from.
@@ -1268,7 +1289,7 @@ function DesktopApp() {
       const id = await invoke<number>("wall_save", { wall: w });
       setWallEditor(null);
       await refreshSavedWalls();
-      if (open) openSavedWall({ ...w, id }, false);
+      if (open) openSavedWall({ ...w, id }, false, true);
     } catch (e) {
       await confirm({ title: "Couldn't save the wall", message: String(e), okLabel: "OK", cancelLabel: "Close" });
     }
