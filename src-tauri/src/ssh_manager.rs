@@ -216,8 +216,11 @@ pub async fn run_pty_pump(
     rx: mpsc::Receiver<TerminalCommand>,
     resize_rx: tokio::sync::watch::Receiver<PtySize>,
     output: crate::term_output::OutputSink,
+    // Output already read from the channel before the pump took it (docker's
+    // root prompt check): it goes first, through the same filter.
+    early: Vec<u8>,
 ) {
-    pty_pump(channel, rx, resize_rx, |buf| output.push(buf)).await;
+    pty_pump(channel, rx, resize_rx, early, |buf| output.push(buf)).await;
     output.finish(move || {
         let _ = app.emit(&format!("terminal-closed-{}", terminal_id), serde_json::json!({}));
     });
@@ -242,6 +245,7 @@ async fn pty_pump<F>(
     channel: russh::Channel<client::Msg>,
     mut rx: mpsc::Receiver<TerminalCommand>,
     mut resize_rx: tokio::sync::watch::Receiver<PtySize>,
+    early: Vec<u8>,
     mut flush: F,
 ) where
     F: FnMut(&mut Vec<u8>),
@@ -292,6 +296,13 @@ async fn pty_pump<F>(
     const FLUSH_CAP: usize = 256 * 1024;
     const FLUSH_WINDOW: std::time::Duration = std::time::Duration::from_millis(8);
     let mut out_buf: Vec<u8> = Vec::new();
+    // What the page shows is cut down first: a number past four digits in a
+    // control sequence can freeze the page (term_filter.rs).
+    let mut limiter = crate::term_filter::CsiLimiter::default();
+    if !early.is_empty() {
+        limiter.filter(&early, &mut out_buf);
+        flush(&mut out_buf);
+    }
     // A flush timer armed ONLY while bytes are buffered. When the buffer is
     // empty its deadline is parked far in the future, so an open-but-idle
     // terminal wakes this task zero times (a free-running interval would fire
@@ -306,7 +317,7 @@ async fn pty_pump<F>(
                 Some(ChannelMsg::Data { ref data })
                 | Some(ChannelMsg::ExtendedData { ref data, .. }) => {
                     let was_empty = out_buf.is_empty();
-                    out_buf.extend_from_slice(data);
+                    limiter.filter(data, &mut out_buf);
                     if out_buf.len() >= FLUSH_CAP {
                         flush(&mut out_buf);
                     } else if was_empty {
@@ -1462,7 +1473,7 @@ mod tests {
         let (_resize_tx, resize_rx) = tokio::sync::watch::channel(PtySize { cols: 80, rows: 24 });
         let output = Arc::new(AtomicUsize::new(0));
         let sink = Arc::clone(&output);
-        let pump = tokio::spawn(pty_pump(channel, rx, resize_rx, move |buf: &mut Vec<u8>| {
+        let pump = tokio::spawn(pty_pump(channel, rx, resize_rx, Vec::new(), move |buf: &mut Vec<u8>| {
             sink.fetch_add(buf.len(), Ordering::SeqCst);
             buf.clear();
         }));

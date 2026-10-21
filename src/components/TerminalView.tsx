@@ -19,6 +19,7 @@ import { DEFAULT_FONT_STACK, fontFamilyCss, readFontFamily, readFontSize } from 
 import { MIN_CONTRAST_RATIO, readBoldBright, readGpu, readMinContrast, schemeForServer } from '../ui/terminalThemes';
 import { HighlightStream, matcherForServer, type Matcher } from '../ui/highlight';
 import { readScrollback } from '../util/terminalScrollback';
+import { withoutPasteControls } from '../util/pasteText';
 import { readUseLocalShell } from '../util/terminalShell';
 import { IS_ANDROID, IS_LINUX } from '../util/platform';
 import { readClipboardText } from '../util/clipboard';
@@ -1117,10 +1118,16 @@ const TerminalView = ({
     // clobber the clipboard. Disarm on blur so only a release we actually see
     // can copy.
     const onWindowBlur = () => { selectionArmed = false; };
+    // Every paste reaches the terminal here: the clipboard, xterm's own paste,
+    // and a Wall's Broadcast. No escape sequence or other control character
+    // gets through (see pasteText.ts); the callers clean it first so they can
+    // say so and show what will be pasted, and this is the last check.
     const pasteText = (text: string) => {
+      const clean = withoutPasteControls(text);
+      if (!clean) return;
       pastingRef.current = true;
       try {
-        term.paste(text);
+        term.paste(clean);
       } finally {
         pastingRef.current = false;
       }
@@ -1134,6 +1141,10 @@ const TerminalView = ({
       // says why; the page's own read only fails when it's refused.
       try { text = await readClipboardText(); }
       catch (e) { notify(typeof e === 'string' ? e : 'Clipboard read denied', 'err'); return; }
+      if (!text) return;
+      // No escape sequence or other control character gets through (see pasteText.ts).
+      const clean = withoutPasteControls(text);
+      if (clean !== text) { text = clean; notify('Control characters left out of the paste'); }
       if (!text) return;
       // More than one line into a program that hasn't turned bracketed-paste
       // mode on (an older bash, a plain sh): each line would run the moment it
@@ -1164,6 +1175,20 @@ const TerminalView = ({
       // and the armed modifiers.
       pasteText(text);
       if (toast) notify('Pasted');
+    };
+    // Ctrl+V, Ctrl+Shift+V, Shift+Insert and a phone's paste menu reach xterm's
+    // own paste. When there is something to take out of the text, it is pasted
+    // without it instead (the capture phase runs before xterm's handler); text
+    // with nothing to take out goes the way it always did.
+    const onPasteEvent = (ev: ClipboardEvent) => {
+      const raw = ev.clipboardData?.getData('text/plain') ?? '';
+      const clean = withoutPasteControls(raw);
+      if (clean === raw) return;
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      if (disabledRef.current || !clean) return;
+      pasteText(clean);
+      notify('Control characters left out of the paste');
     };
     // Right-click → paste. preventDefault swallows the platform context menu
     // so the user gets the terminal-style behavior they asked for.
@@ -1210,6 +1235,7 @@ const TerminalView = ({
     document.addEventListener('mouseup', onDocMouseUp);
     window.addEventListener('blur', onWindowBlur);
     host.addEventListener('contextmenu', onContextMenu);
+    host.addEventListener('paste', onPasteEvent, true);
 
     // Handle Resize, once the size has settled (PTY_SIZE_SETTLE_MS).
     // Refused until the shell is open (NOT_OPEN); the size is sent again
@@ -1453,6 +1479,7 @@ const TerminalView = ({
       window.clearTimeout(sizeTimer);
       host.removeEventListener('mousedown', onMouseDown);
       host.removeEventListener('contextmenu', onContextMenu);
+      host.removeEventListener('paste', onPasteEvent, true);
       document.removeEventListener('mouseup', onDocMouseUp);
       window.removeEventListener('blur', onWindowBlur);
       window.visualViewport?.removeEventListener('resize', onVvResize);

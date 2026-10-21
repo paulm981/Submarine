@@ -11,7 +11,7 @@ This page covers:
 
 What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
-The fork is based on the original project's **0.3.8**, with every change up to [#199](https://github.com/SinaXhpm/submarine/pull/199) brought in or recorded as not taken yet.
+The fork is based on the original project's **0.4.0**, with every change up to [#224](https://github.com/SinaXhpm/submarine/pull/224) brought in or recorded as not taken.
 
 ## What this fork adds
 
@@ -115,18 +115,15 @@ No third-party service is involved. Profiles are encrypted with their password b
 
 - **Troubleshooting.** The app keeps a log on your computer, and a watchdog notes when the window froze and why. **Copy diagnostics** copies the log with server, user and host names replaced, ready to send to whoever is helping.
 - **A failed connect says why:** under the error, whether the name resolved and to what, and whether the port answered, through the jump host or proxy when there is one.
-- **Two uploads to the same file** wait their turn instead of mixing and corrupting it.
-- **A release from every change**, numbered like `v0.3.8-fork.2` and shown in the title bar, with a notice when there's a newer one.
+- **Two uploads to the same file**, or an upload and a Live Edit save, wait their turn instead of mixing and corrupting it.
+- **A release from every change**, numbered like `v0.4.0-fork.2` and shown in the title bar, with a notice when there's a newer one.
 - **Hardening.** On every system:
   - characters that disguise a file name are shown plainly;
-  - a trusted server that shows a different kind of key is a warning, not a silent change.
+  - a trusted server that shows a different kind of key is a warning, not a silent change;
+  - Live Edit opens a file in an editor and never runs it: the one picked in Settings, or else Notepad on Windows, the default text editor on macOS, and on Linux the text editor set for plain text;
+  - the Local pane asks before it opens a file that would run (a program, a script, a shortcut; on macOS a `.terminal` or `.command` file too).
 
-  On Windows:
-  - Live Edit opens a file in an editor and never runs it;
-  - the Local pane asks before it runs a program;
-  - downloads are marked as from the internet.
-
-  macOS and Linux get the Live Edit and Local pane protections next.
+  Downloads are marked as from the internet on Windows and macOS. As in the original project ([#212](https://github.com/SinaXhpm/submarine/pull/212)), a program on a server (`.exe`, `.msi`, `.jar`, `.AppImage`, …) isn't opened from the file pane at all.
 
 ## Where it behaves differently
 
@@ -135,8 +132,8 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | Area | The original project | This fork |
 |---|---|---|
 | Profile sync | Its hosted cloud, `api.sinaxhpm.com` | A folder or git repository you own. The hosted cloud is off unless you turn it on. |
-| Updates | Releases of the original project | Releases of this fork, one for every change: `v0.3.8-fork.1`, `v0.3.8-fork.2`, … |
-| Live Edit (Windows) | Opens the file with its default app | Opens the file in an editor, never runs it |
+| Updates | Releases of the original project | Releases of this fork, one for every change: `v0.4.0-fork.1`, `v0.4.0-fork.2`, … |
+| Live Edit | Refuses a program; on Windows opens a script in Notepad; opens anything else with its default app ([#212](https://github.com/SinaXhpm/submarine/pull/212)) | Refuses a program, and opens anything else in an editor: the one picked in Settings, or Notepad on Windows, the default text editor on macOS, and on Linux the text editor set for plain text. It never runs a file |
 | Root | `sudo` | `sudo` or `dzdo`, and `dzdo su -`. A server without an sftp-server uses the original project's shell file access, under `sudo` only. |
 | Docker | As the user | As the user, or through root where only root may use Docker |
 | Remote Desktop | RDP servers ([#173](https://github.com/SinaXhpm/submarine/pull/173)), opened in the system's RDP app or, experimentally, in the tab ([#199](https://github.com/SinaXhpm/submarine/pull/199)) | The same RDP servers, each with its **Open in** choice of the built-in client or the system's app, per device. Beside them, the fork's Remote Desktop links, imported from MobaXterm and synced, and marked LINK so they aren't taken for RDP servers. Joining Remote Desktop links and RDP servers is next ([#42](https://github.com/paulm981/Submarine/issues/42)) |
@@ -176,10 +173,10 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 
 **Versions.**
 
-- **Every merge to main is a release.** GitHub builds it and publishes it, tagged with the original project's version and the fork's count: `v0.3.8-fork.1`, `v0.3.8-fork.2`, and so on. A higher count is newer. There's nothing to tag by hand.
-- **The title bar shows it,** as in `v0.3.8-fork.2`, and the profile screen says when there's a newer release.
-- **When the original project releases 0.3.9** and it's merged, the count starts again: `v0.3.9-fork.1`.
-- **The installers keep the same names** in every release, so a link to the latest release's `Submarine-windows-x64-setup.exe` always gets the newest. On Windows the installer itself can only say `0.3.8`; the app still knows it's `0.3.8-fork.2`.
+- **Every merge to main is a release.** GitHub builds it and publishes it, tagged with the original project's version and the fork's count: `v0.4.0-fork.1`, `v0.4.0-fork.2`, and so on. A higher count is newer. There's nothing to tag by hand.
+- **The title bar shows it,** as in `v0.4.0-fork.2`, and the profile screen says when there's a newer release.
+- **When the original project releases a new version** and it's merged, the count starts again. Releases on 0.3.8 were `v0.3.8-fork.1` and on; with 0.4.0 in, they're `v0.4.0-fork.1` and on.
+- **The installers keep the same names** in every release, so a link to the latest release's `Submarine-windows-x64-setup.exe` always gets the newest. On Windows the installer itself can only say `0.4.0`; the app still knows it's `0.4.0-fork.2`.
 - **Before `v0.3.8-fork.1`,** the fork numbered its builds instead (build 244 was the last). Those builds are told about the new releases.
 
 **Giving back.** Fixes that apply to the original project too go back to it as pull requests.

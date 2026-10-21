@@ -2,12 +2,53 @@
 
 This changelog lists the releases of [paulm981/Submarine](https://github.com/paulm981/Submarine), newest first.
 
-- Each release is one merge to main, numbered with the original project's version and the fork's count, such as `v0.3.8-fork.2`. The title bar shows it.
+- Each release is one merge to main, numbered with the original project's version and the fork's count, such as `v0.4.0-fork.2`. The title bar shows it.
 - Before `v0.3.8-fork.1`, merges were numbered builds instead, down to build 236 and the summary below it.
 - Sections called **From the original project** list what came in from [SinaXhpm/Submarine](https://github.com/SinaXhpm/submarine), with that project's pull request numbers.
 - [FORK.md](FORK.md) explains what the fork does differently, and which of the original project's changes it hasn't taken yet.
 
 ## Next release
+
+- **Files from a server don't run on macOS and Linux either.** Live Edit opens a file in your default text editor on macOS, and in the text editor set for plain text on Linux. The Local pane asks before it opens a file that could run (on macOS a `.terminal` or `.command` file too, and Windows programs, which Wine can run), and downloads on macOS are marked as from the internet. ([#84](https://github.com/paulm981/Submarine/issues/84))
+- **A jump host that stops answering no longer keeps a tab connecting.** Reaching the server behind it has 15 seconds, and logging in to it 5 minutes, prompts included. Other servers behind it stop waiting for their turn. ([#84](https://github.com/paulm981/Submarine/issues/84))
+- **Home terminals and AI tabs** leave out escape sequences that would freeze the window, as SSH terminals do. So does a container's terminal opened as root. ([#84](https://github.com/paulm981/Submarine/issues/84))
+- **Two windows syncing through the same folder or git repository take turns**, now that each profile can have a window of its own. A file in that storage that's far too big is skipped, and the log says why. ([#84](https://github.com/paulm981/Submarine/issues/84))
+
+### From the original project ([#41](https://github.com/paulm981/Submarine/issues/41))
+
+- **Version 0.4.0** ([#220](https://github.com/SinaXhpm/submarine/pull/220)). The original project is at 0.4.0, so the fork's releases are now numbered `v0.4.0-fork.1` and on.
+- **One window per profile** ([#204](https://github.com/SinaXhpm/submarine/pull/204)). A profile open in one Submarine window can't be opened in a second one, so two windows no longer save over each other's changes. Other profiles still open, and a profile open elsewhere can't be deleted.
+- **Locking a profile locks sharing too** ([#223](https://github.com/SinaXhpm/submarine/pull/223)). The sharing passphrase is asked for again after a lock. Locking also ends the AI tabs' access to the profile's servers.
+- **A copy before a sync deletes** ([#224](https://github.com/SinaXhpm/submarine/pull/224)). Before a sync removes items that were deleted elsewhere, the profile file is copied next to itself as `<name>.submarine.bak-<time>`: at most one copy every 10 minutes, the newest five kept. The log says how many items went and what the copy is called. This works for sync through your own folder or git repository too.
+- **Live Edit keeps syncing** ([#218](https://github.com/SinaXhpm/submarine/pull/218)). It stops only after 12 hours without a save, and says so. A copy with edits that weren't uploaded is kept, and you're told. Editors that save by replacing the file (vim, gedit, JetBrains) are now seen on every save. A Live Edit save and an upload to the same file take turns.
+- **Tag colours** ([#219](https://github.com/SinaXhpm/submarine/pull/219)). The server form has 20 colours, and a last swatch opens the system's colour picker for any other.
+- **The built-in RDP client needs NLA** ([#222](https://github.com/SinaXhpm/submarine/pull/222)). A server that doesn't ask for Network Level Authentication is stopped before anything is sent, and the tab offers **Allow without NLA** for that server. The server form has the same switch, kept on this computer. The system's RDP app isn't affected.
+- **Monitoring** ([#216](https://github.com/SinaXhpm/submarine/pull/216)). Locking a profile stops every monitor. A server that takes the connection and then stops answering now counts as down; through a jump host it gets twice as long.
+- **Imports** ([#213](https://github.com/SinaXhpm/submarine/pull/213)). A MobaXterm export with thousands of sessions of the same name imports in a moment, not minutes. PuTTY session names with accents or in other scripts come out as typed.
+- **Smaller fixes** ([#214](https://github.com/SinaXhpm/submarine/pull/214)):
+  - a `~/.ssh/config` with thousands of bad lines no longer slows every connect;
+  - a ProxyCommand to an IPv6 address in brackets works;
+  - a service whose name has a backslash in it can be started and stopped;
+  - renaming or moving in the Local pane never replaces a file or folder that's there.
+- **Security fixes**:
+  - a program that prints a huge number in an escape sequence can't freeze the window ([#202](https://github.com/SinaXhpm/submarine/pull/202));
+  - VNC and RDP tabs hold new frames back while the window is behind, so a slow window or a hostile server can't run the app out of memory ([#215](https://github.com/SinaXhpm/submarine/pull/215));
+  - a paste leaves out control characters (tab and line breaks stay), so pasted text can't end a bracketed paste and run what follows. Broadcast on a Wall too ([#217](https://github.com/SinaXhpm/submarine/pull/217));
+  - a program on a server isn't opened from the file pane; you're told to download it instead ([#212](https://github.com/SinaXhpm/submarine/pull/212));
+  - an oversized answer from the sync server or the update check can't run the app out of memory ([#203](https://github.com/SinaXhpm/submarine/pull/203));
+  - a synced server whose forwards or mirrors aren't valid no longer brings up the error screen when it's edited ([#205](https://github.com/SinaXhpm/submarine/pull/205));
+  - an encrypted PuTTY or PKCS#8 key that asks for far more work to unlock than a real key is refused ([#206](https://github.com/SinaXhpm/submarine/pull/206));
+  - profile files are read with a size limit, an import never replaces a profile that's there, and an export can't write over the profile's own file ([#207](https://github.com/SinaXhpm/submarine/pull/207));
+  - a profile file that's busy for a moment no longer turns off Windows Hello unlock ([#208](https://github.com/SinaXhpm/submarine/pull/208));
+  - a hostile server can't keep a login, a telnet or an RDP connect going forever, or slip a second request into an HTTP proxy's ([#209](https://github.com/SinaXhpm/submarine/pull/209));
+  - a mirror's folder on this computer can't be a network share ([#210](https://github.com/SinaXhpm/submarine/pull/210));
+  - a copy of a server keeps waiting for your OK where the original was waiting. The fork already did this ([#211](https://github.com/SinaXhpm/submarine/pull/211)).
+- **Release builds** ([#221](https://github.com/SinaXhpm/submarine/pull/221)). The actions they use are pinned to exact versions, and the Android app, when it's built, is signed by a separate job that runs nothing else.
+- **A mirror's folder must be on a drive letter**, on Windows. Some ways of writing a network share still got past the check from #210 and were looked up on the network. ([#41](https://github.com/paulm981/Submarine/issues/41))
+- **Paste in the Library works like a paste.** A command's or note's **Paste** leaves out control characters, keeps several lines together where the program takes a paste as one block, and asks first where each line would run. **Run** works as before. ([#41](https://github.com/paulm981/Submarine/issues/41))
+- **Unsent Live Edit changes are kept when you disconnect or lock the profile.** A copy with changes that never reached the server is moved to **Submarine unsent edits** in your Downloads folder, and the window says so, with a button to show it. ([#41](https://github.com/paulm981/Submarine/issues/41))
+
+## v0.3.8-fork.11
 
 ### From the original project ([#41](https://github.com/paulm981/Submarine/issues/41))
 

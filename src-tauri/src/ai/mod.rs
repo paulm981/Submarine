@@ -365,10 +365,7 @@ impl AiState {
     /// listens any more.
     async fn turn_off(&self) {
         self.lock().enabled = false;
-        let ids: Vec<String> = self.lock().tabs.iter().map(|t| t.id.clone()).collect();
-        for id in ids {
-            self.end_tab(&id);
-        }
+        self.end_all_tabs();
         let listener = self.0.listener.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(l) = listener {
             l.close().await;
@@ -431,6 +428,17 @@ impl AiState {
         let _ = tab.closed.send(true);
         self.audit(audit::Entry::new("ai_tab_ended", &tab.label));
         self.changed();
+    }
+
+    /// Every AI tab's access ends, as when each one closes: its token stops
+    /// working, what it shared and asked for goes. Turning AI tools off does
+    /// this, and so does locking the profile (close_profile), so nothing the
+    /// profile shared outlives it. The channel itself stays as it is.
+    pub(crate) fn end_all_tabs(&self) {
+        let ids: Vec<String> = self.lock().tabs.iter().map(|t| t.id.clone()).collect();
+        for id in ids {
+            self.end_tab(&id);
+        }
     }
 
     /// The tab whose token this is, and its "access ended" signal.

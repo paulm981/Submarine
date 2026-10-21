@@ -8,7 +8,7 @@ use rusqlite::{ffi, Connection, MAIN_DB};
 use rusqlite::serialize::OwnedData;
 use std::ptr::NonNull;
 use std::sync::Mutex as StdMutex;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::fs;
 use tauri::Manager;
 use serde_json::json;
@@ -17,6 +17,7 @@ mod ssh_manager;
 mod tunnel;
 mod telnet;
 mod vnc_client;
+mod screen_flow;
 mod monitor;
 mod cloud;
 mod cloud_config;
@@ -48,9 +49,12 @@ mod term_output;
 mod proxy_command;
 mod diagnose;
 mod ai;
+mod open_policy;
 mod rdp;
 mod quick_unlock;
 mod rdp_client;
+mod term_filter;
+mod vault_backup;
 #[cfg(target_os = "android")]
 mod android_bridge;
 #[cfg(test)]
@@ -106,6 +110,12 @@ pub struct DbState {
     pub generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Delta sync's memory for the open profile (see `SyncCursor`).
     sync_cursor: StdMutex<Option<SyncCursor>>,
+    /// The lock on the open profile's file (`<name>.submarine.lock`), held while
+    /// the profile is open so that only one Submarine window at a time has it:
+    /// two windows saving the same vault would each write over the other's
+    /// changes (see `lock_profile`). Let go by `close_profile`, or by the system
+    /// when the app exits or dies.
+    profile_lock: StdMutex<Option<(PathBuf, fs::File)>>,
 }
 
 impl DbState {
@@ -147,6 +157,52 @@ pub(crate) fn profiles_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 /// validated the name with `validate_profile_name`.
 pub(crate) fn profile_path(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, String> {
     Ok(profiles_dir(app)?.join(format!("{}.submarine", name)))
+}
+
+/// What the user is told when a profile is open in another window.
+const PROFILE_IN_USE: &str = "[PROFILE] This profile is open in another Submarine window. Lock it there, or close that window, then try again.";
+
+/// What `lock_profile` found.
+enum ProfileLock {
+    /// This process already holds the lock on this profile: the page was
+    /// reloaded while the profile was open.
+    Held,
+    /// A new lock, kept in `DbState` once the profile is open.
+    New(fs::File),
+    /// The profile's folder or file system can't lock: nothing guards the
+    /// profile, but nothing stops it either.
+    Unsupported,
+}
+
+/// Takes the lock on a profile before it is opened, so that one profile is
+/// open in one Submarine window at a time. Each save writes the whole vault
+/// from the memory of the window that does it; a second window on the same
+/// profile would write over the first one's changes (and the other way round)
+/// without a word, and nothing but a cloud sync would bring them back.
+///
+/// The lock is a held lock on `<name>.submarine.lock`, not the file's mere
+/// existence, so it can never be left behind: the system lets go of it when the
+/// process ends, however it ends.
+fn lock_profile(state: &DbState, path: &Path) -> Result<ProfileLock, String> {
+    let held_here = state.profile_lock.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE_LOCK")?
+        .as_ref()
+        .is_some_and(|(held, _)| held == path);
+    if held_here {
+        return Ok(ProfileLock::Held);
+    }
+    try_lock_file(&path.with_extension("submarine.lock"))
+}
+
+fn try_lock_file(lock_path: &Path) -> Result<ProfileLock, String> {
+    let file = match fs::OpenOptions::new().create(true).write(true).truncate(false).open(lock_path) {
+        Ok(file) => file,
+        Err(_) => return Ok(ProfileLock::Unsupported),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(ProfileLock::New(file)),
+        Err(fs::TryLockError::WouldBlock) => Err(PROFILE_IN_USE.into()),
+        Err(fs::TryLockError::Error(_)) => Ok(ProfileLock::Unsupported),
+    }
 }
 
 /// Reject names that would let a user escape the profiles dir or collide
@@ -275,6 +331,70 @@ fn vault_compress(plaintext: &[u8]) -> Result<Vec<u8>, String> {
 /// so also the largest it saves: one saved past it could never be opened
 /// again. Released builds open up to the same 64 MiB.
 const VAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// The most a profile's file can be: the vault's limit, with room for the
+/// compression and encryption around it. Anything bigger is not a profile; it is
+/// refused before it is read into memory (a mistaken pick of a big file once
+/// read in whole, and then unlocking it needed about three times its size).
+const VAULT_FILE_MAX_BYTES: u64 = VAULT_MAX_BYTES as u64 + 1024 * 1024;
+
+/// A profile's file, read in whole: refused past `VAULT_FILE_MAX_BYTES` first.
+fn read_vault_file(path: &Path) -> Result<Vec<u8>, String> {
+    let len = fs::metadata(path).map_err(|e| format!("[FILE] VAULT_READ_FAILED: {}", e))?.len();
+    if len > VAULT_FILE_MAX_BYTES {
+        return Err(format!(
+            "[VAULT] TOO_LARGE: this file is {} MB, and a profile is never that big, so it isn't one. It wasn't read.",
+            len / (1024 * 1024)
+        ));
+    }
+    fs::read(path).map_err(|e| format!("[FILE] VAULT_READ_FAILED: {}", e))
+}
+
+/// Puts a new profile file in place without ever leaving half of it under its
+/// final name, and without replacing a profile that is already there: written
+/// beside it (private to the user on Unix, like every save), flushed, then moved
+/// in. A power cut or a full disk used to leave a truncated `.submarine` that
+/// the picker listed and the unlock then called a wrong password.
+fn write_new_profile_file(dst: &Path, bytes: &[u8], name: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    let exists = || format!("Profile '{}' already exists", name);
+    let tmp = dst.with_extension("submarine.tmp");
+    let _ = fs::remove_file(&tmp);
+    {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp).map_err(|e| format!("[FILE] IMPORT_WRITE_FAILED to {:?}: {}", tmp, e))?;
+        file.write_all(bytes).map_err(|e| format!("[FILE] IMPORT_WRITE_FAILED to {:?}: {}", tmp, e))?;
+        file.sync_all().map_err(|e| format!("[FILE] IMPORT_WRITE_FAILED to {:?}: {}", tmp, e))?;
+    }
+    // A link fails if the name is taken, and takes it in one step if not.
+    match fs::hard_link(&tmp, dst) {
+        Ok(()) => {
+            let _ = fs::remove_file(&tmp);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&tmp);
+            Err(exists())
+        }
+        // No hard links here (FAT, some network drives): move it, after looking.
+        Err(_) => {
+            if dst.exists() {
+                let _ = fs::remove_file(&tmp);
+                return Err(exists());
+            }
+            fs::rename(&tmp, dst).map_err(|e| {
+                let _ = fs::remove_file(&tmp);
+                format!("[FILE] IMPORT_WRITE_FAILED to {:?}: {}", dst, e)
+            })
+        }
+    }
+}
 
 /// Decompress the post-decrypt body for vault v2 reads. Bounded by a
 /// generous max-size guard so a corrupt or hostile file can't make us
@@ -906,6 +1026,9 @@ enum ColKind {
     OptionalInt32,
     /// A whole number (true/false count), or NULL.
     OptionalInt,
+    /// Text holding a JSON list of objects (a server's tunnels, mirrors), or
+    /// NULL or empty: the edit form takes the entries as objects.
+    ObjectList,
 }
 
 fn col_kind(table: &str, col: &str) -> ColKind {
@@ -922,6 +1045,7 @@ fn col_kind(table: &str, col: &str) -> ColKind {
         ("servers", "proxy_port") => ColKind::OptionalInt32,
         ("servers", "autostart" | "position") => ColKind::OptionalInt,
         ("highlight_rules", "match_case" | "bold" | "underline" | "enabled" | "position") => ColKind::OptionalInt,
+        ("servers", "tunnels" | "mirrors") => ColKind::ObjectList,
         _ => ColKind::Text,
     }
 }
@@ -938,6 +1062,12 @@ impl ColKind {
             (ColKind::OptionalInt32, Some(v)) => int32(v),
             (ColKind::OptionalInt, None | Some(Value::Null | Value::Bool(_))) => true,
             (ColKind::OptionalInt, Some(v)) => v.is_i64(),
+            (ColKind::ObjectList, None | Some(Value::Null)) => true,
+            (ColKind::ObjectList, Some(Value::String(text))) => {
+                text.is_empty()
+                    || serde_json::from_str::<Value>(text)
+                        .is_ok_and(|list| list.as_array().is_some_and(|a| a.iter().all(Value::is_object)))
+            }
             _ => false,
         }
     }
@@ -1380,6 +1510,24 @@ fn apply_entity(conn: &Connection, key: &[u8; 32], spec: &EntitySpec, rec: &Sync
     Ok(())
 }
 
+/// How many live rows the tombstones in `records` are about to delete: what
+/// `apply_tombstone` does, counted first, so a profile can be kept as it is
+/// before the merge deletes from it (vault_backup.rs).
+pub(crate) fn rows_to_delete(conn: &Connection, records: &[SyncRecord]) -> usize {
+    records
+        .iter()
+        .filter(|r| r.deleted && sane_record(r))
+        .filter(|r| {
+            ENTITIES.iter().find(|s| s.table == r.entity_type).is_some_and(|spec| {
+                conn.query_row(&format!("SELECT updated_at FROM {} WHERE uuid=?1", spec.table), [&r.uuid], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
+                .is_ok_and(|ua| ua.as_deref().unwrap_or("") < r.updated_at.as_str())
+            })
+        })
+        .count()
+}
+
 /// One remote deletion. It can write three things (unlink, delete, record the
 /// tombstone), so the caller runs it in a savepoint: a delete that fails
 /// leaves no tombstone claiming it happened.
@@ -1443,6 +1591,11 @@ struct SyncReport {
     /// The shared profile has a new key waiting for the user's OK
     /// (`accept_share_key`); until then nothing is pushed.
     key_change: bool,
+    /// Rows this sync is deleting here, because they were deleted elsewhere.
+    removed: usize,
+    /// When it deletes any, the copy of the profile kept first: its file name
+    /// (vault_backup.rs). None when nothing was deleted or no copy could be made.
+    backup: Option<String>,
 }
 
 // A personal profile's DEK, sealed under the profile's OWN password, rides the
@@ -1561,6 +1714,45 @@ fn link_profile_server(conn: &Connection, base: &str) -> Result<(), String> {
     )
     .map_err(|e| format!("[SYNC] SET_CLOUD_SERVER: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod profile_lock_tests {
+    use super::*;
+
+    fn temp_lock(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("submarine-lock-test-{}-{name}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("p.submarine.lock")
+    }
+
+    #[test]
+    fn a_second_window_cannot_take_a_profile_the_first_one_has() {
+        let lock = temp_lock("two");
+        let first = try_lock_file(&lock).unwrap();
+        assert!(matches!(first, ProfileLock::New(_)));
+        let second = try_lock_file(&lock);
+        assert_eq!(second.err().as_deref(), Some(PROFILE_IN_USE));
+        // The first one lets go (the window locks the profile, or dies): it is free again.
+        drop(first);
+        assert!(matches!(try_lock_file(&lock).unwrap(), ProfileLock::New(_)));
+        let _ = fs::remove_dir_all(lock.parent().unwrap());
+    }
+
+    #[test]
+    fn two_different_profiles_do_not_get_in_each_others_way() {
+        let a = temp_lock("a");
+        let b = a.with_file_name("q.submarine.lock");
+        let _first = try_lock_file(&a).unwrap();
+        assert!(matches!(try_lock_file(&b).unwrap(), ProfileLock::New(_)));
+        let _ = fs::remove_dir_all(a.parent().unwrap());
+    }
+
+    #[test]
+    fn the_message_says_what_to_do_and_has_no_word_the_unlock_screen_reads_as_a_wrong_password() {
+        assert!(!PROFILE_IN_USE.to_lowercase().contains("decrypt"));
+        assert!(PROFILE_IN_USE.contains("another Submarine window"));
+    }
 }
 
 #[cfg(test)]
@@ -1751,6 +1943,8 @@ async fn sync_with(
         pushed: report.pushed + again.pushed,
         pulled: report.pulled + again.pulled,
         key_change: again.key_change,
+        removed: report.removed + again.removed,
+        backup: again.backup.or(report.backup),
     })
 }
 
@@ -1889,11 +2083,24 @@ async fn sync_round(
     let pulled = exchange.records.len();
     // The server couldn't answer from the cursor: start over (`sync_with`).
     let reset = exchange.full && pull_from.is_some();
+    let removed;
+    let mut backup: Option<String> = None;
 
     {
         let conn_g = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
         let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
         db_state.still_open(generation)?;
+        // About to delete rows? A tombstone proves nothing about who sent it, so
+        // the profile is kept as it stands first (vault_backup.rs); the file on
+        // disk is still the state from before this merge.
+        removed = rows_to_delete(conn, &exchange.records);
+        if removed > 0 {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            match profile_path(app, profile).and_then(|p| vault_backup::keep(&p, now)) {
+                Ok(name) => backup = name,
+                Err(e) => eprintln!("[SYNC] no copy of the profile before a merge that deletes: {e}"),
+            }
+        }
         let skipped = apply_remote_records(conn, &dek, &exchange.records, &hlc)?;
         if unlinked {
             link_profile_server(conn, session.base())?;
@@ -1927,7 +2134,7 @@ async fn sync_round(
     }
     // Persist the merged vault so the applied changes survive a restart.
     save_vault_async(db_state).await?;
-    Ok((SyncReport { pushed, pulled, key_change }, reset))
+    Ok((SyncReport { pushed, pulled, key_change, removed, backup }, reset))
 }
 
 #[derive(serde::Serialize)]
@@ -2303,6 +2510,25 @@ async fn accept_share_key(db_state: tauri::State<'_, DbState>) -> Result<(), Str
         tx.commit().map_err(|e| format!("[SHARE] TX_COMMIT: {e}"))?;
     }
     save_vault_async(&db_state).await
+}
+
+#[cfg(test)]
+mod object_list_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tunnels_and_mirrors_must_be_a_list_of_objects() {
+        let kind = col_kind("servers", "tunnels");
+        assert!(matches!(col_kind("servers", "mirrors"), ColKind::ObjectList));
+        for good in [json!(null), json!(""), json!("[]"), json!("[{\"type\":\"L\",\"local\":\"8080\"}]"), json!("[{},{}]")] {
+            assert!(kind.accepts(Some(&good)), "{good}");
+        }
+        assert!(kind.accepts(None));
+        for bad in [json!("[null]"), json!("{}"), json!("[1]"), json!("[\"x\"]"), json!("[[]]"), json!("not json"), json!("[{},null]"), json!(5), json!([1]), json!({})] {
+            assert!(!kind.accepts(Some(&bad)), "{bad}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2775,6 +3001,14 @@ fn discard_half_built_profile(app: &tauri::AppHandle, name: &str, opened: Option
         if let Ok(mut g) = state.active_profile.lock() { *g = None; }
     }
     if let Ok(p) = profile_path(app, name) {
+        // Its one-window lock (#204) goes with it, or the name would stay
+        // "open in another window" in this one until it quit.
+        if let Ok(mut held) = state.profile_lock.lock() {
+            if held.as_ref().is_some_and(|(locked, _)| *locked == p) {
+                *held = None;
+            }
+        }
+        let _ = fs::remove_file(p.with_extension("submarine.lock"));
         let _ = fs::remove_file(p);
     }
 }
@@ -4570,6 +4804,29 @@ mod sync_engine_tests {
         assert!(approvals::held_deletions(&b).iter().any(|d| d.entity_type == "ssh_keys" && d.name == "k"));
     }
 
+    // Before a merge deletes anything, the profile is kept as it stands
+    // (vault_backup.rs); this is the count that says whether it will.
+    #[test]
+    fn rows_a_merge_is_about_to_delete_are_counted_first() {
+        let (a, _ha) = device("A");
+        for i in 0..6 {
+            a.execute("INSERT INTO servers(name,host,port) VALUES(?1,'h',22)", [format!("s{i}")]).unwrap();
+        }
+        a.execute("INSERT INTO ssh_keys(name,public_key,private_key) VALUES('k','pub','priv')", []).unwrap();
+        let seed = collect_local_records(&a, &KEY, "").unwrap();
+        let (p, hp) = device("P");
+        apply_remote_records(&p, &KEY, &seed, &hp).unwrap();
+        assert_eq!(rows_to_delete(&p, &seed), 0, "a batch of rows to add or update deletes nothing");
+
+        a.execute("DELETE FROM servers WHERE name < 's4'", []).unwrap();
+        a.execute("DELETE FROM ssh_keys", []).unwrap();
+        let batch = collect_local_records(&a, &KEY, "").unwrap();
+        assert_eq!(rows_to_delete(&p, &batch), 5, "four servers and the key");
+        apply_remote_records(&p, &KEY, &batch, &hp).unwrap();
+        assert_eq!((count(&p, "servers"), count(&p, "ssh_keys")), (2, 0));
+        assert_eq!(rows_to_delete(&p, &batch), 0, "once they are gone there is nothing left to delete");
+    }
+
     // The user's call: delete them here too, or keep them. Kept rows get
     // stamps newer than the deletions, so they win them back on every device
     // and the same deletions coming again don't take them.
@@ -5118,6 +5375,8 @@ async fn close_profile(
     state: tauri::State<'_, DbState>,
     ssh: tauri::State<'_, SshState>,
     monitor_map: tauri::State<'_, MonitorMap>,
+    cloud: tauri::State<'_, std::sync::Arc<cloud::CloudState>>,
+    ai: tauri::State<'_, ai::AiState>,
 ) -> Result<(), String> {
     // 0. Persist any accumulated in-memory changes (chief among them:
     // cmd_history rows written by TerminalView's Enter-key handler, which
@@ -5127,11 +5386,21 @@ async fn close_profile(
     // preferable to leaking session state.
     let _ = save_vault_async(&state).await;
 
-    // 1. Stop monitor pollers. Flip `paused` first so the next loop iteration
-    // releases the SSH handle, then drop the map so the Arc strong_count
-    // falls to 1 and the poller exits.
-    monitor::pause_all(monitor_map.inner().clone()).await;
-    monitor_map.lock().await.clear();
+    // 1. Stop monitor pollers: each is told to stop (one waiting on a server
+    // that never answers would otherwise keep its connection, the node's
+    // password or key and its events going), and the list is emptied.
+    monitor::stop_all(monitor_map.inner().clone()).await;
+
+    // 1b. Lock sharing too. The account's sharing identity (its secret half
+    // is wiped) outlived a lock until now: someone at the picker could take a
+    // shared profile in under a password of their own. The Profile panel asks
+    // for the sharing passphrase again when sharing is used.
+    cloud.forget_identity().await;
+
+    // 1c. And the AI tabs: their tools lose access, and what this profile's
+    // servers shared with them goes. The page closes their terminals too, but
+    // that's the page's to do; this doesn't depend on it.
+    ai.end_all_tabs();
 
     // 2. Collect every active session id, then run the standard
     // disconnect path for each one. This frees tunnel listener sockets,
@@ -5146,11 +5415,7 @@ async fn close_profile(
         ssh.docker_root.lock().await.remove(sid);
         ssh.sftp_shell.lock().await.remove(sid);
         ssh.connections.lock().await.remove(sid);
-        for dir in [session_sftp_dir(sid), session_drag_dir(sid)].into_iter().flatten() {
-            if dir.exists() {
-                let _ = std::fs::remove_dir_all(&dir);
-            }
-        }
+        sweep_session_temp(sid);
     }
 
     // 3. Close every terminal channel. The spawned PTY task watches its
@@ -5206,6 +5471,7 @@ async fn close_profile(
     *state.db_path.lock().map_err(|_| "[STATE] LOCK_FAILED_PATH")? = None;
     *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE")? = None;
     *state.hlc.lock().map_err(|_| "[STATE] LOCK_FAILED_HLC")? = None;
+    *state.profile_lock.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE_LOCK")? = None;
     state.bump_generation();
     drop(conn_guard);
     Ok(())
@@ -5216,13 +5482,28 @@ async fn close_profile(
 /// file). UI enforces this by only showing the delete button on the picker
 /// screen.
 #[tauri::command]
-async fn delete_profile(app_handle: tauri::AppHandle, name: String) -> Result<(), String> {
+async fn delete_profile(app_handle: tauri::AppHandle, name: String, state: tauri::State<'_, DbState>) -> Result<(), String> {
     validate_profile_name(&name)?;
     let path = profile_path(&app_handle, &name)?;
+    // This window's own lock on it (the page was reloaded with the profile
+    // still open) is let go of first, or the probe below would meet it.
+    {
+        let mut held = state.profile_lock.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE_LOCK")?;
+        if held.as_ref().is_some_and(|(p, _)| *p == path) {
+            *held = None;
+        }
+    }
+    // Not one that another window has open: it would keep saving into a file
+    // that is gone. (The lock is let go of when this probe ends.)
+    let lock_path = path.with_extension("submarine.lock");
+    if let ProfileLock::New(probe) = try_lock_file(&lock_path)? {
+        drop(probe);
+    }
     if path.exists() {
         fs::remove_file(&path)
             .map_err(|e| format!("[FILE] DELETE_PROFILE_FAILED at {:?}: {}", path, e))?;
     }
+    let _ = fs::remove_file(&lock_path);
     // A save that died between writing the tmp and renaming it leaves a
     // `<name>.submarine.tmp` holding a complete vault. `list_profiles` filters
     // on the `.submarine` extension so nothing ever surfaces it, which means
@@ -5278,6 +5559,12 @@ async fn export_profile(
             None => return Ok(None),
         };
 
+        // Not onto the profile's own file: a copy of a file onto itself can empty it.
+        if let (Ok(a), Ok(b)) = (fs::canonicalize(&src), fs::canonicalize(&dst)) {
+            if a == b {
+                return Err("[FILE] EXPORT_SAME_FILE: that is this profile's own file. Choose another place for the copy.".into());
+            }
+        }
         fs::copy(&src, &dst)
             .map_err(|e| format!("[FILE] EXPORT_COPY_FAILED to {:?}: {}", dst, e))?;
         Ok(Some(dst.to_string_lossy().to_string()))
@@ -5405,8 +5692,7 @@ async fn import_profile_bytes(
     validate_profile_name(&name)?;
     // Real vaults are a few MB at most; refuse anything absurd before
     // allocating for it.
-    const MAX_VAULT_BYTES: usize = 256 * 1024 * 1024;
-    if data.len() / 4 * 3 > MAX_VAULT_BYTES {
+    if (data.len() / 4 * 3) as u64 > VAULT_FILE_MAX_BYTES {
         return Err("The file is too large to be a Submarine profile.".into());
     }
     let bytes = base64::engine::general_purpose::STANDARD
@@ -5420,8 +5706,53 @@ async fn import_profile_bytes(
     if dst.exists() {
         return Err(format!("Profile '{}' already exists", name));
     }
-    fs::write(&dst, &bytes).map_err(|e| format!("[FILE] IMPORT_WRITE_FAILED to {:?}: {}", dst, e))?;
-    Ok(())
+    write_new_profile_file(&dst, &bytes, &name)
+}
+
+#[cfg(test)]
+mod profile_file_safety_tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("submarine-profile-files-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_file_far_bigger_than_any_profile_is_refused_unread() {
+        let dir = temp_dir("big");
+        let path = dir.join("huge.submarine");
+        // Sparse: the length is what counts, no disk is used.
+        let f = fs::File::create(&path).unwrap();
+        f.set_len(VAULT_FILE_MAX_BYTES + 1).unwrap();
+        let err = read_vault_file(&path).unwrap_err();
+        assert!(err.contains("TOO_LARGE") && !err.to_lowercase().contains("decrypt"), "{err}");
+        // At the limit it is read.
+        f.set_len(1024).unwrap();
+        assert_eq!(read_vault_file(&path).unwrap().len(), 1024);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_profile_file_lands_whole_and_never_replaces_one_that_is_there() {
+        let dir = temp_dir("new");
+        let dst = dir.join("p.submarine");
+        write_new_profile_file(&dst, b"first", "p").unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), b"first");
+        assert!(!dst.with_extension("submarine.tmp").exists(), "no half-written file is left");
+        let err = write_new_profile_file(&dst, b"second", "p").unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(fs::read(&dst).unwrap(), b"first", "the profile that was there is untouched");
+        assert!(!dst.with_extension("submarine.tmp").exists());
+        // A stale temp from a crash does not get in the way.
+        let other = dir.join("q.submarine");
+        fs::write(other.with_extension("submarine.tmp"), b"left by a crash").unwrap();
+        write_new_profile_file(&other, b"fresh", "q").unwrap();
+        assert_eq!(fs::read(&other).unwrap(), b"fresh");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -5477,7 +5808,7 @@ async fn import_profile_save(
     // previous "read 5 bytes to validate, then fs::copy" was TOCTOU —
     // an attacker (or a script running in parallel) could swap the file
     // between the header read and the copy and we'd import garbage.
-    let bytes = fs::read(&src).map_err(|e| format!("[FILE] IMPORT_READ_FAILED: {}", e))?;
+    let bytes = read_vault_file(&src)?;
     if bytes.len() < 5 || &bytes[..4] != VAULT_MAGIC || bytes[4] != VAULT_VERSION {
         return Err("Source file is no longer a valid Submarine profile.".into());
     }
@@ -5485,9 +5816,7 @@ async fn import_profile_save(
         return Err("Source file is truncated — header is valid but the body is too small.".into());
     }
 
-    fs::write(&dst, &bytes)
-        .map_err(|e| format!("[FILE] IMPORT_WRITE_FAILED to {:?}: {}", dst, e))?;
-    Ok(())
+    write_new_profile_file(&dst, &bytes, &name)
 }
 
 /// Whether the *currently selected* profile's encrypted file exists on
@@ -5552,6 +5881,9 @@ async fn setup_master_db_inner(
     }
 
     let path = profile_path(&app_handle, &profile_name)?;
+    // Before anything is read: another window on this profile stops it here.
+    // If the password turns out wrong the lock is let go with this function.
+    let profile_lock = lock_profile(&state, &path)?;
     let mut conn;
     let salt_bytes: [u8; SALT_LEN];
     // Wrap the derived AES key so it's wiped on every early-return path
@@ -5561,8 +5893,7 @@ async fn setup_master_db_inner(
     let mut needs_resave;
 
     if path.exists() {
-        let encrypted_data = fs::read(&path)
-            .map_err(|e| format!("[FILE] VAULT_READ_FAILED: {}", e))?;
+        let encrypted_data = read_vault_file(&path)?;
         let (parsed_salt, nonce, ciphertext) = parse_vault_blob(&encrypted_data)?;
         // Normalise the Vec<u8> salt into a fixed-size array up front so we
         // can copy it into both the spawn_blocking closure (move-by-Copy) and
@@ -5966,8 +6297,12 @@ async fn setup_master_db_inner(
     *conn_guard = Some(conn);
     *key_guard = Some(key);
     *salt_guard = Some(salt_bytes);
-    *path_guard = Some(path);
+    *path_guard = Some(path.clone());
     *hlc_guard = Some(hlc_arc);
+    if let ProfileLock::New(file) = profile_lock {
+        // Another profile's lock, if one was held, is let go of by this.
+        *state.profile_lock.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE_LOCK")? = Some((path.clone(), file));
+    }
     // A new opening: anything still running for the profile open before
     // (a sync waiting on the network, say) must not write into this one.
     let generation = state.bump_generation();
@@ -7509,6 +7844,76 @@ pub(crate) fn folder_subtree(conn: &rusqlite::Connection, root: i64) -> rusqlite
 }
 
 #[cfg(test)]
+mod mirror_folder_guard_tests {
+    use super::guard_mirror_folder;
+
+    #[test]
+    fn a_relative_or_empty_folder_is_refused() {
+        for bad in ["", ".", "..", "sub/dir", "folder", "./x"] {
+            assert!(guard_mirror_folder(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_folder_and_a_file_are_refused() {
+        let dir = std::env::temp_dir().join(format!("submarine-mirror-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(guard_mirror_folder(&dir.join("nope").to_string_lossy()).is_err());
+        assert!(guard_mirror_folder(&file.to_string_lossy()).is_err());
+        // A real folder passes, and what comes back is its resolved path.
+        let ok = guard_mirror_folder(&dir.to_string_lossy()).unwrap();
+        assert!(std::path::Path::new(&ok).is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_folder_on_a_drive_letter_passes_as_text() {
+        use super::windows_drive_path;
+        for ok in [r"C:\Users\me\site", "d:/work", r"\\?\C:\Users\me", r"\\?\c:\x", "C:\\"] {
+            assert!(windows_drive_path(ok), "{ok}");
+        }
+        for bad in [
+            r"\\attacker.example\share\dir",
+            "//attacker.example/share",
+            r"\\?\UNC\attacker.example\share",
+            r"\\?\unc\attacker.example\share",
+            r"\\?\GLOBALROOT\Device\Mup\attacker.example\share",
+            r"\\.\pipe\x",
+            r"\\.\C:\x",
+            r"\??\UNC\host\share",
+            r"\Users\me",
+            "C:relative",
+            "C:",
+            "",
+            "folder",
+            "/home/me",
+        ] {
+            assert!(!windows_drive_path(bad), "{bad}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_network_share_is_refused_before_anything_is_looked_at() {
+        for bad in [
+            r"\\attacker.example\share\dir",
+            r"\\?\UNC\attacker.example\share",
+            r"\\?\unc\attacker.example\share",
+            r"\\?\GLOBALROOT\Device\Mup\attacker.example\share",
+            r"\\.\pipe\x",
+        ] {
+            let t = std::time::Instant::now();
+            let err = guard_mirror_folder(bad).unwrap_err();
+            assert!(err.contains("network share") || err.contains("MIRROR"), "{bad}: {err}");
+            assert!(t.elapsed() < std::time::Duration::from_secs(1), "{bad} was looked up on the network");
+        }
+    }
+}
+
+#[cfg(test)]
 mod folder_subtree_tests {
     #[test]
     fn a_folders_subtree_holds_every_level_and_survives_a_loop() {
@@ -7607,6 +8012,21 @@ fn normalize_command_scope(scope: Option<&str>) -> Result<Option<String>, String
         return Ok(None);
     }
     Ok(Some(json!({ "servers": servers, "folders": folders }).to_string()))
+}
+
+#[cfg(test)]
+mod hostile_server_loop_tests {
+    use super::http_connect_host_ok;
+
+    #[test]
+    fn a_host_for_an_http_proxy_has_nothing_that_could_start_another_request() {
+        for ok in ["example.com", "10.0.0.5", "[::1]", "fe80::1%eth0", "my_host-1.internal", "b\u{fc}cher.example", "\u{645}\u{62b}\u{627}\u{644}.com"] {
+            assert!(http_connect_host_ok(ok), "{ok}");
+        }
+        for bad in ["", "a b", "a\r\nHost: evil", "x\r\n\r\nGET / HTTP/1.1", "a\nb", "tab\there", "a/b", "a@b", "a\\b", "a#b", "a?b", "nul\0", &"x".repeat(254)] {
+            assert!(!http_connect_host_ok(bad), "{bad:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -8002,6 +8422,22 @@ fn base_session_id(session_id: &str) -> &str {
         .unwrap_or(session_id)
 }
 
+/// How many times in a row a server may start a keyboard-interactive round with
+/// nothing to answer before the method is given up on (a real one has a
+/// banner, or two).
+const MAX_EMPTY_KBI_ROUNDS: u32 = 20;
+
+/// A host an HTTP proxy is asked to CONNECT to. It goes into the request line,
+/// so one with a CR or LF in it would end that line and let the rest be a
+/// second request to the proxy: the host comes from the saved server, which a
+/// co-member of a shared profile can write. Names (any script), IPv4 and
+/// bracketed IPv6 pass; controls, spaces and what has no place in a host don't.
+pub(crate) fn http_connect_host_ok(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']' | '%'))
+}
+
 /// Why turning a stored private key into a usable keypair failed, split so the
 /// connect path can tell a key that merely needs a passphrase we don't have
 /// (worth asking the user for) from one that is broken regardless (no prompt
@@ -8025,18 +8461,165 @@ pub(crate) enum KeyDecodeError {
 /// of a second, so a key can't make decoding hang.
 const MAX_KEY_KDF_ROUNDS: u32 = 1024;
 
-/// Refuse an OpenSSH private key whose bcrypt KDF asks for more rounds than a
-/// real key ever would, before the expensive derivation runs. The round count
-/// is in the key's cleartext envelope, read here without the passphrase. Keys
-/// in other formats (PEM, PKCS#8) parse past this untouched — their cost is
-/// bounded elsewhere.
+/// What a key's passphrase may cost to try, for the formats that name the cost
+/// in the file: the key is read with the passphrase it was saved with (a synced
+/// key brings its own), and what the file asks for is run as it says. Numbers
+/// far past what any tool writes would pin a thread for hours, or ask for
+/// more memory than there is, which ends the whole app.
+const MAX_PBKDF2_ITERATIONS: u64 = 2_000_000; // OpenSSL writes 2048..600000
+const MAX_SCRYPT_BYTES: u64 = 256 * 1024 * 1024; // 128 * N * r; OpenSSL's default is 16 MB
+const MAX_SCRYPT_PARALLEL: u64 = 16;
+const MAX_PPK_ARGON2_KIB: u64 = 256 * 1024; // PuTTYgen writes 8192 (8 MB)
+const MAX_PPK_ARGON2_WORK: u64 = 64 * 1024 * 1024; // memory (KiB) times passes; PuTTYgen: about 100000
+const MAX_PPK_ARGON2_LANES: u64 = 16;
+
+/// One DER element at the start of `input`: its tag, its content and what
+/// follows it. `None` for anything that isn't well formed or runs past the end.
+fn der_next(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let tag = *input.first()?;
+    let first = *input.get(1)?;
+    let (len, header) = if first < 0x80 {
+        (first as usize, 2)
+    } else {
+        let n = (first & 0x7f) as usize;
+        if n == 0 || n > 4 {
+            return None;
+        }
+        let mut len = 0usize;
+        for i in 0..n {
+            len = len.checked_mul(256)?.checked_add(*input.get(2 + i)? as usize)?;
+        }
+        (len, 2 + n)
+    };
+    let end = header.checked_add(len)?;
+    Some((tag, input.get(header..end)?, &input[end..]))
+}
+
+/// A DER INTEGER as an unsigned number; one that doesn't fit counts as the largest.
+fn der_uint(content: &[u8]) -> u64 {
+    let mut digits = content;
+    while digits.len() > 1 && digits[0] == 0 {
+        digits = &digits[1..];
+    }
+    if digits.len() > 8 {
+        u64::MAX
+    } else {
+        digits.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b))
+    }
+}
+
+enum Pbes2Kdf {
+    Pbkdf2 { iterations: u64 },
+    Scrypt { n: u64, r: u64, p: u64 },
+}
+
+/// The key derivation named by a PKCS#8 `EncryptedPrivateKeyInfo` (PBES2), read
+/// from its DER without the passphrase. `None` when it is anything else.
+fn pbes2_kdf(der: &[u8]) -> Option<Pbes2Kdf> {
+    const OID_PBES2: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x05, 0x0d];
+    const OID_PBKDF2: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x05, 0x0c];
+    const OID_SCRYPT: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0xda, 0x47, 0x04, 0x0b];
+    let (_, info, _) = der_next(der)?; // EncryptedPrivateKeyInfo
+    let (_, algorithm, _) = der_next(info)?; // its AlgorithmIdentifier
+    let (tag, oid, rest) = der_next(algorithm)?;
+    if tag != 0x06 || oid != OID_PBES2 {
+        return None;
+    }
+    let (_, pbes2, _) = der_next(rest)?; // PBES2-params
+    let (_, kdf, _) = der_next(pbes2)?; // keyDerivationFunc
+    let (tag, oid, rest) = der_next(kdf)?;
+    if tag != 0x06 {
+        return None;
+    }
+    let (_, params, _) = der_next(rest)?;
+    let (tag, _salt, rest) = der_next(params)?;
+    let (int_tag, first, rest) = der_next(rest)?;
+    if tag != 0x04 || int_tag != 0x02 {
+        return None;
+    }
+    if oid == OID_PBKDF2 {
+        return Some(Pbes2Kdf::Pbkdf2 { iterations: der_uint(first) });
+    }
+    if oid == OID_SCRYPT {
+        let (r_tag, r, rest) = der_next(rest)?;
+        let (p_tag, p, _) = der_next(rest)?;
+        if r_tag != 0x02 || p_tag != 0x02 {
+            return None;
+        }
+        return Some(Pbes2Kdf::Scrypt { n: der_uint(first), r: der_uint(r), p: der_uint(p) });
+    }
+    None
+}
+
+/// The Argon2 settings in the header of a PuTTY `.ppk` key: memory (KiB),
+/// passes, lanes. `None` unless all three are there.
+fn ppk_argon2(text: &str) -> Option<(u64, u64, u64)> {
+    let (mut memory, mut passes, mut lanes) = (None, None, None);
+    for line in text.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            let value = value.trim().parse::<u64>().ok();
+            match key.trim() {
+                "Argon2-Memory" => memory = value,
+                "Argon2-Passes" => passes = value,
+                "Argon2-Parallelism" => lanes = value,
+                _ => {}
+            }
+        }
+    }
+    Some((memory?, passes?, lanes?))
+}
+
+/// Refuse a private key that asks for more work to unlock than a real key ever
+/// would, before the expensive derivation runs. What it asks for is in the
+/// key's cleartext envelope, read here without the passphrase: the bcrypt
+/// rounds of an OpenSSH key, the Argon2 settings of a PuTTY `.ppk`, the PBKDF2
+/// iterations or scrypt cost of an encrypted PKCS#8 key. Anything else (a
+/// legacy PEM key, whose derivation is a hash or two) parses past this.
 fn guard_key_kdf_cost(pem: &str) -> Result<(), KeyDecodeError> {
+    let too_costly = |what: String| {
+        KeyDecodeError::Malformed(format!(
+            "this key asks for far more work to unlock than a real key needs ({what}); re-save it with a lower cost (an OpenSSH key: `ssh-keygen -p -f <keyfile>`)"
+        ))
+    };
     if let Ok(key) = ssh_key::PrivateKey::from_openssh(pem.trim()) {
         if let ssh_key::Kdf::Bcrypt { rounds, .. } = key.kdf() {
             if *rounds > MAX_KEY_KDF_ROUNDS {
                 return Err(KeyDecodeError::Malformed(format!(
                     "this key asks for {rounds} key-derivation rounds — far more than a real key needs (limit {MAX_KEY_KDF_ROUNDS}); re-save it with `ssh-keygen -p -f <keyfile>`"
                 )));
+            }
+        }
+        return Ok(());
+    }
+    if pem.trim_start().starts_with("PuTTY-User-Key-File-") {
+        if let Some((kib, passes, lanes)) = ppk_argon2(pem) {
+            if kib > MAX_PPK_ARGON2_KIB || kib.saturating_mul(passes) > MAX_PPK_ARGON2_WORK || lanes > MAX_PPK_ARGON2_LANES {
+                return Err(too_costly(format!("Argon2: {kib} KiB, {passes} passes, {lanes} lanes")));
+            }
+        }
+        return Ok(());
+    }
+    if pem_private_key_header(pem) == "-----BEGIN ENCRYPTED PRIVATE KEY-----" {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let body: String = pem
+            .lines()
+            .map(str::trim)
+            .skip_while(|l| !l.starts_with("-----BEGIN "))
+            .skip(1)
+            .take_while(|l| !l.starts_with("-----END "))
+            .collect();
+        if let Some(kdf) = STANDARD.decode(body.as_bytes()).ok().as_deref().and_then(pbes2_kdf) {
+            match kdf {
+                Pbes2Kdf::Pbkdf2 { iterations } if iterations > MAX_PBKDF2_ITERATIONS => {
+                    return Err(too_costly(format!("PBKDF2: {iterations} iterations")));
+                }
+                Pbes2Kdf::Scrypt { n, r, p } => {
+                    let bytes = 128u64.saturating_mul(n).saturating_mul(r);
+                    if bytes > MAX_SCRYPT_BYTES || p > MAX_SCRYPT_PARALLEL {
+                        return Err(too_costly(format!("scrypt: N {n}, r {r}, p {p}")));
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -8940,7 +9523,7 @@ mod key_format_tests {
         "-----END PRIVATE KEY-----", "\n",
     );
     const P521_PKCS8_PASSPHRASE: &str = "pkcs8-pass";
-    const P521_PKCS8_ENC: &str = concat!(
+    pub(super) const P521_PKCS8_ENC: &str = concat!(
         "-----BEGIN ENCRYPTED PRIVATE KEY-----", "\n",
         "MIIBZTBfBgkqhkiG9w0BBQ0wUjAxBgkqhkiG9w0BBQwwJAQQUb69XfifBahYHZCi", "\n",
         "T3/dNQICCAAwDAYIKoZIhvcNAgkFADAdBglghkgBZQMEASoEEFEFBT5lelHs0Ikf", "\n",
@@ -9186,6 +9769,131 @@ mod key_format_tests {
         assert!(private_key_is_encrypted(P521_SEC1_LEGACY_ENC));
         for plain in [P521_OPENSSH, P521_SEC1, P521_PKCS8, ED25519_PKCS8] {
             assert!(!private_key_is_encrypted(plain));
+        }
+    }
+}
+
+#[cfg(test)]
+mod key_kdf_cap_tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        if content.len() < 0x80 {
+            out.push(content.len() as u8);
+        } else {
+            let len = (content.len() as u32).to_be_bytes();
+            let skip = len.iter().take_while(|b| **b == 0).count();
+            out.push(0x80 | (4 - skip) as u8);
+            out.extend_from_slice(&len[skip..]);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+    fn int(n: u64) -> Vec<u8> {
+        let mut bytes: Vec<u8> = n.to_be_bytes().iter().copied().skip_while(|b| *b == 0).collect();
+        if bytes.is_empty() || bytes[0] & 0x80 != 0 {
+            bytes.insert(0, 0);
+        }
+        tlv(0x02, &bytes)
+    }
+    const OID_PBES2: [u8; 9] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x05, 0x0d];
+    const OID_PBKDF2: [u8; 9] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x05, 0x0c];
+    const OID_SCRYPT: [u8; 9] = [0x2b, 0x06, 0x01, 0x04, 0x01, 0xda, 0x47, 0x04, 0x0b];
+    const OID_AES256: [u8; 9] = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2a];
+
+    /// An encrypted PKCS#8 key with the given key derivation and no real key in it.
+    fn pkcs8(kdf_oid: &[u8], kdf_params: Vec<u8>) -> String {
+        let kdf = tlv(0x30, &[tlv(0x06, kdf_oid), tlv(0x30, &kdf_params)].concat());
+        let cipher = tlv(0x30, &[tlv(0x06, &OID_AES256), tlv(0x04, &[7u8; 16])].concat());
+        let pbes2 = tlv(0x30, &[kdf, cipher].concat());
+        let algorithm = tlv(0x30, &[tlv(0x06, &OID_PBES2), pbes2].concat());
+        let der = tlv(0x30, &[algorithm, tlv(0x04, &[1u8; 48])].concat());
+        let b64 = STANDARD.encode(der);
+        let mut out = String::from("-----BEGIN ENCRYPTED PRIVATE KEY-----\n");
+        for chunk in b64.as_bytes().chunks(64) {
+            out.push_str(std::str::from_utf8(chunk).unwrap());
+            out.push('\n');
+        }
+        out.push_str("-----END ENCRYPTED PRIVATE KEY-----\n");
+        out
+    }
+    fn pbkdf2(iterations: Vec<u8>) -> String {
+        pkcs8(&OID_PBKDF2, [tlv(0x04, &[9u8; 16]), iterations].concat())
+    }
+    fn scrypt(n: u64, r: u64, p: u64) -> String {
+        pkcs8(&OID_SCRYPT, [tlv(0x04, &[9u8; 16]), int(n), int(r), int(p)].concat())
+    }
+    fn refused(pem: &str) -> bool {
+        matches!(guard_key_kdf_cost(pem), Err(KeyDecodeError::Malformed(_)))
+    }
+
+    #[test]
+    fn pbkdf2_iterations_are_capped() {
+        for ok in [2048, 10_000, 600_000, MAX_PBKDF2_ITERATIONS] {
+            assert!(!refused(&pbkdf2(int(ok))), "{ok}");
+        }
+        for bad in [MAX_PBKDF2_ITERATIONS + 1, 100_000_000, 1 << 31, u64::MAX] {
+            assert!(refused(&pbkdf2(int(bad))), "{bad}");
+        }
+        // More digits than a u64 holds.
+        assert!(refused(&pbkdf2(tlv(0x02, &[0x01; 12]))));
+    }
+
+    #[test]
+    fn scrypt_memory_and_parallelism_are_capped() {
+        assert!(!refused(&scrypt(1 << 14, 8, 1)), "OpenSSL's default");
+        assert!(!refused(&scrypt(1 << 20, 1, 1)), "128 MB");
+        assert!(refused(&scrypt(1 << 20, 8, 1)), "1 GB");
+        assert!(refused(&scrypt(1 << 30, 8, 1)), "a TB");
+        assert!(refused(&scrypt(1 << 14, 8, 1000)));
+        assert!(refused(&scrypt(u64::MAX, u64::MAX, u64::MAX)));
+    }
+
+    #[test]
+    fn the_real_encrypted_key_in_the_tests_still_passes_the_guard() {
+        assert!(guard_key_kdf_cost(super::key_format_tests::P521_PKCS8_ENC).is_ok());
+    }
+
+    #[test]
+    fn ppk_argon2_settings_are_capped() {
+        let ppk = |memory: &str, passes: &str, lanes: &str| {
+            format!("PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: aes256-cbc\nComment: k\nPublic-Lines: 2\nAAAA\nBBBB\nKey-Derivation: Argon2id\nArgon2-Memory: {memory}\nArgon2-Passes: {passes}\nArgon2-Parallelism: {lanes}\nArgon2-Salt: 00\nPrivate-Lines: 1\nCCCC\nPrivate-MAC: 00\n")
+        };
+        assert!(guard_key_kdf_cost(&ppk("8192", "13", "1")).is_ok(), "PuTTYgen's defaults");
+        assert!(guard_key_kdf_cost(&ppk("8192", "200", "1")).is_ok());
+        assert!(refused(&ppk("4000000", "13", "1")), "4 GB");
+        assert!(refused(&ppk("8192", "100000", "1")));
+        assert!(refused(&ppk("8192", "13", "1000")));
+        assert!(refused(&ppk("99999999999999999999", "1", "1")) || guard_key_kdf_cost(&ppk("99999999999999999999", "1", "1")).is_ok(), "does not panic");
+        // Missing or unreadable numbers are left to the decoder.
+        assert!(guard_key_kdf_cost("PuTTY-User-Key-File-3: ssh-ed25519\nArgon2-Memory: lots\n").is_ok());
+    }
+
+    #[test]
+    fn junk_in_the_armor_never_panics() {
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..4000 {
+            let len = (next() % 200) as usize;
+            let mut der: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            // Half of them start like the real thing.
+            if next() % 2 == 0 && der.len() > 12 {
+                der[..3].copy_from_slice(&[0x30, 0x82, 0x01]);
+            }
+            let _ = pbes2_kdf(&der);
+            let pem = format!("-----BEGIN ENCRYPTED PRIVATE KEY-----\n{}\n-----END ENCRYPTED PRIVATE KEY-----", STANDARD.encode(&der));
+            let _ = guard_key_kdf_cost(&pem);
+        }
+        // Bad lengths in every form.
+        for der in [&[0x30u8][..], &[0x30, 0x80], &[0x30, 0x85, 1, 2, 3, 4, 5], &[0x30, 0x84, 0xff, 0xff, 0xff, 0xff], &[0x30, 0x82, 0x01]] {
+            assert!(pbes2_kdf(der).is_none());
         }
     }
 }
@@ -9526,6 +10234,8 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     // Not used yet; taken by its one answer.
     let mut saved_password = saved_password.filter(|p| !p.is_empty());
     let mut answered_with_saved = false;
+    // Rounds the server asked nothing in: a server can go on with them for ever.
+    let mut empty_rounds = 0u32;
 
     loop {
         match resp {
@@ -9560,6 +10270,11 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
                 // A banner-only InfoRequest (zero prompts) needs an empty
                 // response set to advance — nothing to ask the user.
                 if prompts.is_empty() {
+                    empty_rounds += 1;
+                    if empty_rounds > MAX_EMPTY_KBI_ROUNDS {
+                        log("The server keeps asking for nothing, so this method was given up on.", "error");
+                        return None;
+                    }
                     resp = match session
                         .authenticate_keyboard_interactive_respond(Vec::new())
                         .await
@@ -10471,6 +11186,12 @@ async fn connect_jump_chain(
     .map(|handle| vec![handle])
 }
 
+/// How long a jump host's login may take, prompts included (connect_jump_host).
+const JUMP_LOGIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// How long a jump host may take to open the channel to the server behind it,
+/// as for telnet through an SSH server.
+const JUMP_CHANNEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Establish + authenticate an SSH connection to a ProxyJump intermediate
 /// ("bastion") host and return its live `Handle`. The caller opens a
 /// `direct-tcpip` channel over this handle to reach the real target, then keeps
@@ -10725,52 +11446,69 @@ async fn connect_jump_host(
     // For a jump host that asks for the password through keyboard-interactive
     // (#145).
     let kbi_password = password.clone().map(Zeroizing::new);
-    let mut auth_res = if login_cancelled {
-        Ok(false)
-    } else if let Some((private_key, passphrase, key_name)) = key_data {
-        log("Jump host: private key authentication...", "info");
-        let key_label = key_name
-            .filter(|n| !n.trim().is_empty())
-            .unwrap_or_else(|| format!("{}@{}", effective_user.as_str(), host));
-        authenticate_key_prompting(
-            &mut session,
-            &effective_user,
-            &private_key,
-            &key_label,
-            passphrase.map(Zeroizing::new),
-            SecretSlot::JumpPassphrase,
-            &prompt_ctx,
-        )
-        .await
-    } else {
-        log("Jump host: password authentication...", "info");
-        authenticate_password_prompting(
-            &mut session,
-            &effective_user,
-            &host,
-            None,
-            password.map(Zeroizing::new),
-            SecretSlot::JumpPassword,
-            &prompt_ctx,
-        )
-        .await
-    };
+    // The whole login has a deadline, as the monitor's has: a jump host that
+    // took the connection and stops answering would otherwise hold this
+    // attempt, and its turn in the jump host's login queue, for good. It's
+    // long enough for the prompts in it (90 s for a key's passphrase, 120 s
+    // for a code) to be answered one after another.
+    let ladder = async {
+        let mut auth_res = if login_cancelled {
+            Ok(false)
+        } else if let Some((private_key, passphrase, key_name)) = key_data {
+            log("Jump host: private key authentication...", "info");
+            let key_label = key_name
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| format!("{}@{}", effective_user.as_str(), host));
+            authenticate_key_prompting(
+                &mut session,
+                &effective_user,
+                &private_key,
+                &key_label,
+                passphrase.map(Zeroizing::new),
+                SecretSlot::JumpPassphrase,
+                &prompt_ctx,
+            )
+            .await
+        } else {
+            log("Jump host: password authentication...", "info");
+            authenticate_password_prompting(
+                &mut session,
+                &effective_user,
+                &host,
+                None,
+                password.map(Zeroizing::new),
+                SecretSlot::JumpPassword,
+                &prompt_ctx,
+            )
+            .await
+        };
 
-    // A declined prompt ends the hop — don't fall back to asking again. Nor
-    // after an agent signature failed: the session can't run anything else.
-    if !matches!(auth_res, Ok(true))
-        && !prompt_ctx.cancelled.load(std::sync::atomic::Ordering::Relaxed)
-        && !prompt_ctx.session_unusable.load(std::sync::atomic::Ordering::Relaxed)
-    {
-        if let Some(kbi_res) =
-            run_keyboard_interactive(&mut session, &effective_user, app, session_id, &jump_nonce, kbi_txs, attempt, kbi_password.as_ref().map(|p| p.as_str())).await
+        // A declined prompt ends the hop — don't fall back to asking again. Nor
+        // after an agent signature failed: the session can't run anything else.
+        if !matches!(auth_res, Ok(true))
+            && !prompt_ctx.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+            && !prompt_ctx.session_unusable.load(std::sync::atomic::Ordering::Relaxed)
         {
-            auth_res = kbi_res;
+            if let Some(kbi_res) =
+                run_keyboard_interactive(&mut session, &effective_user, app, session_id, &jump_nonce, kbi_txs, attempt, kbi_password.as_ref().map(|p| p.as_str())).await
+            {
+                auth_res = kbi_res;
+            }
         }
-    }
+        auth_res
+    };
+    let ladder_res = tokio::time::timeout(JUMP_LOGIN_DEADLINE, ladder).await;
     release_agent(&prompt_ctx).await;
     // Belt-and-suspenders: no dangling interactive sender for this hop.
     kbi_txs.lock().await.remove(&jump_nonce);
+    let Ok(auth_res) = ladder_res else {
+        return Err(network_error(format!(
+            "jump host {}:{} didn't finish the login within {} minutes",
+            host,
+            port,
+            JUMP_LOGIN_DEADLINE.as_secs() / 60
+        )));
+    };
 
     if user_prompted && matches!(auth_res, Ok(true)) {
         cache_store_secret(cache, &base_id, SecretSlot::JumpUsername, effective_user.clone()).await;
@@ -10846,11 +11584,7 @@ async fn teardown_connection_key(state: &SshState, mirrors: &MirrorMap, key: &st
     state.connections.lock().await.remove(key);
     state.jump_connections.lock().await.remove(key);
     // Wipe temp files the secondary's SFTP downloads / drags left behind.
-    for dir in [session_sftp_dir(key), session_drag_dir(key)].into_iter().flatten() {
-        if dir.exists() {
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-    }
+    sweep_session_temp(key);
 }
 
 /// A Quick Connect target, for `diagnose_connect`: where it goes and as whom,
@@ -11472,9 +12206,12 @@ async fn initiate_connection(
                 Ok(jump_handle) => {
                     // Originator address is cosmetic (logged by the bastion); the
                     // pair below is what OpenSSH sends for a -J hop.
-                    match jump_handle
-                        .channel_open_direct_tcpip(host.clone(), port as u32, "127.0.0.1", 0)
-                        .await
+                    match tokio::time::timeout(
+                        JUMP_CHANNEL_TIMEOUT,
+                        jump_handle.channel_open_direct_tcpip(host.clone(), port as u32, "127.0.0.1", 0),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(russh::Error::ConnectionTimeout))
                     {
                         Ok(channel) => {
                             emit_log(&format!("ProxyJump: opened tunnel to {}:{} through the jump host.", host, port), "success");
@@ -11584,6 +12321,13 @@ async fn initiate_connection(
                         // best-effort; some platforms / virtual NICs reject it.
                         let _ = tcp_stream.set_nodelay(true);
                         apply_tcp_keepalive(&tcp_stream);
+                        if !http_connect_host_ok(&host) {
+                            let err_msg = format!("'{}' can't be asked of an HTTP proxy: a host has no spaces or control characters.", host.escape_debug());
+                            emit_log(&format!("Error: {}", err_msg), "error");
+                            cleanup().await;
+                            emit_connection_failed(&app, &attempt, &session_id_clone, serde_json::json!({"reason": err_msg, "retry": false})).await;
+                            return;
+                        }
                         emit_log(&format!("Requesting HTTP CONNECT tunnel to {}:{}...", host, port), "info");
                         match tokio::time::timeout(
                             Duration::from_secs(10),
@@ -12896,8 +13640,9 @@ async fn restart_session_tunnels(
 async fn mirror_dry_run(
     ssh: tauri::State<'_, SshState>,
     session_id: String,
-    spec: mirror::MirrorSpec,
+    mut spec: mirror::MirrorSpec,
 ) -> Result<mirror::DryRunReport, String> {
+    spec.local = guard_mirror_folder(&spec.local)?;
     let handle = {
         let conns = ssh.connections.lock().await;
         conns.get(&session_id).cloned()
@@ -12912,8 +13657,9 @@ async fn start_mirror(
     ssh: tauri::State<'_, SshState>,
     mirrors: tauri::State<'_, MirrorMap>,
     session_id: String,
-    spec: mirror::MirrorSpec,
+    mut spec: mirror::MirrorSpec,
 ) -> Result<String, String> {
+    spec.local = guard_mirror_folder(&spec.local)?;
     let handle = {
         let conns = ssh.connections.lock().await;
         conns.get(&session_id).cloned()
@@ -13378,11 +14124,15 @@ async fn rdp_builtin_open(
     state: tauri::State<'_, SshState>,
     db_state: tauri::State<'_, DbState>,
     rdp_clients: tauri::State<'_, RdpClients>,
+    screen_flows: tauri::State<'_, screen_flow::ScreenFlows>,
     session_id: String,
     server_id: i32,
     use_ssh_agent: Option<bool>,
     width: u16,
     height: u16,
+    // This server may be logged in to without NLA (the tab's per-server
+    // option, off unless the user turned it on for the server).
+    allow_no_nla: Option<bool>,
     frames: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Result<(), String> {
     use std::sync::Arc;
@@ -13446,6 +14196,7 @@ async fn rdp_builtin_open(
     let cache = Arc::clone(&state.prompted_secrets);
     let db = Arc::clone(&db_state.conn);
     let clients = rdp_clients.inner().clone();
+    let screens = screen_flows.inner().clone();
     let use_agent = use_ssh_agent.unwrap_or(true);
     tauri::async_runtime::spawn(async move {
         let log = |msg: &str, ty: &str| {
@@ -13657,7 +14408,7 @@ async fn rdp_builtin_open(
         };
 
         let (login_user, domain) = rdp_client::split_domain(&user);
-        let login = rdp_client::Login { host: host.clone(), username: login_user, domain, password, width, height };
+        let login = rdp_client::Login { host: host.clone(), username: login_user, domain, password, width, height, allow_no_nla: allow_no_nla.unwrap_or(false) };
         let connected = {
             let (app, attempt, sid, target) = (app.clone(), attempt.clone(), session_id.clone(), target.clone());
             move |w: u16, h: u16| {
@@ -13675,13 +14426,24 @@ async fn rdp_builtin_open(
                 connected(w, h)
             }
         };
-        let frame = move |bytes: Vec<u8>| frames.send(tauri::ipc::InvokeResponseBody::Raw(bytes)).is_ok();
+        let flow = screens.start(&session_id, generation);
+        let frame = screen_frame_sender(frames, Arc::clone(&flow));
         // A decoder that panics on a bad screen update ends this tab only.
-        let run = tauri::async_runtime::spawn(rdp_client::run(stream, client_addr, login, verify, connected, frame, rx));
+        // What the client wants the tab's log to say along the way.
+        let notice = {
+            let (app, attempt, sid) = (app.clone(), attempt.clone(), session_id.clone());
+            move |msg: &str| {
+                if attempt.is_current_now() {
+                    let _ = app.emit(&format!("session-log-{sid}"), serde_json::json!({"msg": msg, "type": "warning"}));
+                }
+            }
+        };
+        let run = tauri::async_runtime::spawn(rdp_client::run(stream, client_addr, login, verify, connected, notice, frame, flow, rx));
         let outcome = match run.await {
             Ok(r) => r,
             Err(_) => Err("The RDP session stopped on bad data from the server".into()),
         };
+        screens.end(&session_id, generation);
         // The last words (a shutdown request) get a moment to go out; then the
         // connection is closed, whether or not the server has closed its side.
         if tokio::time::timeout(std::time::Duration::from_secs(2), &mut carrier).await.is_err() {
@@ -13727,6 +14489,33 @@ async fn rdp_builtin_resize(rdp_clients: tauri::State<'_, RdpClients>, session_i
     if let Some((_, tx)) = rdp_clients.lock().await.get(&session_id) {
         let _ = tx.send(rdp_client::Cmd::Resize(width, height));
     }
+    Ok(())
+}
+
+/// What a screen session (VNC, built-in RDP) sends its frames with: to the
+/// page, counted in `flow` until the page says it drew them (`screen_ack`).
+/// False when the page is gone.
+fn screen_frame_sender(
+    frames: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+    flow: std::sync::Arc<screen_flow::Flow>,
+) -> impl Fn(Vec<u8>) -> bool {
+    move |bytes: Vec<u8>| {
+        let len = bytes.len();
+        // Counted first: the page can answer before this call returns.
+        flow.sent(len);
+        let sent = frames.send(tauri::ipc::InvokeResponseBody::Raw(bytes)).is_ok();
+        if !sent {
+            flow.drawn(len as u64);
+        }
+        sent
+    }
+}
+
+/// A VNC or RDP tab's page drew `bytes` of the frames it was sent: the session
+/// may send more (see screen_flow.rs).
+#[tauri::command]
+async fn screen_ack(screen_flows: tauri::State<'_, screen_flow::ScreenFlows>, session_id: String, bytes: u64) -> Result<(), String> {
+    screen_flows.drawn(&session_id, bytes);
     Ok(())
 }
 
@@ -14035,6 +14824,7 @@ async fn vnc_open(
     state: tauri::State<'_, SshState>,
     db_state: tauri::State<'_, DbState>,
     vnc_clients: tauri::State<'_, vnc_client::VncClients>,
+    screen_flows: tauri::State<'_, screen_flow::ScreenFlows>,
     session_id: String,
     server_id: i32,
     use_ssh_agent: Option<bool>,
@@ -14103,6 +14893,7 @@ async fn vnc_open(
     let cache = Arc::clone(&state.prompted_secrets);
     let db = Arc::clone(&db_state.conn);
     let clients = vnc_clients.inner().clone();
+    let screens = screen_flows.inner().clone();
     let use_agent = use_ssh_agent.unwrap_or(true);
     tauri::async_runtime::spawn(async move {
         let log = |msg: &str, ty: &str| {
@@ -14260,13 +15051,15 @@ async fn vnc_open(
                 }
             }
         };
-        let frame = move |bytes: Vec<u8>| frames.send(tauri::ipc::InvokeResponseBody::Raw(bytes)).is_ok();
+        let flow = screens.start(&session_id, generation);
+        let frame = screen_frame_sender(frames, Arc::clone(&flow));
         // A decoder that panics on a bad screen update ends this tab only.
-        let run = tauri::async_runtime::spawn(vnc_client::run(stream, password, connected, frame, rx, wanted));
+        let run = tauri::async_runtime::spawn(vnc_client::run(stream, password, connected, frame, flow, rx, wanted));
         let outcome = match run.await {
             Ok(r) => r,
             Err(_) => Err("The VNC session stopped on bad data from the server".into()),
         };
+        screens.end(&session_id, generation);
         if tokio::time::timeout(std::time::Duration::from_secs(2), &mut carrier).await.is_err() {
             carrier.abort();
         }
@@ -14418,11 +15211,7 @@ async fn disconnect_session(
     // Wipe any temp files this session left behind (live-edit downloads + drag
     // staging). Best-effort: failures are usually because an editor still holds
     // a lock on a file, in which case the file persists until the OS cleans temp.
-    for dir in [session_sftp_dir(&session_id), session_drag_dir(&session_id)].into_iter().flatten() {
-        if dir.exists() {
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-    }
+    sweep_session_temp(&session_id);
     // Separate-sessions: reap the dedicated `::sftp` / `::fwd` secondaries so an
     // explicit primary disconnect doesn't leak their SSH sessions. Only when
     // this IS a primary id (no `::` suffix) — a direct disconnect of a secondary
@@ -14572,6 +15361,7 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
         rx,
         resize_rx,
         output,
+        Vec::new(),
     ));
 
     Ok(())
@@ -15044,6 +15834,16 @@ fn is_safe_systemctl_unit(unit: &str) -> bool {
     unit.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@' | ':' | '\\'))
 }
 
+/// The command line for `systemctl <action> <unit>` (`sudo -n` in front for
+/// the retry), for a unit that passed `is_safe_systemctl_unit`. The unit goes
+/// in single quotes (that check lets no quote through): the login shell
+/// reads this line, and a backslash is how systemd writes a dash inside an
+/// instance name (`dev-disk-by\x2duuid-….service`), which the shell would
+/// otherwise eat or decode.
+fn systemctl_command(sudo: bool, action: &str, unit: &str) -> String {
+    format!("{}systemctl {} '{}' 2>&1; echo __SUB_EXITCODE:$?", if sudo { "sudo -n " } else { "" }, action, unit)
+}
+
 // Two-stage firewall probe (lazy detail fetch). The network section returns
 // a per-chain summary only; this command pulls the raw rules for one chain
 // on user expand. Wire cost stays proportional to what the user actually
@@ -15252,7 +16052,7 @@ async fn ssh_nft_chain(
 
 #[cfg(test)]
 mod remote_ident_tests {
-    use super::{is_safe_fw_ident, is_safe_systemctl_unit};
+    use super::{is_safe_fw_ident, is_safe_systemctl_unit, systemctl_command};
 
     #[test]
     fn fw_ident_rejects_leading_dash_flags() {
@@ -15292,8 +16092,31 @@ mod remote_ident_tests {
     #[test]
     fn systemctl_unit_accepts_real_units() {
         for ok in ["nginx.service", "ssh.service", "docker.socket", "getty@tty1.service",
-                   "dev-sda1.device", "my.slice", "run-media.mount"] {
+                   "dev-sda1.device", "my.slice", "run-media.mount",
+                   r"a\x2db.service", r"systemd-fsck@dev-disk-by\x2duuid-1234\x2dabcd.service"] {
             assert!(is_safe_systemctl_unit(ok), "{ok:?} must be accepted");
+        }
+    }
+
+    #[test]
+    fn the_command_has_the_unit_in_single_quotes() {
+        assert_eq!(systemctl_command(false, "restart", "nginx.service"), "systemctl restart 'nginx.service' 2>&1; echo __SUB_EXITCODE:$?");
+        assert_eq!(systemctl_command(true, "status", r"a\x2db.service"), r"sudo -n systemctl status 'a\x2db.service' 2>&1; echo __SUB_EXITCODE:$?");
+        // Nothing the check lets through can close the quote.
+        assert!(!is_safe_systemctl_unit("a'b"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_escaped_unit_name_reaches_the_program_as_it_is() {
+        // What the login shell does with the line: put `printf` where systemctl
+        // goes and see what it is given. Unquoted, `\x2d` came out as `x2d`.
+        for unit in [r"a\x2db.service", r"systemd-fsck@dev-disk-by\x2duuid-1234.service", "nginx.service", "getty@tty1.service", "a:b.service"] {
+            let line = systemctl_command(false, "restart", unit).replacen("systemctl", "printf '<%s>'", 1);
+            let out = std::process::Command::new("sh").arg("-c").arg(&line).output().expect("sh runs");
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            assert!(text.starts_with(&format!("<restart><{unit}>")), "{unit:?}: {text:?}");
+            assert!(text.contains("__SUB_EXITCODE:0"), "{text:?}");
         }
     }
 
@@ -15909,7 +16732,7 @@ async fn ssh_systemctl_action(
     // a password when they need one). A call with `password` is that second
     // try, so it goes straight to root.
     if password.is_none() {
-        let plain_cmd = format!("systemctl {} '{}' 2>&1; echo __SUB_EXITCODE:$?", action, unit);
+        let plain_cmd = systemctl_command(false, &action, &unit);
         let raw1 = run_exec_capture(&state, &session_id, &plain_cmd, 30).await?;
         let (code1, out1) = parse_exit_marker(&raw1);
         let needs_root = code1 != 0 && (
@@ -18773,7 +19596,243 @@ mod live_edit_tests {
             assert!(name.chars().all(|c| c.is_ascii_hexdigit()), "a plain folder name: {name}");
         }
     }
+
+    /// An editor that saves by writing a new file and renaming it over the copy
+    /// (gedit, vim, JetBrains' safe write) must be seen on every save. A watch on
+    /// the file itself is lost with its inode on Linux after the first one, so the
+    /// folder that holds the copy is watched, as `sftp_open_remote_file` does, and
+    /// only events for the copy's own name count.
+    #[test]
+    fn a_save_by_rename_is_seen_every_time_and_a_swap_file_is_not_a_save() {
+        use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode, DebouncedEventKind};
+        use std::ffi::OsString;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("submarine-liveedit-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let copy = dir.join("doc.txt");
+        std::fs::write(&copy, "v0").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut debouncer = new_debouncer(Duration::from_millis(200), tx).unwrap();
+        debouncer.watcher().watch(&dir, RecursiveMode::NonRecursive).unwrap();
+        // Names of the files that had a change, until things go quiet for a while.
+        let names = |rx: &std::sync::mpsc::Receiver<notify_debouncer_mini::DebounceEventResult>| -> Vec<OsString> {
+            let mut seen = Vec::new();
+            while let Ok(res) = rx.recv_timeout(Duration::from_millis(1500)) {
+                for ev in res.unwrap_or_default() {
+                    if matches!(ev.kind, DebouncedEventKind::Any | DebouncedEventKind::AnyContinuous) {
+                        seen.extend(ev.path.file_name().map(|n| n.to_os_string()));
+                    }
+                }
+            }
+            seen
+        };
+        let copy_name = OsString::from("doc.txt");
+        for n in 1..=3 {
+            let swap = dir.join(format!(".doc.txt.{n}.swp"));
+            std::fs::write(&swap, format!("v{n}")).unwrap();
+            std::fs::rename(&swap, &copy).unwrap();
+            let seen = names(&rx);
+            assert!(seen.contains(&copy_name), "save {n} by rename was not seen: {seen:?}");
+        }
+        // A file the editor keeps beside the copy is not the copy.
+        std::fs::write(dir.join("doc.txt~"), "backup").unwrap();
+        let seen = names(&rx);
+        assert!(!seen.contains(&copy_name), "a backup file counted as a save: {seen:?}");
+        drop(debouncer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
+
+/// Live Edit copies being watched, each with the hash of what the server
+/// holds as far as this app knows (what was downloaded, or last uploaded).
+/// A copy whose content differs has edits that were never uploaded.
+fn live_edit_copies() -> &'static StdMutex<std::collections::HashMap<PathBuf, Vec<u8>>> {
+    static COPIES: std::sync::OnceLock<StdMutex<std::collections::HashMap<PathBuf, Vec<u8>>>> = std::sync::OnceLock::new();
+    COPIES.get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
+}
+
+/// Set by the first Live Edit, to tell the page about kept copies from
+/// wherever they're found (a disconnect, a lock).
+static LIVE_EDIT_APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+/// Where copies with unsent edits are kept: "Submarine unsent edits" in the
+/// Downloads folder, where the user will look for a file, or in the app's
+/// data folder when there's no Downloads folder.
+fn unsent_edits_dir() -> Option<PathBuf> {
+    const NAME: &str = "Submarine unsent edits";
+    directories::UserDirs::new()
+        .and_then(|d| d.download_dir().map(|p| p.join(NAME)))
+        .or_else(|| LIVE_EDIT_APP.get().and_then(|a| a.path().app_data_dir().ok()).map(|p| p.join(NAME)))
+}
+
+/// The names a kept copy may take in its folder: `name`, then `name (2)`,
+/// `name (3)`, … before the extension.
+fn kept_names(name: &str) -> impl Iterator<Item = String> + '_ {
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
+        _ => (name, String::new()),
+    };
+    std::iter::once(name.to_string()).chain((2..10_000).map(move |n| format!("{stem} ({n}){ext}")))
+}
+
+/// Moves `src` into `dir` under the first of `kept_names` that's free, and
+/// returns where it went. A name is claimed in one step, so nothing that is
+/// there, or appears meanwhile (another sweep keeping a copy of the same
+/// name), is replaced or written through: a hard link, which fails when the
+/// name is taken; or, where there are no hard links between the two folders,
+/// a new file that must not exist yet, which a link already there also makes
+/// fail.
+fn move_to_free_name(src: &Path, dir: &Path, name: &str) -> Option<PathBuf> {
+    use std::io::ErrorKind;
+    for candidate in kept_names(name) {
+        let dest = dir.join(candidate);
+        if std::fs::symlink_metadata(&dest).is_ok() {
+            continue;
+        }
+        match std::fs::hard_link(src, &dest) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(src);
+                return Some(dest);
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(_) => {}
+        }
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&dest) {
+            Ok(mut out) => {
+                let copied = std::fs::File::open(src).and_then(|mut from| std::io::copy(&mut from, &mut out)).is_ok();
+                drop(out);
+                if copied {
+                    let _ = std::fs::remove_file(src);
+                    return Some(dest);
+                }
+                let _ = std::fs::remove_file(&dest);
+                return None;
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// Before Live Edit copies are deleted, the ones under `under` with edits
+/// that were never uploaded (their content isn't what was last uploaded, or
+/// downloaded) are moved to `unsent_edits_dir`, and the page is told
+/// (`live-edit-kept`). The rest are left to be deleted. Returns the folder
+/// when anything was kept there.
+///
+/// `sweep`: the session's temp folder is about to go (its session ended, the
+/// profile is locked), so the copies' entries go too. Otherwise (a watcher
+/// stopped) the entry stays: the editor may still have the file open, and a
+/// save after this is kept at the sweep, not deleted with the folder.
+fn keep_unsent_edits(under: &Path, sweep: bool) -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let unsent: Vec<PathBuf> = {
+        let mut copies = live_edit_copies().lock().unwrap_or_else(|e| e.into_inner());
+        let found: Vec<PathBuf> = copies
+            .iter()
+            .filter(|(path, synced)| {
+                path.starts_with(under)
+                    && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+                    && std::fs::read(path).is_ok_and(|c| Sha256::digest(&c).as_slice() != synced.as_slice())
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        if sweep {
+            copies.retain(|path, _| !path.starts_with(under));
+        }
+        found
+    };
+    if unsent.is_empty() {
+        return None;
+    }
+    let folder = unsent_edits_dir()?;
+    std::fs::create_dir_all(&folder).ok()?;
+    let mut kept = Vec::new();
+    for path in unsent {
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+        if let Some(dest) = move_to_free_name(&path, &folder, &name) {
+            kept.push(dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name));
+        }
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    crate::applog::write_line("live-edit", &format!("kept {} cop{} with unsent edits in {}", kept.len(), if kept.len() == 1 { "y" } else { "ies" }, folder.display()));
+    if let Some(app) = LIVE_EDIT_APP.get() {
+        use tauri::Emitter;
+        let _ = app.emit("live-edit-kept", serde_json::json!({ "folder": folder.to_string_lossy(), "files": kept }));
+    }
+    Some(folder)
+}
+
+#[cfg(test)]
+mod unsent_edits_tests {
+    use super::{kept_names, move_to_free_name};
+
+    fn fresh(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("submarine-unsent-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_names_a_kept_copy_may_take() {
+        let first = |n: &str| kept_names(n).take(3).collect::<Vec<_>>();
+        assert_eq!(first("index.php"), ["index.php", "index (2).php", "index (3).php"]);
+        assert_eq!(first("Makefile"), ["Makefile", "Makefile (2)", "Makefile (3)"]);
+        assert_eq!(first(".bashrc"), [".bashrc", ".bashrc (2)", ".bashrc (3)"]);
+    }
+
+    #[test]
+    fn a_kept_copy_never_replaces_one_kept_before() {
+        let (src_dir, kept) = (fresh("src"), fresh("kept"));
+        std::fs::write(kept.join("index.php"), "earlier").unwrap();
+        std::fs::write(kept.join("index (2).php"), "earlier 2").unwrap();
+        let src = src_dir.join("index.php");
+        std::fs::write(&src, "mine").unwrap();
+        let dest = move_to_free_name(&src, &kept, "index.php").unwrap();
+        assert_eq!(dest, kept.join("index (3).php"));
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "mine");
+        assert_eq!(std::fs::read_to_string(kept.join("index.php")).unwrap(), "earlier");
+        assert_eq!(std::fs::read_to_string(kept.join("index (2).php")).unwrap(), "earlier 2");
+        assert!(!src.exists(), "moved, not copied");
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&kept);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_where_the_copy_would_go_is_not_written_through() {
+        let (src_dir, kept, elsewhere) = (fresh("src2"), fresh("kept2"), fresh("elsewhere"));
+        let target = elsewhere.join("victim");
+        std::os::unix::fs::symlink(&target, kept.join("notes.txt")).unwrap();
+        let src = src_dir.join("notes.txt");
+        std::fs::write(&src, "mine").unwrap();
+        let dest = move_to_free_name(&src, &kept, "notes.txt").unwrap();
+        assert_eq!(dest, kept.join("notes (2).txt"));
+        assert!(!target.exists(), "nothing was written where the link leads");
+        for d in [src_dir, kept, elsewhere] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+}
+
+/// Wipes a session's temp folders (Live Edit copies, drag staging), keeping
+/// unsent edits first (keep_unsent_edits).
+fn sweep_session_temp(session_id: &str) {
+    for dir in [session_sftp_dir(session_id), session_drag_dir(session_id)].into_iter().flatten() {
+        if dir.exists() {
+            keep_unsent_edits(&dir, true);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// How long a live-edit copy may go without a save before its watcher ends.
+const LIVE_EDIT_IDLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
 
 #[tauri::command]
 async fn sftp_open_remote_file(
@@ -18786,6 +19845,13 @@ async fn sftp_open_remote_file(
 
     let sftp = get_sftp_session(&state, &session_id).await?;
     let filename = safe_temp_leaf_name(&remote_path)?;
+    // A program the server named is refused before anything is fetched
+    // (open_policy.rs). Anything else opens in an editor below, never by its
+    // own default action (local_open.rs), so open_policy's other answers
+    // (Editor, Default) aren't needed here.
+    if let open_policy::Opening::Refuse(why) = open_policy::decide(&filename) {
+        return Err(why);
+    }
 
     // Live-edit opens the copy in an editor, so refuse a file too large to
     // hold in memory (a huge binary, or a broken server's endless read) —
@@ -18813,6 +19879,44 @@ async fn sftp_open_remote_file(
         use sha2::{Digest, Sha256};
         Sha256::digest(&data).to_vec()
     };
+    let _ = LIVE_EDIT_APP.set(app_handle.clone());
+    live_edit_copies().lock().unwrap_or_else(|e| e.into_inner()).insert(temp_file_path.clone(), synced_hash.clone());
+
+    // The watcher is made here, before the editor opens, so one that can't start
+    // (inotify's limits, say) is an error the user sees, not a file that never
+    // uploads. It watches the folder that holds the copy (nothing else is in it)
+    // and not the file: an editor that saves by writing a new file and renaming
+    // it over the old one (gedit, vim, JetBrains' safe write) gives the path a
+    // new inode, and a watch on the old one is gone after the first save.
+    use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode, DebouncedEventKind};
+    let (raw_tx, raw_rx) = std::sync::mpsc::channel();
+    let (tok_tx, mut tok_rx) = tokio::sync::mpsc::channel::<()>(8);
+    let mut debouncer = new_debouncer(std::time::Duration::from_millis(750), raw_tx).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_file_path);
+        let _ = std::fs::remove_dir(&copy_dir);
+        format!("Can't watch the file for changes, so edits to it wouldn't be uploaded: {e}")
+    })?;
+    if let Err(e) = debouncer.watcher().watch(&copy_dir, RecursiveMode::NonRecursive) {
+        let _ = std::fs::remove_file(&temp_file_path);
+        let _ = std::fs::remove_dir(&copy_dir);
+        return Err(format!("Can't watch the file for changes, so edits to it wouldn't be uploaded: {e}"));
+    }
+    // Forward bridge: std::mpsc::recv blocks, so it has to live on the blocking
+    // pool. Only the copy's own file counts, not an editor's swap or backup file.
+    let copy_name = temp_file_path.file_name().map(|n| n.to_os_string());
+    tokio::task::spawn_blocking(move || {
+        while let Ok(res) = raw_rx.recv() {
+            if let Ok(events) = res {
+                let ours = events.iter().any(|ev| {
+                    matches!(ev.kind, DebouncedEventKind::Any | DebouncedEventKind::AnyContinuous)
+                        && ev.path.file_name().map(|n| n.to_os_string()) == copy_name
+                });
+                if ours && tok_tx.blocking_send(()).is_err() {
+                    break;
+                }
+            }
+        }
+    });
 
     // Open local temp file in system default application. The whole
     // live-edit-in-default-editor feature is desktop-only — Android's
@@ -18844,52 +19948,24 @@ async fn sftp_open_remote_file(
     let temp_file_path_clone = temp_file_path.clone();
 
     tokio::spawn(async move {
-        // Notify-driven save detection instead of the old 1.5s poll. Wires
-        // the same `notify-debouncer-mini` crate the mirror module uses:
-        //   - std::mpsc::Sender feeds the debouncer (a blocking pool task
-        //     forwards into a tokio mpsc so this async loop can await it)
-        //   - 750ms debounce coalesces an editor's swap-then-rename
-        //     save pattern (vim, vscode) into one upload instead of
-        //     several. The previous polling burned a syscall every
-        //     1.5s for up to 4800 iterations per open file.
-        use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode, DebouncedEventKind};
-        let (raw_tx, raw_rx) = std::sync::mpsc::channel();
-        let (tok_tx, mut tok_rx) = tokio::sync::mpsc::channel::<()>(8);
-        let mut debouncer = match new_debouncer(std::time::Duration::from_millis(750), raw_tx) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("[sftp-live-edit] debouncer init failed: {} — falling back to no autosync", e);
-                let _ = std::fs::remove_file(&temp_file_path_clone);
-                return;
-            }
-        };
-        if let Err(e) = debouncer.watcher().watch(&temp_file_path_clone, RecursiveMode::NonRecursive) {
-            eprintln!("[sftp-live-edit] watch failed: {} — falling back to no autosync", e);
-            let _ = std::fs::remove_file(&temp_file_path_clone);
-            return;
-        }
-        // Forward bridge: std::mpsc::recv blocks, so it has to live on the
-        // blocking pool.
-        tokio::task::spawn_blocking(move || {
-            while let Ok(res) = raw_rx.recv() {
-                if let Ok(events) = res {
-                    if events.iter().any(|ev| matches!(ev.kind, DebouncedEventKind::Any | DebouncedEventKind::AnyContinuous)) {
-                        if tok_tx.blocking_send(()).is_err() { break; }
-                    }
-                }
-            }
-        });
-
-        // Overall 2-hour ceiling so an editor left open forever doesn't
-        // keep the watcher alive past any reasonable session.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2 * 60 * 60);
+        // Saves are noticed by the watcher made above, not polled: its 750 ms
+        // debounce turns an editor's swap-then-rename save (vim, vscode) into one
+        // upload. The limit is on idleness, not on the session: any save starts
+        // it again. It used to end two hours after the file was opened, and a save
+        // after that was neither uploaded nor reported.
+        let mut deadline = tokio::time::Instant::now() + LIVE_EDIT_IDLE_LIMIT;
+        let mut idle_end = false;
         let mut synced_hash = synced_hash;
         loop {
             let wait = tokio::time::sleep_until(deadline);
             tokio::select! {
-                _ = wait => break,
+                _ = wait => {
+                    idle_end = true;
+                    break;
+                }
                 maybe = tok_rx.recv() => {
                     if maybe.is_none() { break; }
+                    deadline = tokio::time::Instant::now() + LIVE_EDIT_IDLE_LIMIT;
                     if !temp_file_path_clone.exists() { break; }
                     let content = match std::fs::read(&temp_file_path_clone) {
                         Ok(c) => c,
@@ -18949,6 +20025,14 @@ async fn sftp_open_remote_file(
 
                     use russh_sftp::protocol::OpenFlags;
                     use tokio::io::AsyncWriteExt;
+                    // An upload to this same file (the file pane, or a save
+                    // just before) would interleave with this one: take turns,
+                    // as uploads do (RemoteWriteLocks). A save isn't cancelled.
+                    let never = std::sync::atomic::AtomicBool::new(false);
+                    let (_write_turn, _) = remote_write_locks()
+                        .acquire(&session_id_clone, &remote_path_clone, &never)
+                        .await
+                        .ok_or("cancelled")?;
                     // Truncate so shortening the file doesn't leave the old
                     // tail behind on the server.
                     let mut remote_file = sftp
@@ -18976,6 +20060,9 @@ async fn sftp_open_remote_file(
                         );
                     } else {
                         synced_hash = content_hash;
+                        if let Some(h) = live_edit_copies().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&temp_file_path_clone) {
+                            h.clone_from(&synced_hash);
+                        }
                         let _ = app_handle_clone.emit(
                             &format!("sftp-sync-status-{}", session_id_clone),
                             serde_json::json!({ "status": "success", "message": format!("Auto-synced {}", filename_clone) })
@@ -18984,15 +20071,38 @@ async fn sftp_open_remote_file(
                 }
             }
         }
-        // The watcher exited (timeout, file disappeared, or session gone).
-        // Wipe the temp file so the remote contents aren't left lying around
-        // in OS temp once editing is done. Errors are intentionally ignored
-        // — on Windows the editor may still hold a lock on the file, and the
-        // worst case is the file persists until the OS cleans temp.
+        // The watcher exited (idle for a long time, the file disappeared, or the
+        // session is gone). The copy is wiped so the remote contents aren't left
+        // lying around in OS temp once editing is done, unless it holds edits that
+        // were never uploaded: those stay, and the user is told. Errors are
+        // intentionally ignored: on Windows the editor may still hold a lock on the
+        // file, and the worst case is the file persists until the OS cleans temp.
         drop(debouncer);
-        let _ = std::fs::remove_file(&temp_file_path_clone);
-        if let Some(dir) = temp_file_path_clone.parent() {
-            let _ = std::fs::remove_dir(dir); // the file's own folder, if now empty
+        let unsynced = {
+            use sha2::{Digest, Sha256};
+            std::fs::read(&temp_file_path_clone).map(|c| Sha256::digest(&c).to_vec() != synced_hash).unwrap_or(false)
+        };
+        // Moved out of the temp folder, which a disconnect or a lock wipes.
+        let kept_in = keep_unsent_edits(&temp_file_path_clone, false);
+        if unsynced || idle_end {
+            let message = if unsynced {
+                match &kept_in {
+                    Some(folder) => format!("{filename_clone} has changes that were not uploaded; they're kept in {}", folder.display()),
+                    None => format!("{filename_clone} has changes that were not uploaded; the copy on this computer was kept"),
+                }
+            } else {
+                format!("Auto-sync for {filename_clone} stopped after {} hours without a change; open the file again to go on", LIVE_EDIT_IDLE_LIMIT.as_secs() / 3600)
+            };
+            let _ = app_handle_clone.emit(
+                &format!("sftp-sync-status-{}", session_id_clone),
+                serde_json::json!({ "status": "error", "message": message }),
+            );
+        }
+        if !unsynced {
+            let _ = std::fs::remove_file(&temp_file_path_clone);
+            if let Some(dir) = temp_file_path_clone.parent() {
+                let _ = std::fs::remove_dir(dir); // the file's own folder, if now empty
+            }
         }
     });
 
@@ -19691,33 +20801,36 @@ fn parse_putty_reg(text: &str) -> Result<Vec<ImportedHost>, String> {
 
 /// PuTTY registry keys with special characters (space, backslash, non-
 /// ASCII) are percent-escaped in the exported name. `%20` → space,
-/// `%25` → `%`. Anything else is passed through as-is. Not a full URL
-/// decoder — PuTTY's escape table is narrower.
+/// `%25` → `%`, and the bytes of a non-ASCII name (`%C3%A9` → é) are its
+/// UTF-8. A name that isn't valid UTF-8 (an older PuTTY wrote the Windows code
+/// page) keeps one character per byte, as before. Anything else is passed
+/// through as-is. Not a full URL decoder — PuTTY's escape table is narrower.
 fn putty_unescape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         // Only treat `%HH` as an escape when both following bytes are ASCII
-        // hex digits. The is_ascii_hexdigit guard also keeps the `&s[..]`
-        // slice on char boundaries — without it, a `%` before a multi-byte
-        // UTF-8 char (e.g. `%€`) would slice mid-codepoint and panic.
+        // hex digits (so the `%` before a multi-byte UTF-8 char, e.g. `%€`,
+        // is just a `%`).
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
             && bytes[i + 1].is_ascii_hexdigit()
             && bytes[i + 2].is_ascii_hexdigit()
         {
-            let hex = &s[i + 1..i + 3];
-            if let Ok(n) = u8::from_str_radix(hex, 16) {
-                out.push(n as char);
+            if let Ok(n) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(n);
                 i += 3;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    match String::from_utf8(out) {
+        Ok(name) => name,
+        Err(bad) => bad.into_bytes().into_iter().map(|b| b as char).collect(),
+    }
 }
 
 /// `.reg` string entries look like `"HostName"="1.2.3.4"`. Strip the
@@ -19843,6 +20956,8 @@ fn parse_mobaxterm_sessions_in(text: &str, profile_dir: Option<&str>, documents:
     // Session names repeat, within a folder too; the import list keys rows by
     // folder and name.
     let mut names: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    // The next number to try for a name already taken in a folder.
+    let mut next_number: std::collections::HashMap<(String, String), u32> = std::collections::HashMap::new();
     let mut in_bookmarks = false;
     let mut folder: Vec<String> = Vec::new();
     for raw in text.lines() {
@@ -19895,10 +21010,19 @@ fn parse_mobaxterm_sessions_in(text: &str, profile_dir: Option<&str>, documents:
         let jump_credential = proxy_jump.as_ref().and_then(|_| mobaxterm_jump_login(field(8), field(10)));
         let folder_key = folder.join("\\");
         let mut alias = name.to_string();
-        let mut n = 2;
-        while !names.insert((folder_key.clone(), alias.clone())) {
-            alias = format!("{} ({})", name, n);
-            n += 1;
+        if !names.insert((folder_key.clone(), alias.clone())) {
+            // Go on from where this name left off in this folder, not from 2
+            // each time: a list of N sessions with one name must not cost N²
+            // tries (an export of 20,000 of them froze the window for a
+            // minute).
+            let next = next_number.entry((folder_key.clone(), name.to_string())).or_insert(2);
+            loop {
+                alias = format!("{} ({})", name, next);
+                *next += 1;
+                if names.insert((folder_key.clone(), alias.clone())) {
+                    break;
+                }
+            }
         }
         out.push(ImportedHost {
             key: format!("{}\\{}", folder_key, alias),
@@ -20153,6 +21277,55 @@ mod client_import_tests {
         assert_eq!(hosts[1].proxy_jump.as_deref(), Some("me@other.example:2200"), "a spelled-out hop stays as it is");
         assert_eq!(hosts[2].proxy_jump.as_deref(), Some("jump@10.0.0.1:2222,10.9.0.1"));
         assert_eq!(hosts[3].proxy_jump, None);
+    }
+
+    #[test]
+    fn a_long_run_of_one_name_imports_in_linear_time() {
+        // 40,000 sessions called "web": the number to try next is kept per name.
+        // Counting from 2 every time took 200 s for this input.
+        let line = session("web", 109, "0%a.example%22%u%%-1%-1%%%%%0%0%0%%%-1");
+        let text = export(&vec![line; 40_000]);
+        let started = std::time::Instant::now();
+        let hosts = parse_client_hosts(text).unwrap();
+        let took = started.elapsed();
+        assert_eq!(hosts.len(), 40_000);
+        assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
+        assert_eq!(hosts[0].host_alias, "web");
+        assert_eq!(hosts[1].host_alias, "web (2)");
+        assert_eq!(hosts[39_999].host_alias, "web (40000)");
+        let mut unique: Vec<&str> = hosts.iter().map(|h| h.host_alias.as_str()).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 40_000, "every row has its own name");
+    }
+
+    #[test]
+    fn a_session_really_called_web_2_is_not_overwritten_by_the_counter() {
+        let s = |name: &str| session(name, 109, "0%a.example%22%u%%-1%-1%%%%%0%0%0%%%-1");
+        let hosts = parse_client_hosts(export(&[s("web"), s("web (2)"), s("web"), s("web"), s("web (2)")])).unwrap();
+        let names: Vec<&str> = hosts.iter().map(|h| h.host_alias.as_str()).collect();
+        assert_eq!(names, vec!["web", "web (2)", "web (3)", "web (4)", "web (2) (2)"]);
+    }
+
+    #[test]
+    fn putty_names_come_out_as_they_were_typed() {
+        use super::putty_unescape;
+        assert_eq!(putty_unescape("My%20Server"), "My Server");
+        assert_eq!(putty_unescape("100%25"), "100%");
+        // UTF-8 bytes of non-ASCII names (Persian, accented, CJK).
+        assert_eq!(putty_unescape("%C3%A9t%C3%A9"), "été");
+        assert_eq!(putty_unescape("%D8%B3%D8%B1%D9%88%D8%B1"), "سرور");
+        assert_eq!(putty_unescape("%E6%9C%8D%E5%8A%A1%E5%99%A8%201"), "服务器 1");
+        // Already-decoded text is left alone, not turned into two characters each.
+        assert_eq!(putty_unescape("été سرور"), "été سرور");
+        // A name from an older PuTTY (Windows-1252 bytes, not UTF-8) keeps one character per byte.
+        assert_eq!(putty_unescape("caf%E9"), "café");
+        // Not an escape: nothing to decode, and nothing to cut in half.
+        assert_eq!(putty_unescape("50%€"), "50%€");
+        assert_eq!(putty_unescape("%"), "%");
+        assert_eq!(putty_unescape("%4"), "%4");
+        assert_eq!(putty_unescape("%zz"), "%zz");
+        assert_eq!(putty_unescape(""), "");
     }
 
     #[test]
@@ -20425,6 +21598,56 @@ fn guard_local_path_nofollow(path: &str, must_exist: bool) -> Result<std::path::
     check_local_path_policy(full)
 }
 
+/// The local folder of a mirror, checked like any other local path the app
+/// changes. The folder is part of the server's saved row, which a co-member of
+/// a shared profile can write, and a mirror writes into it (and, set to take the
+/// server's files, over what is there): a relative one (`.`) would be the app's
+/// own folder, where a dropped `version.dll` is loaded next time; and a network
+/// share (`\\host\share`) sends this account's Windows login hash to
+/// whatever host the name points to, at the first look at it, before any
+/// preview. So: no network shares, a full path, a folder that exists, none of
+/// the system folders. The resolved path is what the mirror then uses.
+fn guard_mirror_folder(local: &str) -> Result<String, String> {
+    let share = || format!("[MIRROR] A network share ({local}) can't be a mirror's local folder. Map it to a drive letter first.");
+    // Looked at as text first, before anything touches the path: only a
+    // folder on a drive letter. Refusing the kinds of share one by one let
+    // others through (`\\?\unc\…` in lower case, `\\?\GLOBALROOT\Device\Mup\…`).
+    if cfg!(windows) && !windows_drive_path(local) {
+        return Err(share());
+    }
+    let folder = guard_local_path(local, false)?;
+    // And the folder it resolves to: a link on a drive can lead to a share.
+    if !resolved_on_a_drive(&folder) {
+        return Err(share());
+    }
+    if !folder.is_dir() {
+        return Err(format!("[MIRROR] The local folder isn't a folder: {local}"));
+    }
+    Ok(folder.to_string_lossy().into_owned())
+}
+
+/// Whether a Windows path, as text, is a folder on a drive letter: `C:\…`,
+/// `C:/…`, or the same behind `\\?\` (`\\?\C:\…`). Anything else that starts
+/// with a slash is a share, a device or a path relative to the drive, and is
+/// refused. Written over the text, not `Path`, so it means the same on every
+/// system it's tested on.
+fn windows_drive_path(path: &str) -> bool {
+    let p = path.replace('/', "\\");
+    let rest = p.strip_prefix("\\\\?\\").unwrap_or(&p);
+    let b = rest.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\'
+}
+
+/// The resolved folder is on a drive (Windows: a `Disk` or `VerbatimDisk`
+/// prefix), or has no prefix at all (other systems).
+fn resolved_on_a_drive(folder: &std::path::Path) -> bool {
+    use std::path::{Component, Prefix};
+    match folder.components().next() {
+        Some(Component::Prefix(prefix)) => matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)),
+        _ => !cfg!(windows),
+    }
+}
+
 /// The system folders `check_local_path_policy` refuses, as lowercase paths
 /// with `/`. On Windows they are also read from the environment (`var` looks
 /// one up): Windows and its program folders aren't always on drive C. On
@@ -20662,6 +21885,51 @@ mod symlink_fs_tests {
     }
 
     #[tokio::test]
+    async fn renaming_onto_an_existing_file_or_folder_is_refused_and_nothing_is_lost() {
+        let root = scratch("mvclash");
+        let (a, b, dir) = (root.join("report.txt"), root.join("report-final.txt"), root.join("docs"));
+        std::fs::write(&a, b"new").unwrap();
+        std::fs::write(&b, b"old, the one to keep").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("report.txt"), b"in the folder").unwrap();
+        let s = |p: &Path| p.to_string_lossy().to_string();
+
+        let e = local_rename(s(&a), s(&b)).await.unwrap_err();
+        assert!(e.contains("report-final.txt") && e.contains("already exists"), "{e}");
+        assert_eq!(std::fs::read(&b).unwrap(), b"old, the one to keep");
+        assert_eq!(std::fs::read(&a).unwrap(), b"new", "the file that was being moved is where it was");
+        // A move into a folder that has the name is the same thing.
+        let e = local_rename(s(&a), s(&dir.join("report.txt"))).await.unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+        assert_eq!(std::fs::read(dir.join("report.txt")).unwrap(), b"in the folder");
+        // A file onto a folder.
+        assert!(local_rename(s(&a), s(&dir)).await.is_err());
+        assert!(dir.is_dir());
+        // A name that is free still works.
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        local_rename(s(&a), s(&root.join("sub").join("moved.txt"))).await.unwrap();
+        assert_eq!(std::fs::read(root.join("sub").join("moved.txt")).unwrap(), b"new");
+        assert!(!a.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_rename_to_another_spelling_of_the_same_name_is_not_a_clash() {
+        let root = scratch("mvcase");
+        let a = root.join("report.txt");
+        std::fs::write(&a, b"data").unwrap();
+        let upper = root.join("Report.txt");
+        local_rename(a.to_string_lossy().to_string(), upper.to_string_lossy().to_string()).await.unwrap();
+        let names: Vec<String> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["Report.txt".to_string()], "one file, under its new spelling");
+        assert_eq!(std::fs::read(&upper).unwrap(), b"data");
+        // To its own name: nothing happens, nothing fails.
+        local_rename(upper.to_string_lossy().to_string(), upper.to_string_lossy().to_string()).await.unwrap();
+        assert_eq!(std::fs::read(&upper).unwrap(), b"data");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn listing_reports_folder_links_as_folders() {
         let root = scratch("list");
         let target = root.join("real");
@@ -20698,6 +21966,25 @@ mod symlink_fs_tests {
     }
 }
 
+/// Whether two paths are one file or folder (a rename to another spelling of
+/// its own name, on a file system that ignores case).
+fn same_entry(a: &std::path::Path, b: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // A link at the destination is a different entry even when it leads here.
+        let b_is_link = std::fs::symlink_metadata(b).map_or(true, |m| m.file_type().is_symlink());
+        !b_is_link && matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
+    }
+}
+
 #[tauri::command]
 async fn local_rename(from: String, to: String) -> Result<(), String> {
     // No-follow on both ends: renaming a link must move the link, and an
@@ -20705,6 +21992,17 @@ async fn local_rename(from: String, to: String) -> Result<(), String> {
     // target.
     let safe_from = guard_local_path_nofollow(&from, true)?;
     let safe_to = guard_local_path_nofollow(&to, false)?;
+    // Never onto something that is there: rename(2) and MoveFileEx both put the
+    // moved file in the old one's place, with no question and no recycle bin
+    // (the remote pane refuses, as SFTP does). The same entry under another
+    // spelling of its name (report.txt -> Report.txt) is not a clash.
+    if safe_from == safe_to {
+        return Ok(());
+    }
+    if std::fs::symlink_metadata(&safe_to).is_ok() && !same_entry(&safe_from, &safe_to) {
+        let name = safe_to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        return Err(format!("'{name}' already exists there. Nothing was replaced."));
+    }
     // Same auto-mkdir-parent UX as sftp_rename: moving a file into a
     // subfolder that doesn't exist yet would otherwise fail with a
     // confusing "system cannot find the path specified" / ENOENT.
@@ -21806,11 +23104,12 @@ pub fn run() {
     #[cfg(target_os = "android")]
     let builder = builder.plugin(android_bridge::init());
     let builder = builder
-        .manage(DbState { conn: std::sync::Arc::new(StdMutex::new(None)), master_key: StdMutex::new(None), salt: StdMutex::new(None), db_path: StdMutex::new(None), active_profile: StdMutex::new(None), hlc: StdMutex::new(None), generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)), sync_cursor: StdMutex::new(None) })
+        .manage(DbState { conn: std::sync::Arc::new(StdMutex::new(None)), master_key: StdMutex::new(None), salt: StdMutex::new(None), db_path: StdMutex::new(None), active_profile: StdMutex::new(None), hlc: StdMutex::new(None), generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)), sync_cursor: StdMutex::new(None), profile_lock: StdMutex::new(None) })
         .manage(SshState::new())
         .manage(rdp::RdpSessions::default())
         .manage(telnet::Pending::default())
         .manage(vnc_client::VncClients::default())
+        .manage(screen_flow::ScreenFlows::default())
         .manage(RdpClients::default())
         // Docker live-log stream registry — keyed by frontend-issued stream id,
         // values are tokio AbortHandles so the user can stop tailing on demand.
@@ -21882,7 +23181,7 @@ pub fn run() {
             pick_ssh_key_file, read_ssh_key_file, import_ssh_key_file,
             initiate_connection, verify_fingerprint_response, submit_kbi_response, disconnect_session, set_use_ssh_config,
             initiate_rdp, rdp_open_again, rdp_builtin_open, rdp_builtin_input, rdp_builtin_resize, rdp_builtin_close,
-            telnet_connect, telnet_open_terminal, vnc_open, vnc_input, vnc_resize,
+            telnet_connect, telnet_open_terminal, vnc_open, vnc_input, vnc_resize, screen_ack,
             start_tunnel, stop_tunnel, list_tunnels, restart_session_tunnels, persist_session_tunnels,
             list_tunnel_rules, remove_tunnel_rule, rename_tunnel_rule,
             open_terminal, local_shell, write_terminal_data, type_saved_password, resize_terminal, close_terminal,

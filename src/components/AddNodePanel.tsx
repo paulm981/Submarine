@@ -11,6 +11,7 @@ import { SCHEMES, readSchemeId, schemeById } from "../ui/terminalThemes";
 import { HIGHLIGHT_SETS, highlightSetById, readHighlightId } from "../ui/highlight";
 import { SchemeSwatch } from "./TerminalSchemes";
 import { DEFAULT_RDP_OPTIONS, RDP_BUILTIN_EXPERIMENTAL, RDP_WINDOW_SIZES, type RdpOptions } from "../util/rdpOptions";
+import { TAG_COLOURS, customTagColour, pickerValue } from "../util/tagColours";
 
 // Compact "2h ago" style relative time for the attribution line.
 function relTime(d: Date): string {
@@ -572,27 +573,41 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
             <div className="space-y-1.5">
               <label className="text-[11px] font-bold text-zinc-400 ml-1">Tag colour</label>
               <div className="flex items-center gap-2 flex-wrap">
-                {[
-                  { name: "Default", value: null,      cls: "bg-zinc-500" },
-                  { name: "Rose",    value: "#f43f5e", cls: "bg-rose-500" },
-                  { name: "Amber",   value: "#f59e0b", cls: "bg-amber-500" },
-                  { name: "Emerald", value: "#10b981", cls: "bg-emerald-500" },
-                  { name: "Sky",     value: "#0ea5e9", cls: "bg-sky-500" },
-                  { name: "Indigo",  value: "#6366f1", cls: "bg-indigo-500" },
-                  { name: "Fuchsia", value: "#d946ef", cls: "bg-fuchsia-500" },
-                  { name: "Slate",   value: "#64748b", cls: "bg-slate-500" },
-                ].map((p) => {
+                {TAG_COLOURS.map((p) => {
                   const selected = (newNode.color ?? null) === p.value;
                   return (
                     <button
                       key={p.name}
                       type="button"
                       title={p.name}
+                      aria-label={p.name}
+                      aria-pressed={selected}
                       onClick={() => setNewNode({ ...newNode, color: p.value })}
-                      className={`w-6 h-6 rounded-full ${p.cls} ring-2 ring-transparent hover:ring-white/30 transition-all ${selected ? "ring-white" : ""}`}
+                      className={`w-6 h-6 rounded-full ${p.value ? "" : "bg-zinc-500"} ring-2 ring-transparent hover:ring-white/30 transition-all ${selected ? "ring-white" : ""}`}
+                      style={p.value ? { background: p.value } : undefined}
                     />
                   );
                 })}
+                {/* Any other colour: the system's colour picker, as a swatch of its own
+                    (it shows the colour once one is chosen). */}
+                {(() => {
+                  const custom = customTagColour(newNode.color);
+                  return (
+                    <label
+                      title="Another colour…"
+                      className={`relative w-6 h-6 rounded-full cursor-pointer ring-2 ring-transparent hover:ring-white/30 transition-all ${custom ? "ring-white" : ""}`}
+                      style={{ background: custom ?? "conic-gradient(#ef4444, #eab308, #22c55e, #06b6d4, #3b82f6, #a855f7, #ef4444)" }}
+                    >
+                      <input
+                        type="color"
+                        aria-label="Another colour"
+                        value={pickerValue(newNode.color ?? null)}
+                        onChange={(e) => setNewNode({ ...newNode, color: e.target.value })}
+                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                      />
+                    </label>
+                  );
+                })()}
               </div>
             </div>
 
@@ -824,7 +839,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                       </select>
                     </div>
                   )}
-                  {builtin ? (
+                  {builtin ? (<>
                     <div role="note" className="flex gap-2 p-2.5 rounded-lg border border-amber-500/25 bg-amber-500/5 text-[10.5px] leading-snug text-amber-200/90">
                       <FlaskConical size={13} className="shrink-0 mt-px text-amber-300" aria-hidden="true" />
                       <span>
@@ -832,7 +847,25 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                         Clipboard and file sharing work in the computer's RDP app for now.
                       </span>
                     </div>
-                  ) : (<>
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-[11px] font-bold text-zinc-300">Allow servers without NLA</div>
+                        <div className="text-[10.5px] text-zinc-500 leading-snug">
+                          NLA makes the server prove it knows the password before it is sent. Off, a server without it is refused and nothing is sent; on, the password goes inside TLS only.
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => set({ allowNoNla: !o.allowNoNla })}
+                        role="switch"
+                        aria-label="Allow servers without NLA"
+                        aria-checked={!!o.allowNoNla}
+                        className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${o.allowNoNla ? "bg-primary" : "bg-white/10"}`}
+                      >
+                        <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-zinc-100 rounded-full shadow transition-transform ${o.allowNoNla ? "translate-x-5" : "translate-x-0"}`} />
+                      </button>
+                    </div>
+                  </>) : (<>
                   <div className="flex justify-between items-center gap-3">
                     <label className="text-[11px] font-bold text-zinc-400 shrink-0">Window</label>
                     <select

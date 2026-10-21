@@ -5,7 +5,7 @@
 1. **An issue first.** Every change has an issue: an existing one, or a new one opened before the work starts. The issue says what and why; a design that grows goes in the issue, so it's kept.
 2. **A pull request that closes it.** The pull request's body starts with `Closes #N` (one line per issue it finishes; `Part of #N` when it does only some of one). GitHub links them and closes the issue on merge. One pull request may close several small issues that don't touch the same code.
 3. **A line in CHANGELOG.md** for what someone using the app will notice, ending with the issue's link, e.g. `([#45](https://github.com/paulm981/Submarine/issues/45))`. It goes under `## Next release` at the top. Never guess a version number: every merge to main is a release and takes the next number, so two pull requests open at once can't both know theirs.
-4. **The release** is made by the merge itself (`.github/workflows/build.yml`): it's numbered `v0.3.8-fork.N`, and its page lists the merged pull requests, each linking its issues. So a pull request's title is written for the person using the app, not for the code.
+4. **The release** is made by the merge itself (`.github/workflows/build.yml`): it's numbered with the original project's version and the fork's count, such as `v0.4.0-fork.N`, and its page lists the merged pull requests, each linking its issues. So a pull request's title is written for the person using the app, not for the code.
 
 Changes to `.md` files only (docs, this file, the changelog) don't make a release.
 

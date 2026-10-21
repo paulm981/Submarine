@@ -2,17 +2,22 @@
 //!
 //! On Windows the default action for an `.exe`, `.bat`, `.lnk`, `.hta`,
 //! `.js`, … is to run it, and Git for Windows / Python make `.sh` and `.py`
-//! run too. So "open this remote file in its default app" could run it here.
-//! This module keeps that from happening:
+//! run too. macOS runs a `.terminal` or `.command` file in Terminal, and
+//! Linux desktops hand a `.jar` or a `.desktop` file to what runs it. So
+//! "open this remote file in its default app" could run it here. This module
+//! keeps that from happening:
 //!
 //! - Live Edit opens its copy in a text editor: the one picked under
-//!   Settings, or Notepad on Windows. Other systems keep their default app
-//!   unless an editor is picked.
-//! - The Local pane asks before opening a file Windows would run
+//!   Settings, or else Notepad on Windows, the default text editor on macOS
+//!   (`open -t`), and the text editor set for plain text on Linux. Never the
+//!   file's own default app: a list of the types that run can't be complete
+//!   (Wine runs Windows programs and scripts on Linux, for one).
+//! - The Local pane asks before opening a file the system would run
 //!   ([`runs_when_opened`]).
 //! - Files downloaded from a server are marked as coming from the internet
 //!   ([`mark_from_internet`]), as browsers mark their downloads, so
-//!   SmartScreen and Office Protected View treat them as downloads.
+//!   SmartScreen and Office Protected View on Windows, and Gatekeeper on
+//!   macOS, treat them as downloads.
 
 use std::path::{Path, PathBuf};
 use tauri::Manager;
@@ -102,7 +107,13 @@ pub struct LiveEditEditor {
 fn editor_info(app: &tauri::AppHandle) -> LiveEditEditor {
     LiveEditEditor {
         chosen: chosen_editor(app).map(|p| p.to_string_lossy().into_owned()),
-        default_label: if cfg!(windows) { "Notepad" } else { "the system's default app" },
+        default_label: if cfg!(windows) {
+            "Notepad"
+        } else if cfg!(target_os = "macos") {
+            "the default text editor"
+        } else {
+            "the text editor for plain text"
+        },
     }
 }
 
@@ -152,10 +163,61 @@ pub fn open_for_editing(app: &tauri::AppHandle, file: &Path) -> Result<(), Strin
     {
         start_editor(&notepad(), file)
     }
-    #[cfg(not(windows))]
+    // `open -t` opens it in the default text editor (TextEdit, unless
+    // another one is set), never as the file's own type would be opened:
+    // a `.terminal` or `.command` file would run in Terminal.
+    #[cfg(target_os = "macos")]
     {
-        open::that(file).map_err(|e| e.to_string())
+        let mut child = std::process::Command::new("/usr/bin/open")
+            .arg("-t")
+            .arg(file)
+            .spawn()
+            .map_err(|e| format!("couldn't start the text editor: {e}"))?;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
     }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        open_in_text_editor(file)
+    }
+}
+
+/// Linux: the copy opens in the program the desktop sets for plain text
+/// (`xdg-mime query default text/plain`), started by `gtk-launch`, never by
+/// its own type's association. Where either isn't there, it isn't opened:
+/// the error says to pick an editor.
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+fn open_in_text_editor(file: &Path) -> Result<(), String> {
+    let pick_one = "there's no text editor set for plain text here, and a file from a server isn't opened with its default app. Pick an editor for Live Edit in Settings.";
+    let query = std::process::Command::new("xdg-mime")
+        .args(["query", "default", "text/plain"])
+        .output()
+        .map_err(|_| pick_one.to_string())?;
+    let id = String::from_utf8_lossy(&query.stdout).trim().to_string();
+    if !query.status.success() || !is_desktop_id(&id) {
+        return Err(pick_one.into());
+    }
+    let mut child = std::process::Command::new("gtk-launch")
+        .arg(&id)
+        .arg(file)
+        .spawn()
+        .map_err(|_| pick_one.to_string())?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// A desktop entry's id as xdg-mime gives it (`org.gnome.TextEditor.desktop`):
+/// nothing a command line could read as more than one name.
+#[cfg(any(all(unix, not(target_os = "macos"), not(target_os = "android")), test))]
+fn is_desktop_id(id: &str) -> bool {
+    id.ends_with(".desktop")
+        && !id.starts_with('-')
+        && id.len() <= 255
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
 #[cfg(not(target_os = "android"))]
@@ -185,8 +247,8 @@ fn start_editor(editor: &Path, file: &Path) -> Result<(), String> {
 /// the macro-enabled Office formats. The older .doc / .xls / .ppt can carry
 /// macros too but are everyday documents, so they open without asking;
 /// Office blocks macros in files marked as downloaded (mark_from_internet).
-/// Anything %PATHEXT% lists counts too.
-#[cfg(any(windows, test))]
+/// Anything %PATHEXT% lists counts too. On macOS and Linux these are asked
+/// about as well: Wine runs Windows programs and scripts there.
 const RUNS_ON_OPEN: &[&str] = &[
     // programs and installers
     "exe", "com", "scr", "pif", "cpl", "msi", "msp", "mst", "msu", "msix", "msixbundle",
@@ -200,16 +262,29 @@ const RUNS_ON_OPEN: &[&str] = &[
     "settingcontent-ms", "rdp", "ica",
     // system settings, help and containers
     "msc", "reg", "inf", "ins", "isp", "chm", "hlp", "cab", "iso", "img", "vhd", "vhdx", "wsb",
-    "theme", "themepack", "desktopthemepackfile", "diagcab", "diagcfg", "diagpkg", "xll", "xnk",
+    "theme", "themepack", "desktopthemepackfile", "diagcab", "diagcfg", "diagpkg", "xll", "xnk", "vsto",
     // Access and macro-enabled Office files
     "mdb", "mde", "accde", "accdr", "ade", "adp",
     "docm", "dotm", "xlsm", "xltm", "xlam", "pptm", "potm", "ppam", "ppsm", "sldm",
 ];
 
-/// The extension Windows goes by: it drops trailing dots and spaces from a
-/// name, so `x.exe.` and `x.exe ` run as `x.exe`.
-#[cfg(any(windows, test))]
-fn windows_extension(path: &Path) -> Option<String> {
+/// File types macOS or a Linux desktop runs, or hands to something that runs
+/// them, when they're opened: Terminal settings and commands, Automator and
+/// AppleScript, locations that open other files or apps, installers and
+/// configuration profiles, desktop entries, scripts an interpreter may be set
+/// to run, Java archives and Linux programs. Downloads aren't marked
+/// executable, but several of these don't need to be.
+#[cfg(any(not(windows), test))]
+const RUNS_ON_OPEN_UNIX: &[&str] = &[
+    "terminal", "command", "tool", "workflow", "fileloc", "webloc", "inetloc",
+    "pkg", "mpkg", "mobileconfig", "scpt", "scptd", "applescript", "desktop", "app",
+    "sh", "bash", "zsh", "py", "pl", "rb", "jar", "appimage", "run", "bin",
+];
+
+/// The extension the system goes by. Windows drops trailing dots and spaces
+/// from a name, so `x.exe.` and `x.exe ` run as `x.exe`; elsewhere they're
+/// dropped too, to be on the safe side.
+fn file_extension(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
     let name = name.trim_end_matches(['.', ' ']);
     let (_, ext) = name.rsplit_once('.')?;
@@ -227,20 +302,24 @@ fn runs_on_open_ext(ext: &str, pathext: Option<&str>) -> bool {
         })
 }
 
-/// Whether opening `path` would run it rather than show it. Windows only;
-/// elsewhere opening a file doesn't run it unless it is marked executable,
-/// which downloads aren't.
+/// Whether opening `path` would run it rather than show it (on Windows,
+/// RUNS_ON_OPEN and %PATHEXT%; on macOS and Linux, RUNS_ON_OPEN_UNIX).
 pub fn runs_when_opened(path: &Path) -> bool {
     #[cfg(windows)]
     {
         let pathext = std::env::var("PATHEXT").ok();
-        windows_extension(path).is_some_and(|ext| runs_on_open_ext(&ext, pathext.as_deref()))
+        file_extension(path).is_some_and(|ext| runs_on_open_ext(&ext, pathext.as_deref()))
     }
     #[cfg(not(windows))]
     {
-        let _ = path;
-        false
+        file_extension(path).is_some_and(|ext| runs_on_open_unix(&ext))
     }
+}
+
+/// macOS and Linux: their own types that run, and Windows' (Wine).
+#[cfg(any(not(windows), test))]
+fn runs_on_open_unix(ext: &str) -> bool {
+    RUNS_ON_OPEN_UNIX.contains(&ext) || RUNS_ON_OPEN.contains(&ext)
 }
 
 /// Mark a file from a server the way browsers mark downloads: the
@@ -255,10 +334,30 @@ pub fn mark_from_internet(path: &Path) {
         stream.push(":Zone.Identifier");
         let _ = std::fs::write(PathBuf::from(stream), b"[ZoneTransfer]\r\nZoneId=3\r\n");
     }
-    #[cfg(not(windows))]
+    // Gatekeeper's mark (as Safari sets it): the system then asks before
+    // anything in it runs, and says where it came from.
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let value = quarantine_value(now);
+        let Ok(file) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return };
+        // SAFETY: both strings are NUL-terminated and the value's length is its own.
+        unsafe {
+            libc::setxattr(file.as_ptr(), c"com.apple.quarantine".as_ptr(), value.as_ptr().cast(), value.len(), 0, 0);
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = path;
     }
+}
+
+/// The `com.apple.quarantine` value for a file from the internet: the flags
+/// (0081: downloaded, not yet opened), the time in hex, and the app.
+#[cfg(any(target_os = "macos", test))]
+fn quarantine_value(unix_secs: u64) -> String {
+    format!("0081;{unix_secs:08x};Submarine;")
 }
 
 #[cfg(test)]
@@ -266,7 +365,7 @@ mod tests {
     use super::*;
 
     fn runs(name: &str) -> bool {
-        windows_extension(Path::new(name)).is_some_and(|e| runs_on_open_ext(&e, Some(".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WSF;.MSC;.PY")))
+        file_extension(Path::new(name)).is_some_and(|e| runs_on_open_ext(&e, Some(".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WSF;.MSC;.PY")))
     }
 
     #[test]
@@ -286,6 +385,47 @@ mod tests {
     fn documents_and_text_open() {
         for name in ["notes.txt", "photo.png", "report.pdf", "data.csv", "nginx.conf", "Makefile", ".bashrc", "letter.docx", "archive.zip"] {
             assert!(!runs(name), "{name}");
+        }
+    }
+
+    fn runs_unix(name: &str) -> bool {
+        file_extension(Path::new(name)).is_some_and(|e| runs_on_open_unix(&e))
+    }
+
+    #[test]
+    fn windows_programs_and_scripts_are_asked_about_on_macos_and_linux_too() {
+        // Wine runs them there when they're opened.
+        for name in ["setup.exe", "x.MSI", "a.lnk", "run.bat", "x.cmd", "x.vbs", "b.hta", "c.js", "d.ps1", "e.reg", "invoice.pdf .exe"] {
+            assert!(runs_unix(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn macos_and_linux_types_that_run_are_asked_about() {
+        for name in [
+            "report.pdf      .terminal", "x.command", "x.TOOL", "a.workflow", "b.fileloc", "c.webloc", "d.inetloc", "setup.pkg",
+            "e.mpkg", "f.mobileconfig", "g.scpt", "h.scptd", "i.applescript", "app.desktop", "Thing.app", "deploy.sh", "x.bash",
+            "x.zsh", "tool.py", "x.pl", "x.rb", "app.jar", "Tool.AppImage", "installer.run", "firmware.bin", "x.terminal.",
+        ] {
+            assert!(runs_unix(name), "{name}");
+        }
+        for name in ["notes.txt", "photo.png", "report.pdf", "data.csv", "nginx.conf", "Makefile", ".bashrc", "letter.docx", "x.terminal.txt"] {
+            assert!(!runs_unix(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_quarantine_mark_is_in_the_form_macos_reads() {
+        assert_eq!(quarantine_value(0x6543_21ab), "0081;654321ab;Submarine;");
+        assert_eq!(quarantine_value(5), "0081;00000005;Submarine;");
+    }
+
+    #[test]
+    fn only_a_plain_desktop_id_is_started() {
+        assert!(is_desktop_id("org.gnome.TextEditor.desktop"));
+        assert!(is_desktop_id("gedit.desktop"));
+        for bad in ["", "gedit", "-x.desktop", "a b.desktop", "a;b.desktop", "../x.desktop", "a/b.desktop"] {
+            assert!(!is_desktop_id(bad), "{bad:?}");
         }
     }
 

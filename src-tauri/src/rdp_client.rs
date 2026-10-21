@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD_NO_PAD as B64, Engine as _};
 use ironrdp::connector::connection_activation::ConnectionActivationState;
-use ironrdp::connector::{self, ClientConnector, Credentials, DesktopSize};
+use ironrdp::connector::{self, ClientConnector, ClientConnectorState, Credentials, DesktopSize};
 use ironrdp::core::WriteBuf;
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
@@ -28,6 +28,7 @@ use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::input::{Database, MouseButton, MousePosition, Operation, Scancode, WheelRotations};
 use ironrdp::pdu::gcc::{ConnectionType, KeyboardType};
 use ironrdp::pdu::geometry::InclusiveRectangle;
+use ironrdp::pdu::nego::SecurityProtocol;
 use ironrdp::pdu::rdp::capability_sets::{MajorPlatformType, RailSupportLevel};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp::session::image::DecodedImage;
@@ -88,6 +89,25 @@ pub enum InputEvent {
     ReleaseAll,
 }
 
+/// How the refusal of a server without NLA starts; the RDP tab (rdpOptions.ts,
+/// `RDP_NO_NLA_PREFIX`) knows it by this and offers the one-click opt-in.
+pub const NO_NLA: &str = "This server doesn't use NLA";
+
+/// Whether to go on with the way of logging in the server picked. NLA makes
+/// the server prove it knows the password before the password is sent; without
+/// it, the password goes inside TLS to whoever answered: a server that was
+/// never asked to prove anything, or someone in the middle who answered
+/// `PROTOCOL_SSL` to the offer of both. That is for the user to allow, per
+/// server, not the default.
+fn nla_gate(selected: SecurityProtocol, allow_without_nla: bool) -> Result<(), String> {
+    if allow_without_nla || selected.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
+        return Ok(());
+    }
+    Err(format!(
+        "{NO_NLA} (network level authentication), so it can't prove that it knows your password. Nothing was sent. If you trust this server and the network to it, allow servers without NLA for it and connect again."
+    ))
+}
+
 /// Who to log in as, and the first size of the desktop.
 pub struct Login {
     /// The server's name as the user gave it (TLS name and CredSSP target).
@@ -97,6 +117,8 @@ pub struct Login {
     pub password: Zeroizing<String>,
     pub width: u16,
     pub height: u16,
+    /// This server may be logged in to without NLA (see `nla_gate`).
+    pub allow_no_nla: bool,
 }
 
 /// "DOMAIN\user" or "user@domain" as the login name and domain NLA wants.
@@ -277,6 +299,22 @@ fn rect_frame(image: &DecodedImage, r: &InclusiveRectangle) -> Option<Vec<u8>> {
     Some(f)
 }
 
+/// The changed places as they go out: many of them, or together more than the
+/// picture (the same place changing again and again), become one rectangle around
+/// them, so a batch is never more than about one picture.
+fn tidy(rects: Vec<InclusiveRectangle>, picture_area: u64) -> Vec<InclusiveRectangle> {
+    let area: u64 = rects
+        .iter()
+        .map(|r| (u64::from(r.right.saturating_sub(r.left)) + 1) * (u64::from(r.bottom.saturating_sub(r.top)) + 1))
+        .sum();
+    if rects.len() > MAX_RECTS || area > picture_area {
+        if let Some(first) = rects.first() {
+            return vec![rects.iter().fold(first.clone(), |acc, r| union(&acc, r))];
+        }
+    }
+    rects
+}
+
 fn union(a: &InclusiveRectangle, b: &InclusiveRectangle) -> InclusiveRectangle {
     InclusiveRectangle {
         left: a.left.min(b.left),
@@ -334,7 +372,9 @@ pub async fn run<S, V, VF>(
     login: Login,
     verify_cert: V,
     connected: impl FnOnce(u16, u16),
+    notice: impl Fn(&str),
     frame: impl Fn(Vec<u8>) -> bool,
+    flow: Arc<crate::screen_flow::Flow>,
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
 ) -> Result<String, String>
 where
@@ -346,12 +386,24 @@ where
     let mut framed = TokioFramed::new(stream);
     let drdynvc = DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
     let mut connector = ClientConnector::new(connector_config(&login), client_addr).with_static_channel(drdynvc);
+    let allow_no_nla = login.allow_no_nla;
     drop(login);
 
     let should_upgrade = tokio::time::timeout(STEP_TIMEOUT, ironrdp_tokio::connect_begin(&mut framed, &mut connector))
         .await
         .map_err(|_| "The RDP server didn't answer within 30 seconds".to_string())?
         .map_err(|e| format!("The RDP server didn't answer as one: {e}"))?;
+    // How the server wants the login done is known now, before TLS and before
+    // anything secret goes out: NLA, or the user's say-so, or no login at all.
+    match &connector.state {
+        ClientConnectorState::EnhancedSecurityUpgrade { selected_protocol } => {
+            nla_gate(*selected_protocol, allow_no_nla)?;
+            if !selected_protocol.intersects(SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX) {
+                notice("This server doesn't use NLA; the password goes inside TLS only (allowed for this server).");
+            }
+        }
+        _ => return Err("The RDP server picked a way of logging in that this client doesn't offer".into()),
+    }
     let (plain, leftover) = framed.into_inner();
 
     // TLS, then the certificate check, before anything secret is sent.
@@ -477,8 +529,10 @@ where
                     Vec::new()
                 }
             },
-            _ = tick.tick(), if !dirty.is_empty() => {
-                let rects = std::mem::take(&mut dirty);
+            // While the page is far behind on what it was sent, what changes
+            // waits here as one rectangle at most (see screen_flow.rs).
+            _ = tick.tick(), if !dirty.is_empty() && flow.has_room() => {
+                let rects = tidy(std::mem::take(&mut dirty), u64::from(image.width()) * u64::from(image.height()));
                 for r in &rects {
                     if let Some(f) = rect_frame(&image, r) {
                         if !frame(f) {
@@ -488,6 +542,9 @@ where
                 }
                 Vec::new()
             }
+            // The page has caught up: what it is owed goes now, not with the
+            // next thing the server says.
+            _ = flow.room(), if !dirty.is_empty() && !flow.has_room() => Vec::new(),
         };
 
         for out in outputs {
@@ -511,8 +568,11 @@ where
                     let mut activation = activation_factory.create();
                     let mut buf = WriteBuf::new();
                     loop {
-                        let written = single_sequence_step_read(&mut reader, &mut activation, &mut buf)
+                        // A server that starts the desktop over and then says nothing
+                        // would hold this loop for good, deaf to Close.
+                        let written = tokio::time::timeout(STEP_TIMEOUT, single_sequence_step_read(&mut reader, &mut activation, &mut buf))
                             .await
+                            .map_err(|_| "RDP: the server stopped answering while it restarted the desktop".to_string())?
                             .map_err(|e| format!("RDP: {e}"))?;
                         if written.size().is_some() {
                             writer.write_all(buf.filled()).await.map_err(|e| format!("The connection to the RDP server ended: {e}"))?;
@@ -572,6 +632,50 @@ mod tests {
         assert_eq!(split_domain("alice"), ("alice".into(), None));
         assert_eq!(split_domain("alice@corp.example"), ("alice@corp.example".into(), None));
         assert_eq!(split_domain("\\alice"), ("\\alice".into(), None));
+    }
+
+    #[test]
+    fn a_server_without_nla_is_refused_unless_it_was_allowed() {
+        let err = nla_gate(SecurityProtocol::SSL, false).unwrap_err();
+        assert!(err.starts_with(NO_NLA), "{err}");
+        assert!(err.contains("Nothing was sent"), "{err}");
+        // Allowed for this server: the old way, TLS and the password inside it.
+        assert!(nla_gate(SecurityProtocol::SSL, true).is_ok());
+        // A server that does NLA is never in the way, allowed or not.
+        for nla in [SecurityProtocol::HYBRID, SecurityProtocol::HYBRID_EX, SecurityProtocol::SSL | SecurityProtocol::HYBRID] {
+            assert!(nla_gate(nla, false).is_ok(), "{nla:?}");
+            assert!(nla_gate(nla, true).is_ok(), "{nla:?}");
+        }
+        // Nothing selected is no NLA either.
+        assert!(nla_gate(SecurityProtocol::empty(), false).is_err());
+    }
+
+    #[test]
+    fn the_tab_recognises_the_refusal_by_its_start() {
+        let ts = include_str!("../../src/util/rdpOptions.ts");
+        assert!(
+            ts.contains(&format!("\"{NO_NLA}\"")),
+            "src/util/rdpOptions.ts: RDP_NO_NLA_PREFIX must be {NO_NLA:?}, the start of the refusal"
+        );
+    }
+
+    #[test]
+    fn changed_places_that_add_up_to_more_than_the_picture_become_one() {
+        let rect = |left, top, right, bottom| InclusiveRectangle { left, top, right, bottom };
+        let all = rect(0, 0, 99, 99);
+        // The whole picture thirty times in one tick: one frame of it.
+        let out = tidy(vec![all.clone(); 30], 100 * 100);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].left, out[0].top, out[0].right, out[0].bottom), (0, 0, 99, 99));
+        // Two small places that don't add up to the picture stay two frames.
+        let out = tidy(vec![rect(0, 0, 9, 9), rect(50, 50, 59, 59)], 100 * 100);
+        assert_eq!(out.len(), 2);
+        // More places than the limit become one rectangle around them, as before.
+        let many: Vec<_> = (0..40u16).map(|i| rect(i, i, i, i)).collect();
+        let out = tidy(many, 1_000_000);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].left, out[0].top, out[0].right, out[0].bottom), (0, 0, 39, 39));
+        assert!(tidy(Vec::new(), 10).is_empty());
     }
 
     #[test]

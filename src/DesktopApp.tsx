@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Plus, X, RefreshCw, Terminal, Key, Trash2,
@@ -55,6 +56,7 @@ import TelnetSessionView from "./components/TelnetSessionView";
 import VncSessionView from "./components/VncSessionView";
 import MonitoringPanel from "./components/MonitoringPanel";
 import { ErrorBoundary } from "./ui/ErrorBoundary";
+import { parseObjectList } from "./util/serverJson";
 
 const appWindow = getCurrentWindow();
 
@@ -273,7 +275,7 @@ function DesktopApp() {
 
   // Version for the title bar, from the build itself (about::app_info) rather
   // than hardcoded so it can never drift from the real build: a release's
-  // whole version (v0.3.8-fork.2), and the commit in the tooltip when built
+  // whole version (v0.4.0-fork.2), and the commit in the tooltip when built
   // from source. Shown faded next to the brand name; renders nothing if the
   // call ever fails.
   const [appVersion, setAppVersion] = useState<{ version: string; commit: string | null } | null>(null);
@@ -539,6 +541,18 @@ function DesktopApp() {
     setLogs(prev => [...prev.slice(-99), { id, msg, type, time: new Date().toLocaleTimeString() }]);
   }, []);
 
+  // A sync that deleted rows (deleted on another device, or by whoever sent
+  // the server's answer) says so, and where the profile as it was is kept.
+  const logRemoved = useCallback((report: { removed?: number; backup?: string | null }) => {
+    const n = report.removed ?? 0;
+    if (n <= 0) return;
+    addLog(
+      `Sync removed ${n} item${n === 1 ? "" : "s"} from this profile (deleted elsewhere).` +
+        (report.backup ? ` The profile as it was is kept next to its file as ${report.backup}.` : ""),
+      "info",
+    );
+  }, [addLog]);
+
   // Wrapped in useCallback because these are handed to memoised children
   // (SessionView, MirrorsPanel, etc.). Without stable identity every parent
   // render hands a fresh reference and defeats the child's memo gate.
@@ -659,11 +673,12 @@ function DesktopApp() {
   const handleCloudSync = useCallback(async () => {
     setCloudSyncing(true);
     try {
-      const report = await invoke<{ pushed: number; pulled: number; key_change: boolean }>("sync_now");
+      const report = await invoke<{ pushed: number; pulled: number; key_change: boolean; removed?: number; backup?: string | null }>("sync_now");
       await refreshAll();
       refreshSharedState();
       setLastSyncLabel(`Last synced ${new Date().toLocaleTimeString()}`);
       addLog(`Sync complete — sent ${report.pushed}, received ${report.pulled}.`, "success");
+      logRemoved(report);
       if (report.key_change) {
         addLog("This shared profile's key has changed. Your changes aren't uploaded until you accept the new key (Servers → Review).", "info");
       }
@@ -684,7 +699,7 @@ function DesktopApp() {
     // refreshAll closes over stable setters; addLog is memoised. Intentionally
     // excluded to keep this handler identity stable across renders.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [addLog]);
+  }, [addLog, logRemoved]);
 
   // ---- Auto-sync (hybrid: after-edit debounce + window focus + interval) ----
   //
@@ -735,10 +750,11 @@ function DesktopApp() {
     autoSyncBusy.current = true;
     setCloudSyncing(true);
     try {
-      const report = await invoke<{ pushed: number; pulled: number; key_change: boolean }>("sync_now");
+      const report = await invoke<{ pushed: number; pulled: number; key_change: boolean; removed?: number; backup?: string | null }>("sync_now");
       if (report.pulled > 0) await refreshAllRef.current();
       refreshSharedState();
       setLastSyncLabel(`Last synced ${new Date().toLocaleTimeString()}`);
+      logRemoved(report);
     } catch {
       // Silent by design — not signed in, offline, or a viewer with nothing to
       // push. The manual Sync-now button is where errors surface loudly.
@@ -988,6 +1004,24 @@ function DesktopApp() {
   const confirm = useConfirm();
   const choice = useChoice();
   const textPrompt = useTextPrompt();
+
+  // Live Edit copies with changes that were never uploaded, kept when their
+  // session ended or the profile was locked (keep_unsent_edits in lib.rs).
+  useEffect(() => {
+    const unlisten = listen<{ folder: string; files: string[] }>("live-edit-kept", async (e) => {
+      const { folder, files } = e.payload;
+      const what = files.length === 1 ? `${files[0]} has changes` : `${files.length} files have changes`;
+      addLog(`Live Edit: ${what} that were never uploaded to the server. Kept in ${folder}.`, "info");
+      const ok = await confirm({
+        title: "Unsent edits kept",
+        message: `${what} that were never uploaded to the server. ${files.length === 1 ? "It's" : "They're"} kept in:\n\n${folder}`,
+        okLabel: "Show folder",
+        cancelLabel: "OK",
+      });
+      if (ok) invoke("local_open_in_explorer", { localPath: folder }).catch(() => {});
+    });
+    return () => { unlisten.then((f) => f()).catch(() => {}); };
+  }, [addLog, confirm]);
 
   // Window-close guard. Keep `sessions` mirrored into a ref so the close
   // handler (which is registered ONCE inside useEffect, capturing snapshot
@@ -1637,11 +1671,9 @@ function DesktopApp() {
       proxyType: server.proxy_type || "none",
       proxyHost: server.proxy_host || "",
       proxyPort: server.proxy_port || 1080,
-      tunnels: server.tunnels ? JSON.parse(server.tunnels) : [],
+      tunnels: parseObjectList(server.tunnels),
       autostart: !!server.autostart,
-      mirrors: (() => {
-        try { return JSON.parse(server.mirrors || "[]"); } catch { return []; }
-      })(),
+      mirrors: parseObjectList(server.mirrors),
       color: server.color ?? null,
       notes: server.notes || "",
       runOnConnect: server.run_on_connect || "",

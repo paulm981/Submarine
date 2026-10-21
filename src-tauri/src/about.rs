@@ -7,7 +7,7 @@
 //! separate, bigger problem involving signed updates).
 //!
 //! The fork is used two ways (build.rs): as a release, which every merge to
-//! main is (v0.3.8-fork.1, v0.3.8-fork.2, …: the original project's version
+//! main is (v0.4.0-fork.1, v0.4.0-fork.2, …: the original project's version
 //! and a count), or built from source. Besides releases, the check says how
 //! many commits the fork's main has that a build from source doesn't — to
 //! pull and rebuild — and how many the original project has that the fork
@@ -28,7 +28,7 @@ const BUILD_COMMIT: &str = env!("SUBMARINE_GIT_SHA");
 /// "source" or "release" (build.rs).
 const BUILD_KIND: &str = env!("SUBMARINE_BUILD_KIND");
 /// This build's version (build.rs): a release's whole tag, such as
-/// "0.3.8-fork.1", even where the installer's own version can't carry the
+/// "0.4.0-fork.1", even where the installer's own version can't carry the
 /// "-fork.1" (Windows), and otherwise Cargo's.
 const VERSION: &str = env!("SUBMARINE_VERSION");
 
@@ -42,7 +42,7 @@ pub struct AppInfo {
     pub commit: Option<String>,
 }
 
-/// "0.3.8-fork.3 (source, 23d8806)": which build this is, for the log and
+/// "0.4.0-fork.3 (source, 23d8806)": which build this is, for the log and
 /// "Copy diagnostics".
 pub fn build_label() -> String {
     let mut label = VERSION.to_string();
@@ -105,7 +105,9 @@ async fn ahead_by(client: &reqwest::Client, base: &str, head: &str) -> Option<u6
     if !resp.status().is_success() {
         return None;
     }
-    resp.json::<GhCompare>().await.ok().map(|c| c.ahead_by)
+    // One commit's worth of JSON; read no more than 1 MB of it (cloud.rs).
+    let bytes = crate::cloud::read_capped(resp, 1024 * 1024).await.ok()?;
+    serde_json::from_slice::<GhCompare>(&bytes).ok().map(|c| c.ahead_by)
 }
 
 /// Subset of GitHub's `/releases/latest` JSON we actually care about.
@@ -196,10 +198,9 @@ async fn latest_release(client: &reqwest::Client, url: &str, current: String) ->
     }
 
     // An empty repo returns `[]` (200), not 404 — handled naturally below.
-    let releases: Vec<GhRelease> = resp
-        .json()
-        .await
-        .map_err(|e| format!("[UPDATE] BAD_JSON: {}", e))?;
+    // The list of releases is a few hundred KB at most; read no more than 8 MB.
+    let bytes = crate::cloud::read_capped(resp, 8 * 1024 * 1024).await.map_err(|e| format!("[UPDATE] {}", e))?;
+    let releases: Vec<GhRelease> = serde_json::from_slice(&bytes).map_err(|e| format!("[UPDATE] BAD_JSON: {}", e))?;
 
     Ok(match newest_release(releases) {
         None => UpdateInfo::none(current),
@@ -339,6 +340,9 @@ mod tests {
         assert!(semver_greater("0.3.8-fork.2", "0.3.8-fork.1"));
         assert!(semver_greater("0.3.8-fork.10", "0.3.8-fork.9"));
         assert!(semver_greater("0.3.9", "0.3.8-fork.5"));
+        // The count starts again with the original project's next version.
+        assert!(semver_greater("0.4.0-fork.1", "0.3.8-fork.10"));
+        assert!(!semver_greater("0.3.8-fork.10", "0.4.0-fork.1"));
         assert!(!semver_greater("0.3.8-fork.1", "0.3.8-fork.1"));
         assert!(!semver_greater("0.3.8", "0.3.8-fork.1"));
         // Other suffixes still sort equal to their base.

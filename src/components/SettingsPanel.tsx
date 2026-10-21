@@ -985,7 +985,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
 
           <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
             <p className="text-sm text-zinc-400 leading-relaxed">
-              Every change to the fork is a release, numbered like v0.3.8-fork.2 and shown in the title bar. The
+              Every change to the fork is a release, numbered like v0.4.0-fork.2 and shown in the title bar. The
               profile screen says when there's a newer one. Built from source, it also says when the fork's main has
               changes to pull and rebuild.
             </p>
