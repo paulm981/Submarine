@@ -1184,6 +1184,17 @@ function DesktopApp() {
       void confirm({ title: `"${sw.name}" is empty`, message: "None of its servers exist any more. Edit it to pick some.", okLabel: "OK", cancelLabel: "Close" });
       return;
     }
+    // A Wall shows SSH terminals only, so a saved wall whose servers have all
+    // become RDP, telnet or VNC ones has nothing to show (unless it's open).
+    if (!list.some(isSshServer) && !walls.some(w => w.savedId === sw.id)) {
+      void confirm({
+        title: `"${sw.name}" has no SSH servers`,
+        message: "A wall shows SSH terminals only, and its servers are RDP, telnet or VNC ones now. Open them from the server list, or edit the wall to pick SSH servers.",
+        okLabel: "OK",
+        cancelLabel: "Close",
+      });
+      return;
+    }
     openServersAsWall(list, sw.name, { broadcast, cols: sw.cols, savedId: sw.id, addMissing });
   };
 

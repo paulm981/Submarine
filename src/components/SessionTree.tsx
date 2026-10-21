@@ -85,6 +85,9 @@ const SERVER_TYPES: Record<string, { label: string; title: string; tone: string 
 };
 
 const errText = (e: any) => (typeof e === "string" ? e : (e?.message || String(e)));
+// A Wall holds SSH terminals only: RDP, telnet and VNC servers are left off
+// it, so they aren't counted for one either.
+const wallServers = (list: any[]) => list.filter((s) => (s?.protocol ?? "ssh") === "ssh");
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 export const SessionTree = ({
@@ -331,7 +334,9 @@ export const SessionTree = ({
   const picked = useMemo(() => pickedItems(selected), [selected, rows]);
   const pickedCount = picked.list.length + picked.links.length;
   const openSelected = () => openMany(picked.list, picked.links);
-  const openAsWall = async (list: any[], name: string) => {
+  const pickedWall = useMemo(() => wallServers(picked.list), [picked]);
+  const openAsWall = async (all: any[], name: string) => {
+    const list = wallServers(all);
     if (list.length === 0) return;
     if (list.length > WALL_MANY && !(await confirm({
       title: `Open ${list.length} servers as a wall?`,
@@ -340,7 +345,7 @@ export const SessionTree = ({
     }))) return;
     onOpenAsWall(list, name);
   };
-  const openSelectedAsWall = () => openAsWall(picked.list, `${picked.list.length} servers`);
+  const openSelectedAsWall = () => openAsWall(pickedWall, `${pickedWall.length} servers`);
 
   // The rows a move or a delete is about: the selection when `r` is in it
   // (or there is no `r`), else just `r`.
@@ -890,9 +895,11 @@ export const SessionTree = ({
                 <button className={menuItem} onClick={run(() => openMany(list, links))} disabled={list.length + links.length === 0}>
                   <Play size={13} className={menuIcon} /> Open all in this folder ({list.length + links.length})
                 </button>
-                <button className={menuItem} onClick={run(() => openAsWall(list, f.name))} disabled={list.length === 0}>
-                  <LayoutGrid size={13} className={menuIcon} /> Open as wall ({list.length})
-                </button>
+                {wallServers(list).length > 0 && (
+                  <button className={menuItem} onClick={run(() => openAsWall(list, f.name))}>
+                    <LayoutGrid size={13} className={menuIcon} /> Open as wall ({wallServers(list).length})
+                  </button>
+                )}
                 <button className={menuItem} onClick={run(() => toggleFolder(f.id))}>
                   <ChevronRight size={13} className={menuIcon} /> {f.open ? "Collapse" : "Expand"}
                 </button>
@@ -921,9 +928,9 @@ export const SessionTree = ({
                 <button className={menuItem} onClick={run(() => (pickedCount > 1 && selected.has(r.key) ? openSelected() : r.kind === "server" ? openServer(r.server) : openRdp(r.link)))}>
                   <Play size={13} className={menuIcon} /> {pickedCount > 1 && selected.has(r.key) ? `Open ${pickedCount} selected` : r.kind === "server" ? "Open" : "Open in Remote Desktop"}
                 </button>
-                {pickedCount > 1 && selected.has(r.key) && picked.list.length > 1 && (
+                {pickedCount > 1 && selected.has(r.key) && pickedWall.length > 1 && (
                   <button className={menuItem} onClick={run(openSelectedAsWall)}>
-                    <LayoutGrid size={13} className={menuIcon} /> Open {picked.list.length} servers as a wall
+                    <LayoutGrid size={13} className={menuIcon} /> Open {pickedWall.length} servers as a wall
                   </button>
                 )}
                 {!many && (
