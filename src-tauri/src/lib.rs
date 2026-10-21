@@ -7676,10 +7676,42 @@ mod mirror_folder_guard_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn only_a_folder_on_a_drive_letter_passes_as_text() {
+        use super::windows_drive_path;
+        for ok in [r"C:\Users\me\site", "d:/work", r"\\?\C:\Users\me", r"\\?\c:\x", "C:\\"] {
+            assert!(windows_drive_path(ok), "{ok}");
+        }
+        for bad in [
+            r"\\attacker.example\share\dir",
+            "//attacker.example/share",
+            r"\\?\UNC\attacker.example\share",
+            r"\\?\unc\attacker.example\share",
+            r"\\?\GLOBALROOT\Device\Mup\attacker.example\share",
+            r"\\.\pipe\x",
+            r"\\.\C:\x",
+            r"\??\UNC\host\share",
+            r"\Users\me",
+            "C:relative",
+            "C:",
+            "",
+            "folder",
+            "/home/me",
+        ] {
+            assert!(!windows_drive_path(bad), "{bad}");
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_network_share_is_refused_before_anything_is_looked_at() {
-        for bad in [r"\\attacker.example\share\dir", r"\\?\UNC\attacker.example\share", r"\\.\pipe\x"] {
+        for bad in [
+            r"\\attacker.example\share\dir",
+            r"\\?\UNC\attacker.example\share",
+            r"\\?\unc\attacker.example\share",
+            r"\\?\GLOBALROOT\Device\Mup\attacker.example\share",
+            r"\\.\pipe\x",
+        ] {
             let t = std::time::Instant::now();
             let err = guard_mirror_folder(bad).unwrap_err();
             assert!(err.contains("network share") || err.contains("MIRROR"), "{bad}: {err}");
@@ -21145,20 +21177,44 @@ fn guard_local_path_nofollow(path: &str, must_exist: bool) -> Result<std::path::
 /// preview. So: no network shares, a full path, a folder that exists, none of
 /// the system folders. The resolved path is what the mirror then uses.
 fn guard_mirror_folder(local: &str) -> Result<String, String> {
-    use std::path::{Component, Path, Prefix};
-    let p = Path::new(local);
-    if let Some(Component::Prefix(prefix)) = p.components().next() {
-        if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..) | Prefix::DeviceNS(..)) {
-            return Err(format!(
-                "[MIRROR] A network share ({local}) can't be a mirror's local folder. Map it to a drive letter first."
-            ));
-        }
+    let share = || format!("[MIRROR] A network share ({local}) can't be a mirror's local folder. Map it to a drive letter first.");
+    // Looked at as text first, before anything touches the path: only a
+    // folder on a drive letter. Refusing the kinds of share one by one let
+    // others through (`\\?\unc\…` in lower case, `\\?\GLOBALROOT\Device\Mup\…`).
+    if cfg!(windows) && !windows_drive_path(local) {
+        return Err(share());
     }
     let folder = guard_local_path(local, false)?;
+    // And the folder it resolves to: a link on a drive can lead to a share.
+    if !resolved_on_a_drive(&folder) {
+        return Err(share());
+    }
     if !folder.is_dir() {
         return Err(format!("[MIRROR] The local folder isn't a folder: {local}"));
     }
     Ok(folder.to_string_lossy().into_owned())
+}
+
+/// Whether a Windows path, as text, is a folder on a drive letter: `C:\…`,
+/// `C:/…`, or the same behind `\\?\` (`\\?\C:\…`). Anything else that starts
+/// with a slash is a share, a device or a path relative to the drive, and is
+/// refused. Written over the text, not `Path`, so it means the same on every
+/// system it's tested on.
+fn windows_drive_path(path: &str) -> bool {
+    let p = path.replace('/', "\\");
+    let rest = p.strip_prefix("\\\\?\\").unwrap_or(&p);
+    let b = rest.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\'
+}
+
+/// The resolved folder is on a drive (Windows: a `Disk` or `VerbatimDisk`
+/// prefix), or has no prefix at all (other systems).
+fn resolved_on_a_drive(folder: &std::path::Path) -> bool {
+    use std::path::{Component, Prefix};
+    match folder.components().next() {
+        Some(Component::Prefix(prefix)) => matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)),
+        _ => !cfg!(windows),
+    }
 }
 
 /// The system folders `check_local_path_policy` refuses, as lowercase paths
