@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
@@ -27,18 +27,45 @@ export interface AiSnapshot {
 
 const EMPTY: AiSnapshot = { enabled: false, tabs: [], pending: [], running: [], history: [], audit_log: null };
 
-/// The AI state, kept current.
-export const useAi = (): AiSnapshot => {
-  const [snap, setSnap] = useState<AiSnapshot>(EMPTY);
-  useEffect(() => {
-    let alive = true;
-    const load = () => invoke<AiSnapshot>("ai_state").then((s) => { if (alive) setSnap(s); }).catch(() => {});
-    load();
-    const un = listen("ai-changed", load);
-    return () => { alive = false; un.then((u) => u()); };
-  }, []);
-  return snap;
+// One copy of the state for the whole page, however many components use it:
+// one `ai_state` call per change, not one per open server tab.
+let current: AiSnapshot = EMPTY;
+const watchers = new Set<() => void>();
+let stopListening: (() => void) | null = null;
+// Only the newest answer counts, should two cross.
+let asked = 0;
+
+const load = () => {
+  const n = ++asked;
+  invoke<AiSnapshot>("ai_state")
+    .then((s) => {
+      if (n !== asked) return;
+      current = s;
+      watchers.forEach((w) => w());
+    })
+    .catch(() => {});
 };
+
+const subscribe = (w: () => void) => {
+  watchers.add(w);
+  if (!stopListening) {
+    let alive = true;
+    const un = listen("ai-changed", load);
+    stopListening = () => { alive = false; un.then((u) => u()); };
+    // Once listening, again: a change before then would be missed.
+    void un.then(() => { if (alive) load(); });
+  }
+  return () => {
+    watchers.delete(w);
+    if (watchers.size === 0 && stopListening) {
+      stopListening();
+      stopListening = null;
+    }
+  };
+};
+
+/// The AI state, kept current.
+export const useAi = (): AiSnapshot => useSyncExternalStore(subscribe, () => current);
 
 /// The AI tabs a server's tab is shared with.
 export const sharedWith = (snap: AiSnapshot, sessionId: string): AiTab[] =>
