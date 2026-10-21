@@ -1011,12 +1011,15 @@ fn collect_local_records(conn: &Connection, key: &[u8; 32], since: &str) -> Resu
         for row in rows {
             let (uuid, updated_at, mut payload) = row.map_err(|e| format!("[SYNC] SER_ROW {}: {e}", spec.table))?;
             // A server whose switch to telnet or VNC this device holds still
-            // has that protocol everywhere else: an edit here mustn't undo it
-            // (approvals::held_protocol).
+            // has that protocol and port everywhere else: an edit here mustn't
+            // undo it (approvals::held_switch).
             if spec.table == "servers" {
-                if let Some(protocol) = approvals::held_protocol(conn, &uuid) {
+                if let Some(switch) = approvals::held_switch(conn, &uuid) {
                     let mut obj: serde_json::Value = serde_json::from_str(&payload).map_err(|e| format!("[SYNC] SER_ROW {}: {e}", spec.table))?;
-                    obj["protocol"] = serde_json::Value::String(protocol);
+                    obj["protocol"] = serde_json::Value::String(switch.protocol);
+                    if let Some(port) = switch.port {
+                        obj["port"] = serde_json::Value::from(port);
+                    }
                     payload = obj.to_string();
                 }
             }
@@ -1149,17 +1152,27 @@ fn apply_remote_inner(
     // (commands on connect, autostart, forwards, monitor commands) is held
     // until this device's user allows it — see approvals.rs. Holding is part
     // of the merge's transaction: if it can't be recorded, nothing lands.
-    let shared = approvals::ready(&tx) && approvals::profile_is_shared(&tx);
+    let approvals_ready = approvals::ready(&tx);
+    let shared = approvals_ready && approvals::profile_is_shared(&tx);
     for spec in ENTITIES {
         let watch = shared && approvals::watches(spec.table);
         for rec in records.iter().filter(|r| !r.deleted && r.entity_type == spec.table) {
-            // A server's held switch of protocol goes back in the row for the
-            // record to merge over, and hold_changes keeps this device's
-            // protocol again after it, whether the record applied or not.
-            let before = if watch { approvals::before_merge(&tx, spec.table, &rec.uuid)? } else { None };
+            // A server's held switch to telnet or VNC stays held after the
+            // share is left, like everything else held: outside a share, only
+            // that part runs, for a server that has one.
+            let held_switch = !watch
+                && approvals_ready
+                && spec.table == "servers"
+                && approvals::held_switch(&tx, &rec.uuid).is_some();
+            // A held switch's protocol and port go back in the row for the
+            // record to merge over, and hold_switch keeps this device's again
+            // after it, whether the record applied or not.
+            let before = if watch || held_switch { approvals::before_merge(&tx, spec.table, &rec.uuid)? } else { None };
             let applied = apply_entity(&tx, key, spec, rec, &mut fk_fixups);
             if watch {
                 approvals::hold_changes(&tx, spec.table, &rec.uuid, before.as_ref())?;
+            } else if held_switch {
+                approvals::hold_switch(&tx, &rec.uuid, before.as_ref())?;
             }
             if let Err(e) = applied {
                 skipped += 1;
@@ -3515,11 +3528,9 @@ mod sync_engine_tests {
         assert!(approvals::held_by_server(&c).is_empty(), "a personal profile holds nothing");
     }
 
-    // A co-member switching an SSH server to VNC (or telnet) is held: this
-    // device keeps it an SSH server until its user allows the switch, and an
-    // edit made here meanwhile doesn't switch it back for everyone else.
-    #[test]
-    fn a_shared_profile_holds_a_switch_from_ssh_to_vnc() {
+    /// A shared device B with A's SSH server "web" on port 22, and A having
+    /// switched it to VNC on 5900 since: B holds the switch.
+    fn b_holds_a_switch_to_vnc() -> (Connection, std::sync::Arc<hlc::Hlc>, Connection, std::sync::Arc<hlc::Hlc>, String) {
         let (a, ha) = device("A");
         a.execute("INSERT INTO servers(name,host,port) VALUES('web','h',22)", []).unwrap();
         let (b, hb) = device("B");
@@ -3527,34 +3538,137 @@ mod sync_engine_tests {
         b.execute("INSERT INTO sync_meta(key,value) VALUES('share_id','s1')", []).unwrap();
         apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
         let uuid: String = b.query_row("SELECT uuid FROM servers WHERE name='web'", [], |r| r.get(0)).unwrap();
-        let proto = |c: &Connection| -> Option<String> { c.query_row("SELECT protocol FROM servers WHERE name LIKE 'web%'", [], |r| r.get(0)).unwrap() };
         assert!(approvals::held_for(&b, &uuid).is_empty(), "an SSH server arrives as it is");
-
-        a.execute("UPDATE servers SET protocol='vnc' WHERE name='web'", []).unwrap();
+        a.execute("UPDATE servers SET protocol='vnc', port=5900 WHERE name='web'", []).unwrap();
         apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
-        assert_eq!(proto(&b), None, "this device keeps it an SSH server");
-        assert_eq!(approvals::held_for(&b, &uuid).into_iter().collect::<Vec<_>>(), vec!["protocol:vnc".to_string()]);
+        (a, ha, b, hb, uuid)
+    }
 
-        // An edit here pushes the shared profile's protocol, not this device's.
-        b.execute("UPDATE servers SET name='web2' WHERE name='web'", []).unwrap();
-        let recs = collect_local_records(&b, &KEY, "").unwrap();
-        apply_remote_records(&a, &KEY, &recs, &ha).unwrap();
-        assert_eq!(proto(&a).as_deref(), Some("vnc"), "the other device's switch stays");
-        let srv = recs.iter().find(|r| r.entity_type == "servers").unwrap();
+    /// The protocol and port of the server named `name`.
+    fn proto_port(c: &Connection, name: &str) -> (Option<String>, i64) {
+        c.query_row("SELECT protocol, port FROM servers WHERE name=?1", [name], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+    }
+
+    /// What `c` would push for the server named `name`: its protocol and port.
+    fn pushed(c: &Connection, name: &str) -> (serde_json::Value, serde_json::Value) {
+        let uuid: String = c.query_row("SELECT uuid FROM servers WHERE name=?1", [name], |r| r.get(0)).unwrap();
+        let recs = collect_local_records(c, &KEY, "").unwrap();
+        let srv = recs.iter().find(|r| r.entity_type == "servers" && r.uuid == uuid).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&decrypt_entity(srv.blob.as_ref().unwrap(), &KEY).unwrap()).unwrap();
-        assert_eq!(v["protocol"], "vnc");
+        (v["protocol"].clone(), v["port"].clone())
+    }
+
+    // A co-member switching an SSH server to VNC (or telnet) is held: this
+    // device keeps it an SSH server on its old port until its user allows the
+    // switch, and an edit made here meanwhile doesn't switch it back for
+    // everyone else.
+    #[test]
+    fn a_shared_profile_holds_a_switch_from_ssh_to_vnc() {
+        let (a, ha, b, hb, uuid) = b_holds_a_switch_to_vnc();
+        assert_eq!(proto_port(&b, "web"), (None, 22), "this device keeps it SSH on 22");
+        assert_eq!(approvals::held_for(&b, &uuid).into_iter().collect::<Vec<_>>(), vec!["protocol:vnc|5900".to_string()]);
+
+        // An edit here pushes the synced protocol and port, not this device's.
+        b.execute("UPDATE servers SET name='web2' WHERE name='web'", []).unwrap();
+        assert_eq!(pushed(&b, "web2"), (serde_json::json!("vnc"), serde_json::json!(5900)));
+        apply_remote_records(&a, &KEY, &collect_local_records(&b, &KEY, "").unwrap(), &ha).unwrap();
+        assert_eq!(proto_port(&a, "web2"), (Some("vnc".into()), 5900), "the other device's switch stays");
 
         // The other device's next edit, which still says VNC, stays held.
         a.execute("UPDATE servers SET host='h2' WHERE name='web2'", []).unwrap();
         apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
         let host: String = b.query_row("SELECT host FROM servers WHERE name='web2'", [], |r| r.get(0)).unwrap();
-        assert_eq!((host.as_str(), proto(&b)), ("h2", None));
-        assert!(approvals::held_for(&b, &uuid).contains("protocol:vnc"));
+        assert_eq!((host.as_str(), proto_port(&b, "web2")), ("h2", (None, 22)));
 
-        // Allowed: now a VNC server here too.
-        approvals::allow(&b, &uuid, &["protocol:vnc".to_string()]).unwrap();
-        assert_eq!(proto(&b).as_deref(), Some("vnc"));
+        // Allowed: now a VNC server on 5900 here too.
+        approvals::allow(&b, &uuid, &["protocol:vnc|5900".to_string()]).unwrap();
+        assert_eq!(proto_port(&b, "web2"), (Some("vnc".into()), 5900));
         assert!(approvals::held_for(&b, &uuid).is_empty());
+    }
+
+    // An older peer's record has no `protocol` key: the hold stays, and the
+    // row stays SSH on its old port.
+    #[test]
+    fn an_older_peers_edit_keeps_a_held_switch() {
+        let (a, _ha, b, hb, uuid) = b_holds_a_switch_to_vnc();
+        a.execute("UPDATE servers SET host='h2' WHERE name='web'", []).unwrap();
+        let ahead = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 60_000;
+        let mut recs = collect_local_records(&a, &KEY, "").unwrap();
+        for r in recs.iter_mut().filter(|r| r.entity_type == "servers") {
+            let mut obj: serde_json::Value = serde_json::from_slice(&decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap()).unwrap();
+            obj.as_object_mut().unwrap().remove("protocol");
+            r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
+            r.updated_at = format!("{ahead:015}:00000:zzz");
+        }
+        apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+        let host: String = b.query_row("SELECT host FROM servers WHERE name='web'", [], |r| r.get(0)).unwrap();
+        assert_eq!((host.as_str(), proto_port(&b, "web")), ("h2", (None, 22)));
+        assert_eq!(approvals::held_protocol(&b, &uuid).as_deref(), Some("vnc"));
+    }
+
+    // Leaving the share keeps what was held, and later syncs between the
+    // user's own computers keep a held switch held.
+    #[test]
+    fn a_held_switch_stays_held_after_leaving_the_share() {
+        let (a, _ha, b, hb, uuid) = b_holds_a_switch_to_vnc();
+        b.execute("DELETE FROM sync_meta WHERE key='share_id'", []).unwrap();
+        a.execute("UPDATE servers SET host='h2' WHERE name='web'", []).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let host: String = b.query_row("SELECT host FROM servers WHERE name='web'", [], |r| r.get(0)).unwrap();
+        assert_eq!((host.as_str(), proto_port(&b, "web")), ("h2", (None, 22)));
+        assert_eq!(approvals::held_protocol(&b, &uuid).as_deref(), Some("vnc"));
+        // Switched back to SSH over there: nothing held any more.
+        a.execute("UPDATE servers SET protocol=NULL, port=22 WHERE name='web'", []).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        assert!(approvals::held_for(&b, &uuid).is_empty());
+        assert_eq!(proto_port(&b, "web"), (None, 22));
+    }
+
+    // A peer that wrote a literal "ssh": the server is kept as plain SSH
+    // (NULL), so saving the form, which saves SSH as NULL, isn't a choice
+    // that releases the hold and pushes SSH.
+    #[test]
+    fn a_literal_ssh_is_kept_as_null() {
+        let (a, _ha) = device("A");
+        a.execute("INSERT INTO servers(name,host,port,protocol) VALUES('web','h',22,'ssh')", []).unwrap();
+        let (b, hb) = device("B");
+        approvals::create_schema(&b).unwrap();
+        b.execute("INSERT INTO sync_meta(key,value) VALUES('share_id','s1')", []).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let uuid: String = b.query_row("SELECT uuid FROM servers WHERE name='web'", [], |r| r.get(0)).unwrap();
+        a.execute("UPDATE servers SET protocol='telnet', port=23 WHERE name='web'", []).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        assert_eq!(proto_port(&b, "web"), (None, 22));
+        // What the form's save does for an SSH server: no change, still held.
+        b.execute("UPDATE servers SET protocol=NULL WHERE name='web' AND protocol IS NOT NULL", []).unwrap();
+        assert_eq!(approvals::held_protocol(&b, &uuid).as_deref(), Some("telnet"));
+        assert_eq!(pushed(&b, "web"), (serde_json::json!("telnet"), serde_json::json!(23)));
+    }
+
+    // Keep it SSH: this device's own edit, which takes the server back to SSH
+    // on its old port everywhere.
+    #[test]
+    fn keep_it_ssh_goes_to_everyone() {
+        let (a, ha, b, _hb, uuid) = b_holds_a_switch_to_vnc();
+        assert!(approvals::keep_ssh(&b, &uuid).unwrap());
+        assert!(approvals::held_for(&b, &uuid).is_empty());
+        assert_eq!(pushed(&b, "web"), (serde_json::Value::Null, serde_json::json!(22)));
+        apply_remote_records(&a, &KEY, &collect_local_records(&b, &KEY, "").unwrap(), &ha).unwrap();
+        assert_eq!(proto_port(&a, "web"), (None, 22));
+    }
+
+    // A copy of a held server is the SSH server its maker sees: nothing held
+    // on it, and it syncs as SSH, so nobody gets an unheld VNC copy.
+    #[test]
+    fn a_duplicate_of_a_held_server_syncs_as_ssh() {
+        let (_a, _ha, b, _hb, uuid) = b_holds_a_switch_to_vnc();
+        let id: i32 = b.query_row("SELECT id FROM servers WHERE name='web'", [], |r| r.get(0)).unwrap();
+        clone_server_row(&b, id).unwrap();
+        let copy: String = b.query_row("SELECT uuid FROM servers WHERE name='web (copy)'", [], |r| r.get(0)).unwrap();
+        assert!(approvals::held_for(&b, &copy).is_empty());
+        assert_eq!(proto_port(&b, "web (copy)"), (None, 22));
+        assert_eq!(pushed(&b, "web (copy)"), (serde_json::Value::Null, serde_json::json!(22)));
+        assert_eq!(approvals::held_protocol(&b, &uuid).as_deref(), Some("vnc"), "the original stays held");
     }
 
     #[test]
@@ -7094,6 +7208,24 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
         list.push(row);
     }
     Ok(list)
+}
+
+/// "Keep it SSH" for a server whose switch to telnet or VNC is held: it stays
+/// SSH on its old port, saved as this device's own edit, so the next sync
+/// takes it back to SSH everywhere (approvals::keep_ssh). False when no
+/// switch was held.
+#[tauri::command]
+async fn keep_server_ssh(db_state: tauri::State<'_, DbState>, server_id: i32) -> Result<bool, String> {
+    let kept = {
+        let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+        let conn = guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        let uuid = approvals::server_uuid(conn, server_id as i64).ok_or("[SYNC] NO_SUCH_SERVER")?;
+        approvals::keep_ssh(conn, &uuid)?
+    };
+    if kept {
+        save_vault_internal(&db_state)?;
+    }
+    Ok(kept)
 }
 
 /// Allow what this device held back for one server (see approvals.rs): the
@@ -21736,7 +21868,7 @@ pub fn run() {
             accept_share, import_shared_profile, restore_personal_profile, share_set_role, share_revoke, share_leave, share_delete,
             profile_share_status, stop_sharing, profile_sync_stats, share_key_state, accept_share_key, share_replace_key, held_deletions_list, resolve_held_deletions,
             set_editor_label,
-            add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, allow_held, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_terminal_theme, set_server_highlight, set_server_jump_host, set_server_protocol, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
+            add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, allow_held, keep_server_ssh, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_terminal_theme, set_server_highlight, set_server_jump_host, set_server_protocol, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
             get_credentials, generate_ssh_key,
             add_folder, rename_folder, delete_folder, get_folders,
             tree_moves::move_servers, tree_moves::move_rdp_links, tree_moves::move_folder, tree_moves::delete_tree_items,
