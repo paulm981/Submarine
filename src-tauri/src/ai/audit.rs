@@ -2,10 +2,13 @@
 //! this computer only. `ai-audit.log` in the app's log folder (beside
 //! submarine.log, inside `submarine-data` in portable mode), one JSON object
 //! per line. Kept apart from the app log so it doesn't rotate out with it:
-//! past 10 MB it becomes `ai-audit.old.log` and a new one starts.
+//! past 10 MB it becomes `ai-audit.old.log` and a new one starts; the two
+//! before are kept too, as `ai-audit.old.2.log` and `ai-audit.old.3.log`.
 //!
 //! It holds what was asked and decided, never a command's output, and never a
-//! token or a password.
+//! token or a password. What the AI side can make it write is limited
+//! (mod.rs): every request counts toward the rate limit, refused or not, and
+//! every request's command is cut to 4 KB (with a hash of all of it).
 
 use serde::Serialize;
 use std::fs::{File, OpenOptions};
@@ -14,8 +17,26 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 pub(crate) const FILE_NAME: &str = "ai-audit.log";
-const OLD_NAME: &str = "ai-audit.old.log";
 const MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// Full logs kept besides the current one.
+const KEPT: usize = 3;
+
+/// The name of the `n`th older log (1 = the newest of them).
+fn old_name(n: usize) -> String {
+    if n == 1 {
+        "ai-audit.old.log".to_string()
+    } else {
+        format!("ai-audit.old.{n}.log")
+    }
+}
+
+/// The current log becomes the newest old one; the oldest goes.
+fn rotate(dir: &Path) {
+    for n in (1..KEPT).rev() {
+        let _ = std::fs::rename(dir.join(old_name(n)), dir.join(old_name(n + 1)));
+    }
+    let _ = std::fs::rename(dir.join(FILE_NAME), dir.join(old_name(1)));
+}
 
 /// One line of the log. `event` says what happened: an AI tab started or
 /// ended, a server shared or no longer, a request and its outcome.
@@ -76,7 +97,7 @@ impl AuditLog {
         let Ok(mut slot) = self.file.lock() else { return };
         if slot.as_ref().is_some_and(|(_, size)| *size >= MAX_BYTES) {
             *slot = None;
-            let _ = std::fs::rename(dir.join(FILE_NAME), dir.join(OLD_NAME));
+            rotate(dir);
         }
         if slot.is_none() {
             *slot = open(dir).map(|f| {
@@ -135,6 +156,22 @@ mod tests {
             let mode = std::fs::metadata(dir.join(FILE_NAME)).unwrap().permissions().mode();
             assert_eq!(mode & 0o077, 0, "yours only");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keeps_three_old_logs() {
+        let dir = std::env::temp_dir().join(format!("submarine-audit-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..6 {
+            std::fs::write(dir.join(FILE_NAME), format!("{i}")).unwrap();
+            rotate(&dir);
+        }
+        let read = |n| std::fs::read_to_string(dir.join(old_name(n))).unwrap();
+        assert_eq!([read(1), read(2), read(3)], ["5", "4", "3"].map(String::from));
+        assert!(!dir.join(old_name(4)).exists());
+        assert!(!dir.join(FILE_NAME).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

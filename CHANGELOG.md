@@ -9,6 +9,18 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **AI tools, safer** ([#85](https://github.com/paulm981/Submarine/issues/85)), from an independent security review:
+  - **Stop ends the command on the server.** Stopping, unsharing, closing the AI tab or turning AI tools off no longer only stops Submarine waiting for the command.
+  - **Allow can't be clicked by accident.** A double-click can no longer Allow the next request: Allow and Deny take a single click, and wait half a second after a request appears or moves.
+  - **Hidden characters show.** The AI panel shows every hidden or invisible character in a command, on waiting, running and finished requests.
+  - **More secrets are hidden from the AI:**
+    - passwords on command lines (`--password`, `mysql -p…`, `sshpass -p`) and `DB_PASS=` and similar;
+    - Apache password hashes and web tokens;
+    - private keys in base64, including certificate-and-key bundles.
+  - **The AI can't flush the audit log or tie up memory.** Every request counts toward the limit, commands are logged at most 4 KB with a fingerprint, three older logs are kept, and what one AI connection can make Submarine hold is capped.
+
+## v0.3.8-fork.8
+
 - **Two uploads to the same file:** the second one now asks before overwriting what the first one put there ([#84](https://github.com/paulm981/Submarine/issues/84)).
 - **Duplicating a server that fails** no longer leaves a "deleted" record that syncs to your other devices.
 - **Servers that open on launch** have their operating system checked on the port they connected to.

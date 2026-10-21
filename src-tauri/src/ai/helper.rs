@@ -25,7 +25,7 @@ const LAST_ANSWERS: Duration = Duration::from_secs(1);
 /// The helper's whole run; the process's exit code.
 pub fn main() -> i32 {
     let addr = std::env::var(channel::ENV_ADDR).unwrap_or_default();
-    let token = std::env::var(channel::ENV_TOKEN).unwrap_or_default();
+    let token = zeroize::Zeroizing::new(std::env::var(channel::ENV_TOKEN).unwrap_or_default());
     if addr.is_empty() || token.is_empty() {
         eprintln!("submarine --mcp: only an AI tool started from Submarine's Home menu can connect to Submarine.");
         return 2;
