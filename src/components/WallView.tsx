@@ -49,6 +49,11 @@ export interface Wall {
   cols: number;
   /// The saved wall it was opened from or saved as.
   savedId: number | null;
+  /// Broadcast takes the open tabs into its Wall: the sessions that were
+  /// tabs then, so "Back to tabs" and closing the Wall can put them back
+  /// (and tell them from sessions opened into the Wall itself). Their tab
+  /// order is just their order in the session list, which isn't touched.
+  fromTabs?: string[];
 }
 
 export interface WallSession { id: string; serverName: string; wallId?: string; }
@@ -89,7 +94,7 @@ const preview = (text: string) => {
 
 export const WallView = ({
   wall, sessions, statuses, waiting, terminalTitles, snippets,
-  onChange, onOpenSession, onRemove, onReconnect, onAdd, onSave, onRename,
+  onChange, onOpenSession, onRemove, onReconnect, onAdd, onSave, onRename, onBackToTabs,
 }: {
   wall: Wall;
   sessions: WallSession[];
@@ -106,6 +111,8 @@ export const WallView = ({
   onAdd: () => void;
   onSave: () => void;
   onRename: () => void;
+  /// Put the sessions back as tabs and close the Wall (they stay connected).
+  onBackToTabs: () => void;
 }) => {
   useDockVersion();
   const confirm = useConfirm();
@@ -561,6 +568,15 @@ export const WallView = ({
             </button>
           ))}
         </div>
+        {!!wall.fromTabs?.length && (
+          <button
+            onClick={onBackToTabs}
+            title="Put the servers back as tabs and close this wall — they stay connected"
+            className={`${btn} bg-white/[0.04] border-white/10 text-zinc-300 hover:bg-white/[0.08] hover:text-white`}
+          >
+            <LayoutGrid size={11} /> Back to tabs
+          </button>
+        )}
         <button onClick={onAdd} title="Add terminals to this wall" className={`${btn} bg-primary/15 hover:bg-primary/25 text-primary border-primary/30`}>
           <Plus size={11} /> Add
         </button>

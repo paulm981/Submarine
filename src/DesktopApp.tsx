@@ -190,10 +190,10 @@ function DesktopApp() {
     })));
   };
   const makeWallId = () => `wall-${++wallSeq.current}`;
-  const newWall = (name: string, members: WallMember[], opts: { broadcast?: boolean; cols?: number; savedId?: number | null; id?: string } = {}) => {
+  const newWall = (name: string, members: WallMember[], opts: { broadcast?: boolean; cols?: number; savedId?: number | null; id?: string; fromTabs?: string[] } = {}) => {
     const id = opts.id ?? makeWallId();
     setWalls(prev => [...prev, {
-      id, name, members, broadcast: !!opts.broadcast, paused: [], solo: null, cols: opts.cols ?? 0, savedId: opts.savedId ?? null,
+      id, name, members, broadcast: !!opts.broadcast, paused: [], solo: null, cols: opts.cols ?? 0, savedId: opts.savedId ?? null, fromTabs: opts.fromTabs,
     }]);
     setMergedSessionIds([]);
     setActiveView(id);
@@ -1183,14 +1183,43 @@ function DesktopApp() {
     if (typed != null) updateWall(w.id, { name: typed.trim() });
   };
 
+  // Sessions of a Wall that Broadcast took from the tab strip go back to it:
+  // clearing wallId is enough, as they never left their place in the list.
+  // The Wall closes without closing any session (opened-into ones get a tab
+  // too, so nothing is left running with nowhere to see it).
+  const backToTabs = (wall: Wall) => {
+    const back = sessions.filter(s => s.wallId === wall.id);
+    setSessions(prev => prev.map(s => (s.wallId === wall.id ? { ...s, wallId: undefined } : s)));
+    setWalls(prev => prev.filter(w => w.id !== wall.id));
+    setMergedSessionIds([]);
+    setActiveView(prev => (prev === wall.id ? (back[0]?.id ?? START_VIEW) : prev));
+  };
+
   // Close a Wall. Its terminals' sessions stay open in their tabs; the ones
   // opened into it (no tab of their own) close with it — unless another
-  // open Wall has them, which then keeps them.
+  // open Wall has them, which then keeps them. Sessions Broadcast took from
+  // the tabs are asked about: back as tabs, or closed too. A session that
+  // is on two Walls goes back to its tab either way the Wall is closed.
   const closeWall = async (wallId: string) => {
     const keeper = (sid: string) => walls.find(o => o.id !== wallId && o.members.some(m => m.sessionId === sid));
+    const wall = walls.find(w => w.id === wallId);
     const own = sessions.filter(s => s.wallId === wallId);
-    const closing = own.filter(s => !keeper(s.id));
-    if (closing.some(s => sessionStatuses[s.id] === "connected")) {
+    const taken = own.filter(s => wall?.fromTabs?.includes(s.id));
+    const opened = own.filter(s => !taken.includes(s));
+    let closing = opened.filter(s => !keeper(s.id));
+    if (taken.length > 0) {
+      let closeAll = false;
+      const n = taken.length + closing.length;
+      const keep = await confirm({
+        title: "Close this wall?",
+        message: `${taken.length} server${taken.length === 1 ? " was a tab" : "s were tabs"} before Broadcast took ${taken.length === 1 ? "it" : "them"} in. Put ${taken.length === 1 ? "it" : "them"} back as tabs, or close ${taken.length === 1 ? "it" : "them"} with the wall.${closing.length > 0 ? ` ${closing.length} opened into the wall close either way.` : ""}`,
+        okLabel: "Put back as tabs",
+        altLabel: `Close all ${n}`,
+        onAlt: () => { closeAll = true; },
+      });
+      if (!keep && !closeAll) return;
+      if (closeAll) closing = [...taken, ...closing];
+    } else if (closing.some(s => sessionStatuses[s.id] === "connected")) {
       const ok = await confirm({
         title: "Close this wall?",
         message: `${closing.length} session${closing.length === 1 ? " was" : "s were"} opened into it and ${closing.length === 1 ? "has no tab" : "have no tabs"} of ${closing.length === 1 ? "its" : "their"} own, so ${closing.length === 1 ? "it closes" : "they close"} with it.`,
@@ -1200,32 +1229,38 @@ function DesktopApp() {
       if (!ok) return;
     }
     const closingIds = new Set(closing.map(s => s.id));
+    const takenIds = new Set(taken.map(s => s.id));
     setSessions(prev => prev
       .filter(s => !closingIds.has(s.id))
-      .map(s => (s.wallId === wallId ? { ...s, wallId: keeper(s.id)?.id } : s)));
+      .map(s => (s.wallId === wallId ? { ...s, wallId: takenIds.has(s.id) ? undefined : keeper(s.id)?.id } : s)));
     setSessionStatuses(prev => {
       const next = { ...prev };
       for (const sid of closingIds) delete next[sid];
       return next;
     });
     setWalls(prev => prev.filter(w => w.id !== wallId));
+    setMergedSessionIds(prev => {
+      const next = prev.filter(id => !closingIds.has(id));
+      return next.length < 2 ? [] : next;
+    });
     for (const sid of closingIds) forgetSession(sid);
     setActiveView(prev => (prev === wallId || closingIds.has(prev) ? START_VIEW : prev));
   };
 
   // A tile's ✕. A session that was opened for this Wall (no tab of its own)
   // closes — unless another Wall has it too, which then keeps it; any other
-  // just leaves the Wall and keeps its tab.
+  // just leaves the Wall and keeps its tab. One Broadcast took from the tabs
+  // gets its tab back, not closed.
   const removeWallMember = (wall: Wall, m: WallMember) => {
     const s = sessions.find(x => x.id === m.sessionId);
     const sameSessionHere = wall.members.some(o => o.sessionId === m.sessionId && o.terminalId !== m.terminalId);
     if (s?.wallId === wall.id && !sameSessionHere) {
       const other = walls.find(o => o.id !== wall.id && o.members.some(x => x.sessionId === m.sessionId));
-      if (!other) {
+      if (!other && !wall.fromTabs?.includes(m.sessionId)) {
         void closeSessions([m.sessionId]);
         return;
       }
-      setSessions(prev => prev.map(x => (x.id === m.sessionId ? { ...x, wallId: other.id } : x)));
+      setSessions(prev => prev.map(x => (x.id === m.sessionId ? { ...x, wallId: other?.id } : x)));
     }
     removeFromWall(wall.id, m.terminalId);
   };
@@ -1320,7 +1355,7 @@ function DesktopApp() {
 
   // Broadcast on/off — the title bar's button and Ctrl+Shift+B. On a Wall it
   // flips that Wall's Broadcast. Elsewhere it goes back to the Wall that is
-  // broadcasting, or — when none is — puts every open server tab on one and
+  // broadcasting, or — when none is — takes every open server tab into one and
   // starts broadcasting to them (the second time, that same Wall as it was).
   const autoWallRef = useRef<string | null>(null);
   const toggleBroadcast = () => {
@@ -1348,15 +1383,23 @@ function DesktopApp() {
     }
     // The Wall it made before comes back as it was left: terminals taken off
     // it stay off.
+    // Tabs that are on it (popped out of it since) are taken in again.
     const auto = walls.find(w => w.id === autoWallRef.current);
     if (auto) {
-      updateWall(auto.id, { broadcast: true });
+      const back = tabs.filter(s => auto.members.some(m => m.sessionId === s.id)).map(s => s.id);
+      updateWall(auto.id, { broadcast: true, fromTabs: [...new Set([...(auto.fromTabs ?? []), ...back])] });
+      setSessions(prev => prev.map(s => (back.includes(s.id) ? { ...s, wallId: auto.id } : s)));
       setMergedSessionIds([]);
       setActiveView(auto.id);
       return;
     }
     const members = tabs.map(s => ({ sessionId: s.id, terminalId: terminalOf(s.id) }));
-    autoWallRef.current = newWall("Broadcast", members, { broadcast: true });
+    // The tabs go into the Wall (no tab of their own, so 80 servers are one
+    // tab, not 81); "Back to tabs" or closing the Wall brings them back.
+    const id = makeWallId();
+    const taken = new Set(tabs.map(s => s.id));
+    setSessions(prev => prev.map(s => (taken.has(s.id) ? { ...s, wallId: id } : s)));
+    autoWallRef.current = newWall("Broadcast", members, { broadcast: true, id, fromTabs: [...taken] });
   };
   const toggleBroadcastRef = useRef(toggleBroadcast);
   toggleBroadcastRef.current = toggleBroadcast;
@@ -2800,6 +2843,7 @@ function DesktopApp() {
                   onAdd={() => setWallPickerFor(activeWall.id)}
                   onSave={() => { void saveWall(activeWall); }}
                   onRename={() => { void renameWall(activeWall); }}
+                  onBackToTabs={() => backToTabs(activeWall)}
                 />
                 {wallPickerFor === activeWall.id && (
                   <WallPicker

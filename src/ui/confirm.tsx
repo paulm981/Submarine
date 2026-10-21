@@ -83,6 +83,11 @@ export interface ConfirmOptions {
   /** Focus starts on Cancel: an Enter meant for something else (the
    *  terminal the prompt appeared over) can't answer yes. */
   safeDefault?: boolean;
+  /** A third button between Cancel and OK. Clicking it runs `onAlt` and the
+   *  answer is false, so a caller that doesn't read `onAlt` (or Esc, or the
+   *  backdrop) treats it as "no". */
+  altLabel?: string;
+  onAlt?: () => void;
 }
 
 type Resolver = (value: boolean) => void;
@@ -409,6 +414,12 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
                       className="px-3 h-8 rounded text-[11px] font-bold uppercase tracking-wider bg-white/[0.04] border border-white/10 text-zinc-300 hover:bg-white/[0.08] hover:text-white">
                 {state.opts.cancelLabel || "Cancel"}
               </button>
+              {state.opts.altLabel && (
+                <button onClick={() => { state.opts.onAlt?.(); close(false); }}
+                        className="px-3 h-8 rounded text-[11px] font-bold uppercase tracking-wider border bg-rose-500/15 border-rose-500/40 text-rose-300 hover:bg-rose-500/25">
+                  {state.opts.altLabel}
+                </button>
+              )}
               <button onClick={() => close(true)} ref={confirmOkRef}
                       data-default-focus={state.opts.safeDefault ? undefined : true}
                       className={`px-3 h-8 rounded text-[11px] font-bold uppercase tracking-wider border ${
