@@ -15,6 +15,8 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - **Drag a tab to move it** ([#71](https://github.com/paulm981/Submarine/issues/71)), in the title bar and among a server's terminals. Ctrl+Tab follows the new order. Esc puts it back. Without a mouse, use **Move left** and **Move right** in the tab's right-click menu.
 - **Compact tabs** ([#71](https://github.com/paulm981/Submarine/issues/71)): a setting under Settings › UI Customization for flat tabs that fit more across (Home and Wall tabs too), with long names cut short and shown in full on hover.
 
+- **Picking several terminals on a Wall** works as in the session tree ([#84](https://github.com/paulm981/Submarine/issues/84)). Shift-click picks the run from the last terminal you clicked, and a second Shift-click can make it shorter as well as longer. Turning Broadcast off, Clear, or pausing what you picked starts afresh.
+
 ## v0.3.8-fork.6
 
 - **AI tools, first test** ([#32](https://github.com/paulm981/Submarine/issues/32), steps 1 and 2 of the MVP). Off by default: Settings › AI tools.
