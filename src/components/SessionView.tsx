@@ -1133,6 +1133,16 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
       // or a setting stops the cycle; Reconnect is still there.
       if (event.payload?.retry === true) {
         scheduleReconnect(reconnectAttemptRef.current + 1);
+        // Say what got through (name, port, jump host) under the error. It
+        // runs beside the countdown, and is dropped if that moved on (the next
+        // attempt started, or Cancel) before the answer came back.
+        const waiting = reconnectAttemptRef.current;
+        invoke<string[]>("diagnose_connect", { serverId: session.serverId, quickAuth: session.quickAuth || null })
+          .then((lines) => {
+            if (reconnectAttemptRef.current !== waiting || !reconnectTimerRef.current) return;
+            lines.forEach((msg) => pushLog({ msg, type: 'info' }));
+          })
+          .catch(() => {});
       } else {
         cancelReconnect();
       }

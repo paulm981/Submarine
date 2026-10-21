@@ -44,6 +44,7 @@ mod ssh_config;
 mod applog;
 mod term_output;
 mod proxy_command;
+mod diagnose;
 #[cfg(target_os = "android")]
 mod android_bridge;
 #[cfg(test)]
@@ -10209,6 +10210,74 @@ async fn teardown_connection_key(state: &SshState, mirrors: &MirrorMap, key: &st
     }
 }
 
+/// What a failed connect to server `server_id` (or a Quick Connect target)
+/// can say about why: whether the name resolves and the port answers, at a
+/// proxy's or jump host's address when there is one (see `diagnose`). The tab
+/// runs it beside the retry countdown and shows the lines under the error.
+#[tauri::command]
+async fn diagnose_connect(
+    db_state: tauri::State<'_, DbState>,
+    server_id: i32,
+    quick_auth: Option<QuickAuth>,
+) -> Result<Vec<String>, String> {
+    // name, host, port, proxy type / host / port, jump host's name / host / port
+    type Row = (String, String, i32, String, Option<String>, Option<i32>, Option<(String, String, i32)>);
+    let row: Row = if let Some(q) = quick_auth {
+        (q.host.clone(), q.host, q.port, "none".into(), None, None, None)
+    } else {
+        let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
+        let conn = guard.as_ref().ok_or("Database is not open")?;
+        conn.query_row(
+            "SELECT s.name, s.host, s.port, s.proxy_type, s.proxy_host, s.proxy_port, j.name, j.host, j.port
+             FROM servers s LEFT JOIN servers j ON j.id = s.jump_host_id WHERE s.id=?1",
+            [server_id],
+            |r| {
+                let jump = match (r.get::<_, Option<String>>(7)?, r.get::<_, Option<i32>>(8)?) {
+                    (Some(host), Some(port)) => {
+                        Some((r.get::<_, Option<String>>(6)?.unwrap_or_else(|| host.clone()), host, port))
+                    }
+                    _ => None,
+                };
+                Ok((
+                    r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get::<_, Option<String>>(3)?.unwrap_or_else(|| "none".into()),
+                    r.get(4)?,
+                    r.get(5)?,
+                    jump,
+                ))
+            },
+        )
+        .map_err(|_| "Server not found".to_string())?
+    };
+    let (name, host, port, proxy_type, proxy_host, proxy_port, jump) = row;
+    let port = u16::try_from(port).map_err(|_| format!("Port {port} isn't a valid port"))?;
+
+    // The address an alias in ~/.ssh/config stands for, as the connect uses it.
+    let mut target = ConfigTarget::resolve(&host, port, "", Some(name)).await;
+    let own_route = if jump.is_some() {
+        Some("jump host")
+    } else if proxy_type == "socks5" || proxy_type == "http" {
+        Some("proxy")
+    } else {
+        None
+    };
+    let proxy = proxy_host.filter(|h| !h.is_empty()).zip(proxy_port.and_then(|p| u16::try_from(p).ok()));
+    let route = if let Some((jump_name, jump_host, jump_port)) = jump {
+        let jump_port = u16::try_from(jump_port).map_err(|_| format!("Port {jump_port} isn't a valid port"))?;
+        let hop = ConfigTarget::resolve(&jump_host, jump_port, "", Some(jump_name.clone())).await;
+        diagnose::Route::Jump { name: jump_name, host: hop.host, port: hop.port }
+    } else if let (Some((host, port)), true) = (proxy, own_route.is_some()) {
+        diagnose::Route::Proxy { kind: if proxy_type == "socks5" { "SOCKS5" } else { "HTTP" }, host, port }
+    } else if matches!(target.proxy(own_route), Some(ssh_config::Proxy::Command(_))) {
+        diagnose::Route::Command
+    } else {
+        diagnose::Route::Direct
+    };
+    Ok(diagnose::diagnose(&target.host, target.port, route).await)
+}
+
 #[tauri::command]
 async fn initiate_connection(
     app: tauri::AppHandle,
@@ -19797,6 +19866,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            diagnose_connect,
             check_db_exists, setup_master_db, persist_vault,
             list_profiles, cloud_list_sync_profiles, cloud_delete_profile, force_push_profile, select_profile, create_profile, delete_profile, close_profile,
             export_profile, import_profile_pick, import_profile_save, import_profile_bytes,
