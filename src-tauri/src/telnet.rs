@@ -10,6 +10,7 @@
 //! - TERMINAL-TYPE (RFC 1091): xterm-256color, which the terminal is;
 //! - NAWS (RFC 1073): the window size, again on every resize;
 //! - BINARY (RFC 856) both ways when the server asks, for UTF-8.
+//!
 //! Every other option is refused. A server that doesn't echo gets what is
 //! typed echoed here, as a line-mode telnet client does. On a port other than
 //! 23 nothing is asked first (a mail or web server would take the requests

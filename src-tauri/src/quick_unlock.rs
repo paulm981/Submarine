@@ -14,6 +14,7 @@
 //! - Android: an AES key in the Android Keystore that only works right after
 //!   a strong biometric check (BiometricPrompt) and is dropped when a new
 //!   fingerprint is enrolled (SubmarinePlugin.kt).
+//!
 //! The file also holds the vault's salt: a vault replaced since (imported or
 //! restored again) doesn't match, and the file is dropped. A copy of the file
 //! on another machine (a portable folder moved) can't be opened there: the
@@ -164,7 +165,6 @@ pub async fn quick_unlock_enable(app: tauri::AppHandle, state: tauri::State<'_, 
     let key = state.master_key.lock().map_err(|_| "[STATE] LOCK_FAILED")?.clone().ok_or("[STATE] LOCKED")?;
     let salt: [u8; SALT_LEN] = (*state.salt.lock().map_err(|_| "[STATE] LOCK_FAILED")?).ok_or("[STATE] LOCKED")?;
     let derived = {
-        let salt = salt;
         tokio::task::spawn_blocking(move || crate::derive_key(&password, &salt))
             .await
             .map_err(|e| format!("[CRYPTO] KDF_JOIN: {e}"))??

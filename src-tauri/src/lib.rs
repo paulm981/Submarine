@@ -833,7 +833,10 @@ struct EntitySpec {
 /// doesn't know the field", not "clear it" — so the merge keeps this device's
 /// value then (and leaves it NULL on a fresh insert). `position` has its own
 /// shim in apply_entity, as it is NOT NULL. `scope` is a command's (#185).
-const LATE_COLS: &[&str] = &["terminal_theme", "highlight", "scope"];
+/// `protocol` is a server's type (#173: NULL for SSH, "rdp", "telnet",
+/// "vnc"): a peer from before it doesn't turn this device's RDP, telnet or
+/// VNC server back into an SSH one.
+const LATE_COLS: &[&str] = &["terminal_theme", "highlight", "scope", "protocol"];
 
 /// Applied in this order so most FK referents already exist on merge; the two
 /// self-referential FKs (folders.parent_id, servers.jump_host_id) are resolved
@@ -6890,8 +6893,8 @@ fn clone_server_row(conn: &rusqlite::Connection, id: i32) -> Result<i64, String>
         .map_err(|e| format!("[DATABASE] SERVER_CLONE_FAILED: {}", e))?;
     let result = (|| {
         let affected = conn.execute(
-            "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, terminal_theme, highlight)
-             SELECT name || ' (copy)', host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, 0, mirrors, color, notes, run_on_connect, jump_host_id, terminal_theme, highlight
+            "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, terminal_theme, highlight, protocol)
+             SELECT name || ' (copy)', host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, 0, mirrors, color, notes, run_on_connect, jump_host_id, terminal_theme, highlight, protocol
              FROM servers WHERE id = ?1",
             rusqlite::params![id],
         ).map_err(|e| format!("[DATABASE] SERVER_CLONE_FAILED: {}", e))?;
@@ -10233,6 +10236,8 @@ fn resolve_jump_auth(
 /// prompt plumbing and attempt, and whether the jump host's login may ask for
 /// anything. The original project's shape (it chains several hops, from #169,
 /// which the fork hasn't taken), so its RDP, telnet and VNC code fits as is.
+/// Its fields are connect_jump_host's arguments, spelt as they are there.
+#[allow(clippy::type_complexity)]
 struct HopCtx<'a> {
     app: &'a tauri::AppHandle,
     db: &'a std::sync::Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
@@ -14097,6 +14102,8 @@ async fn vnc_resize(vnc_clients: tauri::State<'_, vnc_client::VncClients>, sessi
     Ok(())
 }
 
+// A command's arguments are what the page sends; there's no struct to group.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn disconnect_session(
     app: tauri::AppHandle,
@@ -20864,9 +20871,11 @@ fn resolve_node_auth_row(
     let proxy_host: Option<String> = row.get(11).ok().flatten();
     let proxy_port: Option<i32> = row.get(12).ok().flatten();
     let jump_host_id: Option<i32> = row.get(13).ok().flatten();
-    // An RDP server has no shell to read numbers from (issue #3).
-    if row.get::<_, Option<String>>(14).ok().flatten().as_deref() == Some("rdp") {
-        return Err("an RDP server can't be monitored".into());
+    // An RDP, telnet or VNC server has no SSH shell to read numbers from
+    // (issue #3). The monitor panel doesn't offer them; this holds for a
+    // server that changed type since it was added there.
+    if let Some(kind) = non_ssh_kind(row.get::<_, Option<String>>(14).ok().flatten().as_deref()) {
+        return Err(format!("{kind} server can't be monitored"));
     }
 
     let (username, password, key_id) = if auth_type == "vault" {
@@ -21967,14 +21976,14 @@ mod clone_server_tests {
             "CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT,
                 credential_id INTEGER, folder_id INTEGER, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER, tunnels TEXT,
                 auth_type TEXT, key_id INTEGER, autostart INTEGER NOT NULL DEFAULT 0, mirrors TEXT, color TEXT, notes TEXT,
-                run_on_connect TEXT NOT NULL DEFAULT '', jump_host_id INTEGER, terminal_theme TEXT, highlight TEXT,
+                run_on_connect TEXT NOT NULL DEFAULT '', jump_host_id INTEGER, terminal_theme TEXT, highlight TEXT, protocol TEXT,
                 position INTEGER NOT NULL DEFAULT 0, uuid TEXT);
              CREATE TABLE sync_tombstones(uuid TEXT PRIMARY KEY);
              CREATE TRIGGER s_ai AFTER INSERT ON servers WHEN NEW.uuid IS NULL
                BEGIN UPDATE servers SET uuid = 'u' || NEW.id WHERE id = NEW.id; END;
              CREATE TRIGGER s_ad AFTER DELETE ON servers BEGIN INSERT INTO sync_tombstones VALUES (OLD.uuid); END;
              CREATE TABLE held_approvals(uuid TEXT NOT NULL, item TEXT NOT NULL, since INTEGER NOT NULL, PRIMARY KEY (uuid, item));
-             INSERT INTO servers(id, name, host) VALUES (1, 'web', 'example.com');
+             INSERT INTO servers(id, name, host, protocol) VALUES (1, 'web', 'example.com', 'vnc');
              INSERT INTO held_approvals VALUES ('u1', 'run_on_connect', 0);",
         )
         .unwrap();
@@ -21991,6 +22000,9 @@ mod clone_server_tests {
         let new_id = clone_server_row(&conn, 1).unwrap();
         let name: String = conn.query_row("SELECT name FROM servers WHERE id = ?1", [new_id], |r| r.get(0)).unwrap();
         assert_eq!(name, "web (copy)");
+        // A copy is the same kind of server (#173).
+        let protocol: Option<String> = conn.query_row("SELECT protocol FROM servers WHERE id = ?1", [new_id], |r| r.get(0)).unwrap();
+        assert_eq!(protocol.as_deref(), Some("vnc"));
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM held_approvals"), 2);
         assert!(conn.is_autocommit());
     }

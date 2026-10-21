@@ -187,6 +187,11 @@ function DesktopApp() {
   }, []);
   // The terminal a session joins a Wall with: the one on screen in its tab.
   const terminalOf = (sid: string) => sessionActiveTerm[sid] ?? `${sid}-term-0`;
+  // Only SSH servers go on a Wall: a VNC or RDP tab is a screen, not a
+  // terminal, and must never get broadcast keys; a telnet tab has no shell
+  // panes for a Wall to show.
+  const isSshServer = (server: any) => (server?.protocol ?? "ssh") === "ssh";
+  const onWallable = (s: Session) => (s.protocol ?? "ssh") === "ssh";
   const addToWall = (wallId: string, add: WallMember[]) => {
     setWalls(prev => prev.map(w => {
       if (w.id !== wallId) return w;
@@ -1127,7 +1132,8 @@ function DesktopApp() {
   // already open join with the terminal on screen in their tab. A saved wall
   // that's open already is just shown — plus, when it was just saved
   // (addMissing), the servers it has now and the open one lacks.
-  const openServersAsWall = (list: any[], name: string, opts: { broadcast?: boolean; cols?: number; savedId?: number | null; addMissing?: boolean } = {}) => {
+  const openServersAsWall = (all: any[], name: string, opts: { broadcast?: boolean; cols?: number; savedId?: number | null; addMissing?: boolean } = {}) => {
+    const list = all.filter(isSshServer);
     if (opts.savedId != null) {
       const open = walls.find(w => w.savedId === opts.savedId);
       if (open) {
@@ -1425,7 +1431,7 @@ function DesktopApp() {
       setActiveView(live.id);
       return;
     }
-    const tabs = sessions.filter(s => !s.wallId);
+    const tabs = sessions.filter(s => !s.wallId && onWallable(s));
     if (tabs.length === 0) {
       // Everything open is on Walls already: broadcast on the newest.
       const last = walls[walls.length - 1];
@@ -2155,7 +2161,7 @@ function DesktopApp() {
               walls={walls}
               activeId={activeView}
               saved={savedWalls}
-              canFromTabs={sessions.some(s => !s.wallId)}
+              canFromTabs={sessions.some(s => !s.wallId && onWallable(s))}
               onShow={(wid) => { setWallsMenuOpen(false); setMergedSessionIds([]); setActiveView(wid); }}
               onCloseWall={(wid) => { setWallsMenuOpen(false); void closeWall(wid); }}
               onOpenSaved={(w, b) => { setWallsMenuOpen(false); openSavedWall(w, b); }}
@@ -2164,7 +2170,7 @@ function DesktopApp() {
               onNew={() => { setWallsMenuOpen(false); setWallEditor({ id: null, name: "", server_ids: [], cols: 0 }); }}
               onFromTabs={() => {
                 setWallsMenuOpen(false);
-                newWall("Open tabs", sessions.filter(s => !s.wallId).map(s => ({ sessionId: s.id, terminalId: terminalOf(s.id) })));
+                newWall("Open tabs", sessions.filter(s => !s.wallId && onWallable(s)).map(s => ({ sessionId: s.id, terminalId: terminalOf(s.id) })));
               }}
               onDismiss={() => setWallsMenuOpen(false)}
             />
@@ -2349,6 +2355,8 @@ function DesktopApp() {
                 A Wall's own Add picker is for other terminals and servers. */}
             {(() => {
               const tid = terminalOf(targetId);
+              const target = sessions.find(x => x.id === targetId);
+              if (target && !onWallable(target)) return null;
               return (
                 <>
                   <div className="border-t border-white/5 my-1" />
@@ -2981,10 +2989,10 @@ function DesktopApp() {
                 {wallPickerFor === activeWall.id && (
                   <WallPicker
                     wall={activeWall}
-                    sessions={sessions}
+                    sessions={sessions.filter(onWallable)}
                     terminals={sessionTerminals}
                     statuses={sessionStatuses}
-                    servers={servers}
+                    servers={servers.filter(isSshServer)}
                     folders={folders}
                     onToggle={(m) => (activeWall.members.some(x => x.terminalId === m.terminalId)
                       ? removeWallMember(activeWall, m)
@@ -3005,7 +3013,7 @@ function DesktopApp() {
             {wallEditor && (
               <WallEditorModal
                 initial={wallEditor}
-                servers={servers}
+                servers={servers.filter(isSshServer)}
                 folders={folders}
                 onSave={(w, open) => { void saveSavedWall(w, open); }}
                 onClose={() => setWallEditor(null)}
