@@ -48,6 +48,7 @@ mod term_output;
 mod proxy_command;
 mod diagnose;
 mod ai;
+mod open_policy;
 mod rdp;
 mod quick_unlock;
 mod rdp_client;
@@ -19187,6 +19188,13 @@ async fn sftp_open_remote_file(
 
     let sftp = get_sftp_session(&state, &session_id).await?;
     let filename = safe_temp_leaf_name(&remote_path)?;
+    // A program the server named is refused before anything is fetched
+    // (open_policy.rs). Anything else opens in an editor below, never by its
+    // own default action (local_open.rs), so open_policy's other answers
+    // (Editor, Default) aren't needed here.
+    if let open_policy::Opening::Refuse(why) = open_policy::decide(&filename) {
+        return Err(why);
+    }
 
     // Live-edit opens the copy in an editor, so refuse a file too large to
     // hold in memory (a huge binary, or a broken server's endless read) —
