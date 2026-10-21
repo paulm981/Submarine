@@ -18,6 +18,8 @@ import { readUseSshAgent } from "../util/sshAgent";
 import { useSlideOverFocus } from "../ui/slideOverFocus";
 import { useConfirm } from "../ui/confirm";
 import { markTyped } from "../ui/terminalDock";
+import { COMPACT_TAB_NAME, COMPACT_TAB_PAD, NewsDot, compactTermTabClass } from "../ui/tabStyle";
+import { reorderById, useTabDrag } from "../ui/tabDrag";
 
 // What the shell-config push commands answer (mirror.rs' ShellSync* types).
 type ShellSyncShells = { remote_shell: string; local_shell: string; shell_mismatch: boolean };
@@ -279,7 +281,7 @@ const ToolTitleBar = ({ title, shortTitle, toggle, mirror, extra, onClose }: {
 // `displayName`: the session tab's name, which the user may have changed
 // from the server's (DesktopApp's tabNames). `profile`: the unlocked
 // profile's name, for what is kept per server on this device.
-const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onStatusChange, chromeless = false, onTerminalsChange, isActiveView = false, onPromptChange }: any) => {
+const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onStatusChange, chromeless = false, onTerminalsChange, isActiveView = false, onPromptChange, compactTabs = false }: any) => {
   const [status, setStatus] = useState<'connecting' | 'connected' | 'failed' | 'disconnected'>('connecting');
 
   // Bubble every status change up to the parent so the session-tab strip
@@ -644,6 +646,12 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   };
 
   const [activeTab, setActiveTab] = useState<string>(`${session.id}-term-0`);
+  // Dragging a terminal tab to a new place reorders `terminals` (the Wall
+  // picker, which reads them through onTerminalsChange, follows). The
+  // terminals stay mounted: only their order in the strip changes.
+  const termDrag = useTabDrag(`terms-${session.id}`, (dragId, overId, after) =>
+    setTerminals(prev => reorderById(prev, dragId, overId, after)));
+
   // Bubble our terminals + active-tab up to the parent (App) whenever
   // they change so the Wall pinboard and any other App-level consumers
   // don't have to duplicate the per-session terminal book-keeping.
@@ -1726,7 +1734,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
       {!chromeless && (
       <div inert={shellSyncOpen ? "" : undefined} className="h-12 border-b border-white/5 bg-[#121214]/50 flex items-center px-2 sm:px-4 shrink-0 justify-between gap-1">
         <div
-          className="flex items-center gap-1 overflow-x-auto no-scrollbar flex-1 mr-1 sm:mr-4 mask-fade-right"
+          className={`flex items-center ${compactTabs ? "gap-0" : "gap-1"} overflow-x-auto no-scrollbar flex-1 mr-1 sm:mr-4 mask-fade-right`}
           onWheel={(e) => { e.currentTarget.scrollLeft += e.deltaY; }}
         >
         {terminals.map(t => {
@@ -1735,8 +1743,11 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           // a softer accent, so the pairing is obvious at a glance.
           const isFocusedHalf = activeTab === t.id;
           const isSplitPartner = !!(splitTerminals.includes(t.id) && !isFocusedHalf);
+          const drag = termDrag.tabMark(t.id);
           return (
-          <div key={t.id} className="group relative flex items-center"
+          <div key={t.id} className={`group relative flex items-center select-none ${drag.dim ? 'opacity-50' : ''}`}
+            {...termDrag.tabProps(t.id)}
+            style={drag.style}
             onContextMenu={(e) => { e.preventDefault(); setTermMenu({ x: e.clientX, y: e.clientY, termId: t.id }); }}
             onDoubleClick={(e) => { setTermMenu({ x: e.clientX, y: e.clientY, termId: t.id }); setTermRename(t.id); }}
           >
@@ -1750,19 +1761,28 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                 // a tool pane / another input) — issue #51.
                 requestTerminalFocus();
               }}
-              title={t.container ? `Container: ${t.container.name}` : undefined}
-              className={`h-8 px-3 sm:px-4 ${terminals.length > 1 ? 'pr-8' : ''} rounded-lg flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider transition-all ${
-                isFocusedHalf
-                  ? 'bg-primary/10 text-primary border border-primary/20 shadow-inner'
-                  : isSplitPartner
-                    ? 'bg-primary/[0.04] text-primary/70 border border-primary/10'
-                    : 'text-zinc-300 bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/20 hover:text-white'
-              } ${t.container ? 'ring-1 ring-sky-400/30' : ''}`}
+              title={t.container ? `${t.title} · Container: ${t.container.name}` : t.title}
+              className={`h-8 ${compactTabs
+                ? `${COMPACT_TAB_PAD} ${terminals.length > 1 ? 'pr-6' : ''} gap-1.5 text-[10px] ${
+                    compactTermTabClass(isFocusedHalf, isSplitPartner ? "merged" : "primary")
+                  }`
+                : `px-3 sm:px-4 ${terminals.length > 1 ? 'pr-8' : ''} rounded-lg gap-2 text-[11px] ${
+                    isFocusedHalf
+                      ? 'bg-primary/10 text-primary border border-primary/20 shadow-inner'
+                      : isSplitPartner
+                        ? 'bg-primary/[0.04] text-primary/70 border border-primary/10'
+                        : 'text-zinc-300 bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/20 hover:text-white'
+                  }`
+              } flex items-center font-bold uppercase tracking-wider transition-all ${t.container ? 'ring-1 ring-sky-400/30' : ''}`}
             >
               {t.container
-                ? <Container size={14} className="text-sky-300" />
-                : <TerminalSquare size={14} />}
-              {t.title}
+                ? <Container size={compactTabs ? 12 : 14} className="text-sky-300 shrink-0" />
+                : <TerminalSquare size={compactTabs ? 12 : 14} className="shrink-0" />}
+              {/* Printed something while it was out of sight (cleared when it
+                  comes on screen, so never on the tab in front). */}
+              <NewsDot terminals={[t.id]} />
+              {/* Compact tabs cut a long name; the full one is the hover title. */}
+              <span className={compactTabs ? COMPACT_TAB_NAME : undefined}>{t.title}</span>
               {isSplitPartner && (
                 <SplitSquareHorizontal size={10} className="text-primary/60" />
               )}
@@ -1784,9 +1804,10 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                   }
                 }}
                 aria-label="Close terminal"
-                className="absolute right-1 top-1/2 -translate-y-1/2 w-5 h-5 flex items-center justify-center rounded opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100 hover:bg-white/5 hover:text-red-400 text-zinc-500 transition-all"
+                data-no-tab-drag
+                className={`absolute right-1 top-1/2 -translate-y-1/2 ${compactTabs ? 'w-4 h-4' : 'w-5 h-5'} flex items-center justify-center rounded opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100 hover:bg-white/5 hover:text-red-400 text-zinc-500 transition-all`}
               >
-                <X size={12} />
+                <X size={compactTabs ? 10 : 12} />
               </button>
             )}
           </div>
@@ -2041,7 +2062,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
             onContextMenu={(e) => { e.preventDefault(); setTermMenu(null); }}
           />
           <div
-            style={{ left: Math.min(termMenu.x, window.innerWidth - 240), top: Math.min(termMenu.y, window.innerHeight - 80) }}
+            style={{ left: Math.min(termMenu.x, window.innerWidth - 240), top: Math.min(termMenu.y, window.innerHeight - 120) }}
             className="fixed z-[9999] w-[220px] bg-[#15151a] border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
           >
             {termRename === termMenu.termId ? (
@@ -2059,6 +2080,25 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                 <span className="flex-1">Rename tab</span>
               </button>
             )}
+            {/* Moving the tab without dragging it (keyboard, touchpad). */}
+            {terminals.length > 1 && (() => {
+              const at = terminals.findIndex(t => t.id === termMenu.termId);
+              const moveTo = (to: number) => {
+                setTerminals(prev => reorderById(prev, termMenu.termId, terminals[to].id, to > at));
+                setTermMenu(null);
+              };
+              const item = "w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left disabled:opacity-40 disabled:hover:bg-transparent";
+              return (
+                <>
+                  <button disabled={at <= 0} onClick={() => moveTo(at - 1)} className={item}>
+                    <span className="flex-1">Move left</span>
+                  </button>
+                  <button disabled={at >= terminals.length - 1} onClick={() => moveTo(at + 1)} className={item}>
+                    <span className="flex-1">Move right</span>
+                  </button>
+                </>
+              );
+            })()}
           </div>
         </>,
         document.body
@@ -2244,6 +2284,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                   isActive={isFocused && onScreen}
                   visible={onScreen}
                   isActiveView={isActiveView}
+                  inView={isActiveView || chromeless}
                   focusSignal={focusTick}
                   containerExec={t.container ? { container: t.container.name, useSudo: t.container.useSudo } : undefined}
                   connectionEpoch={connectionEpoch}
