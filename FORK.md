@@ -22,19 +22,20 @@ The fork is based on the original project's **0.3.8**, with every change up to [
 **Walls with broadcast input.** Terminals from many servers sit side by side. With Broadcast on, what you type goes to all of them. You can:
 
 - click into one terminal to type to it alone, and use **Type to all** to go back;
-- pause the terminals to leave out;
+- pause the terminals to leave out: one with its chip, several by Ctrl-clicking (⌘-clicking) their titles or Shift-clicking a run, or **Pause all** and then resume the few you want;
 - paste, or **Send** a set of commands, to all of them.
 
 A server that connects or reconnects partway through a line waits for the next line, so it never gets only the end of a command. Walls can be saved by name, and a whole folder opens as one.
 
 - **Jump hosts at scale.** A hundred servers behind one jump host log in a few at a time; the number is a setting. Monitoring reaches servers through their jump host too.
 - **Split.** A second shell on the same server opens beside the first, so you can watch a log in one and work in the other.
+- **Many tabs.** **Ctrl+Shift+K** opens All tabs with its search ready: type part of a name and press Enter. **Ctrl+Tab** and **Ctrl+Shift+Tab** move between tabs. A tab's right-click menu closes the other tabs, the ones to its right, the disconnected ones, or all of them.
 
 ### Organize them
 
 <img src="docs/screenshots/fork/highlighting-and-tree.png" alt="The session tree beside a terminal: folders, servers with OS badges, a Remote Desktop link, and highlighted log output" width="900" />
 
-- **A session tree** beside the terminal, with search. It holds folders, servers and Remote Desktop links, and you manage it with drag and drop, rename, move and delete.
+- **A session tree** beside the terminal, with search. It holds folders, servers and Remote Desktop links, and you manage it with drag and drop, rename, move and delete. **Show only open** (the eye button) narrows it to the servers you have open.
 - **Remote Desktop links** are saved with your servers and open in Remote Desktop Connection on Windows.
 - **OS badges** on servers, and a look of their own for Remote Desktop links.
 
@@ -49,6 +50,17 @@ A server that connects or reconnects partway through a line waits for the next l
 - Remote Desktop sessions.
 
 A result screen says what came in. PuTTY and OpenSSH config imports are there too.
+
+### AI help, without sharing keys
+
+A first test, off by default: turn it on in **Settings › AI tools**.
+
+- **Claude Code from Home's menu**, under AI tools, opens already connected to Submarine through a local channel only your account can use. Nothing listens on the network.
+- **Share with AI** on a server's tab lets that AI tab ask to run commands there. Each one waits in the **AI panel** (the title bar's AI button) until you click Allow or Deny; typing can't approve anything.
+- Submarine runs the command over its own connection, so the AI never gets a key or password. You see the full output; the AI gets it with known secrets hidden, and you see how many.
+- Every request and decision goes in `ai-audit.log` in the log folder.
+
+What comes next (root prompts, the AI asking for a server, many servers, downloads, more AI tools) is in [#32](https://github.com/paulm981/Submarine/issues/32).
 
 ### Root when you need it
 
@@ -102,6 +114,8 @@ No third-party service is involved. Profiles are encrypted with their password b
 <img src="docs/screenshots/fork/troubleshooting.png" alt="Troubleshooting in Settings: Copy diagnostics and Open log folder" width="600" />
 
 - **Troubleshooting.** The app keeps a log on your computer, and a watchdog notes when the window froze and why. **Copy diagnostics** copies the log with server, user and host names replaced, ready to send to whoever is helping.
+- **A failed connect says why:** under the error, whether the name resolved and to what, and whether the port answered, through the jump host or proxy when there is one.
+- **Two uploads to the same file** wait their turn instead of mixing and corrupting it.
 - **A release from every change**, numbered like `v0.3.8-fork.2` and shown in the title bar, with a notice when there's a newer one.
 - **Hardening.** On every system:
   - characters that disguise a file name are shown plainly;

@@ -46,14 +46,18 @@ The tour with more pictures is in [FORK.md](FORK.md), along with where the fork 
 - **Session import that keeps your setup**: from MobaXterm, nested folders, saved logins, jump hosts and their keys, startup commands such as `dzdo su -`, and Remote Desktop sessions come over as they were, and a result screen says what came in. PuTTY and OpenSSH config imports are there too.
 
 **Work on many servers at once**
-- **Walls with broadcast input**: terminals from many servers side by side. With Broadcast on, typing goes to all of them. Click into one to type to it alone, pause the ones to leave out, or paste or send a set of commands to all. A server that connects or reconnects partway through a line waits for the next one, so it never gets only the end of a command. Walls can be saved by name, and a whole folder opens as one.
+- **Walls with broadcast input**: terminals from many servers side by side. With Broadcast on, typing goes to all of them. Click into one to type to it alone, pause the ones to leave out (several at once: Ctrl-click their titles, or **Pause all** and resume the few you want), or paste or send a set of commands to all. A server that connects or reconnects partway through a line waits for the next one, so it never gets only the end of a command. Walls can be saved by name, and a whole folder opens as one.
+- **Many tabs, easily**: **Ctrl+Shift+K** jumps to a tab by typing part of its name, **Ctrl+Tab** moves between tabs, and a tab's right-click menu closes the others, those to the right, the disconnected ones, or all of them.
 - **Jump hosts at scale**: a hundred servers behind one jump host log in a few at a time (the limit is a setting), and Monitoring reaches servers through their jump host too.
 - **Split**: a second shell on the same server beside the first, to watch a log in one and work in the other.
 
 **Organize them**
-- **A session tree** beside the terminal, with search: folders, servers and Remote Desktop links, managed by drag and drop, rename, move and delete.
+- **A session tree** beside the terminal, with search: folders, servers and Remote Desktop links, managed by drag and drop, rename, move and delete. **Show only open** narrows it to the servers you have open.
 - **Remote Desktop links** saved with your servers, opening in Remote Desktop Connection on Windows.
 - **OS badges** on servers, and a look of their own for Remote Desktop links.
+
+**AI help, without sharing keys** (a first test, off by default)
+- **Claude Code from Home's menu**, already connected to Submarine. Share a server's tab with it, and it can ask to run commands there. Each one waits in the **AI panel** until you click Allow; the AI never gets a key or password, and the output it gets has known secrets hidden. Every request is logged. The design, and what comes next, is in [#32](https://github.com/paulm981/Submarine/issues/32).
 
 **Root when you need it**
 - **SFTP root mode and Info panel actions as root** through `sudo` or `dzdo` (Centrify / Delinea): without a password where the server allows it, including servers that only allow `dzdo su -`.
@@ -70,7 +74,7 @@ The tour with more pictures is in [FORK.md](FORK.md), along with where the fork 
 
 **Ready to roll out to a team**
 - **A release from every change**, numbered like `v0.3.8-fork.2` and shown in the title bar, with a notice when there's a newer one.
-- **Troubleshooting**: a log on your computer, a watchdog that notes when the window froze and why, and **Copy diagnostics** with server, user and host names replaced, ready to send to whoever is helping.
+- **Troubleshooting**: a log on your computer, a watchdog that notes when the window froze and why, and **Copy diagnostics** with server, user and host names replaced, ready to send to whoever is helping. When a connect fails, Submarine says whether the name resolved and the port answered.
 - **Hardening**: characters that disguise a file name are shown plainly, and a trusted server that shows a different kind of key is a warning, not a silent change. On Windows, Live Edit also opens a file in an editor and never runs it, the Local pane asks before it runs a program, and downloads are marked as from the internet.
 - **Close to the original project**: its changes come in through regular sync pull requests, and [FORK.md](FORK.md) lists where the fork differs and what it hasn't taken yet.
 
