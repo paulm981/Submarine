@@ -5136,6 +5136,7 @@ async fn close_profile(
     ssh: tauri::State<'_, SshState>,
     monitor_map: tauri::State<'_, MonitorMap>,
     cloud: tauri::State<'_, std::sync::Arc<cloud::CloudState>>,
+    ai: tauri::State<'_, ai::AiState>,
 ) -> Result<(), String> {
     // 0. Persist any accumulated in-memory changes (chief among them:
     // cmd_history rows written by TerminalView's Enter-key handler, which
@@ -5155,6 +5156,11 @@ async fn close_profile(
     // shared profile in under a password of their own. The Profile panel asks
     // for the sharing passphrase again when sharing is used.
     cloud.forget_identity().await;
+
+    // 1c. And the AI tabs: their tools lose access, and what this profile's
+    // servers shared with them goes. The page closes their terminals too, but
+    // that's the page's to do; this doesn't depend on it.
+    ai.end_all_tabs();
 
     // 2. Collect every active session id, then run the standard
     // disconnect path for each one. This frees tunnel listener sockets,
