@@ -5237,11 +5237,7 @@ async fn close_profile(
         ssh.docker_root.lock().await.remove(sid);
         ssh.sftp_shell.lock().await.remove(sid);
         ssh.connections.lock().await.remove(sid);
-        for dir in [session_sftp_dir(sid), session_drag_dir(sid)].into_iter().flatten() {
-            if dir.exists() {
-                let _ = std::fs::remove_dir_all(&dir);
-            }
-        }
+        sweep_session_temp(sid);
     }
 
     // 3. Close every terminal channel. The spawned PTY task watches its
@@ -11391,11 +11387,7 @@ async fn teardown_connection_key(state: &SshState, mirrors: &MirrorMap, key: &st
     state.connections.lock().await.remove(key);
     state.jump_connections.lock().await.remove(key);
     // Wipe temp files the secondary's SFTP downloads / drags left behind.
-    for dir in [session_sftp_dir(key), session_drag_dir(key)].into_iter().flatten() {
-        if dir.exists() {
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-    }
+    sweep_session_temp(key);
 }
 
 /// A Quick Connect target, for `diagnose_connect`: where it goes and as whom,
@@ -15000,11 +14992,7 @@ async fn disconnect_session(
     // Wipe any temp files this session left behind (live-edit downloads + drag
     // staging). Best-effort: failures are usually because an editor still holds
     // a lock on a file, in which case the file persists until the OS cleans temp.
-    for dir in [session_sftp_dir(&session_id), session_drag_dir(&session_id)].into_iter().flatten() {
-        if dir.exists() {
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-    }
+    sweep_session_temp(&session_id);
     // Separate-sessions: reap the dedicated `::sftp` / `::fwd` secondaries so an
     // explicit primary disconnect doesn't leak their SSH sessions. Only when
     // this IS a primary id (no `::` suffix) — a direct disconnect of a secondary
@@ -19437,6 +19425,127 @@ mod live_edit_tests {
     }
 }
 
+/// Live Edit copies being watched, each with the hash of what the server
+/// holds as far as this app knows (what was downloaded, or last uploaded).
+/// A copy whose content differs has edits that were never uploaded.
+fn live_edit_copies() -> &'static StdMutex<std::collections::HashMap<PathBuf, Vec<u8>>> {
+    static COPIES: std::sync::OnceLock<StdMutex<std::collections::HashMap<PathBuf, Vec<u8>>>> = std::sync::OnceLock::new();
+    COPIES.get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
+}
+
+/// Set by the first Live Edit, to tell the page about kept copies from
+/// wherever they're found (a disconnect, a lock).
+static LIVE_EDIT_APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+/// Where copies with unsent edits are kept: "Submarine unsent edits" in the
+/// Downloads folder, where the user will look for a file, or in the app's
+/// data folder when there's no Downloads folder.
+fn unsent_edits_dir() -> Option<PathBuf> {
+    const NAME: &str = "Submarine unsent edits";
+    directories::UserDirs::new()
+        .and_then(|d| d.download_dir().map(|p| p.join(NAME)))
+        .or_else(|| LIVE_EDIT_APP.get().and_then(|a| a.path().app_data_dir().ok()).map(|p| p.join(NAME)))
+}
+
+/// A name in `dir` that isn't taken: `name`, then `name (2)`, `name (3)`, …
+/// before the extension.
+fn free_name_in(dir: &Path, name: &str) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
+        _ => (name, String::new()),
+    };
+    (2..10_000)
+        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
+        .find(|p| !p.exists())
+        .unwrap_or(first)
+}
+
+/// Before Live Edit copies are deleted (their session ends, the profile is
+/// locked, or the watcher stops), the ones under `under` with edits that were
+/// never uploaded are moved to `unsent_edits_dir`, and the page is told
+/// (`live-edit-kept`). The rest are left to be deleted. Returns the folder
+/// when anything was kept there.
+fn keep_unsent_edits(under: &Path) -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let unsent: Vec<PathBuf> = {
+        let mut copies = live_edit_copies().lock().unwrap_or_else(|e| e.into_inner());
+        let found: Vec<PathBuf> = copies
+            .iter()
+            .filter(|(path, synced)| {
+                path.starts_with(under) && std::fs::read(path).is_ok_and(|c| Sha256::digest(&c).as_slice() != synced.as_slice())
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        copies.retain(|path, _| !path.starts_with(under));
+        found
+    };
+    if unsent.is_empty() {
+        return None;
+    }
+    let folder = unsent_edits_dir()?;
+    std::fs::create_dir_all(&folder).ok()?;
+    let mut kept = Vec::new();
+    for path in unsent {
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+        let dest = free_name_in(&folder, &name);
+        // A rename, or a copy where the temp folder is on another drive.
+        let moved = std::fs::rename(&path, &dest).is_ok() || {
+            let copied = std::fs::copy(&path, &dest).is_ok();
+            if copied {
+                let _ = std::fs::remove_file(&path);
+            }
+            copied
+        };
+        if moved {
+            kept.push(dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name));
+        }
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    crate::applog::write_line("live-edit", &format!("kept {} cop{} with unsent edits in {}", kept.len(), if kept.len() == 1 { "y" } else { "ies" }, folder.display()));
+    if let Some(app) = LIVE_EDIT_APP.get() {
+        use tauri::Emitter;
+        let _ = app.emit("live-edit-kept", serde_json::json!({ "folder": folder.to_string_lossy(), "files": kept }));
+    }
+    Some(folder)
+}
+
+#[cfg(test)]
+mod unsent_edits_tests {
+    #[test]
+    fn a_kept_copy_never_takes_the_name_of_one_kept_before() {
+        let dir = std::env::temp_dir().join(format!("submarine-unsent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(super::free_name_in(&dir, "index.php"), dir.join("index.php"));
+        std::fs::write(dir.join("index.php"), "a").unwrap();
+        assert_eq!(super::free_name_in(&dir, "index.php"), dir.join("index (2).php"));
+        std::fs::write(dir.join("index (2).php"), "b").unwrap();
+        assert_eq!(super::free_name_in(&dir, "index.php"), dir.join("index (3).php"));
+        std::fs::write(dir.join("Makefile"), "c").unwrap();
+        assert_eq!(super::free_name_in(&dir, "Makefile"), dir.join("Makefile (2)"));
+        std::fs::write(dir.join(".bashrc"), "d").unwrap();
+        assert_eq!(super::free_name_in(&dir, ".bashrc"), dir.join(".bashrc (2)"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Wipes a session's temp folders (Live Edit copies, drag staging), keeping
+/// unsent edits first (keep_unsent_edits).
+fn sweep_session_temp(session_id: &str) {
+    for dir in [session_sftp_dir(session_id), session_drag_dir(session_id)].into_iter().flatten() {
+        if dir.exists() {
+            keep_unsent_edits(&dir);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
 /// How long a live-edit copy may go without a save before its watcher ends.
 const LIVE_EDIT_IDLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
 
@@ -19485,6 +19594,8 @@ async fn sftp_open_remote_file(
         use sha2::{Digest, Sha256};
         Sha256::digest(&data).to_vec()
     };
+    let _ = LIVE_EDIT_APP.set(app_handle.clone());
+    live_edit_copies().lock().unwrap_or_else(|e| e.into_inner()).insert(temp_file_path.clone(), synced_hash.clone());
 
     // The watcher is made here, before the editor opens, so one that can't start
     // (inotify's limits, say) is an error the user sees, not a file that never
@@ -19664,6 +19775,9 @@ async fn sftp_open_remote_file(
                         );
                     } else {
                         synced_hash = content_hash;
+                        if let Some(h) = live_edit_copies().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&temp_file_path_clone) {
+                            h.clone_from(&synced_hash);
+                        }
                         let _ = app_handle_clone.emit(
                             &format!("sftp-sync-status-{}", session_id_clone),
                             serde_json::json!({ "status": "success", "message": format!("Auto-synced {}", filename_clone) })
@@ -19683,9 +19797,14 @@ async fn sftp_open_remote_file(
             use sha2::{Digest, Sha256};
             std::fs::read(&temp_file_path_clone).map(|c| Sha256::digest(&c).to_vec() != synced_hash).unwrap_or(false)
         };
+        // Moved out of the temp folder, which a disconnect or a lock wipes.
+        let kept_in = keep_unsent_edits(&temp_file_path_clone);
         if unsynced || idle_end {
             let message = if unsynced {
-                format!("{filename_clone} has changes that were not uploaded; the copy on this computer was kept")
+                match &kept_in {
+                    Some(folder) => format!("{filename_clone} has changes that were not uploaded; they're kept in {}", folder.display()),
+                    None => format!("{filename_clone} has changes that were not uploaded; the copy on this computer was kept"),
+                }
             } else {
                 format!("Auto-sync for {filename_clone} stopped after {} hours without a change; open the file again to go on", LIVE_EDIT_IDLE_LIMIT.as_secs() / 3600)
             };

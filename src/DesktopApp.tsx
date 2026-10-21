@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Plus, X, RefreshCw, Terminal, Key, Trash2,
@@ -993,6 +994,24 @@ function DesktopApp() {
   const confirm = useConfirm();
   const choice = useChoice();
   const textPrompt = useTextPrompt();
+
+  // Live Edit copies with changes that were never uploaded, kept when their
+  // session ended or the profile was locked (keep_unsent_edits in lib.rs).
+  useEffect(() => {
+    const unlisten = listen<{ folder: string; files: string[] }>("live-edit-kept", async (e) => {
+      const { folder, files } = e.payload;
+      const what = files.length === 1 ? `${files[0]} has changes` : `${files.length} files have changes`;
+      addLog(`Live Edit: ${what} that were never uploaded to the server. Kept in ${folder}.`, "info");
+      const ok = await confirm({
+        title: "Unsent edits kept",
+        message: `${what} that were never uploaded to the server. ${files.length === 1 ? "It's" : "They're"} kept in:\n\n${folder}`,
+        okLabel: "Show folder",
+        cancelLabel: "OK",
+      });
+      if (ok) invoke("local_open_in_explorer", { localPath: folder }).catch(() => {});
+    });
+    return () => { unlisten.then((f) => f()).catch(() => {}); };
+  }, [addLog, confirm]);
 
   // Window-close guard. Keep `sessions` mirrored into a ref so the close
   // handler (which is registered ONCE inside useEffect, capturing snapshot
