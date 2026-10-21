@@ -9,6 +9,26 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+### From the original project
+
+- **A saved password at a password prompt** ([#182](https://github.com/SinaXhpm/submarine/pull/182)). When a terminal stops at a password prompt (sudo, dzdo, su, ssh), a **Saved password** button types a saved password there, without pressing Enter. It goes from your profile straight to the server; the window never sees it.
+  - It offers this server's own password and its saved login. Another saved login is offered only when the prompt asks for that login's user by name, so a prompt can't fish for a password it has nothing to do with.
+- **A color scheme of your own** ([#183](https://github.com/SinaXhpm/submarine/pull/183)). Settings › Terminal › Colors takes a Windows Terminal color scheme pasted as JSON. It stays on this computer; a server's own scheme is still one of the built-in ones, so it syncs. Also there: **Bold text in bright colors**, on by default.
+- **Library commands for some servers** ([#185](https://github.com/SinaXhpm/submarine/pull/185)). A command can be for all servers, or only for the servers and folders you tick. A server's Library shows its own commands first, then the ones for all, and hides the rest. The choice syncs with the command.
+- **Compare folders** ([#184](https://github.com/SinaXhpm/submarine/pull/184)). **Compare** in the file browser marks, in both panes, what is only on one side, a different size or kind, or newer or older. **Hide files that are the same** narrows the lists to the differences.
+- **The path bar** ([#181](https://github.com/SinaXhpm/submarine/pull/181)): each folder in it opens with a click. The rest of the bar still edits the path as text.
+- **Walls: choose the rows** ([#190](https://github.com/SinaXhpm/submarine/pull/190)). Beside **Cols**, **Rows** fits one to four rows on screen (more terminals scroll), or **Auto**. Rows now fit the Wall's height, so a Wall no longer scrolls when its terminals would fit. The choice isn't saved with a saved Wall yet.
+- **Terminals:**
+  - the shell gets a new size once it has held for a moment, so turning a phone or opening a panel no longer garbles the screen ([#188](https://github.com/SinaXhpm/submarine/pull/188));
+  - a terminal at its bottom stays there when its box changes size ([#191](https://github.com/SinaXhpm/submarine/pull/191)).
+- **Older network devices connect:** the SHA-1 group-exchange key exchange is offered, after all the others ([#189](https://github.com/SinaXhpm/submarine/pull/189)). The fork already offered the NIST curves, and still leaves out the weak 1024-bit group 1.
+- **Windows:** calls between the window and the app take the faster path again ([#186](https://github.com/SinaXhpm/submarine/pull/186)).
+- **Window buttons** show at any window width on the PC, and never on phones ([#187](https://github.com/SinaXhpm/submarine/pull/187)).
+
+Not taken: [#180](https://github.com/SinaXhpm/submarine/pull/180) gives a terminal pinned to a Wall its own size back. The fork's Walls show the terminal itself rather than a second copy, so it already has one size.
+
+## v0.3.8-fork.8
+
 - **Two uploads to the same file:** the second one now asks before overwriting what the first one put there ([#84](https://github.com/paulm981/Submarine/issues/84)).
 - **Duplicating a server that fails** no longer leaves a "deleted" record that syncs to your other devices.
 - **Servers that open on launch** have their operating system checked on the port they connected to.

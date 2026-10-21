@@ -11,7 +11,7 @@ This page covers:
 
 What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
-The fork is based on the original project's **0.3.8**, with every change up to [#177](https://github.com/SinaXhpm/submarine/pull/177) brought in or recorded as not taken yet.
+The fork is based on the original project's **0.3.8**, with every change up to [#191](https://github.com/SinaXhpm/submarine/pull/191) brought in or recorded as not taken yet.
 
 ## What this fork adds
 
@@ -76,7 +76,7 @@ Root works through `sudo` or `dzdo` (Centrify / Delinea), without a password whe
   <tr>
     <td width="50%" valign="top" align="center">
       <img src="docs/screenshots/fork/color-schemes.png" alt="Color schemes in Settings with a preview" />
-      <br/><sub><b>Color schemes</b>: Campbell, One Half, Solarized, Dracula, Nord, Tokyo Night, Catppuccin, Gruvbox, with a preview. A server can have its own, and it syncs with it.</sub>
+      <br/><sub><b>Color schemes</b>: Campbell, One Half, Solarized, Dracula, Nord, Tokyo Night, Catppuccin, Gruvbox, with a preview, or one of your own from Windows Terminal. A server can have its own, and it syncs with it.</sub>
     </td>
     <td width="50%" valign="top" align="center">
       <img src="docs/screenshots/fork/highlight-settings.png" alt="Syntax highlighting settings: sets, a preview, and a rule of your own" />
@@ -144,6 +144,10 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | Text fields on macOS | Capitalize and correct what's typed | Keep exactly what's typed |
 | Closing a connected session | Always asks | Asks, unless you turn that off in Settings |
 | On-connect commands | Typed once the terminal is open, on the first connect ([#175](https://github.com/SinaXhpm/submarine/pull/175)) | Typed once the shell has printed its login banner, on the first connect and after a reconnect |
+| Walls | One Wall of pinned copies of terminals; a copy sets the terminal's size while it's open ([#180](https://github.com/SinaXhpm/submarine/pull/180)) | Walls of their own, each showing the terminals themselves, so a terminal has one size. Broadcast, saved Walls, and Rows ([#190](https://github.com/SinaXhpm/submarine/pull/190)), which aren't saved with a saved Wall yet |
+| Saved password at a prompt ([#182](https://github.com/SinaXhpm/submarine/pull/182)) | Offers this server's password and every saved login | Offers this server's password and its own login; another saved login only when the prompt names its user. Not in Home's local shells |
+| Terminal colors ([#183](https://github.com/SinaXhpm/submarine/pull/183)) | One scheme per device, or one of your own | The fork's schemes, per device or per server (synced). A scheme of your own is for this device only. "Keep text readable" is on by default |
+| Key exchange ([#189](https://github.com/SinaXhpm/submarine/pull/189)) | Offers the 1024-bit `diffie-hellman-group1-sha1` last | Never offers it (Logjam). Group exchange over SHA-1 is offered, with groups of 2048 bits or more |
 
 ## Changes in the original project not taken yet
 
