@@ -2974,6 +2974,14 @@ fn discard_half_built_profile(app: &tauri::AppHandle, name: &str, opened: Option
         if let Ok(mut g) = state.active_profile.lock() { *g = None; }
     }
     if let Ok(p) = profile_path(app, name) {
+        // Its one-window lock (#204) goes with it, or the name would stay
+        // "open in another window" in this one until it quit.
+        if let Ok(mut held) = state.profile_lock.lock() {
+            if held.as_ref().is_some_and(|(locked, _)| *locked == p) {
+                *held = None;
+            }
+        }
+        let _ = fs::remove_file(p.with_extension("submarine.lock"));
         let _ = fs::remove_file(p);
     }
 }
