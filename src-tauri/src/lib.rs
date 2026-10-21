@@ -13656,8 +13656,8 @@ async fn rdp_open_again(
 /// it's saved with (its `jump_host_id`), whose login asks through this tab's
 /// usual prompts (host key, password, 2FA), over a `direct-tcpip` channel.
 /// The connection then waits for the tab's terminal (`telnet_open_terminal`).
-/// The tab hears `connection-success-{id}` (`address`, `via`) or
-/// `connection-failed-{id}`.
+/// The tab hears `connection-success-{id}` (`address`, `via`, `generation`)
+/// or `connection-failed-{id}`.
 #[tauri::command]
 async fn telnet_connect(
     app: tauri::AppHandle,
@@ -13671,8 +13671,15 @@ async fn telnet_connect(
     use std::sync::Arc;
     use tauri::Emitter;
 
-    // A new attempt replaces the tab's last one.
+    // A new attempt replaces the tab's last one: a connection still waiting
+    // for its terminal, and a terminal still open on the old connection (a
+    // Reconnect while connected), as an SSH reconnect does. The old terminal's
+    // `terminal-closed` carries the old generation, so the tab doesn't take
+    // it for the end of the new connection.
     telnet_pending.lock().await.remove(&session_id);
+    let term_prefix = format!("{session_id}-term-");
+    state.terminal_txs.lock().await.retain(|k, _| !k.starts_with(&term_prefix));
+    state.resize_txs.lock().await.retain(|k, _| !k.starts_with(&term_prefix));
     let generation = {
         let mut g = state.session_generation.lock().await;
         let next = g.get(&session_id).copied().unwrap_or(0).wrapping_add(1);
@@ -13779,13 +13786,16 @@ async fn telnet_connect(
         }
         pending.lock().await.insert(
             session_id.clone(),
-            telnet::Conn { stream, route, telnet_port: port == telnet::DEFAULT_PORT },
+            telnet::Conn { stream, route, telnet_port: port == telnet::DEFAULT_PORT, generation },
         );
         match &via {
             Some(v) => log(&format!("Connected to {target} through {v}. From {v} on, it isn't encrypted."), "success"),
             None => log(&format!("Connected to {target}."), "success"),
         }
-        let _ = app.emit(&format!("connection-success-{session_id}"), serde_json::json!({"address": target, "via": via}));
+        let _ = app.emit(
+            &format!("connection-success-{session_id}"),
+            serde_json::json!({"address": target, "via": via, "generation": generation}),
+        );
     });
     Ok(())
 }

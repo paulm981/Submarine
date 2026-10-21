@@ -335,6 +335,10 @@ pub struct Conn {
     pub route: Vec<russh::client::Handle<ClientHandler>>,
     /// Whether it's the telnet port: then the options are asked first.
     pub telnet_port: bool,
+    /// The connect attempt it came from (the session's generation). Its
+    /// `terminal-closed` carries it, so the tab can tell the end of the
+    /// connection a Reconnect replaced from the end of the live one.
+    pub generation: u64,
 }
 
 /// Connections waiting for their tab's terminal, by session id.
@@ -384,7 +388,8 @@ pub async fn connect_through(route: &[russh::client::Handle<ClientHandler>], hos
 
 /// Drives a tab's telnet connection for its life: the server's text →
 /// coalesced batches to the page (`output`), keys and resizes → the server,
-/// then `terminal-closed-{id}`; and `session-disconnected-{session}` when the
+/// then `terminal-closed-{id}` (with the connection's `generation`); and
+/// `session-disconnected-{session}` when the
 /// server (or the route) ended it rather than the tab. The reader and the
 /// writer are separate tasks, so the reader is drained whatever the writer
 /// waits on (a channel through an SSH server stalls its whole connection
@@ -399,7 +404,7 @@ pub async fn run_pump(
     mut rx: mpsc::Receiver<TerminalCommand>,
     mut resize_rx: watch::Receiver<PtySize>,
 ) {
-    let Conn { stream, route, telnet_port } = conn;
+    let Conn { stream, route, telnet_port, generation } = conn;
     let size = *resize_rx.borrow();
     let telnet = Arc::new(std::sync::Mutex::new(Telnet::new(size.cols, size.rows)));
     let (mut read_half, mut write_half) = tokio::io::split(stream);
@@ -502,7 +507,7 @@ pub async fn run_pump(
     {
         let app = app.clone();
         output.finish(move || {
-            let _ = app.emit(&format!("terminal-closed-{terminal_id}"), serde_json::json!({}));
+            let _ = app.emit(&format!("terminal-closed-{terminal_id}"), serde_json::json!({ "generation": generation }));
         });
     }
     if server_ended {

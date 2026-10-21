@@ -37,6 +37,10 @@ export default function TelnetSessionView({ session, displayName, onClose, onSta
   const fpNonceRef = useRef<string | null>(null);
   const kbiNonceRef = useRef<string | null>(null);
   const kbiFirstInputRef = useRef<HTMLInputElement | null>(null);
+  // The live connection's generation (from connection-success). A Reconnect
+  // ends the old connection's terminal, whose terminal-closed carries the old
+  // generation and so isn't taken for the end of the new one.
+  const generationRef = useRef<number | null>(null);
   const promptWaiting = !!(fingerprintPrompt || kbiPrompt);
 
   useEffect(() => { onStatusChange?.(session.id, status); }, [onStatusChange, session.id, status]);
@@ -54,6 +58,7 @@ export default function TelnetSessionView({ session, displayName, onClose, onSta
   }, []);
 
   const connect = useCallback(() => {
+    generationRef.current = null;
     setStatus("connecting");
     setReason("");
     pushLog({ msg: NOT_ENCRYPTED, type: "warning" });
@@ -96,6 +101,7 @@ export default function TelnetSessionView({ session, displayName, onClose, onSta
         setKbiValues([]);
       }),
       listen(`connection-success-${id}`, (e: any) => {
+        generationRef.current = typeof e.payload?.generation === "number" ? e.payload.generation : null;
         setVia(e.payload?.via ?? null);
         setStatus("connected");
         setEpoch((n) => n + 1);
@@ -114,7 +120,8 @@ export default function TelnetSessionView({ session, displayName, onClose, onSta
       }),
       // The terminal's connection ended; what the server said, if it did,
       // comes as session-disconnected right after.
-      listen(`terminal-closed-${terminalId}`, () => {
+      listen(`terminal-closed-${terminalId}`, (e: any) => {
+        if (e.payload?.generation !== generationRef.current) return;
         setStatus((s) => (s === "connected" ? "disconnected" : s));
         setReason((r) => r || "Disconnected.");
       }),
