@@ -8,7 +8,7 @@
 //! It holds what was asked and decided, never a command's output, and never a
 //! token or a password. What the AI side can make it write is limited
 //! (mod.rs): every request counts toward the rate limit, refused or not, and
-//! a refused request's command is cut to 4 KB.
+//! every request's command is cut to 4 KB (with a hash of all of it).
 
 use serde::Serialize;
 use std::fs::{File, OpenOptions};

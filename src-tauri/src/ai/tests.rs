@@ -268,16 +268,60 @@ async fn refusals_count_toward_the_limit_and_are_logged_cut_short() {
     assert_eq!(refused.len(), RATE_MAX + 1, "{RATE_MAX} refusals, then one line for the limit");
     assert!(refused.last().unwrap()["note"].as_str().unwrap().contains("Too many requests"));
     for l in &refused {
-        assert!(l["command"].as_str().unwrap().len() <= MAX_LOGGED_REFUSED + 64);
+        assert!(l["command"].as_str().unwrap().len() <= MAX_LOGGED_COMMAND + 64);
     }
-    assert!(text.len() < (RATE_MAX + 2) * (MAX_LOGGED_REFUSED + 1024), "{} bytes", text.len());
+    assert!(text.len() < (RATE_MAX + 2) * (MAX_LOGGED_COMMAND + 1024), "{} bytes", text.len());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn clip_keeps_whole_characters() {
-    assert_eq!(clip("abc", 10), "abc");
-    assert_eq!(clip("ééé", 3), "é… [4 bytes more]");
+fn commands_are_logged_cut_short() {
+    assert_eq!(for_log("abc", 10), "abc");
+    // Whole characters, and the hash of all of it.
+    let cut = for_log("ééé", 3);
+    assert!(cut.starts_with("é… [4 bytes more; sha256 "), "{cut}");
+    assert_eq!(cut.len(), "é… [4 bytes more; sha256 ]".len() + 16);
+    assert_ne!(for_log("éééx", 3), cut, "different commands, different hashes");
+    // Escapes count: what's written stays within the limit.
+    for nasty in ["\u{1}".repeat(10_000), "\"".repeat(10_000), "\\".repeat(10_000), "é".repeat(10_000)] {
+        let logged = for_log(&nasty, MAX_LOGGED_COMMAND);
+        let json = serde_json::to_string(&logged).unwrap();
+        assert!(json.len() <= MAX_LOGGED_COMMAND + 80, "{}", json.len());
+    }
+}
+
+/// Asking and withdrawing, without you allowing anything, can't fill the
+/// log: each request's command is logged cut short.
+#[tokio::test]
+async fn withdrawn_requests_are_logged_cut_short() {
+    let dir = std::env::temp_dir().join(format!("submarine-ai-test-{}", channel::random_hex(6)));
+    let exec: Executor = Arc::new(|_, _, _, _| Box::pin(async { Err("no servers in this test".to_string()) }));
+    let s = AiState::new(exec, Box::new(|| {}), Some(dir.clone()));
+    s.turn_on().unwrap();
+    s.start_tab("local-1", "Claude").unwrap();
+    s.share("local-1", "sess-1", "xyz").unwrap();
+    // As long as allowed, and all of it escaped in JSON.
+    let long = "\u{1}".repeat(MAX_COMMAND);
+    for deny in [false, true] {
+        let (cancel_tx, cancel) = watch::channel(false);
+        let (s2, cmd) = (s.clone(), long.clone());
+        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", &cmd, None, cancel).await });
+        wait_for("the request", || s.snapshot().pending.len() == 1).await;
+        if deny {
+            s.decide(s.snapshot().pending[0].id, false).unwrap();
+        } else {
+            cancel_tx.send(true).unwrap();
+        }
+        assert!(req.await.unwrap().is_error);
+    }
+    let text = std::fs::read_to_string(dir.join(audit::FILE_NAME)).unwrap();
+    let requests: Vec<&str> = text.lines().filter(|l| l.contains("\"event\":\"request\"")).collect();
+    assert_eq!(requests.len(), 2);
+    for l in requests {
+        assert!(l.len() < MAX_LOGGED_COMMAND + 512, "{} bytes", l.len());
+        assert!(l.contains("sha256 "));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // -- Against the test SSH server (it runs commands with this machine's sh) --

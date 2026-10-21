@@ -94,6 +94,10 @@ fn valid_id(id: &Value) -> Option<String> {
     }
 }
 
+/// The calls being answered on a connection: by id, each call's own number
+/// and its cancel signal.
+type Calls = HashMap<String, (u64, watch::Sender<bool>)>;
+
 /// Serve one connection for the AI tab `tab_id` until the client goes, or
 /// the tab's access ends (`closed`).
 pub(crate) async fn serve<R, W>(state: AiState, tab_id: String, mut closed: watch::Receiver<bool>, mut reader: BufReader<R>, mut writer: W)
@@ -112,8 +116,11 @@ where
         }
     });
     // Requests still being answered, by their JSON-RPC id, so the client can
-    // cancel one (and leaving cancels them all).
-    let calls: Arc<Mutex<HashMap<String, watch::Sender<bool>>>> = Arc::default();
+    // cancel one (and leaving cancels them all). Each with a number of its
+    // own: once one is cancelled its id may be used again, and the first
+    // call's task must not take the new call's entry for its own.
+    let calls: Arc<Mutex<Calls>> = Arc::default();
+    let mut next_seq: u64 = 0;
     let slots = Arc::new(Semaphore::new(MAX_CALLS));
     let read_loop = async {
         loop {
@@ -139,7 +146,7 @@ where
             let Some(id) = msg.get("id") else {
                 if method == "notifications/cancelled" {
                     if let Some(key) = params.get("requestId").and_then(valid_id) {
-                        if let Some(tx) = calls.lock().ok().and_then(|mut c| c.remove(&key)) {
+                        if let Some((_, tx)) = calls.lock().ok().and_then(|mut c| c.remove(&key)) {
                             let _ = tx.send(true);
                         }
                     }
@@ -179,11 +186,13 @@ where
                         continue;
                     };
                     let (cancel_tx, cancel_rx) = watch::channel(false);
+                    next_seq += 1;
+                    let seq = next_seq;
                     let taken = calls.lock().map(|mut c| {
                         if c.contains_key(&key) {
                             false
                         } else {
-                            c.insert(key.clone(), cancel_tx);
+                            c.insert(key.clone(), (seq, cancel_tx));
                             true
                         }
                     }).unwrap_or(false);
@@ -199,7 +208,18 @@ where
                     tokio::spawn(async move {
                         let _slot = slot;
                         let r = state.call_tool(&tab, &name, &args, cancel_rx).await;
-                        let was_cancelled = calls.lock().map(|mut c| c.remove(&key).is_none()).unwrap_or(false);
+                        // Still ours (same number): answered. Gone, or another
+                        // call's under the same id now: this one was cancelled.
+                        let was_cancelled = calls
+                            .lock()
+                            .map(|mut c| {
+                                let ours = c.get(&key).is_some_and(|(s, _)| *s == seq);
+                                if ours {
+                                    c.remove(&key);
+                                }
+                                !ours
+                            })
+                            .unwrap_or(false);
                         // A cancelled request gets no answer (MCP's rule).
                         if !was_cancelled {
                             let _ = out.send(reply(&id, json!({ "content": [{ "type": "text", "text": r.text }], "isError": r.is_error }))).await;
@@ -222,7 +242,7 @@ where
     }
     // Leaving cancels what's still waiting.
     if let Ok(mut c) = calls.lock() {
-        for (_, tx) in c.drain() {
+        for (_, (_, tx)) in c.drain() {
             let _ = tx.send(true);
         }
     }
@@ -249,6 +269,8 @@ mod tests {
         let exec: Executor = Arc::new(|_, _, _, mut stop| {
             Box::pin(async move {
                 let _ = stop.wait_for(|s| *s).await;
+                // Ending it takes a moment, as on a server.
+                tokio::time::sleep(Duration::from_millis(300)).await;
                 Ok(Exec { stopped: true, ..Exec::default() })
             })
         });
@@ -339,6 +361,37 @@ mod tests {
         let a = recv(&mut r).await;
         assert_eq!(a["error"]["code"], -32600);
         assert_eq!(s.snapshot().pending.len(), 1, "the first still waits");
+    }
+
+    async fn until(what: &str, mut f: impl FnMut() -> bool) {
+        let t = std::time::Instant::now();
+        while !f() {
+            assert!(t.elapsed() < Duration::from_secs(10), "waited for {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// An id used again after its call was cancelled, while the cancelled
+    /// call is still ending: the cancelled one gets no answer, and the new
+    /// one gets its own.
+    #[tokio::test]
+    async fn an_id_reused_after_a_cancel_gets_its_own_answer() {
+        let (s, mut w, mut r, _t) = connection(1 << 20);
+        let call = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "run_command", "arguments": { "server": "xyz", "command": "x" } } });
+        send(&mut w, call.clone()).await;
+        until("the first request", || s.snapshot().pending.len() == 1).await;
+        s.decide(s.snapshot().pending[0].id, true).unwrap();
+        until("it to run", || s.snapshot().running.len() == 1).await;
+        send(&mut w, json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 1 } })).await;
+        send(&mut w, call).await;
+        until("the second request", || s.snapshot().pending.len() == 1).await;
+        // The first ends (it takes a moment) while the second waits.
+        until("the first to end", || s.snapshot().running.is_empty() && s.snapshot().history.len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        s.decide(s.snapshot().pending[0].id, false).unwrap();
+        let a = recv(&mut r).await;
+        assert_eq!(a["id"], 1);
+        assert_eq!(a["result"]["content"][0]["text"], "Denied by the user.", "{a}");
     }
 
     /// A client that sends without reading is made to wait, rather than

@@ -54,14 +54,27 @@ fn short_key_not_secret(c: &regex::Captures) -> bool {
         || (bare && colon && !quoted)
 }
 
-/// A base64 blob that starts like a PEM block but isn't a private key (a
-/// certificate, a public key).
+/// The longest base64 blob that's decoded to look inside; a longer one is
+/// hidden unread.
+const MAX_PEM_BLOB: usize = 64 * 1024;
+
+/// A base64 blob that starts like a PEM block but holds no private key (a
+/// certificate, a public key, a chain of them). All of it is looked at: a
+/// bundle (HAProxy's .pem) may start with its certificate and carry the key
+/// after it. One too long to look at, or that doesn't decode, is hidden.
 fn base64_pem_not_secret(c: &regex::Captures) -> bool {
     use base64::Engine;
-    let blob: String = c[0].chars().filter(|ch| !ch.is_whitespace()).take(96).collect();
-    let usable = blob.trim_end_matches('=').len() / 4 * 4;
-    let head = base64::engine::general_purpose::STANDARD_NO_PAD.decode(&blob.as_bytes()[..usable]).unwrap_or_default();
-    !String::from_utf8_lossy(&head).contains("PRIVATE KEY")
+    let blob: String = c[0].chars().filter(|ch| !ch.is_whitespace()).collect();
+    if blob.len() > MAX_PEM_BLOB {
+        return false;
+    }
+    let data = blob.trim_end_matches('=');
+    // Whole groups only: output cut short may end in a partial one.
+    let usable = data.len() / 4 * 4;
+    match base64::engine::general_purpose::STANDARD_NO_PAD.decode(&data.as_bytes()[..usable]) {
+        Ok(decoded) => !String::from_utf8_lossy(&decoded).contains("PRIVATE KEY"),
+        Err(_) => false,
+    }
 }
 
 static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
@@ -135,12 +148,18 @@ pub(crate) fn filter(text: &str) -> Filtered {
     let mut hidden = 0;
     for r in RULES.iter() {
         // What earlier rules hid: a match touching one is left as it is.
+        // Both come in order and don't overlap among themselves, so one walk
+        // along `done` checks every match (linear, not matches × done).
         let done: Vec<(usize, usize)> = out.match_indices(HIDDEN).map(|(i, s)| (i, i + s.len())).collect();
+        let mut d = 0;
         let mut next = String::with_capacity(out.len());
         let mut last = 0;
         for caps in r.re.captures_iter(&out) {
             let Some(m) = caps.get(r.group) else { continue };
-            if done.iter().any(|&(a, b)| m.start() < b && a < m.end()) {
+            while d < done.len() && done[d].1 <= m.start() {
+                d += 1;
+            }
+            if d < done.len() && done[d].0 < m.end() {
                 continue;
             }
             if r.not_secret.is_some_and(|f| f(&caps)) {
@@ -321,6 +340,52 @@ mod tests {
         let cert = format!("  tls.crt: {}", b64("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"));
         hides(&cert, &cert, 0);
         hides("  client.key: /etc/ssl/private/client.key", "  client.key: /etc/ssl/private/client.key", 0);
+    }
+
+    /// A bundle that starts with its certificate and has the key after it,
+    /// on one line or wrapped: hidden whole. Too long to look at: hidden.
+    #[test]
+    fn a_certificate_and_key_bundle_in_base64() {
+        use base64::Engine;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        let cert = format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", "MIIB".repeat(200));
+        let bundle = b64(&format!("{cert}-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END PRIVATE KEY-----\n"));
+        hides(&format!("  haproxy.pem: {bundle}"), &format!("  haproxy.pem: {HIDDEN}"), 1);
+        let wrapped: Vec<String> = bundle.as_bytes().chunks(76).map(|c| String::from_utf8_lossy(c).into_owned()).collect();
+        let f = filter(&format!("{}\nend", wrapped.join("\n")));
+        assert_eq!(f.hidden, 1);
+        assert!(!f.text.contains("LS0t") && f.text.ends_with("\nend"), "{}", f.text);
+        // A chain of certificates only is left; one past the cap is hidden.
+        let chain = format!("  ca.crt: {}", b64(&cert.repeat(3)));
+        hides(&chain, &chain, 0);
+        let huge = b64(&cert.repeat(80));
+        assert!(huge.len() > MAX_PEM_BLOB);
+        hides(&huge, HIDDEN, 1);
+    }
+
+    /// Many matches of later rules beside many hidden by earlier ones: the
+    /// time grows with the output, not with its square. (Checked as a ratio,
+    /// so a slow machine or a debug build doesn't make it fail.)
+    #[test]
+    fn many_secrets_take_linear_time() {
+        let line = "pass=a password=b\n";
+        let time = |kb: usize| {
+            let text = line.repeat(kb * 1024 / line.len());
+            (0..2)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    let f = filter(&text);
+                    assert_eq!(f.hidden, 2 * (kb * 1024 / line.len()));
+                    t.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let (small, large) = (time(128), time(512));
+        // Four times the output: about four times the time if linear,
+        // sixteen if quadratic.
+        let ratio = large.as_secs_f64() / small.as_secs_f64();
+        assert!(ratio < 6.0, "128 KB: {small:?}, 512 KB: {large:?}");
     }
 
     #[test]

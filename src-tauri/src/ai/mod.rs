@@ -58,9 +58,10 @@ const AI_TAIL: usize = 32 * 1024;
 const RATE_MAX: usize = 20;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_WAITING: usize = 3;
-/// What the log keeps at most of a refused request's command, and of a
-/// server name: the AI may send anything there, up to MCP's 1 MB.
-const MAX_LOGGED_REFUSED: usize = 4 * 1024;
+/// What the log keeps at most of a request's command (as written in its
+/// JSON), and of a server name: the AI may send anything there, up to MCP's
+/// 1 MB, and may ask, withdraw and ask again without you allowing anything.
+const MAX_LOGGED_COMMAND: usize = 4 * 1024;
 const MAX_LOGGED_NAME: usize = 256;
 /// Finished requests the panel keeps.
 const HISTORY: usize = 20;
@@ -250,18 +251,33 @@ async fn withdrawal(cancel: &mut watch::Receiver<bool>) {
     let _ = cancel.wait_for(|c| *c).await;
 }
 
-/// `text` cut to at most `max` bytes (at a character's edge), saying how
-/// much was left out: for the log's refused requests, which may be anything
-/// the AI sends.
-fn clip(text: &str, max: usize) -> String {
-    if text.len() <= max {
+/// `text` for the audit log: cut (at a character's edge) to what takes at
+/// most `max` bytes in the log's JSON, escapes counted, so a line stays
+/// small whatever the AI sends. Cut, it says how much was left out and ends
+/// with the first 16 hex digits of the SHA-256 of all of it, to tell
+/// commands apart.
+fn for_log(text: &str, max: usize) -> String {
+    // What serde_json writes for it.
+    let escaped = |c: char| match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    };
+    let mut used = 0;
+    let mut end = text.len();
+    for (i, c) in text.char_indices() {
+        used += escaped(c);
+        if used > max {
+            end = i;
+            break;
+        }
+    }
+    if end == text.len() {
         return text.to_string();
     }
-    let mut end = max;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}… [{} bytes more]", &text[..end], text.len() - end)
+    use sha2::Digest;
+    let hash = hex::encode(sha2::Sha256::digest(text.as_bytes()));
+    format!("{}… [{} bytes more; sha256 {}]", &text[..end], text.len() - end, &hash[..16])
 }
 
 /// A name for `wanted` that no other server of this AI tab has.
@@ -651,8 +667,8 @@ impl AiState {
     fn refuse(&self, label: &str, server: &str, command: &str, why: String) -> ToolResult {
         let mut e = audit::Entry::new("request", label);
         e.request = Some("run_command");
-        e.server = Some(clip(server, MAX_LOGGED_NAME)).filter(|s| !s.is_empty());
-        e.command = Some(clip(command, MAX_LOGGED_REFUSED));
+        e.server = Some(for_log(server, MAX_LOGGED_NAME)).filter(|s| !s.is_empty());
+        e.command = Some(for_log(command, MAX_LOGGED_COMMAND));
         e.decision = Some("refused");
         e.by = Some("Submarine");
         e.note = Some(why.clone());
@@ -749,7 +765,7 @@ impl AiState {
             let mut e = audit::Entry::new("request", &label);
             e.request = Some("run_command");
             e.server = Some(server.clone());
-            e.command = Some(command.to_string());
+            e.command = Some(for_log(command, MAX_LOGGED_COMMAND));
             e.root = root;
             e
         };
@@ -862,10 +878,26 @@ impl AiState {
                     "Stopped: the server isn't shared any more."
                 })
             }
-            Ok(out) => {
-                let text = String::from_utf8_lossy(&out.output).into_owned();
-                let f = filter::filter(&text);
-                let ai = shorten_for_ai(&f.text);
+            Ok(mut out) => {
+                // Up to a megabyte through every rule: off the async workers.
+                let output = std::mem::take(&mut out.output);
+                let output_bytes = output.len();
+                let filtered = tokio::task::spawn_blocking(move || {
+                    let text = String::from_utf8_lossy(&output).into_owned();
+                    let f = filter::filter(&text);
+                    let ai = shorten_for_ai(&f.text);
+                    (text, f.hidden, ai)
+                })
+                .await;
+                let Ok((text, hidden, ai)) = filtered else {
+                    e.note = Some("filtering the output failed".into());
+                    d.outcome = "failed";
+                    d.error = Some("Submarine couldn't filter the output, so the AI wasn't given it.".into());
+                    self.audit(e);
+                    self.remember(d);
+                    self.changed();
+                    return ToolResult::err("Submarine couldn't filter the output, so it isn't given.");
+                };
                 let exit = out.exit_status.map(i64::from);
                 let mut head = match (exit, &out.exit_signal) {
                     (Some(c), _) => format!("Exit code: {c}\n"),
@@ -878,28 +910,28 @@ impl AiState {
                 if out.cut {
                     head.push_str(&format!("Stopped by Submarine after {} MB of output.\n", OUTPUT_CAP / (1024 * 1024)));
                 }
-                if f.hidden > 0 {
+                if hidden > 0 {
                     head.push_str(&format!(
                         "Submarine hid {} item{} that looked like secrets (shown as {}).\n",
-                        f.hidden,
-                        if f.hidden == 1 { "" } else { "s" },
+                        hidden,
+                        if hidden == 1 { "" } else { "s" },
                         filter::HIDDEN
                     ));
                 }
                 let answer = format!("{head}--- output ---\n{ai}");
                 e.exit_code = exit;
                 e.bytes_returned = Some(ai.len());
-                e.items_hidden = Some(f.hidden);
+                e.items_hidden = Some(hidden);
                 if out.timed_out {
                     e.note = Some("timed out".into());
                 } else if out.cut {
                     e.note = Some("output cap reached".into());
                 }
                 d.exit_code = exit;
-                d.output_bytes = out.output.len();
+                d.output_bytes = output_bytes;
                 d.output = text;
                 d.ai_output = ai;
-                d.hidden = f.hidden;
+                d.hidden = hidden;
                 d.cut = out.cut;
                 d.timed_out = out.timed_out;
                 ToolResult::ok(answer)
