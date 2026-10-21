@@ -11,6 +11,19 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ### From the original project ([#41](https://github.com/paulm981/Submarine/issues/41))
 
+- **RDP servers** ([#173](https://github.com/SinaXhpm/submarine/pull/173)). Add server has a **Type**: SSH, RDP, Telnet or VNC. An RDP server opens in this computer's Remote Desktop app (Remote Desktop Connection on Windows, Remmina or FreeRDP on Linux), straight or through an SSH server. The app asks for the password itself. Window size and what's shared are kept on this computer. Your Remote Desktop links stay as they are, beside RDP servers; joining the two comes next ([#42](https://github.com/paulm981/Submarine/issues/42)).
+- **A built-in RDP client, experimental** ([#199](https://github.com/SinaXhpm/submarine/pull/199)). An RDP server can instead show its desktop in its own tab: choose **Open in** on the server. Your password and the server's certificate check stay in the app; the certificate is remembered like an SSH host key. It's off unless you choose it.
+- **Telnet servers** ([#192](https://github.com/SinaXhpm/submarine/pull/192)) open in a terminal tab, for older network devices. Telnet isn't encrypted: anything you type, passwords too, crosses the network as plain text, and the form, the list and the tab say so. Going through an SSH server keeps the part up to that server encrypted.
+- **VNC servers** ([#193](https://github.com/SinaXhpm/submarine/pull/193)) show their screen in the tab, straight or through an SSH server, with touch, zoom and a keyboard on a phone. Plain VNC isn't encrypted either.
+- RDP, telnet and VNC servers don't go on Walls or into Broadcast, and can't be shared with AI tools: those work with SSH terminals.
+- **Unlock a profile with Windows Hello** ([#195](https://github.com/SinaXhpm/submarine/pull/195)), or a fingerprint on Android. Turn it on for a profile in the profile panel, with its password once. The password isn't kept: a key locked by Windows Hello is, on this computer only, and it never syncs. Not offered on macOS or Linux.
+- **Security updates** ([#198](https://github.com/SinaXhpm/submarine/pull/198)): the TLS library behind sync and the update check, with four advisories fixed, and the zip library.
+- **The Android build**, when this fork's builds turn it on, uses the NDK it installs ([#196](https://github.com/SinaXhpm/submarine/pull/196)).
+
+## v0.3.8-fork.10
+
+### From the original project ([#41](https://github.com/paulm981/Submarine/issues/41))
+
 - **A saved password at a password prompt** ([#182](https://github.com/SinaXhpm/submarine/pull/182)). When a terminal stops at a password prompt (sudo, dzdo, su, ssh), a **Saved password** button types a saved password there, without pressing Enter. It goes from your profile straight to the server; the window never sees it.
   - It offers this server's own password and its saved login. Another saved login is offered only when the prompt asks for that login's user by name, so a prompt can't fish for a password it has nothing to do with.
 - **A color scheme of your own** ([#183](https://github.com/SinaXhpm/submarine/pull/183)). Settings › Terminal › Colors takes a Windows Terminal color scheme pasted as JSON. It stays on this computer; a server's own scheme is still one of the built-in ones, so it syncs. Also there: **Bold text in bright colors**, on by default.
