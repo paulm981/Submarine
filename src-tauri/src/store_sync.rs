@@ -450,6 +450,24 @@ fn is_plain_file(e: &std::fs::DirEntry) -> bool {
 /// sync takes in one answer (cloud::MAX_SYNC_ANSWER).
 const MAX_DEVICE_FILE: u64 = crate::cloud::MAX_SYNC_ANSWER as u64;
 
+/// A computer's file, read no further than `MAX_DEVICE_FILE`: its size is
+/// looked at first, and the read stops one byte past the limit anyway, as the
+/// file can grow while it's read.
+fn read_device_file(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let too_big = || format!("it's more than the {} MB a sync file can be, so it wasn't read", MAX_DEVICE_FILE / (1024 * 1024));
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    if file.metadata().map_err(|e| e.to_string())?.len() > MAX_DEVICE_FILE {
+        return Err(too_big());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_DEVICE_FILE + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_DEVICE_FILE {
+        return Err(too_big());
+    }
+    Ok(bytes)
+}
+
 fn read_profile(dir: &Path, key: &[u8; 32], node: &str) -> Result<Seen, String> {
     let mut seen = Seen::default();
     refuse_links(dir)?;
@@ -472,17 +490,7 @@ fn read_profile(dir: &Path, key: &[u8; 32], node: &str) -> Result<Seen, String> 
         // Looked at before it's read: a file far bigger than any profile (a
         // sync tool's mistake, or someone who can write to the store) would
         // otherwise be read whole into memory on every sync.
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        let read = if size > MAX_DEVICE_FILE {
-            Err(format!(
-                "it's {} MB, more than the {} MB a sync file can be, so it wasn't read",
-                size / (1024 * 1024),
-                MAX_DEVICE_FILE / (1024 * 1024)
-            ))
-        } else {
-            std::fs::read(entry.path()).map_err(|e| e.to_string())
-        };
-        let file = match read.and_then(|b| unseal(key, &b)) {
+        let file = match read_device_file(&entry.path()).and_then(|b| unseal(key, &b)) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("[STORE] skipped {name}: {e}");
@@ -1494,6 +1502,22 @@ mod tests {
         let seen = read_profile(&dir, &KEY, "aaaaaaaaaaaaaaaa").unwrap();
         assert_eq!(seen.unreadable, ["dddddddddddddddd.subdev"]);
         assert!(seen.records.is_empty());
+    }
+
+    #[test]
+    fn a_device_file_is_read_up_to_the_limit_and_no_further() {
+        let dir = tmp("limit");
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = dir.join("small");
+        std::fs::write(&small, b"abc").unwrap();
+        assert_eq!(read_device_file(&small).unwrap(), b"abc");
+        let at = dir.join("at");
+        std::fs::File::create(&at).unwrap().set_len(MAX_DEVICE_FILE).unwrap();
+        assert_eq!(read_device_file(&at).unwrap().len() as u64, MAX_DEVICE_FILE);
+        let over = dir.join("over");
+        std::fs::File::create(&over).unwrap().set_len(MAX_DEVICE_FILE + 1).unwrap();
+        assert!(read_device_file(&over).unwrap_err().contains("more than"));
+        assert!(read_device_file(&dir.join("missing")).is_err());
     }
 
     #[test]
