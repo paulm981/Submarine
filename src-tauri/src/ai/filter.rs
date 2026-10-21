@@ -3,9 +3,11 @@
 //! output in the AI panel, and how many things were hidden.
 //!
 //! The rules are fixed (#32, "Secrets reaching the AI service"): private key
-//! blocks, the value after `password=`, `secret:`, `token=` and their kin, an
-//! Authorization header's credentials, password hashes, cloud and service
-//! access keys, and the password in a URL. They catch the common shapes, not
+//! blocks (also in base64), the value after `password=`, `secret:`,
+//! `token=`, `DB_PASS=` and their kin, passwords on command lines
+//! (`--password X`, `mysql -pX`, `sshpass -p X`), an Authorization header's
+//! credentials, JSON Web Tokens, password hashes, cloud and service access
+//! keys, and the password in a URL. They catch the common shapes, not
 //! everything, and the app says so where it shows them.
 
 use regex::Regex;
@@ -24,10 +26,42 @@ struct Rule {
     re: Regex,
     /// The capture group that's the secret; 0 = the whole match.
     group: usize,
+    /// For a match that isn't one after all: true leaves it as it is.
+    not_secret: Option<fn(&regex::Captures) -> bool>,
 }
 
 fn rule(pattern: &str, group: usize) -> Rule {
-    Rule { re: Regex::new(pattern).expect("filter rule"), group }
+    Rule { re: Regex::new(pattern).expect("filter rule"), group, not_secret: None }
+}
+
+fn rule_unless(pattern: &str, group: usize, not_secret: fn(&regex::Captures) -> bool) -> Rule {
+    Rule { not_secret: Some(not_secret), ..rule(pattern, group) }
+}
+
+/// A value after a short key (`pass`, `pwd`, `credentials`) that's no
+/// secret: the working folder `env` and `set` print (`PWD=/home/you`), git's
+/// `credential.helper`, and a bare `pass:`/`pwd:` (a test run's `pass: 12`),
+/// which only counts as a key quoted (`"pass": …`) or with a prefix
+/// (`db_pass: …`).
+fn short_key_not_secret(c: &regex::Captures) -> bool {
+    let key = c.name("key").map_or("", |m| m.as_str()).to_ascii_lowercase();
+    let value = c.name("value").map_or("", |m| m.as_str());
+    let quoted = c.name("quote").is_some_and(|m| !m.as_str().is_empty());
+    let colon = c.name("sep").is_some_and(|m| m.as_str() == ":");
+    let bare = matches!(key.as_str(), "pass" | "pwd");
+    (matches!(key.as_str(), "pwd" | "oldpwd") && value.starts_with(['/', '~']))
+        || key.starts_with("credential.")
+        || (bare && colon && !quoted)
+}
+
+/// A base64 blob that starts like a PEM block but isn't a private key (a
+/// certificate, a public key).
+fn base64_pem_not_secret(c: &regex::Captures) -> bool {
+    use base64::Engine;
+    let blob: String = c[0].chars().filter(|ch| !ch.is_whitespace()).take(96).collect();
+    let usable = blob.trim_end_matches('=').len() / 4 * 4;
+    let head = base64::engine::general_purpose::STANDARD_NO_PAD.decode(&blob.as_bytes()[..usable]).unwrap_or_default();
+    !String::from_utf8_lossy(&head).contains("PRIVATE KEY")
 }
 
 static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
@@ -35,16 +69,45 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
         // A private key, from its BEGIN line to its END line (or to the end of
         // the output, when it was cut): PEM, OpenSSH, PGP.
         rule(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----(?s:.*?)(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|\z)", 0),
+        // The same in base64 (`LS0tLS1CRUdJTi…` is "-----BEGIN"), as
+        // Kubernetes secrets and CI variables hold them, on one line or
+        // wrapped.
+        rule_unless(r"(?m)LS0tLS1CRUdJTi[A-Za-z0-9+/]*={0,2}(?:\r?\n[A-Za-z0-9+/]{16,}={0,2}\r?$)*", 0, base64_pem_not_secret),
+        // A key file's contents as a YAML value: `tls.key: …`, `client.key: …`.
+        rule(r"(?m)^[ \t]*[A-Za-z0-9_.-]*\.key[ \t]*:[ \t]*([A-Za-z0-9+/]{20,}={0,2})[ \t]*\r?$", 1),
         // A PuTTY key's private part.
         rule(r"(?m)^Private-Lines: *\d+\r?\n((?:[A-Za-z0-9+/=]+(?:\r?\n|\z))+)", 1),
         // Password hashes as crypt(3) writes them, in /etc/shadow and
-        // elsewhere: MD5, bcrypt, SHA-256/512, yescrypt, scrypt, argon2.
-        rule(r"\$(?:1|2[abxy]?|5|6|7|y|gy|md5|sha1|argon2(?:id|i|d))\$[^\s:]{8,}", 0),
+        // elsewhere: MD5 (and Apache's), bcrypt, SHA-256/512, yescrypt,
+        // scrypt, argon2.
+        rule(r"\$(?:1|2[abxy]?|5|6|7|y|gy|md5|apr1|sha1|argon2(?:id|i|d))\$[^\s:]{8,}", 0),
         // `password=…`, `secret: …`, `"api_key": "…"`: the value.
         rule(
             r#"(?i)[A-Za-z0-9_.-]*(?:password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|account[_-]?key)(?:[_.-][A-Za-z0-9_.-]*)?["']?[ \t]*[:=][ \t]*("[^"\r\n]+"|'[^'\r\n]+'|[^\s"',;]+)"#,
             1,
         ),
+        // The same for the short keys, as a word of their own or a part of
+        // one: `pass=…`, `DB_PASS=…`, `MYSQL_PWD=…`, `"pwd": …`,
+        // `credentials: …`. Not `bypass` or `compass`.
+        rule_unless(
+            r#"(?i)(?:^|[^A-Za-z0-9_.-])(?P<quote>["']?)(?P<key>(?:[A-Za-z0-9]+[_.-])*(?:pass|pwd|credentials?)(?:[_.-][A-Za-z0-9]+)*)["']?[ \t]*(?P<sep>[:=])[ \t]*(?P<value>"[^"\r\n]+"|'[^'\r\n]+'|[^\s"',;]+)"#,
+            4,
+            short_key_not_secret,
+        ),
+        // A password on a command line: `--password X`, `--pass=X`, and
+        // their kin.
+        rule(
+            r#"(?i)(?:^|[\s'"])--(?:password|passwd|pass|pwd|passphrase|secret|token|api-key)(?:=|[ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^\s"']+)"#,
+            1,
+        ),
+        // MySQL's and MariaDB's `-pPASSWORD` (no space), and `sshpass -p X`.
+        rule(
+            r#"\b(?:mysql|mysqldump|mysqladmin|mysqlimport|mysqlcheck|mysqlshow|mariadb|mariadb-dump|mariadb-admin)\b[^\r\n]*?[ \t]-p("[^"\r\n]*"|'[^'\r\n]*'|[^\s"'-][^\s"']*)"#,
+            1,
+        ),
+        rule(r#"\bsshpass\b[^\r\n]*?[ \t]-p[ \t]*("[^"\r\n]*"|'[^'\r\n]*'|[^\s"']+)"#, 1),
+        // A JSON Web Token on its own: header and payload, both `{"…`.
+        rule(r"\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*", 0),
         // An HTTP Authorization header's credentials.
         rule(r"(?i)\b(?:proxy-)?authorization[ \t]*:[ \t]*(?:(?:bearer|basic|token|digest)[ \t]+)?([^\s]+)", 1),
         // Access keys with a known shape: AWS key ids, GitHub, GitLab, Slack,
@@ -62,8 +125,13 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
 });
 
 /// `text` with every secret the rules find replaced, rule by rule.
+///
+/// `text` is the output decoded first (non-UTF-8 bytes become U+FFFD, which
+/// the value rules take as part of a value), then filtered. NUL characters
+/// are dropped first, so text written as UTF-16 (`p\0a\0s\0s…`) is read as
+/// its letters.
 pub(crate) fn filter(text: &str) -> Filtered {
-    let mut out = text.to_string();
+    let mut out = text.replace('\0', "");
     let mut hidden = 0;
     for r in RULES.iter() {
         // What earlier rules hid: a match touching one is left as it is.
@@ -73,6 +141,9 @@ pub(crate) fn filter(text: &str) -> Filtered {
         for caps in r.re.captures_iter(&out) {
             let Some(m) = caps.get(r.group) else { continue };
             if done.iter().any(|&(a, b)| m.start() < b && a < m.end()) {
+                continue;
+            }
+            if r.not_secret.is_some_and(|f| f(&caps)) {
                 continue;
             }
             next.push_str(&out[last..m.start()]);
@@ -178,6 +249,90 @@ mod tests {
         hides("postgres://app:s3cret@db.internal:5432/x", &format!("postgres://app:{HIDDEN}@db.internal:5432/x"), 1);
         hides("https://example.com/path", "https://example.com/path", 0);
         hides("ssh://git@example.com/repo", "ssh://git@example.com/repo", 0);
+    }
+
+    #[test]
+    fn passwords_on_command_lines() {
+        hides("mysqldump --password hunter2 db", &format!("mysqldump --password {HIDDEN} db"), 1);
+        hides("app --pass=hunter2 --verbose", &format!("app --pass={HIDDEN} --verbose"), 1);
+        hides("x --password 'two words' y", &format!("x --password {HIDDEN} y"), 1);
+        hides("mysql -u root -phunter2 -h db", &format!("mysql -u root -p{HIDDEN} -h db"), 1);
+        hides("  1234 mariadb -h db -p's3cr3t'", &format!("  1234 mariadb -h db -p{HIDDEN}"), 1);
+        hides("sshpass -p hunter2 ssh host", &format!("sshpass -p {HIDDEN} ssh host"), 1);
+        hides("sshpass -phunter2 ssh host", &format!("sshpass -p{HIDDEN} ssh host"), 1);
+        // Not passwords: a prompt, a file, other programs' -p.
+        for plain in ["mysql -u root -p", "mysql -u root --password", "mkdir -p /tmp/x", "ssh -p2222 host", "ps -p1234", "tar -pxf a.tar", "mysql -P3306"] {
+            hides(plain, plain, 0);
+        }
+    }
+
+    #[test]
+    fn short_keys() {
+        hides("DB_PASS=hunter2", &format!("DB_PASS={HIDDEN}"), 1);
+        hides("export MYSQL_PWD=hunter2", &format!("export MYSQL_PWD={HIDDEN}"), 1);
+        hides("pass=hunter2", &format!("pass={HIDDEN}"), 1);
+        hides("pwd=hunter2", &format!("pwd={HIDDEN}"), 1);
+        hides(r#"{"pwd": "hunter2"}"#, &format!(r#"{{"pwd": {HIDDEN}}}"#), 1);
+        hides("db_pass: hunter2", &format!("db_pass: {HIDDEN}"), 1);
+        hides("credentials: abc123", &format!("credentials: {HIDDEN}"), 1);
+        hides("aws.credential = abc123", &format!("aws.credential = {HIDDEN}"), 1);
+        // Not secrets: the working folder, the pwd command, a test run's
+        // tally, words that end in "pass", git's credential helper.
+        for plain in [
+            "PWD=/home/paul\nOLDPWD=/tmp",
+            "$ pwd\n/home/paul",
+            "pass: 12 fail: 0",
+            "bypass=1 compass=north",
+            "credential.helper=store",
+            "passed: 3",
+        ] {
+            hides(plain, plain, 0);
+        }
+    }
+
+    #[test]
+    fn apache_md5_hashes() {
+        hides("paul:$apr1$r31.....$HqJZimcKQFAMYayBlzkrA/", &format!("paul:{HIDDEN}"), 1);
+    }
+
+    #[test]
+    fn bare_json_web_tokens() {
+        let jwt = concat!("eyJhbGciOiJIUzI1NiJ9", ".", "eyJzdWIiOiIxMjM0NTY3ODkwIn0", ".", "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U");
+        hides(&format!("token is {jwt} ok"), &format!("token is {HIDDEN} ok"), 1);
+        hides(&format!("cookie {jwt}"), &format!("cookie {HIDDEN}"), 1);
+        // One part alone isn't one.
+        hides("eyJhbGciOiJIUzI1NiJ9", "eyJhbGciOiJIUzI1NiJ9", 0);
+    }
+
+    #[test]
+    fn private_keys_in_base64() {
+        use base64::Engine;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        let key = b64("-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n");
+        assert!(key.starts_with("LS0tLS1CRUdJTi"));
+        hides(&format!("data:\n  ssh-key: {key}\nkind: Secret"), &format!("data:\n  ssh-key: {HIDDEN}\nkind: Secret"), 1);
+        // Wrapped, as `base64` writes it.
+        let wrapped: Vec<String> = key.as_bytes().chunks(40).map(|c| String::from_utf8_lossy(c).into_owned()).collect();
+        hides(&format!("{}\ndone", wrapped.join("\n")), &format!("{HIDDEN}\ndone"), 1);
+        // A key file as a YAML value.
+        hides(&format!("  tls.key: {key}"), &format!("  tls.key: {HIDDEN}"), 1);
+        hides("  tls.key: MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", &format!("  tls.key: {HIDDEN}"), 1);
+        // A certificate isn't a secret, nor a path.
+        let cert = format!("  tls.crt: {}", b64("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"));
+        hides(&cert, &cert, 0);
+        hides("  client.key: /etc/ssl/private/client.key", "  client.key: /etc/ssl/private/client.key", 0);
+    }
+
+    #[test]
+    fn output_that_isnt_utf8() {
+        // Decoded first (as run_command does), then filtered.
+        let raw = b"\xff\xfeuser=x password=hun\xffter2 end";
+        let f = filter(&String::from_utf8_lossy(raw));
+        assert!(f.text.contains(&format!("password={HIDDEN} end")), "{}", f.text);
+        // UTF-16 text: read as its letters.
+        let utf16: Vec<u8> = "DB_PASSWORD=hunter2\n".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let f = filter(&String::from_utf8_lossy(&utf16));
+        assert_eq!(f.text, format!("DB_PASSWORD={HIDDEN}\n"));
     }
 
     #[test]
