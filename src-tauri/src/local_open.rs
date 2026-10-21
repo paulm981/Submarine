@@ -200,7 +200,7 @@ const RUNS_ON_OPEN: &[&str] = &[
     "settingcontent-ms", "rdp", "ica",
     // system settings, help and containers
     "msc", "reg", "inf", "ins", "isp", "chm", "hlp", "cab", "iso", "img", "vhd", "vhdx", "wsb",
-    "theme", "themepack", "desktopthemepackfile", "diagcab", "diagcfg", "diagpkg", "xll", "xnk",
+    "theme", "themepack", "desktopthemepackfile", "diagcab", "diagcfg", "diagpkg", "xll", "xnk", "vsto",
     // Access and macro-enabled Office files
     "mdb", "mde", "accde", "accdr", "ade", "adp",
     "docm", "dotm", "xlsm", "xltm", "xlam", "pptm", "potm", "ppam", "ppsm", "sldm",
