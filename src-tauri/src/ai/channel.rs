@@ -55,7 +55,8 @@ pub(crate) async fn read_line<R: AsyncBufReadExt + Unpin>(r: &mut R, max: usize)
     while matches!(buf.last(), Some(b'\n' | b'\r')) {
         buf.pop();
     }
-    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+    // Valid UTF-8 (the usual) becomes the String without another copy.
+    Ok(Some(String::from_utf8(buf).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())))
 }
 
 pub(crate) fn random_hex(bytes: usize) -> String {
@@ -355,9 +356,15 @@ pub(crate) async fn connect(_addr: &str) -> std::io::Result<Box<dyn Stream>> {
 
 /// The helper's side of the hello: send the token, read the answer.
 pub(crate) async fn hello<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut tokio::io::BufReader<S>, token: &str) -> Result<(), String> {
-    let mut line = serde_json::to_string(&Hello { submarine_ai: PROTOCOL, token: token.to_string() }).map_err(|e| e.to_string())?;
-    line.push('\n');
-    stream.get_mut().write_all(line.as_bytes()).await.map_err(|e| format!("Couldn't reach Submarine: {e}"))?;
+    use zeroize::Zeroize;
+    let mut h = Hello { submarine_ai: PROTOCOL, token: token.to_string() };
+    // Room for all of it from the start, so no outgrown copy is left behind.
+    let mut line = zeroize::Zeroizing::new(Vec::with_capacity(token.len() + 256));
+    let written = serde_json::to_writer(&mut *line, &h);
+    h.token.zeroize();
+    written.map_err(|e| e.to_string())?;
+    line.push(b'\n');
+    stream.get_mut().write_all(&line).await.map_err(|e| format!("Couldn't reach Submarine: {e}"))?;
     stream.get_mut().flush().await.map_err(|e| format!("Couldn't reach Submarine: {e}"))?;
     let answer = tokio::time::timeout(std::time::Duration::from_secs(10), read_line(stream, 4096))
         .await

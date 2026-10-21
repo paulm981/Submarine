@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// An AiState whose commands fail (no servers), turned on.
 fn state_without_servers() -> AiState {
-    let exec: Executor = Arc::new(|_, _, _| Box::pin(async { Err("no servers in this test".to_string()) }));
+    let exec: Executor = Arc::new(|_, _, _, _| Box::pin(async { Err("no servers in this test".to_string()) }));
     let s = AiState::new(exec, Box::new(|| {}), None);
     s.turn_on().unwrap();
     s
@@ -244,23 +244,67 @@ async fn the_ai_withdrawing_a_request_cancels_it() {
     assert!(s.decide(id, true).is_err(), "nothing left to allow");
 }
 
+/// The AI can't flush the audit log: every call counts toward the rate
+/// limit, refused or not; past it one line is logged a minute, not one a
+/// call; and a refused command is logged cut short.
+#[tokio::test]
+async fn refusals_count_toward_the_limit_and_are_logged_cut_short() {
+    let dir = std::env::temp_dir().join(format!("submarine-ai-test-{}", channel::random_hex(6)));
+    let exec: Executor = Arc::new(|_, _, _, _| Box::pin(async { Err("no servers in this test".to_string()) }));
+    let s = AiState::new(exec, Box::new(|| {}), Some(dir.clone()));
+    s.turn_on().unwrap();
+    s.start_tab("local-1", "Claude").unwrap();
+    let (_c, cancel) = watch::channel(false);
+    let huge = "x".repeat(200 * 1024);
+    for _ in 0..RATE_MAX + 30 {
+        let r = s.run_command("local-1", "nowhere", &huge, None, cancel.clone()).await;
+        assert!(r.is_error);
+    }
+    let r = s.run_command("local-1", "nowhere", "uptime", None, cancel.clone()).await;
+    assert!(r.text.contains("Too many requests"), "{}", r.text);
+    let text = std::fs::read_to_string(dir.join(audit::FILE_NAME)).unwrap();
+    let lines: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let refused: Vec<&Value> = lines.iter().filter(|l| l["decision"] == "refused").collect();
+    assert_eq!(refused.len(), RATE_MAX + 1, "{RATE_MAX} refusals, then one line for the limit");
+    assert!(refused.last().unwrap()["note"].as_str().unwrap().contains("Too many requests"));
+    for l in &refused {
+        assert!(l["command"].as_str().unwrap().len() <= MAX_LOGGED_REFUSED + 64);
+    }
+    assert!(text.len() < (RATE_MAX + 2) * (MAX_LOGGED_REFUSED + 1024), "{} bytes", text.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn clip_keeps_whole_characters() {
+    assert_eq!(clip("abc", 10), "abc");
+    assert_eq!(clip("ééé", 3), "é… [4 bytes more]");
+}
+
 // -- Against the test SSH server (it runs commands with this machine's sh) --
 
 #[cfg(unix)]
 mod ssh {
     use super::*;
+    use crate::ssh_test_server;
 
     /// An AiState whose `sess-1` is a test server, with an audit log in a
     /// folder of its own, and a count of the page's change events.
     async fn state() -> (AiState, PathBuf, Arc<AtomicUsize>) {
-        let handle = exec::tests::server().await;
-        let exec: Executor = Arc::new(move |sid, cmd, limit| {
+        let (s, dir, changes, _) = state_and_server(ssh_test_server::ShellOpts::default()).await;
+        (s, dir, changes)
+    }
+
+    /// The same, on a server run with `opts`, with its count of commands
+    /// still running there.
+    async fn state_and_server(opts: ssh_test_server::ShellOpts) -> (AiState, PathBuf, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let (handle, running) = exec::tests::server_with(opts).await;
+        let exec: Executor = Arc::new(move |sid, cmd, limit, stop| {
             let h = handle.clone();
             Box::pin(async move {
                 if sid != "sess-1" {
                     return Err("That server's tab isn't connected right now.".into());
                 }
-                exec::run(&h, &cmd, limit, OUTPUT_CAP).await
+                exec::run(&h, &cmd, limit, OUTPUT_CAP, stop).await
             })
         });
         let changes = Arc::new(AtomicUsize::new(0));
@@ -268,7 +312,7 @@ mod ssh {
         let dir = std::env::temp_dir().join(format!("submarine-ai-test-{}", channel::random_hex(6)));
         let s = AiState::new(exec, Box::new(move || { c.fetch_add(1, Ordering::SeqCst); }), Some(dir.clone()));
         s.turn_on().unwrap();
-        (s, dir, changes)
+        (s, dir, changes, running)
     }
 
     fn audit_lines(dir: &std::path::Path) -> Vec<Value> {
@@ -401,6 +445,117 @@ mod ssh {
         let r = tokio::time::timeout(Duration::from_secs(5), req).await.expect("stopped").unwrap();
         assert!(r.is_error && r.text.starts_with("Stopped"), "{}", r.text);
         assert!(s.snapshot().running.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stop, unsharing, closing the AI tab and turning AI tools off end the
+    /// command on the server itself, not only Submarine's wait for it: also
+    /// on a server (like Dropbear) that keeps a command running when its
+    /// channel closes and only ends it on a signal.
+    #[tokio::test]
+    async fn ending_access_ends_the_command_on_the_server() {
+        for (how, keep_running_on_close) in [("stop", false), ("unshare", true), ("close", false), ("off", true), ("gone", false)] {
+            let opts = ssh_test_server::ShellOpts { keep_running_on_close, ..Default::default() };
+            let (s, dir, _, running) = state_and_server(opts).await;
+            s.start_tab("local-1", "Claude").unwrap();
+            s.share("local-1", "sess-1", "xyz").unwrap();
+            let (_c, cancel) = watch::channel(false);
+            let s2 = s.clone();
+            let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "echo begun; exec sleep 30", None, cancel).await });
+            let p = wait_pending(&s).await;
+            s.decide(p.id, true).unwrap();
+            wait_for("it to run on the server", || running.load(Ordering::SeqCst) == 1).await;
+            match how {
+                "stop" => s.stop_tab("local-1"),
+                "unshare" => s.unshare("sess-1", Some("local-1"), "stopped sharing"),
+                "close" => s.end_tab("local-1"),
+                "off" => s.turn_off().await,
+                _ => s.session_gone("sess-1", "reconnected"),
+            }
+            let r = tokio::time::timeout(Duration::from_secs(10), req).await.expect("stopped").unwrap();
+            assert!(r.is_error && r.text.starts_with("Stopped"), "{how}: {}", r.text);
+            wait_for("the command to end on the server", || running.load(Ordering::SeqCst) == 0).await;
+            assert!(audit_lines(&dir).iter().any(|l| l["note"] == "stopped: access ended"), "{how}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The AI withdrawing a running request ends it on the server too.
+    #[tokio::test]
+    async fn the_ai_withdrawing_a_running_request_ends_it() {
+        let (s, dir, _, running) = state_and_server(Default::default()).await;
+        s.start_tab("local-1", "Claude").unwrap();
+        s.share("local-1", "sess-1", "xyz").unwrap();
+        let (cancel_tx, cancel) = watch::channel(false);
+        let s2 = s.clone();
+        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "exec sleep 30", None, cancel).await });
+        let p = wait_pending(&s).await;
+        s.decide(p.id, true).unwrap();
+        wait_for("it to run on the server", || running.load(Ordering::SeqCst) == 1).await;
+        cancel_tx.send(true).unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(10), req).await.expect("stopped").unwrap();
+        assert_eq!(r.text, "Stopped: the request was withdrawn.");
+        wait_for("the command to end on the server", || running.load(Ordering::SeqCst) == 0).await;
+        assert!(audit_lines(&dir).iter().any(|l| l["note"] == "stopped: withdrawn by the AI tool"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Allow and an end of access at the same moment: whichever comes
+    /// first, the command never runs on a server no longer shared.
+    #[tokio::test]
+    async fn allow_racing_an_end_of_access_never_runs() {
+        for allow_first in [true, false] {
+            let (s, dir, _, running) = state_and_server(Default::default()).await;
+            s.start_tab("local-1", "Claude").unwrap();
+            s.share("local-1", "sess-1", "xyz").unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            let marker = dir.join("ran");
+            let cmd = format!("touch '{}'; sleep 30", marker.display());
+            let (_c, cancel) = watch::channel(false);
+            let s2 = s.clone();
+            let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", &cmd, None, cancel).await });
+            let p = wait_pending(&s).await;
+            // Both before the request's task wakes up: in the old code an
+            // allowed request was then in neither list, and ran anyway.
+            if allow_first {
+                s.decide(p.id, true).unwrap();
+                s.session_gone("sess-1", "reconnected");
+            } else {
+                s.unshare("sess-1", Some("local-1"), "stopped sharing");
+                assert!(s.decide(p.id, true).is_err());
+            }
+            let r = tokio::time::timeout(Duration::from_secs(10), req).await.expect("ended").unwrap();
+            assert!(r.is_error, "{}", r.text);
+            assert!(r.text.starts_with(if allow_first { "Stopped" } else { "Cancelled" }), "{}", r.text);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!marker.exists(), "it never ran");
+            assert_eq!(running.load(Ordering::SeqCst), 0);
+            assert!(s.snapshot().running.is_empty() && s.snapshot().pending.is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Allowed just as the AI withdraws it: logged as allowed and stopped by
+    /// the AI, not as "access ended", and it never runs.
+    #[tokio::test]
+    async fn allow_racing_a_withdrawal_is_logged_as_such() {
+        let (s, dir, _, running) = state_and_server(Default::default()).await;
+        s.start_tab("local-1", "Claude").unwrap();
+        s.share("local-1", "sess-1", "xyz").unwrap();
+        let (cancel_tx, cancel) = watch::channel(false);
+        let s2 = s.clone();
+        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "sleep 30", None, cancel).await });
+        let p = wait_pending(&s).await;
+        s.decide(p.id, true).unwrap();
+        cancel_tx.send(true).unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(10), req).await.expect("ended").unwrap();
+        assert_eq!(r.text, "Stopped: the request was withdrawn.");
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+        let log = audit_lines(&dir);
+        let req = log.iter().find(|l| l["event"] == "request").unwrap();
+        assert_eq!(req["decision"], "allowed");
+        assert_eq!(req["note"], "stopped: withdrawn by the AI tool");
+        assert!(!log.iter().any(|l| l["note"] == "access ended"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

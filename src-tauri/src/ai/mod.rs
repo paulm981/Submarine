@@ -14,7 +14,8 @@
 //!   Servers are shared with one AI tab, checked on every request.
 //! - **Access ends** when the AI tab closes, when the server's tab closes or
 //!   reconnects, when you stop sharing, or when Submarine quits; anything
-//!   still waiting for approval is cancelled and anything running stopped.
+//!   still waiting for approval is cancelled and anything running stopped,
+//!   on the server too.
 
 mod audit;
 mod channel;
@@ -57,6 +58,10 @@ const AI_TAIL: usize = 32 * 1024;
 const RATE_MAX: usize = 20;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_WAITING: usize = 3;
+/// What the log keeps at most of a refused request's command, and of a
+/// server name: the AI may send anything there, up to MCP's 1 MB.
+const MAX_LOGGED_REFUSED: usize = 4 * 1024;
+const MAX_LOGGED_NAME: usize = 256;
 /// Finished requests the panel keeps.
 const HISTORY: usize = 20;
 /// The panel's event.
@@ -70,8 +75,8 @@ struct Settings {
 
 type ExecFuture = Pin<Box<dyn Future<Output = Result<exec::Exec, String>> + Send>>;
 /// Runs a command on a session's connection: the real one over SshState, or
-/// a test server's.
-type Executor = Arc<dyn Fn(String, String, Duration) -> ExecFuture + Send + Sync>;
+/// a test server's. `(session_id, command, timeout, stop)`; see exec::run.
+type Executor = Arc<dyn Fn(String, String, Duration, watch::Receiver<bool>) -> ExecFuture + Send + Sync>;
 
 /// A server shared with an AI tab.
 #[derive(Serialize, Clone, Debug)]
@@ -88,6 +93,9 @@ struct Tab {
     servers: Vec<SharedServer>,
     /// When it last asked, for the rate limit.
     asked: VecDeque<Instant>,
+    /// When "rate limited" was last logged for it: once a window, not once
+    /// a call, so the AI can't fill the log by asking too often.
+    rate_logged: Option<Instant>,
     /// Set when its access ends: its connections close.
     closed: watch::Sender<bool>,
 }
@@ -108,6 +116,8 @@ struct PendingView {
 struct Pending {
     view: PendingView,
     decide: oneshot::Sender<bool>,
+    /// Its stop signal, moved to `Running` when you allow it.
+    stop: watch::Sender<bool>,
 }
 
 #[derive(Serialize, Clone)]
@@ -124,7 +134,8 @@ struct Running {
     view: RunningView,
     tab_id: String,
     session_id: String,
-    abort: tokio::task::AbortHandle,
+    /// Stops it, on the server too (exec::run).
+    stop: watch::Sender<bool>,
 }
 
 /// A finished request, for the panel: everything you see, and what the AI
@@ -199,6 +210,12 @@ fn now() -> String {
 
 /// A command that asks for root: one of the tools that give it, as a word
 /// of its own (`sudo x`, `/usr/bin/sudo`, `(su -)`), anywhere in it.
+///
+/// A warning for you on the request's card, NOT a gate: it's easy to dodge
+/// (`s\udo`, `$(echo sudo)`, `runuser`, a script that calls sudo), so
+/// nothing may be allowed or refused because of it. Anything that has to
+/// keep root out (step 3 of #32: running as another account) must decide on
+/// its own `as_root` and treat "can't tell" as root.
 pub(crate) fn asks_for_root(command: &str) -> bool {
     use std::sync::LazyLock;
     static RE: LazyLock<regex::Regex> =
@@ -227,6 +244,26 @@ fn shorten_for_ai(text: &str) -> String {
     format!("{}\n… [{} bytes left out by Submarine] …\n{}", &text[..head], tail - head, &text[tail..])
 }
 
+/// Resolves once the AI withdraws its request (MCP's cancel, or its
+/// connection closing), or once nothing can any more.
+async fn withdrawal(cancel: &mut watch::Receiver<bool>) {
+    let _ = cancel.wait_for(|c| *c).await;
+}
+
+/// `text` cut to at most `max` bytes (at a character's edge), saying how
+/// much was left out: for the log's refused requests, which may be anything
+/// the AI sends.
+fn clip(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [{} bytes more]", &text[..end], text.len() - end)
+}
+
 /// A name for `wanted` that no other server of this AI tab has.
 fn unique_name(servers: &[SharedServer], wanted: &str) -> String {
     let wanted = wanted.trim();
@@ -253,13 +290,13 @@ impl AiState {
     pub(crate) fn for_app(app: &tauri::AppHandle) -> AiState {
         use tauri::{Emitter, Manager};
         let exec_app = app.clone();
-        let exec: Executor = Arc::new(move |session_id, command, limit| {
+        let exec: Executor = Arc::new(move |session_id, command, limit, stop| {
             let app = exec_app.clone();
             Box::pin(async move {
                 let state = app.state::<crate::ssh_manager::SshState>();
                 let handle = state.connections.lock().await.get(&session_id).cloned();
                 let handle = handle.ok_or("That server's tab isn't connected right now.")?;
-                exec::run(&handle, &command, limit, OUTPUT_CAP).await
+                exec::run(&handle, &command, limit, OUTPUT_CAP, stop).await
             })
         });
         let emit_app = app.clone();
@@ -348,7 +385,15 @@ impl AiState {
             .find(|l| !s.tabs.iter().any(|t| &t.label == l))
             .unwrap();
         let env = vec![(channel::ENV_ADDR.to_string(), addr), (channel::ENV_TOKEN.to_string(), token.to_string())];
-        s.tabs.push(Tab { id: id.to_string(), label: label.clone(), token, servers: Vec::new(), asked: VecDeque::new(), closed: watch::channel(false).0 });
+        s.tabs.push(Tab {
+            id: id.to_string(),
+            label: label.clone(),
+            token,
+            servers: Vec::new(),
+            asked: VecDeque::new(),
+            rate_logged: None,
+            closed: watch::channel(false).0,
+        });
         drop(s);
         self.audit(audit::Entry::new("ai_tab_started", &label));
         self.changed();
@@ -364,8 +409,10 @@ impl AiState {
             let Some(at) = s.tabs.iter().position(|t| t.id == id) else { return };
             s.tabs.remove(at)
         };
-        let _ = tab.closed.send(true);
+        // Its requests first, so they're told access ended before its
+        // connections close (which withdraws them).
         self.cancel_where(|tab_id, _| tab_id == id);
+        let _ = tab.closed.send(true);
         self.audit(audit::Entry::new("ai_tab_ended", &tab.label));
         self.changed();
     }
@@ -384,6 +431,12 @@ impl AiState {
             }
         }
         found
+    }
+
+    /// The AI tab `id`'s "access ended" signal.
+    #[cfg(test)]
+    fn closed_of(&self, id: &str) -> watch::Receiver<bool> {
+        self.lock().tabs.iter().find(|t| t.id == id).expect("the AI tab").closed.subscribe()
     }
 
     // -- Sharing -----------------------------------------------------------
@@ -452,31 +505,63 @@ impl AiState {
 
     /// Cancel the waiting requests, and stop the running ones, for which
     /// `which(tab_id, session_id)` holds.
+    ///
+    /// All under one lock with `decide`, so a request is always in one place
+    /// (waiting, or running with its stop signal) and none slips between.
     fn cancel_where(&self, which: impl Fn(&str, &str) -> bool) {
-        let (pending, running) = {
-            let mut s = self.lock();
-            let (gone, keep): (Vec<Pending>, Vec<Pending>) = s.pending.drain(..).partition(|p| which(&p.view.tab_id, &p.view.session_id));
-            s.pending = keep;
-            let (stop, run): (Vec<Running>, Vec<Running>) = s.running.drain(..).partition(|r| which(&r.tab_id, &r.session_id));
-            s.running = run;
-            (gone, stop)
-        };
+        let mut s = self.lock();
         // Dropping a request's sender is what cancels it.
-        drop(pending);
-        for r in running {
-            r.abort.abort();
-        }
+        s.pending.retain(|p| !which(&p.view.tab_id, &p.view.session_id));
+        s.running.retain(|r| {
+            let stop = which(&r.tab_id, &r.session_id);
+            if stop {
+                let _ = r.stop.send(true);
+            }
+            !stop
+        });
     }
 
+    /// Your Allow or Deny. Allowed, the request moves from waiting to
+    /// running in the same step, with its stop signal, and only while its
+    /// AI tab still has the server shared: so unsharing, Stop or a
+    /// reconnect at the same moment either comes first (and it never runs)
+    /// or finds it running (and stops it).
     fn decide(&self, id: u64, allow: bool) -> Result<(), String> {
-        let p = {
+        let result = {
             let mut s = self.lock();
             let at = s.pending.iter().position(|p| p.view.id == id).ok_or("That request isn't waiting any more.")?;
-            s.pending.remove(at)
+            let p = s.pending.remove(at);
+            let still_shared = s.tabs.iter().any(|t| t.id == p.view.tab_id && t.servers.iter().any(|x| x.session_id == p.view.session_id));
+            if !allow {
+                let _ = p.decide.send(false);
+                Ok(())
+            } else if !still_shared {
+                // Dropped: cancelled, as access has ended.
+                Err("That server isn't shared with the AI any more.".to_string())
+            } else {
+                let v = &p.view;
+                s.running.push(Running {
+                    view: RunningView {
+                        id: v.id,
+                        tab_label: v.tab_label.clone(),
+                        session_id: v.session_id.clone(),
+                        server: v.server.clone(),
+                        command: v.command.clone(),
+                        started_at: now(),
+                    },
+                    tab_id: v.tab_id.clone(),
+                    session_id: v.session_id.clone(),
+                    stop: p.stop.clone(),
+                });
+                if p.decide.send(true).is_err() {
+                    // Nobody is waiting for the answer any more.
+                    s.running.pop();
+                }
+                Ok(())
+            }
         };
-        let _ = p.decide.send(allow);
         self.changed();
-        Ok(())
+        result
     }
 
     pub(crate) fn snapshot(&self) -> Snapshot {
@@ -507,12 +592,16 @@ impl AiState {
         let (r, mut w) = tokio::io::split(stream);
         let mut r = tokio::io::BufReader::new(r);
         let hello = tokio::time::timeout(Duration::from_secs(5), channel::read_line(&mut r, 4096)).await;
-        let token = hello
-            .ok()
-            .and_then(|l| l.ok().flatten())
-            .and_then(|l| serde_json::from_str::<channel::Hello>(&l).ok())
+        // The token's copies here are wiped when dropped: the line and the
+        // parsed hello. (The reader's own buffer and the tool's environment
+        // aren't ours to wipe.)
+        let line = hello.ok().and_then(|l| l.ok().flatten()).map(Zeroizing::new);
+        let token = line
+            .as_deref()
+            .and_then(|l| serde_json::from_str::<channel::Hello>(l).ok())
             .filter(|h| h.submarine_ai == channel::PROTOCOL)
             .map(|h| Zeroizing::new(h.token));
+        drop(line);
         let tab = token.as_deref().and_then(|t| self.tab_for_token(t));
         let welcome = match &tab {
             Some(_) => channel::Welcome { ok: true, error: None },
@@ -562,8 +651,8 @@ impl AiState {
     fn refuse(&self, label: &str, server: &str, command: &str, why: String) -> ToolResult {
         let mut e = audit::Entry::new("request", label);
         e.request = Some("run_command");
-        e.server = Some(server.to_string()).filter(|s| !s.is_empty());
-        e.command = Some(command.to_string());
+        e.server = Some(clip(server, MAX_LOGGED_NAME)).filter(|s| !s.is_empty());
+        e.command = Some(clip(command, MAX_LOGGED_REFUSED));
         e.decision = Some("refused");
         e.by = Some("Submarine");
         e.note = Some(why.clone());
@@ -573,7 +662,7 @@ impl AiState {
 
     async fn run_command(&self, tab_id: &str, server: &str, command: &str, timeout: Option<u64>, mut cancel: watch::Receiver<bool>) -> ToolResult {
         // Checked before anything is shown to you.
-        let (label, session_id, server, id, rx) = {
+        let (label, session_id, server, id, mut rx, stop_tx, stop_rx) = {
             let mut s = self.lock();
             let next_id = s.next_id + 1;
             let waiting = s.pending.iter().filter(|p| p.view.tab_id == tab_id).count();
@@ -581,6 +670,26 @@ impl AiState {
                 return ToolResult::err("This AI tab's access has ended.");
             };
             let label = tab.label.clone();
+            // Every call counts toward the rate limit, refused or not; past
+            // it, one line in the log a window, not one a call.
+            if let Some(cutoff) = Instant::now().checked_sub(RATE_WINDOW) {
+                while tab.asked.front().is_some_and(|t| *t < cutoff) {
+                    tab.asked.pop_front();
+                }
+            }
+            if tab.asked.len() >= RATE_MAX {
+                let log = tab.rate_logged.is_none_or(|t| t.elapsed() >= RATE_WINDOW);
+                if log {
+                    tab.rate_logged = Some(Instant::now());
+                }
+                drop(s);
+                let why = format!("Too many requests: at most {RATE_MAX} a minute. Wait a moment.");
+                if !log {
+                    return ToolResult::err(why);
+                }
+                return self.refuse(&label, server, command, why);
+            }
+            tab.asked.push_back(Instant::now());
             let refuse = |why: String| (label.clone(), why);
             let checked: Result<SharedServer, (String, String)> = (|| {
                 if command.trim().is_empty() {
@@ -601,17 +710,9 @@ impl AiState {
                     }));
                 };
                 let found = found.clone();
-                let cutoff = Instant::now() - RATE_WINDOW;
-                while tab.asked.front().is_some_and(|t| *t < cutoff) {
-                    tab.asked.pop_front();
-                }
-                if tab.asked.len() >= RATE_MAX {
-                    return Err(refuse(format!("Too many requests: at most {RATE_MAX} a minute. Wait a moment.")));
-                }
                 if waiting >= MAX_WAITING {
                     return Err(refuse(format!("{MAX_WAITING} requests are already waiting for the user. Wait for them first.")));
                 }
-                tab.asked.push_back(Instant::now());
                 Ok(found)
             })();
             let found = match checked {
@@ -623,6 +724,7 @@ impl AiState {
             };
             s.next_id = next_id;
             let (tx, rx) = oneshot::channel();
+            let (stop_tx, stop_rx) = watch::channel(false);
             s.pending.push(Pending {
                 view: PendingView {
                     id: next_id,
@@ -636,8 +738,9 @@ impl AiState {
                     asked_at: now(),
                 },
                 decide: tx,
+                stop: stop_tx.clone(),
             });
-            (label, found.session_id, found.name, next_id, rx)
+            (label, found.session_id, found.name, next_id, rx, stop_tx, stop_rx)
         };
         self.changed();
         let root = asks_for_root(command);
@@ -668,30 +771,46 @@ impl AiState {
             at: now(),
         };
 
-        // Waiting for you.
-        let decision = tokio::select! {
-            d = rx => d.ok(),
-            _ = cancel.wait_for(|c| *c) => None,
+        // Waiting for you. The answer: Some(allowed), or None when access
+        // ended first (the request dropped by cancel_where or decide).
+        let decision: Result<Option<bool>, ()> = tokio::select! {
+            biased;
+            d = &mut rx => Ok(d.ok()),
+            _ = withdrawal(&mut cancel) => Err(()),
         };
-        let allowed = match decision {
-            Some(a) => a,
-            None => {
-                // Cancelled: by the AI, or its access ended. Gone from the
-                // waiting list either way.
+        let decision = match decision {
+            Ok(d) => d,
+            // The AI withdrew it: unless you or an end of access got to it
+            // first, it's taken off the waiting list here.
+            Err(()) => {
                 let was_waiting = {
                     let mut s = self.lock();
                     let before = s.pending.len();
                     s.pending.retain(|p| p.view.id != id);
                     before != s.pending.len()
                 };
-                let mut e = entry();
-                e.decision = Some("cancelled");
-                e.note = Some(if was_waiting { "cancelled by the AI tool" } else { "access ended" }.into());
-                self.audit(e);
-                self.remember(done("cancelled"));
-                self.changed();
-                return ToolResult::err("Cancelled before the user decided: the server isn't shared any more, or the request was withdrawn.");
+                if was_waiting {
+                    let mut e = entry();
+                    e.decision = Some("cancelled");
+                    e.note = Some("cancelled by the AI tool".into());
+                    self.audit(e);
+                    self.remember(done("cancelled"));
+                    self.changed();
+                    return ToolResult::err("Cancelled before the user decided: the request was withdrawn.");
+                }
+                // Taken off under the same lock as the answer was given, so
+                // it's there now (or the request was dropped).
+                rx.try_recv().ok()
             }
+        };
+        let Some(allowed) = decision else {
+            let mut e = entry();
+            e.decision = Some("cancelled");
+            e.note = Some("access ended".into());
+            self.audit(e);
+            self.remember(done("cancelled"));
+            self.changed();
+            return ToolResult::err("Cancelled before the user decided: the server isn't shared any more.");
         };
         if !allowed {
             let mut e = entry();
@@ -703,33 +822,47 @@ impl AiState {
             return ToolResult::err("Denied by the user.");
         }
 
-        // Allowed: run it, stoppable by an end of access.
-        let exec = (self.0.exec)(session_id.clone(), command.to_string(), limit);
-        let task = tokio::spawn(exec);
-        self.lock().running.push(Running {
-            view: RunningView { id, tab_label: label.clone(), session_id: session_id.clone(), server: server.clone(), command: command.to_string(), started_at: now() },
-            tab_id: tab_id.to_string(),
-            session_id: session_id.clone(),
-            abort: task.abort_handle(),
-        });
-        self.changed();
-        let abort = task.abort_handle();
-        // None: stopped before it finished.
-        let result: Option<Result<exec::Exec, String>> = tokio::select! {
-            r = task => r.ok(),
-            _ = cancel.wait_for(|c| *c) => {
-                abort.abort();
-                None
+        // Allowed: decide() has put it in the running list with its stop
+        // signal, which an end of access sets. The AI withdrawing it sets it
+        // too. Either way exec::run ends it on the server before returning;
+        // it runs as a task of its own, so it does even if this is dropped.
+        let withdrawn = |c: &watch::Receiver<bool>| *c.borrow();
+        if withdrawn(&cancel) {
+            let _ = stop_tx.send(true);
+        }
+        let mut task = tokio::spawn((self.0.exec)(session_id.clone(), command.to_string(), limit, stop_rx));
+        let joined = tokio::select! {
+            r = &mut task => r,
+            _ = withdrawal(&mut cancel) => {
+                let _ = stop_tx.send(true);
+                task.await
             }
         };
-        self.lock().running.retain(|r| r.view.id != id);
+        let result: Result<exec::Exec, String> = joined.unwrap_or_else(|e| Err(format!("It stopped unexpectedly: {e}")));
+        // Still listed: nothing ended its access while it ran.
+        let still_listed = {
+            let mut s = self.lock();
+            let before = s.running.len();
+            s.running.retain(|r| r.view.id != id);
+            before != s.running.len()
+        };
+        let stopped_by_ai = still_listed && withdrawn(&cancel);
 
         let mut e = entry();
         e.decision = Some("allowed");
         e.by = Some("you");
         let mut d = done("done");
         let answer = match result {
-            Some(Ok(out)) => {
+            Ok(out) if out.stopped => {
+                e.note = Some(if stopped_by_ai { "stopped: withdrawn by the AI tool" } else { "stopped: access ended" }.into());
+                d.outcome = "stopped";
+                ToolResult::err(if stopped_by_ai {
+                    "Stopped: the request was withdrawn."
+                } else {
+                    "Stopped: the server isn't shared any more."
+                })
+            }
+            Ok(out) => {
                 let text = String::from_utf8_lossy(&out.output).into_owned();
                 let f = filter::filter(&text);
                 let ai = shorten_for_ai(&f.text);
@@ -771,16 +904,11 @@ impl AiState {
                 d.timed_out = out.timed_out;
                 ToolResult::ok(answer)
             }
-            Some(Err(err)) => {
+            Err(err) => {
                 e.note = Some(err.clone());
                 d.outcome = "failed";
                 d.error = Some(err.clone());
                 ToolResult::err(format!("Couldn't run it: {err}"))
-            }
-            None => {
-                e.note = Some("stopped: access ended".into());
-                d.outcome = "stopped";
-                ToolResult::err("Stopped: the server isn't shared any more, or the request was withdrawn.")
             }
         };
         self.audit(e);
