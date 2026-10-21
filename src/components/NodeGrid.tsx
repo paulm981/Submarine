@@ -439,7 +439,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
         try { await onOpenRdp(l.id); }
         catch (e: any) { setRdpError(`${l.name}: ${typeof e === "string" ? e : (e?.message || String(e))}`); }
       }}
-      title={l.notes || `Open ${l.name} in Remote Desktop`}
+      title={l.notes || `Remote Desktop link: opens ${l.name} in Remote Desktop`}
       className="group relative flex items-center gap-3 h-16 pl-3.5 pr-2 rounded-xl bg-gradient-to-br from-sky-950/40 to-[#121216] border border-dashed border-sky-400/30 hover:border-sky-400/60 transition-colors duration-150 cursor-pointer overflow-hidden"
     >
       <span aria-hidden className="absolute left-0 top-0 bottom-0 w-[3px] bg-sky-400/70" />
@@ -449,7 +449,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
       <div className="min-w-0 flex-1">
         <h3 className="font-bold text-sky-100 text-[13px] truncate tracking-tight leading-tight">{l.name}</h3>
         <div className="flex items-center gap-1 mt-0.5">
-          <span className="px-1 rounded text-[8.5px] font-black tracking-wider bg-sky-500/15 text-sky-300 border border-sky-500/30">REMOTE DESKTOP</span>
+          <span title="Remote Desktop link" className="shrink-0 px-1 rounded text-[8.5px] font-black tracking-wider bg-sky-500/15 text-sky-300 border border-sky-500/30">LINK</span>
           <span className="text-[10.5px] text-zinc-300 font-mono truncate">
             {l.username ? `${l.username} @ ` : ""}{l.host}{l.port && l.port !== 3389 ? `:${l.port}` : ""}
           </span>
@@ -521,10 +521,13 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
           ) : (
             <>
               <h3 className="font-bold text-zinc-100 text-[13px] truncate tracking-tight leading-tight">{f.name}</h3>
-              <span className="text-[10px] text-zinc-500 font-bold uppercase tracking-[0.12em]">
+              <span
+                className="text-[10px] text-zinc-500 font-bold uppercase tracking-[0.12em]"
+                title={rdpCount > 0 ? `${rdpCount === 1 ? "1 Remote Desktop link" : `${rdpCount} Remote Desktop links`}, besides the servers` : undefined}
+              >
                 {subfolderCount > 0 && (subfolderCount === 1 ? '1 folder · ' : `${subfolderCount} folders · `)}
                 {serverCount === 1 ? '1 server' : `${serverCount} servers`}
-                {rdpCount > 0 && ` · ${rdpCount} RDP`}
+                {rdpCount > 0 && (rdpCount === 1 ? ' · 1 link' : ` · ${rdpCount} links`)}
               </span>
             </>
           )}
@@ -690,7 +693,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
                 onClick={newRdp}
                 className="h-8 px-3 bg-sky-500/10 text-sky-300 border border-sky-500/25 hover:bg-sky-500/20 rounded-lg flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider shrink-0"
               >
-                <MonitorSmartphone size={13} /> Add RDP link
+                <MonitorSmartphone size={13} /> Add Remote Desktop link
               </button>
             )}
           </div>
@@ -745,7 +748,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
                     onClick={newRdp}
                     className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg bg-sky-500/10 border border-sky-500/25 text-sky-300 text-[11px] font-bold uppercase tracking-wider hover:bg-sky-500/20 transition-colors"
                   >
-                    <MonitorSmartphone size={13} /> Add RDP link
+                    <MonitorSmartphone size={13} /> Add Remote Desktop link
                   </button>
                 )}
               </div>
