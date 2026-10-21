@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   ArrowLeftRight, ChevronRight, ChevronsDownUp, Copy, CopyPlus, Folder, FolderInput, FolderOpen, FolderPlus,
-  LayoutGrid, MonitorSmartphone, Pencil, Play, Plus, Search, TerminalSquare, Trash2, X,
+  Eye, LayoutGrid, MonitorSmartphone, Pencil, Play, Plus, Search, TerminalSquare, Trash2, X,
 } from "lucide-react";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
 import { FolderRow, indexFolders, subtreeCounts, subtreeIds } from "../util/folderPath";
@@ -51,6 +51,13 @@ const readExpanded = (profile: string): Set<number> => {
   }
 };
 
+// "Show only open" is a per-device preference too, shared by profiles: it
+// says how you like to look at the tree, not which folders exist.
+const OPEN_ONLY_KEY = "submarine-session-tree-open-only";
+const readOpenOnly = (): boolean => {
+  try { return localStorage.getItem(OPEN_ONLY_KEY) === "1"; } catch { return false; }
+};
+
 const byName = (a: string, b: string) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
 
 // How long "Moved … · Undo" stays under the tree.
@@ -73,7 +80,7 @@ const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? o
 
 export const SessionTree = ({
   profile, servers, folders, rdpLinks, sessions, statuses, waiting, activeSessionId,
-  onOpenServers, onOpenAsWall, onOpenRdp, onEditServer, onNewServer, onCloneServer,
+  onOpenServers, onShowSession, onOpenAsWall, onOpenRdp, onEditServer, onNewServer, onCloneServer,
   onCreateFolder, onRenameFolder, onSaveRdp, onDelete, onMove,
   side, onToggleSide, onClose,
 }: {
@@ -86,6 +93,8 @@ export const SessionTree = ({
   waiting: Set<string>;
   activeSessionId: string;
   onOpenServers: (servers: any[]) => void;
+  // Go to a server that's already open: its tab, or the Wall it's on.
+  onShowSession: (sessionId: string) => void;
   // Several servers on one Wall tab instead of a tab each (WallView).
   onOpenAsWall: (servers: any[], name: string) => void;
   onOpenRdp: (id: number) => Promise<void>;
@@ -105,6 +114,7 @@ export const SessionTree = ({
   const confirm = useConfirm();
   const prompt = useTextPrompt();
   const [search, setSearch] = useState("");
+  const [openOnly, setOpenOnly] = useState(readOpenOnly);
   const [expanded, setExpanded] = useState<Set<number>>(() => readExpanded(profile));
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [anchor, setAnchor] = useState<string | null>(null);
@@ -126,6 +136,10 @@ export const SessionTree = ({
   useEffect(() => {
     try { localStorage.setItem(expandedKey(profile), JSON.stringify([...expanded])); } catch { /* per-device nicety only */ }
   }, [expanded, profile]);
+
+  useEffect(() => {
+    try { localStorage.setItem(OPEN_ONLY_KEY, openOnly ? "1" : "0"); } catch { /* per-device nicety only */ }
+  }, [openOnly]);
 
   const index = useMemo(() => indexFolders(folders || []), [folders]);
   const known = (id: number | null | undefined) => (id != null && index.byId.has(id) ? id : null);
@@ -156,17 +170,32 @@ export const SessionTree = ({
   const matchesServer = (s: any) => s.name.toLowerCase().includes(q) || String(s.host).toLowerCase().includes(q);
   const matchesLink = (l: RdpLink) => l.name.toLowerCase().includes(q) || l.host.toLowerCase().includes(q);
   const matchesFolder = (name: string) => name.toLowerCase().includes(q);
+  // Servers with a session open (a tab, or a tile on a Wall).
+  const openIds = useMemo(() => new Set((sessions || []).map((x) => x.serverId)), [sessions]);
+  // Searching or showing only what's open lists matches with their folders
+  // all open, so folders can't be opened or closed meanwhile.
+  const flat = !!q || openOnly;
 
   // The rows on screen, top to bottom. While searching, only matches and
   // the folders leading to them, all open; a folder whose name matches
-  // shows everything in it.
+  // shows everything in it. With "show only open", only servers that are
+  // open (no links, which have no tab) and the folders holding them.
   const rows = useMemo(() => {
     const out: Row[] = [];
     const hits = new Map<number | null, boolean>();
+    const live = new Map<number | null, boolean>();
+    // A folder holds an open server, at any depth.
+    const hasOpen = (id: number | null): boolean => {
+      if (live.has(id)) return live.get(id)!;
+      const r = !!contents.get(id)?.servers.some((s) => openIds.has(s.id)) || (index.children.get(id) ?? []).some((f) => hasOpen(f.id));
+      live.set(id, r);
+      return r;
+    };
+    const serverOk = (s: any) => !openOnly || openIds.has(s.id);
     const hasHit = (id: number | null): boolean => {
       if (hits.has(id)) return hits.get(id)!;
       const c = contents.get(id);
-      const own = !!c && (c.servers.some(matchesServer) || c.links.some(matchesLink));
+      const own = !!c && (c.servers.some((s) => serverOk(s) && matchesServer(s)) || (!openOnly && c.links.some(matchesLink)));
       const r = own || (index.children.get(id) ?? []).some((f) => matchesFolder(f.name) || hasHit(f.id));
       hits.set(id, r);
       return r;
@@ -174,23 +203,24 @@ export const SessionTree = ({
     // `all`: inside a folder whose name matched, so everything shows.
     const walk = (parent: number | null, depth: number, all: boolean) => {
       for (const f of index.children.get(parent) ?? []) {
+        if (openOnly && !hasOpen(f.id)) continue;
         const named = !!q && matchesFolder(f.name);
         if (q && !all && !named && !hasHit(f.id)) continue;
-        const open = q ? true : expanded.has(f.id);
+        const open = flat ? true : expanded.has(f.id);
         out.push({ kind: "folder", id: f.id, name: f.name, depth, open, count: counts.get(f.id) ?? 0 });
         if (open) walk(f.id, depth + 1, all || named);
       }
       const c = contents.get(parent);
       for (const s of c?.servers ?? []) {
-        if (!q || all || matchesServer(s)) out.push({ kind: "server", key: `s:${s.id}`, server: s, depth });
+        if (serverOk(s) && (!q || all || matchesServer(s))) out.push({ kind: "server", key: `s:${s.id}`, server: s, depth });
       }
       for (const l of c?.links ?? []) {
-        if (!q || all || matchesLink(l)) out.push({ kind: "rdp", key: `r:${l.id}`, link: l, depth });
+        if (!openOnly && (!q || all || matchesLink(l))) out.push({ kind: "rdp", key: `r:${l.id}`, link: l, depth });
       }
     };
     walk(null, 0, false);
     return out;
-  }, [index, contents, counts, expanded, q]);
+  }, [index, contents, counts, expanded, q, openOnly, openIds]);
 
   const toggleFolder = (id: number) =>
     setExpanded((prev) => {
@@ -199,7 +229,7 @@ export const SessionTree = ({
       return next;
     });
   const openFolder = (id: number) => {
-    if (q) return; // while searching every folder shows open anyway
+    if (flat) return; // while searching or showing only open, every folder shows open anyway
     setExpanded((prev) => (prev.has(id) ? prev : new Set(prev).add(id)));
   };
 
@@ -255,6 +285,14 @@ export const SessionTree = ({
     catch (e: any) { setError(`${l.name}: ${errText(e)}`); }
   };
 
+  // A double-click or Enter on a server. With "show only open" the tree is
+  // for getting around, so an open one is shown where it is (its tab, or its
+  // Wall) rather than pulled out of its Wall into a tab of its own.
+  const openServer = (server: any) => {
+    const open = openOnly ? sessions.find((x) => x.serverId === server.id) : undefined;
+    if (open) onShowSession(open.id); else onOpenServers([server]);
+  };
+
   // Open servers (tabs) and links together, asking first for a big batch.
   const openMany = async (list: any[], links: RdpLink[]) => {
     const n = list.length + links.length;
@@ -264,7 +302,8 @@ export const SessionTree = ({
       message: `Each one connects as it opens, in a tab of its own${links.length ? `, and each Remote Desktop link opens its own window` : ""}. "Open as wall" puts servers on one tab instead.`,
       okLabel: `Open ${n}`,
     }))) return;
-    if (list.length) onOpenServers(list);
+    if (list.length === 1 && links.length === 0) openServer(list[0]);
+    else if (list.length) onOpenServers(list);
     for (const l of links) await openRdp(l);
   };
 
@@ -440,16 +479,16 @@ export const SessionTree = ({
     const cur = at >= 0 ? rows[at] : undefined;
     if (e.key === "F2" && cur?.kind === "folder") { e.preventDefault(); renameFolder(cur.id); return; }
     if (e.key === "Delete" && selected.size > 0) { e.preventDefault(); remove(null); return; }
-    // While searching every folder shows open, so opening or closing one
-    // would change only what shows once the search is cleared.
+    // While searching (or showing only open) every folder shows open, so
+    // opening or closing one would change only what shows afterwards.
     if (e.key === "Enter") {
       e.preventDefault();
-      if (cur?.kind === "folder") { if (!q) toggleFolder(cur.id); } else openSelected();
+      if (cur?.kind === "folder") { if (!flat) toggleFolder(cur.id); } else openSelected();
       return;
     }
     if ((e.key === "ArrowRight" || e.key === "ArrowLeft") && cur?.kind === "folder") {
       e.preventDefault();
-      if (!q && cur.open !== (e.key === "ArrowRight")) toggleFolder(cur.id);
+      if (!flat && cur.open !== (e.key === "ArrowRight")) toggleFolder(cur.id);
       return;
     }
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
@@ -632,6 +671,14 @@ export const SessionTree = ({
             >
               <Plus size={13} />
             </button>
+            <button
+              onClick={() => setOpenOnly((v) => !v)}
+              aria-pressed={openOnly}
+              title={openOnly ? "Showing only servers that are open — click to show all" : "Show only servers that are open"}
+              className={`p-1 rounded hover:bg-white/5 ${openOnly ? "text-primary" : "text-zinc-500 hover:text-zinc-200"}`}
+            >
+              <Eye size={13} />
+            </button>
             <button onClick={() => setExpanded(new Set())} title="Collapse all folders" className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-white/5"><ChevronsDownUp size={13} /></button>
             <button onClick={onToggleSide} title={`Move to the ${side === "left" ? "right" : "left"}`} className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-white/5"><ArrowLeftRight size={13} /></button>
             <button onClick={onClose} title="Hide the session tree" className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-white/5"><X size={13} /></button>
@@ -683,7 +730,7 @@ export const SessionTree = ({
       >
         {rows.length === 0 && (
           <div className="px-3 py-6 text-center text-[11.5px] text-zinc-600 italic">
-            {q ? "No matches." : "No sessions yet — right-click for a new folder, server or link."}
+            {q ? "No matches." : openOnly ? "No server is open. Turn off “show only open” to see them all." : "No sessions yet — right-click for a new folder, server or link."}
           </div>
         )}
         {rows.map((r) => {
@@ -735,7 +782,7 @@ export const SessionTree = ({
               data-key={r.key}
               onPointerDown={press(r)}
               onClick={clicked((e) => select(r, e))}
-              onDoubleClick={() => (isServer ? onOpenServers([r.server]) : openRdp(r.link))}
+              onDoubleClick={() => (isServer ? openServer(r.server) : openRdp(r.link))}
               onContextMenu={(e) => {
                 e.preventDefault();
                 e.stopPropagation();

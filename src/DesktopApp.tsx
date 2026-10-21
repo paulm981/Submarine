@@ -1366,6 +1366,44 @@ function DesktopApp() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // Ctrl+Shift+K opens All tabs ▾ to jump by name (its search is focused);
+  // Ctrl+Tab / Ctrl+Shift+Tab step through the title bar left to right:
+  // Home, the Walls, then the server tabs. From a view that isn't a tab
+  // (Settings, the vault…) they go to the first or last tab. preventDefault
+  // keeps the webview from doing anything of its own with Ctrl+Tab.
+  const tabOrderRef = useRef<string[]>([]);
+  tabOrderRef.current = [
+    ...(HAS_HOME && isUnlocked ? ["home"] : []),
+    ...walls.map(w => w.id),
+    ...sessions.filter(s => !s.wallId).map(s => s.id),
+  ];
+  const stepTabRef = useRef((_dir: 1 | -1) => {});
+  stepTabRef.current = (dir) => {
+    const order = tabOrderRef.current;
+    if (order.length === 0) return;
+    const at = order.indexOf(activeView);
+    const next = at < 0 ? (dir > 0 ? 0 : order.length - 1) : (at + dir + order.length) % order.length;
+    // Leaves a split the way a plain click on a tab does.
+    setMergedSessionIds([]);
+    setActiveView(order[next]);
+  };
+  const canJumpRef = useRef(false);
+  canJumpRef.current = isUnlocked && sessions.length > 0;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const k = appHotkey(e);
+      if (k !== "jump" && k !== "next" && k !== "prev") return;
+      e.preventDefault();
+      if (e.repeat && k === "jump") return;
+      // Not under a dialog, as for broadcast.
+      if (document.querySelector('[aria-modal="true"]')) return;
+      if (k === "jump") { if (canJumpRef.current) setAllTabsOpen(true); }
+      else stepTabRef.current(k === "next" ? 1 : -1);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   // A session opened into a Wall that's then shown on its own — "open in
   // its own tab", or picked from the tree or All tabs — gets its tab.
   useEffect(() => {
@@ -1935,7 +1973,7 @@ function DesktopApp() {
           <button
             type="button"
             onClick={() => setAllTabsOpen(v => !v)}
-            title={`All sessions (${sessions.length})`}
+            title={`All sessions (${sessions.length}) — Ctrl+Shift+K to jump by name`}
             aria-label="All sessions"
             className={`relative flex items-center justify-center w-7 h-7 rounded-full transition-all ${
               allTabsOpen
@@ -2299,6 +2337,12 @@ function DesktopApp() {
       waiting={promptSessions}
       activeSessionId={activeView}
       onOpenServers={openServers}
+      onShowSession={(sid) => {
+        // On a Wall, its tile's Wall; else its tab.
+        const wallId = sessions.find(s => s.id === sid)?.wallId;
+        setMergedSessionIds([]);
+        setActiveView(wallId ?? sid);
+      }}
       onOpenAsWall={(list, name) => openServersAsWall(list, name)}
       onOpenRdp={openRdp}
       onEditServer={handleEditNode}

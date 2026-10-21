@@ -114,11 +114,19 @@ export const useDockVersion = (): number => useSyncExternalStore(subscribe, () =
 
 /// Keys the app takes before a terminal sees them (xterm would otherwise
 /// turn Ctrl+Shift+B into Ctrl+B for the shell): Ctrl+Shift+B turns
-/// broadcast on or off, Ctrl+Shift+P pauses a terminal in a broadcast.
-export const appHotkey = (e: KeyboardEvent): "broadcast" | "pause" | null => {
-  if (!e.ctrlKey || !e.shiftKey || e.altKey || e.metaKey) return null;
+/// broadcast on or off, Ctrl+Shift+P pauses a terminal in a broadcast,
+/// Ctrl+Shift+K jumps to a session by name, Ctrl+Tab and Ctrl+Shift+Tab
+/// go to the next and previous tab. Ctrl+Tab is no shell key (a terminal
+/// sends nothing for it), and the shifted letters are free for the same
+/// reason as the others: the shell only ever sees the plain Ctrl+letter.
+export type AppHotkey = "broadcast" | "pause" | "jump" | "next" | "prev";
+export const appHotkey = (e: KeyboardEvent): AppHotkey | null => {
+  if (!e.ctrlKey || e.altKey || e.metaKey) return null;
+  if (e.code === "Tab") return e.shiftKey ? "prev" : "next";
+  if (!e.shiftKey) return null;
   if (e.code === "KeyB") return "broadcast";
   if (e.code === "KeyP") return "pause";
+  if (e.code === "KeyK") return "jump";
   return null;
 };
 

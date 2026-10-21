@@ -144,15 +144,22 @@ export const AllTabsMenu = ({
   const tabs = shown.filter((s) => !s.wallId);
   const inWalls = walls.map((w) => ({ wall: w, list: shown.filter((s) => s.wallId === w.id) })).filter((g) => g.list.length > 0);
   const dead = sessions.filter((s) => ["failed", "disconnected"].includes(statuses[s.id] ?? "connecting")).map((s) => s.id);
+  // Enter goes to the highlighted match, the first until ↑/↓ move it: the
+  // rows as listed, tabs first, then each wall's.
+  const [hi, setHi] = useState(0);
+  const order = [...tabs, ...inWalls.flatMap((g) => g.list)];
+  const at = Math.min(hi, order.length - 1);
+  const go = (s: SessionRow) => (s.wallId ? onShowWall(s.wallId) : onShowSession(s.id));
 
   const row = (s: SessionRow, walled: boolean) => {
     const dot = sessionDot(statuses[s.id] ?? "connecting", waiting.has(s.id));
     return (
       <div key={s.id} className="flex items-center gap-0.5">
         <button
+          ref={(el) => { if (el && order[at]?.id === s.id) el.scrollIntoView({ block: "nearest" }); }}
           onClick={() => (walled && s.wallId ? onShowWall(s.wallId) : onShowSession(s.id))}
           title={walled ? "Show its wall" : "Show its tab"}
-          className={`${menuItem} flex-1 min-w-0 ${activeView === s.id ? "bg-primary/15 text-primary" : "text-zinc-200 hover:bg-white/[0.06]"}`}
+          className={`${menuItem} flex-1 min-w-0 ${activeView === s.id ? "bg-primary/15 text-primary" : "text-zinc-200 hover:bg-white/[0.06]"} ${order[at]?.id === s.id ? "ring-1 ring-inset ring-primary/40" : ""}`}
         >
           <span title={dot.title} className={`w-1.5 h-1.5 rounded-full shrink-0 ${dot.tone}`} />
           <span className="truncate flex-1">{s.serverName}</span>
@@ -176,7 +183,17 @@ export const AllTabsMenu = ({
         <input
           autoFocus
           value={q}
-          onChange={(e) => setQ(e.target.value)}
+          onChange={(e) => { setQ(e.target.value); setHi(0); }}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+              e.preventDefault();
+              if (order.length) setHi((at + (e.key === "ArrowDown" ? 1 : order.length - 1)) % order.length);
+            } else if (e.key === "Enter" && !e.nativeEvent.isComposing && order[at]) {
+              e.preventDefault();
+              // Walled ones go to their Wall, as clicking the row does.
+              go(order[at]);
+            }
+          }}
           placeholder={`Find among ${plural(sessions.length, "session")}…`}
           className="w-full h-8 pl-7 pr-2 bg-zinc-900/60 border border-white/10 rounded-md text-[11.5px] text-zinc-50 outline-none focus:border-primary/50 placeholder:text-zinc-600"
         />
