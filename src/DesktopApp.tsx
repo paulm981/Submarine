@@ -2234,8 +2234,14 @@ function DesktopApp() {
         <>
           <div className="fixed inset-0 z-[60]" onClick={() => { setTabMenu(null); setTabRename(null); }} onContextMenu={(e) => { e.preventDefault(); setTabMenu(null); setTabRename(null); }} />
           <div
-            className="fixed z-[70] bg-[#15151a] border border-white/10 rounded-md shadow-2xl py-1 min-w-[240px] text-[11px] no-drag"
-            style={{ left: Math.min(tabMenu.x, window.innerWidth - 260), top: Math.min(tabMenu.y, window.innerHeight - 380) }}
+            className="fixed z-[70] bg-[#15151a] border border-white/10 rounded-md shadow-2xl py-1 min-w-[240px] text-[11px] no-drag overflow-y-auto custom-scrollbar"
+            // With Walls, the split list and the close items, the menu can
+            // be taller than the space under the click: it moves up as far
+            // as it can, and scrolls inside what's left.
+            style={(() => {
+              const top = Math.max(8, Math.min(tabMenu.y, window.innerHeight - 380));
+              return { left: Math.min(tabMenu.x, window.innerWidth - 260), top, maxHeight: window.innerHeight - top - 8 };
+            })()}
           >
             {/* The tab's name. The editor opens inside this menu: Enter
                 keeps the name (an empty one goes back to the server's),
@@ -2434,9 +2440,11 @@ function DesktopApp() {
               const others = tabs.length - (at >= 0 ? 1 : 0);
               const right = at >= 0 ? tabs.length - at - 1 : 0;
               const dead = tabs.filter(id => ["failed", "disconnected"].includes(sessionStatuses[id] ?? "connecting")).length;
-              const item = (label: string, n: number, which: "others" | "right" | "dead" | "all") => (
+              // "Close all" also closes the Walls, so it is there while any is
+              // open, even with no session on it.
+              const item = (label: string, n: number, which: "others" | "right" | "dead" | "all", enabled = n > 0) => (
                 <button
-                  disabled={n === 0}
+                  disabled={!enabled}
                   className="w-full text-left px-3 py-1.5 hover:bg-rose-500/15 hover:text-rose-300 text-zinc-200 disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-zinc-200"
                   onClick={() => { setTabMenu(null); void closeTabs(which, targetId); }}
                 >{label} ({n})</button>
@@ -2446,7 +2454,7 @@ function DesktopApp() {
                   {item("Close other tabs", others, "others")}
                   {item("Close tabs to the right", right, "right")}
                   {item("Close disconnected tabs", dead, "dead")}
-                  {item(walls.length ? "Close all tabs and walls" : "Close all tabs", sessions.length, "all")}
+                  {item(walls.length ? "Close all tabs and walls" : "Close all tabs", sessions.length, "all", sessions.length + walls.length > 0)}
                 </>
               );
             })()}

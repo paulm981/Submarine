@@ -12,6 +12,7 @@ import { useConfirm } from "../ui/confirm";
 import { sessionDot } from "../util/sessionStatus";
 import { IS_LINUX } from "../util/platform";
 import { readClipboardText } from "../util/clipboard";
+import { rangePick } from "../util/rangePick";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // A Wall: terminals from many servers side by side, MobaXterm MultiExec style.
@@ -348,30 +349,46 @@ export const WallView = ({
   togglePauseRef.current = togglePause;
 
   // Terminals picked to pause or resume together: Ctrl-click (⌘ on a Mac) a
-  // title to add or drop one, Shift-click to take the run from the last one
-  // picked, in tile order — as the session tree picks servers. Kept here, not
-  // on the Wall: a pick is for the next button press, not something to keep.
+  // title to add or drop one, Shift-click to pick the run from the last one
+  // Ctrl-clicked to this one, in tile order, on top of what was picked
+  // before the run (Shift-clicking again from the same one grows or shrinks
+  // the run) — as the file panel picks files. Kept here, not on the Wall: a
+  // pick is for the next button press, not something to keep.
   const [picked, setPicked] = useState<string[]>([]);
   const anchor = useRef<string | null>(null);
+  // What was picked before the current run of Shift-clicks (null: no run yet).
+  const runBase = useRef<string[] | null>(null);
   const pickedNow = picked.filter((t) => wall.members.some((m) => m.terminalId === t));
   const pick = (tid: string, e: React.MouseEvent) => {
-    const order = wall.members.map((m) => m.terminalId);
-    const from = anchor.current ? order.indexOf(anchor.current) : -1;
-    if (e.shiftKey && from >= 0) {
-      const to = order.indexOf(tid);
-      const run = order.slice(Math.min(from, to), Math.max(from, to) + 1);
-      setPicked((prev) => [...new Set([...prev, ...run])]);
-      return;
+    if (e.shiftKey && anchor.current) {
+      const base = runBase.current ?? pickedNow;
+      const next = rangePick(wall.members.map((m) => m.terminalId), anchor.current, tid, base);
+      if (next) {
+        runBase.current = base;
+        setPicked(next);
+        return;
+      }
     }
     anchor.current = tid;
+    runBase.current = null;
     setPicked((prev) => (prev.includes(tid) ? prev.filter((t) => t !== tid) : [...prev, tid]));
   };
+  const clearPicks = () => {
+    setPicked([]);
+    anchor.current = null;
+    runBase.current = null;
+  };
+  // Picks are for pausing and resuming in a broadcast: Broadcast off drops
+  // them, so they don't come back when it's turned on again.
+  useEffect(() => {
+    if (!wall.broadcast) clearPicks();
+  }, [wall.broadcast]);
   const setPausedFor = (tids: string[], pause: boolean) => {
     const next = pause
       ? [...new Set([...wall.paused, ...tids])]
       : wall.paused.filter((t) => !tids.includes(t));
     onChange({ paused: next });
-    setPicked([]);
+    clearPicks();
   };
 
   // Ctrl+Shift+P pauses (or resumes) the tile being typed to, else the one
@@ -503,7 +520,7 @@ export const WallView = ({
               <Play size={11} /> Resume {pickedNow.length}
             </button>
             <button
-              onClick={() => setPicked([])}
+              onClick={clearPicks}
               title="Pick none"
               className={`${btn} bg-white/[0.04] border-white/10 text-zinc-400 hover:bg-white/[0.08] hover:text-white`}
             >
@@ -739,6 +756,10 @@ const WallTile = ({
         title={onPick ? "Ctrl-click (⌘-click) to pick several, Shift-click for a run" : undefined}
       >
         <span title={dot.title} className={`w-1.5 h-1.5 rounded-full shrink-0 ${dot.tone}`} />
+        {/* The blue header says "picked" only to the eye; this says it to a
+            screen reader (aria-selected needs a role this header can't have,
+            as it holds buttons). */}
+        {picked && <span className="sr-only">Picked:</span>}
         <span className="font-bold text-zinc-200 truncate" title={name}>{name}</span>
         {termTitle && <span className="text-zinc-500 truncate">· {termTitle}</span>}
         {isSolo && (
