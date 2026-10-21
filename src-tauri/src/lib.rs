@@ -13047,7 +13047,10 @@ async fn type_saved_password(
         return Err("That password has a line break or another control character, so it isn't typed".into());
     }
     let tx = ssh.terminal_txs.lock().await.get(&terminal_id).cloned().ok_or("That terminal isn't open")?;
-    tx.send(TerminalCommand::Data(password.as_bytes().to_vec()))
+    // Behind any keys a broadcast still has queued for it, as typing goes
+    // (write_terminal_data), so it can't land ahead of a queued line.
+    let Some(bytes) = multiexec::into_feed(&terminal_id, password.as_bytes().to_vec()) else { return Ok(()) };
+    tx.send(TerminalCommand::Data(bytes))
         .await
         .map_err(|_| "That terminal isn't open".to_string())
 }

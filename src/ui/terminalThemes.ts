@@ -137,7 +137,7 @@ export function readCustomScheme(): TerminalScheme | null {
 }
 
 function isLight(hex: string | undefined): boolean {
-  const m = /^#([0-9a-f]{3}|[0-9a-f]{6})/i.exec(hex ?? "");
+  const m = /^#([0-9a-f]{6}|[0-9a-f]{3})/i.exec(hex ?? "");
   if (!m) return false;
   const h = m[1].length === 3 ? m[1].replace(/./g, "$&$&") : m[1];
   const [r, g, b] = [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
