@@ -3,13 +3,14 @@ import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { folderOptions } from "../util/folderPath";
 import { IS_ANDROID } from "../util/platform";
-import { Cpu, X, Link2, ArrowLeftRight, Shield, Key, User, FolderPlus, Download, CheckSquare, Square, History, Plus, Copy, Play } from "lucide-react";
+import { Cpu, X, Link2, ArrowLeftRight, Shield, ShieldAlert, Key, User, FolderPlus, Download, CheckSquare, Square, History, Plus, Copy, Play, FlaskConical } from "lucide-react";
 import PasswordField from "./PasswordField";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
 import { useSlideOverFocus } from "../ui/slideOverFocus";
 import { SCHEMES, readSchemeId, schemeById } from "../ui/terminalThemes";
 import { HIGHLIGHT_SETS, highlightSetById, readHighlightId } from "../ui/highlight";
 import { SchemeSwatch } from "./TerminalSchemes";
+import { DEFAULT_RDP_OPTIONS, RDP_BUILTIN_EXPERIMENTAL, RDP_WINDOW_SIZES, type RdpOptions } from "../util/rdpOptions";
 
 // Compact "2h ago" style relative time for the attribution line.
 function relTime(d: Date): string {
@@ -86,6 +87,26 @@ type ImportedSshKey = {
 
 const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credentials, refreshCredentials, refreshRdpLinks, sshKeys, refreshSshKeys, folders, refreshFolders, refreshServers, servers, isEditMode, formError, isMobile, onImported }: any) => {
   const [isCreatingFolder, setIsCreatingFolder] = useState(false);
+  // An RDP (issue #3), telnet (#179) or VNC server has a host, port, login
+  // and maybe an SSH server to go through; the SSH-only parts of the form
+  // are hidden for it.
+  const isRdp = newNode.protocol === "rdp";
+  const isTelnet = newNode.protocol === "telnet";
+  const isVnc = newNode.protocol === "vnc";
+  const isSsh = !isRdp && !isTelnet && !isVnc;
+  const setProtocol = (protocol: "ssh" | "rdp" | "telnet" | "vnc") => {
+    if (protocol === newNode.protocol) return;
+    // The usual port of the new kind, unless another was typed.
+    const usual: Record<string, number> = { ssh: 22, rdp: 3389, telnet: 23, vnc: 5900 };
+    const port = !newNode.port || Object.values(usual).includes(newNode.port) ? usual[protocol] : newNode.port;
+    // No SSH key outside SSH, and no saved login for VNC: VNC sends its
+    // password with weak protection and doesn't check the server's identity,
+    // so a shared login's password would be open to anyone on the path.
+    const dropsLogin = (protocol !== "ssh" && newNode.authType === "custom_key") || (protocol === "vnc" && newNode.authType === "vault");
+    const authType = dropsLogin ? "custom_pass" : newNode.authType;
+    const credentialId = protocol === "vnc" ? "" : newNode.credentialId;
+    setNewNode({ ...newNode, protocol, port, authType, credentialId });
+  };
   const [newFolderName, setNewFolderName] = useState("");
   // Set while the native key picker is open so the Browse button can't be
   // fired twice — a second dialog would sit behind the first with no way to
@@ -469,7 +490,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 PuTTY / MobaXterm / JSON" source that doesn't need a local
                 ~/.ssh/config. The SSH-config tab still errors gracefully
                 there — the user just picks the paste tab. */}
-            {!isEditMode && (
+            {!isEditMode && isSsh && (
               <button
                 onClick={openImportModal}
                 title="Import from MobaXterm, PuTTY, ~/.ssh/config or JSON"
@@ -491,6 +512,37 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
           {formError && <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-500 text-[12px] font-bold">{formError}</div>}
 
           <div className="grid grid-cols-1 gap-4">
+            {/* SSH, RDP, telnet or VNC. An RDP server opens in this
+                computer's RDP app, a telnet one in a terminal, a VNC one as
+                its screen in the tab; all directly or through an SSH server. */}
+            <div className="space-y-1.5">
+              <label htmlFor="server-type" className="text-[11px] font-bold text-zinc-400 ml-1">Type</label>
+              <select
+                id="server-type"
+                aria-label="Server type"
+                value={isRdp ? "rdp" : isTelnet ? "telnet" : isVnc ? "vnc" : "ssh"}
+                onChange={(e) => setProtocol(e.target.value as "ssh" | "rdp" | "telnet" | "vnc")}
+                className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner"
+              >
+                <option value="ssh" className="bg-[#1a1a1e] text-white">SSH</option>
+                <option value="rdp" className="bg-[#1a1a1e] text-white">RDP (Remote Desktop)</option>
+                <option value="telnet" className="bg-[#1a1a1e] text-white">Telnet (not encrypted)</option>
+                <option value="vnc" className="bg-[#1a1a1e] text-white">VNC</option>
+              </select>
+              {isTelnet && (
+                <p role="note" className="flex gap-2 px-3 py-2 rounded-lg border border-amber-500/25 bg-amber-500/10 text-[11px] leading-snug text-amber-200/90">
+                  <ShieldAlert size={13} className="shrink-0 mt-px" aria-hidden="true" />
+                  <span>Telnet isn't encrypted: what is typed, passwords too, crosses the network as plain text. Use it on a network you trust, or through an SSH server: then only the part after that server isn't encrypted.</span>
+                </p>
+              )}
+              {isVnc && !newNode.jumpHostId && (
+                <p role="note" className="flex gap-2 px-3 py-2 rounded-lg border border-amber-500/25 bg-amber-500/10 text-[11px] leading-snug text-amber-200/90">
+                  <ShieldAlert size={13} className="shrink-0 mt-px" aria-hidden="true" />
+                  <span>VNC isn't encrypted: the screen and what is typed cross the network as they are. Pick an SSH server to go through (below) to keep it private up to that server.</span>
+                </p>
+              )}
+            </div>
+
             <div className="space-y-1.5">
               <label className="text-[11px] font-bold text-zinc-400 ml-1">Name</label>
               <input type="text" className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" placeholder="e.g. Work server" value={newNode.name} onChange={e => setNewNode({ ...newNode, name: e.target.value })} />
@@ -559,15 +611,15 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
 
           <div className="pt-5 border-t border-white/5 space-y-4">
             <div className="flex justify-between items-center">
-              <label className="text-[11px] font-bold text-zinc-400">How to log in</label>
+              <label className="text-[11px] font-bold text-zinc-400">{isRdp ? "Who logs in" : "How to log in"}</label>
               <select
                 className="bg-transparent text-[12px] font-bold text-primary outline-none cursor-pointer"
                 value={newNode.authType}
                 onChange={(e) => setNewNode({ ...newNode, authType: e.target.value })}
               >
-                <option value="vault" className="bg-[#121215] text-primary">Use a saved login</option>
-                <option value="custom_pass" className="bg-[#121215] text-primary">Type a password</option>
-                <option value="custom_key" className="bg-[#121215] text-primary">Use an SSH key</option>
+                {!isVnc && <option value="vault" className="bg-[#121215] text-primary">Use a saved login</option>}
+                <option value="custom_pass" className="bg-[#121215] text-primary">{isRdp ? "Type a user name" : "Type a password"}</option>
+                {isSsh && <option value="custom_key" className="bg-[#121215] text-primary">Use an SSH key</option>}
               </select>
             </div>
 
@@ -594,26 +646,40 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               );
             })()}
 
-            {newNode.authType === 'custom_pass' && (
+            {newNode.authType === 'custom_pass' && isRdp && (
+              <div className="space-y-1.5 animate-in fade-in">
+                <label className="text-[11px] font-bold text-zinc-400 ml-1">Username</label>
+                <input type="text" placeholder="Asked by the RDP app" value={newNode.username || ""} onChange={e => setNewNode({ ...newNode, username: e.target.value })} autoCapitalize="none" autoCorrect="off" spellCheck={false} className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" />
+                <p className="text-[10px] text-zinc-500 ml-1">{"DOMAIN\\user works too. The RDP app asks for the password."}</p>
+              </div>
+            )}
+
+            {newNode.authType === 'custom_pass' && !isRdp && (
               <div className="space-y-3 animate-in fade-in">
-                <div className="space-y-1.5">
+                {!isVnc && <div className="space-y-1.5">
                   <label className="text-[11px] font-bold text-zinc-400 ml-1">Username</label>
-                  <input type="text" placeholder="Ask when connecting" value={newNode.username || ""} onChange={e => setNewNode({ ...newNode, username: e.target.value })} className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" />
-                </div>
+                  <input type="text" placeholder={isTelnet ? "For your reference" : "Ask when connecting"} value={newNode.username || ""} onChange={e => setNewNode({ ...newNode, username: e.target.value })} autoCapitalize="none" autoCorrect="off" spellCheck={false} className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" />
+                </div>}
                 <div className="space-y-1.5">
-                  <label className="text-[11px] font-bold text-zinc-400 ml-1">Password</label>
+                  <label className="text-[11px] font-bold text-zinc-400 ml-1">{isVnc ? "VNC password" : "Password"}</label>
                   <PasswordField
                     value={newNode.password || ""}
                     onChange={(v) => setNewNode({ ...newNode, password: v, password_dirty: true })}
                     className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner"
                     placeholder="••••••"
                   />
-                  <p className="text-[10px] text-zinc-500 ml-1">Leave empty to be asked when connecting.</p>
+                  <p className="text-[10px] text-zinc-500 ml-1">
+                    {isTelnet
+                      ? "A telnet server asks for the login in the terminal. Type it there; at the password prompt, the terminal's key button types the saved one."
+                      : isVnc
+                        ? "Leave empty to be asked when the server wants one. VNC uses its first 8 characters."
+                        : "Leave empty to be asked when connecting."}
+                  </p>
                 </div>
               </div>
             )}
 
-            {newNode.authType === 'custom_key' && (
+            {newNode.authType === 'custom_key' && isSsh && (
               <div className="space-y-3 animate-in fade-in">
                 <div className="space-y-1.5">
                   <label className="text-[11px] font-bold text-zinc-400 ml-1">Username</label>
@@ -682,6 +748,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
           </div>
 
           <div className="pt-5 border-t border-white/5 space-y-4">
+            {isSsh && (<>
             <div className="flex justify-between items-center">
               <label className="text-[11px] font-bold text-zinc-400">Proxy</label>
               <select className="bg-transparent text-[12px] font-bold text-zinc-300 outline-none cursor-pointer" value={newNode.proxyType} onChange={e => setNewNode({ ...newNode, proxyType: e.target.value })}>
@@ -708,6 +775,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 />
               </div>
             )}
+            </>)}
 
             {/* ProxyJump — bounce through another saved node to reach this one
                 (like `ssh -J bastion target`). Distinct from the SOCKS/HTTP
@@ -715,15 +783,15 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 that opens a direct-tcpip channel to the target. Self is filtered
                 out so a node can't jump through itself. */}
             <div className="flex justify-between items-center gap-3">
-              <label className="text-[11px] font-bold text-zinc-400 shrink-0">Jump via</label>
+              <label className="text-[11px] font-bold text-zinc-400 shrink-0">{isSsh ? "Jump via" : "Through SSH server"}</label>
               <select
                 className="flex-1 min-w-0 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner"
                 value={newNode.jumpHostId || ""}
                 onChange={e => setNewNode({ ...newNode, jumpHostId: e.target.value })}
               >
-                <option value="" className="bg-[#1a1a1e] text-zinc-500">Direct — no jump host</option>
+                <option value="" className="bg-[#1a1a1e] text-zinc-500">{isSsh ? "Direct — no jump host" : "Direct — no SSH server"}</option>
                 {(servers || [])
-                  .filter((s: any) => s.id !== newNode.id)
+                  .filter((s: any) => s.id !== newNode.id && (s.protocol ?? "ssh") === "ssh")
                   .map((s: any) => (
                     <option key={s.id} value={s.id.toString()} className="bg-[#1a1a1e] text-zinc-300">
                       {s.name} ({s.host})
@@ -732,6 +800,98 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               </select>
             </div>
 
+            {/* RDP options: this device's own (util/rdpOptions), not synced. */}
+            {isRdp && (() => {
+              const o: RdpOptions = newNode.rdpOptions || DEFAULT_RDP_OPTIONS;
+              const set = (patch: Partial<RdpOptions>) => setNewNode({ ...newNode, rdpOptions: { ...o, ...patch } });
+              const size = `${o.width}x${o.height}`;
+              const known = RDP_WINDOW_SIZES.some(([w, h]) => w === o.width && h === o.height);
+              const builtin = IS_ANDROID || o.app === "builtin";
+              return (
+                <div className="space-y-3 pt-1">
+                  {/* A phone has only the built-in client (offered in the tab). */}
+                  {!IS_ANDROID && (
+                    <div className="flex justify-between items-center gap-3">
+                      <label className="text-[11px] font-bold text-zinc-400 shrink-0">Open in</label>
+                      <select
+                        aria-label="Open in"
+                        className="flex-1 min-w-0 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner"
+                        value={o.app}
+                        onChange={(e) => set({ app: e.target.value === "builtin" ? "builtin" : "system" })}
+                      >
+                        <option value="system" className="bg-[#1a1a1e]">This computer's RDP app</option>
+                        <option value="builtin" className="bg-[#1a1a1e]">Submarine's tab (experimental)</option>
+                      </select>
+                    </div>
+                  )}
+                  {builtin ? (
+                    <div role="note" className="flex gap-2 p-2.5 rounded-lg border border-amber-500/25 bg-amber-500/5 text-[10.5px] leading-snug text-amber-200/90">
+                      <FlaskConical size={13} className="shrink-0 mt-px text-amber-300" aria-hidden="true" />
+                      <span>
+                        {RDP_BUILTIN_EXPERIMENTAL} The desktop opens in the server's tab, sized to it; the saved password is used, or asked for there.
+                        Clipboard and file sharing work in the computer's RDP app for now.
+                      </span>
+                    </div>
+                  ) : (<>
+                  <div className="flex justify-between items-center gap-3">
+                    <label className="text-[11px] font-bold text-zinc-400 shrink-0">Window</label>
+                    <select
+                      aria-label="RDP window"
+                      className="flex-1 min-w-0 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner"
+                      value={o.fullScreen ? "full" : size}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        if (v === "full") return set({ fullScreen: true });
+                        const [width, height] = v.split("x").map(Number);
+                        set({ fullScreen: false, width, height });
+                      }}
+                    >
+                      <option value="full" className="bg-[#1a1a1e]">Full screen</option>
+                      {RDP_WINDOW_SIZES.map(([w, h]) => (
+                        <option key={`${w}x${h}`} value={`${w}x${h}`} className="bg-[#1a1a1e]">{w} × {h}</option>
+                      ))}
+                      {!o.fullScreen && !known && <option value={size} className="bg-[#1a1a1e]">{o.width} × {o.height}</option>}
+                    </select>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-[11px] font-bold text-zinc-300">Share the clipboard</div>
+                      <div className="text-[10.5px] text-zinc-500 leading-snug">Copy and paste between this computer and the server.</div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => set({ clipboard: !o.clipboard })}
+                      role="switch"
+                      aria-label="Share the clipboard"
+                      aria-checked={o.clipboard}
+                      className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${o.clipboard ? "bg-primary" : "bg-white/10"}`}
+                    >
+                      <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-zinc-100 rounded-full shadow transition-transform ${o.clipboard ? "translate-x-5" : "translate-x-0"}`} />
+                    </button>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-[11px] font-bold text-zinc-300">Share this computer's files</div>
+                      <div className="text-[10.5px] text-zinc-500 leading-snug">The server can read and change them (with Remmina: your home folder).</div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => set({ drives: !o.drives })}
+                      role="switch"
+                      aria-label="Share this computer's files"
+                      aria-checked={o.drives}
+                      className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${o.drives ? "bg-primary" : "bg-white/10"}`}
+                    >
+                      <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-zinc-100 rounded-full shadow transition-transform ${o.drives ? "translate-x-5" : "translate-x-0"}`} />
+                    </button>
+                  </div>
+                  </>)}
+                  <p className="text-[10px] text-zinc-500 ml-1">These are kept on this device only, not synced.</p>
+                </div>
+              );
+            })()}
+
+            {isSsh && (<>
             <div className="space-y-2.5">
               <div className="flex justify-between items-center">
                 <span className="text-[11px] font-bold text-zinc-400">Port forwarding</span>
@@ -939,6 +1099,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 />
               </button>
             </div>
+            </>)}
 
             {/* Per-node notes — free-form, plain text. Lives on the server
                 row (servers.notes column) and never crosses the network. The
@@ -978,6 +1139,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
             {/* On-connect commands — auto-typed into the FIRST terminal once
                 its shell is up, on connecting and again after a reconnect
                 (not on extra shells you open later). One command per line. */}
+            {isSsh && (
             <div className="space-y-1.5 pt-1">
               <label className="text-[11px] font-bold text-zinc-400 ml-1 flex items-center gap-2">
                 <span>Run on connect</span>
@@ -994,7 +1156,11 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 className="w-full bg-[#1a1a1e] rounded-lg p-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner font-mono leading-relaxed resize-y"
               />
             </div>
+            )}
 
+            {/* A telnet server's tab is a terminal too, so it takes its own
+                colors and highlighting like an SSH server's. */}
+            {(isSsh || isTelnet) && (<>
             {/* Its own terminal colors (synced with the server), e.g. a light
                 scheme for production so it's never mistaken for the rest. */}
             <div className="space-y-1.5 pt-1">
@@ -1037,6 +1203,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 {HIGHLIGHT_SETS.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
               </select>
             </div>
+            </>)}
           </div>
         </div>
 

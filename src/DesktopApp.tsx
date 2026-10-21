@@ -28,6 +28,7 @@ import { SCROLLBACK_KEY, readScrollback } from "./util/terminalScrollback";
 import { USE_LOCAL_SHELL_KEY, readUseLocalShell } from "./util/terminalShell";
 import { USE_SSH_AGENT_KEY, readUseSshAgent } from "./util/sshAgent";
 import { USE_SSH_CONFIG_KEY, readUseSshConfig } from "./util/sshConfig";
+import { DEFAULT_RDP_OPTIONS, readRdpOptions, writeRdpOptions } from "./util/rdpOptions";
 import { Sidebar } from "./components/Sidebar";
 import { NodeGrid } from "./components/NodeGrid";
 import { SessionTree, type TreeItems } from "./components/SessionTree";
@@ -49,6 +50,9 @@ import { reorderById, useTabDrag } from "./ui/tabDrag";
 import SettingsPanel from "./components/SettingsPanel";
 import ProfilePanel from "./components/ProfilePanel";
 import { SessionView } from "./components/SessionView";
+import RdpSessionView from "./components/RdpSessionView";
+import TelnetSessionView from "./components/TelnetSessionView";
+import VncSessionView from "./components/VncSessionView";
 import MonitoringPanel from "./components/MonitoringPanel";
 import { ErrorBoundary } from "./ui/ErrorBoundary";
 
@@ -64,7 +68,7 @@ const appWindow = getCurrentWindow();
 // has no tab of its own until it's popped out of the Wall.
 // `serverUuid` is the saved server's sync id, which keys this device's own
 // per-server settings (the Shell button, see util/shellSync.ts).
-type Session = { id: string; serverId: number; serverName: string; serverUuid?: string | null; host?: string; port?: number; mirrors?: string; runOnConnect?: string; runOnConnectHeld?: boolean; quickAuth?: QuickAuth | null; wallId?: string };
+type Session = { id: string; serverId: number; serverName: string; serverUuid?: string | null; protocol?: "ssh" | "rdp" | "telnet" | "vnc"; host?: string; port?: number; mirrors?: string; runOnConnect?: string; runOnConnectHeld?: boolean; quickAuth?: QuickAuth | null; wallId?: string };
 
 // The Home view (HomePane): terminals on this computer, where the app opens
 // and where closing the last session tab goes back to. Android has no shells
@@ -101,7 +105,8 @@ function DesktopApp() {
   const ai = useAi();
   const [aiOpen, setAiOpen] = useState(false);
   // Tracks the live status of each open session ('connecting' | 'connected'
-  // | 'failed' | 'disconnected'). Updated via the callback every SessionView
+  // | 'failed' | 'disconnected', or 'idle' for an RDP tab on Android that
+  // has nothing to connect yet). Updated via the callback every SessionView
   // fires on its own status change — single source of truth for the dot
   // colour on each tab. Cleared when a session is closed.
   const [sessionStatuses, setSessionStatuses] = useState<Record<string, string>>({});
@@ -182,6 +187,11 @@ function DesktopApp() {
   }, []);
   // The terminal a session joins a Wall with: the one on screen in its tab.
   const terminalOf = (sid: string) => sessionActiveTerm[sid] ?? `${sid}-term-0`;
+  // Only SSH servers go on a Wall: a VNC or RDP tab is a screen, not a
+  // terminal, and must never get broadcast keys; a telnet tab has no shell
+  // panes for a Wall to show.
+  const isSshServer = (server: any) => (server?.protocol ?? "ssh") === "ssh";
+  const onWallable = (s: Session) => (s.protocol ?? "ssh") === "ssh";
   const addToWall = (wallId: string, add: WallMember[]) => {
     setWalls(prev => prev.map(w => {
       if (w.id !== wallId) return w;
@@ -284,7 +294,7 @@ function DesktopApp() {
   const [credentials, setCredentials] = useState<any[]>([]);
   const [sshKeys, setSshKeys] = useState<any[]>([]);
   const [folders, setFolders] = useState<any[]>([]);
-  // Remote Desktop links (src-tauri/src/rdp.rs): shown with the servers, open
+  // Remote Desktop links (src-tauri/src/rdp_links.rs): shown with the servers, open
   // the system's Remote Desktop client.
   const [rdpLinks, setRdpLinks] = useState<RdpLink[]>([]);
   // The servers asked for their OS this run, by server, host and port (the
@@ -335,6 +345,11 @@ function DesktopApp() {
 
   const defaultNode = {
     id: null as number | null,
+    // "ssh", "rdp" (issue #3: it opens in the system's RDP app), "telnet"
+    // (#179: it opens in a terminal, over telnet) or "vnc" (its screen in the tab).
+    protocol: "ssh" as "ssh" | "rdp" | "telnet" | "vnc",
+    // An RDP server's window and sharing on this device (util/rdpOptions).
+    rdpOptions: { ...DEFAULT_RDP_OPTIONS },
     name: "", host: "", port: 22, username: "", password: "",
     // "custom_pass" picked as default because most users adding a new
     // server have a password in hand; the vault option is mainly useful
@@ -546,6 +561,16 @@ function DesktopApp() {
       addLog(items.length ? `Allowed ${items.length} held change${items.length === 1 ? "" : "s"}.` : "Allowed the held changes.", "success");
     } catch (e) {
       addLog(`ALLOW_FAILED: ${e}`, "error");
+    }
+    await refreshServers();
+  }, [addLog, refreshServers]);
+  // Decline a held switch to telnet or VNC: the server stays SSH, and the
+  // other computers get it back as SSH with the next sync.
+  const keepServerSsh = useCallback(async (serverId: number) => {
+    try {
+      if (await invoke<boolean>("keep_server_ssh", { serverId })) addLog("Kept it an SSH server.", "success");
+    } catch (e) {
+      addLog(`KEEP_SSH_FAILED: ${e}`, "error");
     }
     await refreshServers();
   }, [addLog, refreshServers]);
@@ -934,7 +959,8 @@ function DesktopApp() {
       if (waiting.length > 0) {
         addLog(`Autostart: ${waiting.map((s) => s.name).join(", ")} waiting for your OK (Servers → Review).`, "info");
       }
-      const toStart = list.filter((s) => s.autostart && !isHeld(s));
+      // Only SSH servers start by themselves (an RDP server would open an app).
+      const toStart = list.filter((s) => s.autostart && !isHeld(s) && (s.protocol ?? "ssh") === "ssh");
       if (toStart.length === 0) return;
       const newSessions = toStart.map((s) => ({
         id: `session-${s.id}`,
@@ -1062,7 +1088,8 @@ function DesktopApp() {
   useEffect(() => {
     if (!appSettings.detectOs) return;
     for (const s of sessions) {
-      if (s.serverId <= 0 || !s.host || sessionStatuses[s.id] !== "connected") continue;
+      // Only an SSH server has a shell to ask (not an RDP one).
+      if (s.serverId <= 0 || !s.host || (s.protocol ?? "ssh") !== "ssh" || sessionStatuses[s.id] !== "connected") continue;
       const server = servers.find((x: any) => x.id === s.serverId);
       if (!server || server.os) continue;
       // The port the session connected to, like its host: the server may
@@ -1084,6 +1111,7 @@ function DesktopApp() {
     id: `session-${server.id}`,
     serverId: server.id,
     serverName: server.name,
+    protocol: ["rdp", "telnet", "vnc"].includes(server.protocol) ? server.protocol : "ssh",
     host: server.host,
     port: server.port,
     // Pass the raw mirrors JSON through to SessionView so the
@@ -1114,7 +1142,8 @@ function DesktopApp() {
   // already open join with the terminal on screen in their tab. A saved wall
   // that's open already is just shown — plus, when it was just saved
   // (addMissing), the servers it has now and the open one lacks.
-  const openServersAsWall = (list: any[], name: string, opts: { broadcast?: boolean; cols?: number; savedId?: number | null; addMissing?: boolean } = {}) => {
+  const openServersAsWall = (all: any[], name: string, opts: { broadcast?: boolean; cols?: number; savedId?: number | null; addMissing?: boolean } = {}) => {
+    const list = all.filter(isSshServer);
     if (opts.savedId != null) {
       const open = walls.find(w => w.savedId === opts.savedId);
       if (open) {
@@ -1163,6 +1192,17 @@ function DesktopApp() {
     const list = sw.server_ids.map(id => servers.find((s: any) => s.id === id)).filter(Boolean);
     if (list.length === 0) {
       void confirm({ title: `"${sw.name}" is empty`, message: "None of its servers exist any more. Edit it to pick some.", okLabel: "OK", cancelLabel: "Close" });
+      return;
+    }
+    // A Wall shows SSH terminals only, so a saved wall whose servers have all
+    // become RDP, telnet or VNC ones has nothing to show (unless it's open).
+    if (!list.some(isSshServer) && !walls.some(w => w.savedId === sw.id)) {
+      void confirm({
+        title: `"${sw.name}" has no SSH servers`,
+        message: "A wall shows SSH terminals only, and its servers are RDP, telnet or VNC ones now. Open them from the server list, or edit the wall to pick SSH servers.",
+        okLabel: "OK",
+        cancelLabel: "Close",
+      });
       return;
     }
     openServersAsWall(list, sw.name, { broadcast, cols: sw.cols, savedId: sw.id, addMissing });
@@ -1412,7 +1452,7 @@ function DesktopApp() {
       setActiveView(live.id);
       return;
     }
-    const tabs = sessions.filter(s => !s.wallId);
+    const tabs = sessions.filter(s => !s.wallId && onWallable(s));
     if (tabs.length === 0) {
       // Everything open is on Walls already: broadcast on the newest.
       const last = walls[walls.length - 1];
@@ -1582,12 +1622,15 @@ function DesktopApp() {
     }
     setNewNode({
       id: server.id,
+      protocol: ["rdp", "telnet", "vnc"].includes(server.protocol) ? server.protocol : "ssh",
+      rdpOptions: readRdpOptions(server.uuid),
       name: server.name || "",
       host: server.host || "",
       port: server.port || 22,
       username: server.username || "",
       password: revealedPassword,
-      authType: server.auth_type || (server.credential_id ? "vault" : "custom_pass"),
+      // A VNC server never uses a saved login (see the save below).
+      authType: server.protocol === "vnc" ? "custom_pass" : server.auth_type || (server.credential_id ? "vault" : "custom_pass"),
       credentialId: server.credential_id?.toString() || "",
       folderId: server.folder_id?.toString() || "",
       keyId: server.key_id?.toString() || "",
@@ -1724,6 +1767,7 @@ function DesktopApp() {
                       promptSessions.has(s.id) ? 'bg-primary animate-pulse' :
                       st === 'connected'    ? 'bg-emerald-400' :
                       st === 'connecting'   ? 'bg-amber-400 animate-pulse' :
+                      st === 'idle'         ? 'bg-zinc-500' :
                       'bg-rose-500';
                     const isActive = activeView === s.id;
                     const isMerged = mergedSessionIds.includes(s.id);
@@ -2139,7 +2183,7 @@ function DesktopApp() {
               walls={walls}
               activeId={activeView}
               saved={savedWalls}
-              canFromTabs={sessions.some(s => !s.wallId)}
+              canFromTabs={sessions.some(s => !s.wallId && onWallable(s))}
               onShow={(wid) => { setWallsMenuOpen(false); setMergedSessionIds([]); setActiveView(wid); }}
               onCloseWall={(wid) => { setWallsMenuOpen(false); void closeWall(wid); }}
               onOpenSaved={(w, b) => { setWallsMenuOpen(false); openSavedWall(w, b); }}
@@ -2148,7 +2192,7 @@ function DesktopApp() {
               onNew={() => { setWallsMenuOpen(false); setWallEditor({ id: null, name: "", server_ids: [], cols: 0 }); }}
               onFromTabs={() => {
                 setWallsMenuOpen(false);
-                newWall("Open tabs", sessions.filter(s => !s.wallId).map(s => ({ sessionId: s.id, terminalId: terminalOf(s.id) })));
+                newWall("Open tabs", sessions.filter(s => !s.wallId && onWallable(s)).map(s => ({ sessionId: s.id, terminalId: terminalOf(s.id) })));
               }}
               onDismiss={() => setWallsMenuOpen(false)}
             />
@@ -2333,6 +2377,8 @@ function DesktopApp() {
                 A Wall's own Add picker is for other terminals and servers. */}
             {(() => {
               const tid = terminalOf(targetId);
+              const target = sessions.find(x => x.id === targetId);
+              if (target && !onWallable(target)) return null;
               return (
                 <>
                   <div className="border-t border-white/5 my-1" />
@@ -2565,6 +2611,7 @@ function DesktopApp() {
                 onAddClick={addServerIn}
                 onQuickConnect={() => setIsQuickConnectOpen(true)}
                 onAllowHeld={allowHeld}
+                onKeepSsh={keepServerSsh}
                 keyChange={shareKeyChange}
                 onAcceptKey={acceptShareKey}
                 heldDeletions={heldDeletions}
@@ -2849,6 +2896,7 @@ function DesktopApp() {
                               <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                                 (sessionStatuses[sess.id] ?? 'connecting') === 'connected' ? 'bg-emerald-400' :
                                 (sessionStatuses[sess.id] ?? 'connecting') === 'connecting' ? 'bg-amber-400' :
+                                (sessionStatuses[sess.id] ?? 'connecting') === 'idle' ? 'bg-zinc-500' :
                                 'bg-rose-500'
                               }`} />
                               <span className="font-bold text-zinc-200 uppercase tracking-wider truncate flex-1">
@@ -2879,6 +2927,34 @@ function DesktopApp() {
                               if (activeView === sess.id) setActiveView(START_VIEW);
                             }}
                           >
+                            {sess.protocol === "rdp" ? (
+                              <RdpSessionView
+                                session={sess}
+                                displayName={tabLabel(sess)}
+                                onClose={getCloseHandler(sess.id)}
+                                onStatusChange={handleSessionStatus}
+                                isActiveView={isFocused}
+                                onPromptChange={handlePromptChange}
+                              />
+                            ) : sess.protocol === "vnc" ? (
+                              <VncSessionView
+                                session={sess}
+                                displayName={tabLabel(sess)}
+                                onClose={getCloseHandler(sess.id)}
+                                onStatusChange={handleSessionStatus}
+                                isActiveView={isFocused}
+                                onPromptChange={handlePromptChange}
+                              />
+                            ) : sess.protocol === "telnet" ? (
+                              <TelnetSessionView
+                                session={sess}
+                                displayName={tabLabel(sess)}
+                                onClose={getCloseHandler(sess.id)}
+                                onStatusChange={handleSessionStatus}
+                                isActiveView={isFocused}
+                                onPromptChange={handlePromptChange}
+                              />
+                            ) : (
                             <SessionView
                               session={sess}
                               profile={activeProfile}
@@ -2892,6 +2968,7 @@ function DesktopApp() {
                               compactTabs={appSettings.compactTabs}
                               onPromptChange={handlePromptChange}
                             />
+                            )}
                           </ErrorBoundary>
                         </div>
                       );
@@ -2935,10 +3012,10 @@ function DesktopApp() {
                 {wallPickerFor === activeWall.id && (
                   <WallPicker
                     wall={activeWall}
-                    sessions={sessions}
+                    sessions={sessions.filter(onWallable)}
                     terminals={sessionTerminals}
                     statuses={sessionStatuses}
-                    servers={servers}
+                    servers={servers.filter(isSshServer)}
                     folders={folders}
                     onToggle={(m) => (activeWall.members.some(x => x.terminalId === m.terminalId)
                       ? removeWallMember(activeWall, m)
@@ -2959,7 +3036,7 @@ function DesktopApp() {
             {wallEditor && (
               <WallEditorModal
                 initial={wallEditor}
-                servers={servers}
+                servers={servers.filter(isSshServer)}
                 folders={folders}
                 onSave={(w, open) => { void saveSavedWall(w, open); }}
                 onClose={() => setWallEditor(null)}
@@ -3241,12 +3318,12 @@ function DesktopApp() {
             addLog("Name and Host are required.", "error");
             return;
           }
-          if (newNode.authType === "vault" && !newNode.credentialId) {
+          if (newNode.authType === "vault" && !newNode.credentialId && newNode.protocol !== "vnc") {
             setFormError("Please pick a saved login.");
             addLog("Please pick a saved login.", "error");
             return;
           }
-          if (newNode.authType === "custom_key" && !newNode.keyId) {
+          if ((newNode.protocol ?? "ssh") === "ssh" && newNode.authType === "custom_key" && !newNode.keyId) {
             setFormError("Please pick an SSH key.");
             addLog("Please pick an SSH key.", "error");
             return;
@@ -3258,7 +3335,39 @@ function DesktopApp() {
             // `normalize_server_identity` enforces this again on the server
             // side as a belt-and-suspenders guarantee.
             const isInline = newNode.authType === "custom_pass" || newNode.authType === "custom_key";
-            const payload = {
+            // An RDP (issue #3), telnet (#179) or VNC server has a host,
+            // port, login (its own or a saved one) and maybe an SSH server to
+            // go through; nothing that runs over SSH (forwards, mirrors,
+            // autostart, a proxy, a key). An RDP server's saved password isn't
+            // touched: the RDP app asks. A telnet server's is kept, for the
+            // terminal's password button; a VNC server's, for its login. A
+            // VNC server never has a saved login: VNC sends its password with
+            // weak protection and doesn't check the server's identity, so a
+            // shared login's password would be open to anyone on the path.
+            const isRdp = newNode.protocol === "rdp";
+            const isTelnet = newNode.protocol === "telnet";
+            const isVnc = newNode.protocol === "vnc";
+            const keepsPassword = isTelnet || isVnc;
+            const savedLogin = newNode.authType === "vault" && !isVnc;
+            const payload = isRdp || isTelnet || isVnc ? {
+              name: newNode.name,
+              host: newNode.host,
+              port: newNode.port,
+              username: isInline && !isVnc ? (newNode.username?.trim() || null) : null,
+              password: keepsPassword && !savedLogin ? (newNode.password || null) : null,
+              credentialId: (savedLogin && newNode.credentialId) ? parseInt(newNode.credentialId) : null,
+              folderId: newNode.folderId ? parseInt(newNode.folderId) : null,
+              proxyType: "none",
+              proxyHost: "",
+              proxyPort: 1080,
+              tunnels: [],
+              authType: savedLogin ? "vault" : "custom_pass",
+              keyId: null,
+              autostart: false,
+              mirrors: [],
+              color: newNode.color ?? null,
+              preservePassword: keepsPassword ? !!newNode.id && !newNode.password_dirty : true,
+            } : {
               name: newNode.name,
               host: newNode.host,
               port: newNode.port,
@@ -3325,6 +3434,22 @@ function DesktopApp() {
               await invoke("set_server_jump_host", { id: savedId, value: newNode.jumpHostId ? parseInt(newNode.jumpHostId) : null });
             } catch (e) {
               addLog(`SAVE_JUMP_HOST_FAILED: ${e}`, "error");
+            }
+            // SSH, RDP, telnet or VNC: the same separate-write pattern.
+            try {
+              await invoke("set_server_protocol", { id: savedId, value: isRdp ? "rdp" : isTelnet ? "telnet" : isVnc ? "vnc" : null });
+            } catch (e) {
+              addLog(`SAVE_PROTOCOL_FAILED: ${e}`, "error");
+            }
+            // An RDP server's options are this device's own, kept by its sync
+            // id (a new server has one once it's saved).
+            if (isRdp) {
+              try {
+                const uuid = (await invoke<any[]>("get_servers")).find((s) => s.id === savedId)?.uuid;
+                if (uuid) writeRdpOptions(uuid, newNode.rdpOptions || DEFAULT_RDP_OPTIONS);
+              } catch (e) {
+                addLog(`SAVE_RDP_OPTIONS_FAILED: ${e}`, "error");
+              }
             }
             setIsPanelOpen(false);
             setFormError("");

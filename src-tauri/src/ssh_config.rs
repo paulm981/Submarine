@@ -111,7 +111,7 @@ pub(crate) async fn for_host(lookup: Lookup) -> Option<HostConfig> {
 /// The home folder `~` stands for. Debug builds take `SUBMARINE_LAB_HOME`
 /// instead when it's set, so the lab app can be tested against a config
 /// without one being written to the tester's real home.
-fn home_dir() -> Option<String> {
+pub(crate) fn home_dir() -> Option<String> {
     #[cfg(debug_assertions)]
     if let Some(home) = std::env::var("SUBMARINE_LAB_HOME").ok().filter(|h| !h.is_empty()) {
         return Some(home);

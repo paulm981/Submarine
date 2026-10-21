@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   ArrowLeftRight, ChevronRight, ChevronsDownUp, Copy, CopyPlus, Folder, FolderInput, FolderOpen, FolderPlus,
-  Eye, LayoutGrid, MonitorSmartphone, Pencil, Play, Plus, Search, TerminalSquare, Trash2, X,
+  Eye, LayoutGrid, Monitor, MonitorSmartphone, Pencil, Play, Plus, Search, ShieldAlert, TerminalSquare, Trash2, X,
 } from "lucide-react";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
 import { FolderRow, indexFolders, subtreeCounts, subtreeIds } from "../util/folderPath";
@@ -75,7 +75,19 @@ const DRAG_START_PX = 8;
 const DRAG_OPEN_MS = 700;
 const DRAG_SCROLL_PX = 28;
 
+// A server that isn't SSH says what it is, as in the server list; a Remote
+// Desktop link says it's a link, so the two aren't taken for each other.
+const BADGE = "shrink-0 px-1 rounded text-[8.5px] font-black tracking-wider border";
+const SERVER_TYPES: Record<string, { label: string; title: string; tone: string }> = {
+  rdp: { label: "RDP", title: "RDP server", tone: "bg-sky-500/10 text-sky-300 border-sky-500/20" },
+  telnet: { label: "TELNET", title: "Telnet server (not encrypted)", tone: "bg-amber-500/10 text-amber-300 border-amber-500/20" },
+  vnc: { label: "VNC", title: "VNC server", tone: "bg-violet-500/10 text-violet-300 border-violet-500/20" },
+};
+
 const errText = (e: any) => (typeof e === "string" ? e : (e?.message || String(e)));
+// A Wall holds SSH terminals only: RDP, telnet and VNC servers are left off
+// it, so they aren't counted for one either.
+const wallServers = (list: any[]) => list.filter((s) => (s?.protocol ?? "ssh") === "ssh");
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 export const SessionTree = ({
@@ -322,7 +334,9 @@ export const SessionTree = ({
   const picked = useMemo(() => pickedItems(selected), [selected, rows]);
   const pickedCount = picked.list.length + picked.links.length;
   const openSelected = () => openMany(picked.list, picked.links);
-  const openAsWall = async (list: any[], name: string) => {
+  const pickedWall = useMemo(() => wallServers(picked.list), [picked]);
+  const openAsWall = async (all: any[], name: string) => {
+    const list = wallServers(all);
     if (list.length === 0) return;
     if (list.length > WALL_MANY && !(await confirm({
       title: `Open ${list.length} servers as a wall?`,
@@ -331,7 +345,7 @@ export const SessionTree = ({
     }))) return;
     onOpenAsWall(list, name);
   };
-  const openSelectedAsWall = () => openAsWall(picked.list, `${picked.list.length} servers`);
+  const openSelectedAsWall = () => openAsWall(pickedWall, `${pickedWall.length} servers`);
 
   // The rows a move or a delete is about: the selection when `r` is in it
   // (or there is no `r`), else just `r`.
@@ -778,6 +792,7 @@ export const SessionTree = ({
           const status = isServer ? statusOf(r.server.id) : null;
           const isActive = !!status && status.id === activeSessionId;
           const isCarried = !!drag && isSel;
+          const type = isServer ? SERVER_TYPES[r.server.protocol ?? ""] : undefined;
           return (
             <div
               key={r.key}
@@ -796,17 +811,28 @@ export const SessionTree = ({
               className={`h-[22px] pr-2 flex items-center gap-1.5 text-[12px] cursor-pointer ${
                 isSel ? "bg-primary/20 text-white" : isActive ? "bg-white/[0.06] text-white" : "text-zinc-300 hover:bg-white/[0.04]"
               } ${isCarried ? "opacity-50" : ""}`}
-              title={`${name}\n${host}${isServer ? (r.server.os ? ` · ${osName(r.server.os)}` : "") : " · Remote Desktop"}`}
+              title={`${name}\n${host}${isServer ? (type ? ` · ${type.title}` : r.server.os ? ` · ${osName(r.server.os)}` : "") : " · Remote Desktop link"}`}
             >
-              {isServer
-                ? (r.server.os ? <OsBadge os={r.server.os} size={13} /> : <TerminalSquare size={13} className="shrink-0 text-amber-300/90" />)
-                : <MonitorSmartphone size={13} className="shrink-0 text-sky-300" />}
+              {!isServer
+                ? <MonitorSmartphone size={13} className="shrink-0 text-sky-300" />
+                : type && r.server.protocol !== "telnet"
+                  ? <Monitor size={13} className={`shrink-0 ${r.server.protocol === "vnc" ? "text-violet-300" : "text-sky-300"}`} />
+                  : r.server.os && !type
+                    ? <OsBadge os={r.server.os} size={13} />
+                    : <TerminalSquare size={13} className="shrink-0 text-amber-300/90" />}
               <span className={`truncate ${isServer ? "" : "text-sky-200"}`}>{name}</span>
-              {!isServer && (
-                <span className="ml-auto shrink-0 px-1 rounded text-[8.5px] font-black tracking-wider bg-sky-500/15 text-sky-300 border border-sky-500/30">RDP</span>
+              {isServer && r.server.protocol === "telnet" && (
+                <span title="Not encrypted: what is typed, passwords too, crosses the network as plain text." className="shrink-0 text-amber-300">
+                  <ShieldAlert size={11} aria-label="Not encrypted" />
+                </span>
+              )}
+              {!isServer ? (
+                <span title="Remote Desktop link" className={`ml-auto ${BADGE} bg-sky-500/15 text-sky-300 border-sky-500/30`}>LINK</span>
+              ) : type && (
+                <span title={type.title} className={`ml-auto ${BADGE} ${type.tone}`}>{type.label}</span>
               )}
               {status && (
-                <span title={status.dot.title} className={`ml-auto shrink-0 h-1.5 w-1.5 rounded-full ${status.dot.tone}`} />
+                <span title={status.dot.title} className={`${type ? "ml-1" : "ml-auto"} shrink-0 h-1.5 w-1.5 rounded-full ${status.dot.tone}`} />
               )}
             </div>
           );
@@ -869,9 +895,11 @@ export const SessionTree = ({
                 <button className={menuItem} onClick={run(() => openMany(list, links))} disabled={list.length + links.length === 0}>
                   <Play size={13} className={menuIcon} /> Open all in this folder ({list.length + links.length})
                 </button>
-                <button className={menuItem} onClick={run(() => openAsWall(list, f.name))} disabled={list.length === 0}>
-                  <LayoutGrid size={13} className={menuIcon} /> Open as wall ({list.length})
-                </button>
+                {wallServers(list).length > 0 && (
+                  <button className={menuItem} onClick={run(() => openAsWall(list, f.name))}>
+                    <LayoutGrid size={13} className={menuIcon} /> Open as wall ({wallServers(list).length})
+                  </button>
+                )}
                 <button className={menuItem} onClick={run(() => toggleFolder(f.id))}>
                   <ChevronRight size={13} className={menuIcon} /> {f.open ? "Collapse" : "Expand"}
                 </button>
@@ -900,9 +928,9 @@ export const SessionTree = ({
                 <button className={menuItem} onClick={run(() => (pickedCount > 1 && selected.has(r.key) ? openSelected() : r.kind === "server" ? openServer(r.server) : openRdp(r.link)))}>
                   <Play size={13} className={menuIcon} /> {pickedCount > 1 && selected.has(r.key) ? `Open ${pickedCount} selected` : r.kind === "server" ? "Open" : "Open in Remote Desktop"}
                 </button>
-                {pickedCount > 1 && selected.has(r.key) && picked.list.length > 1 && (
+                {pickedCount > 1 && selected.has(r.key) && pickedWall.length > 1 && (
                   <button className={menuItem} onClick={run(openSelectedAsWall)}>
-                    <LayoutGrid size={13} className={menuIcon} /> Open {picked.list.length} servers as a wall
+                    <LayoutGrid size={13} className={menuIcon} /> Open {pickedWall.length} servers as a wall
                   </button>
                 )}
                 {!many && (

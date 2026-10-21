@@ -132,7 +132,7 @@ zstd = { version = "0.14", default-features = false }
 # and unzip on the server). tar 0.4.46 has the fixes for its link and PAX
 # header advisories. flate2 and chrono are in the tree already: deflate for
 # zip and gzip, and the local time a zip entry is stamped with.
-zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2"] }
 tar = { version = "0.4.46", default-features = false }
 flate2 = "1.1.10"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
@@ -143,6 +143,22 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 # String/Vec passed as args to argon2/aes-gcm are zeroized internally by
 # those crates.
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
+vnc-rs = "0.6"
+# The built-in RDP client (#3, rdp_client.rs): Devolutions' IronRDP
+# (MIT/Apache-2.0). It runs here, in the backend, so the password (NLA
+# through its sspi) and the check of the server's certificate never reach
+# the webview. Its own TLS isn't used (its `upgrade` doesn't check
+# certificates): the connection is upgraded with tokio-rustls on ring, both
+# already in the tree, and the certificate is pinned the way SSH host keys
+# are.
+# Pinned to one IronRDP commit, not a release: no release works with russh
+# yet (each pins pre-release curve25519 / ed25519 crates; their master moved
+# to the finals). That's why the built-in client is offered as experimental,
+# off unless chosen. Move to the first release that has it.
+ironrdp = { git = "https://github.com/Devolutions/IronRDP", rev = "62246b364a0282bab85087f658a81fe4207b6b31", default-features = false, features = ["core", "pdu", "connector", "session", "graphics", "input", "displaycontrol", "dvc", "svc"] }
+ironrdp-tokio = { git = "https://github.com/Devolutions/IronRDP", rev = "62246b364a0282bab85087f658a81fe4207b6b31", default-features = false }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+x509-cert = { version = "0.3", default-features = false, features = ["std"] }
 
 # ---------------------------------------------------------------------------
 # Desktop-only deps. These crates either don't compile on Android at all
@@ -178,6 +194,20 @@ libc = "0.2"
 # The AI channel's named pipe (ai/channel.rs) is locked to your account:
 # Security_Authorization for its access rules, Threading for your SID.
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_Threading"] }
+# Windows Hello, to open a profile without typing its password when the user
+# turns that on (#166, quick_unlock.rs): KeyCredentialManager keeps a key (in
+# the TPM where there is one) that signs only after the user's PIN, face or
+# finger. Already in the build through Tauri (same version, nothing new to
+# download); these are its parts used here.
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Security_Credentials",
+    "Security_Cryptography",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_System_TpmBaseServices",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # ---------------------------------------------------------------------------
 # Linux-only. GTK's own crates, already in the build through Tauri (same

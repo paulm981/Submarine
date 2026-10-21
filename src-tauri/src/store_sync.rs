@@ -1287,7 +1287,7 @@ pub async fn store_restore_profile(
     *db_state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(local_name.clone());
     // No strength floor: the key file just proved this is the profile's
     // real password.
-    let opened = match crate::setup_master_db_inner(app.clone(), password, app.state::<DbState>(), false).await {
+    let opened = match crate::setup_master_db_inner(app.clone(), crate::VaultSecret::Password(password), app.state::<DbState>(), false).await {
         Ok(generation) => generation,
         Err(e) => {
             crate::discard_half_built_profile(&app, &local_name, None);

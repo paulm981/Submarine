@@ -2,7 +2,7 @@ import { useState } from "react";
 import { AlertTriangle, MonitorSmartphone, X } from "lucide-react";
 import { FolderRow, folderOptions } from "../util/folderPath";
 
-// Add or edit a Remote Desktop link (src-tauri/src/rdp.rs). The link only
+// Add or edit a Remote Desktop link (src-tauri/src/rdp_links.rs). The link only
 // stores where to connect; the system's Remote Desktop client does the rest
 // and keeps the password itself.
 export type RdpLink = {

@@ -11,7 +11,7 @@ This page covers:
 
 What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
-The fork is based on the original project's **0.3.8**, with every change up to [#191](https://github.com/SinaXhpm/submarine/pull/191) brought in or recorded as not taken yet.
+The fork is based on the original project's **0.3.8**, with every change up to [#199](https://github.com/SinaXhpm/submarine/pull/199) brought in or recorded as not taken yet.
 
 ## What this fork adds
 
@@ -139,7 +139,10 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | Live Edit (Windows) | Opens the file with its default app | Opens the file in an editor, never runs it |
 | Root | `sudo` | `sudo` or `dzdo`, and `dzdo su -`. A server without an sftp-server uses the original project's shell file access, under `sudo` only. |
 | Docker | As the user | As the user, or through root where only root may use Docker |
-| Remote Desktop | RDP servers ([#173](https://github.com/SinaXhpm/submarine/pull/173), not taken yet) | Remote Desktop links, imported from MobaXterm and synced |
+| Remote Desktop | RDP servers ([#173](https://github.com/SinaXhpm/submarine/pull/173)), opened in the system's RDP app or, experimentally, in the tab ([#199](https://github.com/SinaXhpm/submarine/pull/199)) | The same RDP servers, each with its **Open in** choice of the built-in client or the system's app, per device. Beside them, the fork's Remote Desktop links, imported from MobaXterm and synced, and marked LINK so they aren't taken for RDP servers. Joining Remote Desktop links and RDP servers is next ([#42](https://github.com/paulm981/Submarine/issues/42)) |
+| VNC password | The server's own, or its saved login's | The server's own only. VNC sends its password with weak protection and doesn't check the server's identity, so a saved login, shared with other servers, is never sent there |
+| A server switched to telnet or VNC by another computer | Switched at once | In a shared profile, held on this computer, like synced on-connect commands: it stays an SSH server on its old port here until you allow the switch, or keep it SSH, which changes it back everywhere. Telnet and VNC would send its saved password where it could be read. A held switch stays held if you leave the share |
+| RDP, telnet and VNC servers on Walls | Not pinned to a Wall | Not on a Wall either, even when their folder or a saved Wall is opened as one, so a screen never gets Broadcast keys |
 | Paste | The webview's clipboard | Read by the app itself, since the webviews on Windows, macOS and Linux refuse the page |
 | Text fields on macOS | Capitalize and correct what's typed | Keep exactly what's typed |
 | Closing a connected session | Always asks | Asks, unless you turn that off in Settings |
@@ -155,7 +158,6 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 |---|---|---|
 | [#169](https://github.com/SinaXhpm/submarine/pull/169) ProxyJump from `~/.ssh/config` | It changes the connect path that the fork's jump hosts are built on: their login queue, and Monitoring through a jump host. | A careful merge that keeps both. |
 | [#170](https://github.com/SinaXhpm/submarine/pull/170) Teleport and OpenSSH certificates; trusting `known_hosts` | It builds on #169, and changes how host keys are trusted. | With #169. |
-| [#173](https://github.com/SinaXhpm/submarine/pull/173) RDP servers | The fork has its own Remote Desktop links, which import from MobaXterm and sync. | Decide whether to keep one or join the two. |
 
 ## Keeping up with the original project
 
