@@ -18,7 +18,7 @@ import { readUseSshAgent } from "../util/sshAgent";
 import { useSlideOverFocus } from "../ui/slideOverFocus";
 import { useConfirm } from "../ui/confirm";
 import { markTyped } from "../ui/terminalDock";
-import { terminalHasNews, useActivityVersion } from "../ui/terminalActivity";
+import { COMPACT_TAB_NAME, COMPACT_TAB_PAD, NewsDot, compactTermTabClass } from "../ui/tabStyle";
 import { reorderById, useTabDrag } from "../ui/tabDrag";
 
 // What the shell-config push commands answer (mirror.rs' ShellSync* types).
@@ -651,8 +651,6 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // terminals stay mounted: only their order in the strip changes.
   const termDrag = useTabDrag(`terms-${session.id}`, (dragId, overId, after) =>
     setTerminals(prev => reorderById(prev, dragId, overId, after)));
-  // Re-render when a terminal gets or loses news (the dot on its tab).
-  useActivityVersion();
 
   // Bubble our terminals + active-tab up to the parent (App) whenever
   // they change so the Wall pinboard and any other App-level consumers
@@ -1745,9 +1743,6 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           // a softer accent, so the pairing is obvious at a glance.
           const isFocusedHalf = activeTab === t.id;
           const isSplitPartner = !!(splitTerminals.includes(t.id) && !isFocusedHalf);
-          // Printed something while it was out of sight (cleared when it
-          // comes on screen, so never on the tab in front).
-          const news = terminalHasNews(t.id);
           const drag = termDrag.tabMark(t.id);
           return (
           <div key={t.id} className={`group relative flex items-center select-none ${drag.dim ? 'opacity-50' : ''}`}
@@ -1768,12 +1763,8 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               }}
               title={t.container ? `${t.title} · Container: ${t.container.name}` : t.title}
               className={`h-8 ${compactTabs
-                ? `px-2 ${terminals.length > 1 ? 'pr-6' : ''} rounded-none border-b-2 gap-1.5 text-[10px] ${
-                    isFocusedHalf
-                      ? 'bg-primary/[0.07] text-primary border-b-primary'
-                      : isSplitPartner
-                        ? 'text-primary/70 border-b-primary/40'
-                        : 'text-zinc-400 border-b-transparent hover:bg-white/[0.06] hover:text-white'
+                ? `${COMPACT_TAB_PAD} ${terminals.length > 1 ? 'pr-6' : ''} gap-1.5 text-[10px] ${
+                    compactTermTabClass(isFocusedHalf, isSplitPartner ? "merged" : "primary")
                   }`
                 : `px-3 sm:px-4 ${terminals.length > 1 ? 'pr-8' : ''} rounded-lg gap-2 text-[11px] ${
                     isFocusedHalf
@@ -1787,15 +1778,11 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               {t.container
                 ? <Container size={compactTabs ? 12 : 14} className="text-sky-300 shrink-0" />
                 : <TerminalSquare size={compactTabs ? 12 : 14} className="shrink-0" />}
-              {news && (
-                <span
-                  title="New output"
-                  aria-label="New output"
-                  className="w-1.5 h-1.5 rounded-full shrink-0 bg-primary ring-2 ring-primary/30"
-                />
-              )}
+              {/* Printed something while it was out of sight (cleared when it
+                  comes on screen, so never on the tab in front). */}
+              <NewsDot terminals={[t.id]} />
               {/* Compact tabs cut a long name; the full one is the hover title. */}
-              <span className={compactTabs ? 'max-w-[8rem] truncate' : undefined}>{t.title}</span>
+              <span className={compactTabs ? COMPACT_TAB_NAME : undefined}>{t.title}</span>
               {isSplitPartner && (
                 <SplitSquareHorizontal size={10} className="text-primary/60" />
               )}
@@ -2075,7 +2062,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
             onContextMenu={(e) => { e.preventDefault(); setTermMenu(null); }}
           />
           <div
-            style={{ left: Math.min(termMenu.x, window.innerWidth - 240), top: Math.min(termMenu.y, window.innerHeight - 80) }}
+            style={{ left: Math.min(termMenu.x, window.innerWidth - 240), top: Math.min(termMenu.y, window.innerHeight - 120) }}
             className="fixed z-[9999] w-[220px] bg-[#15151a] border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
           >
             {termRename === termMenu.termId ? (
@@ -2093,6 +2080,25 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                 <span className="flex-1">Rename tab</span>
               </button>
             )}
+            {/* Moving the tab without dragging it (keyboard, touchpad). */}
+            {terminals.length > 1 && (() => {
+              const at = terminals.findIndex(t => t.id === termMenu.termId);
+              const moveTo = (to: number) => {
+                setTerminals(prev => reorderById(prev, termMenu.termId, terminals[to].id, to > at));
+                setTermMenu(null);
+              };
+              const item = "w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left disabled:opacity-40 disabled:hover:bg-transparent";
+              return (
+                <>
+                  <button disabled={at <= 0} onClick={() => moveTo(at - 1)} className={item}>
+                    <span className="flex-1">Move left</span>
+                  </button>
+                  <button disabled={at >= terminals.length - 1} onClick={() => moveTo(at + 1)} className={item}>
+                    <span className="flex-1">Move right</span>
+                  </button>
+                </>
+              );
+            })()}
           </div>
         </>,
         document.body

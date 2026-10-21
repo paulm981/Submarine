@@ -11,9 +11,9 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 - **Broadcast takes your tabs into its Wall** ([#73](https://github.com/paulm981/Submarine/issues/73)). The title bar shows the Wall instead of a copy of every server as well. **Back to tabs** on the Wall's bar puts them back where they were, and closing the Wall asks whether to put them back as tabs or close them all. Connections stay up either way.
   - A terminal's ✕ on that Wall gives it its tab back instead of closing it.
-- **A dot on a tab with new output** ([#70](https://github.com/paulm981/Submarine/issues/70)). A terminal you aren't looking at shows a dot on its tab, and on its server's tab, when it prints something. The dot goes away when you look at it. Prompt redraws and the first second after you leave a tab don't count.
-- **Drag a tab to move it** ([#71](https://github.com/paulm981/Submarine/issues/71)), in the title bar and among a server's terminals. Ctrl+Tab follows the new order.
-- **Compact tabs** ([#71](https://github.com/paulm981/Submarine/issues/71)): a setting under Settings › UI Customization for flat tabs that fit more across, with long names cut short and shown in full on hover.
+- **A dot on a tab with new output** ([#70](https://github.com/paulm981/Submarine/issues/70)). A terminal you aren't looking at shows a dot on its tab, and on its server's tab (or its Wall's tab), when it prints something. The dot goes away when you look at it. Prompt redraws and the first second after you leave a tab don't count.
+- **Drag a tab to move it** ([#71](https://github.com/paulm981/Submarine/issues/71)), in the title bar and among a server's terminals. Ctrl+Tab follows the new order. Esc puts it back. Without a mouse, use **Move left** and **Move right** in the tab's right-click menu.
+- **Compact tabs** ([#71](https://github.com/paulm981/Submarine/issues/71)): a setting under Settings › UI Customization for flat tabs that fit more across (Home and Wall tabs too), with long names cut short and shown in full on hover.
 
 ## v0.3.8-fork.6
 

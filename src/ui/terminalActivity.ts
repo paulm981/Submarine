@@ -22,9 +22,19 @@ const MIN_VISIBLE_CHARS = 3;
 
 interface Entry { sessionId: string; looking: boolean; leftAt: number; news: boolean }
 const entries = new Map<string, Entry>();
+/// How many terminals of each session have news, so a server tab's dot
+/// doesn't walk every terminal to find out.
+const newsPerSession = new Map<string, number>();
 const listeners = new Set<() => void>();
-let version = 0;
-const changed = () => { version++; for (const l of listeners) l(); };
+
+const setNews = (e: Entry, news: boolean) => {
+  if (e.news === news) return;
+  e.news = news;
+  const n = (newsPerSession.get(e.sessionId) ?? 0) + (news ? 1 : -1);
+  if (n > 0) newsPerSession.set(e.sessionId, n);
+  else newsPerSession.delete(e.sessionId);
+  for (const l of listeners) l();
+};
 
 // Escape sequences (CSI, OSC up to BEL or ST, and two-byte ones), then
 // control characters and spaces: what's left is text someone could read.
@@ -37,6 +47,12 @@ const NOT_VISIBLE = /[\x00-\x20\x7f]/g;
 export const hasVisibleText = (text: string): boolean =>
   text.replace(ESCAPES, "").replace(NOT_VISIBLE, "").length >= MIN_VISIBLE_CHARS;
 
+// One decoder for every chunk. It isn't in streaming mode, so a UTF-8
+// character split between two chunks comes out as U+FFFD on each side — fine
+// here, as it only has to tell whether there is something to read. (It
+// never throws: `fatal` is off.)
+const decoder = new TextDecoder();
+
 /// A terminal opened (its output starts being watched). It begins as "just
 /// left", so its first second of output (login banner) isn't news.
 export const watchTerminal = (terminalId: string, sessionId: string): (() => void) => {
@@ -45,7 +61,7 @@ export const watchTerminal = (terminalId: string, sessionId: string): (() => voi
   return () => {
     if (entries.get(terminalId) !== e) return;
     entries.delete(terminalId);
-    if (e.news) changed();
+    setNews(e, false);
   };
 };
 
@@ -54,11 +70,8 @@ export const setLooking = (terminalId: string, looking: boolean) => {
   const e = entries.get(terminalId);
   if (!e || e.looking === looking) return;
   e.looking = looking;
-  if (looking) {
-    if (e.news) { e.news = false; changed(); }
-  } else {
-    e.leftAt = Date.now();
-  }
+  if (looking) setNews(e, false);
+  else e.leftAt = Date.now();
 };
 
 /// A chunk of output arrived for the terminal.
@@ -66,23 +79,21 @@ export const noteOutput = (terminalId: string, data: Uint8Array) => {
   const e = entries.get(terminalId);
   if (!e || e.looking || e.news) return;
   if (Date.now() - e.leftAt < QUIET_AFTER_LEAVING_MS) return;
-  let text: string;
-  try { text = new TextDecoder().decode(data); } catch { return; }
-  if (!hasVisibleText(text)) return;
-  e.news = true;
-  changed();
+  if (!hasVisibleText(decoder.decode(data))) return;
+  setNews(e, true);
 };
 
 export const terminalHasNews = (terminalId: string): boolean => entries.get(terminalId)?.news ?? false;
-export const sessionHasNews = (sessionId: string): boolean => {
-  for (const e of entries.values()) if (e.sessionId === sessionId && e.news) return true;
-  return false;
-};
+export const sessionHasNews = (sessionId: string): boolean => newsPerSession.has(sessionId);
 
 const subscribe = (l: () => void) => {
   listeners.add(l);
   return () => { listeners.delete(l); };
 };
-/// Re-renders the caller whenever any terminal gains or loses news; read it
-/// with terminalHasNews / sessionHasNews.
-export const useActivityVersion = (): number => useSyncExternalStore(subscribe, () => version);
+
+/// True while any of these terminals, or any terminal of these sessions, has
+/// news. The caller re-renders only when that answer changes, not on every
+/// other terminal's news — with 80 servers open, one dot changing must not
+/// redraw them all.
+export const useHasNews = ({ terminals = [], sessions = [] }: { terminals?: readonly string[]; sessions?: readonly string[] }): boolean =>
+  useSyncExternalStore(subscribe, () => terminals.some(terminalHasNews) || sessions.some(sessionHasNews));

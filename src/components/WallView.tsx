@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { invoke } from "@tauri-apps/api/core";
 import { Terminal } from "@xterm/xterm";
 import {
-  ClipboardPaste, ExternalLink, LayoutGrid, Pause, Play, Plus, Radio, RotateCw, Save, Send, X,
+  ClipboardPaste, ExternalLink, LayoutGrid, Pause, Play, Plus, Radio, RotateCw, Save, Send, Ungroup, X,
 } from "lucide-react";
 import {
   appHotkey, claimTerminal, DockEntry, dockedTerminal, forCursorMode, markTyped, terminalMark, useDockVersion,
@@ -568,13 +568,16 @@ export const WallView = ({
             </button>
           ))}
         </div>
-        {!!wall.fromTabs?.length && (
+        {/* Only while a server Broadcast took from the tabs is still here:
+            one that went back to its tab (its ✕, opened on its own, closed)
+            no longer counts. */}
+        {sessions.some((s) => s.wallId === wall.id && wall.fromTabs?.includes(s.id)) && (
           <button
             onClick={onBackToTabs}
             title="Put the servers back as tabs and close this wall — they stay connected"
             className={`${btn} bg-white/[0.04] border-white/10 text-zinc-300 hover:bg-white/[0.08] hover:text-white`}
           >
-            <LayoutGrid size={11} /> Back to tabs
+            <Ungroup size={11} /> Back to tabs
           </button>
         )}
         <button onClick={onAdd} title="Add terminals to this wall" className={`${btn} bg-primary/15 hover:bg-primary/25 text-primary border-primary/30`}>

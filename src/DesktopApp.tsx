@@ -12,7 +12,7 @@ import ProfileSelectPage from "./components/ProfileSelectPage";
 import logoUrl from "./assets/logo.png";
 import PasswordField from "./components/PasswordField";
 import QuickConnectModal, { QuickAuth } from "./components/QuickConnectModal";
-import { useConfirm, useTextPrompt } from "./ui/confirm";
+import { useChoice, useConfirm, useTextPrompt } from "./ui/confirm";
 import { useSlideOverFocus } from "./ui/slideOverFocus";
 import { RenameInput } from "./ui/renameInput";
 import { forgetServerBookmarks } from "./util/sftpBookmarks";
@@ -39,7 +39,7 @@ import AddNodePanel from "./components/AddNodePanel";
 import WallView, { type Wall, type WallMember } from "./components/WallView";
 import WallsMenu, { AllTabsMenu, WallEditorModal, WallPicker, type SavedWall } from "./components/WallsMenu";
 import { appHotkey } from "./ui/terminalDock";
-import { sessionHasNews, useActivityVersion } from "./ui/terminalActivity";
+import { COMPACT_TAB_NAME, COMPACT_TAB_PAD, NewsDot, titleTabClass } from "./ui/tabStyle";
 import { reorderById, useTabDrag } from "./ui/tabDrag";
 import SettingsPanel from "./components/SettingsPanel";
 import ProfilePanel from "./components/ProfilePanel";
@@ -209,8 +209,6 @@ function DesktopApp() {
   // Ctrl+Tab (tabOrderRef) and All tabs follow it.
   const sessionDrag = useTabDrag("sessions", (dragId, overId, after) =>
     setSessions(prev => reorderById(prev, dragId, overId, after)));
-  // Re-render when a terminal gets or loses news (the dot on its server's tab).
-  useActivityVersion();
   useEffect(() => {
     const strip = tabStripRef.current;
     if (!strip) return;
@@ -944,6 +942,7 @@ function DesktopApp() {
   };
 
   const confirm = useConfirm();
+  const choice = useChoice();
   const textPrompt = useTextPrompt();
 
   // Window-close guard. Keep `sessions` mirrored into a ref so the close
@@ -1208,10 +1207,11 @@ function DesktopApp() {
   };
 
   // Close a Wall. Its terminals' sessions stay open in their tabs; the ones
-  // opened into it (no tab of their own) close with it — unless another
-  // open Wall has them, which then keeps them. Sessions Broadcast took from
-  // the tabs are asked about: back as tabs, or closed too. A session that
-  // is on two Walls goes back to its tab either way the Wall is closed.
+  // opened into it (no tab of their own) close with it. Sessions Broadcast
+  // took from the tabs are asked about: back as tabs, or closed too. One
+  // rule throughout: a session another open Wall has is never closed — that
+  // Wall keeps it — except that "Put back as tabs" gives every session
+  // Broadcast took its tab back.
   const closeWall = async (wallId: string) => {
     const keeper = (sid: string) => walls.find(o => o.id !== wallId && o.members.some(m => m.sessionId === sid));
     const wall = walls.find(w => w.id === wallId);
@@ -1219,18 +1219,25 @@ function DesktopApp() {
     const taken = own.filter(s => wall?.fromTabs?.includes(s.id));
     const opened = own.filter(s => !taken.includes(s));
     let closing = opened.filter(s => !keeper(s.id));
-    if (taken.length > 0) {
-      let closeAll = false;
-      const n = taken.length + closing.length;
-      const keep = await confirm({
+    // Taken sessions only another Wall has: closing all leaves them there,
+    // so there is nothing to ask about them and they get their tabs back.
+    const takenFree = taken.filter(s => !keeper(s.id));
+    let putBack = true;
+    if (takenFree.length > 0) {
+      const t = takenFree.length;
+      const them = t === 1 ? "it" : "them";
+      const answer = await choice({
         title: "Close this wall?",
-        message: `${taken.length} server${taken.length === 1 ? " was a tab" : "s were tabs"} before Broadcast took ${taken.length === 1 ? "it" : "them"} in. Put ${taken.length === 1 ? "it" : "them"} back as tabs, or close ${taken.length === 1 ? "it" : "them"} with the wall.${closing.length > 0 ? ` ${closing.length} opened into the wall close either way.` : ""}`,
+        message: `${t} server${t === 1 ? " was a tab" : "s were tabs"} before Broadcast took ${them} in. Put ${them} back as tabs, or close ${them} with the wall.${closing.length > 0 ? ` ${closing.length} opened into the wall ${closing.length === 1 ? "closes" : "close"} either way.` : ""}`,
         okLabel: "Put back as tabs",
-        altLabel: `Close all ${n}`,
-        onAlt: () => { closeAll = true; },
+        altLabel: `Close all ${t + closing.length}`,
+        altDestructive: true,
       });
-      if (!keep && !closeAll) return;
-      if (closeAll) closing = [...taken, ...closing];
+      if (answer === null) return;
+      if (answer === "alt") {
+        putBack = false;
+        closing = [...takenFree, ...closing];
+      }
     } else if (closing.some(s => sessionStatuses[s.id] === "connected")) {
       const ok = await confirm({
         title: "Close this wall?",
@@ -1241,10 +1248,11 @@ function DesktopApp() {
       if (!ok) return;
     }
     const closingIds = new Set(closing.map(s => s.id));
-    const takenIds = new Set(taken.map(s => s.id));
+    const backIds = new Set(putBack ? taken.map(s => s.id) : []);
+    for (const sid of closingIds) clearTabName(sid);
     setSessions(prev => prev
       .filter(s => !closingIds.has(s.id))
-      .map(s => (s.wallId === wallId ? { ...s, wallId: takenIds.has(s.id) ? undefined : keeper(s.id)?.id } : s)));
+      .map(s => (s.wallId === wallId ? { ...s, wallId: backIds.has(s.id) ? undefined : keeper(s.id)?.id } : s)));
     setSessionStatuses(prev => {
       const next = { ...prev };
       for (const sid of closingIds) delete next[sid];
@@ -1262,17 +1270,21 @@ function DesktopApp() {
   // A tile's ✕. A session that was opened for this Wall (no tab of its own)
   // closes — unless another Wall has it too, which then keeps it; any other
   // just leaves the Wall and keeps its tab. One Broadcast took from the tabs
-  // gets its tab back, not closed.
+  // gets its tab back (even when another Wall has it too), never closed.
   const removeWallMember = (wall: Wall, m: WallMember) => {
-    const s = sessions.find(x => x.id === m.sessionId);
-    const sameSessionHere = wall.members.some(o => o.sessionId === m.sessionId && o.terminalId !== m.terminalId);
+    const sid = m.sessionId;
+    const s = sessions.find(x => x.id === sid);
+    const sameSessionHere = wall.members.some(o => o.sessionId === sid && o.terminalId !== m.terminalId);
     if (s?.wallId === wall.id && !sameSessionHere) {
-      const other = walls.find(o => o.id !== wall.id && o.members.some(x => x.sessionId === m.sessionId));
-      if (!other && !wall.fromTabs?.includes(m.sessionId)) {
-        void closeSessions([m.sessionId]);
+      const taken = !!wall.fromTabs?.includes(sid);
+      const other = walls.find(o => o.id !== wall.id && o.members.some(x => x.sessionId === sid));
+      if (!other && !taken) {
+        void closeSessions([sid]);
         return;
       }
-      setSessions(prev => prev.map(x => (x.id === m.sessionId ? { ...x, wallId: other?.id } : x)));
+      setSessions(prev => prev.map(x => (x.id === sid ? { ...x, wallId: taken ? undefined : other?.id } : x)));
+      // It has its tab back, so "Back to tabs" no longer counts it.
+      if (taken) updateWall(wall.id, { fromTabs: wall.fromTabs?.filter(id => id !== sid) });
     }
     removeFromWall(wall.id, m.terminalId);
   };
@@ -1474,9 +1486,13 @@ function DesktopApp() {
 
   // A session opened into a Wall that's no longer on it (or on any Wall) is
   // never left running with no tab and no tile: another Wall that has it
-  // takes it, or it gets its tab.
+  // takes it, or it gets its tab. One Broadcast took from the tabs gets its
+  // tab back, as with a tile's ✕.
   useEffect(() => {
-    const home = (s: Session) => walls.find(w => w.members.some(m => m.sessionId === s.id));
+    const home = (s: Session) => {
+      if (walls.find(w => w.id === s.wallId)?.fromTabs?.includes(s.id)) return undefined;
+      return walls.find(w => w.members.some(m => m.sessionId === s.id));
+    };
     const stray = sessions.filter(s => s.wallId && !walls.some(w => w.id === s.wallId && w.members.some(m => m.sessionId === s.id)));
     if (stray.length === 0) return;
     const ids = new Set(stray.map(s => s.id));
@@ -1765,7 +1781,7 @@ function DesktopApp() {
                   {/* Walls — the phone's equivalent of the desktop Wall
                       tabs, since the horizontal tab strip is replaced by
                       this dropdown. */}
-                  {walls.length > 0 && <div className="border-t border-white/5 my-1" />}
+                  {walls.length > 0 && sessions.some(s => !s.wallId) && <div className="border-t border-white/5 my-1" />}
                   {walls.map(w => (
                     <button
                       key={w.id}
@@ -1812,10 +1828,8 @@ function DesktopApp() {
             onClick={() => setActiveView("home")}
             title="Home — terminals on this computer"
             aria-label="Home"
-            className={`no-drag flex items-center justify-center h-7 w-9 rounded-full cursor-pointer transition-all shrink-0 mr-1 ${
-              activeView === "home"
-                ? 'bg-primary/15 text-primary border border-primary/40 shadow-inner shadow-primary/10'
-                : 'bg-white/[0.06] text-zinc-300 border border-white/10 hover:bg-white/[0.1] hover:border-white/20 hover:text-white'
+            className={`no-drag flex items-center justify-center h-7 w-9 cursor-pointer transition-all shrink-0 ${
+              titleTabClass({ compact: appSettings.compactTabs, active: activeView === "home" })
             }`}
           >
             <Home size={14} className="shrink-0" />
@@ -1825,33 +1839,31 @@ function DesktopApp() {
             Orange while it broadcasts. */}
         {walls.map(w => {
           const on = activeView === w.id;
+          const compact = appSettings.compactTabs;
           return (
             <div
               key={w.id}
               data-tab={w.id}
               onClick={() => { setMergedSessionIds([]); setActiveView(w.id); }}
               title={`${w.name} — ${w.members.length} terminal${w.members.length === 1 ? '' : 's'}${w.broadcast ? ', broadcasting' : ''}`}
-              className={`group no-drag flex items-center gap-1.5 h-7 px-3 rounded-full cursor-pointer transition-all shrink-0 mr-1 ${
-                w.broadcast
-                  ? on
-                    ? 'bg-orange-500/20 text-orange-200 border border-orange-400/50 shadow-inner'
-                    : 'bg-orange-500/[0.08] text-orange-300/90 border border-orange-400/30 hover:bg-orange-500/15'
-                  : on
-                    ? 'bg-primary/15 text-primary border border-primary/40 shadow-inner shadow-primary/10'
-                    : 'bg-white/[0.06] text-zinc-300 border border-white/10 hover:bg-white/[0.1] hover:border-white/20 hover:text-white'
+              className={`group no-drag flex items-center gap-1.5 h-7 ${compact ? COMPACT_TAB_PAD : 'px-3'} cursor-pointer transition-all shrink-0 ${
+                titleTabClass({ compact, active: on, tone: w.broadcast ? "broadcast" : "primary" })
               }`}
             >
               {w.broadcast ? <Radio size={12} className="shrink-0 animate-pulse" /> : <LayoutGrid size={12} className="shrink-0" />}
-              <span className="text-[11px] font-semibold whitespace-nowrap tracking-tight">{w.name}</span>
+              {/* A terminal on it printed something while the Wall wasn't
+                  on screen (on screen, its tiles are being looked at). */}
+              <NewsDot terminals={w.members.map(m => m.terminalId)} />
+              <span className={`text-[11px] font-semibold whitespace-nowrap tracking-tight ${compact ? COMPACT_TAB_NAME : ''}`}>{w.name}</span>
               <span className="text-[10px] tabular-nums opacity-70">{w.members.length}</span>
               <button
                 type="button"
                 aria-label="Close wall"
                 title="Close this wall"
-                className="hidden sm:flex ml-0.5 h-5 w-5 items-center justify-center rounded hover:bg-white/5 shrink-0 opacity-0 group-hover:opacity-100 text-zinc-400 hover:text-red-400 transition-opacity"
+                className={`hidden sm:flex ml-0.5 ${compact ? 'h-4 w-4' : 'h-5 w-5'} items-center justify-center rounded hover:bg-white/5 shrink-0 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 text-zinc-400 hover:text-red-400 transition-opacity`}
                 onClick={(e) => { e.stopPropagation(); void closeWall(w.id); }}
               >
-                <X size={12} />
+                <X size={compact ? 10 : 12} />
               </button>
             </div>
           );
@@ -1891,12 +1903,11 @@ function DesktopApp() {
           // Compact tabs: flat, touching, a thin underline for the one in
           // front; long names are cut (the full one is the hover title).
           const compact = appSettings.compactTabs;
-          const news = sessionHasNews(s.id);
           const drag = sessionDrag.tabMark(s.id);
           return (
             <div
               key={s.id}
-              data-tab={s.id}
+              // data-tab (what the strip scrolls into view) comes with these.
               {...sessionDrag.tabProps(s.id)}
               style={drag.style}
               onClick={(e) => {
@@ -1943,22 +1954,8 @@ function DesktopApp() {
               // pill and break the row's height.
               title={isMergedTab ? `${tabLabel(s)} · split beside current view (Ctrl-click to unpair)` : tabLabel(s)}
               className={`group no-drag select-none flex items-center h-7 cursor-pointer transition-all shrink-0 ${drag.dim ? 'opacity-50' : ''} ${
-                compact
-                  ? `px-2 border-b-2 border-r border-r-white/5 rounded-none ${
-                      activeView === s.id
-                        ? 'text-primary border-b-primary bg-primary/[0.07]'
-                        : isMergedTab
-                          ? 'text-primary/80 border-b-primary/40 hover:bg-white/[0.06]'
-                          : 'text-zinc-400 border-b-transparent hover:bg-white/[0.06] hover:text-white'
-                    }`
-                  : `px-2.5 sm:px-4 rounded-full mr-1 ${
-                      activeView === s.id
-                        ? 'bg-primary/15 text-primary border border-primary/40 shadow-inner shadow-primary/10'
-                        : isMergedTab
-                          ? 'bg-primary/[0.05] text-primary/80 border border-primary/25 hover:bg-primary/10'
-                          : 'bg-white/[0.06] text-zinc-300 border border-white/10 hover:bg-white/[0.1] hover:border-white/20 hover:text-white'
-                    }`
-              }`}
+                compact ? COMPACT_TAB_PAD : 'px-2.5 sm:px-4'
+              } ${titleTabClass({ compact, active: activeView === s.id, tone: isMergedTab ? "merged" : "primary" })}`}
             >
               <span
                 title={dotTitle}
@@ -1967,13 +1964,7 @@ function DesktopApp() {
               />
               {/* Something printed in one of its terminals while you weren't
                   looking; clears when you look at that terminal. */}
-              {news && (
-                <span
-                  title="New output in a terminal"
-                  aria-label="New output in a terminal"
-                  className="w-1.5 h-1.5 rounded-full mr-1.5 shrink-0 bg-primary ring-2 ring-primary/30"
-                />
-              )}
+              <NewsDot sessions={[s.id]} className="mr-1.5" />
               {isPausedTarget ? (
                 <span title="Paused in the broadcast" aria-label="Paused in the broadcast" className="mr-1.5 shrink-0 text-zinc-400 flex">
                   <Pause size={9} />
@@ -2011,7 +2002,7 @@ function DesktopApp() {
               <button
                 type="button"
                 aria-current={activeView === s.id ? "page" : undefined}
-                className={`text-[11px] font-semibold whitespace-nowrap tracking-tight rounded outline-none focus-visible:ring-2 focus-visible:ring-primary/60 ${compact ? 'max-w-[9rem] truncate' : ''}`}
+                className={`text-[11px] font-semibold whitespace-nowrap tracking-tight rounded outline-none focus-visible:ring-2 focus-visible:ring-primary/60 ${compact ? COMPACT_TAB_NAME : ''}`}
               >
                 {tabLabel(s)}
               </button>
@@ -2268,6 +2259,29 @@ function DesktopApp() {
                 onClick={() => setTabRename(targetId)}
               >Rename tab</button>
             )}
+            {/* Moving the tab without dragging it (keyboard, touchpad). */}
+            {(() => {
+              const tabs = sessions.filter(s => !s.wallId).map(s => s.id);
+              const at = tabs.indexOf(targetId);
+              const moveTo = (to: number) => {
+                setSessions(prev => reorderById(prev, targetId, tabs[to], to > at));
+                setTabMenu(null);
+              };
+              return (
+                <>
+                  <button
+                    disabled={at <= 0}
+                    className="w-full text-left px-3 py-1.5 hover:bg-white/10 text-zinc-200 disabled:opacity-40 disabled:hover:bg-transparent"
+                    onClick={() => moveTo(at - 1)}
+                  >Move left</button>
+                  <button
+                    disabled={at < 0 || at >= tabs.length - 1}
+                    className="w-full text-left px-3 py-1.5 hover:bg-white/10 text-zinc-200 disabled:opacity-40 disabled:hover:bg-transparent"
+                    onClick={() => moveTo(at + 1)}
+                  >Move right</button>
+                </>
+              );
+            })()}
             <button
               className="w-full text-left px-3 py-1.5 hover:bg-primary/15 hover:text-primary text-zinc-200 flex items-center gap-2"
               onClick={() => {
