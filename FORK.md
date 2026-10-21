@@ -120,7 +120,7 @@ No third-party service is involved. Profiles are encrypted with their password b
 - **Hardening.** On every system:
   - characters that disguise a file name are shown plainly;
   - a trusted server that shows a different kind of key is a warning, not a silent change;
-  - Live Edit opens a file in an editor and never runs it: the one picked in Settings, or else Notepad on Windows, the default text editor on macOS, and on Linux the plain-text editor for a file that could run;
+  - Live Edit opens a file in an editor and never runs it: the one picked in Settings, or else Notepad on Windows, the default text editor on macOS, and on Linux the text editor set for plain text;
   - the Local pane asks before it opens a file that would run (a program, a script, a shortcut; on macOS a `.terminal` or `.command` file too).
 
   Downloads are marked as from the internet on Windows and macOS. As in the original project ([#212](https://github.com/SinaXhpm/submarine/pull/212)), a program on a server (`.exe`, `.msi`, `.jar`, `.AppImage`, …) isn't opened from the file pane at all.
@@ -133,7 +133,7 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 |---|---|---|
 | Profile sync | Its hosted cloud, `api.sinaxhpm.com` | A folder or git repository you own. The hosted cloud is off unless you turn it on. |
 | Updates | Releases of the original project | Releases of this fork, one for every change: `v0.4.0-fork.1`, `v0.4.0-fork.2`, … |
-| Live Edit | Refuses a program; on Windows opens a script in Notepad; opens anything else with its default app ([#212](https://github.com/SinaXhpm/submarine/pull/212)) | Refuses a program, and opens anything else in an editor: the one picked in Settings, or Notepad on Windows, the default text editor on macOS, and on Linux the plain-text editor for a file that could run. It never runs a file |
+| Live Edit | Refuses a program; on Windows opens a script in Notepad; opens anything else with its default app ([#212](https://github.com/SinaXhpm/submarine/pull/212)) | Refuses a program, and opens anything else in an editor: the one picked in Settings, or Notepad on Windows, the default text editor on macOS, and on Linux the text editor set for plain text. It never runs a file |
 | Root | `sudo` | `sudo` or `dzdo`, and `dzdo su -`. A server without an sftp-server uses the original project's shell file access, under `sudo` only. |
 | Docker | As the user | As the user, or through root where only root may use Docker |
 | Remote Desktop | RDP servers ([#173](https://github.com/SinaXhpm/submarine/pull/173)), opened in the system's RDP app or, experimentally, in the tab ([#199](https://github.com/SinaXhpm/submarine/pull/199)) | The same RDP servers, each with its **Open in** choice of the built-in client or the system's app, per device. Beside them, the fork's Remote Desktop links, imported from MobaXterm and synced, and marked LINK so they aren't taken for RDP servers. Joining Remote Desktop links and RDP servers is next ([#42](https://github.com/paulm981/Submarine/issues/42)) |

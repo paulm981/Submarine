@@ -9,7 +9,7 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
-- **Files from a server don't run on macOS and Linux either.** Live Edit opens a file in your default text editor on macOS; on Linux, a file of a type that could run opens in the editor for plain text. The Local pane asks before it opens such a file (on macOS a `.terminal` or `.command` file too), and downloads on macOS are marked as from the internet. ([#84](https://github.com/paulm981/Submarine/issues/84))
+- **Files from a server don't run on macOS and Linux either.** Live Edit opens a file in your default text editor on macOS, and in the text editor set for plain text on Linux. The Local pane asks before it opens a file that could run (on macOS a `.terminal` or `.command` file too, and Windows programs, which Wine can run), and downloads on macOS are marked as from the internet. ([#84](https://github.com/paulm981/Submarine/issues/84))
 - **A jump host that stops answering no longer keeps a tab connecting.** Reaching the server behind it has 15 seconds, and logging in to it 5 minutes, prompts included. Other servers behind it stop waiting for their turn. ([#84](https://github.com/paulm981/Submarine/issues/84))
 - **Home terminals and AI tabs** leave out escape sequences that would freeze the window, as SSH terminals do. So does a container's terminal opened as root. ([#84](https://github.com/paulm981/Submarine/issues/84))
 - **Two windows syncing through the same folder or git repository take turns**, now that each profile can have a window of its own. A file in that storage that's far too big is skipped, and the log says why. ([#84](https://github.com/paulm981/Submarine/issues/84))

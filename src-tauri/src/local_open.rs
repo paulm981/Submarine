@@ -8,9 +8,10 @@
 //! keeps that from happening:
 //!
 //! - Live Edit opens its copy in a text editor: the one picked under
-//!   Settings, or else Notepad on Windows and the default text editor on
-//!   macOS (`open -t`). On Linux a file of a type that can run opens in the
-//!   text editor set for plain text; anything else in its default app.
+//!   Settings, or else Notepad on Windows, the default text editor on macOS
+//!   (`open -t`), and the text editor set for plain text on Linux. Never the
+//!   file's own default app: a list of the types that run can't be complete
+//!   (Wine runs Windows programs and scripts on Linux, for one).
 //! - The Local pane asks before opening a file the system would run
 //!   ([`runs_when_opened`]).
 //! - Files downloaded from a server are marked as coming from the internet
@@ -111,7 +112,7 @@ fn editor_info(app: &tauri::AppHandle) -> LiveEditEditor {
         } else if cfg!(target_os = "macos") {
             "the default text editor"
         } else {
-            "the default app (a text editor for files that could run)"
+            "the text editor for plain text"
         },
     }
 }
@@ -179,21 +180,17 @@ pub fn open_for_editing(app: &tauri::AppHandle, file: &Path) -> Result<(), Strin
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        if runs_when_opened(file) {
-            open_in_text_editor(file)
-        } else {
-            open::that(file).map_err(|e| e.to_string())
-        }
+        open_in_text_editor(file)
     }
 }
 
-/// Linux: a file of a type that can run opens in the program the desktop
-/// sets for plain text (`xdg-mime query default text/plain`), started by
-/// `gtk-launch`, rather than by its own type's association. Where either
-/// isn't there, it isn't opened: the error says to pick an editor.
+/// Linux: the copy opens in the program the desktop sets for plain text
+/// (`xdg-mime query default text/plain`), started by `gtk-launch`, never by
+/// its own type's association. Where either isn't there, it isn't opened:
+/// the error says to pick an editor.
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
 fn open_in_text_editor(file: &Path) -> Result<(), String> {
-    let pick_one = "it's a type that can run when it's opened, so it isn't opened with its default app. Pick an editor for Live Edit in Settings.";
+    let pick_one = "there's no text editor set for plain text here, and a file from a server isn't opened with its default app. Pick an editor for Live Edit in Settings.";
     let query = std::process::Command::new("xdg-mime")
         .args(["query", "default", "text/plain"])
         .output()
@@ -250,8 +247,8 @@ fn start_editor(editor: &Path, file: &Path) -> Result<(), String> {
 /// the macro-enabled Office formats. The older .doc / .xls / .ppt can carry
 /// macros too but are everyday documents, so they open without asking;
 /// Office blocks macros in files marked as downloaded (mark_from_internet).
-/// Anything %PATHEXT% lists counts too.
-#[cfg(any(windows, test))]
+/// Anything %PATHEXT% lists counts too. On macOS and Linux these are asked
+/// about as well: Wine runs Windows programs and scripts there.
 const RUNS_ON_OPEN: &[&str] = &[
     // programs and installers
     "exe", "com", "scr", "pif", "cpl", "msi", "msp", "mst", "msu", "msix", "msixbundle",
@@ -315,8 +312,14 @@ pub fn runs_when_opened(path: &Path) -> bool {
     }
     #[cfg(not(windows))]
     {
-        file_extension(path).is_some_and(|ext| RUNS_ON_OPEN_UNIX.contains(&ext.as_str()))
+        file_extension(path).is_some_and(|ext| runs_on_open_unix(&ext))
     }
+}
+
+/// macOS and Linux: their own types that run, and Windows' (Wine).
+#[cfg(any(not(windows), test))]
+fn runs_on_open_unix(ext: &str) -> bool {
+    RUNS_ON_OPEN_UNIX.contains(&ext) || RUNS_ON_OPEN.contains(&ext)
 }
 
 /// Mark a file from a server the way browsers mark downloads: the
@@ -386,7 +389,15 @@ mod tests {
     }
 
     fn runs_unix(name: &str) -> bool {
-        file_extension(Path::new(name)).is_some_and(|e| RUNS_ON_OPEN_UNIX.contains(&e.as_str()))
+        file_extension(Path::new(name)).is_some_and(|e| runs_on_open_unix(&e))
+    }
+
+    #[test]
+    fn windows_programs_and_scripts_are_asked_about_on_macos_and_linux_too() {
+        // Wine runs them there when they're opened.
+        for name in ["setup.exe", "x.MSI", "a.lnk", "run.bat", "x.cmd", "x.vbs", "b.hta", "c.js", "d.ps1", "e.reg", "invoice.pdf .exe"] {
+            assert!(runs_unix(name), "{name}");
+        }
     }
 
     #[test]
