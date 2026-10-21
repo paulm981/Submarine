@@ -78,6 +78,14 @@ impl Listener {
     pub(crate) fn addr(&self) -> &str {
         &self.addr
     }
+
+    /// Stop listening, and return once nothing listens any more. Dropping
+    /// only asks the listening task to end; on Windows its pipe takes
+    /// connections until the runtime has dropped it, which this waits for.
+    pub(crate) async fn close(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
 }
 
 impl Drop for Listener {
@@ -192,7 +200,7 @@ pub(crate) mod pipe {
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
-    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     fn wide(s: &str) -> Vec<u16> {
@@ -219,18 +227,28 @@ pub(crate) mod pipe {
                 return Err(err);
             }
             let user = &*(buf.as_ptr() as *const TOKEN_USER);
-            let mut text: *mut u16 = std::ptr::null_mut();
-            if ConvertSidToStringSidW(user.User.Sid, &mut text) == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let mut n = 0;
-            while *text.add(n) != 0 {
-                n += 1;
-            }
-            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
-            LocalFree(text as *mut c_void);
-            Ok(sid)
+            sid_string(user.User.Sid)
         }
+    }
+
+    /// A SID as text, always in full (S-1-5-21-…): SDDL may write a
+    /// well-known account by a short name instead (LA for the built-in
+    /// Administrator).
+    ///
+    /// # Safety
+    /// `sid` must point to a valid SID.
+    pub(crate) unsafe fn sid_string(sid: PSID) -> std::io::Result<String> {
+        let mut text: *mut u16 = std::ptr::null_mut();
+        if ConvertSidToStringSidW(sid, &mut text) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut n = 0;
+        while *text.add(n) != 0 {
+            n += 1;
+        }
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
+        LocalFree(text as *mut c_void);
+        Ok(s)
     }
 
     /// A security descriptor whose only rule is: your account, full access.
@@ -466,30 +484,38 @@ mod tests {
         }
     }
 
+    /// The pipe has one access rule, allowing full access, and it's for
+    /// your account: read back from the pipe itself, the SID compared in full.
     #[cfg(windows)]
     #[tokio::test]
     async fn the_pipe_is_yours_only() {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::LocalFree;
         use windows_sys::Win32::Security::Authorization::{ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT};
-        use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+        use windows_sys::Win32::Security::{GetAce, ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+        // winnt.h's, kept here rather than adding windows-sys's SystemServices.
+        const ACCESS_ALLOWED_ACE_TYPE: u32 = 0;
+        const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
         let (on, _) = counting();
         let l = listen(on).unwrap();
         let f = std::fs::OpenOptions::new().read(true).write(true).open(l.addr()).unwrap();
-        // SAFETY: the handle is open; what Windows hands back is freed once.
-        let sddl = unsafe {
+        // SAFETY: the handle is open; the ACL and its ACE are read inside the
+        // descriptor Windows hands back, which is freed once, after.
+        let (sddl, aces, kind, mask, sid) = unsafe {
             let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
             let rc = GetSecurityInfo(
                 f.as_raw_handle() as _,
                 SE_KERNEL_OBJECT,
                 DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                &mut dacl,
                 std::ptr::null_mut(),
                 &mut sd,
             );
             assert_eq!(rc, 0, "GetSecurityInfo");
+            assert!(!dacl.is_null(), "a DACL (none would let everyone in)");
             let mut text: *mut u16 = std::ptr::null_mut();
             let ok = ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &mut text, std::ptr::null_mut());
             assert_ne!(ok, 0, "ConvertSecurityDescriptorToStringSecurityDescriptorW");
@@ -497,15 +523,32 @@ mod tests {
             while *text.add(n) != 0 {
                 n += 1;
             }
-            let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
+            let sddl = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
             LocalFree(text as _);
+            let aces = (*dacl).AceCount;
+            let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
+            assert_ne!(GetAce(dacl, 0, &mut ace), 0, "GetAce");
+            let ace = &*(ace as *const ACCESS_ALLOWED_ACE);
+            let sid = pipe::sid_string(&ace.SidStart as *const u32 as *mut std::ffi::c_void).unwrap();
+            let r = (sddl, aces, ace.Header.AceType as u32, ace.Mask, sid);
             LocalFree(sd as _);
-            s
+            r
         };
-        let me = pipe::my_sid().unwrap();
-        assert_eq!(sddl.matches("(A;").count(), 1, "one rule only: {sddl}");
-        assert!(sddl.contains(&me), "the rule is for you: {sddl}");
+        assert_eq!(aces, 1, "one rule only: {sddl}");
+        assert_eq!(kind, ACCESS_ALLOWED_ACE_TYPE, "it allows: {sddl}");
+        assert_eq!(mask, FILE_ALL_ACCESS, "full access: {sddl}");
+        assert_eq!(sid, pipe::my_sid().unwrap(), "the rule is for you: {sddl}");
         assert!(sddl.starts_with("D:P"), "nothing inherited: {sddl}");
+    }
+
+    /// Closed, it takes no more connections, at once.
+    #[tokio::test]
+    async fn once_closed_nothing_listens() {
+        let (on, _) = counting();
+        let l = listen(on).unwrap();
+        let addr = l.addr().to_string();
+        l.close().await;
+        assert!(connect(&addr).await.is_err());
     }
 
     /// Another account (the anonymous logon, impersonated by a thread of

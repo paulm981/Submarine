@@ -128,7 +128,7 @@ async fn turning_ai_tools_off_ends_access_and_listening() {
     let s = state_without_servers();
     let (_, env) = s.start_tab("local-1", "Claude").unwrap();
     let addr = var(&env, channel::ENV_ADDR).to_string();
-    s.turn_off();
+    s.turn_off().await;
     assert!(s.snapshot().tabs.is_empty());
     assert!(channel::connect(&addr).await.is_err(), "nothing listens");
     assert!(s.start_tab("local-2", "Claude").is_err(), "no AI tab starts while it's off");

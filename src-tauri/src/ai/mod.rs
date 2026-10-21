@@ -308,14 +308,18 @@ impl AiState {
         Ok(())
     }
 
-    /// Stop listening, and end every AI tab's access.
-    fn turn_off(&self) {
+    /// Stop listening, and end every AI tab's access. Returns once nothing
+    /// listens any more.
+    async fn turn_off(&self) {
+        self.lock().enabled = false;
         let ids: Vec<String> = self.lock().tabs.iter().map(|t| t.id.clone()).collect();
         for id in ids {
             self.end_tab(&id);
         }
-        *self.0.listener.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        self.lock().enabled = false;
+        let listener = self.0.listener.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(l) = listener {
+            l.close().await;
+        }
         self.changed();
     }
 
@@ -820,7 +824,7 @@ pub async fn ai_set_enabled(app: tauri::AppHandle, state: tauri::State<'_, AiSta
     if enabled {
         state.turn_on()?;
     } else {
-        state.turn_off();
+        state.turn_off().await;
     }
     Ok(settings_view(&state))
 }

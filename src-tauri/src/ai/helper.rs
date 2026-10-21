@@ -13,7 +13,14 @@
 //! has no token and connects to nothing.
 
 use super::channel;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+
+/// After the AI tool closes stdin, how long the app's last answers may take
+/// to come through before the helper ends anyway. A named pipe (Windows) has
+/// no half-close, so the app can't be told the input is over and the helper
+/// can't wait for the app to close first.
+const LAST_ANSWERS: Duration = Duration::from_secs(1);
 
 /// The helper's whole run; the process's exit code.
 pub fn main() -> i32 {
@@ -63,11 +70,15 @@ where
         let _ = tokio::io::copy(&mut from_app, &mut output).await;
         let _ = output.flush().await;
     };
-    // The app closing ends the helper; the AI tool closing stdin ends it too,
-    // once the app has answered what it had.
+    // The app closing ends the helper. The AI tool closing stdin ends it
+    // too: once the app closes in turn (a socket passes the end of input on),
+    // or after LAST_ANSWERS (a pipe can't).
+    tokio::pin!(down);
     tokio::select! {
-        _ = down => {}
-        _ = async { up.await; std::future::pending::<()>().await } => {}
+        _ = &mut down => {}
+        _ = up => {
+            let _ = tokio::time::timeout(LAST_ANSWERS, &mut down).await;
+        }
     }
     Ok(())
 }
