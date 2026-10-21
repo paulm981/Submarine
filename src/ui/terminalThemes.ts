@@ -1,5 +1,6 @@
 import type { ITheme } from "@xterm/xterm";
 import { IS_WINDOWS } from "../util/platform";
+import { CUSTOM_THEME_ID, parseWindowsTerminalScheme } from "../util/terminalTheme";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Terminal color schemes.
@@ -13,6 +14,10 @@ import { IS_WINDOWS } from "../util/platform";
 // The scheme is a per-device preference (Settings › Terminal), and a server can
 // have its own (its edit panel) — e.g. a light one for production. A server's
 // choice syncs with it; see `terminal_theme` in src-tauri/src/lib.rs.
+//
+// This device can also use a scheme of the user's own, pasted as Windows
+// Terminal JSON (the original project's #183, util/terminalTheme). It stays on
+// this device, so a server's own scheme is always one of the schemes here.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface SchemeCredit {
@@ -99,8 +104,50 @@ export const SCHEMES: readonly TerminalScheme[] = [
 
 const byId = new Map(SCHEMES.map((s) => [s.id, s]));
 
-/** The scheme with this id, or the default for an unknown / empty one. */
+// ── A scheme of the user's own ──────────────────────────────────────────────
+
+export const CUSTOM_SCHEME = CUSTOM_THEME_ID;
+/** The pasted scheme, as checked Windows Terminal JSON. */
+export const CUSTOM_SCHEME_KEY = "submarine-terminal-custom-theme";
+
+// Parsed once per text, so the same scheme object comes back each time and a
+// terminal sees no change when there is none.
+let customCache: { raw: string; scheme: TerminalScheme | null } | null = null;
+
+/** The user's own scheme from its Windows Terminal JSON; null for none or a broken one. */
+export function customSchemeFrom(raw: string | null | undefined): TerminalScheme | null {
+  if (!raw) return null;
+  if (customCache?.raw === raw) return customCache.scheme;
+  let scheme: TerminalScheme | null = null;
+  try {
+    const p = parseWindowsTerminalScheme(raw);
+    scheme = { ...p, light: isLight(p.theme.background), credit: null };
+  } catch { /* broken: none */ }
+  customCache = { raw, scheme };
+  return scheme;
+}
+
+/** This device's own scheme (Settings › Terminal), if it has one. */
+export function readCustomScheme(): TerminalScheme | null {
+  try {
+    return customSchemeFrom(localStorage.getItem(CUSTOM_SCHEME_KEY));
+  } catch {
+    return null;
+  }
+}
+
+function isLight(hex: string | undefined): boolean {
+  const m = /^#([0-9a-f]{3}|[0-9a-f]{6})/i.exec(hex ?? "");
+  if (!m) return false;
+  const h = m[1].length === 3 ? m[1].replace(/./g, "$&$&") : m[1];
+  const [r, g, b] = [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
+  return 0.299 * r + 0.587 * g + 0.114 * b > 150;
+}
+
+/** The scheme with this id, or the default for an unknown / empty one.
+ *  "custom" is this device's own scheme, while it has one. */
 export function schemeById(id: string | null | undefined): TerminalScheme {
+  if (id === CUSTOM_SCHEME) return readCustomScheme() || byId.get(DEFAULT_SCHEME)!;
   return (id && byId.get(id)) || byId.get(DEFAULT_SCHEME)!;
 }
 
@@ -108,6 +155,7 @@ export function schemeById(id: string | null | undefined): TerminalScheme {
 export function readSchemeId(): string {
   try {
     const id = localStorage.getItem(SCHEME_KEY) || DEFAULT_SCHEME;
+    if (id === CUSTOM_SCHEME) return readCustomScheme() ? id : DEFAULT_SCHEME;
     return byId.has(id) ? id : DEFAULT_SCHEME;
   } catch {
     return DEFAULT_SCHEME;
@@ -140,6 +188,7 @@ export function schemeForServer(serverId: number | undefined): TerminalScheme {
 // the default became per-platform (readGpu).
 export const GPU_KEY = "submarine-terminal-gpu-v2";
 export const MIN_CONTRAST_KEY = "submarine-terminal-min-contrast";
+export const BOLD_BRIGHT_KEY = "submarine-terminal-bold-bright";
 
 /** WCAG AA's ratio for body text, the one VS Code's terminal defaults to. */
 export const MIN_CONTRAST_RATIO = 4.5;
@@ -161,6 +210,9 @@ const readFlag = (key: string, fallback: boolean): boolean => {
 export const readGpu = (): boolean => readFlag(GPU_KEY, IS_WINDOWS);
 /** Lift text a program colored too close to the background. Defaults on. */
 export const readMinContrast = (): boolean => readFlag(MIN_CONTRAST_KEY, true);
+/** Bold text in one of the first eight colors uses its bright version, as
+ *  most terminals do (from the original project, #183). Defaults on. */
+export const readBoldBright = (): boolean => readFlag(BOLD_BRIGHT_KEY, true);
 
 // ── For previews ────────────────────────────────────────────────────────────
 

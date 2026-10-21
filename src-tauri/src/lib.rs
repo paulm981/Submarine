@@ -827,8 +827,8 @@ struct EntitySpec {
 /// an older build sends records without the key, which means "this build
 /// doesn't know the field", not "clear it" — so the merge keeps this device's
 /// value then (and leaves it NULL on a fresh insert). `position` has its own
-/// shim in apply_entity, as it is NOT NULL.
-const LATE_COLS: &[&str] = &["terminal_theme", "highlight"];
+/// shim in apply_entity, as it is NOT NULL. `scope` is a command's (#185).
+const LATE_COLS: &[&str] = &["terminal_theme", "highlight", "scope"];
 
 /// Applied in this order so most FK referents already exist on merge; the two
 /// self-referential FKs (folders.parent_id, servers.jump_host_id) are resolved
@@ -857,7 +857,7 @@ const ENTITIES: &[EntitySpec] = &[
         cols: &["name", "host", "port", "username", "notes", "edited_by"],
         fks: &[Fk { key: "folder_uuid", col: "folder_id", ref_table: "folders", required: false }],
     },
-    EntitySpec { table: "commands", cols: &["title", "content", "edited_by"], fks: &[] },
+    EntitySpec { table: "commands", cols: &["title", "content", "edited_by", "scope"], fks: &[] },
     EntitySpec { table: "notes", cols: &["title", "body", "edited_by"], fks: &[] },
     // The user's own highlight rules (highlight.rs).
     EntitySpec {
@@ -3523,7 +3523,7 @@ mod sync_engine_tests {
              CREATE TABLE ssh_keys(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, public_key TEXT, private_key TEXT, passphrase TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE credentials(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, auth_type TEXT, username TEXT, password TEXT, key_id INTEGER, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT{});
              CREATE TABLE servers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT, key_id INTEGER, autostart INTEGER, mirrors TEXT, color TEXT, notes TEXT, run_on_connect TEXT, jump_host_id INTEGER, position INTEGER NOT NULL DEFAULT 0, terminal_theme TEXT, highlight TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT{});
-             CREATE TABLE commands(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
+             CREATE TABLE commands(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT, scope TEXT);
              CREATE TABLE notes(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE monitor_configs(node_id INTEGER PRIMARY KEY, enabled_metrics TEXT, custom_metrics TEXT, paused INTEGER, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT{});
              CREATE TABLE rdp_links(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 3389, username TEXT NOT NULL DEFAULT '', folder_id INTEGER, notes TEXT NOT NULL DEFAULT '', uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);",
@@ -4087,6 +4087,57 @@ mod sync_engine_tests {
             .unwrap();
         assert_eq!(host, "h2", "the newer remote field edit must apply");
         assert_eq!(pos, 5, "a pre-0.3.5 peer edit must NOT reset the local drag position to 0");
+    }
+
+    // #22: which servers a command is for syncs, and a peer from before it
+    // (no `scope` key) editing the command doesn't make it one for all.
+    #[test]
+    fn command_scope_syncs_and_an_older_peers_edit_keeps_it() {
+        let scope = r#"{"servers":["s-1"],"folders":["f-1"]}"#;
+        let (a, _ha) = device("A");
+        a.execute("INSERT INTO commands(title, content, scope) VALUES('restart', 'systemctl restart app', ?1)", [scope]).unwrap();
+        let (b, hb) = device("B");
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let got = |c: &Connection| -> Option<String> { c.query_row("SELECT scope FROM commands WHERE title='restart'", [], |r| r.get(0)).unwrap() };
+        assert_eq!(got(&b).as_deref(), Some(scope), "the scope syncs");
+
+        a.execute("UPDATE commands SET content='systemctl restart app2' WHERE title='restart'", []).unwrap();
+        let ahead = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 60_000;
+        let mut recs = collect_local_records(&a, &KEY, "").unwrap();
+        for r in recs.iter_mut().filter(|r| r.entity_type == "commands") {
+            let mut obj: serde_json::Value = serde_json::from_slice(&decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap()).unwrap();
+            assert!(obj.as_object_mut().unwrap().remove("scope").is_some(), "a current peer always sends the key");
+            r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
+            r.updated_at = format!("{ahead:015}:00000:zzz");
+        }
+        apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+        let content: String = b.query_row("SELECT content FROM commands WHERE title='restart'", [], |r| r.get(0)).unwrap();
+        assert_eq!(content, "systemctl restart app2", "the edit applies");
+        assert_eq!(got(&b).as_deref(), Some(scope), "and the command keeps its servers");
+
+        // A current peer makes it a command for all servers: an explicit NULL.
+        a.execute("UPDATE commands SET scope=NULL WHERE title='restart'", []).unwrap();
+        let later = ahead + 60_000;
+        let mut recs = collect_local_records(&a, &KEY, "").unwrap();
+        for r in recs.iter_mut().filter(|r| r.entity_type == "commands") {
+            r.updated_at = format!("{later:015}:00000:zzz");
+        }
+        apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+        assert_eq!(got(&b), None, "NULL from a current peer is all servers again");
+
+        // And a command that is new to this device, from an older peer, lands
+        // as one for all servers.
+        let (c, _hc) = device("C");
+        c.execute("INSERT INTO commands(title, content) VALUES('uptime', 'uptime')", []).unwrap();
+        let mut recs = collect_local_records(&c, &KEY, "").unwrap();
+        for r in recs.iter_mut().filter(|r| r.entity_type == "commands") {
+            let mut obj: serde_json::Value = serde_json::from_slice(&decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap()).unwrap();
+            obj.as_object_mut().unwrap().remove("scope");
+            r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
+        }
+        apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+        let s: Option<String> = b.query_row("SELECT scope FROM commands WHERE title='uptime'", [], |r| r.get(0)).unwrap();
+        assert_eq!(s, None);
     }
 
     #[test]
@@ -5451,6 +5502,9 @@ async fn setup_master_db_inner(
             // `get_servers` sorts by (position, id) so ties fall back to id.
             // Synced (it's in the servers ENTITIES cols), so order LWW-merges.
             "ALTER TABLE servers ADD COLUMN position INTEGER NOT NULL DEFAULT 0",
+            // Which servers a command is for (#22): JSON of server and folder
+            // uuids, NULL for all servers (normalize_command_scope). Synced.
+            "ALTER TABLE commands ADD COLUMN scope TEXT",
         ] {
             if let Err(e) = conn.execute(stmt, []) {
                 let s = e.to_string();
@@ -5494,7 +5548,7 @@ async fn setup_master_db_inner(
              CREATE TABLE ssh_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, public_key TEXT, private_key TEXT, passphrase TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE credentials (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, auth_type TEXT, username TEXT, password TEXT, key_id INTEGER, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT, FOREIGN KEY(key_id) REFERENCES ssh_keys(id));
              CREATE TABLE servers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT DEFAULT 'none', proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT DEFAULT 'vault', key_id INTEGER, autostart INTEGER NOT NULL DEFAULT 0, mirrors TEXT NOT NULL DEFAULT '[]', color TEXT, notes TEXT NOT NULL DEFAULT '', run_on_connect TEXT NOT NULL DEFAULT '', jump_host_id INTEGER, position INTEGER NOT NULL DEFAULT 0, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT, FOREIGN KEY(folder_id) REFERENCES folders(id));
-             CREATE TABLE commands (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
+             CREATE TABLE commands (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT, scope TEXT);
              CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE known_hosts (id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT, port INTEGER, fingerprint TEXT, key_type TEXT);
              CREATE TABLE monitor_configs (node_id INTEGER PRIMARY KEY, enabled_metrics TEXT NOT NULL DEFAULT '[\"cpu\",\"mem\",\"disk\",\"load\"]', custom_metrics TEXT NOT NULL DEFAULT '[]', paused INTEGER NOT NULL DEFAULT 1, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT, FOREIGN KEY(node_id) REFERENCES servers(id) ON DELETE CASCADE);
@@ -7191,7 +7245,7 @@ mod folder_subtree_tests {
 async fn get_folders(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-    let mut stmt = conn.prepare("SELECT id, name, parent_id, color FROM folders").map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare("SELECT id, name, parent_id, color, uuid FROM folders").map_err(|e| e.to_string())?;
 
     let rows = stmt.query_map([], |row| {
         Ok(json!({
@@ -7199,6 +7253,8 @@ async fn get_folders(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
             "name": row.get::<_, String>(1)?,
             "parent_id": row.get::<_, Option<i32>>(2)?,
             "color": row.get::<_, Option<String>>(3)?,
+            // What a command's scope names a folder by (#22).
+            "uuid": row.get::<_, Option<String>>(4)?,
         }))
     }).map_err(|e| e.to_string())?;
     
@@ -7209,14 +7265,89 @@ async fn get_folders(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
     Ok(list)
 }
 
+/// Which servers a command is for (#22), as kept in `commands.scope`:
+/// `{"servers":[uuid…],"folders":[uuid…]}`, the uuids of saved servers and of
+/// folders (a folder takes in the folders inside it). `None`, or both lists
+/// empty, is every server. Checked and rewritten in one form; a uuid this
+/// device doesn't have (not synced yet, or deleted) is kept, and just matches
+/// nothing.
+fn normalize_command_scope(scope: Option<&str>) -> Result<Option<String>, String> {
+    const MAX_IDS: usize = 1000;
+    let Some(text) = scope.map(str::trim).filter(|s| !s.is_empty() && *s != "null") else {
+        return Ok(None);
+    };
+    let v: serde_json::Value = serde_json::from_str(text).map_err(|_| "[INPUT] BAD_SCOPE".to_string())?;
+    let obj = v.as_object().ok_or("[INPUT] BAD_SCOPE")?;
+    let ids = |key: &str| -> Result<Vec<String>, String> {
+        let mut out: Vec<String> = Vec::new();
+        let Some(list) = obj.get(key) else { return Ok(out) };
+        for id in list.as_array().ok_or("[INPUT] BAD_SCOPE")? {
+            let id = id.as_str().ok_or("[INPUT] BAD_SCOPE")?;
+            let ok = (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+            if !ok {
+                return Err("[INPUT] BAD_SCOPE".into());
+            }
+            if !out.iter().any(|x| x == id) {
+                out.push(id.to_string());
+            }
+        }
+        Ok(out)
+    };
+    let (servers, folders) = (ids("servers")?, ids("folders")?);
+    if servers.len() + folders.len() > MAX_IDS {
+        return Err("[INPUT] BAD_SCOPE".into());
+    }
+    if servers.is_empty() && folders.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(json!({ "servers": servers, "folders": folders }).to_string()))
+}
+
+#[cfg(test)]
+mod command_scope_tests {
+    use super::normalize_command_scope as n;
+
+    #[test]
+    fn all_servers_is_none() {
+        assert_eq!(n(None).unwrap(), None);
+        assert_eq!(n(Some("")).unwrap(), None);
+        assert_eq!(n(Some("null")).unwrap(), None);
+        assert_eq!(n(Some(r#"{"servers":[],"folders":[]}"#)).unwrap(), None);
+        assert_eq!(n(Some("{}")).unwrap(), None);
+    }
+
+    #[test]
+    fn one_form_without_repeats() {
+        assert_eq!(
+            n(Some(r#"{"folders":["f-1"],"servers":["a1","a1","b-2"],"other":1}"#)).unwrap().as_deref(),
+            Some(r#"{"folders":["f-1"],"servers":["a1","b-2"]}"#),
+        );
+    }
+
+    #[test]
+    fn anything_else_is_refused() {
+        for bad in [
+            "[]", "\"x\"", "not json", r#"{"servers":"a"}"#, r#"{"servers":[1]}"#,
+            r#"{"servers":["a b"]}"#, r#"{"servers":["a/../b"]}"#, r#"{"folders":[""]}"#,
+        ] {
+            assert!(n(Some(bad)).is_err(), "{bad}");
+        }
+        let long = format!(r#"{{"servers":["{}"]}}"#, "a".repeat(65));
+        assert!(n(Some(&long)).is_err());
+        let many: Vec<String> = (0..1001).map(|i| format!("\"s{i}\"")).collect();
+        assert!(n(Some(&format!(r#"{{"servers":[{}]}}"#, many.join(",")))).is_err());
+    }
+}
+
 #[tauri::command]
-async fn add_command(state: tauri::State<'_, DbState>, title: String, content: String) -> Result<(), String> {
+async fn add_command(state: tauri::State<'_, DbState>, title: String, content: String, scope: Option<String>) -> Result<(), String> {
+    let scope = normalize_command_scope(scope.as_deref())?;
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-    
+
     conn.execute(
-        "INSERT INTO commands (title, content) VALUES (?1, ?2)",
-        rusqlite::params![title, content],
+        "INSERT INTO commands (title, content, scope) VALUES (?1, ?2, ?3)",
+        rusqlite::params![title, content, scope],
     ).map_err(|e| format!("[DATABASE] COMMAND_INSERT_FAILED: {}", e))?;
     
     drop(conn_guard);
@@ -7239,6 +7370,26 @@ async fn edit_command(state: tauri::State<'_, DbState>, id: i32, title: String, 
     Ok(())
 }
 
+/// Sets which servers a command is for (see normalize_command_scope); `None`
+/// for all. Apart from edit_command, so that an edit of the title or the
+/// command (the session's Library edits those) leaves it as it is. An
+/// unchanged scope doesn't touch the row, so it isn't synced again.
+#[tauri::command]
+async fn set_command_scope(state: tauri::State<'_, DbState>, id: i32, scope: Option<String>) -> Result<(), String> {
+    let scope = normalize_command_scope(scope.as_deref())?;
+    let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+    let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+    let changed = conn.execute(
+        "UPDATE commands SET scope=?1 WHERE id=?2 AND scope IS NOT ?1",
+        rusqlite::params![scope, id],
+    ).map_err(|e| format!("[DATABASE] COMMAND_UPDATE_FAILED: {}", e))?;
+    drop(conn_guard);
+    if changed > 0 {
+        save_vault_internal(&state)?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn delete_command(state: tauri::State<'_, DbState>, id: i32) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
@@ -7258,13 +7409,16 @@ async fn delete_command(state: tauri::State<'_, DbState>, id: i32) -> Result<(),
 async fn get_commands(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-    let mut stmt = conn.prepare("SELECT id, title, content FROM commands").map_err(|e| e.to_string())?;
-    
+    let mut stmt = conn.prepare("SELECT id, title, content, scope FROM commands").map_err(|e| e.to_string())?;
+
     let rows = stmt.query_map([], |row| {
         Ok(json!({
-            "id": row.get::<_, i32>(0)?, 
-            "title": row.get::<_, String>(1)?, 
-            "content": row.get::<_, String>(2)?
+            "id": row.get::<_, i32>(0)?,
+            "title": row.get::<_, String>(1)?,
+            "content": row.get::<_, String>(2)?,
+            // As a synced peer sent it: the frontend reads it defensively
+            // (util/commandScope), so a broken one counts as all servers.
+            "scope": row.get::<_, Option<String>>(3)?
         }))
     }).map_err(|e| e.to_string())?;
     
@@ -9282,6 +9436,11 @@ pub(crate) fn ssh_preferred_algorithms() -> russh::Preferred {
         kex::MLKEM768X25519_SHA256, // hybrid post-quantum (OpenSSH 9.9+; its default since 10.0)
         kex::CURVE25519,
         kex::CURVE25519_PRE_RFC_8731,
+        // The NIST curves, in OpenSSH's own order: the only KEX of some
+        // servers and network devices (#178).
+        kex::ECDH_SHA2_NISTP256,
+        kex::ECDH_SHA2_NISTP384,
+        kex::ECDH_SHA2_NISTP521,
         // Group exchange (issue #33): the only KEX some hardened / appliance
         // servers enable. Bounds in ssh_gex_params.
         kex::DH_GEX_SHA256,
@@ -9294,6 +9453,9 @@ pub(crate) fn ssh_preferred_algorithms() -> russh::Preferred {
         // which is within reach of a well-funded attacker (Logjam) and which
         // OpenSSH stopped offering in 7.0.
         kex::DH_G14_SHA1,
+        // Group exchange over SHA-1: the only one of some old network
+        // devices (#178). Its groups are 2048 bits or more (ssh_gex_params).
+        kex::DH_GEX_SHA1,
         // Pseudo-algorithms, never selected as the KEX: RFC 8308 ext-info
         // (server-sig-algs → RSA SHA-2 user auth) and OpenSSH strict KEX
         // (Terrapin mitigation).
@@ -9745,6 +9907,20 @@ mod ssh_config_tests {
         let gex = pos("diffie-hellman-group-exchange-sha256");
         assert!(pos("mlkem768x25519-sha256") < gex && pos("curve25519-sha256") < gex);
         assert!(gex < pos("diffie-hellman-group14-sha256"));
+        // The NIST curves after X25519, before the finite-field groups (#178).
+        assert!(pos("curve25519-sha256@libssh.org") < pos("ecdh-sha2-nistp256"));
+        assert!(pos("ecdh-sha2-nistp256") < pos("ecdh-sha2-nistp384") && pos("ecdh-sha2-nistp384") < pos("ecdh-sha2-nistp521"));
+        assert!(pos("ecdh-sha2-nistp521") < gex);
+        // SHA-1 only as a last resort, after every SHA-2 one.
+        let sha1 = ["diffie-hellman-group14-sha1", "diffie-hellman-group-exchange-sha1"].map(pos);
+        assert!(sha1.windows(2).all(|w| w[0] < w[1]));
+        // Never the 1024-bit group 1 (Logjam), which the original project
+        // still offers.
+        assert!(!kex.iter().any(|k| k == "diffie-hellman-group1-sha1"));
+        for (i, k) in kex.iter().enumerate() {
+            let real = ["diffie-hellman", "ecdh", "curve", "mlkem"].iter().any(|p| k.starts_with(p));
+            assert!(!real || k.ends_with("-sha1") || i < sha1[0], "{k} comes after a SHA-1 one");
+        }
         // Host keys: the pre-0.63 release order first, so already-pinned hosts
         // keep negotiating the key type whose fingerprint is on file.
         let keys: Vec<String> = p.key.iter().map(|a| a.to_string()).collect();
@@ -9781,6 +9957,37 @@ mod ssh_config_tests {
         assert_eq!(format!("{:?}", names.client_compression), "None");
         assert_eq!(format!("{:?}", names.server_compression), "None");
         assert_eq!(names.kex.as_ref(), "mlkem768x25519-sha256");
+    }
+
+    /// #178: servers whose only key exchange is one of the NIST curves, or the
+    /// old group exchange over SHA-1, connect and negotiate it.
+    #[tokio::test]
+    async fn servers_with_only_a_nist_curve_or_sha1_group_exchange_connect() {
+        for only in [
+            russh::kex::ECDH_SHA2_NISTP256,
+            russh::kex::ECDH_SHA2_NISTP384,
+            russh::kex::ECDH_SHA2_NISTP521,
+            russh::kex::DH_GEX_SHA1,
+        ] {
+            let only_this = move |c: &mut russh::server::Config| {
+                c.preferred = russh::Preferred {
+                    kex: Cow::Owned(vec![only]),
+                    ..russh::Preferred::default()
+                };
+            };
+            let server = TestServer::with_gex_group(russh::kex::dh::groups::DH_GROUP14);
+            let client = TestClient::default();
+            let negotiated = Arc::clone(&client.negotiated);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                connect_with_client(server, only_this, build_ssh_client_config(), client),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{} handshake must finish", only.as_ref()))
+            .unwrap_or_else(|e| panic!("{} must be accepted: {e:?}", only.as_ref()));
+            let names = negotiated.lock().unwrap().clone().expect("kex done");
+            assert_eq!(names.kex.as_ref(), only.as_ref());
+        }
     }
 
     /// #33: a server that ONLY does diffie-hellman-group-exchange-sha256 and
@@ -12807,6 +13014,42 @@ async fn write_terminal_data(state: tauri::State<'_, SshState>, terminal_id: Str
         let _ = tx.send(TerminalCommand::Data(data)).await;
     }
     Ok(())
+}
+
+/// Types a saved password into a terminal, for a password prompt there (sudo,
+/// su, …) that the user picked it for (#28): a server's own saved password
+/// (`server_id`) or a saved login's (`credential_id`). It goes from the
+/// profile to the terminal and never reaches the webview. No Enter after it:
+/// the user sees where it went and presses Enter themselves.
+#[tauri::command]
+async fn type_saved_password(
+    ssh: tauri::State<'_, SshState>,
+    db: tauri::State<'_, DbState>,
+    terminal_id: String,
+    server_id: Option<i32>,
+    credential_id: Option<i32>,
+) -> Result<(), String> {
+    use crate::ssh_manager::TerminalCommand;
+    let saved = {
+        let conn_guard = db.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+        let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        let (sql, id) = match (server_id, credential_id) {
+            (Some(id), None) => ("SELECT password FROM servers WHERE id = ?1", id),
+            (None, Some(id)) => ("SELECT password FROM credentials WHERE id = ?1", id),
+            _ => return Err("Pick one saved password".into()),
+        };
+        conn.query_row(sql, rusqlite::params![id], |row| row.get::<_, Option<String>>(0))
+            .map_err(|e| format!("[DATABASE] READ_FAILED: {}", e))?
+    };
+    let password = Zeroizing::new(saved.filter(|p| !p.is_empty()).ok_or("There's no saved password there")?);
+    // A line break would press Enter part-way through it.
+    if password.chars().any(char::is_control) {
+        return Err("That password has a line break or another control character, so it isn't typed".into());
+    }
+    let tx = ssh.terminal_txs.lock().await.get(&terminal_id).cloned().ok_or("That terminal isn't open")?;
+    tx.send(TerminalCommand::Data(password.as_bytes().to_vec()))
+        .await
+        .map_err(|_| "That terminal isn't open".to_string())
 }
 
 #[tauri::command]
@@ -20023,7 +20266,7 @@ pub fn run() {
             get_credentials, generate_ssh_key,
             add_folder, rename_folder, delete_folder, get_folders,
             tree_moves::move_servers, tree_moves::move_rdp_links, tree_moves::move_folder, tree_moves::delete_tree_items,
-            add_command, edit_command, delete_command, get_commands,
+            add_command, edit_command, set_command_scope, delete_command, get_commands,
             cmd_history_add, cmd_history_list, cmd_history_clear,
             add_note, edit_note, delete_note, get_notes,
             mirror_dry_run, start_mirror, stop_mirror, list_mirrors, pick_local_directory,
@@ -20034,7 +20277,7 @@ pub fn run() {
             initiate_connection, verify_fingerprint_response, submit_kbi_response, disconnect_session, set_use_ssh_config,
             start_tunnel, stop_tunnel, list_tunnels, restart_session_tunnels, persist_session_tunnels,
             list_tunnel_rules, remove_tunnel_rule, rename_tunnel_rule,
-            open_terminal, local_shell, write_terminal_data, resize_terminal, close_terminal,
+            open_terminal, local_shell, write_terminal_data, type_saved_password, resize_terminal, close_terminal,
             multiexec::write_terminals_data,
             local_term::list_local_shells, local_term::local_shell_set_default,
             local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,

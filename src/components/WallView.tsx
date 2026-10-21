@@ -48,6 +48,10 @@ export interface Wall {
   solo: string | null;
   /// Tiles per row; 0 = fit to the count.
   cols: number;
+  /// Rows on screen at once (the original project's #190): 0 or unset = as
+  /// many as the tiles need; a number = that many fill the screen, and tiles
+  /// past columns × rows scroll. Not saved with a saved wall.
+  rows?: number;
   /// The saved wall it was opened from or saved as.
   savedId: number | null;
   /// Broadcast takes the open tabs into its Wall: the sessions that were
@@ -431,6 +435,31 @@ export const WallView = ({
   };
 
   const cols = wall.cols || autoCols(wall.members.length);
+  // Each row gets an explicit height from the grid area's (#190). A flexible
+  // row grew with the terminal in it, which fits itself to the row: a row
+  // that had filled the screen kept doing so, and the Wall scrolled with
+  // tiles that would fit. The padding and gaps are p-1.5 and gap-1.5; as
+  // many rows as needed don't go below 200 px (220 px for up to four
+  // tiles), a chosen number of rows not below 120 px.
+  const gridAreaRef = useRef<HTMLDivElement | null>(null);
+  const [gridAreaH, setGridAreaH] = useState(0);
+  useEffect(() => {
+    const el = gridAreaRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setGridAreaH(el.clientHeight));
+    ro.observe(el);
+    setGridAreaH(el.clientHeight);
+    return () => ro.disconnect();
+  }, []);
+  const wallRows = wall.rows ?? 0;
+  const autoMin = wall.members.length <= 4 ? 220 : 200;
+  const rowHeight = (() => {
+    const rows = wallRows || Math.max(1, Math.ceil(wall.members.length / cols));
+    if (!gridAreaH) return `minmax(${autoMin}px, 1fr)`;
+    const space = 6;
+    const h = Math.floor((gridAreaH - 2 * space - (rows - 1) * space) / rows);
+    return `${Math.max(wallRows ? 120 : autoMin, h)}px`;
+  })();
   const sessionOf = (sid: string) => sessions.find((s) => s.id === sid);
   const soloName = solo ? sessionOf(wall.members.find((m) => m.terminalId === solo)?.sessionId ?? "")?.serverName : null;
   // A click on the bar (not on its buttons) or between tiles: back to typing
@@ -568,15 +597,34 @@ export const WallView = ({
         )}
 
         <div className="flex-1" />
-        <div className="flex items-center gap-1 shrink-0">
+        <div className="flex items-center gap-1 shrink-0" role="group" aria-label="Columns">
           <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-500">Cols</span>
           {[0, 1, 2, 3, 4, 5, 6].map((n) => (
             <button
               key={n}
               onClick={() => onChange({ cols: n })}
               title={n === 0 ? "Fit to the number of terminals" : `${plural(n, "column")} per row`}
+              aria-pressed={wall.cols === n}
               className={`h-6 ${n === 0 ? "px-1.5" : "w-6"} rounded flex items-center justify-center text-[10px] font-bold transition-all ${
                 wall.cols === n
+                  ? "bg-primary/20 text-primary border border-primary/40"
+                  : "text-zinc-400 hover:bg-white/[0.06] border border-transparent"
+              }`}
+            >
+              {n === 0 ? "Auto" : n}
+            </button>
+          ))}
+        </div>
+        <div className="flex items-center gap-1 shrink-0" role="group" aria-label="Rows">
+          <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-500">Rows</span>
+          {[0, 1, 2, 3, 4].map((n) => (
+            <button
+              key={n}
+              onClick={() => onChange({ rows: n })}
+              title={n === 0 ? "As many rows as the terminals need" : `${plural(n, "row")} on screen; more terminals scroll`}
+              aria-pressed={wallRows === n}
+              className={`h-6 ${n === 0 ? "px-1.5" : "w-6"} rounded flex items-center justify-center text-[10px] font-bold transition-all ${
+                wallRows === n
                   ? "bg-primary/20 text-primary border border-primary/40"
                   : "text-zinc-400 hover:bg-white/[0.06] border border-transparent"
               }`}
@@ -610,6 +658,7 @@ export const WallView = ({
       </div>
 
       <div
+        ref={gridAreaRef}
         className="flex-1 relative bg-black/40 overflow-auto custom-scrollbar"
         onMouseDown={(e) => { if (e.target === e.currentTarget || (e.target as HTMLElement).dataset.wallGrid) backToAll(); }}
       >
@@ -627,7 +676,7 @@ export const WallView = ({
             className="min-h-full grid gap-1.5 p-1.5"
             style={{
               gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
-              gridAutoRows: wall.members.length <= 4 ? "minmax(220px, 1fr)" : "minmax(200px, 1fr)",
+              gridAutoRows: rowHeight,
             }}
           >
             {wall.members.map((m) => {

@@ -1162,7 +1162,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
                 if(window.confirm('Reset all UI customizations?')) {
                   setSettings((s: any) => ({
                     ...s, primaryColor: '#60a5fa', backgroundColor: '#0a0a0c', terminalFontSize: 14, terminalFontFamily: '',
-                    terminalScheme: DEFAULT_SCHEME, terminalGpu: IS_WINDOWS, terminalMinContrast: true,
+                    terminalScheme: DEFAULT_SCHEME, terminalGpu: IS_WINDOWS, terminalMinContrast: true, terminalBoldBright: true,
                   }));
                 }
               }}

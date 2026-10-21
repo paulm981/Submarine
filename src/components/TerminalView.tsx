@@ -7,6 +7,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { Channel, invoke } from '@tauri-apps/api/core';
 import '@xterm/xterm/css/xterm.css';
+import { KeyRound } from 'lucide-react';
 import { useIsNarrow } from '../hooks/useViewport';
 import { MobileKeyBar, ModifiersState, ModKey, SpecialKey } from './MobileKeyBar';
 import { appHotkey, markTyped, registerTerminal, terminalStateChanged } from '../ui/terminalDock';
@@ -15,7 +16,7 @@ import { forgetTerminal, logLine, noteTerminalOutput, noteTerminalParsed, noteTe
 import { useConfirm } from '../ui/confirm';
 import HistorySearchOverlay from './HistorySearchOverlay';
 import { DEFAULT_FONT_STACK, fontFamilyCss, readFontFamily, readFontSize } from '../util/terminalFont';
-import { MIN_CONTRAST_RATIO, readGpu, readMinContrast, schemeForServer } from '../ui/terminalThemes';
+import { MIN_CONTRAST_RATIO, readBoldBright, readGpu, readMinContrast, schemeForServer } from '../ui/terminalThemes';
 import { HighlightStream, matcherForServer, type Matcher } from '../ui/highlight';
 import { readScrollback } from '../util/terminalScrollback';
 import { readUseLocalShell } from '../util/terminalShell';
@@ -95,6 +96,14 @@ const LINE_FINALS = new Set<string>(['S', 'T', 'L', 'M']);
 // off → armed → locked → off (cycled by repeated taps).
 const cycleMod = (s: "off" | "armed" | "locked"): "off" | "armed" | "locked" =>
   s === "off" ? "armed" : s === "armed" ? "locked" : "off";
+
+// How long a terminal's size must hold before its PTY gets it. A layout
+// change passes through sizes for a few frames: the narrow and the wide
+// layout swap at 640 px (the terminal is 2 columns wide for a frame) and
+// panels animate their width. The shell redraws its prompt for every size
+// it is given, so each of those left the screen garbled and the cursor out
+// of place.
+const PTY_SIZE_SETTLE_MS = 150;
 
 const TerminalView = ({
   sessionId,
@@ -610,6 +619,60 @@ const TerminalView = ({
     })();
   };
 
+  // The output ends in a password prompt (sudo, su, …): a button offers to
+  // type a saved password there (#28). The next key typed or more output
+  // takes it away. The backend types the password: it never comes here.
+  const [atPasswordPrompt, setAtPasswordPrompt] = useState(false);
+  const atPasswordPromptRef = useRef(false);
+  const showPasswordButton = (on: boolean) => {
+    if (atPasswordPromptRef.current === on) return;
+    atPasswordPromptRef.current = on;
+    setAtPasswordPrompt(on);
+    if (!on) setPasswordMenu(null);
+  };
+  type SavedPassword = { label: string; detail: string; serverId?: number; credentialId?: number };
+  const [passwordMenu, setPasswordMenu] = useState<SavedPassword[] | null>(null);
+  const openPasswordMenu = async () => {
+    try {
+      const [servers, logins] = await Promise.all([
+        invoke<any[]>('get_servers'),
+        invoke<any[]>('get_credentials'),
+      ]);
+      const server = serverId > 0 ? servers.find((s) => s.id === serverId) : undefined;
+      const items: SavedPassword[] = [];
+      if (server?.has_password) {
+        items.push({ label: "This server's password", detail: server.username || server.name, serverId: server.id });
+      }
+      // Its own saved login first, then the others.
+      const withPassword = logins.filter((c) => c.has_password);
+      withPassword.sort((a, b) => Number(b.id === server?.credential_id) - Number(a.id === server?.credential_id));
+      for (const c of withPassword) {
+        items.push({
+          label: c.name,
+          detail: c.id === server?.credential_id ? `${c.username} · this server's login` : c.username,
+          credentialId: c.id,
+        });
+      }
+      setPasswordMenu(items);
+    } catch (e) {
+      notify(`Couldn't read the saved passwords: ${String(e)}`, 'err');
+    }
+  };
+  const typeSavedPassword = async (p: SavedPassword) => {
+    setPasswordMenu(null);
+    try {
+      await invoke('type_saved_password', {
+        terminalId,
+        serverId: p.serverId ?? null,
+        credentialId: p.credentialId ?? null,
+      });
+      showPasswordButton(false);
+    } catch (e) {
+      notify(String(e), 'err');
+    }
+    xtermRef.current?.focus();
+  };
+
   useEffect(() => {
     if (!terminalRef.current) return;
 
@@ -629,6 +692,8 @@ const TerminalView = ({
       // Text a program colored too close to its background is lightened or
       // darkened until it reads (WCAG AA, as VS Code's terminal does).
       minimumContrastRatio: readMinContrast() ? MIN_CONTRAST_RATIO : 1,
+      // Bold text in the first eight colors uses their bright versions.
+      drawBoldTextInBrightColors: readBoldBright(),
       // OSC 8 hyperlinks a program on the server prints: asked first
       // (openLink). xterm already ignores other schemes while
       // allowNonHttpProtocols is off.
@@ -813,6 +878,7 @@ const TerminalView = ({
       // A Wall's line isn't this one's whole any more — unless this is only
       // the terminal saying it got or lost the focus (for vim, tmux).
       if (data !== '\x1b[I' && data !== '\x1b[O') markTyped(terminalId);
+      showPasswordButton(false);
       // A paste: our right-click path, or xterm's own keyboard paste, which
       // starts with the bracketed-paste marker when the remote program asked
       // for one. Never run through the armed modifiers or into history.
@@ -1094,11 +1160,15 @@ const TerminalView = ({
     window.addEventListener('blur', onWindowBlur);
     host.addEventListener('contextmenu', onContextMenu);
 
-    // Handle Resize
+    // Handle Resize, once the size has settled (PTY_SIZE_SETTLE_MS).
     // Refused until the shell is open (NOT_OPEN); the size is sent again
     // once it is (syncSize), so that's not worth an error in the log.
-    const onResizeDisposable = term.onResize(({ cols, rows }) => {
-      invoke(commands.resize, { terminalId, cols, rows }).catch(() => {});
+    let sizeTimer = 0;
+    const onResizeDisposable = term.onResize(() => {
+      window.clearTimeout(sizeTimer);
+      sizeTimer = window.setTimeout(() => {
+        invoke(commands.resize, { terminalId, cols: term.cols, rows: term.rows }).catch(() => {});
+      }, PTY_SIZE_SETTLE_MS);
     });
 
     // Output: raw bytes over the channel the terminal was opened with. Once
@@ -1145,6 +1215,7 @@ const TerminalView = ({
         const txt = new TextDecoder().decode(data);
         const combined = recentOutputRef.current + txt;
         recentOutputRef.current = combined.length > 512 ? combined.slice(-512) : combined;
+        showPasswordButton(looksLikePasswordPrompt(recentOutputRef.current));
       } catch { /* decode hiccup on a split multibyte chunk — ignore */ }
     };
 
@@ -1156,6 +1227,16 @@ const TerminalView = ({
     const resizeObserver = new ResizeObserver(() => {
       if (!xtermRef.current) return;
       if (!onScreen()) return;
+      // A terminal at its bottom stays there. On a phone, the box changing
+      // while output comes in (the key bar back after a reconnect, the
+      // keyboard) is at times taken by xterm for the user scrolling up, and
+      // the view then stops following what comes in: a reconnected session
+      // kept showing the old one's last lines, its new prompt out of sight
+      // below. Put it back at the bottom once the change has settled.
+      const buf = xtermRef.current.buffer.active;
+      if (buf.viewportY === buf.baseY) {
+        requestAnimationFrame(() => requestAnimationFrame(() => xtermRef.current?.scrollToBottom()));
+      }
       if (rafId) return; // a rAF is already queued; coalesce
       rafId = requestAnimationFrame(() => {
         rafId = 0;
@@ -1182,6 +1263,8 @@ const TerminalView = ({
       }
       const ratio = readMinContrast() ? MIN_CONTRAST_RATIO : 1;
       if (term.options.minimumContrastRatio !== ratio) term.options.minimumContrastRatio = ratio;
+      const boldBright = readBoldBright();
+      if (term.options.drawBoldTextInBrightColors !== boldBright) term.options.drawBoldTextInBrightColors = boldBright;
       setGpu(readGpu());
       const next = matcherForServer(serverId);
       if (next !== matcher) {
@@ -1316,6 +1399,7 @@ const TerminalView = ({
       onDataDisposable.dispose();
       if (inputRef.current === handleData) inputRef.current = null;
       onResizeDisposable.dispose();
+      window.clearTimeout(sizeTimer);
       host.removeEventListener('mousedown', onMouseDown);
       host.removeEventListener('contextmenu', onContextMenu);
       document.removeEventListener('mouseup', onDocMouseUp);
@@ -1403,6 +1487,46 @@ const TerminalView = ({
           >
             {'✕'}
           </button>
+        </div>
+      )}
+      {atPasswordPrompt && !disabled && !showSearch && (
+        <div className="absolute top-2 right-2 z-20 flex flex-col items-end gap-1 max-w-[calc(100%-1rem)]">
+          <button
+            type="button"
+            onClick={() => (passwordMenu ? setPasswordMenu(null) : void openPasswordMenu())}
+            aria-haspopup="menu"
+            aria-expanded={!!passwordMenu}
+            title="Type a saved password at this prompt (no Enter)"
+            className="flex items-center gap-1.5 rounded-md bg-zinc-800 border border-white/10 px-2 py-1 shadow-lg text-[11px] text-zinc-200 hover:text-white hover:border-primary/40"
+          >
+            <KeyRound size={12} className="text-primary shrink-0" />
+            <span className="whitespace-nowrap">Saved password</span>
+          </button>
+          {passwordMenu && (
+            <div
+              role="menu"
+              aria-label="Saved passwords"
+              onKeyDown={(e) => { if (e.key === 'Escape') { e.stopPropagation(); setPasswordMenu(null); xtermRef.current?.focus(); } }}
+              className="w-64 max-w-full max-h-60 overflow-y-auto rounded-md bg-zinc-900 border border-white/10 shadow-xl p-1"
+            >
+              {passwordMenu.length === 0 ? (
+                <div className="px-2 py-1.5 text-[11px] text-zinc-400">
+                  No saved passwords. Save one with the server or under Logins.
+                </div>
+              ) : passwordMenu.map((p) => (
+                <button
+                  key={p.serverId != null ? `s${p.serverId}` : `c${p.credentialId}`}
+                  type="button"
+                  role="menuitem"
+                  onClick={() => void typeSavedPassword(p)}
+                  className="w-full text-left px-2 py-1.5 rounded hover:bg-white/[0.06] focus:bg-white/[0.06] focus:outline-none"
+                >
+                  <div className="text-[11.5px] text-zinc-100 truncate">{p.label}</div>
+                  {p.detail && <div className="text-[10px] text-zinc-500 truncate">{p.detail}</div>}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       )}
       {isMobile && !disabled && (
