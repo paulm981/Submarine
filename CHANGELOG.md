@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Enter in a question does what the focused button says.** Tab to Cancel (or Skip, or ✕) and press Enter, and that's what happens. Before, Enter always took the main action, so it could delete a folder or overwrite a file you meant to keep. With no button focused, Enter still takes the main action. ([#94](https://github.com/paulm981/Submarine/issues/94))
+
+## v0.4.0-fork.1
+
 - **Files from a server don't run on macOS and Linux either.** Live Edit opens a file in your default text editor on macOS, and in the text editor set for plain text on Linux. The Local pane asks before it opens a file that could run (on macOS a `.terminal` or `.command` file too, and Windows programs, which Wine can run), and downloads on macOS are marked as from the internet. ([#84](https://github.com/paulm981/Submarine/issues/84))
 - **A jump host that stops answering no longer keeps a tab connecting.** Reaching the server behind it has 15 seconds, and logging in to it 5 minutes, prompts included. Other servers behind it stop waiting for their turn. ([#84](https://github.com/paulm981/Submarine/issues/84))
 - **Home terminals and AI tabs** leave out escape sequences that would freeze the window, as SSH terminals do. So does a container's terminal opened as root. ([#84](https://github.com/paulm981/Submarine/issues/84))
