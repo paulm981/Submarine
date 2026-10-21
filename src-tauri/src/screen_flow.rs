@@ -65,10 +65,13 @@ impl Flow {
 /// The open screen tabs' flows, each with the attempt it belongs to: a
 /// Reconnect starts a new one, and the old attempt's end must not take it away.
 #[derive(Default, Clone)]
-pub struct ScreenFlows(Arc<Mutex<HashMap<String, (u64, Arc<Flow>)>>>);
+pub struct ScreenFlows(Arc<Mutex<FlowMap>>);
+
+/// Each tab's attempt and its flow, by session id.
+type FlowMap = HashMap<String, (u64, Arc<Flow>)>;
 
 impl ScreenFlows {
-    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, (u64, Arc<Flow>)>> {
+    fn map(&self) -> std::sync::MutexGuard<'_, FlowMap> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 

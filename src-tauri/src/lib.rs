@@ -194,7 +194,7 @@ fn lock_profile(state: &DbState, path: &Path) -> Result<ProfileLock, String> {
 }
 
 fn try_lock_file(lock_path: &Path) -> Result<ProfileLock, String> {
-    let file = match fs::OpenOptions::new().create(true).write(true).open(lock_path) {
+    let file = match fs::OpenOptions::new().create(true).write(true).truncate(false).open(lock_path) {
         Ok(file) => file,
         Err(_) => return Ok(ProfileLock::Unsupported),
     };
