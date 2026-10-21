@@ -1,7 +1,7 @@
-import { ReactNode, useState } from "react";
+import { ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Bot, Check, ChevronDown, ChevronRight, Loader2, ShieldAlert, Square, X } from "lucide-react";
-import { AiDone, AiSnapshot } from "../util/ai";
+import { AiDone, AiPending, AiSnapshot } from "../util/ai";
 import { HIDDEN_CONTROLS } from "../util/fileName";
 
 // The AI panel (#32): one for the whole app, docked on the right and opened
@@ -18,14 +18,16 @@ import { HIDDEN_CONTROLS } from "../util/fileName";
 /// detail count.
 const byPointer = (e: React.MouseEvent) => e.detail > 0;
 
-// What would hide or reorder text, shown plainly: the controls file names
+// What would hide or reorder text, shown plainly: the characters file names
 // are checked for (HIDDEN_CONTROLS), and the other control characters but
-// tab and newline.
-const OTHER_CONTROLS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g;
+// tab and newline. Matched by code point (the `u` flag), so a character
+// outside the BMP shows as one code.
+const OTHER_CONTROLS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/gu;
+const HIDDEN_SOURCE = `${HIDDEN_CONTROLS.source}|${OTHER_CONTROLS.source}`;
 
 /// `text` with every hidden or control character shown as its code, marked.
 export const showPlainly = (text: string): ReactNode[] => {
-  const re = new RegExp(`${HIDDEN_CONTROLS.source}|${OTHER_CONTROLS.source}`, "g");
+  const re = new RegExp(HIDDEN_SOURCE, "gu");
   const out: ReactNode[] = [];
   let last = 0;
   for (const m of text.matchAll(re)) {
@@ -43,26 +45,121 @@ export const showPlainly = (text: string): ReactNode[] => {
   return out;
 };
 
-const hasHidden = (text: string) => new RegExp(`${HIDDEN_CONTROLS.source}|${OTHER_CONTROLS.source}`).test(text);
+const hasHidden = (text: string) => new RegExp(HIDDEN_SOURCE, "u").test(text);
 
 const time = (iso: string) => {
   const d = new Date(iso);
   return isNaN(d.getTime()) ? "" : d.toLocaleTimeString();
 };
 
-const NoFocusButton = ({ onPick, className, children, title }: { onPick: () => void; className: string; children: ReactNode; title?: string }) => (
+const NoFocusButton = ({ onPick, className, children, title, onDown, accept }: {
+  onPick: () => void; className: string; children: ReactNode; title?: string;
+  /// Told of the mouse going down on it.
+  onDown?: () => void;
+  /// Whether this click counts, beyond being a pointer's.
+  accept?: (e: React.MouseEvent) => boolean;
+}) => (
   <button
     type="button"
     tabIndex={-1}
     title={title}
-    onMouseDown={(e) => e.preventDefault()}
-    onClick={(e) => { if (byPointer(e)) onPick(); }}
+    onMouseDown={(e) => { e.preventDefault(); onDown?.(); }}
+    onClick={(e) => { if (byPointer(e) && (!accept || accept(e))) onPick(); }}
     onKeyDown={(e) => e.preventDefault()}
     className={className}
   >
     {children}
   </button>
 );
+
+/// How long a request's card ignores clicks after it appears or moves.
+const SETTLE_MS = 500;
+
+/// A request waiting for you. Its Allow and Deny only take a deliberate
+/// click: a single click (not a double-click's second), pressed and
+/// released on this card, and not within SETTLE_MS of the card appearing or
+/// moving. So when a card above it goes (the AI can withdraw one) and this
+/// one slides up under the pointer, a click meant for the other can't
+/// decide it.
+const PendingCard = ({ p, decide, onGoToServer }: { p: AiPending; decide: (allow: boolean) => void; onGoToServer: (sessionId: string) => void }) => {
+  const ref = useRef<HTMLDivElement>(null);
+  const settledAt = useRef(0);
+  const lastTop = useRef<number | null>(null);
+  const downHere = useRef(false);
+  // On every render (any change to the panel): has it moved?
+  useLayoutEffect(() => {
+    const top = ref.current?.offsetTop ?? 0;
+    if (lastTop.current !== top) {
+      lastTop.current = top;
+      settledAt.current = performance.now() + SETTLE_MS;
+      downHere.current = false;
+    }
+  });
+  // Moved by something that didn't re-render it (the window resized, text
+  // above it wrapping differently): the same.
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => {
+      if (lastTop.current !== el.offsetTop) {
+        lastTop.current = el.offsetTop;
+        settledAt.current = performance.now() + SETTLE_MS;
+        downHere.current = false;
+      }
+    });
+    if (el.parentElement) ro.observe(el.parentElement);
+    return () => ro.disconnect();
+  }, []);
+  const accept = (e: React.MouseEvent) => {
+    const ok = e.detail === 1 && downHere.current && performance.now() >= settledAt.current;
+    downHere.current = false;
+    return ok;
+  };
+  const down = () => { downHere.current = performance.now() >= settledAt.current; };
+  return (
+    <div ref={ref} className="m-2 rounded-xl border border-primary/30 bg-primary/[0.06] p-3 space-y-2">
+      <div className="text-[11.5px] text-zinc-300">
+        <span className="font-bold text-white">{p.tab_label}</span> wants to run on{" "}
+        <NoFocusButton onPick={() => onGoToServer(p.session_id)} className="font-bold text-white hover:underline">{p.server}</NoFocusButton>
+        {p.timeout_secs !== 60 && <span className="text-zinc-500"> · stops after {p.timeout_secs}s</span>}
+      </div>
+      {p.root && (
+        <div className="flex items-start gap-1.5 text-[11px] text-amber-300">
+          <ShieldAlert size={13} className="shrink-0 mt-px" />
+          <span>Asks for root (sudo, dzdo, su, doas or pkexec). Where those need no password, it runs as root.</span>
+        </div>
+      )}
+      {hasHidden(p.command) && (
+        <div className="flex items-start gap-1.5 text-[11px] text-amber-300">
+          <ShieldAlert size={13} className="shrink-0 mt-px" />
+          <span>It has hidden or control characters, shown below as ⟨U+…⟩.</span>
+        </div>
+      )}
+      {/* The whole command, never cut off. */}
+      <pre className="whitespace-pre-wrap break-all rounded-lg bg-black/50 border border-white/10 p-2 font-mono text-[11.5px] text-zinc-100 select-text">
+        {showPlainly(p.command)}
+      </pre>
+      <div className="flex gap-2">
+        <NoFocusButton
+          onPick={() => decide(true)}
+          onDown={down}
+          accept={accept}
+          className="flex-1 h-8 rounded-lg bg-primary/15 border border-primary/40 text-primary text-[11px] font-bold uppercase tracking-wider hover:bg-primary hover:text-zinc-950 flex items-center justify-center gap-1.5"
+        >
+          <Check size={13} /> Allow
+        </NoFocusButton>
+        <NoFocusButton
+          onPick={() => decide(false)}
+          onDown={down}
+          accept={accept}
+          className="flex-1 h-8 rounded-lg bg-zinc-900 border border-white/10 text-zinc-300 text-[11px] font-bold uppercase tracking-wider hover:border-red-400/50 hover:text-red-300 flex items-center justify-center gap-1.5"
+        >
+          <X size={13} /> Deny
+        </NoFocusButton>
+      </div>
+    </div>
+  );
+};
 
 const outcomeLabel = (d: AiDone) => {
   switch (d.outcome) {
@@ -101,7 +198,7 @@ const DoneRow = ({ d }: { d: AiDone }) => {
             <span>{d.server}</span>
             <span className="ml-auto">{time(d.at)}</span>
           </span>
-          <span className="block font-mono text-[11px] text-zinc-200 truncate">{d.command}</span>
+          <span className="block font-mono text-[11px] text-zinc-200 truncate">{showPlainly(d.command)}</span>
           <span className={`block text-[10.5px] ${ok ? "text-emerald-400" : ran ? "text-amber-300" : "text-zinc-500"}`}>
             {outcomeLabel(d)}
             {d.hidden > 0 && <span className="text-sky-300"> · {d.hidden} hidden from the AI</span>}
@@ -203,43 +300,7 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
 
         {/* Waiting for you. */}
         {snap.pending.map((p) => (
-          <div key={p.id} className="m-2 rounded-xl border border-primary/30 bg-primary/[0.06] p-3 space-y-2">
-            <div className="text-[11.5px] text-zinc-300">
-              <span className="font-bold text-white">{p.tab_label}</span> wants to run on{" "}
-              <NoFocusButton onPick={() => onGoToServer(p.session_id)} className="font-bold text-white hover:underline">{p.server}</NoFocusButton>
-              {p.timeout_secs !== 60 && <span className="text-zinc-500"> · stops after {p.timeout_secs}s</span>}
-            </div>
-            {p.root && (
-              <div className="flex items-start gap-1.5 text-[11px] text-amber-300">
-                <ShieldAlert size={13} className="shrink-0 mt-px" />
-                <span>Asks for root (sudo, dzdo, su, doas or pkexec). Where those need no password, it runs as root.</span>
-              </div>
-            )}
-            {hasHidden(p.command) && (
-              <div className="flex items-start gap-1.5 text-[11px] text-amber-300">
-                <ShieldAlert size={13} className="shrink-0 mt-px" />
-                <span>It has hidden or control characters, shown below as ⟨U+…⟩.</span>
-              </div>
-            )}
-            {/* The whole command, never cut off. */}
-            <pre className="whitespace-pre-wrap break-all rounded-lg bg-black/50 border border-white/10 p-2 font-mono text-[11.5px] text-zinc-100 select-text">
-              {showPlainly(p.command)}
-            </pre>
-            <div className="flex gap-2">
-              <NoFocusButton
-                onPick={() => run("ai_decide", { id: p.id, allow: true })}
-                className="flex-1 h-8 rounded-lg bg-primary/15 border border-primary/40 text-primary text-[11px] font-bold uppercase tracking-wider hover:bg-primary hover:text-zinc-950 flex items-center justify-center gap-1.5"
-              >
-                <Check size={13} /> Allow
-              </NoFocusButton>
-              <NoFocusButton
-                onPick={() => run("ai_decide", { id: p.id, allow: false })}
-                className="flex-1 h-8 rounded-lg bg-zinc-900 border border-white/10 text-zinc-300 text-[11px] font-bold uppercase tracking-wider hover:border-red-400/50 hover:text-red-300 flex items-center justify-center gap-1.5"
-              >
-                <X size={13} /> Deny
-              </NoFocusButton>
-            </div>
-          </div>
+          <PendingCard key={p.id} p={p} decide={(allow) => run("ai_decide", { id: p.id, allow })} onGoToServer={onGoToServer} />
         ))}
 
         {/* Running now. */}
@@ -248,7 +309,7 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
             <Loader2 size={12} className="mt-0.5 shrink-0 animate-spin text-primary" />
             <span className="flex-1 min-w-0">
               <span className="block text-[10.5px] text-zinc-500"><span className="font-semibold text-zinc-300">{r.tab_label}</span> {r.server} · running</span>
-              <span className="block font-mono text-[11px] text-zinc-200 truncate">{r.command}</span>
+              <span className="block font-mono text-[11px] text-zinc-200 truncate">{showPlainly(r.command)}</span>
             </span>
           </div>
         ))}

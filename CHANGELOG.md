@@ -9,7 +9,7 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
-### From the original project
+### From the original project ([#41](https://github.com/paulm981/Submarine/issues/41))
 
 - **A saved password at a password prompt** ([#182](https://github.com/SinaXhpm/submarine/pull/182)). When a terminal stops at a password prompt (sudo, dzdo, su, ssh), a **Saved password** button types a saved password there, without pressing Enter. It goes from your profile straight to the server; the window never sees it.
   - It offers this server's own password and its saved login. Another saved login is offered only when the prompt asks for that login's user by name, so a prompt can't fish for a password it has nothing to do with.
@@ -26,6 +26,18 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - **Window buttons** show at any window width on the PC, and never on phones ([#187](https://github.com/SinaXhpm/submarine/pull/187)).
 
 Not taken: [#180](https://github.com/SinaXhpm/submarine/pull/180) gives a terminal pinned to a Wall its own size back. The fork's Walls show the terminal itself rather than a second copy, so it already has one size.
+
+## v0.3.8-fork.9
+
+- **AI tools, safer** ([#85](https://github.com/paulm981/Submarine/issues/85)), from an independent security review:
+  - **Stop ends the command on the server.** Stopping, unsharing, closing the AI tab or turning AI tools off no longer only stops Submarine waiting for the command.
+  - **Allow can't be clicked by accident.** A double-click can no longer Allow the next request: Allow and Deny take a single click, and wait half a second after a request appears or moves.
+  - **Hidden characters show.** The AI panel shows every hidden or invisible character in a command, on waiting, running and finished requests.
+  - **More secrets are hidden from the AI:**
+    - passwords on command lines (`--password`, `mysql -p…`, `sshpass -p`) and `DB_PASS=` and similar;
+    - Apache password hashes and web tokens;
+    - private keys in base64, including certificate-and-key bundles.
+  - **The AI can't flush the audit log or tie up memory.** Every request counts toward the limit, commands are logged at most 4 KB with a fingerprint, three older logs are kept, and what one AI connection can make Submarine hold is capped.
 
 ## v0.3.8-fork.8
 
