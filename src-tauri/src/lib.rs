@@ -19483,6 +19483,14 @@ async fn sftp_open_remote_file(
 
                     use russh_sftp::protocol::OpenFlags;
                     use tokio::io::AsyncWriteExt;
+                    // An upload to this same file (the file pane, or a save
+                    // just before) would interleave with this one: take turns,
+                    // as uploads do (RemoteWriteLocks). A save isn't cancelled.
+                    let never = std::sync::atomic::AtomicBool::new(false);
+                    let (_write_turn, _) = remote_write_locks()
+                        .acquire(&session_id_clone, &remote_path_clone, &never)
+                        .await
+                        .ok_or("cancelled")?;
                     // Truncate so shortening the file doesn't leave the old
                     // tail behind on the server.
                     let mut remote_file = sftp
