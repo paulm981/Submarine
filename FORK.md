@@ -131,7 +131,7 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 
 | Area | The original project | This fork |
 |---|---|---|
-| Profile sync | Its hosted cloud, `api.sinaxhpm.com` | A folder or git repository you own. The hosted cloud is off unless you turn it on. |
+| Profile sync | Its hosted cloud, `submarine.sinaxhpm.com` | A folder or git repository you own. The hosted cloud is off unless you turn it on. |
 | Updates | Releases of the original project | Releases of this fork, one for every change: `v0.4.0-fork.1`, `v0.4.0-fork.2`, … |
 | Live Edit | Refuses a program; on Windows opens a script in Notepad; opens anything else with its default app ([#212](https://github.com/SinaXhpm/submarine/pull/212)) | Refuses a program, and opens anything else in an editor: the one picked in Settings, or Notepad on Windows, the default text editor on macOS, and on Linux the text editor set for plain text. It never runs a file |
 | Root | `sudo` | `sudo` or `dzdo`, and `dzdo su -`. A server without an sftp-server uses the original project's shell file access, under `sudo` only. |
