@@ -291,6 +291,12 @@ function AiToolsSettings() {
           <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${info.enabled ? 'left-[22px]' : 'left-0.5'}`} />
         </button>
       </div>
+      {info.enabled && (
+        <p className="text-[12px] text-amber-200/90 leading-relaxed rounded-lg border border-amber-400/20 bg-amber-400/[0.06] px-3 py-2">
+          Output you allow goes to the AI provider. Each command's output, with the secrets Submarine recognises
+          hidden, is sent to the AI tool and on to its provider: for Claude Code, Anthropic, or the cloud you've set it to use.
+        </p>
+      )}
       <p className="text-[12px] text-zinc-400 leading-relaxed">
         {info.claude ? (
           <>Claude Code is installed: <span className="font-mono text-[11.5px] text-zinc-300 break-all select-text">{info.claude}</span>.{" "}
@@ -302,10 +308,15 @@ function AiToolsSettings() {
       <p className="text-[11.5px] text-zinc-500 leading-relaxed">
         What the AI gets back is filtered: private keys, password and token values, password hashes, access keys and
         passwords in URLs are replaced with [hidden by Submarine]. The filter catches common shapes, not everything.
-        The AI tool runs as you on this computer, so it could read files such as ~/.ssh by itself: in Claude Code's own
-        settings (~/.claude/settings.json), deny that with{" "}
-        <span className="font-mono text-zinc-400 select-text">{'"permissions": { "deny": ["Read(~/.ssh/**)"] }'}</span>.
         Every request and decision is logged on this computer, in ai-audit.log in the log folder (Troubleshooting).
+      </p>
+      <p className="text-[11.5px] text-zinc-500 leading-relaxed">
+        The AI tool starts without your SSH agent and the usual cloud logins (AWS, Azure, Google Cloud, GitHub), so it
+        doesn't find them there. It still runs as you: unless its own sandbox stops it (in Claude Code,{" "}
+        <span className="font-mono text-zinc-400 select-text">/sandbox</span>, on macOS and Linux), what it runs can read
+        key files such as those in ~/.ssh, look for your SSH agent itself, and use the network. On Windows, ssh finds the
+        Windows OpenSSH agent without being told where it is, and Claude Code has no sandbox: for production servers, run
+        Submarine and its AI tools in WSL2 or a virtual machine.
       </p>
       {error && <p className="text-[11.5px] text-red-400">{error}</p>}
     </div>
