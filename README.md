@@ -425,6 +425,10 @@ npm run tauri build        # build release bundle
 
 Each run's files are also kept for 90 days under **Artifacts** on the run's page (GitHub sign-in needed there). Android is built only when the repository variable `BUILD_ANDROID` is `true` and the signing secrets the workflow names are set.
 
+macOS is built only when the repository variable `BUILD_MACOS` is `true`, or when **Run workflow** is started with **Build macOS too** ticked. A macOS minute uses ten of the account's GitHub Actions minutes, so releases are Windows and Linux unless macOS is asked for. Pull request checks likewise run on Linux and Windows, and also on macOS when the pull request has the `macos` label.
+
+**Building macOS on your own Mac:** install the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) (Xcode's command line tools, Rust, Node 20+), then in a clone of the repository run `npm ci` and `SUBMARINE_VERSION=0.4.0-fork.N npm run tauri build -- --bundles app,dmg` with the release's number. The app and the `.dmg` land in `src-tauri/target/release/bundle/`.
+
 ### Android build
 
 Extra requirements: Android SDK + Platform-Tools, NDK 27, and JDK 17. `scripts/android-env.ps1` sets `JAVA_HOME`, `ANDROID_HOME`, and `NDK_HOME` for the current PowerShell session. It finds the SDK through `ANDROID_HOME` or `ANDROID_SDK_ROOT`, or in Android Studio's default folder (`%LOCALAPPDATA%\Android\Sdk`).

@@ -6,7 +6,9 @@ name: Check
 #
 #   • rust (Linux and Windows): the Rust tests.
 #   • rust (macOS): the AI bridge's tests only (#32): the local channel and
-#     `submarine --mcp`, which work differently on each system.
+#     `submarine --mcp`, which work differently on each system. A macOS
+#     minute costs ten of the account's Actions minutes, so it runs only on
+#     a pull request labelled `macos`, or from Run workflow.
 #   • rust (Windows) also runs `submarine --mcp`'s test as a release build:
 #     there Submarine is a windowed program, and the helper's stdin and stdout
 #     have to work all the same.
@@ -28,6 +30,8 @@ name: Check
 on:
   pull_request:
     branches: [main]
+    # `labeled`: adding the `macos` label runs the checks again, with macOS.
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
 permissions:
@@ -50,13 +54,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: ubuntu-22.04
-            os_name: linux
-          - platform: windows-latest
-            os_name: windows
-          - platform: macos-latest
-            os_name: macos
+        # Linux and Windows always; macOS only when asked for (see the top).
+        include: ${{ fromJSON(format('[{0},{1}{2}]',
+          '{"platform":"ubuntu-22.04","os_name":"linux"}',
+          '{"platform":"windows-latest","os_name":"windows"}',
+          (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'macos'))
+            && ',{"platform":"macos-latest","os_name":"macos"}' || '')) }}
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 40
     steps:
