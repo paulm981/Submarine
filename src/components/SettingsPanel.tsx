@@ -440,8 +440,9 @@ function SshConfigSetting({ settings, setSettings }: any) {
             ~/.ssh/config connects to its HostName and Port, takes its User when no username is
             saved, uses the ssh-agent IdentityAgent names, and goes through its ProxyCommand (such
             as cloudflared or tsh) or ProxyJump unless the server has a jump host or proxy of its
-            own. Its IdentityFile keys and CertificateFile certificates log in when a server has
-            no saved password or key (Teleport, for one), and the host keys and certificate
+            own. Its IdentityFile keys and CertificateFile certificates are tried when a server has
+            no saved password or key (Teleport, for one), and when the saved one doesn't work. The
+            host keys and certificate
             authorities in your known_hosts are trusted without the first-time prompt. The host
             keys this app already trusts still come first: a changed key always gets the warning,
             and a key known_hosts marks @revoked is refused. Host
