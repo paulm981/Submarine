@@ -369,8 +369,8 @@ function WallCloseSetting({ settings, setSettings }: any) {
         <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
           Turning Broadcast on takes the servers' tabs into the Wall. Closing the Wall can put them back as tabs
           or close them. <span className="text-zinc-300">Close them all</span> still asks if one of them is busy:
-          a file is uploading or downloading, a Live Edit file has changes not sent yet, or an AI command is
-          running there. <span className="text-zinc-300">Back to tabs</span> on the Wall's bar always puts
+          a file is uploading or downloading, an archive is being made or unpacked, a mirror is running, a
+          Live Edit file has changes not sent yet, or an AI command is running there. <span className="text-zinc-300">Back to tabs</span> on the Wall's bar always puts
           them back without asking.
         </p>
       </div>
