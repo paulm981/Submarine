@@ -9,6 +9,11 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Send to all leaves out control characters**, as a paste does. A Library command someone shared, or text typed into **Send** on a Wall, can't press keys you didn't see. Tab and line breaks stay, and the Wall says when anything was left out. ([#98](https://github.com/paulm981/Submarine/issues/98))
+- **On-connect commands leave out control characters too.** When any were left out, the terminal says so before the commands are typed. ([#98](https://github.com/paulm981/Submarine/issues/98))
+
+## v0.4.0-fork.4
+
 - **Importing thousands of servers takes a moment.** Checking which ones are already saved used to take seconds for 10,000 rows, with the app waiting. ([#94](https://github.com/paulm981/Submarine/issues/94))
 - **The `~/.ssh/config` import reads settings as `ssh` does.** A `Host *` block, and other wildcard blocks that match a host, give it their settings as defaults. When a setting appears twice, the first one counts. A `Match` block's lines are left out instead of being added to the host above them. ([#94](https://github.com/paulm981/Submarine/issues/94))
 - **The PuTTY import brings in telnet sessions** as telnet servers, and leaves out "Default Settings" and other sessions with no host. Serial, raw and rlogin sessions are listed as not imported instead of coming in as SSH servers. ([#94](https://github.com/paulm981/Submarine/issues/94))

@@ -18,7 +18,8 @@ import { readUseLocalShell } from "../util/terminalShell";
 import { readUseSshAgent } from "../util/sshAgent";
 import { useSlideOverFocus } from "../ui/slideOverFocus";
 import { useConfirm } from "../ui/confirm";
-import { markTyped } from "../ui/terminalDock";
+import { dockedTerminal, markTyped } from "../ui/terminalDock";
+import { withoutPasteControls } from "../util/pasteText";
 import { COMPACT_TAB_NAME, COMPACT_TAB_PAD, NewsDot, compactTermTabClass } from "../ui/tabStyle";
 import { reorderById, useTabDrag } from "../ui/tabDrag";
 import { parseObjectList } from "../util/serverJson";
@@ -601,11 +602,22 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
       ? () => {
           if (startupRanForEpochRef.current === connectionEpoch) return;
           startupRanForEpochRef.current = connectionEpoch;
+          // Typed line by line, without escape sequences or other control
+          // characters (a tab stays): the commands can come from anyone the
+          // profile is shared with, and one could press keys nobody saw in
+          // the text (pasteText.ts). The terminal says when any were left out.
           const typeThem = (text: string) => {
-            const lines = text
-              .split(/\r?\n/)
-              .map((l: string) => l.trimEnd())
+            const asSet = text.split(/\r\n|\r|\n/);
+            const lines = asSet
+              .map((l: string) => withoutPasteControls(l).trimEnd())
               .filter((l: string) => l.trim().length > 0);
+            const cleaned = asSet.some((l: string) => withoutPasteControls(l) !== l);
+            if (cleaned) {
+              dockedTerminal(terminalId)?.term.write(
+                '\r\n\x1b[33mSubmarine: control characters were left out of the on-connect commands.\x1b[0m\r\n',
+              );
+              addLog(`Control characters were left out of the on-connect commands for ${session.serverName}.`, "warn");
+            }
             if (lines.length === 0) return;
             const bytes = Array.from(new TextEncoder().encode(lines.join('\n') + '\n'));
             markTyped(terminalId);
