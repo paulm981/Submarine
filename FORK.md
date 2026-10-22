@@ -60,6 +60,7 @@ With **Use settings from ~/.ssh/config** on (**Settings › Authentication**), s
 - **ProxyJump.** A server behind a chain of jump hosts connects, as with `ssh -J`. Each jump host waits its turn to log in (**Logins at a time per jump host**, in **Settings › Servers**), so a hundred servers don't all log in to it at once. A server's own saved jump host or proxy still comes first.
 - **Key files and certificates.** The IdentityFile keys the config names are tried, each with its certificate (CertificateFile, or `<key>-cert.pub`), so Teleport nodes connect. An expired certificate is skipped, and the log says so.
 - **known_hosts.** A host key listed there skips the first-time question, and is saved to Submarine's own trusted keys. Those always come first: a key that changed gets the warning, even when known_hosts lists the new one. A key marked `@revoked` is always refused.
+- **Host certificates.** A server's certificate is trusted through an `@cert-authority` line in known_hosts, checked as OpenSSH checks it. If the key in it isn't the one Submarine trusts for the server, as after a server is reinstalled, you get the changed-key warning and decide. A certificate that doesn't check out is refused.
 
 Nothing is written to `~/.ssh`. With the setting off, none of these files is read.
 
