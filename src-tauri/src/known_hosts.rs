@@ -48,6 +48,12 @@ pub(crate) enum Verdict {
 }
 
 impl HostTrust {
+    /// The host keys listed for this host, each with the file that lists it.
+    // fork (#43): the changed-key warning shows them (trust_policy.rs).
+    pub(crate) fn listed_keys(&self) -> &[(PublicKey, String)] {
+        &self.keys
+    }
+
     /// Whether any CA is trusted for this host (then certificates are asked for).
     pub(crate) fn has_cas(&self) -> bool {
         !self.cas.is_empty()

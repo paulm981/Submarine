@@ -59,6 +59,7 @@ mod rdp_client;
 mod term_filter;
 mod vault_backup;
 mod known_hosts;
+mod trust_policy;
 #[cfg(target_os = "android")]
 mod android_bridge;
 #[cfg(test)]

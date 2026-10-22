@@ -881,56 +881,37 @@ impl client::Handler for ClientHandler {
             self.fp_outcome.store(0, std::sync::atomic::Ordering::SeqCst);
             return Ok(false);
         }
-        // What known_hosts says decides first: a certificate from a trusted
-        // CA, a listed key, a revoked one (see known_hosts.rs).
+        // What the user's known_hosts and the app's own trusted keys say
+        // (trust_policy.rs, #43): a certificate is checked against a CA
+        // known_hosts trusts for the host; a plain key below.
         let log = |msg: &str, ty: &str| {
             println!("[LOG-{}] {}", self.session_id, msg);
-            let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({"msg": msg, "type": ty}));
+            if self.attempt.is_current_now() {
+                let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({"msg": msg, "type": ty}));
+            }
         };
-        let trust_verdict = match (offered, &self.host_trust) {
-            (PublicKeyOrCertificate::Certificate(cert), Some(trust)) => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                Some(trust.check_certificate(cert, now))
-            }
-            (PublicKeyOrCertificate::PublicKey { key, .. }, Some(trust)) => Some(trust.check_key(key)),
-            _ => None,
-        };
-        // Fork (#43): a plain key known_hosts lists only answers the
-        // first-time question; the app's own trusted keys decide first, so a
-        // changed key still gets the warning (below).
-        let mut listed_in_known_hosts: Option<String> = None;
-        match trust_verdict {
-            Some(crate::known_hosts::Verdict::Trusted(why)) if matches!(offered, PublicKeyOrCertificate::Certificate(_)) => {
-                log(&why, "success");
-                self.fp_outcome.store(1, std::sync::atomic::Ordering::SeqCst);
-                return Ok(true);
-            }
-            Some(crate::known_hosts::Verdict::Trusted(why)) => listed_in_known_hosts = Some(why),
-            Some(crate::known_hosts::Verdict::Refused(why)) => {
-                log(&format!("Host key refused: {why}."), "error");
-                if let Ok(mut r) = self.host_key_refusal.lock() {
-                    *r = Some(why);
-                }
-                self.fp_outcome.store(0, std::sync::atomic::Ordering::SeqCst);
-                return Ok(false);
-            }
-            Some(crate::known_hosts::Verdict::Undecided(Some(note))) => log(&note, "warn"),
-            Some(crate::known_hosts::Verdict::Undecided(None)) | None => {}
-        }
-        let Some(server_public_key) = plain_host_key(offered) else {
-            log(
-                "Server presented an SSH host CERTIFICATE, and no @cert-authority line in your known_hosts covers this host, so it can't be checked; the connection was refused.",
-                "error",
-            );
+        let refuse = |why: String| {
+            log(&format!("Host key refused: {why}."), "error");
             if let Ok(mut r) = self.host_key_refusal.lock() {
-                *r = Some("the server presented a host certificate, and no @cert-authority line in your known_hosts covers this host".into());
+                *r = Some(why);
             }
             // A host-key failure (not a transport / algorithm error).
             self.fp_outcome.store(0, std::sync::atomic::Ordering::SeqCst);
-            return Ok(false);
+            Ok(false)
+        };
+        let server_public_key = match offered {
+            PublicKeyOrCertificate::Certificate(cert) => {
+                return match crate::trust_policy::decide_certificate(self.host_trust.as_deref(), cert, crate::trust_policy::now()) {
+                    crate::trust_policy::HostKeyDecision::Trusted { why, .. } => {
+                        log(&why, "success");
+                        self.fp_outcome.store(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(true)
+                    }
+                    crate::trust_policy::HostKeyDecision::Refused(why) => refuse(why),
+                    crate::trust_policy::HostKeyDecision::Ask { .. } => refuse("a host certificate can't be approved by hand".into()),
+                };
+            }
+            PublicKeyOrCertificate::PublicKey { key, .. } => key,
         };
         // The key's own algorithm (`ssh-rsa` for any RSA key).
         let key_type = server_public_key.algorithm().to_string();
@@ -964,28 +945,24 @@ impl client::Handler for ClientHandler {
             }));
             return Ok(false);
         };
-        if let (HostKeyVerdict::New, Some(why)) = (&verdict, listed_in_known_hosts) {
-            log(&why, "success");
-            self.fp_outcome.store(1, std::sync::atomic::Ordering::SeqCst);
-            return Ok(true);
-        }
-        let (is_known, mismatch, prior_fingerprints) = match verdict {
-            HostKeyVerdict::Known => (true, false, Vec::new()),
-            HostKeyVerdict::Changed { prior } => (false, true, prior),
-            HostKeyVerdict::New => (false, false, Vec::new()),
-        };
-
-        if is_known {
-            let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
-                "msg": "Host fingerprint found in known_hosts database. Verified.",
-                "type": "success"
-            }));
-            // Mark as auto-accepted (no prompt was shown) so the connect
-            // driver knows host-key wasn't the failure mode for any
-            // downstream error.
-            self.fp_outcome.store(1, std::sync::atomic::Ordering::SeqCst);
-            return Ok(true);
-        }
+        let (mismatch, prior_fingerprints) =
+            match crate::trust_policy::decide_plain_key(verdict, self.host_trust.as_deref(), server_public_key) {
+                crate::trust_policy::HostKeyDecision::Trusted { why, .. } => {
+                    log(&why, "success");
+                    // Mark as auto-accepted (no prompt was shown) so the connect
+                    // driver knows host-key wasn't the failure mode for any
+                    // downstream error.
+                    self.fp_outcome.store(1, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(true);
+                }
+                crate::trust_policy::HostKeyDecision::Refused(why) => return refuse(why),
+                crate::trust_policy::HostKeyDecision::Ask { mismatch, prior, note } => {
+                    if let Some(note) = note {
+                        log(&note, "warn");
+                    }
+                    (mismatch, prior)
+                }
+            };
 
         if !self.prompt_allowed {
             // A dedicated SFTP / port-forwarding connection can't show a
