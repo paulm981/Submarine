@@ -40,6 +40,7 @@ mod tree_moves;
 mod multiexec;
 mod store_sync;
 mod shell_sftp;
+mod remote_sh;
 mod archive;
 mod approvals;
 mod agent_auth;
@@ -1298,7 +1299,11 @@ fn apply_remote_inner(
             // record to merge over, and hold_switch keeps this device's again
             // after it, whether the record applied or not.
             let before = if watch || held_switch { approvals::before_merge(&tx, spec.table, &rec.uuid)? } else { None };
+            let tunnels_before = if spec.table == "servers" { stored_tunnels(&tx, &rec.uuid) } else { None };
             let applied = apply_entity(&tx, key, spec, rec, &mut fk_fixups);
+            if let Some(old) = tunnels_before {
+                note_synced_tunnels(&tx, &rec.uuid, &old)?;
+            }
             if watch {
                 approvals::hold_changes(&tx, spec.table, &rec.uuid, before.as_ref())?;
             } else if held_switch {
@@ -1687,7 +1692,7 @@ fn open_pw_escrow(blob_hex: &str, password: &str) -> Result<[u8; 32], String> {
 fn profile_server(conn: &Connection) -> Option<String> {
     match conn.query_row("SELECT value FROM sync_meta WHERE key='cloud_server'", [], |r| r.get::<_, String>(0)) {
         Ok(server) if server.is_empty() => None,
-        Ok(server) => Some(server),
+        Ok(server) => Some(cloud::server_id(&server).to_string()),
         Err(_) => Some(cloud::CLOUD_API_BASE.to_string()),
     }
 }
@@ -1793,6 +1798,17 @@ mod profile_server_tests {
         assert_eq!(check_profile_server(&conn, cloud::CLOUD_API_BASE), Ok(false));
         assert!(check_profile_server(&conn, OWN).is_err());
     }
+
+    // A profile linked to the default server's API root (typed in by hand on a
+    // 0.4 build) is a profile of the default server.
+    #[test]
+    fn the_api_root_is_the_default_server() {
+        let conn = meta();
+        link_profile_server(&conn, cloud::CLOUD_API_ROOT).unwrap();
+        assert_eq!(profile_server(&conn).as_deref(), Some(cloud::CLOUD_API_BASE));
+        assert_eq!(check_profile_server(&conn, cloud::CLOUD_API_BASE), Ok(false));
+        assert!(check_profile_server(&conn, OWN).is_err());
+    }
 }
 
 /// Delta sync's memory for the open profile: how far this device's pushes got
@@ -1877,6 +1893,19 @@ async fn sync_with(
     session: &cloud::Session,
     pinned: Option<u64>,
 ) -> Result<SyncReport, String> {
+    sync_with_from(app, db_state, cloud, session, pinned, true).await
+}
+
+/// `sync_with`, from the delta cursor when `use_cursor`, or in full: every
+/// row, and a personal profile's key escrow, whatever the cursor says.
+async fn sync_with_from(
+    app: &tauri::AppHandle,
+    db_state: &DbState,
+    cloud: &cloud::CloudState,
+    session: &cloud::Session,
+    pinned: Option<u64>,
+    use_cursor: bool,
+) -> Result<SyncReport, String> {
     // Checked before anything goes out, the shared key refresh below included:
     // a server the profile isn't linked to could hand back a key it knows,
     // and every record pushed after that would be readable to it.
@@ -1931,7 +1960,7 @@ async fn sync_with(
         }
     }
 
-    let (report, reset) = sync_round(app, db_state, cloud, session, &profile, unlinked, generation, true).await?;
+    let (report, reset) = sync_round(app, db_state, cloud, session, &profile, unlinked, generation, use_cursor).await?;
     if !reset {
         return Ok(report);
     }
@@ -2914,7 +2943,7 @@ async fn import_shared_profile(
     // and nowhere else.
     let opened = {
         use tauri::Manager as _;
-        match setup_master_db_inner(app.clone(), VaultSecret::Password(vault_password), app.state::<DbState>(), true).await {
+        match setup_master_db_with(app.clone(), VaultSecret::Password(vault_password), app.state::<DbState>(), true, true).await {
             Ok(generation) => generation,
             Err(e) => {
                 discard_half_built_profile(&app, &local_name, None);
@@ -2982,9 +3011,18 @@ async fn import_shared_profile(
 /// `opened` is the generation the half-built profile was opened at (None when
 /// opening it is what failed). If another profile has been opened since, that
 /// one stays open; only the half-built file goes.
+///
+/// Only a file this call made goes: the callers open with `must_create`, so
+/// it's this call's when the profile was opened (`opened`), or when opening
+/// got as far as setting it up here (its last step, the first save, failed).
+/// A profile that another window made or opened meanwhile stays, and so does
+/// one open in another window now.
 fn discard_half_built_profile(app: &tauri::AppHandle, name: &str, opened: Option<u64>) {
     use tauri::Manager as _;
     let state = app.state::<DbState>();
+    let path = profile_path(app, name).ok();
+    let made_here = opened.is_some()
+        || path.is_some() && state.db_path.lock().ok().is_some_and(|g| g.as_ref() == path.as_ref());
     // Under the connection's lock when it can be had, as in close_profile.
     let mut conn = state.conn.lock().ok();
     let ours = opened.is_none_or(|g| state.generation_now() == g);
@@ -3000,17 +3038,26 @@ fn discard_half_built_profile(app: &tauri::AppHandle, name: &str, opened: Option
     if ours {
         if let Ok(mut g) = state.active_profile.lock() { *g = None; }
     }
-    if let Ok(p) = profile_path(app, name) {
-        // Its one-window lock (#204) goes with it, or the name would stay
-        // "open in another window" in this one until it quit.
-        if let Ok(mut held) = state.profile_lock.lock() {
-            if held.as_ref().is_some_and(|(locked, _)| *locked == p) {
-                *held = None;
-            }
-        }
-        let _ = fs::remove_file(p.with_extension("submarine.lock"));
-        let _ = fs::remove_file(p);
-    }
+    let Some(p) = path.filter(|_| made_here) else { return };
+    let lock_path = p.with_extension("submarine.lock");
+    // Its one-window lock (#204) goes with it, or the name would stay "open in
+    // another window" in this one until it quit. Not held here any more
+    // (another profile opened here since): only when no other window has it.
+    let ours = state
+        .profile_lock
+        .lock()
+        .ok()
+        .and_then(|mut held| if held.as_ref().is_some_and(|(locked, _)| *locked == p) { held.take() } else { None });
+    let lock = match ours {
+        Some((_, file)) => ProfileLock::New(file),
+        None => match try_lock_file(&lock_path) {
+            Ok(lock) => lock,
+            Err(_) => return,
+        },
+    };
+    let _ = fs::remove_file(&p);
+    drop(lock);
+    let _ = fs::remove_file(lock_path);
 }
 
 /// New device: restore one of YOUR OWN personal cloud profiles using nothing but
@@ -3073,7 +3120,7 @@ async fn restore_personal_profile(
         use tauri::Manager as _;
         // No strength floor here: the escrow above already proved this is the
         // profile's real password. A pre-existing short one must still restore.
-        match setup_master_db_inner(app.clone(), VaultSecret::Password(vault_password), app.state::<DbState>(), false).await {
+        match setup_master_db_with(app.clone(), VaultSecret::Password(vault_password), app.state::<DbState>(), false, true).await {
             Ok(generation) => generation,
             Err(e) => {
                 discard_half_built_profile(&app, &local_name, None);
@@ -3760,6 +3807,52 @@ mod sync_engine_tests {
         approvals::create_schema(&c).unwrap();
         apply_remote_records(&c, &KEY, &recs, &hc).unwrap();
         assert!(approvals::held_by_server(&c).is_empty(), "a personal profile holds nothing");
+    }
+
+    // A forward a co-member adds while this device has a session open on the
+    // server: the session's next save keeps it (and its hold) instead of
+    // writing the list it read before over it.
+    #[test]
+    fn a_sessions_save_keeps_a_forward_that_came_by_sync() {
+        let l8080 = r#"[{"type":"L","local":"127.0.0.1:8080","remote":"db:5432"}]"#;
+        let (a, ha) = device("A");
+        a.execute("INSERT INTO servers(name,host,port,tunnels) VALUES('web','h',22,?1)", [l8080]).unwrap();
+        let (b, hb) = device("B");
+        approvals::create_schema(&b).unwrap();
+        b.execute("INSERT INTO sync_meta(key,value) VALUES('share_id','s1')", []).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let (id, uuid): (i32, String) = b.query_row("SELECT id, uuid FROM servers WHERE name='web'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        approvals::allow(&b, &uuid, &[]).unwrap();
+        assert!(take_synced_tunnels_base(&b, id).is_none(), "a new server has no session to be out of date");
+        // B's session reads the rules; then A adds a SOCKS forward.
+        let ours: Vec<tunnel::TunnelSpec> = serde_json::from_str(l8080).unwrap();
+        a.execute(
+            "UPDATE servers SET tunnels=?1 WHERE name='web'",
+            [r#"[{"type":"L","local":"127.0.0.1:8080","remote":"db:5432"},{"type":"D","local":"0.0.0.0:1080"}]"#],
+        )
+        .unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        assert!(approvals::held_for(&b, &uuid).contains("tunnel:D|0.0.0.0:1080|"));
+        // B stops its forward and saves, as persist_session_tunnels does.
+        let mut ours = ours;
+        let first = ours[0].clone();
+        tunnel::rule_stopped(&mut ours, &first);
+        let base = take_synced_tunnels_base(&b, id).expect("sync changed the saved forwards");
+        let saved: Vec<tunnel::TunnelSpec> =
+            serde_json::from_str(&b.query_row("SELECT tunnels FROM servers WHERE id=?1", [id], |r| r.get::<_, String>(0)).unwrap()).unwrap();
+        let merged = tunnel::merge_rules(&base, &ours, &saved);
+        b.execute("UPDATE servers SET tunnels=?1 WHERE id=?2", rusqlite::params![serde_json::to_string(&merged).unwrap(), id]).unwrap();
+        let now: Vec<tunnel::TunnelSpec> =
+            serde_json::from_str(&b.query_row("SELECT tunnels FROM servers WHERE id=?1", [id], |r| r.get::<_, String>(0)).unwrap()).unwrap();
+        assert_eq!(now.len(), 2, "the synced forward stays");
+        assert!(now[0].stopped && !now[1].stopped);
+        assert!(approvals::held_for(&b, &uuid).contains("tunnel:D|0.0.0.0:1080|"), "and stays held");
+        assert!(take_synced_tunnels_base(&b, id).is_none(), "taken once");
+        // A record that leaves the forwards alone marks nothing.
+        apply_remote_records(&a, &KEY, &collect_local_records(&b, &KEY, "").unwrap(), &ha).unwrap();
+        a.execute("UPDATE servers SET host='h2' WHERE name='web'", []).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        assert!(take_synced_tunnels_base(&b, id).is_none());
     }
 
     /// A shared device B with A's SSH server "web" on port 22, and A having
@@ -5341,11 +5434,19 @@ async fn force_push_profile(
     }
     let removed = cloud::delete_sync_profile(&app, &cloud, &session, &cloud_profile).await?;
     eprintln!("[SYNC] force push: server dropped {removed} record(s) for '{cloud_profile}'");
-    // Pushes are always a full set, so the very next sync repopulates the
-    // partition from this vault — including a fresh DEK escrow record. Only
-    // this profile's, though: if another opened meanwhile, the sync refuses,
-    // and this profile's next sync fills its partition back up.
-    sync_with(&app, &db_state, &cloud, &session, Some(generation)).await
+    // The delta cursor describes the copy just deleted: forget it, or the next
+    // round would send only what changed since, and no key escrow. Then a full
+    // sync fills the partition from this vault, DEK escrow record included.
+    // Only this profile's, though: if another opened meanwhile, the sync
+    // refuses, and with no cursor this profile's next sync is a full one.
+    forget_sync_cursor(&db_state)?;
+    sync_with_from(&app, &db_state, &cloud, &session, Some(generation), false).await
+}
+
+/// Drops the open profile's delta-sync cursor: the next round is a full one.
+fn forget_sync_cursor(db_state: &DbState) -> Result<(), String> {
+    *db_state.sync_cursor.lock().map_err(|_| "[STATE] LOCK_SYNC_CURSOR")? = None;
+    Ok(())
 }
 
 /// Mark a profile as the active one. Subsequent `check_db_exists` /
@@ -5412,6 +5513,7 @@ async fn close_profile(
         ssh.sftp_sessions.lock().await.remove(sid);
         ssh.sftp_elevation.lock().await.remove(sid);
         ssh.root_access.lock().await.remove(sid);
+        ssh.root_gates.lock().await.remove(sid);
         ssh.docker_root.lock().await.remove(sid);
         ssh.sftp_shell.lock().await.remove(sid);
         ssh.connections.lock().await.remove(sid);
@@ -5449,8 +5551,11 @@ async fn close_profile(
     ssh.sftp_sessions.lock().await.clear();
     ssh.sftp_elevation.lock().await.clear();
     ssh.root_access.lock().await.clear();
+    ssh.root_gates.lock().await.clear();
     ssh.docker_root.lock().await.clear();
     ssh.sftp_shell.lock().await.clear();
+    ssh.session_servers.lock().await.clear();
+    ssh.terminal_servers.lock().await.clear();
     // Wipe every connect-time secret the user typed this profile (issue #30).
     ssh.prompted_secrets.lock().await.clear();
     ssh.connections.lock().await.clear();
@@ -5512,6 +5617,9 @@ async fn delete_profile(app_handle: tauri::AppHandle, name: String, state: tauri
     // the profile itself is already gone, so a locked tmp shouldn't fail the
     // delete the user asked for.
     let _ = fs::remove_file(path.with_extension("submarine.tmp"));
+    // And the copies a deleting sync kept of it (vault_backup.rs): they hold
+    // the same servers, logins and keys.
+    vault_backup::remove_all(&path);
     // And its quick unlock on this device (#166), with its Windows Hello key.
     quick_unlock::forget(&app_handle, &name);
     Ok(())
@@ -5863,6 +5971,21 @@ async fn setup_master_db_inner(
     state: tauri::State<'_, DbState>,
     enforce_strength: bool,
 ) -> Result<u64, String> {
+    setup_master_db_with(app_handle, secret, state, enforce_strength, false).await
+}
+
+/// `setup_master_db_inner`, and with `must_create` only for a profile that
+/// isn't there yet: one that appeared since the caller looked (another window
+/// made or restored it) is refused once this window holds its lock, so a
+/// restore or import that then fails never removes a profile it didn't make
+/// (`discard_half_built_profile`).
+async fn setup_master_db_with(
+    app_handle: tauri::AppHandle,
+    secret: VaultSecret,
+    state: tauri::State<'_, DbState>,
+    enforce_strength: bool,
+    must_create: bool,
+) -> Result<u64, String> {
     let (mut password, known_key) = match secret {
         VaultSecret::Password(p) => (p, None),
         VaultSecret::Key(k) => (String::new(), Some(k)),
@@ -5884,6 +6007,9 @@ async fn setup_master_db_inner(
     // Before anything is read: another window on this profile stops it here.
     // If the password turns out wrong the lock is let go with this function.
     let profile_lock = lock_profile(&state, &path)?;
+    if must_create && path.exists() {
+        return Err(format!("Profile '{}' already exists", profile_name));
+    }
     let mut conn;
     let salt_bytes: [u8; SALT_LEN];
     // Wrap the derived AES key so it's wiped on every early-return path
@@ -7545,10 +7671,10 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
     Ok(list)
 }
 
-/// "Keep it SSH" for a server whose switch to telnet or VNC is held: it stays
-/// SSH on its old port, saved as this device's own edit, so the next sync
-/// takes it back to SSH everywhere (approvals::keep_ssh). False when no
-/// switch was held.
+/// "Keep it SSH" (or RDP) for a server whose switch to telnet or VNC is held:
+/// it stays as it was on its old port, saved as this device's own edit, so the
+/// next sync takes it back to that everywhere (approvals::keep_ssh). False
+/// when no switch was held.
 #[tauri::command]
 async fn keep_server_ssh(db_state: tauri::State<'_, DbState>, server_id: i32) -> Result<bool, String> {
     let kept = {
@@ -7570,6 +7696,9 @@ async fn keep_server_ssh(db_state: tauri::State<'_, DbState>, server_id: i32) ->
 /// connect starts them (as does the Start button now). Autostart counts from
 /// the next unlock; the frontend types allowed on-connect commands itself.
 /// An allowed switch to telnet or VNC is made at once (approvals::allow).
+/// `run_on_connect` is the on-connect text the user was shown: allowing the
+/// commands needs it, and it's refused when the commands have changed since
+/// (approvals::check_seen_run_on_connect), so the user is asked again.
 #[tauri::command]
 async fn allow_held(
     db_state: tauri::State<'_, DbState>,
@@ -7577,6 +7706,7 @@ async fn allow_held(
     map: tauri::State<'_, MonitorMap>,
     server_id: i32,
     items: Vec<String>,
+    run_on_connect: Option<String>,
 ) -> Result<usize, String> {
     let (allowed, customs) = {
         let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
@@ -7588,6 +7718,8 @@ async fn allow_held(
         } else {
             items.into_iter().filter(|i| held.contains(i)).collect()
         };
+        let allowing_commands = allowed.iter().any(|i| i == approvals::RUN_ON_CONNECT);
+        approvals::check_seen_run_on_connect(conn, &uuid, allowing_commands, run_on_connect.as_deref())?;
         if allowed.is_empty() {
             return Ok(0);
         }
@@ -11747,6 +11879,7 @@ async fn initiate_connection(
     let start_tunnels_inline = role == "primary" && !separate;
 
     println!("[BACKEND] initiate_connection invoked for session_id: {} (role: {}, separate: {}), server_id: {}", session_id, role, separate, server_id);
+    state.session_servers.lock().await.insert(session_id.clone(), server_id);
 
     // Reconnect path: if a previous session under this id is still registered,
     // tear it down before starting the fresh handshake. Without this, the
@@ -13323,6 +13456,72 @@ async fn start_tunnel_specs_on(
     }
 }
 
+/// A server's saved `tunnels` JSON, by uuid. None when there's no such row.
+fn stored_tunnels(conn: &Connection, uuid: &str) -> Option<Option<String>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row("SELECT tunnels FROM servers WHERE uuid = ?1", [uuid], |r| r.get::<_, Option<String>>(0))
+        .optional()
+        .ok()
+        .flatten()
+}
+
+/// After the merge engine applied a server record: when it changed the
+/// server's saved forwards, what they were before is kept (the first time
+/// only, until a session takes it), in a table that lives as long as the
+/// connection and is never saved or synced. A session's rule list read before
+/// the sync is out of date then; `refresh_synced_session_rules` and
+/// `persist_session_tunnels` use it so saving the session's list doesn't undo
+/// what sync brought (a forward added elsewhere deleted everywhere, and its
+/// hold let go).
+fn note_synced_tunnels(conn: &Connection, uuid: &str, before: &Option<String>) -> Result<(), String> {
+    if stored_tunnels(conn, uuid).as_ref() == Some(before) {
+        return Ok(());
+    }
+    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS synced_tunnels_base (uuid TEXT PRIMARY KEY, tunnels TEXT)")
+        .map_err(|e| format!("[SYNC] TUNNELS_BASE: {e}"))?;
+    conn.execute(
+        "INSERT OR IGNORE INTO temp.synced_tunnels_base (uuid, tunnels) VALUES (?1, ?2)",
+        rusqlite::params![uuid, before],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("[SYNC] TUNNELS_BASE: {e}"))
+}
+
+/// Takes what a server's saved forwards were before sync changed them (see
+/// `note_synced_tunnels`): Some when they changed since a session last read
+/// or saved them.
+fn take_synced_tunnels_base(conn: &Connection, server_id: i32) -> Option<Vec<tunnel::TunnelSpec>> {
+    let uuid = approvals::server_uuid(conn, server_id as i64)?;
+    let before: Option<String> = conn
+        .query_row("SELECT tunnels FROM temp.synced_tunnels_base WHERE uuid = ?1", [&uuid], |r| r.get(0))
+        .ok()?;
+    let _ = conn.execute("DELETE FROM temp.synced_tunnels_base WHERE uuid = ?1", [&uuid]);
+    Some(before.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default())
+}
+
+/// A session whose server's saved forwards changed by sync since it read them
+/// starts again from the saved ones (with this device's holds), before the
+/// user sees or changes its rules. The session saves after every change, so
+/// it has nothing of its own that isn't saved.
+async fn refresh_synced_session_rules(state: &SshState, db_state: &DbState, session_id: &str, server_id: Option<i32>) -> Result<(), String> {
+    let server_id = server_id.unwrap_or(0);
+    if server_id <= 0 {
+        return Ok(());
+    }
+    let stale = {
+        let conn_guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+        let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        take_synced_tunnels_base(conn, server_id).is_some()
+    };
+    if stale {
+        let saved = saved_tunnel_rules(db_state, server_id)?;
+        if let Some(rules) = state.session_tunnel_specs.lock().await.get_mut(session_id) {
+            *rules = saved;
+        }
+    }
+    Ok(())
+}
+
 /// The forwarding rules saved on a node (its `tunnels` column).
 fn saved_tunnel_rules(db_state: &DbState, server_id: i32) -> Result<Vec<tunnel::TunnelSpec>, String> {
     let conn_guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
@@ -13354,6 +13553,7 @@ async fn ensure_session_rules(
     session_id: &str,
     server_id: Option<i32>,
 ) -> Result<(), String> {
+    refresh_synced_session_rules(state, db_state, session_id, server_id).await?;
     let server_id = server_id.unwrap_or(0);
     if server_id <= 0 || state.session_tunnel_specs.lock().await.contains_key(session_id) {
         return Ok(());
@@ -13458,6 +13658,7 @@ async fn list_tunnel_rules(
     session_id: String,
     server_id: Option<i32>,
 ) -> Result<Vec<tunnel::TunnelSpec>, String> {
+    refresh_synced_session_rules(state.inner(), db_state.inner(), &session_id, server_id).await?;
     if let Some(rules) = state.session_tunnel_specs.lock().await.get(&session_id) {
         return Ok(rules.clone());
     }
@@ -13550,22 +13751,23 @@ async fn persist_session_tunnels(
     let Some(mut specs) = state.session_tunnel_specs.lock().await.get(&session_id).cloned() else {
         return Ok(());
     };
+    let mut merged = false;
     {
         // Scoped so the non-Send rusqlite guard drops before save_vault_internal.
         let conn_guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        let saved: Vec<tunnel::TunnelSpec> = conn
+            .query_row("SELECT tunnels FROM servers WHERE id=?1", [server_id], |r| r.get::<_, Option<String>>(0))
+            .ok()
+            .flatten()
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
         // A forward held for this device's OK sits stopped in the session only
         // on this device. What is saved keeps the node's own stopped flag for
         // it, so the hold never reaches the people the profile is shared with.
         if let Some(uuid) = approvals::server_uuid(conn, server_id as i64) {
             let held = approvals::held_for(conn, &uuid);
             if held.iter().any(|i| i.starts_with("tunnel:")) {
-                let saved: Vec<tunnel::TunnelSpec> = conn
-                    .query_row("SELECT tunnels FROM servers WHERE id=?1", [server_id], |r| r.get::<_, Option<String>>(0))
-                    .ok()
-                    .flatten()
-                    .and_then(|j| serde_json::from_str(&j).ok())
-                    .unwrap_or_default();
                 for spec in specs.iter_mut().filter(|s| held.contains(&approvals::tunnel_item(s))) {
                     if let Some(s) = saved.iter().find(|s| *s == &*spec) {
                         spec.stopped = s.stopped;
@@ -13573,12 +13775,26 @@ async fn persist_session_tunnels(
                 }
             }
         }
+        // Sync changed the saved forwards after this session last read them
+        // (between the change and this save): the session's change goes on
+        // top of what's saved now, rather than its whole list over it.
+        if let Some(base) = take_synced_tunnels_base(conn, server_id) {
+            specs = tunnel::merge_rules(&base, &specs, &saved);
+            merged = true;
+        }
         let json = serde_json::to_string(&specs).unwrap_or_else(|_| "[]".to_string());
         conn.execute(
             "UPDATE servers SET tunnels=?1 WHERE id=?2",
             rusqlite::params![json, server_id],
         )
         .map_err(|e| format!("[DATABASE] TUNNELS_SAVE_FAILED: SQL_ERROR={}", e))?;
+    }
+    if merged {
+        // The session lists what was saved, with this device's holds.
+        let saved = saved_tunnel_rules(db_state.inner(), server_id)?;
+        if let Some(rules) = state.session_tunnel_specs.lock().await.get_mut(&session_id) {
+            *rules = saved;
+        }
     }
     save_vault_internal(&db_state)?;
     Ok(())
@@ -13602,6 +13818,7 @@ async fn restart_session_tunnels(
     // list (even empty) is authoritative (user stopped everything); only seed
     // from the node's saved tunnels when the key is ABSENT (first engagement),
     // so explicitly-stopped tunnels don't resurrect on a restore.
+    refresh_synced_session_rules(state.inner(), db_state.inner(), &session_id, Some(server_id)).await?;
     let existing: Option<Vec<tunnel::TunnelSpec>> =
         state.session_tunnel_specs.lock().await.get(&session_id).cloned();
     let mut specs: Vec<tunnel::TunnelSpec> = existing.clone().unwrap_or_default();
@@ -14646,6 +14863,7 @@ async fn telnet_connect(
     server_id: i32,
     use_ssh_agent: Option<bool>,
 ) -> Result<(), String> {
+    state.session_servers.lock().await.insert(session_id.clone(), server_id);
     use std::sync::Arc;
     use tauri::Emitter;
 
@@ -14800,6 +15018,7 @@ async fn telnet_open_terminal(
     let (tx, rx) = tokio::sync::mpsc::channel::<TerminalCommand>(32);
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(PtySize { cols, rows });
     state.terminal_txs.lock().await.insert(terminal_id.clone(), tx);
+    note_terminal_server(&state, &session_id, &terminal_id).await;
     state.resize_txs.lock().await.insert(terminal_id.clone(), resize_tx);
     // The output goes to the page's channel, paced like an SSH terminal's
     // (term_output.rs).
@@ -15171,6 +15390,7 @@ async fn disconnect_session(
     state.sftp_sessions.lock().await.remove(&session_id);
     state.sftp_elevation.lock().await.remove(&session_id);
     state.root_access.lock().await.remove(&session_id);
+    state.root_gates.lock().await.remove(&session_id);
     state.docker_root.lock().await.remove(&session_id);
     state.sftp_shell.lock().await.remove(&session_id);
     state.connections.lock().await.remove(&session_id);
@@ -15284,7 +15504,7 @@ const LOGIN_SHELL_SCRIPT: &str =
     r#"if [ -x "$1" ]; then SHELL=$1; export SHELL; exec "$1" -l; fi; exec "${SHELL:-/bin/sh}" -l"#;
 
 fn login_shell_command(shell: &str) -> String {
-    format!("sh -c '{}' sh {}", LOGIN_SHELL_SCRIPT, crate::docker::shq(shell))
+    format!("sh -c '{}' sh {}", LOGIN_SHELL_SCRIPT, remote_sh::quote(shell))
 }
 
 // Whether the server can start `shell` that way: it takes exec requests, it
@@ -15293,7 +15513,7 @@ fn login_shell_command(shell: &str) -> String {
 // gets the plain shell request, as with the setting off: a terminal opens in
 // any case. Asked on a channel of its own, before the terminal's.
 async fn server_runs_login_shell(session_arc: &SessionHandleArc, shell: &str) -> bool {
-    let cmd = format!("sh -c '[ -x \"$1\" ] && echo __SUB_SHELL:OK' sh {}", crate::docker::shq(shell));
+    let cmd = format!("sh -c '[ -x \"$1\" ] && echo __SUB_SHELL:OK' sh {}", remote_sh::quote(shell));
     matches!(
         exec_with_stdin_capture(session_arc, &cmd, None, 4).await,
         Ok(out) if out.lines().any(|line| line.trim() == "__SUB_SHELL:OK")
@@ -15346,6 +15566,7 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
         crate::ssh_manager::PtySize { cols, rows },
     );
     state.terminal_txs.lock().await.insert(terminal_id.clone(), tx);
+    note_terminal_server(&state, &session_id, &terminal_id).await;
     state.resize_txs.lock().await.insert(terminal_id.clone(), resize_tx);
 
     // Output coalescing, keystroke / resize forwarding and the split,
@@ -15386,11 +15607,24 @@ async fn write_terminal_data(state: tauri::State<'_, SshState>, terminal_id: Str
     Ok(())
 }
 
+/// The saved server a shell terminal's session was opened for, kept for
+/// type_saved_password. A container's terminal isn't the server's shell and
+/// isn't noted.
+async fn note_terminal_server(state: &SshState, session_id: &str, terminal_id: &str) {
+    let server = state.session_servers.lock().await.get(session_id).copied();
+    let mut terminals = state.terminal_servers.lock().await;
+    match server {
+        Some(id) => terminals.insert(terminal_id.to_string(), id),
+        None => terminals.remove(terminal_id),
+    };
+}
+
 /// Types a saved password into a terminal, for a password prompt there (sudo,
 /// su, …) that the user picked it for (#28): a server's own saved password
-/// (`server_id`) or a saved login's (`credential_id`). It goes from the
-/// profile to the terminal and never reaches the webview. No Enter after it:
-/// the user sees where it went and presses Enter themselves.
+/// (`server_id`), only into one of that server's own terminals, or a saved
+/// login's (`credential_id`). It goes from the profile to the terminal and
+/// never reaches the webview. No Enter after it: the user sees where it went
+/// and presses Enter themselves.
 #[tauri::command]
 async fn type_saved_password(
     ssh: tauri::State<'_, SshState>,
@@ -15400,6 +15634,11 @@ async fn type_saved_password(
     credential_id: Option<i32>,
 ) -> Result<(), String> {
     use crate::ssh_manager::TerminalCommand;
+    if let Some(id) = server_id {
+        if ssh.terminal_servers.lock().await.get(&terminal_id) != Some(&id) {
+            return Err("That's another server's password: it's only typed into that server's own terminals".into());
+        }
+    }
     let saved = {
         let conn_guard = db.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
@@ -15439,6 +15678,7 @@ async fn resize_terminal(state: tauri::State<'_, SshState>, terminal_id: String,
 async fn close_terminal(state: tauri::State<'_, SshState>, terminal_id: String) -> Result<(), String> {
     state.terminal_txs.lock().await.remove(&terminal_id);
     state.resize_txs.lock().await.remove(&terminal_id);
+    state.terminal_servers.lock().await.remove(&terminal_id);
     Ok(())
 }
 
@@ -15872,7 +16112,7 @@ async fn ssh_iptables_chain(
     let args = ["iptables", "-t", table.as_str(), "-n", "-v", "-L", chain.as_str(), "--line-numbers"]
         .map(String::from);
     if password.is_none() {
-        let direct = format!("{} 2>/dev/null", quote_args(&args));
+        let direct = sh_user_command(&format!("{} 2>/dev/null", remote_sh::quote_words(&args)));
         let out = run_exec_capture(&state, &session_id, &direct, 15).await?;
         if !out.trim().is_empty() {
             return Ok(out);
@@ -16040,7 +16280,7 @@ async fn ssh_nft_chain(
     }
     let args = ["nft", "list", "chain", family.as_str(), table.as_str(), chain.as_str()].map(String::from);
     if password.is_none() {
-        let direct = format!("{} 2>/dev/null", quote_args(&args));
+        let direct = sh_user_command(&format!("{} 2>/dev/null", remote_sh::quote_words(&args)));
         let out = run_exec_capture(&state, &session_id, &direct, 15).await?;
         if !out.trim().is_empty() {
             return Ok(out);
@@ -16141,6 +16381,15 @@ struct SystemctlActionResult {
     root_tool: Option<String>,
 }
 
+/// The user's own try at an Info panel action before root (a service
+/// action, a kill, a firewall read), run by sh whatever the login shell is:
+/// csh and tcsh read `2>&1` and `$?` their own way (remote_sh), and the
+/// answer decides whether root is asked for. Not for what must also work
+/// on Windows (server_os's probe runs in cmd.exe there).
+fn sh_user_command(cmd: &str) -> String {
+    remote_sh::sh_command(&[], cmd, &[])
+}
+
 async fn run_exec_capture(
     state: &SshState,
     session_id: &str,
@@ -16202,46 +16451,25 @@ fn parse_exit_marker(raw: &str) -> (i32, String) {
 // from the tab's SFTP root mode — so it's asked for once. Commands are fixed
 // words plus validated arguments; the password goes to the tool's stdin.
 
-/// The arguments as single-quoted shell words (a quote inside one closes the
-/// word, adds an escaped quote and reopens it). Every caller also validates
-/// them first: unit names, PIDs, firewall identifiers.
-fn quote_args(args: &[String]) -> String {
-    args.iter()
-        .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+// Every script below is POSIX sh, sent with remote_sh::sh_command so that
+// any login shell (csh and tcsh included) passes it to `sh` unread; the
+// arguments are quoted words (remote_sh::quote_words), validated first by
+// every caller: unit names, PIDs, firewall identifiers.
 
-#[cfg(test)]
-mod quote_args_tests {
-    #[test]
-    fn each_argument_is_one_shell_word() {
-        let args = ["systemctl", "restart", "a b", "it's"].map(String::from);
-        assert_eq!(super::quote_args(&args), r#"'systemctl' 'restart' 'a b' 'it'\''s'"#);
-        // What a POSIX shell (the server's) makes of them.
-        if cfg!(unix) {
-            let out = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("printf '%s|' {}", super::quote_args(&args)))
-                .output()
-                .unwrap();
-            assert_eq!(String::from_utf8_lossy(&out.stdout), "systemctl|restart|a b|it's|");
-        }
-    }
-}
+/// root_probe's script: `$SUB_TOOL -l <command>` (`-l` runs nothing, so all
+/// it prints is the tool's own).
+const ROOT_PROBE_SCRIPT: &str = r#"if command -v "$SUB_TOOL" >/dev/null 2>&1; then :; else echo __SUB_SUDO:NO_SUDO; exit 0; fi
+if [ "$SUB_MODE" = pw ]; then OUT=$("$SUB_TOOL" -S -k -p "" -l "$@" 2>&1); else OUT=$("$SUB_TOOL" -n -l "$@" 2>&1); fi
+if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s "$OUT" | tr "\n" " ")"; fi"#;
 
 /// Can `tool` run `args` as root on this server? `tool -l <command>` asks
 /// without running it, and also answers for sudoers rules scoped to one
 /// command. `Err` is a [SUDO] code (see classify_sudo_failure).
-async fn root_probe(session_arc: &SessionHandleArc, tool: &str, password: Option<&str>, args: &[String]) -> Result<(), String> {
-    // POSIX sh, as `sh -c '<script>' sh <args>`: no single quotes inside.
-    const SCRIPT: &str = r#"if command -v "$SUB_TOOL" >/dev/null 2>&1; then :; else echo __SUB_SUDO:NO_SUDO; exit 0; fi
-if [ "$SUB_MODE" = pw ]; then OUT=$("$SUB_TOOL" -S -k -p "" -l "$@" 2>&1); else OUT=$("$SUB_TOOL" -n -l "$@" 2>&1); fi
-if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s "$OUT" | tr "\n" " ")"; fi"#;
+async fn root_probe<H: russh::client::Handler>(session_arc: &HandleArc<H>, tool: &str, password: Option<&str>, args: &[String]) -> Result<(), String> {
     let mode = if password.is_some() { "pw" } else { "n" };
-    let cmd = format!("env SUB_MODE={} SUB_TOOL={} sh -c '{}' sh {}", mode, tool, SCRIPT, quote_args(args));
-    let stdin = password.map(|p| zeroize::Zeroizing::new(format!("{}\n", p)));
-    let out = exec_with_stdin_capture(session_arc, &cmd, stdin.as_ref().map(|s| s.as_bytes()), 20).await?;
+    let cmd = remote_sh::sh_command(&[("SUB_MODE", mode), ("SUB_TOOL", tool)], ROOT_PROBE_SCRIPT, args);
+    let stdin = password.map(password_line);
+    let out = exec_with_stdin_capture(session_arc, &cmd, stdin.as_ref().map(|s| &s[..]), 20).await?;
     for line in out.lines() {
         match line.trim().strip_prefix("__SUB_SUDO:") {
             Some("OK") => return Ok(()),
@@ -16262,18 +16490,17 @@ if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s
 /// the tool, in the order tried. Fixed text, never from input.
 const ROOT_SHELL_FORMS: &[&str] = &["su -", "su - root", "su"];
 
-/// What a root shell is given to run `script` (one line of POSIX sh): root's
-/// own shell may be csh or another, so it starts /bin/sh with the script as
-/// one single-quoted word, which they all read the same way.
+/// What a root shell is given to run `script` (POSIX sh): root's own shell
+/// may be csh or another, so it starts /bin/sh with the script in octal
+/// (remote_sh), which they all pass on unread. One line.
 fn root_shell_line(script: &str) -> String {
-    debug_assert!(!script.contains('\n'));
-    format!("exec /bin/sh -c {}\n", quote_args(&[script.to_string()]))
+    format!("exec {}\n", remote_sh::sh_command_with("/bin/sh", &[], script, &[]))
 }
 
 /// Does `tool <form>` give a root shell without a password? The rules are
 /// asked first (`-l`, which doesn't run anything), then the shell is started
 /// and asked who it is.
-async fn root_shell_probe(session_arc: &SessionHandleArc, tool: &'static str, form: &'static str) -> Result<(), String> {
+async fn root_shell_probe<H: russh::client::Handler>(session_arc: &HandleArc<H>, tool: &'static str, form: &'static str) -> Result<(), String> {
     let words: Vec<String> = form.split(' ').map(String::from).collect();
     root_probe(session_arc, tool, None, &words).await?;
     let line = root_shell_line("echo __SUB_SU_UID:$(id -u)");
@@ -16283,7 +16510,7 @@ async fn root_shell_probe(session_arc: &SessionHandleArc, tool: &'static str, fo
     } else if out.contains("__SUB_SU_UID:") {
         Err(SUDO_NOT_ALLOWED.into())
     } else {
-        Err(classify_sudo_failure(&out))
+        Err(classify_tool_output(&out))
     }
 }
 
@@ -16292,7 +16519,7 @@ async fn root_shell_probe(session_arc: &SessionHandleArc, tool: &'static str, fo
 /// (NOT_ALLOWED: they have rules for the user, just not that one). A tool's
 /// forms stop at the first other answer: when `-l su -` wants a password,
 /// the others do too, and every refused ask is in the server's auth log.
-async fn find_root_shell(session_arc: &SessionHandleArc, tools: &[&'static str]) -> Option<(&'static str, &'static str)> {
+async fn find_root_shell<H: russh::client::Handler>(session_arc: &HandleArc<H>, tools: &[&'static str]) -> Option<(&'static str, &'static str)> {
     let mut tried: Vec<String> = Vec::new();
     for &tool in tools {
         for &form in ROOT_SHELL_FORMS {
@@ -16314,28 +16541,374 @@ async fn find_root_shell(session_arc: &SessionHandleArc, tools: &[&'static str])
     None
 }
 
+/// The first of `tools` that gives a root shell (ROOT_SHELL_FORMS) with the
+/// user's `password`: `dzdo su -` where the tool asks for it. `tools` are
+/// the ones that took the password and refused the command itself. Each try
+/// is one sign-in (ROOT_EXEC_SCRIPT checks the password on its own first),
+/// and the forms are tried in order, stopping at the first that works; any
+/// answer but "not allowed" (a wrong password above all) ends the search, so
+/// a password the tool turns down is never tried again. `Ok(None)`: no form
+/// is allowed.
+async fn find_root_shell_with_password<H: russh::client::Handler>(
+    session_arc: &HandleArc<H>,
+    tools: &[&'static str],
+    password: &zeroize::Zeroizing<String>,
+) -> Result<Option<(&'static str, &'static str)>, String> {
+    let mut tried: Vec<String> = Vec::new();
+    for &tool in tools {
+        for &form in ROOT_SHELL_FORMS {
+            let access = ssh_manager::RootAccess::new(tool, Some(password.clone()), Some(form), None);
+            match root_run(session_arc, &access, &["true".to_string()], 25, None).await {
+                Ok(_) => {
+                    crate::applog::write_line("root", &format!("as root through `{} {}`, with the password", tool, form));
+                    return Ok(Some((tool, form)));
+                }
+                Err(e) if e == SUDO_NOT_ALLOWED => tried.push(format!("`{} {}`", tool, form)),
+                Err(e) => {
+                    crate::applog::write_line("root", &format!("`{} {}` with the password: {}", tool, form, e));
+                    return Err(e);
+                }
+            }
+        }
+    }
+    if !tried.is_empty() {
+        crate::applog::write_line("root", &format!("no root shell with the password ({} not allowed)", tried.join(", ")));
+    }
+    Ok(None)
+}
+
+/// A new tag for one call's ROOT_EXEC_SCRIPT: 128 random bits, so nothing
+/// the server or a command prints can pass for the script's own lines.
+fn new_root_tag() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    format!("__SUB_{}", hex)
+}
+
+/// The password and a line break, in a buffer that never grows (so no copy
+/// is left behind unzeroised).
+fn password_line(password: &str) -> zeroize::Zeroizing<Vec<u8>> {
+    let mut line = zeroize::Zeroizing::new(Vec::with_capacity(password.len() + 1));
+    line.extend_from_slice(password.as_bytes());
+    line.push(b'\n');
+    line
+}
+
+/// How every command runs as root (POSIX sh, remote_sh::sh_command, the
+/// command's words as "$@"). With a password (`SUB_PW`), the app writes it
+/// as one line once the script says `READ`, and:
+///
+/// 1. it goes to `$SUB_TOOL -S -v`, on a pipe that holds nothing else: the
+///    tool checks it and, when it's wrong, asks again and reads the end of
+///    the pipe. One sign-in, one failed attempt at most, and nothing the app
+///    sends later can ever be taken for a second try. Whatever prompt the
+///    tool or PAM would show doesn't matter (`-p ""`, no prompt is looked
+///    for). The answer comes back as `V:<code>`.
+/// 2. When the tool now has a ticket for this shell (`-n -v` works: sudo's,
+///    sudo-rs's and dzdo's default), the command runs with `-n`, so it is
+///    never given the password, even where its rule needs none.
+/// 3. Where the tool keeps no ticket (`timestamp_timeout=0`), the tool is
+///    run asking with `<tag>:PW:` as its prompt, and the app answers only
+///    that prompt.
+///
+/// `RUN:t`, `RUN:p` or (no password) `RUN:n` says the command starts; all
+/// it prints comes after. In a terminal (`SUB_TTY`) echo is off while the
+/// password is read. The command isn't exec'd: a ticket kept for the
+/// shell's children (no terminal: sudo's per-parent ticket) must still be
+/// its own.
+const ROOT_EXEC_SCRIPT: &str = r#"T=$SUB_TAG
+if [ -n "$SUB_ERR" ]; then exec 2>&1; fi
+if [ -z "$SUB_PW" ]; then echo "$T:RUN:n"; "$SUB_TOOL" -n "$@"; exit $?; fi
+if [ -n "$SUB_TTY" ]; then stty -echo 2>/dev/null; fi
+echo "$T:READ"
+IFS= read -r p || exit 97
+if [ -n "$SUB_TTY" ]; then stty echo 2>/dev/null; fi
+printf '%s\n' "$p" | "$SUB_TOOL" -S -p "" -v 2>&1
+r=$?
+p=
+echo "$T:V:$r"
+if [ "$r" != 0 ]; then exit 98; fi
+if "$SUB_TOOL" -n -v >/dev/null 2>&1; then echo "$T:RUN:t"; "$SUB_TOOL" -n "$@"; exit $?; fi
+echo "$T:RUN:p"
+if [ -n "$SUB_TTY" ]; then "$SUB_TOOL" -p "$T:PW:" "$@"; else "$SUB_TOOL" -S -p "$T:PW:" "$@"; fi
+exit $?"#;
+
+/// The command that runs `words` as root with `tool` (ROOT_EXEC_SCRIPT).
+fn root_exec_command(tool: &str, tag: &str, password: bool, pty: bool, stderr_to_stdout: bool, words: &[String]) -> String {
+    let mut env = vec![("SUB_TOOL", tool), ("SUB_TAG", tag)];
+    if password {
+        env.push(("SUB_PW", "1"));
+    }
+    if pty {
+        env.push(("SUB_TTY", "1"));
+    }
+    if stderr_to_stdout {
+        env.push(("SUB_ERR", "1"));
+    }
+    remote_sh::sh_command(&env, ROOT_EXEC_SCRIPT, words)
+}
+
+/// What root_feed gives a channel running ROOT_EXEC_SCRIPT.
+struct RootFeed<'a> {
+    /// The script's tag (new_root_tag).
+    tag: &'a str,
+    password: Option<&'a str>,
+    /// What goes on stdin once the command starts: a root shell's line.
+    then: &'a [u8],
+    /// The command reads no more: stdin is closed after `then`.
+    end: bool,
+    /// A terminal: the tool asks on it (ROOT_EXEC_SCRIPT's third case).
+    pty: bool,
+}
+
+/// One call's turn with the tab's kept password, settled as soon as the
+/// tool has answered it (not when the command ends), so the tab's other
+/// calls wait only that long.
+struct TurnHook<'a> {
+    turn: PasswordTurn,
+    state: &'a SshState,
+    session_id: &'a str,
+    access: &'a ssh_manager::RootAccess,
+}
+
+impl TurnHook<'_> {
+    async fn settle(self, worked: Option<bool>) {
+        self.turn.finish(self.state, self.session_id, self.access, worked).await;
+    }
+}
+
+/// How long the tool may take to check a password: sssd or AD can be slow,
+/// and nothing else is sent meanwhile.
+const ROOT_CHECK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Drive ROOT_EXEC_SCRIPT on `channel`: the password when it asks, the
+/// tool's answer, then `then`. Returns what the command printed so far.
+async fn root_feed(channel: &mut russh::Channel<russh::client::Msg>, feed: RootFeed<'_>, hook: Option<TurnHook<'_>>) -> Result<Vec<u8>, String> {
+    use russh::ChannelMsg;
+    use std::time::{Duration, Instant};
+    let find = |seen: &[u8], what: &[u8]| seen.windows(what.len()).position(|w| w == what);
+    let read_tag = format!("{}:READ", feed.tag);
+    let verdict_tag = format!("{}:V:", feed.tag);
+    let run_tag = format!("{}:RUN:", feed.tag);
+    let mut hook = hook;
+    // The script's lines up to RUN; what the tool said since READ.
+    let mut pending: Vec<u8> = Vec::new();
+    let mut said: Vec<u8> = Vec::new();
+    let mut deadline = Instant::now() + Duration::from_secs(20);
+    let (how, mut rest) = 'lines: loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let data = match tokio::time::timeout(left, channel.wait()).await {
+            Ok(Some(ChannelMsg::Data { data })) | Ok(Some(ChannelMsg::ExtendedData { data, .. })) => data,
+            Ok(Some(ChannelMsg::Close | ChannelMsg::Eof | ChannelMsg::ExitStatus { .. })) | Ok(None) => {
+                return Err(tool_answer(&String::from_utf8_lossy(&said)).unwrap_or_else(|| format!("{}: it ended before the command started", SUDO_FAILED)));
+            }
+            Ok(Some(_)) => continue,
+            Err(_) => return Err(format!("{}: the server didn't answer", SUDO_FAILED)),
+        };
+        pending.extend_from_slice(&data);
+        while let Some(nl) = pending.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = pending.drain(..=nl).collect();
+            let text = String::from_utf8_lossy(&line_bytes);
+            // The script's own lines may follow a prompt the tool or PAM
+            // printed without a line break: the tag is looked for anywhere.
+            let line = match text.find(feed.tag) {
+                Some(at) => {
+                    if at > 0 && said.len() < 8192 {
+                        said.extend_from_slice(text[..at].as_bytes());
+                        said.push(b'\n');
+                    }
+                    text[at..].trim()
+                }
+                None => text.trim(),
+            };
+            if line == read_tag {
+                let Some(pw) = feed.password else { return Err(format!("{}: unexpected reply from the server", SUDO_FAILED)) };
+                channel.data(&password_line(pw)[..]).await.map_err(|e| e.to_string())?;
+                deadline = Instant::now() + ROOT_CHECK_WAIT;
+            } else if let Some(code) = line.strip_prefix(verdict_tag.as_str()) {
+                if code == "0" {
+                    if let Some(h) = hook.take() {
+                        h.settle(Some(true)).await;
+                    }
+                    deadline = Instant::now() + Duration::from_secs(20);
+                } else {
+                    let answer = tool_answer(&String::from_utf8_lossy(&said));
+                    let wrong = answer.as_deref() == Some(SUDO_WRONG_PASSWORD);
+                    if let Some(h) = hook.take() {
+                        h.settle(wrong.then_some(false)).await;
+                    }
+                    return Err(answer.unwrap_or_else(|| {
+                        let text: String = String::from_utf8_lossy(&said).trim().chars().take(300).collect();
+                        format!("{}: the password couldn't be checked{}{}", SUDO_FAILED, if text.is_empty() { "" } else { ": " }, text)
+                    }));
+                }
+            } else if let Some(how) = line.strip_prefix(run_tag.as_str()) {
+                break 'lines (how.to_string(), std::mem::take(&mut pending));
+            } else if said.len() < 8192 {
+                said.extend_from_slice(&line_bytes);
+            }
+        }
+    };
+    if how == "p" {
+        // No ticket: the tool asks again, with the tag as its prompt, and
+        // only that prompt is answered. A prompt of PAM's own instead isn't
+        // answered: in a terminal with nothing else to send, the user sees
+        // it and types; otherwise it fails.
+        let pw = feed.password.ok_or_else(|| format!("{}: unexpected reply from the server", SUDO_FAILED))?;
+        let prompt = format!("{}:PW:", feed.tag);
+        let start = Instant::now();
+        let mut quiet_by: Option<Instant> = None;
+        let mut asked = find(&rest, prompt.as_bytes());
+        while asked.is_none() {
+            let until = quiet_by.unwrap_or(start + Duration::from_secs(20));
+            let left = until.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(left, channel.wait()).await {
+                Ok(Some(ChannelMsg::Data { data })) | Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
+                    rest.extend_from_slice(&data);
+                    asked = find(&rest, prompt.as_bytes());
+                    if !String::from_utf8_lossy(&rest).trim().is_empty() {
+                        quiet_by = Some(Instant::now() + Duration::from_millis(500));
+                    }
+                }
+                Ok(Some(ChannelMsg::Close | ChannelMsg::Eof)) | Ok(None) => {
+                    let text = String::from_utf8_lossy(&rest);
+                    return match tool_answer(&text) {
+                        Some(answer) => Err(answer),
+                        // It ran without asking (a NOPASSWD rule) and is done.
+                        None if feed.then.is_empty() => Ok(rest),
+                        None => Err(format!("{}: it ended before the command started", SUDO_FAILED)),
+                    };
+                }
+                Ok(Some(_)) => {}
+                Err(_) => {
+                    let text = String::from_utf8_lossy(&rest);
+                    // The command's own output, ending its lines, and the tool
+                    // never asked: a NOPASSWD rule. The password isn't given.
+                    let ran = text.trim_end_matches([' ', '\t']).ends_with('\n') && tool_answer(&text).is_none();
+                    if feed.then.is_empty() && (ran || feed.pty) {
+                        if feed.end {
+                            channel.eof().await.map_err(|e| e.to_string())?;
+                        }
+                        return Ok(rest);
+                    }
+                    return Err(if text.trim().is_empty() {
+                        format!("{}: the server didn't answer", SUDO_FAILED)
+                    } else {
+                        format!("{}: sudo or dzdo asked for the password with a prompt of its own, which the app doesn't answer", SUDO_FAILED)
+                    });
+                }
+            }
+        }
+        let at = asked.unwrap_or(0);
+        rest.drain(..at + prompt.len());
+        channel.data(&password_line(pw)[..]).await.map_err(|e| e.to_string())?;
+        if feed.pty && !feed.then.is_empty() {
+            // The tool is done with the terminal (and drops what was typed
+            // ahead) once the root shell shows its prompt.
+            let start = Instant::now();
+            while String::from_utf8_lossy(&rest).trim().is_empty() {
+                let left = (start + Duration::from_secs(20)).saturating_duration_since(Instant::now());
+                match tokio::time::timeout(left, channel.wait()).await {
+                    Ok(Some(ChannelMsg::Data { data })) | Ok(Some(ChannelMsg::ExtendedData { data, .. })) => rest.extend_from_slice(&data),
+                    Ok(Some(ChannelMsg::Close | ChannelMsg::Eof)) | Ok(None) => {
+                        return Err(classify_tool_output(&String::from_utf8_lossy(&rest)));
+                    }
+                    Ok(Some(_)) => {}
+                    Err(_) => return Err(format!("{}: the root shell didn't start", SUDO_FAILED)),
+                }
+            }
+        }
+    }
+    if !feed.then.is_empty() {
+        channel.data(feed.then).await.map_err(|e| e.to_string())?;
+    }
+    if feed.end {
+        channel.eof().await.map_err(|e| e.to_string())?;
+    }
+    Ok(rest)
+}
+
+/// Run ROOT_EXEC_SCRIPT's `cmd`, feed it (root_feed), and collect what the
+/// command prints until it ends: up to `max` bytes, within `timeout_secs`.
+/// Returns the command's exit code too.
+async fn exec_fed_capture<H: russh::client::Handler>(
+    session_arc: &HandleArc<H>,
+    cmd: &str,
+    feed: RootFeed<'_>,
+    hook: Option<TurnHook<'_>>,
+    timeout_secs: u64,
+    max: usize,
+) -> Result<(i32, String), String> {
+    use russh::ChannelMsg;
+    let mut channel = {
+        let session = session_arc.lock().await;
+        session.channel_open_session().await.map_err(|e| e.to_string())?
+    };
+    channel.exec(true, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
+    let mut code: Option<u32> = None;
+    let work = async {
+        let mut out = root_feed(&mut channel, feed, hook).await?;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
+                    if out.len() < max {
+                        out.extend_from_slice(data);
+                    }
+                }
+                ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
+                ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        Ok::<_, String>(out)
+    };
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), work).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            let _ = channel.close().await;
+            return Err(e);
+        }
+        Err(_) => {
+            let _ = channel.close().await;
+            return Err(format!("{} after {}s", ROOT_TIMED_OUT, timeout_secs));
+        }
+    };
+    Ok((code.map(|c| c as i32).unwrap_or(-1), String::from_utf8_lossy(&out).into_owned()))
+}
+
+/// How a root command that ran out of time fails: it may have done its work
+/// (a restart that took long), so it isn't run again.
+const ROOT_TIMED_OUT: &str = "the command timed out";
+
 /// Run `args` as root with `access`: the command's exit code and output.
-async fn root_run(session_arc: &SessionHandleArc, access: &ssh_manager::RootAccess, args: &[String], timeout_secs: u64) -> Result<(i32, String), String> {
-    const SCRIPT: &str = r#"if [ "$SUB_MODE" = pw ]; then "$SUB_TOOL" -S -k -p "" "$@" 2>&1; else "$SUB_TOOL" -n "$@" 2>&1; fi; echo __SUB_EXITCODE:$?"#;
+/// `hook`: the tab's turn with a kept password, settled once the tool has
+/// answered it.
+async fn root_run<H: russh::client::Handler>(
+    session_arc: &HandleArc<H>,
+    access: &ssh_manager::RootAccess,
+    args: &[String],
+    timeout_secs: u64,
+    hook: Option<TurnHook<'_>>,
+) -> Result<(i32, String), String> {
     let tool = if ELEVATION_TOOLS.contains(&access.tool) { access.tool } else { "sudo" };
+    let tag = new_root_tag();
+    let password = access.password.as_ref().map(|p| p.as_str());
     if let Some(form) = access.shell.filter(|s| ROOT_SHELL_FORMS.contains(s)) {
         // The root shell's own start-up (a profile that prints) comes before
-        // the start marker and isn't part of the output.
-        let flags = if access.password.is_some() { "-S -k -p ''" } else { "-n" };
-        let mut stdin = zeroize::Zeroizing::new(String::new());
-        if let Some(p) = &access.password {
-            stdin.push_str(p);
-            stdin.push('\n');
-        }
-        // The marker says who the shell is, so a kept root shell needs no
-        // check of its own before each command (run_as_root).
-        stdin.push_str(&root_shell_line(&format!(
+        // the start marker and isn't part of the output. The marker says who
+        // the shell is, so a kept root shell needs no check of its own before
+        // each command (run_as_root).
+        let line = root_shell_line(&format!(
             "echo __SUB_ROOT_OUT__:$(id -u); {} 2>&1; echo __SUB_EXITCODE:$?",
-            quote_args(args)
-        )));
-        let out = exec_with_stdin_capture_upto(session_arc, &format!("{} {} {}", tool, flags, form), Some(stdin.as_bytes()), timeout_secs, ROOT_OUTPUT_MAX).await?;
+            remote_sh::quote_words(args)
+        ));
+        let words: Vec<String> = form.split(' ').map(String::from).collect();
+        let cmd = root_exec_command(tool, &tag, password.is_some(), false, true, &words);
+        let feed = RootFeed { tag: &tag, password, then: line.as_bytes(), end: true, pty: false };
+        let (_, out) = exec_fed_capture(session_arc, &cmd, feed, hook, timeout_secs, ROOT_OUTPUT_MAX).await?;
         let Some(start) = out.find("__SUB_ROOT_OUT__:") else {
-            return Err(classify_sudo_failure(&out));
+            return Err(classify_tool_output(&out));
         };
         let rest = &out[start + "__SUB_ROOT_OUT__:".len()..];
         let (uid, after) = rest.split_once('\n').unwrap_or((rest, ""));
@@ -16344,11 +16917,10 @@ async fn root_run(session_arc: &SessionHandleArc, access: &ssh_manager::RootAcce
         }
         return Ok(parse_exit_marker(after));
     }
-    let mode = if access.password.is_some() { "pw" } else { "n" };
-    let cmd = format!("env SUB_MODE={} SUB_TOOL={} sh -c '{}' sh {}", mode, tool, SCRIPT, quote_args(args));
-    let stdin = access.password.as_ref().map(|p| zeroize::Zeroizing::new(format!("{}\n", p.as_str())));
-    let out = exec_with_stdin_capture_upto(session_arc, &cmd, stdin.as_ref().map(|s| s.as_bytes()), timeout_secs, ROOT_OUTPUT_MAX).await?;
-    Ok(parse_exit_marker(&out))
+    let cmd = root_exec_command(tool, &tag, password.is_some(), false, true, args);
+    let feed = RootFeed { tag: &tag, password, then: b"", end: true, pty: false };
+    let (code, out) = exec_fed_capture(session_arc, &cmd, feed, hook, timeout_secs, ROOT_OUTPUT_MAX).await?;
+    Ok((code, out.trim_end_matches('\n').to_string()))
 }
 
 /// What root_run keeps of a command's output: a container's logs or a
@@ -16360,18 +16932,13 @@ const ROOT_OUTPUT_MAX: usize = 4 * 1024 * 1024;
 /// by the shell's uid and a line break.
 pub(crate) const ROOT_STREAM_MARKER: &str = "__SUB_ROOT_STREAM__:";
 
-/// What the tool is asked to show as its password prompt in a terminal
-/// (root_channel): the password is sent once it shows, so it's never typed
-/// before the tool has turned the terminal's echo off.
-const ROOT_PTY_PROMPT: &str = "__SUB_ROOT_PASSWORD__:";
-
 /// A channel running `args` as root on this tab's server for as long as the
 /// command runs: a container's live logs, or (with `pty`, its size) a
 /// terminal in a container. Root is found as for run_as_root: what the tab
 /// has, else a look, with `password` when the tool asks for one. Returns
 /// the channel; through a root shell without a terminal, the marker its
-/// output starts after (ROOT_STREAM_MARKER); and in a terminal, what the
-/// command already wrote while the tool's password prompt was looked for.
+/// output starts after (ROOT_STREAM_MARKER); and what the command already
+/// wrote as it started.
 pub(crate) async fn root_channel(
     state: &SshState,
     session_id: &str,
@@ -16383,7 +16950,20 @@ pub(crate) async fn root_channel(
         let connections = state.connections.lock().await;
         connections.get(session_id).map(Arc::clone).ok_or_else(|| "Session not connected".to_string())?
     };
+    let typed = password.is_some();
     let access = root_access_for(state, session_id, &session_arc, args, password, true).await?;
+    let turn = password_turn(state, session_id, &access, typed).await?;
+    let hook = TurnHook { turn, state, session_id, access: &access };
+    root_channel_open(&session_arc, &access, args, pty, Some(hook)).await
+}
+
+async fn root_channel_open<H: russh::client::Handler>(
+    session_arc: &HandleArc<H>,
+    access: &ssh_manager::RootAccess,
+    args: &[String],
+    pty: Option<(u32, u32)>,
+    hook: Option<TurnHook<'_>>,
+) -> Result<(russh::Channel<russh::client::Msg>, Option<&'static str>, Vec<u8>), String> {
     let tool = if ELEVATION_TOOLS.contains(&access.tool) { access.tool } else { "sudo" };
     let mut channel = {
         let session = session_arc.lock().await;
@@ -16395,40 +16975,30 @@ pub(crate) async fn root_channel(
             .await
             .map_err(|e| e.to_string())?;
     }
-    let to_stderr = if pty.is_some() { "" } else { " 2>&1" };
-    let mut stdin = zeroize::Zeroizing::new(String::new());
-    let mut wait_for_prompt = false;
-    let (cmd, marker) = if let Some(form) = access.shell.filter(|s| ROOT_SHELL_FORMS.contains(s)) {
-        // root_access_for gives a root shell only without a password.
-        let script = if pty.is_some() {
-            // In a terminal the line given to the root shell shows as it's
-            // typed; the screen is cleared before the command starts.
-            format!("printf '\\033[H\\033[2J\\033[3J'; exec {}", quote_args(args))
-        } else {
-            format!("echo {}$(id -u); exec {} 2>&1", ROOT_STREAM_MARKER, quote_args(args))
-        };
-        stdin.push_str(&root_shell_line(&script));
-        // Without a terminal, what the tool says when it refuses comes on
-        // stderr, which a stream doesn't read.
-        (format!("{} -n {}{}", tool, form, to_stderr), pty.is_none().then_some(ROOT_STREAM_MARKER))
-    } else if let Some(p) = &access.password {
-        stdin.push_str(p);
-        stdin.push('\n');
-        if pty.is_some() {
-            // In a terminal the tool reads it from the terminal, with echo
-            // off once its prompt shows (`-S` would leave echo on).
-            wait_for_prompt = true;
-            (format!("{} -k -p '{}' {}", tool, ROOT_PTY_PROMPT, quote_args(args)), None)
-        } else {
-            (format!("{} -S -k -p '' {}{}", tool, quote_args(args), to_stderr), None)
+    let tag = new_root_tag();
+    let password = access.password.as_ref().map(|p| p.as_str());
+    let (words, line, marker) = match access.shell.filter(|s| ROOT_SHELL_FORMS.contains(s)) {
+        Some(form) => {
+            let script = if pty.is_some() {
+                // In a terminal the line given to the root shell shows as it's
+                // typed; the screen is cleared before the command starts.
+                format!("printf '\\033[H\\033[2J\\033[3J'; exec {}", remote_sh::quote_words(args))
+            } else {
+                format!("echo {}$(id -u); exec {} 2>&1", ROOT_STREAM_MARKER, remote_sh::quote_words(args))
+            };
+            let words: Vec<String> = form.split(' ').map(String::from).collect();
+            (words, root_shell_line(&script), pty.is_none().then_some(ROOT_STREAM_MARKER))
         }
-    } else {
-        (format!("{} -n {}{}", tool, quote_args(args), to_stderr), None)
+        None => (args.to_vec(), String::new(), None),
     };
-    channel.exec(true, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
+    // Without a terminal, what the tool says when it refuses comes on
+    // stderr, which a stream doesn't read: it goes to stdout.
+    let command = root_exec_command(tool, &tag, password.is_some(), pty.is_some(), pty.is_none(), &words);
+    channel.exec(true, command.as_bytes()).await.map_err(|e| e.to_string())?;
     // From here a failure closes the channel: a dropped one stays open on the
     // server, with whatever the tool started in it.
-    match root_channel_start(&mut channel, wait_for_prompt, &stdin, pty.is_none()).await {
+    let feed = RootFeed { tag: &tag, password, then: line.as_bytes(), end: pty.is_none(), pty: pty.is_some() };
+    match root_feed(&mut channel, feed, hook).await {
         Ok(early) => Ok((channel, marker, early)),
         Err(e) => {
             let _ = channel.close().await;
@@ -16437,65 +17007,124 @@ pub(crate) async fn root_channel(
     }
 }
 
-/// root_channel's last steps: the password once the tool asks for it (in a
-/// terminal), what goes on stdin, and its end (without a terminal). Returns
-/// what came out before (see root_channel).
-async fn root_channel_start(
-    channel: &mut russh::Channel<russh::client::Msg>,
-    wait_for_prompt: bool,
-    stdin: &str,
-    end_stdin: bool,
-) -> Result<Vec<u8>, String> {
-    use russh::ChannelMsg;
-    use std::time::{Duration, Instant};
-    if wait_for_prompt {
-        // The tool's prompt, then the password goes; or the command's own
-        // output, when the tool let it run without one (a NOPASSWD rule for
-        // it): then the password isn't given, or the command would get it.
-        // What comes first may be split, or follow sudo's first-use lecture,
-        // so a little more is waited for before deciding.
-        let has_prompt = |seen: &[u8]| seen.windows(ROOT_PTY_PROMPT.len()).position(|w| w == ROOT_PTY_PROMPT.as_bytes());
-        let mut seen: Vec<u8> = Vec::new();
-        let start = Instant::now();
-        let mut decide_by: Option<Instant> = None;
-        loop {
-            let until = decide_by.unwrap_or(start + Duration::from_secs(20));
-            let left = until.saturating_duration_since(Instant::now());
-            match tokio::time::timeout(left, channel.wait()).await {
-                Ok(Some(ChannelMsg::Data { ref data })) | Ok(Some(ChannelMsg::ExtendedData { ref data, .. })) => {
-                    seen.extend_from_slice(data);
-                    if let Some(at) = has_prompt(&seen) {
-                        seen.drain(..at + ROOT_PTY_PROMPT.len());
-                        break;
-                    }
-                    decide_by.get_or_insert_with(|| Instant::now() + Duration::from_millis(500));
+/// How long a kept password that worked is taken to work still: calls with
+/// it go at once and side by side.
+const PASSWORD_TRUSTED_FOR: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// One call's turn with the tab's kept password (RootAccess::checked).
+struct PasswordTurn {
+    /// Held while a password not known to work lately is tried: the tab's
+    /// other calls wait for its answer rather than each sign in with it.
+    held: Option<tokio::sync::OwnedMutexGuard<Option<std::time::Instant>>>,
+}
+
+/// Wait for this call's turn with `access`'s password. `Err` when it was
+/// forgotten meanwhile because it stopped working: the tab asks for it.
+async fn password_turn(state: &SshState, session_id: &str, access: &ssh_manager::RootAccess, typed: bool) -> Result<PasswordTurn, String> {
+    if access.password.is_none() {
+        return Ok(PasswordTurn { held: None });
+    }
+    let guard = Arc::clone(&access.checked).lock_owned().await;
+    if !typed && !root_access_is_kept(state, session_id, access).await {
+        return Err(SUDO_WRONG_PASSWORD.into());
+    }
+    let trusted = guard.is_some_and(|t| t.elapsed() < PASSWORD_TRUSTED_FOR);
+    Ok(PasswordTurn { held: (!trusted).then_some(guard) })
+}
+
+impl PasswordTurn {
+    /// What the tool said of the password: `Some(true)` it worked,
+    /// `Some(false)` it was turned down (forgotten for the whole tab at
+    /// once), `None` no answer either way.
+    async fn finish(self, state: &SshState, session_id: &str, access: &ssh_manager::RootAccess, worked: Option<bool>) {
+        let Some(pw) = &access.password else { return };
+        let Some(worked) = worked else { return };
+        if !worked {
+            forget_root_password(state, session_id, pw).await;
+        }
+        let when = worked.then(std::time::Instant::now);
+        match self.held {
+            Some(mut held) => *held = when,
+            // Another call is trying it: its answer counts.
+            None => {
+                if let Ok(mut checked) = access.checked.try_lock() {
+                    *checked = when;
                 }
-                Ok(Some(ChannelMsg::Close | ChannelMsg::Eof)) | Ok(None) => {
-                    return Err(classify_sudo_failure(&String::from_utf8_lossy(&seen)));
-                }
-                Ok(Some(_)) => {}
-                // Output and no prompt: it runs without the password.
-                Err(_) if !seen.is_empty() => return Ok(seen),
-                Err(_) => return Err(format!("{}: the server didn't answer", SUDO_FAILED)),
             }
         }
-        channel.data(stdin.as_bytes()).await.map_err(|e| e.to_string())?;
-        return Ok(seen);
     }
-    if !stdin.is_empty() {
-        channel.data(stdin.as_bytes()).await.map_err(|e| e.to_string())?;
+}
+
+/// Is `access` still the one the tab keeps?
+async fn root_access_is_kept(state: &SshState, session_id: &str, access: &ssh_manager::RootAccess) -> bool {
+    state.root_access.lock().await.get(session_id).is_some_and(|a| Arc::ptr_eq(&a.checked, &access.checked))
+}
+
+/// What the tab already has for root: its own, else its SFTP root mode's
+/// (kept as its own from then on, so the tab's calls share one answer on
+/// whether its password still works). Not a password that stopped working.
+async fn known_root_access(state: &SshState, session_id: &str) -> Option<ssh_manager::RootAccess> {
+    // Lock order: root_access, then sftp_elevation.
+    let mut own = state.root_access.lock().await;
+    if let Some(a) = own.get(session_id) {
+        return Some(a.clone());
     }
-    if end_stdin {
-        channel.eof().await.map_err(|e| e.to_string())?;
+    let e = state.sftp_elevation.lock().await.get(session_id).cloned()?;
+    if e.password_failed {
+        return None;
     }
-    Ok(Vec::new())
+    let a = ssh_manager::RootAccess::new(e.tool, e.password.clone(), e.shell, None);
+    own.insert(session_id.to_string(), a.clone());
+    Some(a)
+}
+
+/// Forget `access` for the tab, if it's still the one kept (another call
+/// may have put a newer one there).
+async fn forget_root_access(state: &SshState, session_id: &str, access: &ssh_manager::RootAccess) {
+    let mut own = state.root_access.lock().await;
+    if own.get(session_id).is_some_and(|a| Arc::ptr_eq(&a.checked, &access.checked)) {
+        own.remove(session_id);
+    }
+}
+
+/// The tool turned down the tab's kept password `pw`: forget it everywhere
+/// the tab keeps it at once (its root access and its SFTP root mode), so
+/// nothing tries it again; the next action asks for the password.
+async fn forget_root_password(state: &SshState, session_id: &str, pw: &str) {
+    crate::applog::write_line("root", "the kept password was turned down; forgotten for this tab");
+    {
+        let mut own = state.root_access.lock().await;
+        if own.get(session_id).and_then(|a| a.password.as_ref()).is_some_and(|p| p.as_str() == pw) {
+            own.remove(session_id);
+        }
+    }
+    let mut modes = state.sftp_elevation.lock().await;
+    if let Some(e) = modes.get_mut(session_id) {
+        if e.password.as_ref().is_some_and(|p| p.as_str() == pw) {
+            e.password_failed = true;
+        }
+    }
+}
+
+/// A password the user just typed worked for `access.tool`: where the tab's
+/// SFTP root mode had that tool's password turned down, it takes this one.
+async fn revive_sftp_password(state: &SshState, session_id: &str, access: &ssh_manager::RootAccess) {
+    let Some(pw) = &access.password else { return };
+    let mut modes = state.sftp_elevation.lock().await;
+    if let Some(e) = modes.get_mut(session_id) {
+        if e.password_failed && e.tool == access.tool {
+            e.password = Some(pw.clone());
+            e.password_failed = false;
+        }
+    }
 }
 
 /// How this tab gets root for `args`: what it already has (its own, else its
 /// SFTP root mode's) when that still works, else the first tool that lets it
-/// — without a password, then with `password`. Kept for the tab. `Err` is a
-/// [SUDO] code; with NEED_PASSWORD or WRONG_PASSWORD the panel asks for the
-/// password and calls again with it.
+/// — without a password, then with `password`, the command itself and then a
+/// root shell (`dzdo su -`). Kept for the tab. `Err` is a [SUDO] code; with
+/// NEED_PASSWORD or WRONG_PASSWORD the panel asks for the password and calls
+/// again with it.
 async fn root_access_for(
     state: &SshState,
     session_id: &str,
@@ -16511,51 +17140,38 @@ async fn root_access_for(
             return Err(format!("{}: the password contains a line break", SUDO_FAILED));
         }
     }
+    // A typed password means what the tab had stopped working: start over.
+    if let Some(pw) = password {
+        return typed_root_access(state, session_id, session_arc, args, pw).await;
+    }
     let keep = |a: &RootAccess| {
         let a = a.clone();
         async move { state.root_access.lock().await.insert(session_id.to_string(), a) }
     };
-    // A typed password means what the tab had stopped working: start over.
-    if password.is_none() && use_known {
-        let own = state.root_access.lock().await.get(session_id).cloned();
-        let known = match own {
-            Some(a) => Some(a),
-            None => state
-                .sftp_elevation
-                .lock()
-                .await
-                .get(session_id)
-                .map(|e| RootAccess { tool: e.tool, password: e.password.clone(), shell: e.shell }),
-        };
-        if let Some(a) = known {
+    if use_known {
+        if let Some(a) = known_root_access(state, session_id).await {
             // A root shell runs anything, and root_run checks it's still root
-            // as it runs the command (run_as_root looks again if not); a
-            // tool's own rules are asked about this command.
-            if a.shell.is_some() {
-                keep(&a).await;
+            // as it runs the command (run_as_root looks again if not). With a
+            // password, the run itself is the check: asking first (`-l`)
+            // would be a second sign-in per command. Without one, the tool's
+            // rules are asked about this command (no sign-in).
+            if a.shell.is_some() || a.password.is_some() {
                 return Ok(a);
             }
-            if root_probe(session_arc, a.tool, a.password.as_deref().map(|s| s.as_str()), args).await.is_ok() {
-                keep(&a).await;
+            if root_probe(session_arc, a.tool, None, args).await.is_ok() {
                 return Ok(a);
             }
-            // The kept password no longer works, or this tool doesn't allow
-            // this command (a sudoers rule for sftp-server only, say): forget
-            // it and look again.
-            state.root_access.lock().await.remove(session_id);
+            // This tool doesn't allow this command (a sudoers rule for
+            // sftp-server only, say): look again.
+            forget_root_access(state, session_id, &a).await;
         }
     }
     let mut best: Option<String> = None;
     let mut refused: Vec<&'static str> = Vec::new();
-    // A typed password means the tools were tried without one: `-l` can say
-    // yes without a password where another of the user's rules has NOPASSWD
-    // (sudo's `listpw`), even for a command that needs one, so asking again
-    // without it would skip the password.
-    let tools_without_password: &[&'static str] = if password.is_some() { &[] } else { ELEVATION_TOOLS };
-    for &tool in tools_without_password {
+    for &tool in ELEVATION_TOOLS {
         match root_probe(session_arc, tool, None, args).await {
             Ok(()) => {
-                let a = RootAccess { tool, password: None, shell: None };
+                let a = RootAccess::new(tool, None, None, None);
                 keep(&a).await;
                 return Ok(a);
             }
@@ -16574,31 +17190,102 @@ async fn root_access_for(
     }
     // As SFTP root mode: a root shell without a password before asking for
     // one (probe_sudo_sftp).
-    if password.is_none() {
-        if let Some((tool, form)) = find_root_shell(session_arc, &refused).await {
-            crate::applog::write_line("root", &format!("as root through `{} {}`, no password", tool, form));
-            let a = RootAccess { tool, password: None, shell: Some(form) };
-            keep(&a).await;
-            return Ok(a);
-        }
+    if let Some((tool, form)) = find_root_shell(session_arc, &refused).await {
+        crate::applog::write_line("root", &format!("as root through `{} {}`, no password", tool, form));
+        let a = RootAccess::new(tool, None, Some(form), None);
+        keep(&a).await;
+        return Ok(a);
     }
-    let best = best.unwrap_or_else(|| SUDO_NO_SUDO.into());
-    let Some(pw) = password else { return Err(best) };
-    // As SFTP root mode: a tool that isn't there or doesn't allow the user
-    // hands over to the next; a wrong password ends it (one failed attempt,
-    // not one per tool).
-    for tool in ELEVATION_TOOLS {
-        match root_probe(session_arc, tool, Some(pw.as_str()), args).await {
-            Ok(()) => {
-                let a = RootAccess { tool, password: Some(pw), shell: None };
-                keep(&a).await;
-                return Ok(a);
+    Err(best.unwrap_or_else(|| SUDO_NO_SUDO.into()))
+}
+
+/// The tab's gate for passwords the user types (ssh_manager::RootGate).
+async fn root_gate(state: &SshState, session_id: &str) -> Arc<tokio::sync::Mutex<ssh_manager::RootGate>> {
+    Arc::clone(state.root_gates.lock().await.entry(session_id.to_string()).or_default())
+}
+
+/// A digest of `password` with this run's own random salt, to tell a
+/// password just turned down when it's typed again (RootGate::rejected).
+fn password_digest(password: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    static SALT: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    let salt = SALT.get_or_init(|| {
+        let mut b = [0u8; 32];
+        rand::rng().fill_bytes(&mut b);
+        b
+    });
+    let mut h = Sha256::new();
+    h.update(b"submarine-root-password\0");
+    h.update(salt);
+    h.update(password.as_bytes());
+    h.finalize().into()
+}
+
+/// How long a password sudo or dzdo turned down is answered "wrong" again
+/// at once, without trying it.
+const REJECTED_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether `password` was turned down for this tab a moment ago.
+fn just_rejected(gate: &ssh_manager::RootGate, password: &str) -> bool {
+    gate.rejected.is_some_and(|(d, at)| d == password_digest(password) && at.elapsed() < REJECTED_FOR)
+}
+
+/// root_access_for with a password the user typed. Every call of the tab
+/// that was waiting for the password gets the same answer (rootInvoke), so
+/// they take turns: the first tries it; the others take what it found, or
+/// are told it's wrong without trying it again (an account lockout after a
+/// few failed attempts). Then, as SFTP root mode: a tool that isn't there or
+/// doesn't allow the user hands over to the next; a wrong password ends it
+/// (one failed attempt, not one per tool); a tool that took the password but
+/// allows only a root shell gets `dzdo su -`.
+async fn typed_root_access<H: russh::client::Handler>(
+    state: &SshState,
+    session_id: &str,
+    session_arc: &HandleArc<H>,
+    args: &[String],
+    pw: zeroize::Zeroizing<String>,
+) -> Result<ssh_manager::RootAccess, String> {
+    use ssh_manager::RootAccess;
+    let gate = root_gate(state, session_id).await;
+    let mut gate = gate.lock().await;
+    if just_rejected(&gate, &pw) {
+        return Err(SUDO_WRONG_PASSWORD.into());
+    }
+    let kept = state.root_access.lock().await.get(session_id).cloned();
+    if let Some(a) = kept.filter(|a| a.password.as_ref().is_some_and(|p| p.as_str() == pw.as_str())) {
+        return Ok(a);
+    }
+    let found = async {
+        let mut refused: Vec<&'static str> = Vec::new();
+        for tool in ELEVATION_TOOLS {
+            match root_probe(session_arc, tool, Some(pw.as_str()), args).await {
+                Ok(()) => return Ok((*tool, None)),
+                Err(e) if e == SUDO_NO_SUDO => continue,
+                Err(e) if e == SUDO_NOT_ALLOWED => refused.push(*tool),
+                Err(e) => return Err(e),
             }
-            Err(e) if e == SUDO_NO_SUDO || e == SUDO_NOT_ALLOWED => continue,
-            Err(e) => return Err(e),
+        }
+        match find_root_shell_with_password(session_arc, &refused, &pw).await? {
+            Some((tool, form)) => Ok((tool, Some(form))),
+            None => Err(SUDO_NOT_ALLOWED.to_string()),
         }
     }
-    Err(SUDO_NOT_ALLOWED.into())
+    .await;
+    match found {
+        Ok((tool, shell)) => {
+            gate.rejected = None;
+            let a = RootAccess::new(tool, Some(pw), shell, Some(std::time::Instant::now()));
+            state.root_access.lock().await.insert(session_id.to_string(), a.clone());
+            revive_sftp_password(state, session_id, &a).await;
+            Ok(a)
+        }
+        Err(e) => {
+            if e == SUDO_WRONG_PASSWORD {
+                gate.rejected = Some((password_digest(&pw), std::time::Instant::now()));
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Run `args` as root on this tab's server: exit code, output, and the tool.
@@ -16613,28 +17300,44 @@ pub(crate) async fn run_as_root(
         let connections = state.connections.lock().await;
         connections.get(session_id).map(Arc::clone).ok_or_else(|| "Session not connected".to_string())?
     };
+    let typed = password.is_some();
     let access = root_access_for(state, session_id, &session_arc, args, password, true).await?;
-    match root_run(&session_arc, &access, args, timeout_secs).await {
-        // A root shell is used only when no password was typed, so the
-        // second look needs none either.
-        Err(e) if access.shell.is_some() => {
-            crate::applog::write_line("root", &format!("the root shell didn't work this time ({}); looking again", e));
-            state.root_access.lock().await.remove(session_id);
-            let access = root_access_for(state, session_id, &session_arc, args, None, false).await?;
-            let (code, out) = root_run(&session_arc, &access, args, timeout_secs).await?;
-            Ok((code, out, access.tool))
-        }
-        done => {
-            let (code, out) = done?;
+    // The turn ends once the tool has answered the password (root_feed), not
+    // when the command does.
+    let turn = password_turn(state, session_id, &access, typed).await?;
+    let hook = TurnHook { turn, state, session_id, access: &access };
+    let ran = root_run(&session_arc, &access, args, timeout_secs, Some(hook)).await;
+    // Where the tool ran the command itself, its refusal is in the output.
+    let ran = match ran {
+        Ok((code, out)) if code != 0 && access.shell.is_none() => match tool_answer(&out) {
             // `-l` answers without a password where any of the user's rules
             // has NOPASSWD (sudo's `listpw`), even for a command that needs
             // one; running it says so. Then the tab asks for the password.
-            if code != 0 && access.password.is_none() && access.shell.is_none() && classify_sudo_failure(&out) == SUDO_NEED_PASSWORD {
-                state.root_access.lock().await.remove(session_id);
-                return Err(SUDO_NEED_PASSWORD.into());
+            Some(a) if a == SUDO_NEED_PASSWORD && access.password.is_none() => {
+                forget_root_access(state, session_id, &access).await;
+                return Err(a);
             }
+            // A kept password's tool, whose rules don't cover this command.
+            Some(a) if a == SUDO_NOT_ALLOWED && access.password.is_some() && !typed => Err(a),
+            _ => Ok((code, out)),
+        },
+        ran => ran,
+    };
+    match ran {
+        Ok((code, out)) => Ok((code, out, access.tool)),
+        // A kept root shell that didn't work this time (not root any more),
+        // or a kept password's tool that doesn't allow this command: look
+        // again, with the kept password if there is one. Not after a time-out:
+        // the command may have done its work, and isn't run twice.
+        Err(e) if !typed && e != SUDO_WRONG_PASSWORD && !e.starts_with(ROOT_TIMED_OUT) && (access.shell.is_some() || e == SUDO_NOT_ALLOWED) => {
+            crate::applog::write_line("root", &format!("what the tab had for root didn't work this time ({}); looking again", e));
+            forget_root_access(state, session_id, &access).await;
+            let again = access.password.as_ref().map(|p| p.to_string());
+            let access = root_access_for(state, session_id, &session_arc, args, again, false).await?;
+            let (code, out) = root_run(&session_arc, &access, args, timeout_secs, None).await?;
             Ok((code, out, access.tool))
         }
+        Err(e) => Err(e),
     }
 }
 
@@ -16732,7 +17435,7 @@ async fn ssh_systemctl_action(
     // a password when they need one). A call with `password` is that second
     // try, so it goes straight to root.
     if password.is_none() {
-        let plain_cmd = systemctl_command(false, &action, &unit);
+        let plain_cmd = sh_user_command(&systemctl_command(false, &action, &unit));
         let raw1 = run_exec_capture(&state, &session_id, &plain_cmd, 30).await?;
         let (code1, out1) = parse_exit_marker(&raw1);
         let needs_root = code1 != 0 && (
@@ -16789,7 +17492,7 @@ async fn ssh_kill_process(
 
     // As ssh_systemctl_action: the user's own kill, then as root.
     if password.is_none() {
-        let plain = format!("kill -{} {} 2>&1; echo __SUB_EXITCODE:$?", sig, pid);
+        let plain = sh_user_command(&format!("kill -{} {} 2>&1; echo __SUB_EXITCODE:$?", sig, pid));
         let raw1 = run_exec_capture(&state, &session_id, &plain, 15).await?;
         let (code1, out1) = parse_exit_marker(&raw1);
         let low = out1.to_lowercase();
@@ -16861,6 +17564,8 @@ struct SftpListResult {
 // the same options and is tried the same way; see ELEVATION_TOOLS.
 
 type SessionHandleArc = Arc<tokio::sync::Mutex<russh::client::Handle<ssh_manager::ClientHandler>>>;
+/// A connection with any client handler: the app's own, or a test's.
+type HandleArc<H> = Arc<tokio::sync::Mutex<russh::client::Handle<H>>>;
 
 const SUDO_NEED_PASSWORD: &str = "[SUDO] NEED_PASSWORD";
 const SUDO_WRONG_PASSWORD: &str = "[SUDO] WRONG_PASSWORD";
@@ -16871,8 +17576,8 @@ const SUDO_NO_SFTP_SERVER: &str = "[SUDO] NO_SFTP_SERVER";
 const SUDO_FAILED: &str = "[SUDO] FAILED";
 const ELEVATED_SFTP_READY: &str = "__SUB_SUDO_READY__";
 
-// POSIX sh, run as `sh -c '<script>'`: no single quotes inside, and no `!`
-// (tcsh history expansion) so it survives any login shell. `SUB_MODE=pw`
+// POSIX sh, sent with remote_sh::sh_command (any login shell passes it on
+// unread). `SUB_MODE=pw`
 // makes sudo read the password from stdin; `-k` ignores a cached ticket so
 // the password is really checked. `sudo -l <cmd>` tests the exact command
 // we will run, which also works for sudoers rules scoped to sftp-server.
@@ -16958,10 +17663,33 @@ fn classify_sudo_failure(msg: &str) -> String {
     }
 }
 
+/// Is this line of output one of sudo's, dzdo's or sudo-rs's own? Those
+/// start with the tool's name, or are its refusals ("Sorry, try again.",
+/// "Sorry, user bob may not run sudo", "bob is not in the sudoers file").
+fn is_tool_line(line: &str) -> bool {
+    let l = line.trim().to_ascii_lowercase();
+    ["sudo:", "dzdo:", "sudo-rs:", "sorry, try again", "sorry, user "].iter().any(|p| l.starts_with(p))
+        || l.contains(" is not in the sudoers file")
+}
+
+/// classify_sudo_failure for output that also holds what the command (or a
+/// root shell's start-up) printed: only the tool's own lines (is_tool_line)
+/// are read, so a command that prints "incorrect password" is never taken
+/// for the tool turning the password down.
+fn classify_tool_output(out: &str) -> String {
+    tool_answer(out).unwrap_or_else(|| SUDO_NOT_ALLOWED.into())
+}
+
+/// classify_sudo_failure of the tool's own lines in `out`, if it has any.
+fn tool_answer(out: &str) -> Option<String> {
+    let lines: Vec<&str> = out.lines().map(str::trim).filter(|l| is_tool_line(l)).collect();
+    (!lines.is_empty()).then(|| classify_sudo_failure(&lines.join(" ")))
+}
+
 /// Run a command on its own exec channel, optionally feeding stdin, and
 /// collect stdout+stderr until the channel closes.
-async fn exec_with_stdin_capture(
-    session_arc: &SessionHandleArc,
+async fn exec_with_stdin_capture<H: russh::client::Handler>(
+    session_arc: &HandleArc<H>,
     cmd: &str,
     stdin: Option<&[u8]>,
     timeout_secs: u64,
@@ -16970,8 +17698,8 @@ async fn exec_with_stdin_capture(
 }
 
 /// exec_with_stdin_capture keeping up to `max` bytes of the output.
-async fn exec_with_stdin_capture_upto(
-    session_arc: &SessionHandleArc,
+async fn exec_with_stdin_capture_upto<H: russh::client::Handler>(
+    session_arc: &HandleArc<H>,
     cmd: &str,
     stdin: Option<&[u8]>,
     timeout_secs: u64,
@@ -17016,18 +17744,19 @@ async fn exec_with_stdin_capture_upto(
 /// wrong password above all) ends it, so a mistyped password counts as one
 /// failed attempt, not one per tool.
 ///
-/// Without a password, when no tool may run sftp-server itself, a root
-/// shell is tried next (find_root_shell): `dzdo su -` with no password is
+/// When no tool may run sftp-server itself, a root shell is tried next:
+/// without a password (find_root_shell), `dzdo su -` with no password is
 /// how many AD-managed hosts give root, and must not end in a password
-/// prompt. Returns the root shell's words too, when that's the way in.
-async fn probe_sudo_sftp(
-    session_arc: &SessionHandleArc,
-    password: Option<&str>,
+/// prompt; with one (find_root_shell_with_password), `dzdo su -` that asks
+/// for it. Returns the root shell's words too, when that's the way in.
+async fn probe_sudo_sftp<H: russh::client::Handler>(
+    session_arc: &HandleArc<H>,
+    password: Option<&zeroize::Zeroizing<String>>,
 ) -> Result<(String, &'static str, Option<&'static str>), String> {
     let mut best: Option<String> = None;
     let mut refused: Vec<&'static str> = Vec::new();
     for tool in ELEVATION_TOOLS {
-        match probe_sudo_sftp_with(session_arc, password, tool).await {
+        match probe_sudo_sftp_with(session_arc, password.map(|p| p.as_str()), tool).await {
             Ok(path) => return Ok((path, tool, None)),
             // A fact about the server, whichever tool asked.
             Err(e) if e == SUDO_NO_SFTP_SERVER => return Err(e),
@@ -17045,19 +17774,21 @@ async fn probe_sudo_sftp(
             }
         }
     }
-    if password.is_none() {
-        if let Some((tool, form)) = find_root_shell(session_arc, &refused).await {
-            let path = find_sftp_server(session_arc).await?;
-            crate::applog::write_line("root", &format!("SFTP as root: through `{} {}`, no password", tool, form));
-            return Ok((path, tool, Some(form)));
-        }
+    let shell = match password {
+        None => find_root_shell(session_arc, &refused).await,
+        Some(pw) => find_root_shell_with_password(session_arc, &refused, pw).await?,
+    };
+    if let Some((tool, form)) = shell {
+        let path = find_sftp_server(session_arc).await?;
+        crate::applog::write_line("root", &format!("SFTP as root: through `{} {}`", tool, form));
+        return Ok((path, tool, Some(form)));
     }
     Err(best.unwrap_or_else(|| SUDO_NO_SUDO.into()))
 }
 
 /// The server's sftp-server, found as the login user.
-async fn find_sftp_server(session_arc: &SessionHandleArc) -> Result<String, String> {
-    let cmd = format!("sh -c '{}'", SFTP_SERVER_FIND);
+async fn find_sftp_server<H: russh::client::Handler>(session_arc: &HandleArc<H>) -> Result<String, String> {
+    let cmd = remote_sh::sh_command(&[], SFTP_SERVER_FIND, &[]);
     let out = exec_with_stdin_capture(session_arc, &cmd, None, 20).await?;
     for line in out.lines() {
         match line.trim().strip_prefix("__SUB_SUDO:") {
@@ -17077,11 +17808,11 @@ async fn find_sftp_server(session_arc: &SessionHandleArc) -> Result<String, Stri
     Err(format!("{}: unexpected reply from the server", SUDO_FAILED))
 }
 
-async fn probe_sudo_sftp_with(session_arc: &SessionHandleArc, password: Option<&str>, tool: &str) -> Result<String, String> {
+async fn probe_sudo_sftp_with<H: russh::client::Handler>(session_arc: &HandleArc<H>, password: Option<&str>, tool: &str) -> Result<String, String> {
     let mode = if password.is_some() { "pw" } else { "n" };
-    let cmd = format!("env SUB_MODE={} SUB_TOOL={} sh -c '{}'", mode, tool, SUDO_SFTP_PROBE);
-    let stdin = password.map(|p| zeroize::Zeroizing::new(format!("{}\n", p)));
-    let out = exec_with_stdin_capture(session_arc, &cmd, stdin.as_ref().map(|s| s.as_bytes()), 25).await?;
+    let cmd = remote_sh::sh_command(&[("SUB_MODE", mode), ("SUB_TOOL", tool)], SUDO_SFTP_PROBE, &[]);
+    let stdin = password.map(password_line);
+    let out = exec_with_stdin_capture(session_arc, &cmd, stdin.as_ref().map(|s| &s[..]), 25).await?;
     let mut path: Option<String> = None;
     for line in out.lines() {
         let Some(rest) = line.trim().strip_prefix("__SUB_SUDO:") else { continue };
@@ -17110,7 +17841,7 @@ async fn probe_sudo_sftp_with(session_arc: &SessionHandleArc, password: Option<&
 
 // For a server without sftp-server: file operations as root run as shell
 // commands under sudo (`shell_sftp`), so sudo must allow `sh`. Same rules as
-// SUDO_SFTP_PROBE (sent as `sh -c '<script>'`).
+// SUDO_SFTP_PROBE (sent with remote_sh::sh_command).
 const SUDO_SHELL_PROBE: &str = r#"if command -v sudo >/dev/null 2>&1; then :; else echo __SUB_SUDO:NO_SUDO; exit 0; fi
 if [ "$SUB_MODE" = pw ]; then OUT=$(sudo -S -k -p "" -l sh 2>&1); else OUT=$(sudo -n -l sh 2>&1); fi
 if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s "$OUT" | tr "\n" " ")"; fi"#;
@@ -17120,7 +17851,7 @@ if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s
 /// and shell commands under sudo instead (`shell_sftp`, sudo only for now).
 async fn probe_sudo_files(
     session_arc: &SessionHandleArc,
-    password: Option<&str>,
+    password: Option<&zeroize::Zeroizing<String>>,
 ) -> Result<(Option<String>, &'static str, Option<&'static str>), String> {
     match probe_sudo_sftp(session_arc, password).await {
         Ok((path, tool, shell)) => return Ok((Some(path), tool, shell)),
@@ -17128,9 +17859,9 @@ async fn probe_sudo_files(
         Err(e) => return Err(e),
     }
     let mode = if password.is_some() { "pw" } else { "n" };
-    let cmd = format!("env SUB_MODE={} sh -c '{}'", mode, SUDO_SHELL_PROBE);
-    let stdin = password.map(|p| zeroize::Zeroizing::new(format!("{}\n", p)));
-    let out = exec_with_stdin_capture(session_arc, &cmd, stdin.as_ref().map(|s| s.as_bytes()), 25).await?;
+    let cmd = remote_sh::sh_command(&[("SUB_MODE", mode)], SUDO_SHELL_PROBE, &[]);
+    let stdin = password.map(|p| password_line(p));
+    let out = exec_with_stdin_capture(session_arc, &cmd, stdin.as_ref().map(|s| &s[..]), 25).await?;
     for line in out.lines() {
         match line.trim().strip_prefix("__SUB_SUDO:") {
             Some("OK") => return Ok((None, "sudo", None)),
@@ -17255,6 +17986,10 @@ async fn open_elevated(
     session_arc: &SessionHandleArc,
     elevation: &ssh_manager::SftpElevation,
 ) -> Result<(russh_sftp::client::SftpSession, bool), String> {
+    // Its password stopped working: not tried again (forget_root_password).
+    if elevation.password_failed {
+        return Err(SUDO_WRONG_PASSWORD.into());
+    }
     match &elevation.server_path {
         Some(path) => open_elevated_sftp(session_arc, path, elevation).await.map(|s| (s, false)),
         None => {
@@ -17320,58 +18055,65 @@ mod sftp_config_tests {
     }
 }
 
-/// Start `sudo <sftp-server>` on a fresh exec channel and hand the stream to
-/// russh-sftp. The shell echoes a ready marker first; anything a noisy shell
-/// rc prints before it is skipped. In password mode sudo always prompts
-/// (`-k`), so it consumes exactly the password line and the SFTP bytes that
-/// follow go to sftp-server.
-async fn open_elevated_sftp(
-    session_arc: &SessionHandleArc,
+/// Start `sudo <sftp-server>` on a fresh exec channel (ROOT_EXEC_SCRIPT, so
+/// a password is checked on its own first) and hand the stream to
+/// russh-sftp. Through a root shell, the shell echoes a ready marker first;
+/// anything its start-up prints before it is skipped.
+async fn open_elevated_sftp<H: russh::client::Handler>(
+    session_arc: &HandleArc<H>,
     server_path: &str,
     elevation: &ssh_manager::SftpElevation,
 ) -> Result<russh_sftp::client::SftpSession, String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
     if !is_safe_remote_exec_path(server_path) {
         return Err(format!("{}: unusual sftp-server path", SUDO_FAILED));
     }
     let tool = if ELEVATION_TOOLS.contains(&elevation.tool) { elevation.tool } else { "sudo" };
-    let password = elevation.password.as_ref();
-    let flags = if password.is_some() { "-S -k -p ''" } else { "-n" };
-    // Through a root shell, the shell prints the ready marker and starts
-    // sftp-server; nothing else goes to it before the marker is back.
-    let shell = elevation.shell.filter(|s| ROOT_SHELL_FORMS.contains(s));
-    let (cmd, shell_line) = match shell {
-        Some(form) => (
-            format!("{} {} {}", tool, flags, form),
-            Some(format!("echo {}; exec {}\n", ELEVATED_SFTP_READY, server_path)),
-        ),
-        None => (format!("echo {}; exec {} {} {}", ELEVATED_SFTP_READY, tool, flags, server_path), None),
-    };
-    let channel = {
+    let tag = new_root_tag();
+    let password = elevation.password.as_ref().map(|p| p.as_str());
+    let mut channel = {
         let session = session_arc.lock().await;
         session.channel_open_session().await.map_err(|e| e.to_string())?
     };
+    // Through a root shell, the shell prints the ready marker and starts
+    // sftp-server; nothing else goes to it before the marker is back. The
+    // tool's answer to the password comes before either (root_feed), so a
+    // wrong one is said so and SFTP's bytes never reach its password read.
+    let shell = elevation.shell.filter(|s| ROOT_SHELL_FORMS.contains(s));
+    let (words, line) = match shell {
+        Some(form) => (
+            form.split(' ').map(String::from).collect::<Vec<_>>(),
+            root_shell_line(&format!("echo {}; exec {}", ELEVATED_SFTP_READY, server_path)),
+        ),
+        None => (vec![server_path.to_string()], String::new()),
+    };
+    let cmd = root_exec_command(tool, &tag, password.is_some(), false, false, &words);
     channel.exec(true, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
-    let mut stream = channel.into_stream();
-    if let Some(pw) = password {
-        let mut line = zeroize::Zeroizing::new(Vec::with_capacity(pw.len() + 1));
-        line.extend_from_slice(pw.as_bytes());
-        line.push(b'\n');
-        stream.write_all(&line).await.map_err(|e| e.to_string())?;
-        stream.flush().await.map_err(|e| e.to_string())?;
+    let feed = RootFeed { tag: &tag, password, then: line.as_bytes(), end: false, pty: false };
+    if let Err(e) = root_feed(&mut channel, feed, None).await {
+        let _ = channel.close().await;
+        return Err(e);
     }
-    if let Some(line) = &shell_line {
-        stream.write_all(line.as_bytes()).await.map_err(|e| e.to_string())?;
-        stream.flush().await.map_err(|e| e.to_string())?;
+    let mut stream = channel.into_stream();
+    if shell.is_none() {
+        return russh_sftp::client::SftpSession::new_with_config(stream, sftp_client_config())
+            .await
+            .map_err(|e| format!("{}: {}", SUDO_FAILED, e));
     }
     let wait_ready = async {
         let mut line: Vec<u8> = Vec::new();
         let mut byte = [0u8; 1];
         let mut seen = 0usize;
+        // What came before the marker, for the reason it never came.
+        let mut said: Vec<u8> = Vec::new();
         loop {
             let n = stream.read(&mut byte).await.map_err(|e| e.to_string())?;
             if n == 0 {
-                return Err(format!("{}: sudo closed the channel", SUDO_FAILED));
+                let said = String::from_utf8_lossy(&said);
+                return Err(tool_answer(&said).unwrap_or_else(|| format!("{}: sudo closed the channel", SUDO_FAILED)));
+            }
+            if said.len() < 4096 {
+                said.push(byte[0]);
             }
             seen += 1;
             if seen > 64 * 1024 {
@@ -17409,6 +18151,23 @@ mod elevated_sftp_tests {
         assert_eq!(classify_sudo_failure("bob is not in the sudoers file."), SUDO_NOT_ALLOWED);
         assert_eq!(classify_sudo_failure(""), SUDO_NOT_ALLOWED);
         assert!(classify_sudo_failure("sudo: something odd").starts_with(SUDO_FAILED));
+    }
+
+    /// What a command prints is never taken for the tool's answer (#96).
+    #[test]
+    fn only_the_tools_own_lines_are_read() {
+        // A container's log, a unit's status text.
+        let noise = "app: incorrect password for user admin\nauth: a password is required\nlogin: authentication failure\n";
+        assert_eq!(classify_tool_output(noise), SUDO_NOT_ALLOWED);
+        assert_eq!(classify_tool_output(&format!("{noise}sudo: a password is required\n")), SUDO_NEED_PASSWORD);
+        assert_eq!(classify_tool_output("Sorry, try again.\r\nSorry, try again.\r\ndzdo: 2 incorrect password attempts\r\n"), SUDO_WRONG_PASSWORD);
+        assert_eq!(classify_tool_output("  sudo-rs: interactive authentication is required"), SUDO_NEED_PASSWORD);
+        assert_eq!(classify_tool_output("bob is not in the sudoers file.  This incident will be reported.\n"), SUDO_NOT_ALLOWED);
+        assert_eq!(
+            classify_tool_output("Last login: today\nSorry, user bob is not allowed to execute '/bin/su -' as root on web1.\n"),
+            SUDO_NOT_ALLOWED
+        );
+        assert_eq!(classify_tool_output("sudo: sorry, you must have a tty to run sudo\n"), SUDO_REQUIRETTY);
     }
 
     #[test]
@@ -17464,34 +18223,439 @@ mod elevated_sftp_tests {
         assert!(!is_safe_remote_exec_path("/usr/lib/$(id)/sftp-server"));
     }
 
-    #[test]
-    fn a_root_shell_gets_one_line_of_posix_sh() {
-        let line = root_shell_line("echo __SUB_ROOT_OUT__; 'systemctl' 'restart' 'it'\\''s' 2>&1; echo __SUB_EXITCODE:$?");
-        assert!(line.ends_with('\n') && line.matches('\n').count() == 1, "{line:?}");
-        // What a shell makes of it: /bin/sh gets the script as one word.
-        if cfg!(unix) {
-            let out = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(line.trim_end().replacen("exec /bin/sh -c", "printf %s", 1))
-                .output()
-                .unwrap();
-            assert_eq!(
-                String::from_utf8_lossy(&out.stdout),
-                "echo __SUB_ROOT_OUT__; 'systemctl' 'restart' 'it'\\''s' 2>&1; echo __SUB_EXITCODE:$?"
-            );
-        }
-        for form in ROOT_SHELL_FORMS {
-            assert!(form.chars().all(|c| c.is_ascii_lowercase() || c == ' ' || c == '-'), "{form}");
-        }
-        assert!(!SFTP_SERVER_FIND.contains('\'') && !SFTP_SERVER_FIND.contains('!'));
+    /// The shells a server may run the app's commands with: its login
+    /// shell (sshd runs `<shell> -c <command>`) or root's (a root shell
+    /// reads its line). sh always; tcsh and csh where this machine has them.
+    #[cfg(unix)]
+    fn shells() -> Vec<&'static str> {
+        ["sh", "tcsh", "csh"]
+            .into_iter()
+            .filter(|s| std::process::Command::new(s).arg("-c").arg("true").output().is_ok_and(|o| o.status.success()))
+            .collect()
     }
 
     #[test]
-    fn probe_script_survives_single_quote_wrapping_in_any_shell() {
-        // It is sent as `sh -c '<script>'`: a single quote would end the
-        // argument early, and `!` triggers history expansion in tcsh.
-        assert!(!SUDO_SFTP_PROBE.contains('\''));
-        assert!(!SUDO_SFTP_PROBE.contains('!'));
+    fn a_root_shell_gets_one_line_of_posix_sh() {
+        let script = format!("echo __SUB_ROOT_OUT__; printf '%s|' {}; echo", remote_sh::quote_words(&["it's".into(), "a b".into()]));
+        let line = root_shell_line(&script);
+        assert!(line.ends_with('\n') && line.matches('\n').count() == 1 && !line.contains('!'), "{line:?}");
+        for form in ROOT_SHELL_FORMS {
+            assert!(form.chars().all(|c| c.is_ascii_lowercase() || c == ' ' || c == '-'), "{form}");
+        }
+        // What root's shell makes of it, whichever it is.
+        #[cfg(unix)]
+        for shell in shells() {
+            let out = std::process::Command::new(shell)
+                .arg("-c")
+                .arg(line.trim_end().strip_prefix("exec ").unwrap())
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "__SUB_ROOT_OUT__\nit's|a b|\n", "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
+    /// Every script the root features send, as the exact command sent, run
+    /// through sh and through tcsh and csh (a login shell that rejected the
+    /// scripts' line breaks inside quotes, #96). `true` and `false` stand in
+    /// for sudo.
+    #[test]
+    fn root_scripts_run_under_any_login_shell() {
+        let args = vec!["systemctl".to_string(), "restart".to_string(), "it's".to_string()];
+        let cases: Vec<(String, &str)> = vec![
+            (remote_sh::sh_command(&[("SUB_MODE", "n"), ("SUB_TOOL", "true")], ROOT_PROBE_SCRIPT, &args), "__SUB_SUDO:OK"),
+            (remote_sh::sh_command(&[("SUB_MODE", "pw"), ("SUB_TOOL", "false")], ROOT_PROBE_SCRIPT, &args), "__SUB_SUDO:FAIL:"),
+            (remote_sh::sh_command(&[("SUB_MODE", "n"), ("SUB_TOOL", "no-such-tool")], ROOT_PROBE_SCRIPT, &args), "__SUB_SUDO:NO_SUDO"),
+            (root_exec_command("true", "TAG", false, false, true, &args), "TAG:RUN:n"),
+            (root_exec_command("true", "TAG", true, false, true, &args), "TAG:READ"),
+            (remote_sh::sh_command(&[("SUB_MODE", "n"), ("SUB_TOOL", "true")], SUDO_SFTP_PROBE, &[]), "__SUB_SUDO:"),
+            (remote_sh::sh_command(&[], SFTP_SERVER_FIND, &[]), "__SUB_SUDO:"),
+            (remote_sh::sh_command(&[("SUB_MODE", "n")], SUDO_SHELL_PROBE, &[]), "__SUB_SUDO:"),
+        ];
+        for (cmd, _) in &cases {
+            assert!(!cmd.contains(['\n', '\r', '!']), "{cmd}");
+            // Dropbear takes a command of up to 9000 bytes.
+            assert!(cmd.len() < 8000, "{} bytes", cmd.len());
+        }
+        #[cfg(unix)]
+        for shell in shells() {
+            for (cmd, want) in &cases {
+                let out = std::process::Command::new(shell).arg("-c").arg(cmd).output().unwrap();
+                let text = String::from_utf8_lossy(&out.stdout);
+                assert!(text.contains(want), "{shell}: {cmd}\n{text}\n{}", String::from_utf8_lossy(&out.stderr));
+            }
+        }
+    }
+}
+
+/// Root over a real SSH connection to a server that runs commands with this
+/// machine's shell (tcsh as the login shell where it's installed), with
+/// stand-ins for sudo and dzdo: `dzdo su -` with a password (#96), what a
+/// wrong one costs, and a NOPASSWD rule never getting the password.
+#[cfg(all(test, unix))]
+mod root_over_ssh_tests {
+    use super::*;
+    use crate::ssh_test_server::{connect, ShellOpts, TestClient, TestServer};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    /// sudo or dzdo, as far as the app can tell. Files beside it set it up:
+    /// `rules.<name>` (`all`, `shell` for `su -` only, `none`, plus
+    /// `nopasswd`), `password`; `notickets` (no ticket kept after a sign-in,
+    /// as with `timestamp_timeout=0`); `pamprompt` (PAM's own prompt shown
+    /// instead of `-p`'s); `early` (a warning of its own first, then that
+    /// many seconds before it asks); `slowcheck` (seconds to check a
+    /// password). Each password read is a line in `attempts`. Like sudo
+    /// without a terminal, a sign-in leaves a ticket for the caller's
+    /// process (its parent), which `-n` and `-v` then use; `-k` ignores it.
+    const FAKE_TOOL: &str = r#"#!/bin/sh
+D=$(dirname "$0")
+T=$(basename "$0")
+n=; p=; l=; v=; k=
+while [ $# -gt 0 ]; do
+  case $1 in
+    -n) n=1;; -l) l=1;; -v) v=1;; -k) k=1;; -p) shift; p=$1;; -S) ;; *) break;;
+  esac
+  shift
+done
+if [ -f "$D/early" ]; then echo "$T: unable to resolve host test: Name or service not known" >&2; sleep "$(cat "$D/early")"; fi
+rules=$(cat "$D/rules.$T")
+case $rules in
+  *none*) [ -n "$l" ] && exit 1; echo "Sorry, user bob may not run $T on test." >&2; exit 1;;
+esac
+need=1
+case $rules in *nopasswd*) need=;; esac
+if [ -n "$need" ] && [ -z "$k" ] && [ -f "$D/ticket.$PPID" ]; then need=; fi
+if [ -n "$need" ]; then
+  if [ -n "$n" ]; then echo "$T: a password is required" >&2; exit 1; fi
+  if [ -f "$D/pamprompt" ]; then p=$(cat "$D/pamprompt"); fi
+  tries=0
+  while :; do
+    printf '%s' "$p" >&2
+    IFS= read -r pw || { echo >&2; echo "$T: no password was provided" >&2; exit 1; }
+    echo >&2
+    echo try >> "$D/attempts"
+    if [ -f "$D/slowcheck" ]; then sleep "$(cat "$D/slowcheck")"; fi
+    [ "$pw" = "$(cat "$D/password")" ] && break
+    echo "Sorry, try again." >&2
+    tries=$((tries + 1))
+    if [ $tries -ge 3 ]; then echo "$T: 3 incorrect password attempts" >&2; exit 1; fi
+  done
+  if [ -z "$k" ] && [ ! -f "$D/notickets" ]; then touch "$D/ticket.$PPID"; fi
+fi
+[ -n "$v" ] && exit 0
+case "$rules" in
+  *all*) ;;
+  *shell*) if [ "$*" != "su -" ]; then
+      [ -n "$l" ] && exit 1
+      echo "Sorry, user bob is not allowed to execute '$*' as root on test." >&2; exit 1
+    fi;;
+esac
+[ -n "$l" ] && exit 0
+# A real `su -` is root: in its shell `id -u` says 0, whoever runs the tests.
+if [ "$1" = su ]; then PATH="$D/root:$PATH" exec sh; fi
+exec "$@"
+"#;
+
+    struct Lab {
+        dir: PathBuf,
+        handle: HandleArc<TestClient>,
+    }
+
+    impl Lab {
+        async fn new(name: &str, dzdo: &str, sudo: &str) -> Lab {
+            let dir = std::env::temp_dir().join(format!("sub-root-{}-{}", name, std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            for tool in ["dzdo", "sudo"] {
+                let path = dir.join(tool);
+                std::fs::write(&path, FAKE_TOOL).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            std::fs::create_dir_all(dir.join("root")).unwrap();
+            std::fs::write(dir.join("root/id"), "#!/bin/sh\nif [ \"$1\" = -u ]; then echo 0; else exec /usr/bin/env -u PATH id \"$@\"; fi\n").unwrap();
+            std::fs::set_permissions(dir.join("root/id"), std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(dir.join("rules.dzdo"), dzdo).unwrap();
+            std::fs::write(dir.join("rules.sudo"), sudo).unwrap();
+            std::fs::write(dir.join("password"), "s3cret pass\n").unwrap();
+            // The account's login shell: tcsh where this machine has it.
+            let tcsh = std::process::Command::new("tcsh").arg("-c").arg("true").output().is_ok_and(|o| o.status.success());
+            let login = if tcsh { vec!["tcsh".to_string(), "-c".to_string()] } else { Vec::new() };
+            let opts = ShellOpts {
+                path: Some(format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default())),
+                cwd: Some(dir.clone()),
+                login,
+                keep_running_on_close: false,
+            };
+            let session = connect(TestServer::with_shell(opts), |_| {}, build_ssh_client_config()).await.expect("in-process SSH connection");
+            Lab { dir, handle: Arc::new(tokio::sync::Mutex::new(session)) }
+        }
+
+        fn set(&self, file: &str, value: &str) {
+            std::fs::write(self.dir.join(file), value).unwrap();
+        }
+
+        fn attempts(&self) -> usize {
+            std::fs::read_to_string(self.dir.join("attempts")).map(|s| s.lines().count()).unwrap_or(0)
+        }
+    }
+
+    impl Drop for Lab {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn pw(s: &str) -> zeroize::Zeroizing<String> {
+        zeroize::Zeroizing::new(s.to_string())
+    }
+
+    fn words(script: &str) -> Vec<String> {
+        vec!["sh".to_string(), "-c".to_string(), script.to_string()]
+    }
+
+    fn su(password: &str) -> ssh_manager::RootAccess {
+        ssh_manager::RootAccess::new("dzdo", Some(pw(password)), Some("su -"), None)
+    }
+
+    #[tokio::test]
+    async fn dzdo_su_with_a_password_gives_root() {
+        let lab = Lab::new("su", "shell", "none").await;
+        let cmd = words("echo ran as root");
+        // Without the password: dzdo wants it, and no root shell goes without.
+        assert_eq!(root_probe(&lab.handle, "dzdo", None, &cmd).await, Err(SUDO_NEED_PASSWORD.to_string()));
+        assert_eq!(find_root_shell(&lab.handle, &["dzdo"]).await, None);
+        assert_eq!(lab.attempts(), 0);
+        // With it: the command itself isn't allowed, `dzdo su -` is.
+        assert_eq!(root_probe(&lab.handle, "dzdo", Some("s3cret pass"), &cmd).await, Err(SUDO_NOT_ALLOWED.to_string()));
+        let found = find_root_shell_with_password(&lab.handle, &["dzdo"], &pw("s3cret pass")).await;
+        assert_eq!(found, Ok(Some(("dzdo", "su -"))));
+        assert_eq!(lab.attempts(), 2);
+        // A command through it: one sign-in, then the ticket.
+        let (code, out) = root_run(&lab.handle, &su("s3cret pass"), &cmd, 30, None).await.unwrap();
+        assert_eq!((code, out.trim()), (0, "ran as root"));
+        assert_eq!(lab.attempts(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_is_tried_once() {
+        let lab = Lab::new("wrong", "shell", "none").await;
+        let found = find_root_shell_with_password(&lab.handle, &["dzdo"], &pw("not it")).await;
+        assert_eq!(found, Err(SUDO_WRONG_PASSWORD.to_string()));
+        // Not the root shell's line as a second try, not the next form.
+        assert_eq!(lab.attempts(), 1);
+        assert_eq!(root_run(&lab.handle, &su("not it"), &["true".to_string()], 30, None).await, Err(SUDO_WRONG_PASSWORD.to_string()));
+        assert_eq!(lab.attempts(), 2);
+    }
+
+    /// Where the tool asks for nothing (a NOPASSWD rule), the password never
+    /// reaches the command (#96).
+    #[tokio::test]
+    async fn a_command_the_tool_runs_without_asking_never_gets_the_password() {
+        let lab = Lab::new("nopasswd", "all nopasswd", "none").await;
+        let access = ssh_manager::RootAccess::new("dzdo", Some(pw("s3cret pass")), None, None);
+        // It prints whatever comes on its stdin.
+        let (code, out) = root_run(&lab.handle, &access, &words("printf '[%s]' \"$(cat)\""), 30, None).await.unwrap();
+        assert_eq!((code, out.as_str()), (0, "[]"));
+        assert_eq!(lab.attempts(), 0);
+    }
+
+    /// PAM's own prompt ("Password for bob@REALM:", an OTP) instead of the
+    /// tool's: the password is checked without looking for any prompt, so
+    /// it works; where no ticket is kept, it fails plainly, after one
+    /// sign-in, with nothing typed into the prompt it doesn't know (#96).
+    #[tokio::test]
+    async fn a_prompt_of_pams_own() {
+        let lab = Lab::new("pam", "shell", "none").await;
+        lab.set("pamprompt", "Password for bob@EXAMPLE.COM: ");
+        let (code, out) = root_run(&lab.handle, &su("s3cret pass"), &words("echo root"), 30, None).await.unwrap();
+        assert_eq!((code, out.trim()), (0, "root"));
+        assert_eq!(lab.attempts(), 1);
+        // A wrong one under that prompt is said so, after one try.
+        assert_eq!(root_run(&lab.handle, &su("not it"), &words("echo root"), 30, None).await, Err(SUDO_WRONG_PASSWORD.to_string()));
+        assert_eq!(lab.attempts(), 2);
+        lab.set("notickets", "");
+        let got = root_run(&lab.handle, &su("s3cret pass"), &words("echo root"), 60, None).await;
+        assert!(got.as_ref().is_err_and(|e| e.contains("prompt of its own")), "{got:?}");
+        assert_eq!(lab.attempts(), 3);
+    }
+
+    /// Where no ticket is kept, the tool asks again with the app's prompt,
+    /// and only that prompt is answered.
+    #[tokio::test]
+    async fn without_tickets_the_tools_own_ask_is_answered() {
+        let lab = Lab::new("notickets", "shell", "none").await;
+        lab.set("notickets", "");
+        let (code, out) = root_run(&lab.handle, &su("s3cret pass"), &words("echo root"), 30, None).await.unwrap();
+        assert_eq!((code, out.trim()), (0, "root"));
+        assert_eq!(lab.attempts(), 2);
+    }
+
+    /// A warning of the tool's own first ("unable to resolve host"), and a
+    /// slow sssd or LDAP before it asks: nothing is sent before it does.
+    #[tokio::test]
+    async fn an_early_warning_and_a_slow_ask() {
+        let lab = Lab::new("early", "shell", "none").await;
+        lab.set("early", "2");
+        let (code, out) = root_run(&lab.handle, &su("s3cret pass"), &words("echo root"), 60, None).await.unwrap();
+        assert_eq!((code, out.trim()), (0, "root"));
+        assert_eq!(lab.attempts(), 1);
+    }
+
+    /// A slow answer to a wrong password (AD): still one attempt, and the
+    /// root shell's line never becomes a second.
+    #[tokio::test]
+    async fn a_slow_answer_to_a_wrong_password_is_one_attempt() {
+        let lab = Lab::new("slow", "shell", "none").await;
+        lab.set("slowcheck", "7");
+        assert_eq!(root_run(&lab.handle, &su("not it"), &words("echo root"), 60, None).await, Err(SUDO_WRONG_PASSWORD.to_string()));
+        assert_eq!(lab.attempts(), 1);
+    }
+
+    /// SFTP root mode through `dzdo su -` with the password.
+    #[tokio::test]
+    async fn sftp_root_mode_finds_dzdo_su_with_a_password() {
+        let lab = Lab::new("sftp", "shell", "none").await;
+        // This machine may have no sftp-server: then that's the answer.
+        let have_server = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(SFTP_SERVER_FIND)
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("PATH:"));
+        let got = probe_sudo_sftp(&lab.handle, Some(&pw("s3cret pass"))).await;
+        if have_server {
+            let (_, tool, shell) = got.unwrap();
+            assert_eq!((tool, shell), ("dzdo", Some("su -")));
+        } else {
+            assert_eq!(got, Err(SUDO_NO_SFTP_SERVER.to_string()));
+        }
+    }
+
+    /// Files as root with the password, through `dzdo su -` and through
+    /// `dzdo <sftp-server>`: SFTP starts and answers, and a wrong password
+    /// is said so after one try (#96).
+    #[tokio::test]
+    async fn sftp_root_mode_opens_and_says_when_the_password_is_wrong() {
+        for (rules, shell) in [("shell", Some("su -")), ("all", None)] {
+            let lab = Lab::new(&format!("sftp-open-{}", rules), rules, "none").await;
+            let Ok(path) = find_sftp_server(&lab.handle).await else {
+                return; // No sftp-server on this machine.
+            };
+            let elevation = ssh_manager::SftpElevation {
+                server_path: Some(path.clone()),
+                tool: "dzdo",
+                password: Some(pw("s3cret pass")),
+                shell,
+                password_failed: false,
+            };
+            let sftp = open_elevated_sftp(&lab.handle, &path, &elevation).await.unwrap();
+            assert!(sftp.canonicalize(".").await.unwrap().starts_with('/'));
+            let before = lab.attempts();
+            let wrong = ssh_manager::SftpElevation { password: Some(pw("not it")), ..elevation };
+            assert_eq!(open_elevated_sftp(&lab.handle, &path, &wrong).await.err(), Some(SUDO_WRONG_PASSWORD.to_string()), "{rules}");
+            assert_eq!(lab.attempts(), before + 1, "{rules}");
+        }
+    }
+
+    async fn read_all(mut channel: russh::Channel<russh::client::Msg>, early: Vec<u8>) -> String {
+        let mut all = early;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { ref data } => all.extend_from_slice(data),
+                russh::ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        String::from_utf8_lossy(&all).into_owned()
+    }
+
+    /// A container's live logs as root with the password, a stopped
+    /// container's that end at once among them; a wrong password is caught
+    /// before the logs start.
+    #[tokio::test]
+    async fn a_root_stream_with_a_password() {
+        let lab = Lab::new("stream", "all", "none").await;
+        let access = ssh_manager::RootAccess::new("dzdo", Some(pw("s3cret pass")), None, None);
+        let (channel, marker, early) = root_channel_open(&lab.handle, &access, &words("echo one; sleep 1; echo two"), None, None).await.unwrap();
+        assert_eq!(marker, None);
+        assert_eq!(read_all(channel, early).await, "one\ntwo\n");
+        let (channel, _, early) = root_channel_open(&lab.handle, &access, &words("echo the last line"), None, None).await.unwrap();
+        assert_eq!(read_all(channel, early).await, "the last line\n");
+        let wrong = ssh_manager::RootAccess::new("dzdo", Some(pw("not it")), None, None);
+        assert_eq!(root_channel_open(&lab.handle, &wrong, &words("echo one"), None, None).await.err(), Some(SUDO_WRONG_PASSWORD.to_string()));
+        assert_eq!(lab.attempts(), 3);
+    }
+
+    /// The password typed once and handed to every call of the tab that was
+    /// waiting for it: a mistyped one is tried once, a right one signs in
+    /// once (#96).
+    #[tokio::test]
+    async fn a_typed_password_is_tried_once_for_all_the_waiting_calls() {
+        let lab = Arc::new(Lab::new("typed", "all", "none").await);
+        let state = Arc::new(SshState::new());
+        for (typed, attempts) in [("not it", 1), ("s3cret pass", 2)] {
+            let mut calls = Vec::new();
+            for _ in 0..4 {
+                let (lab, state) = (Arc::clone(&lab), Arc::clone(&state));
+                calls.push(tokio::spawn(async move {
+                    typed_root_access(&state, "tab", &lab.handle, &words("true"), pw(typed)).await.map(|a| a.tool)
+                }));
+            }
+            for call in calls {
+                let got = call.await.unwrap();
+                if typed == "not it" {
+                    assert_eq!(got, Err(SUDO_WRONG_PASSWORD.to_string()));
+                } else {
+                    assert_eq!(got, Ok("dzdo"));
+                }
+            }
+            assert_eq!(lab.attempts(), attempts, "{typed}");
+        }
+    }
+
+    /// A kept password that stopped working: one call tries it, the tab's
+    /// others find it forgotten (root access and SFTP root mode alike).
+    #[tokio::test]
+    async fn a_kept_password_that_stopped_working_is_tried_once() {
+        let state = SshState::new();
+        let access = ssh_manager::RootAccess::new("dzdo", Some(pw("old")), None, None);
+        state.root_access.lock().await.insert("tab".into(), access.clone());
+        state.sftp_elevation.lock().await.insert(
+            "tab".into(),
+            ssh_manager::SftpElevation { server_path: None, tool: "dzdo", password: Some(pw("old")), shell: None, password_failed: false },
+        );
+        let tries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = Arc::new(state);
+        let mut calls = Vec::new();
+        for _ in 0..4 {
+            let (state, access, tries) = (Arc::clone(&state), access.clone(), Arc::clone(&tries));
+            calls.push(tokio::spawn(async move {
+                let turn = password_turn(&state, "tab", &access, false).await?;
+                tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                turn.finish(&state, "tab", &access, Some(false)).await;
+                Err::<(), String>(SUDO_WRONG_PASSWORD.into())
+            }));
+        }
+        for call in calls {
+            assert_eq!(call.await.unwrap(), Err(SUDO_WRONG_PASSWORD.to_string()));
+        }
+        assert_eq!(tries.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(state.root_access.lock().await.get("tab").is_none());
+        assert!(state.sftp_elevation.lock().await.get("tab").unwrap().password_failed);
+        assert!(known_root_access(&state, "tab").await.is_none());
+    }
+
+    /// One that works: after the first call's answer, the others go at once.
+    #[tokio::test]
+    async fn a_kept_password_that_works_is_trusted_after_one_answer() {
+        let state = SshState::new();
+        let access = ssh_manager::RootAccess::new("sudo", Some(pw("ok")), None, None);
+        state.root_access.lock().await.insert("tab".into(), access.clone());
+        let first = password_turn(&state, "tab", &access, false).await.unwrap();
+        assert!(first.held.is_some());
+        first.finish(&state, "tab", &access, Some(true)).await;
+        let next = password_turn(&state, "tab", &access, false).await.unwrap();
+        assert!(next.held.is_none());
     }
 }
 
@@ -17714,8 +18878,22 @@ async fn sftp_set_elevated(
         Ok(found) => (found, None),
         Err(e) if e == SUDO_NEED_PASSWORD => {
             let Some(pw) = password else { return Err(e) };
-            let found = probe_sudo_files(&session_arc, Some(pw.as_str())).await?;
-            (found, Some(pw))
+            // One typed password at a time per tab, and not one just turned
+            // down (typed_root_access).
+            let gate = root_gate(&state, &session_id).await;
+            let mut gate = gate.lock().await;
+            if just_rejected(&gate, &pw) {
+                return Err(SUDO_WRONG_PASSWORD.into());
+            }
+            match probe_sudo_files(&session_arc, Some(&pw)).await {
+                Ok(found) => (found, Some(pw)),
+                Err(e) => {
+                    if e == SUDO_WRONG_PASSWORD {
+                        gate.rejected = Some((password_digest(&pw), std::time::Instant::now()));
+                    }
+                    return Err(e);
+                }
+            }
         }
         Err(e) => return Err(e),
     };
@@ -17723,7 +18901,7 @@ async fn sftp_set_elevated(
     set_sftp_mode(
         &state,
         &session_id,
-        Some(ssh_manager::SftpElevation { server_path, tool, password: used_password, shell }),
+        Some(ssh_manager::SftpElevation { server_path, tool, password: used_password, shell, password_failed: false }),
     )
     .await;
     // Open it right away so a failure shows up here, not on the next click.
@@ -17775,7 +18953,37 @@ pub async fn get_sftp_session(
     let elevation = state.sftp_elevation.lock().await.get(session_id).cloned();
     let was_elevated = elevation.is_some();
     let (sftp, via_shell) = match elevation {
-        Some(elev) => open_elevated(&session_arc, &elev).await?,
+        Some(elev) => {
+            // With a password, one open at a time per tab: parallel file
+            // actions don't each sign in, and after one is turned down the
+            // others find the password marked as failed (open_elevated).
+            let gate = match elev.password {
+                Some(_) => Some(root_gate(state, session_id).await),
+                None => None,
+            };
+            let _turn = match &gate {
+                Some(g) => Some(g.lock().await),
+                None => None,
+            };
+            let elev = match &gate {
+                Some(_) => {
+                    if let Some(s) = state.sftp_sessions.lock().await.get(session_id) {
+                        return Ok(Arc::clone(s));
+                    }
+                    state.sftp_elevation.lock().await.get(session_id).cloned().unwrap_or(elev)
+                }
+                None => elev,
+            };
+            match open_elevated(&session_arc, &elev).await {
+                Err(e) if e == SUDO_WRONG_PASSWORD => {
+                    if let Some(pw) = &elev.password {
+                        forget_root_password(state, session_id, pw).await;
+                    }
+                    return Err(e);
+                }
+                opened => opened?,
+            }
+        }
         None => open_sftp(&session_arc).await?,
     };
     let arc = Arc::new(sftp);
@@ -20367,8 +21575,9 @@ struct ImportedHost {
     /// Resolved `ProxyJump`: `[user@]host[:port]`, comma-separated hops.
     /// The import links a single hop to a saved server (host_import.rs).
     proxy_jump: Option<String>,
-    /// Unique within one parse; the picker keys its rows by it. Empty means
-    /// `host_alias`, which every format but MobaXterm keeps unique.
+    /// Unique within one parse; the picker keys its rows by it (MobaXterm's
+    /// folder and name, else the row's place in the list). Empty means
+    /// `host_alias`.
     #[serde(default)]
     key: String,
     /// Folder path, outermost first (MobaXterm's session folders).
@@ -20391,6 +21600,9 @@ struct ImportedHost {
     /// (rdp_links.rs), not a server.
     #[serde(default)]
     rdp: bool,
+    /// A telnet session (PuTTY's): imported as a telnet server.
+    #[serde(default)]
+    telnet: bool,
 }
 
 /// What the pasted-import parser found: the hosts, and a line about the
@@ -20424,12 +21636,12 @@ async fn import_hosts(
 
 /// Read the user's OpenSSH client config (default `~/.ssh/config`) and
 /// return one `ImportedHost` per non-wildcard alias so the UI can offer a
-/// checkbox picker. We deliberately keep the parser dumb: no macro
-/// expansion, no `Include` recursion, no token substitution (`%h`/`%u`),
-/// no `Match` blocks. Anything we don't understand is skipped silently
-/// rather than surfaced as an error — a user's config often has many
-/// directives (ForwardAgent, LogLevel, etc.) that are irrelevant to
-/// picking a host to import.
+/// checkbox picker (`parse_ssh_config_text`). We deliberately keep the
+/// parser simple: no `Include` recursion, no token substitution
+/// (`%h`/`%u`), and `Match` blocks are left out. Anything we don't
+/// understand is skipped silently rather than surfaced as an error — a
+/// user's config often has many directives (ForwardAgent, LogLevel, etc.)
+/// that are irrelevant to picking a host to import.
 ///
 /// Desktop-only. Android has no meaningful `~/.ssh/config` path and its
 /// import story goes through profile export/import instead — we return a
@@ -20443,55 +21655,6 @@ async fn parse_ssh_config(path: Option<String>) -> Result<Vec<ImportedHost>, Str
     }
     #[cfg(not(target_os = "android"))]
     {
-        // One in-progress Host block. We accumulate resolved fields as we
-        // walk the file and emit one ImportedHost per alias when the block
-        // ends (either the next `Host` line or EOF).
-        struct Block {
-            aliases: Vec<String>,
-            hostname: Option<String>,
-            port: Option<u16>,
-            user: Option<String>,
-            identity_file: Option<String>,
-            proxy_jump: Option<String>,
-        }
-
-        // Split `Directive value...` into (directive, rest). OpenSSH treats
-        // `=` and whitespace as equivalent separators between the directive
-        // name and its argument, so both `Port 2222` and `Port=2222` parse
-        // the same way.
-        fn split_directive(line: &str) -> (&str, &str) {
-            match line.find(|c: char| c.is_whitespace() || c == '=') {
-                Some(i) => {
-                    let key = &line[..i];
-                    let rest = line[i..]
-                        .trim_start_matches(|c: char| c.is_whitespace() || c == '=');
-                    (key, rest)
-                }
-                None => (line, ""),
-            }
-        }
-
-        // Emit one ImportedHost per non-wildcard alias in the block. Wildcard
-        // (`*` / `?`) and negation (`!prefix`) aliases are OpenSSH's template
-        // mechanism — they don't correspond to a single server the user
-        // would want as a row, so we skip them silently.
-        fn flush_block(b: &Block, out: &mut Vec<ImportedHost>) {
-            for alias in &b.aliases {
-                if alias.contains('*') || alias.contains('?') || alias.starts_with('!') {
-                    continue;
-                }
-                out.push(ImportedHost {
-                    host_alias: alias.clone(),
-                    hostname: b.hostname.clone().unwrap_or_else(|| alias.clone()),
-                    port: b.port.unwrap_or(22),
-                    user: b.user.clone().unwrap_or_default(),
-                    identity_file: b.identity_file.clone(),
-                    proxy_jump: b.proxy_jump.clone(),
-                    ..Default::default()
-                });
-            }
-        }
-
         let config_path: PathBuf = match path {
             Some(p) if !p.trim().is_empty() => PathBuf::from(p),
             _ => directories::UserDirs::new()
@@ -20518,68 +21681,135 @@ async fn parse_ssh_config(path: Option<String>) -> Result<Vec<ImportedHost>, Str
         .await
         .map_err(|e| format!("Failed to read SSH config: {e}"))??;
 
-        let mut out: Vec<ImportedHost> = Vec::new();
-        let mut cur: Option<Block> = None;
+        Ok(parse_ssh_config_text(&contents))
+    }
+}
 
-        for raw_line in contents.lines() {
-            let line = raw_line.trim();
-            if line.is_empty() || line.starts_with('#') {
+/// The hosts in an OpenSSH client config, one per alias that names a single
+/// host (not `*`, `?` or `!`), each with what OpenSSH would use for it:
+///
+/// - every `Host` block whose patterns match the alias counts, in file order,
+///   so a `Host *` (or `Host web*`) block's settings are its defaults;
+/// - the first value found for a setting wins, as in OpenSSH, so a block
+///   further down can't override one above it;
+/// - lines before the first `Host` apply to every host;
+/// - a `Match` block's lines are left out, up to the next `Host`: they
+///   depend on things only known when connecting.
+///
+/// Wildcard blocks are never imported as hosts themselves.
+#[cfg(not(target_os = "android"))]
+fn parse_ssh_config_text(contents: &str) -> Vec<ImportedHost> {
+    #[derive(Default, Clone)]
+    struct Settings {
+        hostname: Option<String>,
+        port: Option<u16>,
+        user: Option<String>,
+        identity_file: Option<String>,
+        /// As written: `none` is kept, so it still wins over a later value.
+        proxy_jump: Option<String>,
+    }
+    impl Settings {
+        fn fill_from(&mut self, other: &Settings) {
+            self.hostname = self.hostname.take().or_else(|| other.hostname.clone());
+            self.port = self.port.or(other.port);
+            self.user = self.user.take().or_else(|| other.user.clone());
+            self.identity_file = self.identity_file.take().or_else(|| other.identity_file.clone());
+            self.proxy_jump = self.proxy_jump.take().or_else(|| other.proxy_jump.clone());
+        }
+    }
+    /// One `Host` block (or the lines before the first one, as `*`). A
+    /// `Match` block has no patterns, so it applies to nothing.
+    struct Block {
+        patterns: Vec<String>,
+        settings: Settings,
+    }
+    fn matches(patterns: &[String], alias: &str) -> bool {
+        let mut hit = false;
+        for p in patterns {
+            match p.strip_prefix('!') {
+                Some(negated) if ssh_config::glob_matches(negated, alias, true) => return false,
+                Some(_) => {}
+                None => hit |= ssh_config::glob_matches(p, alias, true),
+            }
+        }
+        hit
+    }
+
+    let mut blocks = vec![Block { patterns: vec!["*".into()], settings: Settings::default() }];
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // `Directive value` or `Directive=value`.
+        let (key, rest) = match line.find(|c: char| c.is_whitespace() || c == '=') {
+            Some(i) => (&line[..i], line[i..].trim_start_matches(|c: char| c.is_whitespace() || c == '=')),
+            None => (line, ""),
+        };
+        let key = key.to_ascii_lowercase();
+        match key.as_str() {
+            "host" => blocks.push(Block { patterns: ssh_config::arguments(rest), settings: Settings::default() }),
+            "match" => blocks.push(Block { patterns: Vec::new(), settings: Settings::default() }),
+            "hostname" | "port" | "user" | "identityfile" | "proxyjump" => {
+                let Some(val) = ssh_config::arguments(rest).into_iter().next().filter(|v| !v.is_empty()) else {
+                    continue;
+                };
+                let s = &mut blocks.last_mut().expect("the lines before any Host").settings;
+                match key.as_str() {
+                    "hostname" => { s.hostname.get_or_insert(val); }
+                    "port" => {
+                        if s.port.is_none() {
+                            s.port = val.parse::<u16>().ok();
+                        }
+                    }
+                    "user" => { s.user.get_or_insert(val); }
+                    "identityfile" => { s.identity_file.get_or_insert(val); }
+                    _ => { s.proxy_jump.get_or_insert(val); }
+                }
+            }
+            // Include chains and every other directive are out of scope.
+            _ => {}
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<ImportedHost> = Vec::new();
+    for block in &blocks[1..] {
+        for alias in &block.patterns {
+            if alias.contains(['*', '?']) || alias.starts_with('!') || !seen.insert(alias.to_lowercase()) {
                 continue;
             }
-            let (key, rest) = split_directive(line);
-            let key_lc = key.to_ascii_lowercase();
-            match key_lc.as_str() {
-                "host" => {
-                    // Close out the previous block before starting a new one.
-                    if let Some(prev) = cur.take() {
-                        flush_block(&prev, &mut out);
-                    }
-                    let mut b = Block {
-                        aliases: Vec::new(),
-                        hostname: None,
-                        port: None,
-                        user: None,
-                        identity_file: None,
-                        proxy_jump: None,
-                    };
-                    for a in rest.split_whitespace() {
-                        b.aliases.push(a.trim_matches('"').to_string());
-                    }
-                    cur = Some(b);
-                }
-                "hostname" | "port" | "user" | "identityfile" | "proxyjump" => {
-                    if let Some(b) = cur.as_mut() {
-                        let val = rest.trim().trim_matches('"');
-                        if val.is_empty() {
-                            continue;
-                        }
-                        match key_lc.as_str() {
-                            "hostname" => b.hostname = Some(val.to_string()),
-                            "port" => {
-                                if let Ok(p) = val.parse::<u16>() {
-                                    b.port = Some(p);
-                                }
-                            }
-                            "user" => b.user = Some(val.to_string()),
-                            "identityfile" => b.identity_file = Some(val.to_string()),
-                            // `none` turns off a ProxyJump set by a wildcard block.
-                            "proxyjump" => b.proxy_jump = (!val.eq_ignore_ascii_case("none")).then(|| val.to_string()),
-                            _ => {}
-                        }
-                    }
-                }
-                // Include chains, Match blocks, and every other directive
-                // are v1-out-of-scope. Ignoring them keeps the parser
-                // predictable for the "flat list of hosts" use case.
-                _ => {}
+            let mut s = Settings::default();
+            for b in blocks.iter().filter(|b| matches(&b.patterns, alias)) {
+                s.fill_from(&b.settings);
             }
+            // `%h` in a HostName (often from a wildcard block: `HostName
+            // %h.prod.example`) is the alias. A HostName with a token it
+            // doesn't take is left out, as is a key path or jump with a token
+            // other than `%h` and `%%`, rather than saved with the `%` in it.
+            let hostname = s
+                .hostname
+                .and_then(|h| ssh_config::expand_hostname(&h, alias).ok())
+                .filter(|h| !h.trim().is_empty())
+                .unwrap_or_else(|| alias.clone());
+            let identity_file = s.identity_file.and_then(|f| ssh_config::expand_hostname(&f, &hostname).ok());
+            out.push(ImportedHost {
+                host_alias: alias.clone(),
+                hostname,
+                port: s.port.unwrap_or(22),
+                user: s.user.unwrap_or_default(),
+                identity_file,
+                // `none` turns off a ProxyJump set by a wildcard block.
+                proxy_jump: s.proxy_jump.filter(|j| !j.eq_ignore_ascii_case("none") && !j.contains('%')),
+                ..Default::default()
+            });
         }
-        if let Some(last) = cur.take() {
-            flush_block(&last, &mut out);
-        }
-        resolve_proxy_jump_aliases(&mut out);
-        Ok(out)
     }
+    resolve_proxy_jump_aliases(&mut out);
+    for (i, h) in out.iter_mut().enumerate() {
+        h.key = i.to_string();
+    }
+    out
 }
 
 /// OpenSSH looks up each ProxyJump hop in the same config, so `ProxyJump
@@ -20649,6 +21879,8 @@ fn resolve_proxy_jump_aliases(hosts: &mut [ImportedHost]) {
 fn parse_client_import(text: String) -> Result<ClientImport, String> {
     let skipped = if text.lines().any(|l| l.trim_start().starts_with("[Bookmarks")) {
         mobaxterm_skipped(&text)
+    } else if is_putty_reg(text.trim()) {
+        putty_skipped(&putty_sessions(text.trim()).1)
     } else {
         None
     };
@@ -20709,6 +21941,8 @@ fn parse_client_hosts(text: String) -> Result<Vec<ImportedHost>, String> {
             let identity_file = get_str(&["identity_file", "identityFile", "key", "privateKey"]);
             let proxy_jump = get_str(&["proxy_jump", "proxyJump", "jump"]);
             out.push(ImportedHost {
+                // Names may repeat: the picker keys rows by this.
+                key: i.to_string(),
                 host_alias: alias,
                 hostname,
                 port,
@@ -20725,52 +21959,95 @@ fn parse_client_hosts(text: String) -> Result<Vec<ImportedHost>, String> {
     }
 
     // ── PuTTY .reg export
-    if trimmed.to_ascii_lowercase().contains("windows registry editor")
-        || trimmed.contains("[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions")
-        || trimmed.contains("[HKEY_USERS\\") && trimmed.contains("SimonTatham\\PuTTY\\Sessions")
-    {
+    if is_putty_reg(trimmed) {
         return parse_putty_reg(trimmed);
     }
 
     Err("Unrecognised format — paste a JSON array, a PuTTY .reg export, or a MobaXterm .mxtsessions block.".into())
 }
 
-/// Parse `regedit /e` output of PuTTY's session key. The format is
-/// deterministic (one `[...]` header line per session, then `"key"=type:val`
-/// lines) so a line-oriented walk covers it. We only pull the three fields
-/// that translate to a Submarine row: HostName, PortNumber, UserName.
-/// Session-name percent-escapes (%20 for space, etc.) are undone so the
-/// alias reads naturally.
+fn is_putty_reg(trimmed: &str) -> bool {
+    trimmed.to_ascii_lowercase().contains("windows registry editor")
+        || trimmed.contains("[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions")
+        || trimmed.contains("[HKEY_USERS\\") && trimmed.contains("SimonTatham\\PuTTY\\Sessions")
+}
+
+/// Parse `regedit /e` output of PuTTY's session key: the SSH and telnet
+/// sessions (`putty_sessions`), or why there are none.
 fn parse_putty_reg(text: &str) -> Result<Vec<ImportedHost>, String> {
+    let (mut out, skipped) = putty_sessions(text);
+    // Names may repeat (two exports pasted together): the picker keys rows
+    // by this.
+    for (i, h) in out.iter_mut().enumerate() {
+        h.key = i.to_string();
+    }
+    if out.is_empty() {
+        return Err(match putty_skipped(&skipped) {
+            Some(why) => format!("No PuTTY SSH or telnet sessions found. {}", why),
+            None => "No PuTTY sessions found in the pasted text.".into(),
+        });
+    }
+    Ok(out)
+}
+
+/// The sessions in a PuTTY `.reg` export, and how many of each other kind
+/// (serial, raw, rlogin, …) were left out. The format is deterministic (one
+/// `[...]` header line per session, then `"key"=type:val` lines) so a
+/// line-oriented walk covers it. We pull the fields that translate to a
+/// Submarine row: HostName, PortNumber, UserName and Protocol. An SSH
+/// session becomes an SSH server, a telnet one a telnet server. A session
+/// with no host name ("Default Settings", say) isn't one to connect to and
+/// is left out. Session-name percent-escapes (%20 for space, etc.) are
+/// undone so the alias reads naturally.
+fn putty_sessions(text: &str) -> (Vec<ImportedHost>, std::collections::BTreeMap<String, usize>) {
+    struct Session {
+        name: String,
+        host: String,
+        port: u16,
+        user: String,
+        /// PuTTY's own word; a session without one is SSH, PuTTY's default.
+        protocol: String,
+    }
     let mut out: Vec<ImportedHost> = Vec::new();
-    let mut current: Option<(String, String, u16, String)> = None; // (alias, host, port, user)
-    let close = |cur: &mut Option<(String, String, u16, String)>, out: &mut Vec<ImportedHost>| {
-        if let Some((alias, host, port, user)) = cur.take() {
-            if !host.is_empty() || !alias.is_empty() {
-                out.push(ImportedHost {
-                    host_alias: alias.clone(),
-                    hostname: if host.is_empty() { alias } else { host },
-                    port: if port == 0 { 22 } else { port },
-                    user,
-                    identity_file: None,
-                    proxy_jump: None,
-                    ..Default::default()
-                });
-            }
+    let mut skipped: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut current: Option<Session> = None;
+    let mut close = |cur: &mut Option<Session>| {
+        let Some(s) = cur.take() else { return };
+        if s.host.trim().is_empty() {
+            return;
         }
+        let telnet = match s.protocol.as_str() {
+            "" | "ssh" => false,
+            "telnet" => true,
+            other => {
+                *skipped.entry(other.to_string()).or_default() += 1;
+                return;
+            }
+        };
+        let usual = if telnet { 23 } else { 22 };
+        out.push(ImportedHost {
+            host_alias: s.name,
+            hostname: s.host.trim().to_string(),
+            port: if s.port == 0 { usual } else { s.port },
+            user: s.user,
+            identity_file: None,
+            proxy_jump: None,
+            telnet,
+            ..Default::default()
+        });
     };
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() { continue; }
         if line.starts_with('[') && line.ends_with(']') {
-            close(&mut current, &mut out);
+            close(&mut current);
             // Only sessions — skip other PuTTY keys (SshHostKeys, Jumplist).
             let inner = &line[1..line.len() - 1];
             let Some(idx) = inner.rfind("\\Sessions\\") else { continue; };
             let name_raw = &inner[idx + "\\Sessions\\".len()..];
             let name = putty_unescape(name_raw);
             if name.is_empty() { continue; }
-            current = Some((name, String::new(), 0, String::new()));
+            current = Some(Session { name, host: String::new(), port: 0, user: String::new(), protocol: String::new() });
             continue;
         }
         let Some((key, val_raw)) = line.split_once('=') else { continue; };
@@ -20779,24 +22056,43 @@ fn parse_putty_reg(text: &str) -> Result<Vec<ImportedHost>, String> {
         let val = val_raw.trim();
         match key {
             "HostName" => {
-                if let Some(v) = strip_reg_string(val) { cur.1 = v; }
+                if let Some(v) = strip_reg_string(val) { cur.host = v; }
             }
             "PortNumber" => {
                 if let Some(n) = strip_reg_dword(val) {
-                    if let Ok(p) = u16::try_from(n) { cur.2 = p; }
+                    if let Ok(p) = u16::try_from(n) { cur.port = p; }
                 }
             }
             "UserName" => {
-                if let Some(v) = strip_reg_string(val) { cur.3 = v; }
+                if let Some(v) = strip_reg_string(val) { cur.user = v; }
+            }
+            "Protocol" => {
+                if let Some(v) = strip_reg_string(val) { cur.protocol = v.trim().to_ascii_lowercase(); }
             }
             _ => {}
         }
     }
-    close(&mut current, &mut out);
-    if out.is_empty() {
-        return Err("No PuTTY sessions found in the pasted text.".into());
+    close(&mut current);
+    (out, skipped)
+}
+
+/// "Not imported: 2 serial and 1 raw sessions — …" for the PuTTY sessions
+/// `putty_sessions` left out; None when it left out none.
+fn putty_skipped(counts: &std::collections::BTreeMap<String, usize>) -> Option<String> {
+    if counts.is_empty() {
+        return None;
     }
-    Ok(out)
+    let parts: Vec<String> = counts.iter().map(|(k, n)| format!("{} {}", n, k)).collect();
+    let total: usize = counts.values().sum();
+    let list = match parts.len() {
+        1 => parts[0].clone(),
+        _ => format!("{} and {}", parts[..parts.len() - 1].join(", "), parts[parts.len() - 1]),
+    };
+    Some(format!(
+        "Not imported: {} {} — Submarine imports PuTTY's SSH and telnet sessions.",
+        list,
+        if total == 1 { "session" } else { "sessions" }
+    ))
 }
 
 /// PuTTY registry keys with special characters (space, backslash, non-
@@ -21038,6 +22334,7 @@ fn parse_mobaxterm_sessions_in(text: &str, profile_dir: Option<&str>, documents:
             jump_identity_file,
             jump_credential,
             rdp,
+            telnet: false,
         });
     }
     if out.is_empty() {
@@ -21096,7 +22393,7 @@ fn mobaxterm_jump_hosts(hosts: &str, ports: &str, users: &str) -> Option<String>
 
 #[cfg(test)]
 mod client_import_tests {
-    use super::{parse_client_hosts, parse_mobaxterm_sessions_in, mobaxterm_skipped, expand_mobaxterm_path};
+    use super::{parse_client_hosts, parse_client_import, parse_mobaxterm_sessions_in, mobaxterm_skipped, expand_mobaxterm_path};
 
     #[test]
     fn a_startup_command_comes_back_as_it_was_typed() {
@@ -21256,6 +22553,85 @@ mod client_import_tests {
     }
 
     #[test]
+    fn ssh_config_import_reads_settings_as_openssh_does() {
+        let hosts = super::parse_ssh_config_text(
+            "User everyone\n\
+             Host web1 web2\n\
+             \tHostName web.example\n\
+             \tPort 2200\n\
+             \tPort 2300\n\
+             Match host web1\n\
+             \tUser matched\n\
+             \tPort 9999\n\
+             Host db\n\
+             \tHostName=db.example\n\
+             \tProxyJump none\n\
+             Host web*\n\
+             \tIdentityFile ~/.ssh/web\n\
+             \tProxyJump bastion.example\n\
+             Host *\n\
+             \tUser fallback\n\
+             \tPort 2022\n\
+             \tProxyJump gate.example\n\
+             Host web1\n\
+             \tHostName ignored.example\n",
+        );
+        let names: Vec<&str> = hosts.iter().map(|h| h.host_alias.as_str()).collect();
+        assert_eq!(names, vec!["web1", "web2", "db"], "no wildcard host, and web1 once");
+        let keys: Vec<&str> = hosts.iter().map(|h| h.key.as_str()).collect();
+        assert_eq!(keys, vec!["0", "1", "2"]);
+        let web1 = &hosts[0];
+        assert_eq!(web1.hostname, "web.example", "the first HostName wins");
+        assert_eq!(web1.port, 2200, "the first Port wins; Match's lines don't count");
+        assert_eq!(web1.user, "everyone", "lines before any Host apply to all");
+        assert_eq!(web1.identity_file.as_deref(), Some("~/.ssh/web"), "a matching wildcard block gives defaults");
+        assert_eq!(web1.proxy_jump.as_deref(), Some("bastion.example"));
+        let db = &hosts[2];
+        assert_eq!((db.hostname.as_str(), db.port, db.user.as_str()), ("db.example", 2022, "everyone"));
+        assert_eq!(db.identity_file, None);
+        assert_eq!(db.proxy_jump, None, "ProxyJump none wins over Host *");
+    }
+
+    #[test]
+    fn ssh_config_import_expands_percent_h() {
+        let hosts = super::parse_ssh_config_text(
+            "Host web1 web2 odd\n\
+             Host odd\n\
+             \tHostName %r.example\n\
+             \tIdentityFile ~/.ssh/%u_key\n\
+             \tProxyJump %r@gate\n\
+             Host web*\n\
+             \tHostName %h.prod.example.com\n\
+             \tIdentityFile ~/.ssh/%h-100%%\n\
+             \tProxyJump gate.example\n",
+        );
+        let got: Vec<(&str, &str, Option<&str>, Option<&str>)> = hosts
+            .iter()
+            .map(|h| (h.host_alias.as_str(), h.hostname.as_str(), h.identity_file.as_deref(), h.proxy_jump.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("web1", "web1.prod.example.com", Some("~/.ssh/web1.prod.example.com-100%"), Some("gate.example")),
+                ("web2", "web2.prod.example.com", Some("~/.ssh/web2.prod.example.com-100%"), Some("gate.example")),
+                ("odd", "odd", None, None),
+            ],
+            "%h is the alias in HostName and the host in IdentityFile; other tokens are left out"
+        );
+    }
+
+    #[test]
+    fn ssh_config_import_honours_negated_patterns() {
+        let hosts = super::parse_ssh_config_text(
+            "Host prod-a prod-b\n\
+             Host prod-* !prod-b\n\
+             \tUser deploy\n",
+        );
+        assert_eq!(hosts.len(), 2);
+        assert_eq!((hosts[0].user.as_str(), hosts[1].user.as_str()), ("deploy", ""));
+    }
+
+    #[test]
     fn ssh_config_jump_aliases_name_the_real_host() {
         let host = |alias: &str, hostname: &str, user: &str, port: u16, jump: Option<&str>| super::ImportedHost {
             host_alias: alias.into(),
@@ -21308,6 +22684,48 @@ mod client_import_tests {
     }
 
     #[test]
+    fn putty_import_takes_ssh_and_telnet_and_counts_the_rest() {
+        let session = |name: &str, host: &str, protocol: Option<&str>, port: Option<u32>| {
+            let mut s = format!("[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions\\{name}]\r\n\"HostName\"=\"{host}\"\r\n");
+            if let Some(p) = protocol {
+                s.push_str(&format!("\"Protocol\"=\"{p}\"\r\n"));
+            }
+            if let Some(p) = port {
+                s.push_str(&format!("\"PortNumber\"=dword:{p:08x}\r\n"));
+            }
+            s
+        };
+        let text = [
+            "Windows Registry Editor Version 5.00\r\n".to_string(),
+            session("Default%20Settings", "", Some("ssh"), Some(22)),
+            session("web", "web.example", Some("ssh"), Some(2222)),
+            session("old", "old.example", None, None),
+            session("switch", "10.0.0.9", Some("telnet"), None),
+            session("console", "COM1", Some("serial"), None),
+            session("raw1", "r.example", Some("raw"), Some(7)),
+            session("raw2", "r.example", Some("raw"), Some(8)),
+            session("legacy", "l.example", Some("rlogin"), Some(513)),
+        ]
+        .concat();
+        let hosts = parse_client_hosts(text.clone()).unwrap();
+        let keys: Vec<&str> = hosts.iter().map(|h| h.key.as_str()).collect();
+        assert_eq!(keys, vec!["0", "1", "2"], "each row has a key of its own");
+        let got: Vec<(&str, &str, u16, bool)> = hosts.iter().map(|h| (h.host_alias.as_str(), h.hostname.as_str(), h.port, h.telnet)).collect();
+        assert_eq!(
+            got,
+            vec![("web", "web.example", 2222, false), ("old", "old.example", 22, false), ("switch", "10.0.0.9", 23, true)],
+            "no Default Settings; a session with no Protocol is SSH; telnet on 23"
+        );
+        assert_eq!(
+            parse_client_import(text).unwrap().skipped.as_deref(),
+            Some("Not imported: 2 raw, 1 rlogin and 1 serial sessions — Submarine imports PuTTY's SSH and telnet sessions.")
+        );
+        let only_serial = ["Windows Registry Editor Version 5.00\r\n".to_string(), session("console", "COM1", Some("serial"), None)].concat();
+        let err = parse_client_hosts(only_serial).err().expect("nothing to import");
+        assert!(err.contains("1 serial session"), "{err}");
+    }
+
+    #[test]
     fn putty_names_come_out_as_they_were_typed() {
         use super::putty_unescape;
         assert_eq!(putty_unescape("My%20Server"), "My Server");
@@ -21330,7 +22748,8 @@ mod client_import_tests {
 
     #[test]
     fn json_arrays_still_import() {
-        let hosts = parse_client_hosts("\n  [ {\"name\": \"box\", \"host\": \"j.example\", \"port\": 2200, \"user\": \"u\"} ]".into()).unwrap();
+        let hosts = parse_client_hosts("\n  [ {\"name\": \"box\", \"host\": \"j.example\", \"port\": 2200, \"user\": \"u\"}, {\"name\": \"box\", \"host\": \"k.example\"} ]".into()).unwrap();
+        assert_eq!((hosts[0].key.as_str(), hosts[1].key.as_str()), ("0", "1"), "two rows called box keep keys of their own");
         assert_eq!((hosts[0].host_alias.as_str(), hosts[0].hostname.as_str(), hosts[0].port), ("box", "j.example", 2200));
         let err = parse_client_hosts("[ {\"name\": ".into()).err().expect("broken JSON must be refused");
         assert!(err.starts_with("JSON parse failed"), "{err}");
@@ -23154,7 +24573,7 @@ pub fn run() {
             export_profile, import_profile_pick, import_profile_save, import_profile_bytes,
             get_secure_screen, set_secure_screen,
             cloud::cloud_status, cloud::cloud_signup, cloud::cloud_consume_verify_link,
-            cloud::cloud_set_password, cloud::cloud_login, cloud::cloud_logout,
+            cloud::cloud_set_password, cloud::cloud_login, cloud::cloud_logout, cloud::cloud_delete_account,
             cloud::cloud_request_password_reset, cloud::cloud_reset_password,
             cloud::cloud_request_login_link, cloud::cloud_login_with_link,
             cloud::get_cloud_enabled, cloud::set_cloud_enabled,

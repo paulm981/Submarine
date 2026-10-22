@@ -457,7 +457,7 @@ fn split_directive(line: &str) -> (&str, &str) {
 
 /// The arguments of a line, split on whitespace, a double-quoted one kept
 /// whole. Backslashes are left as they are (Windows paths are full of them).
-fn arguments(rest: &str) -> Vec<String> {
+pub(crate) fn arguments(rest: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut chars = rest.trim().chars().peekable();
     while let Some(&c) = chars.peek() {
@@ -521,7 +521,7 @@ fn pattern_list_matches(list: &str, value: &str, ignore_case: bool) -> bool {
 }
 
 /// OpenSSH's patterns: `*` any run of characters, `?` one.
-fn glob_matches(pattern: &str, name: &str, ignore_case: bool) -> bool {
+pub(crate) fn glob_matches(pattern: &str, name: &str, ignore_case: bool) -> bool {
     let fold = |s: &str| if ignore_case { s.to_lowercase() } else { s.to_string() };
     let p: Vec<char> = fold(pattern).chars().collect();
     let n: Vec<char> = fold(name).chars().collect();
@@ -546,7 +546,7 @@ fn glob_matches(pattern: &str, name: &str, ignore_case: bool) -> bool {
 }
 
 /// `HostName` takes `%h` (the address as given) and `%%`.
-fn expand_hostname(value: &str, address: &str) -> Result<String, String> {
+pub(crate) fn expand_hostname(value: &str, address: &str) -> Result<String, String> {
     let mut out = String::new();
     let mut chars = value.chars();
     while let Some(c) = chars.next() {

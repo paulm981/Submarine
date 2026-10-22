@@ -125,6 +125,36 @@ pub fn rule_renamed(rules: &mut [TunnelSpec], spec: &TunnelSpec, name: Option<&s
     found
 }
 
+/// A session's rules (`ours`) saved over a node whose saved forwards changed
+/// by sync since the session read them (`base` then, `theirs` now): each side
+/// keeps what it changed. A forward one side removed stays removed, one it
+/// added stays; for a forward both have, a name or stopped flag the session
+/// changed is the session's, and otherwise the synced one. In `theirs`' order,
+/// with the session's new forwards after.
+pub fn merge_rules(base: &[TunnelSpec], ours: &[TunnelSpec], theirs: &[TunnelSpec]) -> Vec<TunnelSpec> {
+    let mut out = Vec::new();
+    for t in theirs {
+        let b = base.iter().find(|r| *r == t);
+        match (ours.iter().find(|r| *r == t), b) {
+            // The session removed it.
+            (None, Some(_)) => {}
+            // Added by sync after the session read the rules.
+            (None, None) => out.push(t.clone()),
+            (Some(o), None) => out.push(o.clone()),
+            (Some(o), Some(b)) => out.push(TunnelSpec {
+                name: if o.name != b.name { o.name.clone() } else { t.name.clone() },
+                stopped: if o.stopped != b.stopped { o.stopped } else { t.stopped },
+                ..t.clone()
+            }),
+        }
+    }
+    // The session's own new forwards; one in `base` that sync took away stays away.
+    for o in ours.iter().filter(|o| !theirs.contains(o) && !base.contains(o)) {
+        out.push(o.clone());
+    }
+    out
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TunnelStatus {
     pub id: String,
@@ -1988,6 +2018,32 @@ mod tunnel_tests {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use super::merge_rules;
+
+    fn rule(kind: &str, local: &str, name: Option<&str>, stopped: bool) -> TunnelSpec {
+        TunnelSpec { kind: kind.into(), local: local.into(), remote: "db:5432".into(), name: name.map(Into::into), stopped }
+    }
+
+    #[test]
+    fn a_session_saved_over_synced_forwards_keeps_both_sides_changes() {
+        let a = rule("L", "8080", None, false);
+        let b = rule("L", "8081", None, false);
+        let gone = rule("L", "8082", None, false);
+        let base = vec![a.clone(), b.clone(), gone.clone()];
+        // This session stopped A, removed B, and added its own.
+        let mine = rule("D", "1080", None, false);
+        let ours = vec![rule("L", "8080", None, true), gone.clone(), mine.clone()];
+        // Meanwhile sync named A, removed one, and added a forward.
+        let synced = rule("R", "9000", Some("theirs"), false);
+        let theirs = vec![rule("L", "8080", Some("web"), false), b.clone(), synced.clone()];
+        let merged = merge_rules(&base, &ours, &theirs);
+        assert_eq!(merged, vec![a.clone(), synced.clone(), mine.clone()]);
+        assert!(merged[0].stopped, "stopped here");
+        assert_eq!(merged[0].name.as_deref(), Some("web"), "named there");
+        assert_eq!(merged[1].name.as_deref(), Some("theirs"));
+        // Nothing changed by sync: the session's list as it is.
+        assert_eq!(merge_rules(&base, &ours, &base), vec![a, gone, mine]);
+    }
 
     fn spec(kind: &str, local: &str, remote: &str) -> TunnelSpec {
         serde_json::from_value(serde_json::json!({ "type": kind, "local": local, "remote": remote })).unwrap()

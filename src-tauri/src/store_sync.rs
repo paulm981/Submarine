@@ -203,8 +203,10 @@ fn shown_location(store: &Store) -> String {
 /// address without them and the two, decoded: git is given the password
 /// through its credential protocol rather than on its command line, where
 /// other users of the computer could read it, and it never reaches the
-/// user's own credential helper, which would store it.
-fn split_credentials(url: &str) -> (String, Option<(String, String)>) {
+/// user's own credential helper, which would store it. A user name alone
+/// (`https://TOKEN@host/…`, as a token is often given) is taken out too, with
+/// no password: it may be the secret.
+fn split_credentials(url: &str) -> (String, Option<(String, Option<String>)>) {
     let lower = url.to_ascii_lowercase();
     let Some(scheme_end) = url.find("://").filter(|_| lower.starts_with("https://") || lower.starts_with("http://")) else {
         return (url.to_string(), None);
@@ -212,9 +214,12 @@ fn split_credentials(url: &str) -> (String, Option<(String, String)>) {
     let rest = &url[scheme_end + 3..];
     let host_end = rest.find('/').unwrap_or(rest.len());
     let Some(at) = rest[..host_end].rfind('@') else { return (url.to_string(), None) };
-    let Some((user, pass)) = rest[..at].split_once(':') else { return (url.to_string(), None) };
     let bare = format!("{}{}", &url[..scheme_end + 3], &rest[at + 1..]);
-    (bare, Some((percent_decode(user), percent_decode(pass))))
+    match rest[..at].split_once(':') {
+        Some((user, pass)) => (bare, Some((percent_decode(user), Some(percent_decode(pass))))),
+        None if at > 0 => (bare, Some((percent_decode(&rest[..at]), None))),
+        None => (url.to_string(), None),
+    }
 }
 
 fn percent_decode(s: &str) -> String {
@@ -450,19 +455,33 @@ fn is_plain_file(e: &std::fs::DirEntry) -> bool {
 /// sync takes in one answer (cloud::MAX_SYNC_ANSWER).
 const MAX_DEVICE_FILE: u64 = crate::cloud::MAX_SYNC_ANSWER as u64;
 
-/// A computer's file, read no further than `MAX_DEVICE_FILE`: its size is
-/// looked at first, and the read stops one byte past the limit anyway, as the
-/// file can grow while it's read.
+/// The most a profile's `profile.key` (a sealed key, in hex) may be.
+const MAX_KEY_FILE: u64 = 64 * 1024;
+
+/// A computer's file, read no further than `MAX_DEVICE_FILE`.
 fn read_device_file(path: &Path) -> Result<Vec<u8>, String> {
+    read_capped(path, MAX_DEVICE_FILE)
+}
+
+/// A file in the store, read no further than `max` bytes: its size is looked
+/// at first, and the read stops one byte past the limit anyway, as the file
+/// can grow while it's read.
+fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     use std::io::Read as _;
-    let too_big = || format!("it's more than the {} MB a sync file can be, so it wasn't read", MAX_DEVICE_FILE / (1024 * 1024));
+    let too_big = || {
+        if max >= 1024 * 1024 {
+            format!("it's more than the {} MB a sync file can be, so it wasn't read", max / (1024 * 1024))
+        } else {
+            format!("it's more than the {} KB this file can be, so it wasn't read", max / 1024)
+        }
+    };
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    if file.metadata().map_err(|e| e.to_string())?.len() > MAX_DEVICE_FILE {
+    if file.metadata().map_err(|e| e.to_string())?.len() > max {
         return Err(too_big());
     }
     let mut bytes = Vec::new();
-    file.take(MAX_DEVICE_FILE + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > MAX_DEVICE_FILE {
+    file.take(max + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > max {
         return Err(too_big());
     }
     Ok(bytes)
@@ -674,8 +693,10 @@ fn device_label() -> String {
 struct Repo {
     url: String,
     /// User name and password from the address, given to git through an
-    /// environment variable its credential helper reads.
-    login: Option<(String, String)>,
+    /// environment variable its credential helper reads. A user name with no
+    /// password (often a token) goes to git as `credential.username`, set
+    /// through the environment too.
+    login: Option<(String, Option<String>)>,
     branch: String,
     dir: PathBuf,
 }
@@ -732,16 +753,30 @@ impl Repo {
         ] {
             cmd.arg("-c").arg(c);
         }
-        if self.login.is_some() {
-            // Only this helper: the user's own would be asked to store the
-            // password from the address.
-            cmd.arg("-c").arg("credential.helper=");
-            cmd.arg("-c").arg(
-                "credential.helper=!f() { printf '%s\\n' \"username=$SUBMARINE_GIT_USER\" \"password=$SUBMARINE_GIT_PASS\"; }; f",
-            );
-        }
-        if let Some((user, pass)) = &self.login {
-            cmd.env("SUBMARINE_GIT_USER", user).env("SUBMARINE_GIT_PASS", pass);
+        match &self.login {
+            Some((user, Some(pass))) => {
+                // Only this helper: the user's own would be asked to store the
+                // password from the address.
+                cmd.arg("-c").arg("credential.helper=");
+                cmd.arg("-c").arg(
+                    "credential.helper=!f() { printf '%s\\n' \"username=$SUBMARINE_GIT_USER\" \"password=$SUBMARINE_GIT_PASS\"; }; f",
+                );
+                cmd.env("SUBMARINE_GIT_USER", user).env("SUBMARINE_GIT_PASS", pass);
+            }
+            Some((user, None)) => {
+                // The user name alone, as git would have taken it from the
+                // address: the user's own helpers are asked for its password
+                // as before, and when none has one, an empty one is sent (a
+                // token as user name needs none). Through the environment,
+                // after any settings already given there, so it isn't on the
+                // command line.
+                let n: usize = std::env::var("GIT_CONFIG_COUNT").ok().and_then(|c| c.parse().ok()).unwrap_or(0);
+                cmd.env("GIT_CONFIG_COUNT", (n + 1).to_string())
+                    .env(format!("GIT_CONFIG_KEY_{n}"), "credential.username")
+                    .env(format!("GIT_CONFIG_VALUE_{n}"), user);
+                cmd.arg("-c").arg("credential.helper=!f() { printf '%s\\n' password=; }; f");
+            }
+            None => {}
         }
         cmd.args(args)
             .env_remove("GIT_DIR")
@@ -1165,7 +1200,7 @@ fn find_same_profile(data: &Path, key: &[u8; 32]) -> Option<String> {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(DEVICE_EXT) && is_plain_file(&entry) && std::fs::read(entry.path()).is_ok_and(|b| unseal(key, &b).is_ok()) {
+            if name.ends_with(DEVICE_EXT) && is_plain_file(&entry) && read_device_file(&entry.path()).is_ok_and(|b| unseal(key, &b).is_ok()) {
                 return Some(id);
             }
         }
@@ -1196,7 +1231,7 @@ fn key_files(dir: &Path) -> Vec<String> {
             let n = e.file_name().to_string_lossy().into_owned();
             n.starts_with("profile") && n.ends_with(".key") && is_plain_file(e)
         })
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|e| read_capped(&e.path(), MAX_KEY_FILE).ok().and_then(|b| String::from_utf8(b).ok()))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
@@ -1379,7 +1414,7 @@ pub async fn store_restore_profile(
     *db_state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(local_name.clone());
     // No strength floor: the key file just proved this is the profile's
     // real password.
-    let opened = match crate::setup_master_db_inner(app.clone(), crate::VaultSecret::Password(password), app.state::<DbState>(), false).await {
+    let opened = match crate::setup_master_db_with(app.clone(), crate::VaultSecret::Password(password), app.state::<DbState>(), false, true).await {
         Ok(generation) => generation,
         Err(e) => {
             crate::discard_half_built_profile(&app, &local_name, None);
@@ -1521,6 +1556,18 @@ mod tests {
     }
 
     #[test]
+    fn key_files_and_the_same_profile_are_looked_for_within_the_limits() {
+        let data = tmp("capped");
+        let dir = data.join("aaaaaaaaaaaaaaaa");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("profile.key"), "  abcd\n").unwrap();
+        std::fs::File::create(dir.join("profile (conflict).key")).unwrap().set_len(MAX_KEY_FILE + 1).unwrap();
+        assert_eq!(key_files(&dir), ["abcd"], "the oversized one is skipped, not read");
+        std::fs::File::create(dir.join("bbbbbbbbbbbbbbbb.subdev")).unwrap().set_len(MAX_DEVICE_FILE + 1).unwrap();
+        assert_eq!(find_same_profile(&data, &KEY), None);
+    }
+
+    #[test]
     fn a_file_under_another_key_is_left_alone() {
         let dir = tmp("other").join("p");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1567,10 +1614,15 @@ mod tests {
         assert_eq!(shown_location(&s), "https://•••@example.com/r.git");
         assert_eq!(
             split_credentials("https://me:p%40ss@example.com/r.git"),
-            ("https://example.com/r.git".to_string(), Some(("me".to_string(), "p@ss".to_string())))
+            ("https://example.com/r.git".to_string(), Some(("me".to_string(), Some("p@ss".to_string()))))
         );
         assert_eq!(split_credentials("git@example.com:r.git").1, None);
-        assert_eq!(split_credentials("https://me@example.com/r.git").1, None);
+        // A token given as the user name is taken out of the address too.
+        assert_eq!(
+            split_credentials("https://ghp_t%2Bk@example.com/r.git"),
+            ("https://example.com/r.git".to_string(), Some(("ghp_t+k".to_string(), None)))
+        );
+        assert_eq!(split_credentials("https://example.com/r.git").1, None);
     }
 
     fn git_available() -> bool {
@@ -1594,7 +1646,10 @@ mod tests {
         let (a, mut b) = (repo("a"), repo("b"));
         // A password from the address goes through the inline helper; a
         // local repository never asks for it, but git must take the config.
-        b.login = Some(("me".into(), "p w'd".into()));
+        b.login = Some(("me".into(), Some("p w'd".into())));
+        // And a user name alone through the environment's settings.
+        let mut a = a;
+        a.login = Some(("tok3n".into(), None));
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             assert_eq!(a.pull().await.unwrap(), None);

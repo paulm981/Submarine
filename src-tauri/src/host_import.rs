@@ -140,9 +140,61 @@ fn login_id(conn: &Connection, logins: &mut HashMap<String, i64>, name: &str, re
     Ok(id)
 }
 
+/// What's already saved, read once so each picked row is checked in memory.
+/// With the tables read again for every row, 10,000 rows took seconds, with
+/// the vault locked all the while.
+struct Saved {
+    /// (name, host, port, folder) → id, for "already saved".
+    servers: HashMap<SavedKey, i64>,
+    rdp_links: HashMap<SavedKey, i64>,
+    /// The highest `position` in each folder (None: the top level).
+    max_position: HashMap<Option<i64>, i64>,
+}
+
+/// Matches what `name = ? AND host = ? AND port = ? AND folder_id IS ?` did.
+type SavedKey = (Option<String>, Option<String>, Option<i64>, Option<i64>);
+
+fn saved_key(name: &str, host: &str, port: u16, folder_id: Option<i64>) -> SavedKey {
+    (Some(name.to_string()), Some(host.to_string()), Some(port as i64), folder_id)
+}
+
+impl Saved {
+    fn load(conn: &Connection) -> rusqlite::Result<Self> {
+        let key = |r: &rusqlite::Row| -> rusqlite::Result<SavedKey> {
+            Ok((r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        };
+        let mut servers = HashMap::new();
+        let mut max_position: HashMap<Option<i64>, i64> = HashMap::new();
+        let mut stmt = conn.prepare("SELECT id, name, host, port, folder_id, position FROM servers ORDER BY id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, key(r)?, r.get::<_, i64>(5)?)))?;
+        for row in rows {
+            let (id, k, position) = row?;
+            let max = max_position.entry(k.3).or_insert(position);
+            *max = (*max).max(position);
+            servers.entry(k).or_insert(id);
+        }
+        let mut rdp_links = HashMap::new();
+        let mut stmt = conn.prepare("SELECT id, name, host, port, folder_id FROM rdp_links ORDER BY id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, key(r)?)))?;
+        for row in rows {
+            let (id, k) = row?;
+            rdp_links.entry(k).or_insert(id);
+        }
+        Ok(Saved { servers, rdp_links, max_position })
+    }
+
+    /// The position for a row added at the bottom of `folder_id`.
+    fn next_position(&mut self, folder_id: Option<i64>) -> i64 {
+        let next = self.max_position.get(&folder_id).map_or(0, |m| m + 1);
+        self.max_position.insert(folder_id, next);
+        next
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn insert_server(
     conn: &Connection,
+    saved: &mut Saved,
     name: &str,
     host: &str,
     port: u16,
@@ -151,6 +203,7 @@ fn insert_server(
     key_id: Option<i64>,
     folder_id: Option<i64>,
     run_on_connect: &str,
+    telnet: bool,
 ) -> rusqlite::Result<i64> {
     // Its own key wins over a Login; then add_server's rule decides which
     // fields the row keeps (normalize_server_identity).
@@ -166,17 +219,15 @@ fn insert_server(
         key_id.map(|k| k as i32),
         credential_id.map(|c| c as i32),
     );
+    // To the bottom of its folder, as add_server does.
+    let position = saved.next_position(folder_id);
     conn.execute(
-        "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect)
-         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, 'none', '', 1080, '[]', ?7, ?8, 0, '[]', NULL, '', ?9)",
-        params![name, host, port, username, credential_id, folder_id, auth_type, key_id, run_on_connect],
+        "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, position, protocol)
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, 'none', '', 1080, '[]', ?7, ?8, 0, '[]', NULL, '', ?9, ?10, ?11)",
+        params![name, host, port, username, credential_id, folder_id, auth_type, key_id, run_on_connect, position, telnet.then_some("telnet")],
     )?;
     let id = conn.last_insert_rowid();
-    // To the bottom of its folder, as add_server does.
-    conn.execute(
-        "UPDATE servers SET position = COALESCE((SELECT MAX(position) FROM servers WHERE id != ?1 AND folder_id IS ?2), -1) + 1 WHERE id = ?1",
-        params![id, folder_id],
-    )?;
+    saved.servers.entry(saved_key(name, host, port, folder_id)).or_insert(id);
     Ok(id)
 }
 
@@ -186,6 +237,7 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
     let db = |e: rusqlite::Error| format!("[DATABASE] IMPORT_FAILED: {}", e);
     let mut report = ImportReport::default();
     let mut folders = Folders::load(conn).map_err(db)?;
+    let mut saved = Saved::load(conn).map_err(db)?;
     let mut logins: HashMap<String, i64> = {
         let mut stmt = conn.prepare("SELECT id, name FROM credentials").map_err(db)?;
         let rows = stmt
@@ -212,15 +264,7 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
         let folder_id = folders.resolve(conn, &h.folder).map_err(db)?;
 
         if h.rdp {
-            let existing: Option<i64> = conn
-                .query_row(
-                    "SELECT id FROM rdp_links WHERE name = ?1 AND host = ?2 AND port = ?3 AND folder_id IS ?4 LIMIT 1",
-                    params![name, host, port, folder_id],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(db)?;
-            if existing.is_some() {
+            if saved.rdp_links.contains_key(&saved_key(name, host, port, folder_id)) {
                 report.already_there += 1;
                 continue;
             }
@@ -241,20 +285,13 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
                 report.rdp_skipped.push(format!("{}: {}", name, why));
                 continue;
             }
-            crate::rdp_links::save(conn, &link)?;
+            let link_id = crate::rdp_links::save(conn, &link)?;
+            saved.rdp_links.entry(saved_key(name, host, port, folder_id)).or_insert(link_id);
             report.rdp_added += 1;
             continue;
         }
 
-        let existing: Option<i64> = conn
-            .query_row(
-                "SELECT id FROM servers WHERE name = ?1 AND host = ?2 AND port = ?3 AND folder_id IS ?4 LIMIT 1",
-                params![name, host, port, folder_id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(db)?;
-        if let Some(id) = existing {
+        if let Some(&id) = saved.servers.get(&saved_key(name, host, port, folder_id)) {
             report.already_there += 1;
             by_alias.entry(name.to_lowercase()).or_insert(id);
             continue;
@@ -267,7 +304,7 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
             None => None,
         };
         let run = h.run_on_connect.as_deref().map(str::trim).unwrap_or("");
-        let id = insert_server(conn, name, host, port, &h.user, credential_id, row.key_id, folder_id, run).map_err(db)?;
+        let id = insert_server(conn, &mut saved, name, host, port, &h.user, credential_id, row.key_id, folder_id, run, h.telnet).map_err(db)?;
         report.added += 1;
         by_alias.entry(name.to_lowercase()).or_insert(id);
         // `none` is OpenSSH's "no jump host", e.g. to override a wildcard block.
@@ -322,7 +359,7 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
                         Some(c) => Some(login_id(conn, &mut logins, c, &mut report).map_err(db)?),
                         None => None,
                     };
-                    let j = insert_server(conn, &name, &host, port, &user, login, row.jump_key_id, None, "").map_err(db)?;
+                    let j = insert_server(conn, &mut saved, &name, &host, port, &user, login, row.jump_key_id, None, "", false).map_err(db)?;
                     report.jump_hosts_created.push(name);
                     j
                 }
@@ -430,7 +467,7 @@ mod tests {
             "CREATE TABLE folders(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, parent_id INTEGER, color TEXT);
              CREATE TABLE ssh_keys(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, public_key TEXT, private_key TEXT, passphrase TEXT);
              CREATE TABLE credentials(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, auth_type TEXT, username TEXT, password TEXT, key_id INTEGER);
-             CREATE TABLE servers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT, key_id INTEGER, autostart INTEGER, mirrors TEXT, color TEXT, notes TEXT, run_on_connect TEXT, jump_host_id INTEGER, position INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE servers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT, key_id INTEGER, autostart INTEGER, mirrors TEXT, color TEXT, notes TEXT, run_on_connect TEXT, jump_host_id INTEGER, position INTEGER NOT NULL DEFAULT 0, protocol TEXT);
              INSERT INTO ssh_keys(name, private_key) VALUES ('id_jump', 'k1'), ('own', 'k2');",
         )
         .unwrap();
@@ -537,6 +574,64 @@ mod tests {
         assert!(again.logins_created.is_empty() && again.jump_hosts_created.is_empty());
         let servers: i64 = conn.query_row("SELECT COUNT(*) FROM servers", [], |r| r.get(0)).unwrap();
         assert_eq!(servers, 3);
+    }
+
+    #[test]
+    fn duplicates_are_found_and_rows_go_to_the_bottom_of_their_folder() {
+        let conn = vault();
+        conn.execute_batch(
+            "INSERT INTO folders (id, name) VALUES (7, 'A');
+             INSERT INTO servers (name, host, port, folder_id, position) VALUES ('old', 'old.example', 22, 7, 4);
+             INSERT INTO servers (name, host, port, folder_id, position) VALUES ('top', 'top.example', 22, NULL, 9);",
+        )
+        .unwrap();
+        let rows = vec![
+            moba("old", &["A"], "old.example", None, None),
+            moba("new1", &["A"], "new1.example", None, None),
+            // The same row twice in one file comes in once.
+            moba("new1", &["A"], "new1.example", None, None),
+            moba("new2", &["A"], "new2.example", None, None),
+            moba("root", &[], "root.example", None, None),
+            moba("other", &["B"], "other.example", None, None),
+            // Same name and host, but another folder or port: not the same.
+            moba("old", &[], "old.example", None, None),
+            ImportRow { host: ImportedHost { port: 2222, ..moba("old", &["A"], "old.example", None, None).host }, key_id: None, jump_key_id: None },
+        ];
+        let r = import_rows(&conn, &rows).unwrap();
+        assert_eq!((r.added, r.already_there), (6, 2));
+        let pos = |name: &str, port: i64, top: bool| -> i64 {
+            conn.query_row(
+                "SELECT position FROM servers WHERE name = ?1 AND port = ?2 AND (folder_id IS NULL) = ?3",
+                params![name, port, top],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!((pos("new1", 22, false), pos("new2", 22, false), pos("old", 2222, false)), (5, 6, 7));
+        assert_eq!((pos("root", 22, true), pos("old", 22, true)), (10, 11));
+        assert_eq!(pos("other", 22, false), 0, "a new folder starts at 0");
+        let again = import_rows(&conn, &rows).unwrap();
+        assert_eq!((again.added, again.already_there), (0, 8));
+    }
+
+    #[test]
+    fn a_telnet_session_becomes_a_telnet_server() {
+        let conn = vault();
+        let row = ImportRow {
+            host: ImportedHost { host_alias: "switch".into(), hostname: "10.0.0.9".into(), port: 23, telnet: true, ..Default::default() },
+            key_id: None,
+            jump_key_id: None,
+        };
+        let r = import_rows(&conn, &[row, moba("web1", &[], "web1.example", None, None)]).unwrap();
+        assert_eq!(r.added, 2);
+        let kinds: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT name, protocol FROM servers ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(kinds, vec![("switch".into(), Some("telnet".into())), ("web1".into(), None)]);
     }
 
     #[test]

@@ -38,13 +38,14 @@ export function scopeMatches(scope: CommandScope, ids: { server: string | null; 
   return (!!ids.server && scope.servers.includes(ids.server)) || ids.folders.some((u) => scope.folders.includes(u));
 }
 
-// "web-1, web-2 and the Acme folder", short enough for a card.
+// "web-1, web-2 and Acme (folder)", short enough for a card, after "For ".
 export function describeScope(scope: CommandScope | null, servers: any[], folders: any[]): string {
   if (!scope) return "All servers";
   const names = [
     ...scope.folders.map((u) => folders.find((f) => f.uuid === u)?.name).filter(Boolean).map((n) => `${n} (folder)`),
     ...scope.servers.map((u) => servers.find((s) => s.uuid === u)?.name).filter(Boolean),
   ] as string[];
-  if (names.length === 0) return "No server here";
+  // Every server and folder it names was deleted: "For servers that were deleted".
+  if (names.length === 0) return "servers that were deleted";
   return names.length <= 3 ? names.join(", ") : `${names.slice(0, 2).join(", ")} and ${names.length - 2} more`;
 }

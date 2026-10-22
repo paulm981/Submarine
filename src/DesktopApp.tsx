@@ -337,6 +337,10 @@ function DesktopApp() {
   const [isKeyPanelOpen, setIsKeyPanelOpen] = useState(false);
   const [editKeyData, setEditKeyData] = useState<any>({ id: null, name: "", public_key: "", private_key: "", passphrase: "" });
   const [formError, setFormError] = useState("");
+  // The five panels share one error line: a panel opening or closing (by ✕,
+  // the backdrop or Escape) starts it empty, so one panel's error never
+  // shows in the next.
+  useEffect(() => { setFormError(""); }, [isPanelOpen, isCommandPanelOpen, isNotePanelOpen, isCredPanelOpen, isKeyPanelOpen]);
   const commandPanelRef = useSlideOverFocus(isCommandPanelOpen);
   const notePanelRef = useSlideOverFocus(isNotePanelOpen);
   const credPanelRef = useSlideOverFocus(isCredPanelOpen);
@@ -569,20 +573,24 @@ function DesktopApp() {
   }, [refreshServers]);
   // Allow what this device holds back for a server (see the review dialog in
   // the server list), then show the list as it now is.
-  const allowHeld = useCallback(async (serverId: number, items: string[]) => {
+  // `runOnConnect` is the on-connect text the review showed, needed to allow
+  // those commands: when they changed again meanwhile, the OK is refused and
+  // the review shows the new text.
+  const allowHeld = useCallback(async (serverId: number, items: string[], runOnConnect?: string) => {
     try {
-      await invoke("allow_held", { serverId, items });
+      await invoke("allow_held", { serverId, items, runOnConnect: runOnConnect ?? null });
       addLog(items.length ? `Allowed ${items.length} held change${items.length === 1 ? "" : "s"}.` : "Allowed the held changes.", "success");
     } catch (e) {
-      addLog(`ALLOW_FAILED: ${e}`, "error");
+      if (String(e).includes("HELD_CHANGED")) addLog("Those on-connect commands were changed again. Look at them again before you allow them.", "warn");
+      else addLog(`ALLOW_FAILED: ${e}`, "error");
     }
     await refreshServers();
   }, [addLog, refreshServers]);
-  // Decline a held switch to telnet or VNC: the server stays SSH, and the
-  // other computers get it back as SSH with the next sync.
+  // Decline a held switch to telnet or VNC: the server stays SSH (or RDP),
+  // and the other computers get it back as that with the next sync.
   const keepServerSsh = useCallback(async (serverId: number) => {
     try {
-      if (await invoke<boolean>("keep_server_ssh", { serverId })) addLog("Kept it an SSH server.", "success");
+      if (await invoke<boolean>("keep_server_ssh", { serverId })) addLog("Kept the server as it was.", "success");
     } catch (e) {
       addLog(`KEEP_SSH_FAILED: ${e}`, "error");
     }
@@ -875,12 +883,27 @@ function DesktopApp() {
       ...defaultNode,
       folderId: folderId != null ? String(folderId) : "",
     });
+    setFormError("");
     setIsPanelOpen(true);
   };
 
   // Rethrows so the session tree can say it failed; the grid ignores that.
   const cloneServer = async (id: number) => {
-    try { await invoke("clone_server", { id }); refreshServers(); bumpSync(); addLog("Node cloned.", "success"); }
+    try {
+      const copyId = await invoke<number>("clone_server", { id });
+      // An RDP server's window and sharing options are this device's own,
+      // kept by sync id (util/rdpOptions): the copy starts with the same.
+      const original = (servers || []).find((s: any) => s.id === id);
+      if (original?.protocol === "rdp" && original.uuid) {
+        try {
+          const copy = (await invoke<any[]>("get_servers")).find((s) => s.id === copyId);
+          if (copy?.uuid) writeRdpOptions(copy.uuid, readRdpOptions(original.uuid));
+        } catch (e) {
+          addLog(`CLONE_RDP_OPTIONS_FAILED: ${e}`, "error");
+        }
+      }
+      refreshServers(); bumpSync(); addLog("Node cloned.", "success");
+    }
     catch (e) { addLog(`CLONE_ERROR: ${e}`, "error"); throw e; }
   };
 
@@ -908,8 +931,17 @@ function DesktopApp() {
   // one vault save however much is selected. Rethrows so the tree can say
   // what failed.
   const deleteItems = async (items: TreeItems) => {
+    // The servers that go, the picked ones and those in the picked folders,
+    // for the same per-server cleanup removeServer does.
+    const tree = folderTree(folders);
+    const insideFolders = new Set<number>(items.folders.flatMap((f) => [...tree.subtreeOf(f)]));
+    const gone = new Set<number>([
+      ...items.servers,
+      ...(servers || []).filter((s: any) => insideFolders.has(tree.serverFolder(s) as number)).map((s: any) => s.id as number),
+    ]);
     try {
       await invoke("delete_tree_items", { servers: items.servers, links: items.links, folders: items.folders });
+      if (activeProfile) gone.forEach((sid) => forgetServerBookmarks(activeProfile, sid));
       addLog("Removed from the session tree.", "info");
     } finally {
       await Promise.all([refreshFolders(), refreshServers(), refreshRdpLinks()]);
@@ -1688,6 +1720,7 @@ function DesktopApp() {
       // and a real overwrite.
       password_dirty: false,
     });
+    setFormError("");
     setIsPanelOpen(true);
   };
 
@@ -3350,6 +3383,11 @@ function DesktopApp() {
             addLog("Name and Host are required.", "error");
             return;
           }
+          // An emptied Port field would save as no port at all.
+          if (!Number.isInteger(newNode.port) || newNode.port < 1 || newNode.port > 65535) {
+            setFormError("Port must be a number from 1 to 65535.");
+            return;
+          }
           if (newNode.authType === "vault" && !newNode.credentialId && newNode.protocol !== "vnc") {
             setFormError("Please pick a saved login.");
             addLog("Please pick a saved login.", "error");
@@ -3552,7 +3590,7 @@ function DesktopApp() {
             <button 
               onClick={async () => {
                 if (!editCommandData.title || !editCommandData.content) {
-                  addLog("Title and Content are required.", "error");
+                  setFormError("Give the command a title and the command to run.");
                   return;
                 }
                 const scope = editCommandData.scope;

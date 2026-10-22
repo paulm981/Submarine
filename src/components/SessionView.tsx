@@ -601,22 +601,29 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
       ? () => {
           if (startupRanForEpochRef.current === connectionEpoch) return;
           startupRanForEpochRef.current = connectionEpoch;
-          const cmds = startupCommands.join('\n') + '\n';
-          const typeThem = () => {
-            const bytes = Array.from(new TextEncoder().encode(cmds));
+          const typeThem = (text: string) => {
+            const lines = text
+              .split(/\r?\n/)
+              .map((l: string) => l.trimEnd())
+              .filter((l: string) => l.trim().length > 0);
+            if (lines.length === 0) return;
+            const bytes = Array.from(new TextEncoder().encode(lines.join('\n') + '\n'));
             markTyped(terminalId);
             invoke('write_terminal_data', { terminalId, data: bytes }).catch(() => {});
           };
           if (!session.runOnConnectHeld) {
-            typeThem();
+            typeThem(session.runOnConnect || "");
             return;
           }
           // Someone this profile is shared with set or changed these
           // commands and this device hasn't allowed them: ask, never type
           // them unasked. Cancel has the focus, so a stray Enter is a no.
-          confirmRef.current({
+          // The OK counts only for the text shown (`runOnConnect`): when the
+          // commands changed again meanwhile, it's refused, and the new
+          // ones are shown.
+          const ask = (text: string) => confirmRef.current({
             title: "Run the on-connect commands?",
-            message: `Someone you share this profile with set these commands to run when you connect to ${session.serverName}:\n\n${cmds.trimEnd()}\n\nThey would be typed into your terminal on that server.`,
+            message: `Someone you share this profile with set these commands to run when you connect to ${session.serverName}:\n\n${text.trimEnd()}\n\nThey would be typed into your terminal on that server.`,
             okLabel: "Allow and run",
             cancelLabel: "Not now",
             safeDefault: true,
@@ -626,14 +633,33 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               return;
             }
             try {
-              await invoke("allow_held", { serverId: session.serverId, items: ["run_on_connect"] });
+              await invoke("allow_held", { serverId: session.serverId, items: ["run_on_connect"], runOnConnect: text });
               window.dispatchEvent(new Event("submarine-held-changed"));
             } catch (e) {
-              addLog(`ALLOW_FAILED: ${e}`, "error");
+              if (!String(e).includes("HELD_CHANGED")) {
+                addLog(`ALLOW_FAILED: ${e}`, "error");
+                return;
+              }
+              window.dispatchEvent(new Event("submarine-held-changed"));
+              addLog(`The on-connect commands for ${session.serverName} were changed again. Look at them again before you allow them.`, "warn");
+              let server: any;
+              try {
+                server = ((await invoke("get_servers")) as any[]).find((s) => s.id === session.serverId);
+              } catch (e2) {
+                addLog(`ALLOW_FAILED: ${e2}`, "error");
+                return;
+              }
+              const now: string = server?.run_on_connect || "";
+              if (!now.trim()) return;
+              // Still held: ask about the new text. Not held any more: it was
+              // allowed meanwhile, or changed on this device.
+              if ((server?.held || []).includes("run_on_connect")) ask(now);
+              else typeThem(now);
               return;
             }
-            typeThem();
+            typeThem(text);
           });
+          ask(session.runOnConnect || "");
         }
       : undefined;
   const openContainerTerminal = (containerName: string, useSudo: boolean) => {

@@ -142,10 +142,7 @@ async fn start_with(open: OpenChannel, sudo: Sudo, portable: bool) -> Result<Sft
 // Commands
 // ---------------------------------------------------------------------------
 
-/// `s` as one word for `sh`.
-fn quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
+use crate::remote_sh::quote;
 
 /// A path as a word that never starts with `-`, so no command takes it for an
 /// option: relative paths get `./`.
@@ -162,16 +159,7 @@ fn qpath(p: &str) -> String {
 /// The script as RUNNER reads it: one line, SCRIPT_TAG then each byte as a
 /// `\ooo` escape.
 fn encode_script(script: &str) -> String {
-    let mut line = String::with_capacity(SCRIPT_TAG.len() + script.len() * 4 + 1);
-    line.push_str(SCRIPT_TAG);
-    for b in script.bytes() {
-        line.push('\\');
-        line.push(char::from(b'0' + (b >> 6)));
-        line.push(char::from(b'0' + ((b >> 3) & 7)));
-        line.push(char::from(b'0' + (b & 7)));
-    }
-    line.push('\n');
-    line
+    format!("{}{}\n", SCRIPT_TAG, crate::remote_sh::octal(script))
 }
 
 /// Drops what the login shell's startup files print before MARKER.
@@ -255,7 +243,14 @@ impl Remote {
         if let Some(e) = self.sudo_failed.lock().unwrap().clone() {
             return Err(e);
         }
-        let mut input = Zeroizing::new(Vec::new());
+        let encoded = encode_script(&format!("{}{}", PRELUDE, script));
+        let pw = match &self.sudo {
+            Sudo::Password(pw) => pw.as_str(),
+            _ => "",
+        };
+        // Its final size at once: a buffer that grows would leave a copy of
+        // the password behind, unzeroised.
+        let mut input = Zeroizing::new(Vec::with_capacity(pw.len() + 1 + encoded.len()));
         if let Sudo::Password(pw) = &self.sudo {
             // RUNNER would take such a line for the script.
             if pw.contains(['\n', '\r', '\0']) || pw.starts_with(SCRIPT_TAG) {
@@ -264,7 +259,7 @@ impl Remote {
             input.extend_from_slice(pw.as_bytes());
             input.push(b'\n');
         }
-        input.extend_from_slice(encode_script(&format!("{}{}", PRELUDE, script)).as_bytes());
+        input.extend_from_slice(encoded.as_bytes());
         let channel = (self.open)().await.map_err(|e| failure(format!("Couldn't run a command: {}", e)))?;
         let sent = async {
             channel.exec(true, self.command()).await?;
@@ -358,8 +353,8 @@ fn outcome(o: &Output) -> Result<(), StatusReply> {
 fn from_stderr(err: &[u8]) -> StatusReply {
     let text = String::from_utf8_lossy(err);
     let line = text.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("");
-    if text.contains("sudo:") || text.contains("sudo-rs:") {
-        let sudo = crate::classify_sudo_failure(&text.replace('\n', " "));
+    if text.lines().any(crate::is_tool_line) {
+        let sudo = crate::classify_tool_output(&text);
         if !sudo.starts_with(crate::SUDO_FAILED) {
             return failure(sudo);
         }

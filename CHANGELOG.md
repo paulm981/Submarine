@@ -9,6 +9,44 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Importing thousands of servers takes a moment.** Checking which ones are already saved used to take seconds for 10,000 rows, with the app waiting. ([#94](https://github.com/paulm981/Submarine/issues/94))
+- **The `~/.ssh/config` import reads settings as `ssh` does.** A `Host *` block, and other wildcard blocks that match a host, give it their settings as defaults. When a setting appears twice, the first one counts. A `Match` block's lines are left out instead of being added to the host above them. ([#94](https://github.com/paulm981/Submarine/issues/94))
+- **The PuTTY import brings in telnet sessions** as telnet servers, and leaves out "Default Settings" and other sessions with no host. Serial, raw and rlogin sessions are listed as not imported instead of coming in as SSH servers. ([#94](https://github.com/paulm981/Submarine/issues/94))
+- **Two imported servers with the same name are picked one at a time.** Ticking one used to tick both, and **Select all** didn't count as all. ([#94](https://github.com/paulm981/Submarine/issues/94))
+- **Switching a server from SSH or RDP to VNC or telnet empties its password,** and the form says so. Saving clears the saved one, so that password is never sent over VNC or telnet. VNC needs its own password anyway. ([#94](https://github.com/paulm981/Submarine/issues/94))
+- **An error in a side panel goes when you close it,** and doesn't show up in the next panel you open. A command with no title or nothing to run says so in the panel. ([#94](https://github.com/paulm981/Submarine/issues/94))
+- **Smaller fixes:** ([#94](https://github.com/paulm981/Submarine/issues/94))
+  - deleting servers from the session tree also forgets their SFTP bookmarks;
+  - a duplicated RDP server keeps its window and sharing options on this computer;
+  - the Remote Desktop link dialog closes with Escape and keeps Tab inside it;
+  - an empty Port field in the server form asks for a port instead of saving none;
+  - a command for servers that were all deleted says "For servers that were deleted".
+- **A server switched from RDP to telnet or VNC by another computer waits for your OK too**, in a shared profile, as one switched from SSH does. It stays an RDP server here until you allow the switch, or keep it RDP. Before, switching it to RDP first got round the hold. ([#95](https://github.com/paulm981/Submarine/issues/95))
+- **Allowing on-connect commands counts only for the commands you were shown.** In a shared profile, if someone changes them again while you're looking at them, Allow is refused and you're shown the new ones to check. Before, the OK went to whatever had come in last. ([#95](https://github.com/paulm981/Submarine/issues/95))
+- **Stopping, starting or renaming a forward no longer deletes forwards that came by sync.** With a tab open, a forward someone added on another computer was dropped everywhere the next time you changed one in the Ports panel, and in a shared profile it stopped waiting for your OK. The panel now shows the synced forwards and keeps them. ([#95](https://github.com/paulm981/Submarine/issues/95))
+- **Replace the cloud copy with this device uploads everything again.** After an earlier sync, it uploaded only recent changes, so the cloud copy could end up missing most of the profile and the key other devices unlock it with. ([#95](https://github.com/paulm981/Submarine/issues/95))
+- **A restore or import that fails no longer deletes a profile of the same name** that another window made or opened while it ran. It's refused instead, and only what the failed restore made itself is cleaned up. ([#95](https://github.com/paulm981/Submarine/issues/95))
+- **Deleting a profile deletes the copies a sync kept of it too**, the `<name>.submarine.bak-<time>` files next to it. They hold the same servers, logins and keys. ([#95](https://github.com/paulm981/Submarine/issues/95))
+- **A forward you stopped stays stopped until you start it.** In a shared profile, someone else starting it again now waits for your OK, like a forward they add. A forward that arrives stopped doesn't need your OK, since it runs nothing. ([#95](https://github.com/paulm981/Submarine/issues/95))
+- **A token given as the user name in a git address** (`https://TOKEN@host/…`) is no longer on git's command line, where other users of the computer could read it. It's handed to git the way a password in the address already is. ([#95](https://github.com/paulm981/Submarine/issues/95))
+- **Root with `dzdo su -` or `sudo su -` that asks for your password.** Where sudo or dzdo lets you in only through a root shell, and wants your password for it, the app now gets root that way once you enter it: in SFTP root mode, the Info panel and the Docker tab. ([#96](https://github.com/paulm981/Submarine/issues/96))
+- **Root works when your login shell is csh or tcsh.** SFTP root mode, the Info panel's actions and Docker as root used to fail on such accounts. ([#96](https://github.com/paulm981/Submarine/issues/96))
+- **A root password is never tried twice by mistake, so it can't lock your account.** A wrong one costs one failed attempt, even when several actions were waiting for it or the server is slow to answer. One that stopped working is forgotten for the whole tab, SFTP root mode included, and asked for again. Each action signs in once. ([#96](https://github.com/paulm981/Submarine/issues/96))
+- **Your password goes only to sudo or dzdo.** It's checked on its own before anything runs, whatever prompt your server shows (Kerberos included). A command that runs without a password never gets it, and a command's own output is never mistaken for sudo's answer. ([#96](https://github.com/paulm981/Submarine/issues/96))
+- **A container's terminal asks for the root password** when it needs one, as the Docker tab does, instead of showing `[SUDO] NEED_PASSWORD`. ([#96](https://github.com/paulm981/Submarine/issues/96))
+- **A server's saved password is typed only into that server's own terminals.** ([#96](https://github.com/paulm981/Submarine/issues/96))
+
+### From the original project ([#41](https://github.com/paulm981/Submarine/issues/41))
+
+- **The last column of a full line shows whole** ([#227](https://github.com/SinaXhpm/submarine/pull/227)). Its right edge was sometimes cut off when the terminal draws without the GPU. On a Wall too.
+- **Delete your Submarine Cloud account from the app** ([#225](https://github.com/SinaXhpm/submarine/pull/225)). If you turned Submarine Cloud on, its panel has **Delete Submarine Cloud account…**, confirmed with the account password. It deletes the account and what the server holds for it. The profiles on your computer, and sync through your own folder or git repository, stay as they are.
+- **A privacy policy** ([#225](https://github.com/SinaXhpm/submarine/pull/225)). **Privacy** at the bottom of the profile screen opens it. It's the original project's, with a note on where this fork differs.
+- **Submarine Cloud's new address** ([#228](https://github.com/SinaXhpm/submarine/pull/228)). When it's on, the app asks the sync service at its new address, under `/api`, as the original project's app now does. Nobody is signed out, and no profile has to move.
+- **Test builds** ([#226](https://github.com/SinaXhpm/submarine/pull/226)). A build started by hand now has a version Android accepts.
+- **The original project's website** ([#229](https://github.com/SinaXhpm/submarine/pull/229)) comes with its source, in `website/`. It isn't part of the app, and this fork doesn't publish it.
+
+## v0.4.0-fork.3
+
 - **Search for the jump host.** In a server's form, **Jump via** is now a search box: type part of a name, address or folder, and pick with the arrow keys and Enter or a click. Servers already used as a jump host are listed first. ([#102](https://github.com/paulm981/Submarine/issues/102))
 
 ## v0.4.0-fork.2
