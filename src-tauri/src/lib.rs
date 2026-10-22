@@ -16160,6 +16160,11 @@ async fn run_exec_capture(
         let session = session_arc.lock().await;
         session.channel_open_session().await.map_err(|e| e.to_string())?
     };
+    // Run by sh whatever the login shell is: csh and tcsh read `2>&1` and
+    // `$?` their own way (remote_sh). These are the user's own tries before
+    // root (a service action, a kill, a firewall read), and their answer
+    // decides whether root is asked for.
+    let cmd = remote_sh::sh_command(&[], cmd, &[]);
     channel.exec(true, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
     let mut stream = channel.into_stream();
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
@@ -17499,6 +17504,8 @@ mod elevated_sftp_tests {
         ];
         for (cmd, _) in &cases {
             assert!(!cmd.contains(['\n', '\r', '!']), "{cmd}");
+            // Dropbear takes a command of up to 9000 bytes.
+            assert!(cmd.len() < 8000, "{} bytes", cmd.len());
         }
         #[cfg(unix)]
         for shell in shells() {

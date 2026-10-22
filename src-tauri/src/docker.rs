@@ -96,7 +96,9 @@ async fn run_capture(
             .await
             .map_err(|e| e.to_string())?
     };
-    let wrapped = format!("{}\necho __DOCK_EXIT:$?", cmd);
+    // Run by sh whatever the login shell is: csh and tcsh read `2>&1` and
+    // `$?` their own way (remote_sh).
+    let wrapped = crate::remote_sh::sh_command(&[], &format!("{}\necho __DOCK_EXIT:$?", cmd), &[]);
     channel
         .exec(true, wrapped.as_bytes())
         .await
@@ -614,7 +616,7 @@ pub async fn ssh_docker_logs_start(
                 .await
                 .map_err(|e| e.to_string())?
         };
-        let cmd = format!("{} 2>&1", Cmd::Docker(args).shell());
+        let cmd = crate::remote_sh::sh_command(&[], &format!("{} 2>&1", Cmd::Docker(args).shell()), &[]);
         channel
             .exec(true, cmd.as_bytes())
             .await
