@@ -3,8 +3,22 @@
 //! `config_jump_chain`, `reach_hop`, `login_hop`), with one-line calls into
 //! this file.
 
+/// A `ProxyJump` with `%` tokens (`%h`, `%r`, …) is refused before anything
+/// is dialled (#43, D7). OpenSSH fills them in; Submarine doesn't yet, and
+/// taken as written they'd send a login to a host literally called `%h`.
+pub(crate) fn refuse_tokens(spec: &str) -> Result<(), String> {
+    if spec.contains('%') {
+        return Err(format!(
+            "ProxyJump {spec:?} in ~/.ssh/config uses % tokens (such as %h or %r), which Submarine doesn't fill in yet. \
+             Write the jump hosts out in full."
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::ssh_test_server::{client_over, connect, TestClient, TestServer};
     use russh::client;
     use russh::ChannelMsg;
@@ -63,6 +77,15 @@ mod tests {
         let (flooded, echoed) = tokio::time::timeout(Duration::from_secs(60), work).await.expect("no deadlock across the hops");
         assert_eq!(flooded, BYTES);
         assert_eq!(echoed, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn proxy_jump_tokens_are_refused() {
+        for spec in ["%r@gate", "gate:%p", "%h", "a,b%%"] {
+            let err = refuse_tokens(spec).unwrap_err();
+            assert!(err.contains("% tokens"), "{err}");
+        }
+        assert!(refuse_tokens("alice@gate:2222,ssh://bob@inner").is_ok());
     }
 
     /// A hop that never answers the channel open ends with an error in time,

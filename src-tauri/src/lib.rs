@@ -11570,6 +11570,7 @@ fn config_jump_chain<'a>(
     depth: usize,
 ) -> HopChain<'a> {
     Box::pin(async move {
+        hop_policy::refuse_tokens(spec)?; // fork (#43, D7): no % tokens yet
         let hops = parse_proxy_jump(spec)?;
         if depth + hops.len() > MAX_JUMP_HOPS {
             return Err(format!(
