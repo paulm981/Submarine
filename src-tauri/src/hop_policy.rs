@@ -10,7 +10,23 @@ use std::pin::Pin;
 /// A `ProxyJump` with `%` tokens (`%h`, `%r`, …) is refused before anything
 /// is dialled (#43, D7). OpenSSH fills them in; Submarine doesn't yet, and
 /// taken as written they'd send a login to a host literally called `%h`.
+/// An IPv6 address with a zone (`[fe80::1%en0]`) has a `%` too, and isn't
+/// usable either; it gets its own message.
 pub(crate) fn refuse_tokens(spec: &str) -> Result<(), String> {
+    let has_zone = spec.split(',').any(|item| {
+        let item = item.trim();
+        let item = item.strip_prefix("ssh://").unwrap_or(item);
+        let host = item.rsplit_once('@').map_or(item, |(_, h)| h);
+        // An IPv6 address: in brackets, or bare with more than one colon.
+        let v6 = host.strip_prefix('[').and_then(|h| h.split_once(']')).map(|(h, _)| h).unwrap_or(host);
+        v6.matches(':').count() >= 2 && v6.contains('%')
+    });
+    if has_zone {
+        return Err(format!(
+            "ProxyJump {spec:?} in ~/.ssh/config names an IPv6 address with a zone (the part after %), \
+             which Submarine can't use there. Use a host name or an address without the zone."
+        ));
+    }
     if spec.contains('%') {
         return Err(format!(
             "ProxyJump {spec:?} in ~/.ssh/config uses % tokens (such as %h or %r), which Submarine doesn't fill in yet. \
@@ -298,6 +314,11 @@ mod tests {
             assert!(first_hop(spec, 0, &config(&[])).await.is_err());
         }
         assert!(refuse_tokens("alice@gate:2222,ssh://bob@inner").is_ok());
+        // An IPv6 zone isn't a token: it gets its own message.
+        for spec in ["[fe80::1%en0]", "u@[fe80::1%25eth0]:2222", "gate,fe80::1%en0"] {
+            let err = refuse_tokens(spec).unwrap_err();
+            assert!(err.contains("IPv6 address with a zone") && !err.contains("% tokens"), "{err}");
+        }
         assert!(first_hop("u@", 0, &config(&[])).await.unwrap_err().contains("isn't a list"));
     }
 
