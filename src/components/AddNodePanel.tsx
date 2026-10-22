@@ -109,22 +109,28 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     const dropsLogin = (protocol !== "ssh" && newNode.authType === "custom_key") || (protocol === "vnc" && newNode.authType === "vault");
     const authType = dropsLogin ? "custom_pass" : newNode.authType;
     const credentialId = protocol === "vnc" ? "" : newNode.credentialId;
-    // An SSH password isn't sent over VNC (weakly protected) or telnet (not
-    // protected at all): leaving SSH for either empties the field, and the
-    // save clears the saved one too. It's held here, so going back to SSH
-    // before saving brings it back.
+    // An SSH or RDP password isn't sent over VNC (weakly protected) or
+    // telnet (not protected at all): switching into either from another kind
+    // empties the field, and the save clears the saved one too. It's held
+    // here, so switching out again before saving (to SSH or RDP) brings it
+    // back as it was.
+    const weak = (p: string | undefined) => p === "vnc" || p === "telnet";
     let password = {};
-    if (isSsh && (protocol === "vnc" || protocol === "telnet")) {
+    if (!weak(newNode.protocol) && weak(protocol)) {
       password = {
         password: "",
         password_dirty: true,
-        heldSshPassword: { password: newNode.password || "", dirty: !!newNode.password_dirty },
+        heldPassword: {
+          from: newNode.protocol === "rdp" ? "RDP" : "SSH",
+          password: newNode.password || "",
+          dirty: !!newNode.password_dirty,
+        },
       };
-    } else if (protocol === "ssh" && newNode.heldSshPassword) {
+    } else if (weak(newNode.protocol) && !weak(protocol) && newNode.heldPassword) {
       password = {
-        password: newNode.heldSshPassword.password,
-        password_dirty: newNode.heldSshPassword.dirty,
-        heldSshPassword: undefined,
+        password: newNode.heldPassword.password,
+        password_dirty: newNode.heldPassword.dirty,
+        heldPassword: undefined,
       };
     }
     setNewNode({ ...newNode, protocol, port, authType, credentialId, ...password });
@@ -704,11 +710,11 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                     className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner"
                     placeholder="••••••"
                   />
-                  {(isTelnet || isVnc) && newNode.heldSshPassword?.password && !newNode.password && (
+                  {(isTelnet || isVnc) && newNode.heldPassword?.password && !newNode.password && (
                     <p className="text-[10px] text-amber-300/90 ml-1">
                       {isVnc
-                        ? "The SSH password was taken out, so it isn't sent over VNC. VNC servers have a password of their own: type it here."
-                        : "The SSH password was taken out, so it isn't sent over telnet, which doesn't protect it. Type one here if you want it saved."}
+                        ? `The ${newNode.heldPassword.from} password was taken out, so it isn't sent over VNC. VNC servers have a password of their own: type it here.`
+                        : `The ${newNode.heldPassword.from} password was taken out, so it isn't sent over telnet, which doesn't protect it. Type one here if you want it saved.`}
                     </p>
                   )}
                   <p className="text-[10px] text-zinc-500 ml-1">
