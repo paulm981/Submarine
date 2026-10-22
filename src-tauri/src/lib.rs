@@ -10366,6 +10366,11 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     // through the password method (#145): it answers the server's password
     // question once, and only that (see is_password_prompt).
     saved_password: Option<&str>,
+    // `Some` on a connection that can't ask the user anything (a `::sftp` /
+    // `::fwd` one, whose prompts no tab listens to): the saved password still
+    // answers the server's password question, but any other question ends
+    // the login at once, as a failure, and sets this. `None` asks the user.
+    unasked: Option<&std::sync::atomic::AtomicBool>,
 ) -> Option<Result<bool, russh::Error>> {
     use russh::client::KeyboardInteractiveAuthResponse;
     use tauri::Emitter;
@@ -10469,6 +10474,15 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
                 }
                 answered_with_saved = false;
                 asked_anything = true;
+
+                // Nobody would see the question: rather than wait out the
+                // 120 s below (holding a turn in the jump host's login queue),
+                // stop now and say why.
+                if let Some(unasked) = unasked {
+                    unasked.store(true, std::sync::atomic::Ordering::Relaxed);
+                    log("The server asks for a code or a password this connection can't ask you for.", "error");
+                    return Some(Ok(false));
+                }
 
                 // A superseded or abandoned attempt doesn't put its prompt over
                 // a newer one; it ends like a cancelled prompt.
@@ -11607,8 +11621,10 @@ async fn connect_jump_host(
             None => (Zeroizing::new(String::new()), false, true),
         };
     // For a jump host that asks for the password through keyboard-interactive
-    // (#145).
+    // (#145). On a connection that can't ask (see `allow_prompt`) it's all
+    // keyboard-interactive may send: a code it asks for ends the login there.
     let kbi_password = password.clone().map(Zeroizing::new);
+    let kbi_unasked = std::sync::atomic::AtomicBool::new(false);
     // The whole login has a deadline, as the monitor's has: a jump host that
     // took the connection and stops answering would otherwise hold this
     // attempt, and its turn in the jump host's login queue, for good. It's
@@ -11652,8 +11668,18 @@ async fn connect_jump_host(
             && !prompt_ctx.cancelled.load(std::sync::atomic::Ordering::Relaxed)
             && !prompt_ctx.session_unusable.load(std::sync::atomic::Ordering::Relaxed)
         {
-            if let Some(kbi_res) =
-                run_keyboard_interactive(&mut session, &effective_user, app, session_id, &jump_nonce, kbi_txs, attempt, kbi_password.as_ref().map(|p| p.as_str())).await
+            if let Some(kbi_res) = run_keyboard_interactive(
+                &mut session,
+                &effective_user,
+                app,
+                session_id,
+                &jump_nonce,
+                kbi_txs,
+                attempt,
+                kbi_password.as_ref().map(|p| p.as_str()),
+                (!allow_prompt).then_some(&kbi_unasked),
+            )
+            .await
             {
                 auth_res = kbi_res;
             }
@@ -11686,6 +11712,10 @@ async fn connect_jump_host(
             auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
             Err("jump host login cancelled".into())
         }
+        Ok(false) if kbi_unasked.load(std::sync::atomic::Ordering::Relaxed) => {
+            auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            Err(JUMP_ASKS_UNASKED.into())
+        }
         Ok(false) => {
             auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
             Err("jump host authentication failed".into())
@@ -11707,6 +11737,11 @@ async fn connect_jump_host(
         }
     }
 }
+
+/// A `::sftp` / `::fwd` connection's jump host asked for a code (or a password
+/// that isn't saved) that only the server's own tab can ask for.
+const JUMP_ASKS_UNASKED: &str =
+    "the jump host asks for a code or a password, and only the server's own tab can ask you for it";
 
 /// Shown when an ssh-agent didn't sign a login it was asked to (a declined
 /// confirmation, a removed card, a PIN or touch not given in time).
@@ -12691,6 +12726,7 @@ async fn initiate_connection(
                         &kbi_txs_clone,
                         &attempt,
                         kbi_password.as_ref().map(|p| p.as_str()),
+                        None,
                     )
                     .await
                     {
