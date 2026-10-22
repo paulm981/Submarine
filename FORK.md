@@ -172,16 +172,25 @@ None: every change in the original project up to [#229](https://github.com/SinaX
 
 **Seeing what's new.** In Settings › Updates, turn on **Watch the original project**. The profile screen then says when the original project has changes the fork doesn't have yet, and links to GitHub's view of them. The maintainer also gets a weekly check, Monday mornings, that lists them with a recommendation for each. Don't use GitHub's **Sync fork** button: the fork has commits of its own, and Sync fork offers to discard them.
 
+**When.** At the start of every batch of work, before anything else, so the fork never falls far behind. A small sync each time is easier than a big one later.
+
 **Bringing it in.** A sync pull request, the same way every time:
 
-1. On a branch, merge the original project's main: `git fetch upstream && git merge upstream/main`. Merging, not cherry-picking, keeps the history saying what came from where. It also leaves the original project's changes as they were, so the next merge has less to sort out.
-2. Resolve conflicts by keeping both sides. Where the fork does something differently, keep the fork's way and say so in the table above.
-3. Anything not taken goes in the table above with the reason, and gets a backlog item. Record it in git so the next merge doesn't bring it in unseen: `git merge -s ours <its commit>`, with a message saying why. That takes no changes, and the update check stops counting it. To take it later, cherry-pick it.
-4. Check it:
+1. **Look before merging.** `git fetch upstream`, then `git merge-tree --write-tree HEAD upstream/main` shows which files would conflict without touching anything. `git log HEAD..upstream/main` lists what's new.
+2. **Decide first when a change collides with the fork.** If one of the original project's changes touches something the fork does its own way (security above all), write the choices down in an issue and settle them before writing code, as [#43](https://github.com/paulm981/Submarine/issues/43) did for ProxyJump and known_hosts (D1 to D8). Then bring such changes in one pull request each, not all at once.
+3. **Merge, don't cherry-pick:** `git merge upstream/main` on a branch. That keeps the history saying what came from where, and leaves the original project's changes as they were, so the next merge has less to sort out. Record a change you leave out with `git merge -s ours <its commit>` and a message saying why. Take it later with `git cherry-pick -x <its commit>`, so the commit says where it came from.
+4. **Resolve conflicts toward the original project's text** as it is on its main now. Then put the fork's behavior back the way that changes their code least:
+   - **Fork rules live in fork-only files,** called from one-line hooks in the shared code: `hop_policy.rs` (jump hosts), `trust_policy.rs` (host keys), `remote_sh.rs` (root), `busy.rs` (what's still running). A conflict then touches one line, not the rule.
+   - **Code waiting on the original project** gets a comment, `// fork: until upstream #NNN`, so it's easy to find and drop once they take the fix.
+   - **A safety fix the merge itself needs** goes in the first commit, so no commit in the history is unsafe.
+5. **Say what's different.** Anything taken differently goes in the [table above](#where-it-behaves-differently), anything not taken in [not taken yet](#changes-in-the-original-project-not-taken-yet) with a backlog item, and the "up to #N" line at the top moves on.
+6. **Check it:**
    - the pull request's checks: the tests on Linux and Windows, clippy, and the TypeScript check and page build. They run by themselves, and main only takes a pull request that passes them;
-   - the app itself, against a test server: terminal, SFTP and SFTP root mode, a Wall behind a jump host, and Monitoring;
-   - lines in [CHANGELOG.md](CHANGELOG.md).
-5. Merge it. GitHub publishes it as the next release.
+   - `src-tauri/src/lib.rs` keeps its Windows line endings (CRLF) on every line, as the original project has it; a file that changes them conflicts on every line at the next merge;
+   - a security review of the merged result, its findings fixed before merging;
+   - the app itself, against a test server: terminal, SFTP and SFTP root mode, a Wall behind a jump host, and Monitoring. Whatever wasn't tried is said plainly in the pull request;
+   - lines in [CHANGELOG.md](CHANGELOG.md), under "From the original project".
+7. **Merge it.** GitHub publishes it as the next release.
 
 **Versions.**
 
