@@ -121,9 +121,9 @@ No third-party service is involved. Profiles are encrypted with their password b
   - characters that disguise a file name are shown plainly;
   - a trusted server that shows a different kind of key is a warning, not a silent change;
   - Live Edit opens a file in an editor and never runs it: the one picked in Settings, or else Notepad on Windows, the default text editor on macOS, and on Linux the text editor set for plain text;
-  - the Local pane asks before it opens a file that would run (a program, a script, a shortcut; on macOS a `.terminal` or `.command` file too).
+  - the Local pane asks before it opens a file that would run (a program, a script, a shortcut; on macOS a `.terminal` or `.command` file too; on macOS and Linux, any file marked as executable).
 
-  Downloads are marked as from the internet on Windows and macOS. As in the original project ([#212](https://github.com/SinaXhpm/submarine/pull/212)), a program on a server (`.exe`, `.msi`, `.jar`, `.AppImage`, …) isn't opened from the file pane at all.
+  Downloads are marked as from the internet on Windows and macOS, and so is what the Local pane unpacks from an archive marked that way. As in the original project ([#212](https://github.com/SinaXhpm/submarine/pull/212)), a program on a server (`.exe`, `.msi`, `.jar`, `.AppImage`, …) isn't opened from the file pane at all.
 
 ## Where it behaves differently
 

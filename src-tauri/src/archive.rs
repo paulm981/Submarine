@@ -577,7 +577,10 @@ fn make_usable(dir: &Path, meta: &std::fs::Metadata) -> Result<(), String> {
 // destination: such an archive is refused as a whole, as on the remote side.
 // So is anything that is not a file, folder or link. Folders are made usable
 // (`make_usable`) on the way down, and setuid and setgid bits are dropped.
-fn settle_staged(dir: &Path, rel: &str) -> Result<(), String> {
+// `mark`: the archive is marked as from the internet, and so is every file
+// in it (mark_staged), as Windows' own extraction does: a program in a
+// downloaded zip is then asked about before it runs, like the zip itself.
+fn settle_staged(dir: &Path, rel: &str, mark: bool) -> Result<(), String> {
     let meta = std::fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
     make_usable(dir, &meta).map_err(|e| format!("{}: {}", if rel.is_empty() { "." } else { rel }, e))?;
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
@@ -592,8 +595,11 @@ fn settle_staged(dir: &Path, rel: &str) -> Result<(), String> {
                 return Err(format!("The archive has a link that points outside the destination: {}", rel));
             }
         } else if meta.is_dir() {
-            settle_staged(&path, &rel)?;
+            settle_staged(&path, &rel, mark)?;
         } else if meta.is_file() {
+            if mark {
+                mark_staged(&path);
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -608,6 +614,32 @@ fn settle_staged(dir: &Path, rel: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+// Marks a staged file as from the internet (local_open::mark_from_internet).
+// A file the archive made read-only can't take the mark, so it's writable
+// for that moment. Best effort, like the mark itself.
+fn mark_staged(path: &Path) {
+    let Ok(perms) = std::fs::symlink_metadata(path).map(|m| m.permissions()) else { return };
+    let mut writable = perms.clone();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        writable.set_mode(perms.mode() | 0o200);
+    }
+    #[cfg(not(unix))]
+    {
+        #[allow(clippy::permissions_set_readonly_false)]
+        writable.set_readonly(false);
+    }
+    if writable == perms {
+        crate::local_open::mark_from_internet(path);
+        return;
+    }
+    if std::fs::set_permissions(path, writable).is_ok() {
+        crate::local_open::mark_from_internet(path);
+        let _ = std::fs::set_permissions(path, perms);
+    }
 }
 
 // Every path the staged tree will take in `dest` goes through the same policy
@@ -739,8 +771,12 @@ fn extract_local(
     crate::check_local_path_policy(stage.clone())?;
     // Not `create_dir_all`: a folder already under that name is not ours.
     std::fs::create_dir(&stage).map_err(|e| format!("Failed to create temporary folder: {}", e))?;
+    // What came out of an archive from the internet is marked as from there
+    // too. Run bits are kept: a tarball of tools is unpacked to be run, and
+    // the Local pane asks before it opens a file marked executable.
+    let mark = crate::local_open::is_marked_from_internet(archive);
     let res = unpack_local(archive, &stage, format, cancel)
-        .and_then(|()| settle_staged(&stage, ""))
+        .and_then(|()| settle_staged(&stage, "", mark))
         .and_then(|()| check_staged_policy(&stage, &dest))
         .and_then(|()| if cancel.load(Ordering::Relaxed) { Err(cancelled()) } else { Ok(()) })
         .and_then(|()| place_staged(&stage, &dest, folder.unwrap_or(".")));
