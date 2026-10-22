@@ -11986,6 +11986,18 @@ async fn initiate_connection(
     let term_prefix = format!("{}-term-", session_id);
     state.terminal_txs.lock().await.retain(|k, _| !k.starts_with(&term_prefix));
     state.resize_txs.lock().await.retain(|k, _| !k.starts_with(&term_prefix));
+    // A reconnect replays the session's forward list. When sync changed this
+    // server's saved forwards since the session read them (another computer
+    // deleted one, say), the list starts again from the saved ones first, so
+    // the reconnect doesn't bring back a forward that's gone. The list is
+    // kept under the base session id, which the `::fwd` connection replays
+    // too; other connections (`::sftp`) have none, and mustn't use up the change.
+    if role == "primary" || role == "forward" {
+        let rules_key = session_id.strip_suffix("::fwd").unwrap_or(&session_id);
+        if let Err(e) = refresh_synced_session_rules(state.inner(), db_state.inner(), rules_key, Some(server_id)).await {
+            println!("[BACKEND] {}: the saved forwards weren't read again: {}", session_id, e);
+        }
+    }
     // This attempt, as its prompts and failure report see it: once a newer
     // attempt starts (or the tab disconnects) they stay quiet.
     let attempt = ssh_manager::ConnectAttempt::new(
