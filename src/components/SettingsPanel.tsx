@@ -442,7 +442,9 @@ function SshConfigSetting({ settings, setSettings }: any) {
             as cloudflared or tsh) or ProxyJump unless the server has a jump host or proxy of its
             own. Its IdentityFile keys and CertificateFile certificates log in when a server has
             no saved password or key (Teleport, for one), and the host keys and certificate
-            authorities in your known_hosts are trusted without the first-time prompt. Host
+            authorities in your known_hosts are trusted without the first-time prompt. The host
+            keys this app already trusts still come first: a changed key always gets the warning,
+            and a key known_hosts marks @revoked is refused. Host
             blocks are matched against a server's address and its name; Include and Match are
             followed, Match exec is never run. These files are only read, and nothing from them
             is synced. Turn off to use only what's saved for each server.
