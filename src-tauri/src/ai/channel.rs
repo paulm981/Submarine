@@ -11,6 +11,12 @@
 //! The address is random for each run. A connection starts with the helper's
 //! hello line, carrying its AI tab's token; the app answers with one line
 //! saying whether it took it, and then the connection is MCP.
+//!
+//! Before it sends the token, the helper checks that the other end is the
+//! app's own process (its id, `SUBMARINE_AI_PID`), as the system reports it
+//! for the socket or pipe: a program running as you can remove the socket
+//! and listen in its place, or add an instance of the pipe, but it can't
+//! make either report Submarine's process id.
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -21,6 +27,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 /// command line or in a file.
 pub(crate) const ENV_ADDR: &str = "SUBMARINE_AI_ADDR";
 pub(crate) const ENV_TOKEN: &str = "SUBMARINE_AI_TOKEN";
+/// The app's process id, for the helper to check the channel's other end by.
+pub(crate) const ENV_PID: &str = "SUBMARINE_AI_PID";
 
 /// The helper's first line.
 #[derive(Serialize, Deserialize)]
@@ -185,9 +193,13 @@ fn listen_in(dir: std::path::PathBuf, on_connect: OnConnect) -> std::io::Result<
     Ok(Listener { addr: path.to_string_lossy().into_owned(), task, dir })
 }
 
+/// Connect to the channel at `addr`: the stream, and the id of the process
+/// listening at the other end, when the system says (Linux and macOS do).
 #[cfg(unix)]
-pub(crate) async fn connect(addr: &str) -> std::io::Result<Box<dyn Stream>> {
-    Ok(Box::new(tokio::net::UnixStream::connect(addr).await?))
+pub(crate) async fn connect_to(addr: &str) -> std::io::Result<(Box<dyn Stream>, Option<u32>)> {
+    let s = tokio::net::UnixStream::connect(addr).await?;
+    let pid = s.peer_cred().ok().and_then(|c| c.pid()).and_then(|p| u32::try_from(p).ok());
+    Ok((Box::new(s), pid))
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +293,17 @@ pub(crate) mod pipe {
 
     /// An instance of the pipe, refusing remote clients, with `sd` as its
     /// access rules. `first`: fail if the name is already taken.
+    /// The id of the process that made the instance of the pipe `client`
+    /// is connected to.
+    pub(crate) fn server_pid(client: &tokio::net::windows::named_pipe::NamedPipeClient) -> Option<u32> {
+        use std::os::windows::io::AsRawHandle;
+        let mut pid = 0u32;
+        // SAFETY: the handle is the open pipe's, for the call; pid is a u32
+        // that outlives it.
+        let ok = unsafe { windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId(client.as_raw_handle() as HANDLE, &mut pid) };
+        (ok != 0).then_some(pid)
+    }
+
     pub(crate) fn instance(name: &str, sd: &OnlyMe, first: bool) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
         let mut sa = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -326,7 +349,7 @@ pub(crate) fn listen(on_connect: OnConnect) -> std::io::Result<Listener> {
 }
 
 #[cfg(windows)]
-pub(crate) async fn connect(addr: &str) -> std::io::Result<Box<dyn Stream>> {
+pub(crate) async fn connect_to(addr: &str) -> std::io::Result<(Box<dyn Stream>, Option<u32>)> {
     const ERROR_PIPE_BUSY: i32 = 231;
     // Only Submarine's own pipes.
     if !addr.starts_with(r"\\.\pipe\submarine-ai-") {
@@ -335,7 +358,10 @@ pub(crate) async fn connect(addr: &str) -> std::io::Result<Box<dyn Stream>> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         match tokio::net::windows::named_pipe::ClientOptions::new().open(addr) {
-            Ok(c) => return Ok(Box::new(c)),
+            Ok(c) => {
+                let pid = pipe::server_pid(&c);
+                return Ok((Box::new(c), pid));
+            }
             Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && std::time::Instant::now() < deadline => {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await
             }
@@ -350,8 +376,25 @@ pub(crate) fn listen(_on_connect: OnConnect) -> std::io::Result<Listener> {
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(crate) async fn connect(_addr: &str) -> std::io::Result<Box<dyn Stream>> {
+pub(crate) async fn connect_to(_addr: &str) -> std::io::Result<(Box<dyn Stream>, Option<u32>)> {
     Err(std::io::Error::other("AI tools aren't available on this system"))
+}
+
+/// Connect, without the check of who listens (tests).
+#[cfg(test)]
+pub(crate) async fn connect(addr: &str) -> std::io::Result<Box<dyn Stream>> {
+    Ok(connect_to(addr).await?.0)
+}
+
+/// Whether the process at the channel's other end (`server`) may be the
+/// app (`app`). No for a known id that's another's. When either isn't known
+/// (no id was given, the system gives none, or 0: a process outside the
+/// helper's PID namespace), it can't be told, and isn't held against it.
+pub(crate) fn may_be_the_app(server: Option<u32>, app: Option<u32>) -> bool {
+    match (server, app) {
+        (Some(s), Some(a)) if s != 0 && a != 0 => s == a,
+        _ => true,
+    }
 }
 
 /// The helper's side of the hello: send the token, read the answer.
@@ -546,6 +589,18 @@ mod tests {
         assert_eq!(mask, FILE_ALL_ACCESS, "full access: {sddl}");
         assert_eq!(sid, pipe::my_sid().unwrap(), "the rule is for you: {sddl}");
         assert!(sddl.starts_with("D:P"), "nothing inherited: {sddl}");
+    }
+
+    /// The other end is this process, and the check knows it from another.
+    #[tokio::test]
+    async fn the_listening_process_is_known() {
+        let (on, _) = counting();
+        let l = listen(on).unwrap();
+        let (_s, pid) = connect_to(l.addr()).await.unwrap();
+        assert_eq!(pid, Some(std::process::id()));
+        assert!(may_be_the_app(pid, Some(std::process::id())));
+        assert!(!may_be_the_app(pid, Some(std::process::id() + 1)));
+        assert!(may_be_the_app(None, Some(1)) && may_be_the_app(Some(0), Some(1)) && may_be_the_app(Some(5), None));
     }
 
     /// Closed, it takes no more connections, at once.

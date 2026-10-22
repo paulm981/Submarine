@@ -175,6 +175,24 @@ pub(crate) async fn login_turn(
     attempt: &ConnectAttempt,
     waiting: impl FnOnce(i64),
 ) -> Result<Option<OwnedSemaphorePermit>, String> {
+    queue_for_login(app, jump_server_id, Some(attempt), waiting).await
+}
+
+/// A turn to log in to this jump host, for a connection with no connect
+/// attempt (a monitor's): as `login_turn`, but it waits until it gets one
+/// or is dropped (the monitor's stop signal drops it).
+pub(crate) async fn login_turn_until_dropped(app: &tauri::AppHandle, jump_server_id: i32) -> Option<OwnedSemaphorePermit> {
+    // Without an attempt nothing gives up but a closed queue, and the queues
+    // are never closed.
+    queue_for_login(app, jump_server_id, None, |_| {}).await.ok().flatten()
+}
+
+async fn queue_for_login(
+    app: &tauri::AppHandle,
+    jump_server_id: i32,
+    attempt: Option<&ConnectAttempt>,
+    waiting: impl FnOnce(i64),
+) -> Result<Option<OwnedSemaphorePermit>, String> {
     let mut waiting = Some(waiting);
     loop {
         let limit = login_limit(app);
@@ -199,9 +217,10 @@ enum Turn {
     LimitChanged,
 }
 
+/// `attempt`: gives up once it's replaced or its tab closed. `None` waits on.
 async fn wait_for_turn(
     sem: Arc<Semaphore>,
-    attempt: &ConnectAttempt,
+    attempt: Option<&ConnectAttempt>,
     on_wait: impl FnOnce(),
     same_limit: impl Fn() -> bool,
 ) -> Result<Turn, String> {
@@ -219,8 +238,10 @@ async fn wait_for_turn(
                 return permit.map(Turn::Got).map_err(|_| "jump host login queue closed".to_string());
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                if !attempt.is_current().await {
-                    return Err("stopped waiting for a jump host login slot".into());
+                if let Some(attempt) = attempt {
+                    if !attempt.is_current().await {
+                        return Err("stopped waiting for a jump host login slot".into());
+                    }
                 }
                 if !same_limit() {
                     return Ok(Turn::LimitChanged);
@@ -422,7 +443,7 @@ mod tests {
         let turn = {
             let (sem, attempt) = (Arc::clone(&sem), attempt.clone());
             tokio::spawn(async move {
-                let r = wait_for_turn(sem, &attempt, || said = true, || true).await;
+                let r = wait_for_turn(sem, Some(&attempt), || said = true, || true).await;
                 (matches!(r, Ok(Turn::Got(_))), said)
             })
         };
@@ -433,11 +454,36 @@ mod tests {
 
         // A new limit while waiting: it queues again under that one.
         let _held = Arc::clone(&sem).try_acquire_owned().unwrap();
-        assert!(matches!(wait_for_turn(Arc::clone(&sem), &attempt, || {}, || false).await, Ok(Turn::LimitChanged)));
+        assert!(matches!(wait_for_turn(Arc::clone(&sem), Some(&attempt), || {}, || false).await, Ok(Turn::LimitChanged)));
 
         // The tab reconnected or closed while waiting: it stops waiting.
         generations.lock().await.insert("s".into(), 2);
-        assert!(wait_for_turn(Arc::clone(&sem), &attempt, || {}, || true).await.is_err());
+        assert!(wait_for_turn(Arc::clone(&sem), Some(&attempt), || {}, || true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_monitors_login_waits_for_a_turn_until_its_stopped() {
+        let sem = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&sem).try_acquire_owned().unwrap();
+
+        // No attempt to give up with: it waits past the checks for one...
+        let turn = tokio::spawn(wait_for_turn(Arc::clone(&sem), None, || {}, || true));
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert!(!turn.is_finished());
+        // ...gets the turn when the login ahead of it is done...
+        drop(held);
+        assert!(matches!(turn.await.unwrap(), Ok(Turn::Got(_))));
+
+        // ...and a stopped monitor (its wait dropped) leaves the queue: the
+        // login after it isn't held up.
+        let held = Arc::clone(&sem).try_acquire_owned().unwrap();
+        let stopped = tokio::spawn(wait_for_turn(Arc::clone(&sem), None, || {}, || true));
+        let next = tokio::spawn(wait_for_turn(Arc::clone(&sem), None, || {}, || true));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        stopped.abort();
+        drop(held);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), next).await.expect("the next login's turn");
+        assert!(matches!(got.unwrap(), Ok(Turn::Got(_))));
     }
 
     #[tokio::test]

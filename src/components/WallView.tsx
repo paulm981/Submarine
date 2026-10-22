@@ -139,6 +139,9 @@ export const WallView = ({
     noteTimer.current = window.setTimeout(() => setNote(null), 3000);
   };
   useEffect(() => () => window.clearTimeout(noteTimer.current), []);
+  // Broadcast went off while the Wall had the keys: they go to no one until
+  // a terminal is clicked, and the Wall says so until then.
+  const [pickOne, setPickOne] = useState(false);
 
   // Read by the keyboard terminal's long-lived handlers.
   const wallRef = useRef(wall);
@@ -215,7 +218,7 @@ export const WallView = ({
   const ghostRef = useRef<Terminal | null>(null);
   const focusGhost = useCallback(() => {
     requestAnimationFrame(() => {
-      if (document.querySelector('[aria-modal="true"]')) return;
+      if (document.querySelector('[aria-modal="true"]') || !wallRef.current.broadcast) return;
       ghostRef.current?.focus();
     });
   }, []);
@@ -322,8 +325,20 @@ export const WallView = ({
     if (!wall.broadcast) {
       if (wall.solo) onChange({ solo: null });
       setParked(false);
+      // The keyboard terminal had the keys: with Broadcast off it types to
+      // nobody, so they'd be lost without a word. Nor do they go to the
+      // terminal under the mouse: someone typing to all who turns Broadcast
+      // off and keeps typing would send the rest of a command, or a
+      // password, to one server they never chose. The Wall says to click one.
+      const ghost = ghostBox.current;
+      const active = document.activeElement;
+      if (ghost && active instanceof Node && ghost.contains(active)) {
+        ghostRef.current?.blur();
+        setPickOne(true);
+      }
       return;
     }
+    setPickOne(false);
     if (solo) {
       const id = requestAnimationFrame(() => {
         if (!document.querySelector('[aria-modal="true"]')) dockedTerminal(solo)?.term.focus();
@@ -424,7 +439,17 @@ export const WallView = ({
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const sendToAll = (text: string, run: boolean) => {
+  // What's sent is typed as it stands, so no escape sequence or other
+  // control character goes in (tab and line breaks stay): a Library command
+  // can come from anyone the profile is shared with, and one could end a
+  // bracketed paste or press keys nobody saw (pasteText.ts).
+  const sendToAll = (raw: string, run: boolean) => {
+    const text = withoutPasteControls(raw);
+    const cleaned = text !== raw;
+    if (!text.trim()) {
+      flash(cleaned ? "Nothing to send: it was only control characters." : "Nothing to send.");
+      return;
+    }
     let body = text.replace(/\r\n?/g, "\n");
     if (run && !body.endsWith("\n")) body += "\n";
     // Into a line half typed, only to those that have the start of it.
@@ -437,7 +462,10 @@ export const WallView = ({
     const ids = sent.map((e) => e.terminalId);
     markTyped(...ids);
     invoke("write_terminals_data", { terminalIds: ids, data: encode(data) })
-      .then(() => flash(`Sent to ${plural(sent.length, "server")}.`), (e) => flash(`Couldn't send: ${e}`));
+      .then(
+        () => flash(`Sent to ${plural(sent.length, "server")}.` + (cleaned ? " Control characters were left out." : "")),
+        (e) => flash(`Couldn't send: ${e}`),
+      );
     afterTyping(data, sent);
   };
 
@@ -705,6 +733,7 @@ export const WallView = ({
                   onPick={wall.broadcast ? (e) => pick(m.terminalId, e) : undefined}
                   nextLine={atNextLine(m.terminalId)}
                   onFocusIn={() => {
+                    setPickOne(false);
                     if (!wallRef.current.broadcast) return;
                     setParked(false);
                     setSolo(m.terminalId);
@@ -721,9 +750,9 @@ export const WallView = ({
             })}
           </div>
         )}
-        {note && (
+        {(note || pickOne) && (
           <div className="sticky bottom-3 mx-auto w-fit px-3 py-1.5 rounded-lg bg-zinc-900/95 border border-white/10 text-[11px] text-zinc-200 shadow-xl pointer-events-none">
-            {note}
+            {note ?? "Broadcast is off. Click a terminal to type."}
           </div>
         )}
       </div>

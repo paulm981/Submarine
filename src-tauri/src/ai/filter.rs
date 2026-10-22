@@ -7,7 +7,10 @@
 //! `token=`, `DB_PASS=` and their kin, passwords on command lines
 //! (`--password X`, `mysql -pX`, `sshpass -p X`), an Authorization header's
 //! credentials, JSON Web Tokens, password hashes, cloud and service access
-//! keys, and the password in a URL. They catch the common shapes, not
+//! keys, and the password in a URL; and in config files that write it after
+//! a space: Cisco's `password 7 …` and `secret 5 …`, Redis's `requirepass`,
+//! `.netrc`, Juniper's `$9$…` and `encrypted-password`, Docker's `"auth"`,
+//! `.pgpass` lines, Wi-Fi `psk=` and Debian's `wpa-psk`. They catch the common shapes, not
 //! everything, and the app says so where it shows them.
 
 use regex::Regex;
@@ -90,10 +93,15 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
         rule(r"(?m)^[ \t]*[A-Za-z0-9_.-]*\.key[ \t]*:[ \t]*([A-Za-z0-9+/]{20,}={0,2})[ \t]*\r?$", 1),
         // A PuTTY key's private part.
         rule(r"(?m)^Private-Lines: *\d+\r?\n((?:[A-Za-z0-9+/=]+(?:\r?\n|\z))+)", 1),
+        // Juniper: `encrypted-password "…"` (before the hashes, so the quotes
+        // go with it), and its reversible `$9$…`, anywhere; Cisco's type 9
+        // (scrypt) `$9$salt$hash` too, all of it.
+        rule(r#"\bencrypted-password[ \t]+("[^"\r\n]*"|[^\s;]+)"#, 1),
+        rule(r"\$9\$[A-Za-z0-9./$-]{8,}", 0),
         // Password hashes as crypt(3) writes them, in /etc/shadow and
         // elsewhere: MD5 (and Apache's), bcrypt, SHA-256/512, yescrypt,
-        // scrypt, argon2.
-        rule(r"\$(?:1|2[abxy]?|5|6|7|y|gy|md5|apr1|sha1|argon2(?:id|i|d))\$[^\s:]{8,}", 0),
+        // scrypt, argon2; and Cisco's type 8 (PBKDF2).
+        rule(r"\$(?:1|2[abxy]?|5|6|7|8|y|gy|md5|apr1|sha1|argon2(?:id|i|d))\$[^\s:]{8,}", 0),
         // `password=…`, `secret: …`, `"api_key": "…"`: the value.
         rule(
             r#"(?i)[A-Za-z0-9_.-]*(?:password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|account[_-]?key)(?:[_.-][A-Za-z0-9_.-]*)?["']?[ \t]*[:=][ \t]*("[^"\r\n]+"|'[^'\r\n]+'|[^\s"',;]+)"#,
@@ -134,6 +142,43 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
         rule(r"\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}", 0),
         // The password in `scheme://user:password@host`.
         rule(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@]+:([^\s/@]+)@", 1),
+        // Config lines that give the value after a space, not `=` or `:`:
+        // Cisco's `enable secret 5 …` and `password 7 …` (the digit is the
+        // kind, the value follows; `enable` may name a `level N` first), Redis's `requirepass` and `masterauth`,
+        // a `.netrc` password on a line of its own. Only a line that starts
+        // with the word, in lower case, and ends with the value: not prose
+        // ("password reset link sent"), nor PAM's `password required pam_unix.so`.
+        rule(
+            r#"(?m)^[ \t]*(?:enable[ \t]+(?:password|secret)(?:[ \t]+level[ \t]+[0-9]+)?|password|secret|requirepass|masterauth)[ \t]+(?:[0-9][ \t]+)?("[^"\r\n]*"|'[^'\r\n]*'|\S+)[ \t]*\r?$"#,
+            1,
+        ),
+        // Cisco's `username NAME [privilege N] [algorithm-type T] password|secret [N] VALUE`.
+        rule(
+            r#"(?m)^[ \t]*username[ \t]+\S+(?:[ \t]+privilege[ \t]+[0-9]+)?(?:[ \t]+algorithm-type[ \t]+\S+)?[ \t]+(?:password|secret)[ \t]+(?:[0-9][ \t]+)?("[^"\r\n]*"|\S+)[ \t]*\r?$"#,
+            1,
+        ),
+        // `.netrc`: `machine HOST [login U] [account A] [port P] password PW`,
+        // or `default login U password PW`, the line made of these only.
+        rule(
+            r"(?m)^[ \t]*(?:machine[ \t]+\S+(?:[ \t]+(?:login|account|port)[ \t]+\S+)*|default(?:[ \t]+(?:login|account|port)[ \t]+\S+)+)[ \t]+password[ \t]+(\S+)(?:[ \t]+(?:login|account|port)[ \t]+\S+)*[ \t]*\r?$",
+            1,
+        ),
+        // Docker's config.json: `"auth": "<base64 of user:password>"`.
+        rule(r#""auth"[ \t]*:[ \t]*("[^"\r\n]+")"#, 1),
+        // A `.pgpass` line, `host:port:database:user:password`: the last
+        // field, which is the rest of the line, spaces and all. Five fields
+        // exactly (a colon in the password is escaped), the port a number
+        // or `*`, so /etc/passwd and /etc/shadow lines aren't taken for one.
+        rule(
+            r"(?m)^(?:[^\s:\\]|\\.)+:(?:[0-9]+|\*):(?:[^\s:\\]|\\.)+:(?:[^\s:\\]|\\.)+:((?:[^\s:\\]|\\.)(?:[^\r\n:\\]|\\.)*?)[ \t]*\r?$",
+            1,
+        ),
+        // Wi-Fi: wpa_supplicant's and NetworkManager's `psk=…`, hostapd's
+        // `wpa_psk=…`.
+        rule(r#"(?im)(?:^|[\s{;,-])(?:wpa_)?psk[ \t]*=[ \t]*("[^"\r\n]*"|[^\s"]+)"#, 1),
+        // Debian's /etc/network/interfaces: `wpa-psk VALUE` (and
+        // `wpa-password` for 802.1X), the value the rest of the line.
+        rule(r"(?m)^[ \t]*wpa-(?:psk|password)[ \t]+(\S(?:[^\r\n]*\S)?)[ \t]*\r?$", 1),
     ]
 });
 
@@ -304,6 +349,74 @@ mod tests {
             "bypass=1 compass=north",
             "credential.helper=store",
             "passed: 3",
+        ] {
+            hides(plain, plain, 0);
+        }
+    }
+
+    #[test]
+    fn cisco_and_redis_config_lines() {
+        hides("enable secret 5 $1$mERr$hx5rVt7rPNoS4wqbXKX7m0", &format!("enable secret 5 {HIDDEN}"), 1);
+        hides("enable password cisco123", &format!("enable password {HIDDEN}"), 1);
+        hides("line vty 0 4\n password 7 0822455D0A16\n login", &format!("line vty 0 4\n password 7 {HIDDEN}\n login"), 1);
+        hides(" password 0 plaintext\r\n", &format!(" password 0 {HIDDEN}\r\n"), 1);
+        hides("username admin password 7 0822455D0A16", &format!("username admin password 7 {HIDDEN}"), 1);
+        hides("username paul privilege 15 secret 8 $8$dsYGNam3K1SIJO$7nv/35M/qr6t.dVc7UY9zrJDWRVqncHub1PE9UlMQFs", &format!("username paul privilege 15 secret 8 {HIDDEN}"), 1);
+        hides(
+            "username paul privilege 15 algorithm-type scrypt secret 9 $9$nhEmQVczB7dqsO$X.HsgL6x1il0RxkOSSvyQYwucySCt7qFm4v7pqCxkKM",
+            &format!("username paul privilege 15 algorithm-type scrypt secret 9 {HIDDEN}"),
+            1,
+        );
+        hides("requirepass foobared\nmasterauth \"two words\"", &format!("requirepass {HIDDEN}\nmasterauth {HIDDEN}"), 2);
+        hides("enable password level 15 cisco", &format!("enable password level 15 {HIDDEN}"), 1);
+        hides("enable secret level 15 5 $1$mERr$hx5rVt7rPNoS4wqbXKX7m0", &format!("enable secret level 15 5 {HIDDEN}"), 1);
+    }
+
+    #[test]
+    fn netrc_juniper_docker_pgpass_and_wifi() {
+        hides("machine example.com login paul password hunter2", &format!("machine example.com login paul password {HIDDEN}"), 1);
+        hides("machine h login u password pw account a", &format!("machine h login u password {HIDDEN} account a"), 1);
+        hides("default login anonymous password me@x", &format!("default login anonymous password {HIDDEN}"), 1);
+        hides("machine h\n  login u\n  password hunter2\n", &format!("machine h\n  login u\n  password {HIDDEN}\n"), 1);
+        hides(r#"encrypted-password "$6$abcdefgh$0123456789abcdefghijklmnop";"#, &format!("encrypted-password {HIDDEN};"), 1);
+        hides(r#"pre-shared-key ascii-text "$9$Hk5FCtOIEhrlMWx7-ws2gUjH"; ## SECRET-DATA"#, &format!(r#"pre-shared-key ascii-text "{HIDDEN}"; ## SECRET-DATA"#), 1);
+        hides(r#"{"auths": {"registry.example.com": {"auth": "cGF1bDpodW50ZXIy"}}}"#, &format!(r#"{{"auths": {{"registry.example.com": {{"auth": {HIDDEN}}}}}}}"#), 1);
+        hides("db.internal:5432:app:paul:hunter2\n*:*:*:paul:pa\\:ss", &format!("db.internal:5432:app:paul:{HIDDEN}\n*:*:*:paul:{HIDDEN}"), 2);
+        hides("network={\n\tssid=\"home\"\n\tpsk=\"correct horse\"\n}", &format!("network={{\n\tssid=\"home\"\n\tpsk={HIDDEN}\n}}"), 1);
+        hides("wpa_psk=0123456789abcdef", &format!("wpa_psk={HIDDEN}"), 1);
+        hides("db:5432:app:paul:correct horse battery\r\n", &format!("db:5432:app:paul:{HIDDEN}\r\n"), 1);
+        hides("*:*:*:paul:two words \\: one colon  \n", &format!("*:*:*:paul:{HIDDEN}  \n"), 1);
+        hides(
+            "iface wlan0 inet dhcp\n    wpa-ssid home\n    wpa-psk correct horse battery\n    wpa-password hunter2\n",
+            &format!("iface wlan0 inet dhcp\n    wpa-ssid home\n    wpa-psk {HIDDEN}\n    wpa-password {HIDDEN}\n"),
+            2,
+        );
+    }
+
+    /// The space-separated rules leave prose and look-alikes alone.
+    #[test]
+    fn space_separated_rules_leave_prose_alone() {
+        for plain in [
+            "Your password reset link was sent.",
+            "Password reset required",
+            "password reset link sent",
+            "the default password is admin",
+            "username and password are required",
+            "secret sauce recipe inside",
+            "password    required    pam_unix.so sha512 shadow",
+            "PasswordAuthentication no",
+            "root:x:0:0:root:/root:/bin/bash",
+            "daemon:*:19000:0:99999:7:::",
+            "12:30:45 start",
+            "# hostname:port:database:username:password",
+            "machine learning password manager review",
+            "\"auth\": {\"type\": \"oauth\"}",
+            "upsk=1 pskreport",
+            "enable password level 15",
+            "wpa-psk",
+            "daemon:*:19000:0:99999:7:::",
+            "nobody:*:0:0:Unprivileged User:/var/empty:/usr/bin/false",
+            "00:11:22:33:44:55 permanent",
         ] {
             hides(plain, plain, 0);
         }

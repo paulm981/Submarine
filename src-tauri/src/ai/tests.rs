@@ -31,7 +31,7 @@ fn helper(addr: &str, token: &str) -> Helper {
     let (to, stdin) = tokio::io::duplex(1 << 20);
     let (stdout, from) = tokio::io::duplex(1 << 20);
     let (addr, token) = (addr.to_string(), token.to_string());
-    let task = tokio::spawn(async move { helper::relay(stdin, stdout, &addr, &token).await });
+    let task = tokio::spawn(async move { helper::relay(stdin, stdout, &addr, &token, Some(std::process::id())).await });
     Helper { to, from: BufReader::new(from), task }
 }
 
@@ -99,10 +99,10 @@ async fn the_channel_refuses_a_wrong_token() {
     let (_, env) = s.start_tab("local-1", "Claude").unwrap();
     let addr = var(&env, channel::ENV_ADDR).to_string();
     let wrong = channel::random_hex(32);
-    let err = helper::relay(tokio::io::empty(), tokio::io::sink(), &addr, &wrong).await.unwrap_err();
+    let err = helper::relay(tokio::io::empty(), tokio::io::sink(), &addr, &wrong, None).await.unwrap_err();
     assert!(err.contains("doesn't know this AI tab"), "{err}");
     // Nor an empty one, or garbage instead of a hello.
-    assert!(helper::relay(tokio::io::empty(), tokio::io::sink(), &addr, "").await.is_err());
+    assert!(helper::relay(tokio::io::empty(), tokio::io::sink(), &addr, "", None).await.is_err());
     let mut raw = BufReader::new(channel::connect(&addr).await.unwrap());
     raw.get_mut().write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
     let answer = channel::read_line(&mut raw, 4096).await.unwrap().unwrap();
@@ -120,7 +120,62 @@ async fn a_closed_ai_tab_s_token_stops_working_and_its_connection_closes() {
     // The open connection ends...
     assert!(tokio::time::timeout(Duration::from_secs(5), h.task).await.expect("the helper ended").unwrap().is_ok());
     // ...and the token can't connect again.
-    assert!(helper::relay(tokio::io::empty(), tokio::io::sink(), &addr, &token).await.is_err());
+    assert!(helper::relay(tokio::io::empty(), tokio::io::sink(), &addr, &token, None).await.is_err());
+}
+
+/// One live connection per AI tab: a second with the same token, while the
+/// first is open, is refused and the panel warns; the first carries on.
+#[tokio::test]
+async fn a_second_connection_with_a_tab_s_token_is_refused() {
+    let s = state_without_servers();
+    let (_, env) = s.start_tab("local-1", "Claude").unwrap();
+    let (addr, token) = (var(&env, channel::ENV_ADDR).to_string(), var(&env, channel::ENV_TOKEN).to_string());
+    let mut first = helper(&addr, &token);
+    first.call(1, "ping", json!({})).await;
+    assert!(s.snapshot().tabs[0].intruder_at.is_none());
+    let t = Instant::now();
+    let err = helper::relay(tokio::io::empty(), tokio::io::sink(), &addr, &token, None).await.unwrap_err();
+    assert!(err.contains("already connected"), "{err}");
+    assert!(t.elapsed() >= RECONNECT_GRACE - Duration::from_millis(100), "waited for the first to end");
+    assert!(s.snapshot().tabs[0].intruder_at.is_some(), "the panel warns");
+    first.call(2, "ping", json!({})).await;
+}
+
+/// The AI tool reconnecting (its old helper ends, a new one starts) gets
+/// through: once the first has ended, and also when the new one comes
+/// before the app has seen the old one close.
+#[tokio::test]
+async fn a_reconnect_after_the_first_helper_ends_gets_through() {
+    let s = state_without_servers();
+    let (_, env) = s.start_tab("local-1", "Claude").unwrap();
+    let (addr, token) = (var(&env, channel::ENV_ADDR).to_string(), var(&env, channel::ENV_TOKEN).to_string());
+    let mut first = helper(&addr, &token);
+    first.call(1, "ping", json!({})).await;
+    drop(first.to);
+    assert!(tokio::time::timeout(Duration::from_secs(5), first.task).await.expect("ended").unwrap().is_ok());
+    let mut second = helper(&addr, &token);
+    second.call(1, "ping", json!({})).await;
+    // At once, without waiting for it to end.
+    drop(second.to);
+    let mut third = helper(&addr, &token);
+    third.call(1, "ping", json!({})).await;
+    assert!(s.snapshot().tabs[0].intruder_at.is_none(), "no warning for a reconnect");
+}
+
+/// The helper sends nothing to a channel whose other end isn't the app's
+/// process (another program listening in its place).
+#[tokio::test]
+async fn the_helper_wont_talk_to_another_process() {
+    let s = state_without_servers();
+    let (_, env) = s.start_tab("local-1", "Claude").unwrap();
+    let (addr, token) = (var(&env, channel::ENV_ADDR).to_string(), var(&env, channel::ENV_TOKEN).to_string());
+    assert_eq!(var(&env, channel::ENV_PID), std::process::id().to_string());
+    let err = helper::relay(tokio::io::empty(), tokio::io::sink(), &addr, &token, Some(std::process::id() + 1)).await.unwrap_err();
+    assert!(err.contains("taken the place"), "{err}");
+    // Nothing reached the app: the token was never used.
+    let mut h = helper(&addr, &token);
+    h.call(1, "ping", json!({})).await;
+    assert!(s.snapshot().tabs[0].intruder_at.is_none());
 }
 
 #[tokio::test]
@@ -244,6 +299,116 @@ async fn the_ai_withdrawing_a_request_cancels_it() {
     assert!(s.decide(id, true).is_err(), "nothing left to allow");
 }
 
+/// An AiState whose commands all print `output`, turned on, with one AI
+/// tab sharing `sess-1` as `xyz`.
+fn state_printing(output: &'static str) -> AiState {
+    let exec: Executor = Arc::new(move |_, _, _, _| {
+        Box::pin(async move { Ok(exec::Exec { output: output.as_bytes().to_vec(), exit_status: Some(0), ..exec::Exec::default() }) })
+    });
+    let s = AiState::new(exec, Box::new(|| {}), None);
+    s.turn_on().unwrap();
+    s.start_tab("local-1", "Claude").unwrap();
+    s.share("local-1", "sess-1", "xyz").unwrap();
+    s
+}
+
+/// Run `command` on `xyz` and allow it.
+async fn run_allowed(s: &AiState, command: &str) -> mcp::ToolResult {
+    let (_c, cancel) = watch::channel(false);
+    let (s2, cmd) = (s.clone(), command.to_string());
+    let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", &cmd, None, cancel).await });
+    wait_for("the request", || !s.snapshot().pending.is_empty()).await;
+    s.decide(s.snapshot().pending[0].id, true).unwrap();
+    req.await.unwrap()
+}
+
+/// Locking the profile (close_profile ends every AI tab) or turning AI
+/// tools off empties the panel's history, outputs and all; a request that
+/// was still waiting doesn't bring its row back once it's cancelled.
+#[tokio::test]
+async fn locking_or_turning_off_forgets_what_ran() {
+    for off in [false, true] {
+        let s = state_printing("db password is hunter2");
+        assert!(!run_allowed(&s, "cat notes").await.is_error);
+        assert_eq!(s.snapshot().history.len(), 1);
+        let id = s.snapshot().history[0].id;
+        assert!(s.lock().history[0].output.contains("hunter2"));
+        // One more, left waiting.
+        let (_c, cancel) = watch::channel(false);
+        let s2 = s.clone();
+        let waiting = tokio::spawn(async move { s2.run_command("local-1", "xyz", "uptime", None, cancel).await });
+        wait_for("the request", || s.snapshot().pending.len() == 1).await;
+        if off {
+            s.turn_off().await;
+        } else {
+            s.end_all_tabs();
+        }
+        assert!(waiting.await.unwrap().is_error);
+        assert!(s.snapshot().history.is_empty(), "off: {off}");
+        assert!(s.lock().history.iter().all(|d| d.view.id != id));
+        // A new AI tab starts with an empty history, and fills it again.
+        if off {
+            s.turn_on().unwrap();
+        }
+        s.start_tab("local-2", "Claude").unwrap();
+        assert!(s.snapshot().history.is_empty());
+    }
+}
+
+/// A request asked while every AI tab's access is ending (here, from the
+/// page's change notice, between one tab ending and the next) leaves no
+/// row in the cleared history: the tabs and the history go in one step.
+#[tokio::test]
+async fn a_request_asked_while_access_ends_leaves_no_row() {
+    use futures::FutureExt;
+    use std::sync::{Mutex as StdMutex, OnceLock};
+    type Asked = std::pin::Pin<Box<dyn std::future::Future<Output = mcp::ToolResult> + Send>>;
+
+    let state: Arc<OnceLock<AiState>> = Arc::new(OnceLock::new());
+    let asked: Arc<StdMutex<Option<Asked>>> = Arc::new(StdMutex::new(None));
+    let (_cancel_tx, cancel) = watch::channel(false);
+    let ending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let on_change = {
+        let (state, asked, ending) = (Arc::clone(&state), Arc::clone(&asked), Arc::clone(&ending));
+        Box::new(move || {
+            // Once, at the first notice while access ends (not again from
+            // inside the request's own notice).
+            if !ending.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let Some(s) = state.get() else { return };
+            // Asked by whichever tab is still there, run up to where it
+            // waits for you.
+            let Some(tab) = s.lock().tabs.first().map(|t| t.id.clone()) else { return };
+            let (s, cancel) = (s.clone(), cancel.clone());
+            let server = if tab == "local-1" { "xyz" } else { "abc" };
+            let mut f: Asked = Box::pin(async move { s.run_command(&tab, server, "uptime", None, cancel).await });
+            if let Some(r) = (&mut f).now_or_never() {
+                assert!(r.is_error, "refused at once: {}", r.text);
+            }
+            *asked.lock().unwrap() = Some(f);
+        }) as Box<dyn Fn() + Send + Sync>
+    };
+    let exec: Executor = Arc::new(|_, _, _, _| Box::pin(async { Err("no servers in this test".to_string()) }));
+    let s = AiState::new(exec, on_change, None);
+    assert!(state.set(s.clone()).is_ok());
+    s.turn_on().unwrap();
+    s.start_tab("local-1", "Claude").unwrap();
+    s.share("local-1", "sess-1", "xyz").unwrap();
+    s.start_tab("local-2", "Claude").unwrap();
+    s.share("local-2", "sess-2", "abc").unwrap();
+
+    ending.store(true, Ordering::SeqCst);
+    s.end_all_tabs();
+    let f = asked.lock().unwrap().take();
+    if let Some(f) = f {
+        assert!(f.await.is_error);
+    }
+    assert!(s.snapshot().tabs.is_empty());
+    assert!(s.snapshot().pending.is_empty());
+    assert!(s.snapshot().history.is_empty(), "{:?}", s.snapshot().history.iter().map(|d| d.outcome).collect::<Vec<_>>());
+}
+
 /// The AI can't flush the audit log: every call counts toward the rate
 /// limit, refused or not; past it one line is logged a minute, not one a
 /// call; and a refused command is logged cut short.
@@ -271,6 +436,36 @@ async fn refusals_count_toward_the_limit_and_are_logged_cut_short() {
         assert!(l["command"].as_str().unwrap().len() <= MAX_LOGGED_COMMAND + 64);
     }
     assert!(text.len() < (RATE_MAX + 2) * (MAX_LOGGED_COMMAND + 1024), "{} bytes", text.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A server name of a megabyte, sent again and again, can't fill the log:
+/// the name is cut in the line, and in the note that says why it was
+/// refused.
+#[tokio::test]
+async fn long_server_names_are_logged_cut_short() {
+    let dir = std::env::temp_dir().join(format!("submarine-ai-test-{}", channel::random_hex(6)));
+    let exec: Executor = Arc::new(|_, _, _, _| Box::pin(async { Err("no servers in this test".to_string()) }));
+    let s = AiState::new(exec, Box::new(|| {}), Some(dir.clone()));
+    s.turn_on().unwrap();
+    s.start_tab("local-1", "Claude").unwrap();
+    let (_c, cancel) = watch::channel(false);
+    let huge = "\"".repeat(1024 * 1024);
+    for shared in [false, true] {
+        if shared {
+            s.share("local-1", "sess-1", "xyz").unwrap();
+        }
+        let r = s.run_command("local-1", &huge, "uptime", None, cancel.clone()).await;
+        assert!(r.is_error && r.text.contains("isn't shared with you"), "{}", &r.text[..200.min(r.text.len())]);
+        assert!(r.text.len() < 4 * 1024, "the AI's answer is cut too: {} bytes", r.text.len());
+    }
+    let text = std::fs::read_to_string(dir.join(audit::FILE_NAME)).unwrap();
+    let refused: Vec<&str> = text.lines().filter(|l| l.contains("\"refused\"")).collect();
+    assert_eq!(refused.len(), 2);
+    for l in refused {
+        assert!(l.len() < MAX_LOGGED_NAME + MAX_LOGGED_NOTE + 1024, "{} bytes", l.len());
+        assert!(l.contains("sha256 "));
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -399,17 +594,23 @@ mod ssh {
         assert!(text.contains(&format!("password={}", filter::HIDDEN)) && !text.contains("hunter2"), "{text}");
         assert!(text.contains("hid 1 item"), "{text}");
         // You see all of it.
+        assert!(s.lock().history[0].output.contains("hunter2"));
         let done = &s.snapshot().history[0];
-        assert!(done.output.contains("hunter2"));
         assert!(!serde_json::to_string(&s.snapshot()).unwrap().contains("hunter2"), "outputs aren't in the panel's every update");
         assert_eq!((done.outcome, done.exit_code, done.hidden), ("done", Some(4), 1));
         let log = audit_lines(&dir);
-        let req = log.iter().find(|l| l["event"] == "request").unwrap();
+        // Logged as you allowed it, and again once it ended.
+        let req = log.iter().position(|l| l["event"] == "request").unwrap();
+        let fin = log.iter().position(|l| l["event"] == "finished").unwrap();
+        assert!(req < fin);
+        let (req, fin) = (&log[req], &log[fin]);
         assert_eq!(req["decision"], "allowed");
         assert_eq!(req["by"], "you");
-        assert_eq!(req["exit_code"], 4);
-        assert_eq!(req["items_hidden"], 1);
-        assert_eq!(req["ai_tab"], "Claude");
+        assert!(req.get("exit_code").is_none());
+        assert_eq!(fin["id"], req["id"]);
+        assert_eq!(fin["exit_code"], 4);
+        assert_eq!(fin["items_hidden"], 1);
+        assert_eq!((&req["ai_tab"], &fin["ai_tab"]), (&json!("Claude"), &json!("Claude")));
         assert!(!std::fs::read_to_string(dir.join(audit::FILE_NAME)).unwrap().contains("hunter2"), "no output in the log");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -524,6 +725,27 @@ mod ssh {
         }
     }
 
+    /// Allowed, a command is in the log while it runs, not only once it ends.
+    #[tokio::test]
+    async fn allowed_is_logged_before_it_ends() {
+        let (s, dir, _, running) = state_and_server(Default::default()).await;
+        s.start_tab("local-1", "Claude").unwrap();
+        s.share("local-1", "sess-1", "xyz").unwrap();
+        let (_c, cancel) = watch::channel(false);
+        let s2 = s.clone();
+        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "exec sleep 30", None, cancel).await });
+        let p = wait_pending(&s).await;
+        s.decide(p.id, true).unwrap();
+        wait_for("it to run on the server", || running.load(Ordering::SeqCst) == 1).await;
+        let log = audit_lines(&dir);
+        assert!(log.iter().any(|l| l["event"] == "request" && l["decision"] == "allowed" && l["id"] == p.id), "{log:?}");
+        assert!(!log.iter().any(|l| l["event"] == "finished"));
+        s.stop_tab("local-1");
+        tokio::time::timeout(Duration::from_secs(10), req).await.expect("stopped").unwrap();
+        assert!(audit_lines(&dir).iter().any(|l| l["event"] == "finished" && l["id"] == p.id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The AI withdrawing a running request ends it on the server too.
     #[tokio::test]
     async fn the_ai_withdrawing_a_running_request_ends_it() {
@@ -598,7 +820,8 @@ mod ssh {
         let log = audit_lines(&dir);
         let req = log.iter().find(|l| l["event"] == "request").unwrap();
         assert_eq!(req["decision"], "allowed");
-        assert_eq!(req["note"], "stopped: withdrawn by the AI tool");
+        let fin = log.iter().find(|l| l["event"] == "finished").unwrap();
+        assert_eq!(fin["note"], "stopped: withdrawn by the AI tool");
         assert!(!log.iter().any(|l| l["note"] == "access ended"));
         let _ = std::fs::remove_dir_all(&dir);
     }

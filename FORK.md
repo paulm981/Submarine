@@ -27,7 +27,7 @@ The fork is based on the original project's **0.4.0**, with every change up to [
 
 A server that connects or reconnects partway through a line waits for the next line, so it never gets only the end of a command. Walls can be saved by name, and a whole folder opens as one.
 
-- **Jump hosts at scale.** A hundred servers behind one jump host log in a few at a time; the number is a setting. Monitoring reaches servers through their jump host too.
+- **Jump hosts at scale.** A hundred servers behind one jump host log in a few at a time, in terminals and in Monitoring; the number is a setting. Monitoring reaches servers through their jump host too, by the same `~/.ssh/config` name as the terminal.
 - **Split.** A second shell on the same server opens beside the first, so you can watch a log in one and work in the other.
 - **Many tabs.** **Ctrl+Shift+K** opens All tabs with its search ready: type part of a name and press Enter. **Ctrl+Tab** and **Ctrl+Shift+Tab** move between tabs. A tab's right-click menu closes the other tabs, the ones to its right, the disconnected ones, or all of them.
 
@@ -59,6 +59,8 @@ A first test, off by default: turn it on in **Settings › AI tools**.
 - **Share with AI** on a server's tab lets that AI tab ask to run commands there. Each one waits in the **AI panel** (the title bar's AI button) until you click Allow or Deny; typing can't approve anything.
 - Submarine runs the command over its own connection, so the AI never gets a key or password. You see the full output; the AI gets it with known secrets hidden, and you see how many.
 - Every request and decision goes in `ai-audit.log` in the log folder.
+
+AI tabs are kept apart from each other, from other accounts on the computer, and from the network. They aren't kept apart from a hostile program running as you: it could read an AI tab's access, edit the log, or click Allow for you. Submarine refuses a second connection as the same AI tab and warns you in the AI panel, but can't stop everything. Run Claude Code with its sandbox on (`/sandbox`), which fences in the commands it runs on your computer.
 
 What comes next (root prompts, the AI asking for a server, many servers, downloads, more AI tools) is in [#32](https://github.com/paulm981/Submarine/issues/32).
 
@@ -121,9 +123,9 @@ No third-party service is involved. Profiles are encrypted with their password b
   - characters that disguise a file name are shown plainly;
   - a trusted server that shows a different kind of key is a warning, not a silent change;
   - Live Edit opens a file in an editor and never runs it: the one picked in Settings, or else Notepad on Windows, the default text editor on macOS, and on Linux the text editor set for plain text;
-  - the Local pane asks before it opens a file that would run (a program, a script, a shortcut; on macOS a `.terminal` or `.command` file too).
+  - the Local pane asks before it opens a file that would run (a program, a script, a shortcut; on macOS a `.terminal` or `.command` file too; on macOS and Linux, any file marked as executable).
 
-  Downloads are marked as from the internet on Windows and macOS. As in the original project ([#212](https://github.com/SinaXhpm/submarine/pull/212)), a program on a server (`.exe`, `.msi`, `.jar`, `.AppImage`, …) isn't opened from the file pane at all.
+  Downloads are marked as from the internet on Windows and macOS, and so is what the Local pane unpacks from an archive marked that way. As in the original project ([#212](https://github.com/SinaXhpm/submarine/pull/212)), a program on a server (`.exe`, `.msi`, `.jar`, `.AppImage`, …) isn't opened from the file pane at all.
 
 ## Where it behaves differently
 

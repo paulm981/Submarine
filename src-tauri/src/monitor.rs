@@ -199,6 +199,14 @@ pub struct NodeAuth {
     /// server's own proxy setting then doesn't apply.
     #[serde(default)]
     pub jump: Option<Box<NodeAuth>>,
+    /// The server's name. A jump host's is matched against `~/.ssh/config`
+    /// Host patterns, as the terminal matches it.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The server's id. A jump host's picks its login queue, the one the
+    /// terminals behind it wait in (multiexec::login_turn).
+    #[serde(default)]
+    pub server_id: Option<i32>,
 }
 
 /// A user-defined metric. The probe loop wraps each command in BEGIN/END
@@ -535,11 +543,22 @@ async fn run_poller(
                     continue;
                 }
             };
+            // Through a jump host, a turn in its login queue first, as the
+            // terminals behind it take one, so resuming a hundred monitors
+            // doesn't log in to it a hundred times at once. The wait isn't
+            // part of the connect's budget: a busy queue isn't an outage.
+            let jump_turn = match target.jump.as_ref().and_then(|j| j.server_id) {
+                Some(jump_id) => tokio::select! {
+                    _ = &mut stop_rx => break,
+                    turn = crate::multiexec::login_turn_until_dropped(&app, jump_id) => turn,
+                },
+                None => None,
+            };
             let connected = tokio::select! {
                 _ = &mut stop_rx => break,
                 // The handshake has its own budget; the logins after it had none.
                 // Through a jump host there are two of each, and the channel between.
-                r = within(connect_timeout * if target.jump.is_some() { 8 } else { 4 }, connect_for_monitor(&db, &target, connect_timeout)) => r,
+                r = within(connect_timeout * if target.jump.is_some() { 8 } else { 4 }, connect_for_monitor(&db, &target, connect_timeout, jump_turn)) => r,
             };
             match connected {
                 Ok(h) => {
@@ -954,13 +973,35 @@ impl MonitorSession {
 }
 
 /// The node as `~/.ssh/config` resolves it: an alias's HostName and Port, and
-/// its User when none is saved. The monitor takes nothing else from the config
-/// (no ProxyCommand / ProxyJump, key files or agent): in the background it
-/// never runs commands or asks for anything. A node the config sends through
-/// a ProxyCommand or ProxyJump (and that has no proxy of its own) isn't
-/// checked at all: `Err` says why.
+/// its User when none is saved; its jump host's too, as the terminal resolves
+/// it (`ConfigTarget::resolve_jump_host`), so the monitor dials the address
+/// the terminal does and finds the host key the terminal stored under it.
+/// The monitor takes nothing else from the config (no ProxyCommand /
+/// ProxyJump, key files or agent): in the background it never runs commands
+/// or asks for anything. A node the config sends through a ProxyCommand or
+/// ProxyJump (and that has no proxy of its own), or a jump host it sends
+/// through a ProxyCommand, isn't checked at all: `Err` says why. A jump
+/// host's ProxyJump is dialled past, as the terminal does.
 async fn with_ssh_config(auth: &NodeAuth, node_name: &str) -> Result<NodeAuth, String> {
-    let mut t = crate::ConfigTarget::resolve(&auth.host, auth.port, &auth.username, Some(node_name.to_string())).await;
+    let target = crate::ConfigTarget::resolve(&auth.host, auth.port, &auth.username, Some(node_name.to_string())).await;
+    let jump = match auth.jump.as_deref() {
+        Some(j) => Some(
+            crate::ConfigTarget::resolve_jump_host(&j.host, i32::from(j.port), &j.username, j.name.clone())
+                .await
+                .map_err(|e| format!("jump host {}: {}", j.host, e))?,
+        ),
+        None => None,
+    };
+    apply_ssh_config(auth, target, jump)
+}
+
+/// `with_ssh_config` once the config is read: `t` is the node's, `jump` its
+/// jump host's, with the ProxyCommand or ProxyJump the config gives it.
+fn apply_ssh_config(
+    auth: &NodeAuth,
+    mut t: crate::ConfigTarget,
+    jump: Option<(crate::ConfigTarget, Option<crate::ssh_config::Proxy>)>,
+) -> Result<NodeAuth, String> {
     let own_route = match auth.proxy_type.as_str() {
         "socks5" => Some("SOCKS5 proxy"),
         "http" => Some("HTTP proxy"),
@@ -969,21 +1010,38 @@ async fn with_ssh_config(auth: &NodeAuth, node_name: &str) -> Result<NodeAuth, S
         _ => None,
     };
     match t.proxy(own_route) {
-        Some(crate::ssh_config::Proxy::Command(_)) => Err(NOT_CHECKED_PROXY_COMMAND.into()),
-        Some(crate::ssh_config::Proxy::Jump(_)) => Err(NOT_CHECKED_PROXY_JUMP.into()),
-        _ => Ok(NodeAuth { host: t.host, port: t.port, username: t.user, ..auth.clone() }),
+        Some(crate::ssh_config::Proxy::Command(_)) => return Err(NOT_CHECKED_PROXY_COMMAND.into()),
+        Some(crate::ssh_config::Proxy::Jump(_)) => return Err(NOT_CHECKED_PROXY_JUMP.into()),
+        _ => {}
     }
+    let jump = match (auth.jump.as_deref(), jump) {
+        (Some(saved), Some((j, proxy))) => {
+            // A ProxyJump the config gives the jump host is dialled past, as
+            // the terminal does (`connect_jump_host`: "isn't used yet").
+            if let Some(crate::ssh_config::Proxy::Command(_)) = proxy {
+                return Err(NOT_CHECKED_JUMP_PROXY_COMMAND.into());
+            }
+            Some(Box::new(NodeAuth { host: j.host, port: j.port, username: j.user, ..saved.clone() }))
+        }
+        _ => None,
+    };
+    Ok(NodeAuth { host: t.host, port: t.port, username: t.user, jump, ..auth.clone() })
 }
 
 const NOT_CHECKED_PROXY_COMMAND: &str =
     "Not checked: ~/.ssh/config reaches this server through a ProxyCommand, which status checks don't run.";
 const NOT_CHECKED_PROXY_JUMP: &str =
     "Not checked: ~/.ssh/config reaches this server through a ProxyJump, which status checks don't use.";
+const NOT_CHECKED_JUMP_PROXY_COMMAND: &str =
+    "Not checked: ~/.ssh/config reaches this server's jump host through a ProxyCommand, which status checks don't run.";
 
+/// `jump_turn`: the turn in the jump host's login queue, let go once the jump
+/// host has logged this one in (or failed to).
 async fn connect_for_monitor(
     db: &Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
     auth: &NodeAuth,
     connect_timeout: Duration,
+    jump_turn: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<MonitorSession, String> {
     // Through the jump host like `ssh -J`: log in to it, open a channel to
     // the server, and run this server's handshake over that channel. Both
@@ -1000,6 +1058,7 @@ async fn connect_for_monitor(
     require_username(jump).map_err(in_jump)?;
     let transport = open_transport(jump, connect_timeout).await.map_err(in_jump)?;
     let bastion = login_for_monitor(db, jump, transport, connect_timeout).await.map_err(in_jump)?;
+    drop(jump_turn);
     let channel = tokio::time::timeout(
         connect_timeout,
         bastion.channel_open_direct_tcpip(auth.host.clone(), auth.port as u32, "127.0.0.1", 0),
@@ -1815,7 +1874,82 @@ mod jump_host_tests {
             proxy_host: None,
             proxy_port: None,
             jump: jump.map(Box::new),
+            name: None,
+            server_id: None,
         }
+    }
+
+    fn config(f: impl FnOnce(&mut crate::ssh_config::HostConfig)) -> Option<crate::ssh_config::HostConfig> {
+        let mut c = crate::ssh_config::HostConfig::default();
+        f(&mut c);
+        Some(c)
+    }
+
+    /// The jump host as the config resolves it, like resolve_jump_host.
+    fn jump_target(
+        saved: &NodeAuth,
+        c: Option<crate::ssh_config::HostConfig>,
+    ) -> Option<(crate::ConfigTarget, Option<crate::ssh_config::Proxy>)> {
+        let mut t = crate::ConfigTarget::apply(&saved.host, saved.port, &saved.username, c);
+        let proxy = t.proxy(None);
+        Some((t, proxy))
+    }
+
+    // The monitor dials the jump host where the terminal does: an alias's
+    // HostName, Port and (for a blank username) User.
+    #[test]
+    fn a_jump_hosts_ssh_config_alias_is_followed() {
+        let mut saved = node("bastion", 22, None);
+        saved.server_id = Some(7);
+        let mut auth = node("inner.example", 22, Some(saved));
+        auth.jump.as_mut().unwrap().username = String::new();
+        let target = crate::ConfigTarget::apply("inner.example", 22, "test", None);
+        let jump = jump_target(
+            &auth.jump.clone().unwrap(),
+            config(|c| {
+                c.hostname = Some("10.0.0.9".into());
+                c.port = Some(2222);
+                c.user = Some("hop".into());
+            }),
+        );
+        let resolved = apply_ssh_config(&auth, target, jump).expect("checked");
+        let j = resolved.jump.expect("still through the jump host");
+        assert_eq!((j.host.as_str(), j.port, j.username.as_str()), ("10.0.0.9", 2222, "hop"));
+        assert_eq!(j.password.as_deref(), Some("test"), "the jump host's own login is kept");
+        assert_eq!(j.server_id, Some(7), "and its login queue");
+        assert_eq!((resolved.host.as_str(), resolved.port), ("inner.example", 22));
+    }
+
+    // A jump host the config reaches through a ProxyCommand isn't checked,
+    // as for the server itself. One it reaches through a ProxyJump is dialled
+    // straight, as the terminal does.
+    #[test]
+    fn a_jump_host_behind_a_config_proxy_is_not_checked() {
+        let auth = node("inner.example", 22, Some(node("bastion", 22, None)));
+        let saved = auth.jump.clone().unwrap();
+        let target = crate::ConfigTarget::apply("inner.example", 22, "test", None);
+        let jump = jump_target(&saved, config(|c| c.proxy = Some(crate::ssh_config::Proxy::Command("nc %h %p".into()))));
+        assert_eq!(apply_ssh_config(&auth, target, jump).err().as_deref(), Some(NOT_CHECKED_JUMP_PROXY_COMMAND));
+
+        let target = crate::ConfigTarget::apply("inner.example", 22, "test", None);
+        let jump = jump_target(
+            &saved,
+            config(|c| {
+                c.hostname = Some("10.0.0.9".into());
+                c.proxy = Some(crate::ssh_config::Proxy::Jump("outer".into()));
+            }),
+        );
+        let resolved = apply_ssh_config(&auth, target, jump).expect("checked, past the ProxyJump");
+        assert_eq!(resolved.jump.expect("through the jump host").host, "10.0.0.9");
+        // The server's own ProxyJump gives way to its saved jump host.
+        let target = crate::ConfigTarget::apply(
+            "inner.example",
+            22,
+            "test",
+            config(|c| c.proxy = Some(crate::ssh_config::Proxy::Jump("outer".into()))),
+        );
+        let jump = jump_target(&saved, None);
+        assert!(apply_ssh_config(&auth, target, jump).is_ok());
     }
 
     #[tokio::test]
@@ -1824,7 +1958,7 @@ mod jump_host_tests {
         let behind = Arc::clone(&bastion.jump_target_received);
         let port = listen(bastion).await;
         let db = known_hosts(&[("127.0.0.1", port), ("inner.example", 22)]);
-        let conn = connect_for_monitor(&db, &node("inner.example", 22, Some(node("127.0.0.1", port, None))), Duration::from_secs(10))
+        let conn = connect_for_monitor(&db, &node("inner.example", 22, Some(node("127.0.0.1", port, None))), Duration::from_secs(10), None)
             .await
             .expect("a monitor session through the jump host");
         assert!(conn.jump.is_some() && !conn.is_closed());
@@ -1846,7 +1980,7 @@ mod jump_host_tests {
         let back = Arc::clone(&server.opened_back);
         let port = listen(server).await;
         let db = known_hosts(&[("127.0.0.1", port)]);
-        let conn = connect_for_monitor(&db, &node("127.0.0.1", port, None), Duration::from_secs(10))
+        let conn = connect_for_monitor(&db, &node("127.0.0.1", port, None), Duration::from_secs(10), None)
             .await
             .expect("a monitor session");
         let channel = conn.session.channel_open_session().await.unwrap();
@@ -1872,7 +2006,7 @@ mod jump_host_tests {
     async fn an_untrusted_server_behind_the_jump_host_is_refused() {
         let port = listen(TestServer::default()).await;
         let db = known_hosts(&[("127.0.0.1", port)]);
-        let err = connect_for_monitor(&db, &node("inner.example", 22, Some(node("127.0.0.1", port, None))), Duration::from_secs(10))
+        let err = connect_for_monitor(&db, &node("inner.example", 22, Some(node("127.0.0.1", port, None))), Duration::from_secs(10), None)
             .await
             .err()
             .expect("an unknown host key behind the jump host must be refused");
@@ -1883,7 +2017,7 @@ mod jump_host_tests {
     async fn an_untrusted_jump_host_is_refused() {
         let port = listen(TestServer::default()).await;
         let db = known_hosts(&[("inner.example", 22)]);
-        let err = connect_for_monitor(&db, &node("inner.example", 22, Some(node("127.0.0.1", port, None))), Duration::from_secs(10))
+        let err = connect_for_monitor(&db, &node("inner.example", 22, Some(node("127.0.0.1", port, None))), Duration::from_secs(10), None)
             .await
             .err()
             .expect("an unknown jump host key must be refused");

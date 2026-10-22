@@ -13,7 +13,8 @@
 //!   file's own default app: a list of the types that run can't be complete
 //!   (Wine runs Windows programs and scripts on Linux, for one).
 //! - The Local pane asks before opening a file the system would run
-//!   ([`runs_when_opened`]).
+//!   ([`runs_when_opened`]): by its type, and on macOS and Linux also when
+//!   it's marked executable.
 //! - Files downloaded from a server are marked as coming from the internet
 //!   ([`mark_from_internet`]), as browsers mark their downloads, so
 //!   SmartScreen and Office Protected View on Windows, and Gatekeeper on
@@ -303,7 +304,9 @@ fn runs_on_open_ext(ext: &str, pathext: Option<&str>) -> bool {
 }
 
 /// Whether opening `path` would run it rather than show it (on Windows,
-/// RUNS_ON_OPEN and %PATHEXT%; on macOS and Linux, RUNS_ON_OPEN_UNIX).
+/// RUNS_ON_OPEN and %PATHEXT%; on macOS and Linux, RUNS_ON_OPEN_UNIX, or a
+/// file marked executable, whatever its name: a program or script without
+/// an extension runs when a file manager opens it).
 pub fn runs_when_opened(path: &Path) -> bool {
     #[cfg(windows)]
     {
@@ -312,8 +315,21 @@ pub fn runs_when_opened(path: &Path) -> bool {
     }
     #[cfg(not(windows))]
     {
-        file_extension(path).is_some_and(|ext| runs_on_open_unix(&ext))
+        file_extension(path).is_some_and(|ext| runs_on_open_unix(&ext)) || has_run_bits(path)
     }
+}
+
+/// A regular file (a link is followed, as opening it would) that anyone may
+/// run: any of its `x` bits is set.
+#[cfg(unix)]
+fn has_run_bits(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn has_run_bits(_path: &Path) -> bool {
+    false
 }
 
 /// macOS and Linux: their own types that run, and Windows' (Wine).
@@ -350,6 +366,43 @@ pub fn mark_from_internet(path: &Path) {
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = path;
+    }
+}
+
+/// Whether `path` is marked as from the internet (mark_from_internet, or a
+/// browser's mark): on Windows a `Zone.Identifier` stream for the Internet or
+/// Restricted zone (or one that doesn't say), on macOS a quarantine mark.
+/// Never on other systems, which have no such mark.
+pub fn is_marked_from_internet(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let mut stream = path.as_os_str().to_owned();
+        stream.push(":Zone.Identifier");
+        std::fs::read(PathBuf::from(stream)).is_ok_and(|text| zone_is_internet(&String::from_utf8_lossy(&text)))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(file) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
+        // SAFETY: both strings are NUL-terminated; with no buffer (null, size
+        // 0) it only answers the value's size, or -1 when there's no mark.
+        unsafe { libc::getxattr(file.as_ptr(), c"com.apple.quarantine".as_ptr(), std::ptr::null_mut(), 0, 0, 0) >= 0 }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Whether a `Zone.Identifier` stream's text puts the file in the Internet
+/// (3) or Restricted (4) zone. One without a zone that can be read counts
+/// too: something marked it.
+#[cfg(any(windows, test))]
+fn zone_is_internet(text: &str) -> bool {
+    match text.lines().find_map(|line| line.trim().strip_prefix("ZoneId=")) {
+        Some(zone) => !matches!(zone.trim().parse::<u32>(), Ok(zone) if zone < 3),
+        None => true,
     }
 }
 
@@ -412,6 +465,37 @@ mod tests {
         for name in ["notes.txt", "photo.png", "report.pdf", "data.csv", "nginx.conf", "Makefile", ".bashrc", "letter.docx", "x.terminal.txt"] {
             assert!(!runs_unix(name), "{name}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_marked_executable_runs_whatever_its_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("submarine-runbits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let set = |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        for (name, mode, runs) in [("install", 0o755, true), ("notes", 0o644, false), ("readme.txt", 0o700, true), ("group-only", 0o610, true)] {
+            let file = dir.join(name);
+            std::fs::write(&file, "#!/bin/sh\n").unwrap();
+            set(&file, mode);
+            assert_eq!(runs_when_opened(&file), runs, "{name} {mode:o}");
+        }
+        let folder = dir.join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        assert!(!runs_when_opened(&folder), "a folder isn't run");
+        std::os::unix::fs::symlink(dir.join("install"), dir.join("link")).unwrap();
+        assert!(runs_when_opened(&dir.join("link")), "a link to a program");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_zone_mark_says_internet() {
+        assert!(zone_is_internet("[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=about:internet\r\n"));
+        assert!(zone_is_internet("[ZoneTransfer]\nZoneId=4\n"));
+        assert!(!zone_is_internet("[ZoneTransfer]\r\nZoneId=1\r\n"));
+        assert!(!zone_is_internet("[ZoneTransfer]\r\nZoneId=2\r\n"));
+        assert!(zone_is_internet("garbled"), "marked, without a zone that can be read");
     }
 
     #[test]

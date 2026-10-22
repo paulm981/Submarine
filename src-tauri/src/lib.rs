@@ -8963,6 +8963,13 @@ impl AgentSlot {
 
 /// A node's display name. An imported node keeps its `~/.ssh/config` alias as
 /// its name, so `Host` patterns are matched against it as well as the address.
+/// A saved port as one a connection can use. The form only takes 1 to 65535,
+/// but a synced or imported server may carry anything, and a plain cast would
+/// quietly dial another port.
+fn valid_port(port: i32) -> Result<u16, String> {
+    u16::try_from(port).map_err(|_| format!("Port {port} isn't a valid port"))
+}
+
 fn server_display_name(conn: &rusqlite::Connection, server_id: i32) -> Option<String> {
     conn.query_row("SELECT name FROM servers WHERE id = ?1", [server_id], |row| row.get::<_, Option<String>>(0))
         .ok()
@@ -8997,6 +9004,22 @@ impl ConfigTarget {
         };
         let config = ssh_config::for_host(lookup).await;
         Self::apply(host, port, user, config)
+    }
+
+    /// A jump host as `connect_jump_host` reaches it, for the connect, the
+    /// check under a failed one and the monitor alike: its saved port
+    /// checked, `~/.ssh/config` applied, and the ProxyCommand or ProxyJump
+    /// the config gives it (a jump host is reached without its own proxy
+    /// setting, so the config's has nothing to give way to).
+    async fn resolve_jump_host(
+        host: &str,
+        port: i32,
+        user: &str,
+        name: Option<String>,
+    ) -> Result<(Self, Option<ssh_config::Proxy>), String> {
+        let mut target = Self::resolve(host, valid_port(port)?, user, name).await;
+        let proxy = target.proxy(None);
+        Ok((target, proxy))
     }
 
     fn apply(host: &str, port: u16, user: &str, config: Option<ssh_config::HostConfig>) -> Self {
@@ -9787,6 +9810,15 @@ mod key_format_tests {
     // ~/.ssh/config: an alias address takes HostName and Port; User only
     // fills a blank username; every change is logged.
     #[test]
+    fn a_port_out_of_range_is_refused_not_cast() {
+        assert_eq!(valid_port(22), Ok(22));
+        assert_eq!(valid_port(65535), Ok(65535));
+        // 65558 as u16 would have dialled port 22.
+        assert_eq!(valid_port(65558), Err("Port 65558 isn't a valid port".to_string()));
+        assert_eq!(valid_port(-1), Err("Port -1 isn't a valid port".to_string()));
+    }
+
+    #[test]
     fn a_config_alias_changes_where_to_connect() {
         let c = host_config(|c| {
             c.hostname = Some("10.0.0.5".into());
@@ -10334,6 +10366,11 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     // through the password method (#145): it answers the server's password
     // question once, and only that (see is_password_prompt).
     saved_password: Option<&str>,
+    // `Some` on a connection that can't ask the user anything (a `::sftp` /
+    // `::fwd` one, whose prompts no tab listens to): the saved password still
+    // answers the server's password question, but any other question ends
+    // the login at once, as a failure, and sets this. `None` asks the user.
+    unasked: Option<&std::sync::atomic::AtomicBool>,
 ) -> Option<Result<bool, russh::Error>> {
     use russh::client::KeyboardInteractiveAuthResponse;
     use tauri::Emitter;
@@ -10437,6 +10474,15 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
                 }
                 answered_with_saved = false;
                 asked_anything = true;
+
+                // Nobody would see the question: rather than wait out the
+                // 120 s below (holding a turn in the jump host's login queue),
+                // stop now and say why.
+                if let Some(unasked) = unasked {
+                    unasked.store(true, std::sync::atomic::Ordering::Relaxed);
+                    log("The server asks for a code or a password this connection can't ask you for.", "error");
+                    return Some(Ok(false));
+                }
 
                 // A superseded or abandoned attempt doesn't put its prompt over
                 // a newer one; it ends like a cancelled prompt.
@@ -11401,8 +11447,7 @@ async fn connect_jump_host(
         }
     };
     // What ~/.ssh/config says about the bastion (its alias, agent, proxy).
-    let mut target = ConfigTarget::resolve(&host, port as u16, &user, jump_name).await;
-    let bastion_proxy = target.proxy(None);
+    let (target, bastion_proxy) = ConfigTarget::resolve_jump_host(&host, port, &user, jump_name).await?;
     for line in &target.log {
         log(line, "info");
     }
@@ -11576,8 +11621,10 @@ async fn connect_jump_host(
             None => (Zeroizing::new(String::new()), false, true),
         };
     // For a jump host that asks for the password through keyboard-interactive
-    // (#145).
+    // (#145). On a connection that can't ask (see `allow_prompt`) it's all
+    // keyboard-interactive may send: a code it asks for ends the login there.
     let kbi_password = password.clone().map(Zeroizing::new);
+    let kbi_unasked = std::sync::atomic::AtomicBool::new(false);
     // The whole login has a deadline, as the monitor's has: a jump host that
     // took the connection and stops answering would otherwise hold this
     // attempt, and its turn in the jump host's login queue, for good. It's
@@ -11621,8 +11668,18 @@ async fn connect_jump_host(
             && !prompt_ctx.cancelled.load(std::sync::atomic::Ordering::Relaxed)
             && !prompt_ctx.session_unusable.load(std::sync::atomic::Ordering::Relaxed)
         {
-            if let Some(kbi_res) =
-                run_keyboard_interactive(&mut session, &effective_user, app, session_id, &jump_nonce, kbi_txs, attempt, kbi_password.as_ref().map(|p| p.as_str())).await
+            if let Some(kbi_res) = run_keyboard_interactive(
+                &mut session,
+                &effective_user,
+                app,
+                session_id,
+                &jump_nonce,
+                kbi_txs,
+                attempt,
+                kbi_password.as_ref().map(|p| p.as_str()),
+                (!allow_prompt).then_some(&kbi_unasked),
+            )
+            .await
             {
                 auth_res = kbi_res;
             }
@@ -11655,6 +11712,10 @@ async fn connect_jump_host(
             auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
             Err("jump host login cancelled".into())
         }
+        Ok(false) if kbi_unasked.load(std::sync::atomic::Ordering::Relaxed) => {
+            auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            Err(JUMP_ASKS_UNASKED.into())
+        }
         Ok(false) => {
             auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
             Err("jump host authentication failed".into())
@@ -11676,6 +11737,11 @@ async fn connect_jump_host(
         }
     }
 }
+
+/// A `::sftp` / `::fwd` connection's jump host asked for a code (or a password
+/// that isn't saved) that only the server's own tab can ask for.
+const JUMP_ASKS_UNASKED: &str =
+    "the jump host asks for a code or a password, and only the server's own tab can ask you for it";
 
 /// Shown when an ssh-agent didn't sign a login it was asked to (a declined
 /// confirmation, a removed card, a PIN or touch not given in time).
@@ -11787,7 +11853,7 @@ async fn diagnose_connect(
         })
         .map_err(|_| "Server not found".to_string())?
     };
-    let port = u16::try_from(row.port).map_err(|_| format!("Port {} isn't a valid port", row.port))?;
+    let port = valid_port(row.port)?;
 
     // The address an alias in ~/.ssh/config stands for, as the connect uses it.
     let mut target = ConfigTarget::resolve(&row.host, port, row.user.as_deref().unwrap_or(""), row.name).await;
@@ -11795,11 +11861,11 @@ async fn diagnose_connect(
         ConnectRoute::Jump(_) => {
             // The connect fails on its own when the jump host is gone.
             let Some(hop) = row.jump else { return Ok(Vec::new()) };
-            let jump_port = u16::try_from(hop.port).map_err(|_| format!("Port {} isn't a valid port", hop.port))?;
             let label = hop.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| hop.host.clone());
-            let mut resolved = ConfigTarget::resolve(&hop.host, jump_port, hop.user.as_deref().unwrap_or(""), hop.name).await;
+            let (resolved, proxy) =
+                ConfigTarget::resolve_jump_host(&hop.host, hop.port, hop.user.as_deref().unwrap_or(""), hop.name).await?;
             // connect_jump_host takes the jump host's ProxyCommand when it has one.
-            if matches!(resolved.proxy(None), Some(ssh_config::Proxy::Command(_))) {
+            if matches!(proxy, Some(ssh_config::Proxy::Command(_))) {
                 diagnose::Route::Command
             } else {
                 diagnose::Route::Jump { name: label, host: resolved.host, port: resolved.port }
@@ -11887,6 +11953,20 @@ async fn initiate_connection(
     // reconnect attempt and the UI would just sit on "connecting…" forever.
     // Tunnels + forwarded_targets get the same treatment further down via the
     // stop_all_for_session call, so we don't duplicate that here.
+    //
+    // Bump the generation FIRST, as teardown_connection_key and
+    // disconnect_session do, so any watcher task still alive from the prior
+    // attempt sees a newer value next tick and bails silently instead of
+    // racing the new connect to emit `session-disconnected-{id}`, and a prior
+    // attempt still logging in fails its "still wanted?" check instead of
+    // registering itself (and its jump host) after the removals below, where
+    // nothing would watch or close it.
+    let connect_generation: u64 = {
+        let mut g = state.session_generation.lock().await;
+        let next = g.get(&session_id).copied().unwrap_or(0).wrapping_add(1);
+        g.insert(session_id.clone(), next);
+        next
+    };
     {
         let mut conns = state.connections.lock().await;
         if conns.remove(&session_id).is_some() {
@@ -11906,15 +11986,20 @@ async fn initiate_connection(
     let term_prefix = format!("{}-term-", session_id);
     state.terminal_txs.lock().await.retain(|k, _| !k.starts_with(&term_prefix));
     state.resize_txs.lock().await.retain(|k, _| !k.starts_with(&term_prefix));
-    // Bump the generation so any watcher task still alive from the prior
-    // attempt sees a newer value next tick and bails silently instead of
-    // racing the new connect to emit `session-disconnected-{id}`.
-    let connect_generation: u64 = {
-        let mut g = state.session_generation.lock().await;
-        let next = g.get(&session_id).copied().unwrap_or(0).wrapping_add(1);
-        g.insert(session_id.clone(), next);
-        next
-    };
+    // A reconnect replays the session's forward list. When sync changed this
+    // server's saved forwards since the session read them (another computer
+    // deleted one, say), the list starts again from the saved ones first, so
+    // the reconnect doesn't bring back a forward that's gone. The list is
+    // kept under the base session id, which the `::fwd` connection replays
+    // too. A first connect (no list yet) reads the saved ones anyway, and
+    // other connections (`::sftp`) have none: neither may use up the change,
+    // which another tab on this server may still need.
+    let rules_key = session_id.strip_suffix("::fwd").unwrap_or(&session_id);
+    if (role == "primary" || role == "forward") && state.session_tunnel_specs.lock().await.contains_key(rules_key) {
+        if let Err(e) = refresh_synced_session_rules(state.inner(), db_state.inner(), rules_key, Some(server_id)).await {
+            println!("[BACKEND] {}: the saved forwards weren't read again: {}", session_id, e);
+        }
+    }
     // This attempt, as its prompts and failure report see it: once a newer
     // attempt starts (or the tab disconnects) they stay quiet.
     let attempt = ssh_manager::ConnectAttempt::new(
@@ -12151,7 +12236,7 @@ async fn initiate_connection(
         } else {
             db_state.conn.lock().ok().and_then(|g| g.as_ref().and_then(|c| server_display_name(c, server_id)))
         };
-        let port = u16::try_from(port).map_err(|_| format!("Port {port} isn't a valid port"))?;
+        let port = valid_port(port)?;
         ConfigTarget::resolve(&host, port, &user, name).await
     };
     // Its jump host, proxy or ProxyCommand (see connect_route).
@@ -12660,6 +12745,7 @@ async fn initiate_connection(
                         &kbi_txs_clone,
                         &attempt,
                         kbi_password.as_ref().map(|p| p.as_str()),
+                        None,
                     )
                     .await
                     {
@@ -12697,6 +12783,14 @@ async fn initiate_connection(
                                     .lock()
                                     .await
                                     .insert(session_id_clone.clone(), Arc::clone(&session_arc));
+                                // ProxyJump: park the bastion's Handle with the
+                                // session, under the same check, so it stays
+                                // alive for the whole session (its direct-tcpip
+                                // channel carries our transport) and a later
+                                // reconnect / disconnect / close drops it.
+                                if let Some(jh) = jump_handle_holder.take() {
+                                    state_jump_connections.lock().await.insert(session_id_clone.clone(), jh);
+                                }
                                 true
                             } else {
                                 false
@@ -12716,13 +12810,6 @@ async fn initiate_connection(
                         // transport preference. Live migration, no re-keying.
                         if let Some(base) = session_id_clone.strip_suffix("::sftp") {
                             state_sftp_sessions.lock().await.remove(base);
-                        }
-                        // ProxyJump: now that the target session is live, park
-                        // the bastion's Handle so it stays alive for the whole
-                        // session (its direct-tcpip channel carries our
-                        // transport). Dropped on reconnect / disconnect / close.
-                        if let Some(jh) = jump_handle_holder.take() {
-                            state_jump_connections.lock().await.insert(session_id_clone.clone(), jh);
                         }
                         let _ = app.emit(
                             &format!("connection-success-{}", session_id_clone),
@@ -15527,35 +15614,52 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
     use std::sync::Arc;
     use crate::ssh_manager::TerminalCommand;
 
-    let session_arc = {
-        let mut connections = state.connections.lock().await;
-        if let Some(sess) = connections.get_mut(&session_id) {
-            Arc::clone(sess)
-        } else {
-            return Err("Session not connected".into());
+    // The page can close the terminal while this waits on the server (the
+    // tab closed as it opened): that close is kept (TerminalOpenings), and
+    // then the shell is closed here rather than left running. First of all,
+    // so a close that comes while this waits for a lock is kept too.
+    let opening = state.terminal_openings.lock().await.begin(&terminal_id);
+    let opened = async {
+        let session_arc = {
+            let connections = state.connections.lock().await;
+            match connections.get(&session_id) {
+                Some(sess) => Arc::clone(sess),
+                None => return Err("Session not connected".to_string()),
+            }
+        };
+
+        // Settings → Terminal → "Use my default shell": this computer's shell,
+        // started on the server as a login shell in place of the account's own
+        // (LOGIN_SHELL_SCRIPT), where the server can (server_runs_login_shell);
+        // otherwise, and with the setting off, the account's own shell. Asked
+        // before the session is locked for the terminal's channel.
+        let login_shell = match use_local_shell.then(local_default_shell).flatten() {
+            Some(shell) if server_runs_login_shell(&session_arc, &shell).await => Some(shell),
+            _ => None,
+        };
+
+        let session = session_arc.lock().await;
+        let channel = session.channel_open_session().await.map_err(|e| e.to_string())?;
+
+        // Request PTY
+        channel.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]).await.map_err(|e| e.to_string())?;
+        match login_shell {
+            Some(shell) => channel.exec(true, login_shell_command(&shell).as_bytes()).await,
+            None => channel.request_shell(true).await,
         }
-    };
-
-    // Settings → Terminal → "Use my default shell": this computer's shell,
-    // started on the server as a login shell in place of the account's own
-    // (LOGIN_SHELL_SCRIPT), where the server can (server_runs_login_shell);
-    // otherwise, and with the setting off, the account's own shell. Asked
-    // before the session is locked for the terminal's channel.
-    let login_shell = match use_local_shell.then(local_default_shell).flatten() {
-        Some(shell) if server_runs_login_shell(&session_arc, &shell).await => Some(shell),
-        _ => None,
-    };
-
-    let session = session_arc.lock().await;
-    let channel = session.channel_open_session().await.map_err(|e| e.to_string())?;
-
-    // Request PTY
-    channel.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]).await.map_err(|e| e.to_string())?;
-    match login_shell {
-        Some(shell) => channel.exec(true, login_shell_command(&shell).as_bytes()).await,
-        None => channel.request_shell(true).await,
+        .map_err(|e| e.to_string())?;
+        Ok::<_, String>(channel)
     }
-    .map_err(|e| e.to_string())?;
+    .await;
+
+    let mut openings = state.terminal_openings.lock().await;
+    let wanted = openings.finish(&terminal_id, opening);
+    let channel = opened?;
+    if !wanted {
+        drop(openings);
+        let _ = channel.close().await;
+        return Ok(());
+    }
 
     let (tx, rx) = tokio::sync::mpsc::channel::<TerminalCommand>(32);
     // Last-wins watch channel for PTY resizes. The PTY task selects on
@@ -15568,6 +15672,7 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
     state.terminal_txs.lock().await.insert(terminal_id.clone(), tx);
     note_terminal_server(&state, &session_id, &terminal_id).await;
     state.resize_txs.lock().await.insert(terminal_id.clone(), resize_tx);
+    drop(openings);
 
     // Output coalescing, keystroke / resize forwarding and the split,
     // always-draining read/write pump (required by russh's channel
@@ -15676,9 +15781,14 @@ async fn resize_terminal(state: tauri::State<'_, SshState>, terminal_id: String,
 
 #[tauri::command]
 async fn close_terminal(state: tauri::State<'_, SshState>, terminal_id: String) -> Result<(), String> {
+    // Held throughout, so an open finishing now either sees this close or
+    // has registered the terminal already (TerminalOpenings).
+    let mut openings = state.terminal_openings.lock().await;
+    openings.close(&terminal_id);
     state.terminal_txs.lock().await.remove(&terminal_id);
     state.resize_txs.lock().await.remove(&terminal_id);
     state.terminal_servers.lock().await.remove(&terminal_id);
+    drop(openings);
     Ok(())
 }
 
@@ -19525,9 +19635,16 @@ async fn sftp_download_file(
         drop(local_file); scrap_temp(&temp_path).await; emit_progress(transferred, "error", Some(e.to_string())); return Err(format!("flush: {e}"));
     }
     drop(local_file);
-    // The one touch of the destination: the full download replaces it atomically.
-    if let Err(e) = tokio::fs::rename(&temp_path, &local_path).await {
+    // The one touch of the destination: the full download replaces it
+    // atomically when the user chose to replace it, and otherwise goes there
+    // only if nothing is there yet. Another download of the same name that
+    // finished first is then asked about, as one that was there at the start.
+    if let Err(e) = finalize_download(&temp_path, std::path::Path::new(&local_path), overwrite == Some(true)).await {
         scrap_temp(&temp_path).await;
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            emit_progress(transferred, "cancelled", Some("a file of this name was saved there meanwhile".into()));
+            return Err(format!("EXISTS:{}", local_path));
+        }
         emit_progress(transferred, "error", Some(e.to_string()));
         return Err(format!("finalize: {e}"));
     }
@@ -19736,15 +19853,31 @@ async fn sftp_download_dir(
     // AppData\…\Startup\x.bat in the real Startup folder. Files that would
     // land in a folder the system runs things from at login are left out and
     // counted on the card.
-    let autorun = autorun_dirs();
+    let login_folders = LoginFolders::new();
     let dest_root = std::path::PathBuf::from(&local_path).join(&folder_name);
     let before = files.len();
-    files.retain(|(_, rel, _)| !lands_in(&dest_root.join(rel), &autorun));
+    files.retain(|(_, rel, _)| login_folders.may_hold_server_file(&dest_root.join(rel)));
     let skipped_autorun = (before - files.len()) as u64;
-
-    let skipped_note = match (skipped_names_note(skipped_names), autorun_skipped_note(skipped_autorun)) {
-        (Some(a), Some(b)) => Some(format!("{}; {}", a, b)),
-        (a, b) => a.or(b),
+    // Where upper and lower case are the same name (Windows, and macOS as
+    // usually set up), two files whose names differ only in case would land
+    // on one file, the second replacing the first. The second is left out.
+    let skipped_case = drop_case_twins(&mut files, cfg!(any(windows, target_os = "macos")));
+    // Files left out at the end because something of that name was there
+    // (another download finished first): nothing is replaced unless the user
+    // chose to.
+    let mut skipped_existing: u64 = 0;
+    let replace = overwrite == Some(true);
+    let notes = |skipped_existing: u64| {
+        let notes: Vec<String> = [
+            skipped_names_note(skipped_names),
+            autorun_skipped_note(skipped_autorun),
+            case_twins_note(skipped_case),
+            existing_skipped_note(skipped_existing),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!notes.is_empty()).then(|| notes.join("; "))
     };
 
     if files.is_empty() {
@@ -19752,7 +19885,7 @@ async fn sftp_download_dir(
         // shape — otherwise the user sees "done" with nothing to show for it.
         let local_root = std::path::PathBuf::from(&local_path).join(&folder_name);
         let _ = tokio::fs::create_dir_all(&local_root).await;
-        emit_progress(0, 0, "done", skipped_note);
+        emit_progress(0, 0, "done", notes(0));
         return Ok(());
     }
 
@@ -19851,16 +19984,131 @@ async fn sftp_download_dir(
             drop(local_file); scrap(&temp).await; emit_progress(transferred, total_bytes, "error", Some(format!("flush {}: {}", dest.display(), e))); return Err(format!("flush {}: {}", dest.display(), e));
         }
         drop(local_file);
-        if let Err(e) = tokio::fs::rename(&temp, &dest).await {
+        if let Err(e) = finalize_download(&temp, &dest, replace).await {
             scrap(&temp).await;
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                skipped_existing += 1;
+                continue;
+            }
             emit_progress(transferred, total_bytes, "error", Some(format!("finalize {}: {}", dest.display(), e)));
             return Err(format!("finalize {}: {}", dest.display(), e));
         }
         local_open::mark_from_internet(&dest);
     }
 
-    emit_progress(transferred, total_bytes, "done", skipped_note);
+    emit_progress(transferred, total_bytes, "done", notes(skipped_existing));
     Ok(())
+}
+
+/// Puts a finished download at `dest`: over what's there when the user chose
+/// to replace it (an atomic rename), and otherwise only if nothing is there,
+/// failing with `AlreadyExists` if something is (move_no_replace). That also
+/// catches a second download of the same name that finished first, and on a
+/// file system that ignores case, a file whose name differs only in case.
+async fn finalize_download(temp: &std::path::Path, dest: &std::path::Path, replace: bool) -> std::io::Result<()> {
+    if replace {
+        return tokio::fs::rename(temp, dest).await;
+    }
+    let (temp, dest) = (temp.to_path_buf(), dest.to_path_buf());
+    tokio::task::spawn_blocking(move || move_no_replace(&temp, &dest, false))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
+/// Leaves out the files of a folder download whose path, ignoring case, is
+/// one an earlier file has, when `ignores_case` (the local file system treats
+/// them as one name). Returns how many were left out.
+fn drop_case_twins(files: &mut Vec<(String, String, u64)>, ignores_case: bool) -> u64 {
+    if !ignores_case {
+        return 0;
+    }
+    let before = files.len();
+    let mut seen = std::collections::HashSet::new();
+    files.retain(|(_, rel, _)| seen.insert(rel.to_lowercase()));
+    (before - files.len()) as u64
+}
+
+/// The note on a finished folder-download card for files left out because
+/// another file's name differs from theirs only in case (drop_case_twins).
+fn case_twins_note(skipped: u64) -> Option<String> {
+    match skipped {
+        0 => None,
+        1 => Some("1 file skipped: its name differs from another file's only in upper and lower case, which this computer treats as the same name".into()),
+        n => Some(format!("{} files skipped: their names differ from other files' only in upper and lower case, which this computer treats as the same name", n)),
+    }
+}
+
+/// The note on a finished folder-download card for files left out because a
+/// file of that name was saved there meanwhile (finalize_download).
+fn existing_skipped_note(skipped: u64) -> Option<String> {
+    match skipped {
+        0 => None,
+        1 => Some("1 file skipped: a file of that name was already there, and was left as it was".into()),
+        n => Some(format!("{} files skipped: files of those names were already there, and were left as they were", n)),
+    }
+}
+
+#[cfg(test)]
+mod download_finalize_tests {
+    use super::{drop_case_twins, finalize_download};
+
+    fn fresh(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("submarine-finalize-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Two downloads to the same name: the one that finishes second doesn't
+    /// replace the first unless the user chose to replace it.
+    #[tokio::test]
+    async fn a_finished_download_replaces_nothing_unless_asked_to() {
+        let dir = fresh("one");
+        let dest = dir.join("report.txt");
+        let (first, second) = (dir.join("report.txt.sub-tmp-1"), dir.join("report.txt.sub-tmp-2"));
+        std::fs::write(&first, "first").unwrap();
+        std::fs::write(&second, "second").unwrap();
+        finalize_download(&first, &dest, false).await.unwrap();
+        assert!(!first.exists(), "the temp file is gone once it's in place");
+        let err = finalize_download(&second, &dest, false).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "first");
+        finalize_download(&second, &dest, true).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "second", "replaced when asked to");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_in_the_way_is_not_written_through() {
+        let dir = fresh("link");
+        let target = dir.join("elsewhere");
+        std::os::unix::fs::symlink(&target, dir.join("x.txt")).unwrap();
+        let temp = dir.join("x.txt.sub-tmp-1");
+        std::fs::write(&temp, "data").unwrap();
+        assert_eq!(finalize_download(&temp, &dir.join("x.txt"), false).await.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(!target.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn names_that_differ_only_in_case_are_one_name_where_case_is_ignored() {
+        let list = || {
+            ["Docs/Readme.md", "docs/README.md", "docs/other.md", "Makefile", "makefile"]
+                .iter()
+                .map(|rel| (format!("/srv/{rel}"), rel.to_string(), 1))
+                .collect::<Vec<_>>()
+        };
+        let mut files = list();
+        assert_eq!(drop_case_twins(&mut files, true), 2);
+        let kept: Vec<&str> = files.iter().map(|(_, rel, _)| rel.as_str()).collect();
+        assert_eq!(kept, ["Docs/Readme.md", "docs/other.md", "Makefile"]);
+        let mut files = list();
+        assert_eq!(drop_case_twins(&mut files, false), 0, "where case counts, they're different files");
+        assert_eq!(files.len(), 5);
+        assert!(super::case_twins_note(2).unwrap().starts_with("2 files skipped"));
+        assert_eq!(super::existing_skipped_note(0), None);
+    }
 }
 
 #[tauri::command]
@@ -20544,6 +20792,21 @@ fn transfer_id() -> String {
     format!("{}-{}", ts, seq)
 }
 
+/// Removes this run's temp root, keeping Live Edit copies with edits that
+/// never reached the server first, as a disconnect does (keep_unsent_edits).
+fn remove_own_temp(root: &Path) {
+    keep_unsent_edits(root, true);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Whether a name in the system's temp folder is one of this app's temp
+/// roots: `submarine-` and the hex app_temp_root mints (24 digits; 32 is
+/// accepted too). Nothing else there is swept.
+fn is_app_temp_name(name: &str) -> bool {
+    name.strip_prefix("submarine-")
+        .is_some_and(|h| (h.len() == 24 || h.len() == 32) && h.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// Remove this run's temp root (live-edit / drag staging), and any left by a
 /// run that didn't get to. Called on exit, and on startup for the old ones.
 /// Only `submarine-<hex>` dirs older than a day are swept on startup: a newer
@@ -20551,26 +20814,110 @@ fn transfer_id() -> String {
 /// installed app beside a test build, say), whose live files must not go.
 fn sweep_app_temp(include_own: bool) {
     if include_own {
-        let _ = std::fs::remove_dir_all(app_temp_root());
+        // Let go of this run's lock first: on Windows a file held open
+        // keeps its folder from being removed.
+        drop(APP_TEMP_LOCK.lock().unwrap_or_else(|e| e.into_inner()).take());
+        remove_own_temp(app_temp_root());
     }
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
-    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    sweep_old_temp_roots(&std::env::temp_dir(), std::time::Duration::from_secs(24 * 60 * 60));
+}
+
+/// The file in each run's temp root that the run holds locked for as long
+/// as it lives (lock_temp_root). The system lets go of it when the process
+/// ends, however it ends.
+const TEMP_ROOT_LOCK: &str = ".submarine-run.lock";
+
+/// This run's lock on its temp root, taken when the root is made.
+static APP_TEMP_LOCK: StdMutex<Option<std::fs::File>> = StdMutex::new(None);
+
+/// Makes the lock file in `root` and locks it; None where that can't be done.
+fn lock_temp_root(root: &Path) -> Option<std::fs::File> {
+    let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(root.join(TEMP_ROOT_LOCK)).ok()?;
+    file.try_lock().ok()?;
+    Some(file)
+}
+
+/// Removes the temp roots in `temp` that other runs left: ones older than
+/// `age` whose run is over. A run that's still going holds its root's lock
+/// (another copy of the app beside this one), and its root is left alone;
+/// so is one whose lock can't be looked at, or that isn't this user's. A
+/// root from before the lock (no lock file) goes by its age only. Live Edit
+/// copies in a root are kept in `unsent_edits_dir` before it goes: which of
+/// them had edits that never reached the server isn't known any more.
+fn sweep_old_temp_roots(temp: &Path, age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(temp) else { return };
     for e in entries.flatten() {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
-        // `submarine-<32 hex>`, the shape app_temp_root mints.
-        let is_ours = name.strip_prefix("submarine-").is_some_and(|h| h.len() == 32 && h.bytes().all(|b| b.is_ascii_hexdigit()));
-        if !is_ours {
+        if !is_app_temp_name(name) {
             continue;
         }
-        let old = e
-            .metadata()
-            .and_then(|m| m.modified())
-            .map(|t| t.elapsed().map(|age| age > day).unwrap_or(false))
-            .unwrap_or(false);
-        if old {
-            let _ = std::fs::remove_dir_all(e.path());
+        // The folder itself, never what a link leads to.
+        let Ok(meta) = std::fs::symlink_metadata(e.path()) else { continue };
+        if !meta.is_dir() {
+            continue;
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid has no preconditions and can't fail.
+            if meta.uid() != unsafe { libc::geteuid() } {
+                continue;
+            }
+        }
+        let old = meta.modified().map(|t| t.elapsed().map(|a| a > age).unwrap_or(false)).unwrap_or(false);
+        if !old {
+            continue;
+        }
+        let lock = match std::fs::OpenOptions::new().read(true).open(e.path().join(TEMP_ROOT_LOCK)) {
+            Ok(file) => match file.try_lock() {
+                Ok(()) => Some(file),
+                // Held: that run is still going. Or locks don't work there,
+                // and nothing says it's over.
+                Err(_) => continue,
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => continue,
+        };
+        keep_live_edit_copies_of(&e.path());
+        drop(lock);
+        let _ = std::fs::remove_dir_all(e.path());
+    }
+}
+
+/// Moves every Live Edit copy in another run's temp root
+/// (`sftp_<session>/<hash>/<file>`) to `unsent_edits_dir`, and says so.
+/// Only real folders and regular files: a link is never followed.
+fn keep_live_edit_copies_of(root: &Path) {
+    let real_dirs = |dir: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|rd| rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).collect())
+            .unwrap_or_default()
+    };
+    let Some(folder) = unsent_edits_dir() else { return };
+    let mut kept = Vec::new();
+    for session in real_dirs(root) {
+        if !session.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("sftp_")) {
+            continue;
+        }
+        for copy_dir in real_dirs(&session) {
+            let Ok(files) = std::fs::read_dir(&copy_dir) else { continue };
+            for file in files.flatten() {
+                if !file.file_type().is_ok_and(|t| t.is_file()) {
+                    continue;
+                }
+                if kept.is_empty() && make_unsent_edits_dir(&folder).is_err() {
+                    return;
+                }
+                let name = file.file_name().to_string_lossy().into_owned();
+                if let Some(dest) = move_to_free_name(&file.path(), &folder, &name) {
+                    kept.push(dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name));
+                }
+            }
+        }
+    }
+    if !kept.is_empty() {
+        report_kept(&folder, &kept);
     }
 }
 
@@ -20648,6 +20995,11 @@ async fn read_remote_capped(
     Ok(data)
 }
 
+/// The name of a temp root: `submarine-` and its random bytes in hex.
+fn app_temp_name(bytes: &[u8]) -> String {
+    format!("submarine-{}", hex::encode(bytes))
+}
+
 /// Process-global, UNPREDICTABLE temp root for SFTP live-edit / drag staging,
 /// created once with a random name (and 0700 on Unix). The old code used a
 /// fully predictable `submarine_sftp_<session_id>` directory directly in the
@@ -20661,13 +21013,16 @@ fn app_temp_root() -> &'static std::path::PathBuf {
     ROOT.get_or_init(|| {
         let mut bytes = [0u8; 12];
         rand::rng().fill_bytes(&mut bytes);
-        let root = std::env::temp_dir().join(format!("submarine-{}", hex::encode(bytes)));
+        let root = std::env::temp_dir().join(app_temp_name(&bytes));
         let _ = std::fs::create_dir_all(&root);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
         }
+        // Held for as long as this run lives, so another copy of the app
+        // sweeping old roots leaves this one alone (sweep_old_temp_roots).
+        *APP_TEMP_LOCK.lock().unwrap_or_else(|e| e.into_inner()) = lock_temp_root(&root);
         root
     })
 }
@@ -20793,6 +21148,19 @@ fn live_edit_dir_name(remote_path: &str) -> String {
 mod live_edit_tests {
     use super::live_edit_dir_name;
 
+    /// The startup sweep recognises the temp roots this app makes (it used
+    /// to look for 32 hex digits where 24 are made, and swept nothing), and
+    /// nothing else.
+    #[test]
+    fn the_startup_sweep_knows_its_own_temp_folders() {
+        use super::{app_temp_name, is_app_temp_name};
+        assert!(is_app_temp_name(&app_temp_name(&[0xab; 12])));
+        assert!(is_app_temp_name(&format!("submarine-{}", "0f".repeat(16))));
+        for other in ["submarine-", "submarine-xyz", "submarine-liveedit-test-1", "submarine-0123456789abcdef0123456", "other-abababababababababababab", "submarine-abababababababababababab/x"] {
+            assert!(!is_app_temp_name(other), "{other}");
+        }
+    }
+
     #[test]
     fn same_named_files_in_different_folders_get_different_copies() {
         let a = live_edit_dir_name("/var/www/site1/index.php");
@@ -20867,11 +21235,18 @@ static LIVE_EDIT_APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLoc
 /// Where copies with unsent edits are kept: "Submarine unsent edits" in the
 /// Downloads folder, where the user will look for a file, or in the app's
 /// data folder when there's no Downloads folder.
+#[cfg(not(test))]
 fn unsent_edits_dir() -> Option<PathBuf> {
     const NAME: &str = "Submarine unsent edits";
     directories::UserDirs::new()
         .and_then(|d| d.download_dir().map(|p| p.join(NAME)))
         .or_else(|| LIVE_EDIT_APP.get().and_then(|a| a.path().app_data_dir().ok()).map(|p| p.join(NAME)))
+}
+
+/// Tests keep copies in a folder of their own, not in the Downloads folder.
+#[cfg(test)]
+fn unsent_edits_dir() -> Option<PathBuf> {
+    Some(std::env::temp_dir().join(format!("submarine-test-unsent-edits-{}", std::process::id())))
 }
 
 /// The names a kept copy may take in its folder: `name`, then `name (2)`,
@@ -20884,44 +21259,100 @@ fn kept_names(name: &str) -> impl Iterator<Item = String> + '_ {
     std::iter::once(name.to_string()).chain((2..10_000).map(move |n| format!("{stem} ({n}){ext}")))
 }
 
+/// Copies the file `src` to `dest`, which must not exist yet: anything
+/// there, a link too, makes it fail with `AlreadyExists`, and nothing is
+/// written through it. A copy that fails part way is removed. `private`: on
+/// Unix the copy is readable by its owner only (0600) from the start.
+fn copy_to_new(src: &Path, dest: &Path, private: bool) -> std::io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if private {
+            opts.mode(0o600);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    let mut out = opts.open(dest)?;
+    let copied = std::fs::File::open(src)
+        .and_then(|mut from| std::io::copy(&mut from, &mut out))
+        .and_then(|_| out.sync_all());
+    drop(out);
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(dest);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Moves the file `src` to `dest` only if nothing is there, and never
+/// replaces or writes through what is (a file, a folder, a link), even one
+/// that appears meanwhile: it fails with `AlreadyExists` instead. The name is
+/// claimed in one step: a hard link, which fails when the name is taken; or,
+/// where there are no hard links (FAT, some shares), a new file filled with a
+/// copy (copy_to_new). `src` is removed once it's in place. `private`: on
+/// Unix, the file is readable by its owner only (0600).
+fn move_no_replace(src: &Path, dest: &Path, private: bool) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(src, std::fs::Permissions::from_mode(0o600));
+    }
+    match std::fs::hard_link(src, dest) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(src);
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(e),
+        Err(_) => {}
+    }
+    copy_to_new(src, dest, private)?;
+    let _ = std::fs::remove_file(src);
+    Ok(())
+}
+
 /// Moves `src` into `dir` under the first of `kept_names` that's free, and
-/// returns where it went. A name is claimed in one step, so nothing that is
-/// there, or appears meanwhile (another sweep keeping a copy of the same
-/// name), is replaced or written through: a hard link, which fails when the
-/// name is taken; or, where there are no hard links between the two folders,
-/// a new file that must not exist yet, which a link already there also makes
-/// fail.
+/// returns where it went. Nothing that is there, or appears meanwhile
+/// (another sweep keeping a copy of the same name), is replaced or written
+/// through (move_no_replace). On Unix the kept copy is readable by its owner
+/// only: the folder it goes to may be readable by others.
 fn move_to_free_name(src: &Path, dir: &Path, name: &str) -> Option<PathBuf> {
-    use std::io::ErrorKind;
+    claim_free_name(dir, name, |dest| move_no_replace(src, dest, true))
+}
+
+/// Like move_to_free_name, but `src` stays where it is: a copy is kept.
+fn copy_to_free_name(src: &Path, dir: &Path, name: &str) -> Option<PathBuf> {
+    claim_free_name(dir, name, |dest| copy_to_new(src, dest, true))
+}
+
+/// The first of `kept_names` in `dir` that `place` manages to claim.
+fn claim_free_name(dir: &Path, name: &str, place: impl Fn(&Path) -> std::io::Result<()>) -> Option<PathBuf> {
     for candidate in kept_names(name) {
         let dest = dir.join(candidate);
         if std::fs::symlink_metadata(&dest).is_ok() {
             continue;
         }
-        match std::fs::hard_link(src, &dest) {
-            Ok(()) => {
-                let _ = std::fs::remove_file(src);
-                return Some(dest);
-            }
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
-            Err(_) => {}
-        }
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&dest) {
-            Ok(mut out) => {
-                let copied = std::fs::File::open(src).and_then(|mut from| std::io::copy(&mut from, &mut out)).is_ok();
-                drop(out);
-                if copied {
-                    let _ = std::fs::remove_file(src);
-                    return Some(dest);
-                }
-                let _ = std::fs::remove_file(&dest);
-                return None;
-            }
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+        match place(&dest) {
+            Ok(()) => return Some(dest),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) => return None,
         }
     }
     None
+}
+
+/// Makes `unsent_edits_dir` if it isn't there; on Unix only its owner may
+/// look in it.
+fn make_unsent_edits_dir(folder: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(folder)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
 }
 
 /// Before Live Edit copies are deleted, the ones under `under` with edits
@@ -20956,7 +21387,7 @@ fn keep_unsent_edits(under: &Path, sweep: bool) -> Option<PathBuf> {
         return None;
     }
     let folder = unsent_edits_dir()?;
-    std::fs::create_dir_all(&folder).ok()?;
+    make_unsent_edits_dir(&folder).ok()?;
     let mut kept = Vec::new();
     for path in unsent {
         let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
@@ -20967,12 +21398,118 @@ fn keep_unsent_edits(under: &Path, sweep: bool) -> Option<PathBuf> {
     if kept.is_empty() {
         return None;
     }
+    report_kept(&folder, &kept);
+    Some(folder)
+}
+
+/// Logs the copies kept in `folder` and tells the page (`live-edit-kept`).
+fn report_kept(folder: &Path, kept: &[String]) {
     crate::applog::write_line("live-edit", &format!("kept {} cop{} with unsent edits in {}", kept.len(), if kept.len() == 1 { "y" } else { "ies" }, folder.display()));
     if let Some(app) = LIVE_EDIT_APP.get() {
         use tauri::Emitter;
         let _ = app.emit("live-edit-kept", serde_json::json!({ "folder": folder.to_string_lossy(), "files": kept }));
     }
-    Some(folder)
+}
+
+/// Live Edit copies that have a watcher running, each with when it was last
+/// opened again while it ran (None if it wasn't). A copy opened again gets
+/// no second watcher, which would upload every save twice: the one running
+/// goes on (end_live_edit_watch).
+fn live_edit_watchers() -> &'static StdMutex<std::collections::HashMap<PathBuf, Option<std::time::Instant>>> {
+    static WATCHERS: std::sync::OnceLock<StdMutex<std::collections::HashMap<PathBuf, Option<std::time::Instant>>>> = std::sync::OnceLock::new();
+    WATCHERS.get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
+}
+
+fn sha256_of(data: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(data).to_vec()
+}
+
+/// Before the server's copy is written over a Live Edit copy that's already
+/// there (the file opened again), the copy is kept in `unsent_edits_dir` if it
+/// has edits that never reached the server: its content is neither what was
+/// last uploaded or downloaded, nor what the server holds now (`server_hash`).
+/// It's copied, not moved, so the editor that has it open keeps its file, and
+/// the page is told. When it can't be kept, nothing is written over it.
+fn keep_before_reopen(copy: &Path, server_hash: &[u8]) -> Result<(), String> {
+    if !std::fs::symlink_metadata(copy).is_ok_and(|m| m.is_file()) {
+        return Ok(());
+    }
+    let Ok(content) = std::fs::read(copy) else { return Ok(()) };
+    let hash = sha256_of(&content);
+    let synced = live_edit_copies().lock().unwrap_or_else(|e| e.into_inner()).get(copy).cloned();
+    if hash == server_hash || synced.as_deref() == Some(hash.as_slice()) {
+        return Ok(());
+    }
+    let name = copy.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let not_kept = || {
+        format!(
+            "{name} has changes on this computer that were never uploaded, and they couldn't be kept, so it wasn't opened again. Save it in the editor to upload them, or copy them from {}",
+            copy.display()
+        )
+    };
+    let folder = unsent_edits_dir().ok_or_else(not_kept)?;
+    make_unsent_edits_dir(&folder).map_err(|_| not_kept())?;
+    let dest = copy_to_free_name(copy, &folder, &name).ok_or_else(not_kept)?;
+    report_kept(&folder, &[dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name)]);
+    Ok(())
+}
+
+/// A Live Edit watcher is about to end: idle too long (`idle_end`), the copy
+/// gone, the session gone, or the watch itself lost. When the file was opened
+/// again meanwhile and the copy is there (`can_go_on`: the end was idleness
+/// or the copy missing, which opening it again undoes), it goes on instead,
+/// with a new deadline, returned. Otherwise the copy is wiped so the remote
+/// contents aren't left lying around in OS temp once editing is done, unless
+/// it holds edits that were never uploaded: those are kept, and the user is
+/// told. Done under the watchers' lock, so a file opened again either finds
+/// this watcher running or none, never one that's ending.
+fn end_live_edit_watch(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    filename: &str,
+    copy: &Path,
+    idle_end: bool,
+    can_go_on: bool,
+) -> Option<std::time::Instant> {
+    use tauri::Emitter;
+    let mut watchers = live_edit_watchers().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(Some(opened)) = watchers.get(copy) {
+        if can_go_on && opened.elapsed() < LIVE_EDIT_IDLE_LIMIT && std::fs::symlink_metadata(copy).is_ok_and(|m| m.is_file()) {
+            let deadline = *opened + LIVE_EDIT_IDLE_LIMIT;
+            watchers.insert(copy.to_path_buf(), None);
+            return Some(deadline);
+        }
+    }
+    watchers.remove(copy);
+    // Errors are intentionally ignored: on Windows the editor may still hold a
+    // lock on the file, and the worst case is the file persists until the OS
+    // cleans temp.
+    let synced = live_edit_copies().lock().unwrap_or_else(|e| e.into_inner()).get(copy).cloned();
+    let unsynced = std::fs::read(copy).map(|c| Some(sha256_of(&c)) != synced).unwrap_or(false);
+    // Moved out of the temp folder, which a disconnect or a lock wipes.
+    let kept_in = keep_unsent_edits(copy, false);
+    if unsynced || idle_end {
+        let message = if unsynced {
+            match &kept_in {
+                Some(folder) => format!("{filename} has changes that were not uploaded; they're kept in {}", folder.display()),
+                None => format!("{filename} has changes that were not uploaded; the copy on this computer was kept"),
+            }
+        } else {
+            format!("Auto-sync for {filename} stopped after {} hours without a change; open the file again to go on", LIVE_EDIT_IDLE_LIMIT.as_secs() / 3600)
+        };
+        let _ = app.emit(
+            &format!("sftp-sync-status-{}", session_id),
+            serde_json::json!({ "status": "error", "message": message }),
+        );
+    }
+    if !unsynced {
+        let _ = std::fs::remove_file(copy);
+        if let Some(dir) = copy.parent() {
+            let _ = std::fs::remove_dir(dir); // the file's own folder, if now empty
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -21009,6 +21546,126 @@ mod unsent_edits_tests {
         assert!(!src.exists(), "moved, not copied");
         let _ = std::fs::remove_dir_all(&src_dir);
         let _ = std::fs::remove_dir_all(&kept);
+    }
+
+    /// The copy is moved out of the app's private temp folder into Downloads,
+    /// which others on the computer may be able to read.
+    #[cfg(unix)]
+    #[test]
+    fn a_kept_copy_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let (src_dir, kept) = (fresh("src3"), fresh("kept3"));
+        let src = src_dir.join("secret.conf");
+        std::fs::write(&src, "mine").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let dest = move_to_free_name(&src, &kept, "secret.conf").unwrap();
+        assert_eq!(std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777, 0o600);
+        // The copy made where there are no hard links is private from the start.
+        let other = src_dir.join("other.conf");
+        std::fs::write(&other, "x").unwrap();
+        super::copy_to_new(&other, &kept.join("copied.conf"), true).unwrap();
+        assert_eq!(std::fs::metadata(kept.join("copied.conf")).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            super::copy_to_new(&other, &kept.join("copied.conf"), true).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "a copy never replaces a file that's there"
+        );
+        super::make_unsent_edits_dir(&kept.join("folder")).unwrap();
+        assert_eq!(std::fs::metadata(kept.join("folder")).unwrap().permissions().mode() & 0o777, 0o700);
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&kept);
+    }
+
+    /// Opening a file again writes the server's copy over the Live Edit copy.
+    /// One with edits that never reached the server is kept first, and stays
+    /// where it is for the editor that has it open; one without isn't.
+    #[test]
+    fn opening_a_file_again_keeps_unsent_edits_first() {
+        let dir = fresh("reopen");
+        let copy = dir.join("reopen-edited.txt");
+        std::fs::write(&copy, "changed here").unwrap();
+        let downloaded = super::sha256_of(b"as downloaded");
+        super::live_edit_copies().lock().unwrap().insert(copy.clone(), downloaded.clone());
+        let kept_dir = super::unsent_edits_dir().unwrap();
+        // Unchanged since the download, or already what the server holds: nothing to keep.
+        let clean = dir.join("reopen-clean.txt");
+        std::fs::write(&clean, "as downloaded").unwrap();
+        super::live_edit_copies().lock().unwrap().insert(clean.clone(), downloaded.clone());
+        super::keep_before_reopen(&clean, &super::sha256_of(b"newer on the server")).unwrap();
+        super::keep_before_reopen(&copy, &super::sha256_of(b"changed here")).unwrap();
+        assert!(!kept_dir.join("reopen-clean.txt").exists());
+        assert!(!kept_dir.join("reopen-edited.txt").exists());
+        // Edited, and the server has something else: kept.
+        super::keep_before_reopen(&copy, &super::sha256_of(b"newer on the server")).unwrap();
+        assert_eq!(std::fs::read_to_string(kept_dir.join("reopen-edited.txt")).unwrap(), "changed here");
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "changed here", "the editor's file stays");
+        // No copy there yet: nothing to do.
+        super::keep_before_reopen(&dir.join("reopen-new.txt"), &downloaded).unwrap();
+        {
+            let mut copies = super::live_edit_copies().lock().unwrap();
+            copies.remove(&copy);
+            copies.remove(&clean);
+        }
+        let _ = std::fs::remove_file(kept_dir.join("reopen-edited.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Another run's temp root that's still in use (its lock is held) is
+    /// left alone; one whose run is over goes, its Live Edit copies kept first.
+    #[test]
+    fn the_startup_sweep_leaves_running_copies_alone_and_keeps_live_edit_copies() {
+        let temp = fresh("sweep");
+        let pid = std::process::id();
+        let busy = temp.join(super::app_temp_name(&[1; 12]));
+        let done = temp.join(super::app_temp_name(&[2; 12]));
+        for root in [&busy, &done] {
+            std::fs::create_dir_all(root.join("sftp_session-1/0123456789abcdef")).unwrap();
+            std::fs::create_dir_all(root.join("drag_session-1")).unwrap();
+            std::fs::write(root.join("drag_session-1/dragged.bin"), "x").unwrap();
+        }
+        let busy_copy = busy.join(format!("sftp_session-1/0123456789abcdef/sweep-busy-{pid}.txt"));
+        let done_copy = done.join(format!("sftp_session-1/0123456789abcdef/sweep-done-{pid}.txt"));
+        std::fs::write(&busy_copy, "busy").unwrap();
+        std::fs::write(&done_copy, "edited").unwrap();
+        let held = super::lock_temp_root(&busy).expect("a lock");
+        // The other run's lock file, no longer held by anyone.
+        drop(super::lock_temp_root(&done).expect("a lock"));
+        super::sweep_old_temp_roots(&temp, std::time::Duration::ZERO);
+        assert!(busy_copy.exists(), "a run that's still going keeps its folder");
+        assert!(!done.exists(), "a finished run's folder is removed");
+        let kept_dir = super::unsent_edits_dir().unwrap();
+        assert_eq!(std::fs::read_to_string(kept_dir.join(format!("sweep-done-{pid}.txt"))).unwrap(), "edited");
+        assert!(!kept_dir.join("dragged.bin").exists(), "drag copies aren't edits");
+        drop(held);
+        let _ = std::fs::remove_file(kept_dir.join(format!("sweep-done-{pid}.txt")));
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// Quitting the app removes its temp folder; a Live Edit copy in it with
+    /// edits that never reached the server is kept first, and one without
+    /// goes with the folder.
+    #[test]
+    fn quitting_keeps_unsent_edits() {
+        use sha2::{Digest, Sha256};
+        let root = fresh("exit-root");
+        let edited = root.join("sftp_session-1/0123456789abcdef/exit-edited.txt");
+        let clean = root.join("sftp_session-1/fedcba9876543210/exit-clean.txt");
+        for (path, content) in [(&edited, "changed here"), (&clean, "as on the server")] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        {
+            let mut copies = super::live_edit_copies().lock().unwrap();
+            copies.insert(edited.clone(), Sha256::digest(b"as on the server").to_vec());
+            copies.insert(clean.clone(), Sha256::digest(b"as on the server").to_vec());
+        }
+        super::remove_own_temp(&root);
+        assert!(!root.exists(), "the temp folder is gone");
+        let kept_dir = super::unsent_edits_dir().unwrap();
+        assert_eq!(std::fs::read_to_string(kept_dir.join("exit-edited.txt")).unwrap(), "changed here");
+        assert!(!kept_dir.join("exit-clean.txt").exists(), "a copy without edits isn't kept");
+        assert!(!super::live_edit_copies().lock().unwrap().keys().any(|p| p.starts_with(&root)));
+        let _ = std::fs::remove_file(kept_dir.join("exit-edited.txt"));
     }
 
     #[cfg(unix)]
@@ -21079,16 +21736,35 @@ async fn sftp_open_remote_file(
     std::fs::create_dir_all(&copy_dir)
         .map_err(|e| format!("Failed to create temp dir: {}", e))?;
     let temp_file_path = copy_dir.join(&filename);
-    std::fs::write(&temp_file_path, &data).map_err(|e| format!("Failed to write temporary file: {}", e))?;
     // What the server holds as far as we know — upload only when the copy
     // differs from it, not on every write event (an editor touching the file,
     // the same file opened a second time).
-    let synced_hash = {
-        use sha2::{Digest, Sha256};
-        Sha256::digest(&data).to_vec()
-    };
+    let synced_hash = sha256_of(&data);
     let _ = LIVE_EDIT_APP.set(app_handle.clone());
-    live_edit_copies().lock().unwrap_or_else(|e| e.into_inner()).insert(temp_file_path.clone(), synced_hash.clone());
+    // The file may be open already. Its copy is then kept first if it has
+    // edits that never reached the server (keep_before_reopen), and the
+    // watcher that's running goes on: a second one would upload every save
+    // twice. All of it under the watchers' lock (see end_live_edit_watch).
+    let watching = {
+        let mut watchers = live_edit_watchers().lock().unwrap_or_else(|e| e.into_inner());
+        let watching = watchers.contains_key(&temp_file_path);
+        keep_before_reopen(&temp_file_path, &synced_hash)?;
+        std::fs::write(&temp_file_path, &data).map_err(|e| format!("Failed to write temporary file: {}", e))?;
+        live_edit_copies().lock().unwrap_or_else(|e| e.into_inner()).insert(temp_file_path.clone(), synced_hash.clone());
+        watchers.insert(temp_file_path.clone(), watching.then(std::time::Instant::now));
+        watching
+    };
+    if watching {
+        #[cfg(not(target_os = "android"))]
+        {
+            local_open::mark_from_internet(&temp_file_path);
+            local_open::open_for_editing(&app_handle, &temp_file_path).map_err(|e| format!("Failed to open file: {}", e))?;
+        }
+        return Ok(());
+    }
+    let forget_watcher = |path: &Path| {
+        live_edit_watchers().lock().unwrap_or_else(|e| e.into_inner()).remove(path);
+    };
 
     // The watcher is made here, before the editor opens, so one that can't start
     // (inotify's limits, say) is an error the user sees, not a file that never
@@ -21100,11 +21776,13 @@ async fn sftp_open_remote_file(
     let (raw_tx, raw_rx) = std::sync::mpsc::channel();
     let (tok_tx, mut tok_rx) = tokio::sync::mpsc::channel::<()>(8);
     let mut debouncer = new_debouncer(std::time::Duration::from_millis(750), raw_tx).map_err(|e| {
+        forget_watcher(&temp_file_path);
         let _ = std::fs::remove_file(&temp_file_path);
         let _ = std::fs::remove_dir(&copy_dir);
         format!("Can't watch the file for changes, so edits to it wouldn't be uploaded: {e}")
     })?;
     if let Err(e) = debouncer.watcher().watch(&copy_dir, RecursiveMode::NonRecursive) {
+        forget_watcher(&temp_file_path);
         let _ = std::fs::remove_file(&temp_file_path);
         let _ = std::fs::remove_dir(&copy_dir);
         return Err(format!("Can't watch the file for changes, so edits to it wouldn't be uploaded: {e}"));
@@ -21133,7 +21811,7 @@ async fn sftp_open_remote_file(
     // depend on. Refuse cleanly so the UI can surface a polite message.
     #[cfg(target_os = "android")]
     {
-        let _ = &temp_file_path;
+        forget_watcher(&temp_file_path);
         return Err("Live edit in system editor is not available on Android.".into());
     }
     // In an editor, never by the file's own default action: on Windows that
@@ -21142,6 +21820,7 @@ async fn sftp_open_remote_file(
     {
         local_open::mark_from_internet(&temp_file_path);
         if let Err(e) = local_open::open_for_editing(&app_handle, &temp_file_path) {
+            forget_watcher(&temp_file_path);
             return Err(format!("Failed to open file: {}", e));
         }
     }
@@ -21161,20 +21840,29 @@ async fn sftp_open_remote_file(
         // upload. The limit is on idleness, not on the session: any save starts
         // it again. It used to end two hours after the file was opened, and a save
         // after that was neither uploaded nor reported.
+        // What the server holds is in live_edit_copies, not kept here: opening
+        // the file again sets it to what was downloaded then.
         let mut deadline = tokio::time::Instant::now() + LIVE_EDIT_IDLE_LIMIT;
-        let mut idle_end = false;
-        let mut synced_hash = synced_hash;
+        // Set when the watch is to end: whether it was idle for too long, and
+        // whether opening the file again would undo why (end_live_edit_watch).
+        let mut ended: Option<(bool, bool)> = None;
         loop {
+            if let Some((idle_end, can_go_on)) = ended.take() {
+                match end_live_edit_watch(&app_handle_clone, &session_id_clone, &filename_clone, &temp_file_path_clone, idle_end, can_go_on) {
+                    Some(next) => deadline = tokio::time::Instant::from_std(next),
+                    None => break,
+                }
+            }
             let wait = tokio::time::sleep_until(deadline);
             tokio::select! {
                 _ = wait => {
-                    idle_end = true;
-                    break;
+                    ended = Some((true, true));
+                    continue;
                 }
                 maybe = tok_rx.recv() => {
-                    if maybe.is_none() { break; }
+                    if maybe.is_none() { ended = Some((false, false)); continue; }
                     deadline = tokio::time::Instant::now() + LIVE_EDIT_IDLE_LIMIT;
-                    if !temp_file_path_clone.exists() { break; }
+                    if !temp_file_path_clone.exists() { ended = Some((false, true)); continue; }
                     let content = match std::fs::read(&temp_file_path_clone) {
                         Ok(c) => c,
                         Err(e) => {
@@ -21185,11 +21873,14 @@ async fn sftp_open_remote_file(
                             continue;
                         }
                     };
-                    let content_hash = {
-                        use sha2::{Digest, Sha256};
-                        Sha256::digest(&content).to_vec()
-                    };
-                    if content_hash == synced_hash { continue; }
+                    let content_hash = sha256_of(&content);
+                    let synced_hash = live_edit_copies().lock().unwrap_or_else(|e| e.into_inner()).get(&temp_file_path_clone).cloned();
+                    match synced_hash {
+                        Some(h) if h == content_hash => continue,
+                        Some(_) => {}
+                        // Swept: the session's temp folder is going.
+                        None => { ended = Some((false, false)); continue; }
+                    }
                     // Cheap pre-check: if the session is gone we exit the
                     // watcher entirely instead of looping and spamming
                     // "Auto-sync failed" toasts on every subsequent save.
@@ -21203,7 +21894,8 @@ async fn sftp_open_remote_file(
                                     "message": format!("Auto-sync stopped — session for {} is gone", filename_clone),
                                 }),
                             );
-                            break;
+                            ended = Some((false, false));
+                            continue;
                         }
                     }
                     let upload_res = async {
@@ -21267,9 +21959,8 @@ async fn sftp_open_remote_file(
                             serde_json::json!({ "status": "error", "message": format!("Auto-sync failed: {}", e) })
                         );
                     } else {
-                        synced_hash = content_hash;
                         if let Some(h) = live_edit_copies().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&temp_file_path_clone) {
-                            h.clone_from(&synced_hash);
+                            *h = content_hash;
                         }
                         let _ = app_handle_clone.emit(
                             &format!("sftp-sync-status-{}", session_id_clone),
@@ -21279,39 +21970,7 @@ async fn sftp_open_remote_file(
                 }
             }
         }
-        // The watcher exited (idle for a long time, the file disappeared, or the
-        // session is gone). The copy is wiped so the remote contents aren't left
-        // lying around in OS temp once editing is done, unless it holds edits that
-        // were never uploaded: those stay, and the user is told. Errors are
-        // intentionally ignored: on Windows the editor may still hold a lock on the
-        // file, and the worst case is the file persists until the OS cleans temp.
         drop(debouncer);
-        let unsynced = {
-            use sha2::{Digest, Sha256};
-            std::fs::read(&temp_file_path_clone).map(|c| Sha256::digest(&c).to_vec() != synced_hash).unwrap_or(false)
-        };
-        // Moved out of the temp folder, which a disconnect or a lock wipes.
-        let kept_in = keep_unsent_edits(&temp_file_path_clone, false);
-        if unsynced || idle_end {
-            let message = if unsynced {
-                match &kept_in {
-                    Some(folder) => format!("{filename_clone} has changes that were not uploaded; they're kept in {}", folder.display()),
-                    None => format!("{filename_clone} has changes that were not uploaded; the copy on this computer was kept"),
-                }
-            } else {
-                format!("Auto-sync for {filename_clone} stopped after {} hours without a change; open the file again to go on", LIVE_EDIT_IDLE_LIMIT.as_secs() / 3600)
-            };
-            let _ = app_handle_clone.emit(
-                &format!("sftp-sync-status-{}", session_id_clone),
-                serde_json::json!({ "status": "error", "message": message }),
-            );
-        }
-        if !unsynced {
-            let _ = std::fs::remove_file(&temp_file_path_clone);
-            if let Some(dir) = temp_file_path_clone.parent() {
-                let _ = std::fs::remove_dir(dir); // the file's own folder, if now empty
-            }
-        }
     });
 
     Ok(())
@@ -22895,6 +23554,48 @@ fn lands_in(path: &std::path::Path, dirs: &[std::path::PathBuf]) -> bool {
     dirs.iter().map(|d| norm(d)).any(|d| !d.is_empty() && (p == d || p.starts_with(&format!("{}/", d))))
 }
 
+/// The folders this system runs programs from at login (autorun_dirs), as
+/// written and as resolved, for asking whether a file a server named may be
+/// written somewhere. Every writer that puts files the server names below a
+/// folder the user chose asks it: folder downloads, and a mirror's downloads
+/// (mirror.rs).
+pub(crate) struct LoginFolders(Vec<std::path::PathBuf>);
+
+impl LoginFolders {
+    pub(crate) fn new() -> Self {
+        Self::of(autorun_dirs())
+    }
+
+    fn of(dirs: Vec<std::path::PathBuf>) -> Self {
+        let resolved: Vec<std::path::PathBuf> = dirs.iter().filter_map(|d| d.canonicalize().ok()).collect();
+        Self(dirs.into_iter().chain(resolved).collect())
+    }
+
+    /// Whether a file a server named may be written at `path`: not in or
+    /// under a login folder. Checked as written and, for the part of the path
+    /// that exists, as resolved, so a link or junction to a login folder
+    /// (`~/Downloads/x -> ~/.config/autostart`) doesn't get around it.
+    pub(crate) fn may_hold_server_file(&self, path: &std::path::Path) -> bool {
+        !lands_in(path, &self.0) && !resolve_existing_part(path).is_some_and(|p| lands_in(&p, &self.0))
+    }
+}
+
+/// `path` with the longest part of it that exists resolved (links followed,
+/// `..` taken out), and the rest, which doesn't exist yet, as written. None
+/// when nothing of it resolves.
+fn resolve_existing_part(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut rest = Vec::new();
+    let mut part = path;
+    loop {
+        if let Ok(mut real) = part.canonicalize() {
+            real.extend(rest.iter().rev());
+            return Some(real);
+        }
+        rest.push(part.file_name()?.to_os_string());
+        part = part.parent()?;
+    }
+}
+
 /// The note on a finished folder-download card for files left out because
 /// they would land in a login folder (see autorun_dirs).
 fn autorun_skipped_note(skipped: u64) -> Option<String> {
@@ -23840,7 +24541,7 @@ fn resolve_node_auth_row(
     Ok((
         monitor::NodeAuth {
             host,
-            port: port as u16,
+            port: valid_port(port)?,
             // Blank stays blank: connect_for_monitor reports it instead of
             // guessing root (#54).
             username,
@@ -23851,6 +24552,8 @@ fn resolve_node_auth_row(
             proxy_host: proxy_host.filter(|s| !s.is_empty()),
             proxy_port: proxy_port.map(|p| p as u16),
             jump: None,
+            name: server_display_name(conn, node_id),
+            server_id: Some(node_id),
         },
         jump_host_id,
     ))
@@ -24782,6 +25485,27 @@ mod tests {
         assert!(!lands_in(std::path::Path::new("/home/me/.config/autostart-old/x"), &dirs));
         assert!(!lands_in(std::path::Path::new("/anything"), &[std::path::PathBuf::new()]));
         assert_eq!(autorun_skipped_note(0), None);
+        let folders = LoginFolders::of(dirs.clone());
+        assert!(!folders.may_hold_server_file(std::path::Path::new("/home/me/.config/autostart/x.desktop")));
+        assert!(folders.may_hold_server_file(std::path::Path::new("/home/me/Downloads/alice/.config/autostart/x.desktop")));
+    }
+
+    /// A link to a login folder, below the folder a download or a mirror
+    /// writes into, is seen through.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_login_folder_is_caught_too() {
+        let root = std::env::temp_dir().join(format!("submarine-login-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let autostart = root.join("home/.config/autostart");
+        std::fs::create_dir_all(&autostart).unwrap();
+        std::fs::create_dir_all(root.join("mirror")).unwrap();
+        std::os::unix::fs::symlink(&autostart, root.join("mirror/startup")).unwrap();
+        let folders = LoginFolders::of(vec![autostart.clone()]);
+        assert!(!folders.may_hold_server_file(&root.join("mirror/startup/x.desktop")));
+        assert!(!folders.may_hold_server_file(&root.join("mirror/startup/new/deeper/x.desktop")));
+        assert!(folders.may_hold_server_file(&root.join("mirror/other/x.desktop")));
+        let _ = std::fs::remove_dir_all(&root);
         assert!(autorun_skipped_note(2).unwrap().starts_with("2 files skipped"));
     }
 

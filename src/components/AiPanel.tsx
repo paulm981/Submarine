@@ -86,36 +86,50 @@ const PendingCard = ({ p, decide, onGoToServer }: { p: AiPending; decide: (allow
   const settledAt = useRef(0);
   const lastTop = useRef<number | null>(null);
   const downHere = useRef(false);
-  // On every render (any change to the panel): has it moved?
-  useLayoutEffect(() => {
-    const top = ref.current?.offsetTop ?? 0;
-    if (lastTop.current !== top) {
-      lastTop.current = top;
-      settledAt.current = performance.now() + SETTLE_MS;
-      downHere.current = false;
-    }
-  });
-  // Moved by something that didn't re-render it (the window resized, text
-  // above it wrapping differently): the same.
+  // Where it is on screen now, against where it was: moved, its clicks wait
+  // SETTLE_MS again. On the screen, not in its list (offsetTop), so
+  // scrolling counts too: the AI withdrawing a card above can make the
+  // panel scroll this one under the pointer without it moving in the list.
+  const moved = () => {
+    const el = ref.current;
+    if (!el) return false;
+    const top = el.getBoundingClientRect().top;
+    if (lastTop.current === top) return false;
+    lastTop.current = top;
+    settledAt.current = performance.now() + SETTLE_MS;
+    downHere.current = false;
+    return true;
+  };
+  // On every render (any change to the panel).
+  useLayoutEffect(() => { moved(); });
+  // And when it moves without a render: any scrolling (caught on the way
+  // down, so the panel's own counts), the window resizing, text above it
+  // wrapping differently.
   useEffect(() => {
     const el = ref.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(() => {
-      if (lastTop.current !== el.offsetTop) {
-        lastTop.current = el.offsetTop;
-        settledAt.current = performance.now() + SETTLE_MS;
-        downHere.current = false;
-      }
-    });
-    if (el.parentElement) ro.observe(el.parentElement);
-    return () => ro.disconnect();
+    if (!el) return;
+    const check = () => { moved(); };
+    document.addEventListener("scroll", check, true);
+    window.addEventListener("resize", check);
+    const ro = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(check);
+    if (ro) {
+      ro.observe(el);
+      if (el.parentElement) ro.observe(el.parentElement);
+    }
+    return () => {
+      document.removeEventListener("scroll", check, true);
+      window.removeEventListener("resize", check);
+      ro?.disconnect();
+    };
   }, []);
+  // Looked at again as the button goes down and as the click comes: a move
+  // nothing above reported still counts.
   const accept = (e: React.MouseEvent) => {
-    const ok = e.detail === 1 && downHere.current && performance.now() >= settledAt.current;
+    const ok = !moved() && e.detail === 1 && downHere.current && performance.now() >= settledAt.current;
     downHere.current = false;
     return ok;
   };
-  const down = () => { downHere.current = performance.now() >= settledAt.current; };
+  const down = () => { downHere.current = !moved() && performance.now() >= settledAt.current; };
   return (
     <div ref={ref} className="m-2 rounded-xl border border-primary/30 bg-primary/[0.06] p-3 space-y-2">
       <div className="text-[11.5px] text-zinc-300">
@@ -268,6 +282,15 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
             <Bot size={13} className="mt-0.5 shrink-0 text-zinc-400" />
             <div className="flex-1 min-w-0">
               <div className="font-semibold text-zinc-200">{t.label}</div>
+              {t.intruder_at && (
+                <div className="my-1 flex items-start gap-1.5 text-[11px] text-amber-300 leading-snug">
+                  <ShieldAlert size={13} className="shrink-0 mt-px" />
+                  <span>
+                    Another program tried to connect as this AI tab{time(t.intruder_at) && <> at {time(t.intruder_at)}</>}, and was refused.
+                    Only the AI tool in that tab should connect: another program running as you may have copied its access. If you didn't expect this, close the AI tab.
+                  </span>
+                </div>
+              )}
               <div className="text-[11px] text-zinc-500 flex flex-wrap gap-x-2">
                 {t.servers.length === 0 ? "nothing shared" : (
                   <>

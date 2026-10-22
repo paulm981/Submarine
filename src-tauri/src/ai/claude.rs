@@ -4,7 +4,8 @@
 //! It starts with `--mcp-config` naming one MCP server, `submarine`, which
 //! runs this program with `--mcp` (helper.rs). That adds to your own MCP
 //! servers rather than replacing them. The entry's `env` names
-//! `${SUBMARINE_AI_ADDR}` and `${SUBMARINE_AI_TOKEN}`, which Claude Code fills
+//! `${SUBMARINE_AI_ADDR}`, `${SUBMARINE_AI_TOKEN}` and `${SUBMARINE_AI_PID}`
+//! (the app's process id, which the helper checks the channel by), which Claude Code fills
 //! in from its own environment, where Submarine put them: the token is never
 //! on a command line or in a file.
 //!
@@ -13,7 +14,7 @@
 //!   cmd.exe, and JSON doesn't survive cmd.exe's quoting. So `--mcp-config`
 //!   names a file in Submarine's data folder instead. It holds no secret.
 
-use super::channel::{ENV_ADDR, ENV_TOKEN};
+use super::channel::{ENV_ADDR, ENV_PID, ENV_TOKEN};
 use std::path::{Path, PathBuf};
 
 pub(crate) const LABEL: &str = "Claude Code";
@@ -31,6 +32,7 @@ pub(crate) fn mcp_config(helper: &Path) -> serde_json::Value {
                 "env": {
                     ENV_ADDR: format!("${{{ENV_ADDR}}}"),
                     ENV_TOKEN: format!("${{{ENV_TOKEN}}}"),
+                    ENV_PID: format!("${{{ENV_PID}}}"),
                 }
             }
         }
@@ -152,6 +154,7 @@ mod tests {
         assert_eq!(s["args"], serde_json::json!(["--mcp"]));
         assert_eq!(s["env"][ENV_TOKEN], "${SUBMARINE_AI_TOKEN}");
         assert_eq!(s["env"][ENV_ADDR], "${SUBMARINE_AI_ADDR}");
+        assert_eq!(s["env"][ENV_PID], "${SUBMARINE_AI_PID}");
     }
 
     #[cfg(not(windows))]
