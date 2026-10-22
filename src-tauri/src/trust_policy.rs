@@ -122,6 +122,39 @@ pub(crate) fn known_only_by_certificate(known_hosts: Option<&HostTrust>, conn: &
             .is_ok()
 }
 
+/// After `HostKeyAlgorithms` from ~/.ssh/config (#170) has had its say, the
+/// kinds of host key the app trusts for the host are still asked for first,
+/// as without it (`prefer_known_host_keys`): a list that put another kind
+/// first would make a server with several keys show one the app doesn't
+/// know, and the changed-key warning would follow. A list that leaves the
+/// trusted kind out entirely is logged.
+pub(crate) fn keep_known_kinds_first(
+    db: &std::sync::Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
+    host: &str,
+    port: u16,
+    preferred: &mut russh::Preferred,
+    log: &mut Vec<String>,
+) {
+    let families = match db.lock() {
+        Ok(guard) => guard.as_ref().map(|c| crate::ssh_manager::known_host_families(c, host, port)).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    keep_kinds_first(preferred, &families, log);
+}
+
+fn keep_kinds_first(preferred: &mut russh::Preferred, families: &[String], log: &mut Vec<String>) {
+    crate::prefer_known_host_keys(preferred, families);
+    let asked: Vec<String> = preferred.key.iter().map(|a| crate::ssh_manager::key_type_family(a.as_str())).collect();
+    let missing: Vec<&str> = families.iter().filter(|f| !asked.contains(f)).map(String::as_str).collect();
+    if !missing.is_empty() {
+        log.push(format!(
+            "~/.ssh/config: HostKeyAlgorithms leaves out the kind of host key this app trusts for this server ({}); \
+             another kind of key from it will get the changed-key warning.",
+            missing.join(", ")
+        ));
+    }
+}
+
 /// Seconds since the epoch.
 pub(crate) fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -296,5 +329,29 @@ mod tests {
         assert!(said.contains("~/.tsh/u-cert.pub has expired; skipped"), "{said}");
         let current = cert(&ca, &["u"], (now() - 60, now() + 3600), CertType::User);
         assert!(offer_client_certificate("c", &current, |_| panic!("no line for a usable one")));
+    }
+
+    #[test]
+    fn host_key_algorithms_from_the_config_keep_the_trusted_kind_first() {
+        let order = |p: &russh::Preferred| p.key.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let on_file = vec!["ssh-ed25519".to_string()];
+        // A list that puts RSA first: the trusted Ed25519 is still asked for first.
+        let mut p = crate::ssh_preferred_algorithms();
+        let mut log = Vec::new();
+        crate::apply_host_key_algorithms(&mut p, false, Some("rsa-sha2-512,ssh-ed25519"), &mut log);
+        assert_eq!(order(&p)[0], "rsa-sha2-512");
+        keep_kinds_first(&mut p, &on_file, &mut log);
+        assert_eq!(order(&p), vec!["ssh-ed25519", "rsa-sha2-512"]);
+        assert!(log.is_empty(), "{log:?}");
+        // A list without it: said in the log.
+        let mut p = crate::ssh_preferred_algorithms();
+        crate::apply_host_key_algorithms(&mut p, false, Some("rsa-sha2-512"), &mut log);
+        keep_kinds_first(&mut p, &on_file, &mut log);
+        assert!(log.iter().any(|l| l.contains("leaves out") && l.contains("ssh-ed25519")), "{log:?}");
+        // Nothing on file: the config's order stands.
+        let mut p = crate::ssh_preferred_algorithms();
+        crate::apply_host_key_algorithms(&mut p, false, Some("^rsa-sha2-256"), &mut Vec::new());
+        keep_kinds_first(&mut p, &[], &mut Vec::new());
+        assert_eq!(order(&p)[0], "rsa-sha2-256");
     }
 }

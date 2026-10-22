@@ -11070,6 +11070,7 @@ fn client_config_for_target(
 ) -> russh::client::Config {
     let mut config = build_ssh_client_config_for(db, host, port);
     apply_host_key_algorithms(&mut config.preferred, trust.is_some_and(|t| t.has_cas()), host_key_algorithms, log);
+    trust_policy::keep_known_kinds_first(db, host, port, &mut config.preferred, log); // fork (#43)
     config
 }
 
