@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { SearchAddon, ISearchOptions } from '@xterm/addon-search';
@@ -244,6 +245,12 @@ const TerminalView = ({
     };
   };
   const terminalRef = useRef<HTMLDivElement>(null);
+  // What a Wall moves into its tile (terminalDock): the div xterm draws
+  // into, and over it this terminal's search box, Saved password button and
+  // toast, so they go with it. The ref is for long-lived handlers, the state
+  // to render the overlays into it.
+  const dockElRef = useRef<HTMLDivElement | null>(null);
+  const [dockEl, setDockEl] = useState<HTMLDivElement | null>(null);
   const xtermRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const searchAddonRef = useRef<SearchAddon | null>(null);
@@ -581,7 +588,8 @@ const TerminalView = ({
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (!(e.ctrlKey || e.metaKey)) return;
-      const wrapper = terminalRef.current;
+      // Where the terminal is now: its tab, or a Wall's tile.
+      const wrapper = dockElRef.current;
       if (!wrapper) return;
       const active = document.activeElement;
       if (!(active instanceof Node) || !wrapper.contains(active)) return;
@@ -815,10 +823,17 @@ const TerminalView = ({
     // src/ui/terminalDock.ts) — so the mouse, resize and focus handling
     // below is bound to it, not to this component's wrapper.
     const home = terminalRef.current;
+    const dock = document.createElement('div');
+    dock.style.position = 'relative';
+    dock.style.width = '100%';
+    dock.style.height = '100%';
     const host = document.createElement('div');
     host.style.width = '100%';
     host.style.height = '100%';
-    home.appendChild(host);
+    dock.appendChild(host);
+    home.appendChild(dock);
+    dockElRef.current = dock;
+    setDockEl(dock);
     term.open(host);
 
     // Draw with the GPU (xterm's WebGL renderer) unless Settings turned it
@@ -1449,7 +1464,7 @@ const TerminalView = ({
       terminalId,
       sessionId,
       term,
-      host,
+      host: dock,
       home,
       live: () => !disabledRef.current && ptyLiveRef.current,
       paste: (text) => {
@@ -1510,7 +1525,9 @@ const TerminalView = ({
       webgl?.dispose();
       forgetTerminal(terminalId);
       term.dispose();
-      host.remove();
+      dock.remove();
+      if (dockElRef.current === dock) dockElRef.current = null;
+      setDockEl((cur) => (cur === dock ? null : cur));
       invoke(commands.close, { terminalId }).catch(console.error);
     };
   }, [sessionId, terminalId]);
@@ -1525,104 +1542,128 @@ const TerminalView = ({
         ref={terminalRef}
         className="flex-1 min-h-0 w-full overflow-hidden select-text"
       />
-      {/* Search chip — floats above xterm; positioned inside the outer
-          flex column so it never displaces the terminal grid. Absolute
-          top-2 right-2 keeps it clear of the disconnected badge (which
-          centers) and the clipboard toast (bottom-right). */}
-      {showSearch && (
-        <div className="absolute top-2 right-2 z-20 flex items-center gap-1 rounded-md bg-zinc-800 border border-white/10 px-1.5 py-1 shadow-lg">
-          <input
-            ref={searchInputRef}
-            autoFocus
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => {
-              // Stop keys from leaking to the document listener (Ctrl+F
-              // reopen loop) and to xterm's textarea (which would type
-              // into the shell).
-              if (e.key === 'Escape') {
-                e.preventDefault();
-                setQuery('');
-                closeSearch();
-              } else if (e.key === 'Enter') {
-                e.preventDefault();
-                runFind(e.shiftKey ? 'prev' : 'next');
-              } else if ((e.ctrlKey || e.metaKey) && (e.key === 'f' || e.key === 'F')) {
-                // Swallow so the outer document handler doesn't re-fire
-                // (which would just refocus us — harmless but noisy).
-                e.preventDefault();
-                (e.currentTarget as HTMLInputElement).select();
-              }
-              e.stopPropagation();
-            }}
-            placeholder="Find"
-            className="bg-transparent outline-none text-[12px] text-zinc-100 placeholder:text-zinc-500 w-40 px-1"
-          />
-          <button
-            type="button"
-            onClick={() => runFind('prev')}
-            title="Previous match (Shift+Enter)"
-            className="px-1.5 py-0.5 text-[11px] text-zinc-300 hover:text-white hover:bg-white/5 rounded"
-          >
-            {'↑'}
-          </button>
-          <button
-            type="button"
-            onClick={() => runFind('next')}
-            title="Next match (Enter)"
-            className="px-1.5 py-0.5 text-[11px] text-zinc-300 hover:text-white hover:bg-white/5 rounded"
-          >
-            {'↓'}
-          </button>
-          <button
-            type="button"
-            onClick={() => { setQuery(''); closeSearch(); }}
-            title="Close (Esc)"
-            className="px-1.5 py-0.5 text-[11px] text-zinc-400 hover:text-white hover:bg-white/5 rounded"
-          >
-            {'✕'}
-          </button>
-        </div>
-      )}
-      {atPasswordPrompt && !local && !disabled && !showSearch && (
-        <div className="absolute top-2 right-2 z-20 flex flex-col items-end gap-1 max-w-[calc(100%-1rem)]">
-          <button
-            type="button"
-            onClick={() => (passwordMenu ? setPasswordMenu(null) : void openPasswordMenu())}
-            aria-haspopup="menu"
-            aria-expanded={!!passwordMenu}
-            title="Type a saved password at this prompt (no Enter)"
-            className="flex items-center gap-1.5 rounded-md bg-zinc-800 border border-white/10 px-2 py-1 shadow-lg text-[11px] text-zinc-200 hover:text-white hover:border-primary/40"
-          >
-            <KeyRound size={12} className="text-primary shrink-0" />
-            <span className="whitespace-nowrap">Saved password</span>
-          </button>
-          {passwordMenu && (
-            <div
-              role="menu"
-              aria-label="Saved passwords"
-              onKeyDown={(e) => { if (e.key === 'Escape') { e.stopPropagation(); setPasswordMenu(null); xtermRef.current?.focus(); } }}
-              className="w-64 max-w-full max-h-60 overflow-y-auto rounded-md bg-zinc-900 border border-white/10 shadow-xl p-1"
-            >
-              {passwordMenu.length === 0 ? (
-                <div className="px-2 py-1.5 text-[11px] text-zinc-400">
-                  No saved password for this prompt. This server's own password, or a saved login for the user it asks about, can be typed here.
-                </div>
-              ) : passwordMenu.map((p) => (
-                <button
-                  key={p.serverId != null ? `s${p.serverId}` : `c${p.credentialId}`}
-                  type="button"
-                  role="menuitem"
-                  onClick={() => void typeSavedPassword(p)}
-                  className="w-full text-left px-2 py-1.5 rounded hover:bg-white/[0.06] focus:bg-white/[0.06] focus:outline-none"
-                >
-                  <div className="text-[11.5px] text-zinc-100 truncate">{p.label}</div>
-                  {p.detail && <div className="text-[10px] text-zinc-500 truncate">{p.detail}</div>}
-                </button>
-              ))}
+      {/* Over the terminal, inside what a Wall moves (dockEl), so they go
+          with it into a tile. */}
+      {dockEl && createPortal(
+        <>
+          {/* Search chip — floats above xterm, so it never displaces the
+              terminal grid. Absolute top-2 right-2 keeps it clear of the
+              disconnected badge (which centers) and the clipboard toast
+              (bottom-right). */}
+          {showSearch && (
+            <div className="absolute top-2 right-2 z-20 flex items-center gap-1 rounded-md bg-zinc-800 border border-white/10 px-1.5 py-1 shadow-lg">
+              <input
+                ref={searchInputRef}
+                autoFocus
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  // Stop keys from leaking to the document listener (Ctrl+F
+                  // reopen loop) and to xterm's textarea (which would type
+                  // into the shell).
+                  if (e.key === 'Escape') {
+                    e.preventDefault();
+                    setQuery('');
+                    closeSearch();
+                  } else if (e.key === 'Enter') {
+                    e.preventDefault();
+                    runFind(e.shiftKey ? 'prev' : 'next');
+                  } else if ((e.ctrlKey || e.metaKey) && (e.key === 'f' || e.key === 'F')) {
+                    // Swallow so the outer document handler doesn't re-fire
+                    // (which would just refocus us — harmless but noisy).
+                    e.preventDefault();
+                    (e.currentTarget as HTMLInputElement).select();
+                  }
+                  e.stopPropagation();
+                }}
+                placeholder="Find"
+                className="bg-transparent outline-none text-[12px] text-zinc-100 placeholder:text-zinc-500 w-40 px-1"
+              />
+              <button
+                type="button"
+                onClick={() => runFind('prev')}
+                title="Previous match (Shift+Enter)"
+                className="px-1.5 py-0.5 text-[11px] text-zinc-300 hover:text-white hover:bg-white/5 rounded"
+              >
+                {'↑'}
+              </button>
+              <button
+                type="button"
+                onClick={() => runFind('next')}
+                title="Next match (Enter)"
+                className="px-1.5 py-0.5 text-[11px] text-zinc-300 hover:text-white hover:bg-white/5 rounded"
+              >
+                {'↓'}
+              </button>
+              <button
+                type="button"
+                onClick={() => { setQuery(''); closeSearch(); }}
+                title="Close (Esc)"
+                className="px-1.5 py-0.5 text-[11px] text-zinc-400 hover:text-white hover:bg-white/5 rounded"
+              >
+                {'✕'}
+              </button>
             </div>
           )}
-        </div>
+          {atPasswordPrompt && !local && !disabled && !showSearch && (
+            <div className="absolute top-2 right-2 z-20 flex flex-col items-end gap-1 max-w-[calc(100%-1rem)]">
+              <button
+                type="button"
+                onClick={() => (passwordMenu ? setPasswordMenu(null) : void openPasswordMenu())}
+                aria-haspopup="menu"
+                aria-expanded={!!passwordMenu}
+                title="Type a saved password at this prompt (no Enter)"
+                className="flex items-center gap-1.5 rounded-md bg-zinc-800 border border-white/10 px-2 py-1 shadow-lg text-[11px] text-zinc-200 hover:text-white hover:border-primary/40"
+              >
+                <KeyRound size={12} className="text-primary shrink-0" />
+                <span className="whitespace-nowrap">Saved password</span>
+              </button>
+              {passwordMenu && (
+                <div
+                  role="menu"
+                  aria-label="Saved passwords"
+                  onKeyDown={(e) => { if (e.key === 'Escape') { e.stopPropagation(); setPasswordMenu(null); xtermRef.current?.focus(); } }}
+                  className="w-64 max-w-full max-h-60 overflow-y-auto rounded-md bg-zinc-900 border border-white/10 shadow-xl p-1"
+                >
+                  {passwordMenu.length === 0 ? (
+                    <div className="px-2 py-1.5 text-[11px] text-zinc-400">
+                      No saved password for this prompt. This server's own password, or a saved login for the user it asks about, can be typed here.
+                    </div>
+                  ) : passwordMenu.map((p) => (
+                    <button
+                      key={p.serverId != null ? `s${p.serverId}` : `c${p.credentialId}`}
+                      type="button"
+                      role="menuitem"
+                      onClick={() => void typeSavedPassword(p)}
+                      className="w-full text-left px-2 py-1.5 rounded hover:bg-white/[0.06] focus:bg-white/[0.06] focus:outline-none"
+                    >
+                      <div className="text-[11.5px] text-zinc-100 truncate">{p.label}</div>
+                      {p.detail && <div className="text-[10px] text-zinc-500 truncate">{p.detail}</div>}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          {/* Clipboard toast — bottom-right of the terminal pane, never wider
+              than the pane (a split or a wide tool panel can leave it narrow).
+              Pointer-events off so a stray hover never blocks selection /
+              right-click. */}
+          {toast && (
+            <div className="absolute bottom-3 right-3 z-20 max-w-[calc(100%-1.5rem)] pointer-events-none">
+              <span
+                className={`block truncate px-2.5 py-1 rounded text-[10.5px] font-mono uppercase tracking-wider border ${
+                  toast.tone === 'err'
+                    ? 'bg-rose-500/15 border-rose-500/30 text-rose-300'
+                    : 'bg-emerald-500/15 border-emerald-500/30 text-emerald-300'
+                }`}
+              >
+                {toast.msg}
+              </span>
+            </div>
+          )}
+        </>,
+        dockEl,
       )}
       {isMobile && !disabled && (
         <MobileKeyBar
@@ -1630,23 +1671,6 @@ const TerminalView = ({
           onToggleModifier={toggleModifier}
           onSpecialKey={sendSpecialKey}
         />
-      )}
-      {/* Clipboard toast — bottom-right of the terminal pane, never wider
-          than the pane (a split or a wide tool panel can leave it narrow).
-          Pointer-events off so a stray hover never blocks selection /
-          right-click. */}
-      {toast && (
-        <div className="absolute bottom-3 right-3 z-20 max-w-[calc(100%-1.5rem)] pointer-events-none">
-          <span
-            className={`block truncate px-2.5 py-1 rounded text-[10.5px] font-mono uppercase tracking-wider border ${
-              toast.tone === 'err'
-                ? 'bg-rose-500/15 border-rose-500/30 text-rose-300'
-                : 'bg-emerald-500/15 border-emerald-500/30 text-emerald-300'
-            }`}
-          >
-            {toast.msg}
-          </span>
-        </div>
       )}
       {!local && <HistorySearchOverlay
         isOpen={showHistory}

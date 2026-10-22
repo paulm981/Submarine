@@ -13,6 +13,7 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - **On-connect commands leave out control characters too.** When any were left out, the terminal says so before the commands are typed. ([#98](https://github.com/paulm981/Submarine/issues/98))
 - **Closing a terminal while it opens closes its shell on the server.** It used to keep running there, unseen. This goes for a container's terminal too. ([#98](https://github.com/paulm981/Submarine/issues/98))
 - **Turning Broadcast off on a Wall no longer swallows what you type.** The terminal under the mouse gets the keys, or the Wall says to click one. ([#98](https://github.com/paulm981/Submarine/issues/98))
+- **A terminal on a Wall has its Find box (Ctrl+F), Saved password button and Copied and Pasted notes**, as in its own tab. Ctrl+R opens command history there too. ([#98](https://github.com/paulm981/Submarine/issues/98))
 
 ## v0.4.0-fork.4
 
