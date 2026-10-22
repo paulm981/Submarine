@@ -81,12 +81,9 @@ async fn an_ai_tool_is_pointed_at_no_ssh_agent() {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let addr = std::path::Path::new(var(&env, channel::ENV_ADDR));
-        let sock = std::path::Path::new(sock);
-        assert_eq!(sock.parent(), addr.parent(), "in the channel's own folder");
-        assert!(!sock.exists());
-        assert_eq!(std::fs::metadata(sock.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        use std::os::unix::fs::FileTypeExt;
+        assert_eq!(sock, "/dev/null");
+        assert!(!std::fs::metadata(sock).unwrap().file_type().is_socket());
     }
     assert!(!CREDENTIAL_ENV.contains(&"SSH_AUTH_SOCK"));
 }

@@ -1019,7 +1019,7 @@ mod tests {
             "Claude".into(),
             PathBuf::from("/bin/claude"),
             vec![],
-            vec![("SUBMARINE_AI_TOKEN".into(), "t".into()), ("SSH_AUTH_SOCK".into(), "/run/user/1000/submarine-ai-x/no-ssh-agent".into())],
+            vec![("SUBMARINE_AI_TOKEN".into(), "t".into()), ("SSH_AUTH_SOCK".into(), "/dev/null".into())],
             crate::ai::CREDENTIAL_ENV.to_vec(),
         );
         let mut cmd = CommandBuilder::new("claude");
@@ -1028,7 +1028,7 @@ mod tests {
         for name in crate::ai::CREDENTIAL_ENV {
             assert_eq!(cmd.get_env(name), None, "{name}");
         }
-        assert_eq!(cmd.get_env("SSH_AUTH_SOCK").and_then(|v| v.to_str()), Some("/run/user/1000/submarine-ai-x/no-ssh-agent"));
+        assert_eq!(cmd.get_env("SSH_AUTH_SOCK").and_then(|v| v.to_str()), Some("/dev/null"));
         assert_eq!(cmd.get_env("PATH").and_then(|v| v.to_str()), Some("/usr/bin"));
         assert_eq!(cmd.get_env("SUBMARINE_AI_TOKEN").and_then(|v| v.to_str()), Some("t"));
         // An ordinary shell keeps them.

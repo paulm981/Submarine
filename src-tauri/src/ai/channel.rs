@@ -155,13 +155,14 @@ pub(crate) fn peer_is_me(stream: &tokio::net::UnixStream) -> bool {
     stream.peer_cred().is_ok_and(|c| c.uid() == my_uid())
 }
 
-/// Where an AI tool's SSH_AUTH_SOCK points: a name in the channel's own
-/// folder (0700, only you can open it) that's never made, so ssh finds no
-/// agent there. `addr`: the channel's socket.
+/// Where an AI tool's SSH_AUTH_SOCK points: /dev/null, which isn't a
+/// socket, so ssh's connect fails ("Connection refused") and it carries on
+/// without an agent. Nobody can put an agent there, whatever happens to the
+/// channel's folder while the AI tool runs (AI tools turned off removes it,
+/// and without XDG_RUNTIME_DIR it's in /tmp).
 #[cfg(unix)]
-pub(crate) fn no_agent_at(addr: &str) -> String {
-    let dir = std::path::Path::new(addr).parent().unwrap_or(std::path::Path::new("/nonexistent"));
-    dir.join("no-ssh-agent").to_string_lossy().into_owned()
+pub(crate) fn no_agent_at(_addr: &str) -> String {
+    "/dev/null".to_string()
 }
 
 /// Listen on a new socket; each connection from a process running as you
