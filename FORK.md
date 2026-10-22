@@ -27,7 +27,7 @@ The fork is based on the original project's **0.4.0**, with every change up to [
 
 A server that connects or reconnects partway through a line waits for the next line, so it never gets only the end of a command. Walls can be saved by name, and a whole folder opens as one.
 
-- **Jump hosts at scale.** A hundred servers behind one jump host log in a few at a time; the number is a setting. Monitoring reaches servers through their jump host too.
+- **Jump hosts at scale.** A hundred servers behind one jump host log in a few at a time, in terminals and in Monitoring; the number is a setting. Monitoring reaches servers through their jump host too, by the same `~/.ssh/config` name as the terminal.
 - **Split.** A second shell on the same server opens beside the first, so you can watch a log in one and work in the other.
 - **Many tabs.** **Ctrl+Shift+K** opens All tabs with its search ready: type part of a name and press Enter. **Ctrl+Tab** and **Ctrl+Shift+Tab** move between tabs. A tab's right-click menu closes the other tabs, the ones to its right, the disconnected ones, or all of them.
 

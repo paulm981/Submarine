@@ -9,6 +9,15 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **SFTP or forwarding on its own connection fails at once when the jump host asks for a code.** It used to wait two minutes for a code nobody was asked for, and other servers behind that jump host waited with it. The server's own tab still asks for the code. ([#92](https://github.com/paulm981/Submarine/issues/92))
+- **Monitors log in to a jump host a few at a time,** like terminals, so starting them all doesn't log in to it a hundred times at once. Waiting for a turn doesn't count as the server being down. ([#92](https://github.com/paulm981/Submarine/issues/92))
+- **Monitoring finds a jump host by its `~/.ssh/config` name,** as terminals do: its HostName, Port and User. If the config reaches the jump host through a ProxyCommand or ProxyJump, the server isn't checked, and its card says why. ([#92](https://github.com/paulm981/Submarine/issues/92))
+- **A reconnect doesn't bring back a forward deleted on another computer.** It starts the forwards that are saved now. ([#92](https://github.com/paulm981/Submarine/issues/92))
+- **A reconnect can't leave a hidden connection open.** A login from before the reconnect that finished at just the wrong moment could keep a connection, and its jump host, open with nothing watching it. ([#92](https://github.com/paulm981/Submarine/issues/92))
+- **A jump host saved with a port above 65535 is refused** with "Port … isn't a valid port", instead of being reached on another port. So is such a server or jump host in Monitoring. ([#92](https://github.com/paulm981/Submarine/issues/92))
+
+## v0.4.0-fork.4
+
 - **Importing thousands of servers takes a moment.** Checking which ones are already saved used to take seconds for 10,000 rows, with the app waiting. ([#94](https://github.com/paulm981/Submarine/issues/94))
 - **The `~/.ssh/config` import reads settings as `ssh` does.** A `Host *` block, and other wildcard blocks that match a host, give it their settings as defaults. When a setting appears twice, the first one counts. A `Match` block's lines are left out instead of being added to the host above them. ([#94](https://github.com/paulm981/Submarine/issues/94))
 - **The PuTTY import brings in telnet sessions** as telnet servers, and leaves out "Default Settings" and other sessions with no host. Serial, raw and rlogin sessions are listed as not imported instead of coming in as SSH servers. ([#94](https://github.com/paulm981/Submarine/issues/94))
