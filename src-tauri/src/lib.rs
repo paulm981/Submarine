@@ -8963,6 +8963,13 @@ impl AgentSlot {
 
 /// A node's display name. An imported node keeps its `~/.ssh/config` alias as
 /// its name, so `Host` patterns are matched against it as well as the address.
+/// A saved port as one a connection can use. The form only takes 1 to 65535,
+/// but a synced or imported server may carry anything, and a plain cast would
+/// quietly dial another port.
+fn valid_port(port: i32) -> Result<u16, String> {
+    u16::try_from(port).map_err(|_| format!("Port {port} isn't a valid port"))
+}
+
 fn server_display_name(conn: &rusqlite::Connection, server_id: i32) -> Option<String> {
     conn.query_row("SELECT name FROM servers WHERE id = ?1", [server_id], |row| row.get::<_, Option<String>>(0))
         .ok()
@@ -8997,6 +9004,22 @@ impl ConfigTarget {
         };
         let config = ssh_config::for_host(lookup).await;
         Self::apply(host, port, user, config)
+    }
+
+    /// A jump host as `connect_jump_host` reaches it, for the connect, the
+    /// check under a failed one and the monitor alike: its saved port
+    /// checked, `~/.ssh/config` applied, and the ProxyCommand or ProxyJump
+    /// the config gives it (a jump host is reached without its own proxy
+    /// setting, so the config's has nothing to give way to).
+    async fn resolve_jump_host(
+        host: &str,
+        port: i32,
+        user: &str,
+        name: Option<String>,
+    ) -> Result<(Self, Option<ssh_config::Proxy>), String> {
+        let mut target = Self::resolve(host, valid_port(port)?, user, name).await;
+        let proxy = target.proxy(None);
+        Ok((target, proxy))
     }
 
     fn apply(host: &str, port: u16, user: &str, config: Option<ssh_config::HostConfig>) -> Self {
@@ -9787,6 +9810,15 @@ mod key_format_tests {
     // ~/.ssh/config: an alias address takes HostName and Port; User only
     // fills a blank username; every change is logged.
     #[test]
+    fn a_port_out_of_range_is_refused_not_cast() {
+        assert_eq!(valid_port(22), Ok(22));
+        assert_eq!(valid_port(65535), Ok(65535));
+        // 65558 as u16 would have dialled port 22.
+        assert_eq!(valid_port(65558), Err("Port 65558 isn't a valid port".to_string()));
+        assert_eq!(valid_port(-1), Err("Port -1 isn't a valid port".to_string()));
+    }
+
+    #[test]
     fn a_config_alias_changes_where_to_connect() {
         let c = host_config(|c| {
             c.hostname = Some("10.0.0.5".into());
@@ -10334,6 +10366,11 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     // through the password method (#145): it answers the server's password
     // question once, and only that (see is_password_prompt).
     saved_password: Option<&str>,
+    // `Some` on a connection that can't ask the user anything (a `::sftp` /
+    // `::fwd` one, whose prompts no tab listens to): the saved password still
+    // answers the server's password question, but any other question ends
+    // the login at once, as a failure, and sets this. `None` asks the user.
+    unasked: Option<&std::sync::atomic::AtomicBool>,
 ) -> Option<Result<bool, russh::Error>> {
     use russh::client::KeyboardInteractiveAuthResponse;
     use tauri::Emitter;
@@ -10437,6 +10474,15 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
                 }
                 answered_with_saved = false;
                 asked_anything = true;
+
+                // Nobody would see the question: rather than wait out the
+                // 120 s below (holding a turn in the jump host's login queue),
+                // stop now and say why.
+                if let Some(unasked) = unasked {
+                    unasked.store(true, std::sync::atomic::Ordering::Relaxed);
+                    log("The server asks for a code or a password this connection can't ask you for.", "error");
+                    return Some(Ok(false));
+                }
 
                 // A superseded or abandoned attempt doesn't put its prompt over
                 // a newer one; it ends like a cancelled prompt.
@@ -11401,8 +11447,7 @@ async fn connect_jump_host(
         }
     };
     // What ~/.ssh/config says about the bastion (its alias, agent, proxy).
-    let mut target = ConfigTarget::resolve(&host, port as u16, &user, jump_name).await;
-    let bastion_proxy = target.proxy(None);
+    let (target, bastion_proxy) = ConfigTarget::resolve_jump_host(&host, port, &user, jump_name).await?;
     for line in &target.log {
         log(line, "info");
     }
@@ -11576,8 +11621,10 @@ async fn connect_jump_host(
             None => (Zeroizing::new(String::new()), false, true),
         };
     // For a jump host that asks for the password through keyboard-interactive
-    // (#145).
+    // (#145). On a connection that can't ask (see `allow_prompt`) it's all
+    // keyboard-interactive may send: a code it asks for ends the login there.
     let kbi_password = password.clone().map(Zeroizing::new);
+    let kbi_unasked = std::sync::atomic::AtomicBool::new(false);
     // The whole login has a deadline, as the monitor's has: a jump host that
     // took the connection and stops answering would otherwise hold this
     // attempt, and its turn in the jump host's login queue, for good. It's
@@ -11621,8 +11668,18 @@ async fn connect_jump_host(
             && !prompt_ctx.cancelled.load(std::sync::atomic::Ordering::Relaxed)
             && !prompt_ctx.session_unusable.load(std::sync::atomic::Ordering::Relaxed)
         {
-            if let Some(kbi_res) =
-                run_keyboard_interactive(&mut session, &effective_user, app, session_id, &jump_nonce, kbi_txs, attempt, kbi_password.as_ref().map(|p| p.as_str())).await
+            if let Some(kbi_res) = run_keyboard_interactive(
+                &mut session,
+                &effective_user,
+                app,
+                session_id,
+                &jump_nonce,
+                kbi_txs,
+                attempt,
+                kbi_password.as_ref().map(|p| p.as_str()),
+                (!allow_prompt).then_some(&kbi_unasked),
+            )
+            .await
             {
                 auth_res = kbi_res;
             }
@@ -11655,6 +11712,10 @@ async fn connect_jump_host(
             auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
             Err("jump host login cancelled".into())
         }
+        Ok(false) if kbi_unasked.load(std::sync::atomic::Ordering::Relaxed) => {
+            auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            Err(JUMP_ASKS_UNASKED.into())
+        }
         Ok(false) => {
             auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
             Err("jump host authentication failed".into())
@@ -11676,6 +11737,11 @@ async fn connect_jump_host(
         }
     }
 }
+
+/// A `::sftp` / `::fwd` connection's jump host asked for a code (or a password
+/// that isn't saved) that only the server's own tab can ask for.
+const JUMP_ASKS_UNASKED: &str =
+    "the jump host asks for a code or a password, and only the server's own tab can ask you for it";
 
 /// Shown when an ssh-agent didn't sign a login it was asked to (a declined
 /// confirmation, a removed card, a PIN or touch not given in time).
@@ -11787,7 +11853,7 @@ async fn diagnose_connect(
         })
         .map_err(|_| "Server not found".to_string())?
     };
-    let port = u16::try_from(row.port).map_err(|_| format!("Port {} isn't a valid port", row.port))?;
+    let port = valid_port(row.port)?;
 
     // The address an alias in ~/.ssh/config stands for, as the connect uses it.
     let mut target = ConfigTarget::resolve(&row.host, port, row.user.as_deref().unwrap_or(""), row.name).await;
@@ -11795,11 +11861,11 @@ async fn diagnose_connect(
         ConnectRoute::Jump(_) => {
             // The connect fails on its own when the jump host is gone.
             let Some(hop) = row.jump else { return Ok(Vec::new()) };
-            let jump_port = u16::try_from(hop.port).map_err(|_| format!("Port {} isn't a valid port", hop.port))?;
             let label = hop.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| hop.host.clone());
-            let mut resolved = ConfigTarget::resolve(&hop.host, jump_port, hop.user.as_deref().unwrap_or(""), hop.name).await;
+            let (resolved, proxy) =
+                ConfigTarget::resolve_jump_host(&hop.host, hop.port, hop.user.as_deref().unwrap_or(""), hop.name).await?;
             // connect_jump_host takes the jump host's ProxyCommand when it has one.
-            if matches!(resolved.proxy(None), Some(ssh_config::Proxy::Command(_))) {
+            if matches!(proxy, Some(ssh_config::Proxy::Command(_))) {
                 diagnose::Route::Command
             } else {
                 diagnose::Route::Jump { name: label, host: resolved.host, port: resolved.port }
@@ -11887,6 +11953,20 @@ async fn initiate_connection(
     // reconnect attempt and the UI would just sit on "connecting…" forever.
     // Tunnels + forwarded_targets get the same treatment further down via the
     // stop_all_for_session call, so we don't duplicate that here.
+    //
+    // Bump the generation FIRST, as teardown_connection_key and
+    // disconnect_session do, so any watcher task still alive from the prior
+    // attempt sees a newer value next tick and bails silently instead of
+    // racing the new connect to emit `session-disconnected-{id}`, and a prior
+    // attempt still logging in fails its "still wanted?" check instead of
+    // registering itself (and its jump host) after the removals below, where
+    // nothing would watch or close it.
+    let connect_generation: u64 = {
+        let mut g = state.session_generation.lock().await;
+        let next = g.get(&session_id).copied().unwrap_or(0).wrapping_add(1);
+        g.insert(session_id.clone(), next);
+        next
+    };
     {
         let mut conns = state.connections.lock().await;
         if conns.remove(&session_id).is_some() {
@@ -11906,15 +11986,20 @@ async fn initiate_connection(
     let term_prefix = format!("{}-term-", session_id);
     state.terminal_txs.lock().await.retain(|k, _| !k.starts_with(&term_prefix));
     state.resize_txs.lock().await.retain(|k, _| !k.starts_with(&term_prefix));
-    // Bump the generation so any watcher task still alive from the prior
-    // attempt sees a newer value next tick and bails silently instead of
-    // racing the new connect to emit `session-disconnected-{id}`.
-    let connect_generation: u64 = {
-        let mut g = state.session_generation.lock().await;
-        let next = g.get(&session_id).copied().unwrap_or(0).wrapping_add(1);
-        g.insert(session_id.clone(), next);
-        next
-    };
+    // A reconnect replays the session's forward list. When sync changed this
+    // server's saved forwards since the session read them (another computer
+    // deleted one, say), the list starts again from the saved ones first, so
+    // the reconnect doesn't bring back a forward that's gone. The list is
+    // kept under the base session id, which the `::fwd` connection replays
+    // too. A first connect (no list yet) reads the saved ones anyway, and
+    // other connections (`::sftp`) have none: neither may use up the change,
+    // which another tab on this server may still need.
+    let rules_key = session_id.strip_suffix("::fwd").unwrap_or(&session_id);
+    if (role == "primary" || role == "forward") && state.session_tunnel_specs.lock().await.contains_key(rules_key) {
+        if let Err(e) = refresh_synced_session_rules(state.inner(), db_state.inner(), rules_key, Some(server_id)).await {
+            println!("[BACKEND] {}: the saved forwards weren't read again: {}", session_id, e);
+        }
+    }
     // This attempt, as its prompts and failure report see it: once a newer
     // attempt starts (or the tab disconnects) they stay quiet.
     let attempt = ssh_manager::ConnectAttempt::new(
@@ -12151,7 +12236,7 @@ async fn initiate_connection(
         } else {
             db_state.conn.lock().ok().and_then(|g| g.as_ref().and_then(|c| server_display_name(c, server_id)))
         };
-        let port = u16::try_from(port).map_err(|_| format!("Port {port} isn't a valid port"))?;
+        let port = valid_port(port)?;
         ConfigTarget::resolve(&host, port, &user, name).await
     };
     // Its jump host, proxy or ProxyCommand (see connect_route).
@@ -12660,6 +12745,7 @@ async fn initiate_connection(
                         &kbi_txs_clone,
                         &attempt,
                         kbi_password.as_ref().map(|p| p.as_str()),
+                        None,
                     )
                     .await
                     {
@@ -12697,6 +12783,14 @@ async fn initiate_connection(
                                     .lock()
                                     .await
                                     .insert(session_id_clone.clone(), Arc::clone(&session_arc));
+                                // ProxyJump: park the bastion's Handle with the
+                                // session, under the same check, so it stays
+                                // alive for the whole session (its direct-tcpip
+                                // channel carries our transport) and a later
+                                // reconnect / disconnect / close drops it.
+                                if let Some(jh) = jump_handle_holder.take() {
+                                    state_jump_connections.lock().await.insert(session_id_clone.clone(), jh);
+                                }
                                 true
                             } else {
                                 false
@@ -12716,13 +12810,6 @@ async fn initiate_connection(
                         // transport preference. Live migration, no re-keying.
                         if let Some(base) = session_id_clone.strip_suffix("::sftp") {
                             state_sftp_sessions.lock().await.remove(base);
-                        }
-                        // ProxyJump: now that the target session is live, park
-                        // the bastion's Handle so it stays alive for the whole
-                        // session (its direct-tcpip channel carries our
-                        // transport). Dropped on reconnect / disconnect / close.
-                        if let Some(jh) = jump_handle_holder.take() {
-                            state_jump_connections.lock().await.insert(session_id_clone.clone(), jh);
                         }
                         let _ = app.emit(
                             &format!("connection-success-{}", session_id_clone),
@@ -24311,7 +24398,7 @@ fn resolve_node_auth_row(
     Ok((
         monitor::NodeAuth {
             host,
-            port: port as u16,
+            port: valid_port(port)?,
             // Blank stays blank: connect_for_monitor reports it instead of
             // guessing root (#54).
             username,
@@ -24322,6 +24409,8 @@ fn resolve_node_auth_row(
             proxy_host: proxy_host.filter(|s| !s.is_empty()),
             proxy_port: proxy_port.map(|p| p as u16),
             jump: None,
+            name: server_display_name(conn, node_id),
+            server_id: Some(node_id),
         },
         jump_host_id,
     ))
