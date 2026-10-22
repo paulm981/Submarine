@@ -244,6 +244,62 @@ async fn the_ai_withdrawing_a_request_cancels_it() {
     assert!(s.decide(id, true).is_err(), "nothing left to allow");
 }
 
+/// An AiState whose commands all print `output`, turned on, with one AI
+/// tab sharing `sess-1` as `xyz`.
+fn state_printing(output: &'static str) -> AiState {
+    let exec: Executor = Arc::new(move |_, _, _, _| {
+        Box::pin(async move { Ok(exec::Exec { output: output.as_bytes().to_vec(), exit_status: Some(0), ..exec::Exec::default() }) })
+    });
+    let s = AiState::new(exec, Box::new(|| {}), None);
+    s.turn_on().unwrap();
+    s.start_tab("local-1", "Claude").unwrap();
+    s.share("local-1", "sess-1", "xyz").unwrap();
+    s
+}
+
+/// Run `command` on `xyz` and allow it.
+async fn run_allowed(s: &AiState, command: &str) -> mcp::ToolResult {
+    let (_c, cancel) = watch::channel(false);
+    let (s2, cmd) = (s.clone(), command.to_string());
+    let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", &cmd, None, cancel).await });
+    wait_for("the request", || !s.snapshot().pending.is_empty()).await;
+    s.decide(s.snapshot().pending[0].id, true).unwrap();
+    req.await.unwrap()
+}
+
+/// Locking the profile (close_profile ends every AI tab) or turning AI
+/// tools off empties the panel's history, outputs and all; a request that
+/// was still waiting doesn't bring its row back once it's cancelled.
+#[tokio::test]
+async fn locking_or_turning_off_forgets_what_ran() {
+    for off in [false, true] {
+        let s = state_printing("db password is hunter2");
+        assert!(!run_allowed(&s, "cat notes").await.is_error);
+        assert_eq!(s.snapshot().history.len(), 1);
+        let id = s.snapshot().history[0].id;
+        assert!(s.lock().history[0].output.contains("hunter2"));
+        // One more, left waiting.
+        let (_c, cancel) = watch::channel(false);
+        let s2 = s.clone();
+        let waiting = tokio::spawn(async move { s2.run_command("local-1", "xyz", "uptime", None, cancel).await });
+        wait_for("the request", || s.snapshot().pending.len() == 1).await;
+        if off {
+            s.turn_off().await;
+        } else {
+            s.end_all_tabs();
+        }
+        assert!(waiting.await.unwrap().is_error);
+        assert!(s.snapshot().history.is_empty(), "off: {off}");
+        assert!(s.lock().history.iter().all(|d| d.id != id));
+        // A new AI tab starts with an empty history, and fills it again.
+        if off {
+            s.turn_on().unwrap();
+        }
+        s.start_tab("local-2", "Claude").unwrap();
+        assert!(s.snapshot().history.is_empty());
+    }
+}
+
 /// The AI can't flush the audit log: every call counts toward the rate
 /// limit, refused or not; past it one line is logged a minute, not one a
 /// call; and a refused command is logged cut short.

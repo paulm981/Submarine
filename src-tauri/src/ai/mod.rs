@@ -152,12 +152,12 @@ struct Done {
     /// denied, cancelled, done, failed, stopped.
     outcome: &'static str,
     exit_code: Option<i64>,
-    /// The whole output, up to OUTPUT_CAP.
+    /// The whole output, up to OUTPUT_CAP. Wiped when it's dropped.
     #[serde(skip)]
-    output: String,
+    output: Zeroizing<String>,
     /// What the AI got.
     #[serde(skip)]
-    ai_output: String,
+    ai_output: Zeroizing<String>,
     output_bytes: usize,
     hidden: usize,
     cut: bool,
@@ -192,6 +192,10 @@ struct Shared {
     running: Vec<Running>,
     history: VecDeque<Done>,
     next_id: u64,
+    /// Counts the times the history was cleared: a request remembers its
+    /// row only in the history it was asked in, so one that ends after the
+    /// profile locked doesn't bring the old profile's output back.
+    epoch: u64,
 }
 
 struct Inner {
@@ -434,11 +438,29 @@ impl AiState {
     /// working, what it shared and asked for goes. Turning AI tools off does
     /// this, and so does locking the profile (close_profile), so nothing the
     /// profile shared outlives it. The channel itself stays as it is.
+    ///
+    /// The panel's history goes too, outputs wiped: it shows what ran on the
+    /// profile's servers, which the next profile (or whoever is at the
+    /// picker) mustn't see. First, so a request this cancels doesn't add its
+    /// row back.
     pub(crate) fn end_all_tabs(&self) {
+        self.forget_history();
         let ids: Vec<String> = self.lock().tabs.iter().map(|t| t.id.clone()).collect();
         for id in ids {
             self.end_tab(&id);
         }
+        self.changed();
+    }
+
+    /// Empty the panel's history (each output wiped as it's dropped), and
+    /// keep out rows of requests asked before now.
+    fn forget_history(&self) {
+        let gone = {
+            let mut s = self.lock();
+            s.epoch += 1;
+            std::mem::take(&mut s.history)
+        };
+        drop(gone);
     }
 
     /// The tab whose token this is, and its "access ended" signal.
@@ -600,8 +622,13 @@ impl AiState {
         }
     }
 
-    fn remember(&self, done: Done) {
+    /// Keep a finished request's row, unless the history was cleared since
+    /// it was asked (`epoch`, from then).
+    fn remember(&self, epoch: u64, done: Done) {
         let mut s = self.lock();
+        if s.epoch != epoch {
+            return;
+        }
         s.history.push_back(done);
         while s.history.len() > HISTORY {
             s.history.pop_front();
@@ -686,9 +713,10 @@ impl AiState {
 
     async fn run_command(&self, tab_id: &str, server: &str, command: &str, timeout: Option<u64>, mut cancel: watch::Receiver<bool>) -> ToolResult {
         // Checked before anything is shown to you.
-        let (label, session_id, server, id, mut rx, stop_tx, stop_rx) = {
+        let (label, session_id, server, id, epoch, mut rx, stop_tx, stop_rx) = {
             let mut s = self.lock();
             let next_id = s.next_id + 1;
+            let epoch = s.epoch;
             let waiting = s.pending.iter().filter(|p| p.view.tab_id == tab_id).count();
             let Some(tab) = s.tabs.iter_mut().find(|t| t.id == tab_id) else {
                 return ToolResult::err("This AI tab's access has ended.");
@@ -764,7 +792,7 @@ impl AiState {
                 decide: tx,
                 stop: stop_tx.clone(),
             });
-            (label, found.session_id, found.name, next_id, rx, stop_tx, stop_rx)
+            (label, found.session_id, found.name, next_id, epoch, rx, stop_tx, stop_rx)
         };
         self.changed();
         let root = asks_for_root(command);
@@ -785,8 +813,8 @@ impl AiState {
             root,
             outcome,
             exit_code: None,
-            output: String::new(),
-            ai_output: String::new(),
+            output: Zeroizing::default(),
+            ai_output: Zeroizing::default(),
             output_bytes: 0,
             hidden: 0,
             cut: false,
@@ -818,7 +846,7 @@ impl AiState {
                     e.decision = Some("cancelled");
                     e.note = Some("cancelled by the AI tool".into());
                     self.audit(e);
-                    self.remember(done("cancelled"));
+                    self.remember(epoch, done("cancelled"));
                     self.changed();
                     return ToolResult::err("Cancelled before the user decided: the request was withdrawn.");
                 }
@@ -832,7 +860,7 @@ impl AiState {
             e.decision = Some("cancelled");
             e.note = Some("access ended".into());
             self.audit(e);
-            self.remember(done("cancelled"));
+            self.remember(epoch, done("cancelled"));
             self.changed();
             return ToolResult::err("Cancelled before the user decided: the server isn't shared any more.");
         };
@@ -841,7 +869,7 @@ impl AiState {
             e.decision = Some("denied");
             e.by = Some("you");
             self.audit(e);
-            self.remember(done("denied"));
+            self.remember(epoch, done("denied"));
             self.changed();
             return ToolResult::err("Denied by the user.");
         }
@@ -888,12 +916,15 @@ impl AiState {
             }
             Ok(mut out) => {
                 // Up to a megabyte through every rule: off the async workers.
-                let output = std::mem::take(&mut out.output);
+                // The main copies of it are wiped when they're dropped (not
+                // every one the filter makes on the way).
+                let output = Zeroizing::new(std::mem::take(&mut out.output));
                 let output_bytes = output.len();
                 let filtered = tokio::task::spawn_blocking(move || {
-                    let text = String::from_utf8_lossy(&output).into_owned();
+                    let text = Zeroizing::new(String::from_utf8_lossy(&output).into_owned());
                     let f = filter::filter(&text);
-                    let ai = shorten_for_ai(&f.text);
+                    let filtered = Zeroizing::new(f.text);
+                    let ai = Zeroizing::new(shorten_for_ai(&filtered));
                     (text, f.hidden, ai)
                 })
                 .await;
@@ -902,7 +933,7 @@ impl AiState {
                     d.outcome = "failed";
                     d.error = Some("Submarine couldn't filter the output, so the AI wasn't given it.".into());
                     self.audit(e);
-                    self.remember(d);
+                    self.remember(epoch, d);
                     self.changed();
                     return ToolResult::err("Submarine couldn't filter the output, so it isn't given.");
                 };
@@ -926,7 +957,7 @@ impl AiState {
                         filter::HIDDEN
                     ));
                 }
-                let answer = format!("{head}--- output ---\n{ai}");
+                let answer = format!("{head}--- output ---\n{}", ai.as_str());
                 e.exit_code = exit;
                 e.bytes_returned = Some(ai.len());
                 e.items_hidden = Some(hidden);
@@ -952,7 +983,7 @@ impl AiState {
             }
         };
         self.audit(e);
-        self.remember(d);
+        self.remember(epoch, d);
         self.changed();
         answer
     }
@@ -1037,7 +1068,7 @@ pub struct DoneOutput {
 pub async fn ai_output(state: tauri::State<'_, AiState>, id: u64) -> Result<DoneOutput, String> {
     let s = state.lock();
     let d = s.history.iter().find(|d| d.id == id).ok_or("That request's output is no longer kept.")?;
-    Ok(DoneOutput { output: d.output.clone(), ai_output: d.ai_output.clone() })
+    Ok(DoneOutput { output: d.output.to_string(), ai_output: d.ai_output.to_string() })
 }
 
 #[tauri::command]
