@@ -9088,9 +9088,10 @@ enum ConnectRoute {
     Proxy { socks5: bool, host: Option<String>, port: u16 },
     /// Through the ProxyCommand ~/.ssh/config gives the host.
     Command(String),
-    /// Straight there. `unused_jump` is a ProxyJump from ~/.ssh/config,
-    /// which isn't used yet.
-    Direct { unused_jump: Option<String> },
+    /// Through the ProxyJump chain ~/.ssh/config gives the host.
+    ConfigJump(String),
+    /// Straight there.
+    Direct,
 }
 
 /// The route for a server saved with this jump host and proxy, and the
@@ -9124,8 +9125,8 @@ fn connect_route(
     }
     match config_proxy {
         Some(ssh_config::Proxy::Command(command)) => ConnectRoute::Command(command),
-        Some(ssh_config::Proxy::Jump(spec)) => ConnectRoute::Direct { unused_jump: Some(spec) },
-        _ => ConnectRoute::Direct { unused_jump: None },
+        Some(ssh_config::Proxy::Jump(spec)) => ConnectRoute::ConfigJump(spec),
+        _ => ConnectRoute::Direct,
     }
 }
 
@@ -12051,7 +12052,8 @@ async fn diagnose_connect(
         // No proxy address to check: the connect says the proxy host is empty.
         ConnectRoute::Proxy { host: None, .. } => return Ok(Vec::new()),
         ConnectRoute::Command(_) => diagnose::Route::Command,
-        ConnectRoute::Direct { .. } => diagnose::Route::Direct,
+        // fork: until diagnose follows the chain (next commit).
+        ConnectRoute::ConfigJump(_) | ConnectRoute::Direct => diagnose::Route::Direct,
     };
     Ok(diagnose::diagnose(&target.host, target.port, route).await)
 }
@@ -12610,7 +12612,7 @@ async fn initiate_connection(
                 emit_log(&format!("ProxyJump: routing through jump host (server id {})...", jid), "info");
                 Some(connect_jump_host(&hop_ctx, *jid).await)
             }
-            ConnectRoute::Direct { unused_jump: Some(spec) } => {
+            ConnectRoute::ConfigJump(spec) => {
                 emit_log(&format!("~/.ssh/config: connecting through ProxyJump {spec}..."), "info");
                 Some(config_jump_chain(&hop_ctx, spec, 0).await)
             }
@@ -25801,8 +25803,21 @@ mod connect_route_tests {
     fn otherwise_the_config_decides() {
         assert_eq!(connect_route(None, "none", None, None, &mut target(command())), ConnectRoute::Command("nc %h %p".into()));
         let jump = Some(ssh_config::Proxy::Jump("bastion".into()));
-        assert_eq!(connect_route(None, "none", None, None, &mut target(jump)), ConnectRoute::Direct { unused_jump: Some("bastion".into()) });
-        assert_eq!(connect_route(None, "none", None, None, &mut target(None)), ConnectRoute::Direct { unused_jump: None });
+        assert_eq!(connect_route(None, "none", None, None, &mut target(jump)), ConnectRoute::ConfigJump("bastion".into()));
+        assert_eq!(connect_route(None, "none", None, None, &mut target(None)), ConnectRoute::Direct);
+    }
+
+    // D2: the server's own saved jump host wins over its config ProxyJump,
+    // and the log says so; so does its own SOCKS / HTTP proxy.
+    #[test]
+    fn the_servers_own_route_wins_over_a_config_proxy_jump() {
+        let jump = || Some(ssh_config::Proxy::Jump("bastion".into()));
+        let mut t = target(jump());
+        assert_eq!(connect_route(Some(7), "none", None, None, &mut t), ConnectRoute::Jump(7));
+        assert!(t.log.iter().any(|l| l.contains("ProxyJump isn't used: this server goes through its own jump host")), "{:?}", t.log);
+        let mut t = target(jump());
+        assert!(matches!(connect_route(None, "http", Some("p".into()), None, &mut t), ConnectRoute::Proxy { socks5: false, .. }));
+        assert!(t.log.iter().any(|l| l.contains("ProxyJump isn't used: this server goes through its own HTTP proxy")), "{:?}", t.log);
     }
 }
 
