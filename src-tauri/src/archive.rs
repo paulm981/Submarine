@@ -1244,6 +1244,8 @@ pub async fn sftp_archive(
     }
     let session = job_session(&state, &session_id).await?;
     let (cancel, _job) = start_job(&state, &job_id).await?;
+    // Counted while it runs: closing the session would cut it off (busy.rs).
+    let _running = crate::busy::running_archive(&session_id);
     let run = run_remote_job(&session, &archive_script(&dir, &names, &name, format, overwrite), &cancel).await?;
     remote_outcome(run, if format == Format::Zip { "zip" } else { "tar" }, &name)
 }
@@ -1262,6 +1264,8 @@ pub async fn sftp_extract(
     check_remote_dir(&dir)?;
     let session = job_session(&state, &session_id).await?;
     let (cancel, _job) = start_job(&state, &job_id).await?;
+    // Counted while it runs: closing the session would cut it off (busy.rs).
+    let _running = crate::busy::running_archive(&session_id);
     let run = run_remote_job(&session, &extract_script(&dir, &name, folder.as_deref(), format), &cancel).await?;
     remote_outcome(run, if format == Format::Zip { "unzip" } else { "tar" }, &name)
 }
