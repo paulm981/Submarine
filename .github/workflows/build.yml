@@ -21,10 +21,12 @@ name: Build
 on:
   push:
     branches: [main]
-    # A change to the docs alone isn't a new release.
+    # A change to the docs alone isn't a new release, nor is one to the pull
+    # request checks alone.
     paths-ignore:
       - "**/*.md"
       - "LICENSE"
+      - ".github/workflows/check.yml"
   workflow_dispatch:
     inputs:
       version:
