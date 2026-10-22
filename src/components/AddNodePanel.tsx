@@ -639,7 +639,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               </div>
               <div className="space-y-1.5">
                 <label className="text-[11px] font-bold text-zinc-400 ml-1">Port</label>
-                <input type="number" className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" value={newNode.port} onChange={e => setNewNode({ ...newNode, port: parseInt(e.target.value) })} />
+                <input type="number" className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" value={newNode.port ?? ""} onChange={e => setNewNode({ ...newNode, port: e.target.value === "" ? "" : parseInt(e.target.value, 10) })} />
               </div>
             </div>
 

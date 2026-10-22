@@ -3379,6 +3379,11 @@ function DesktopApp() {
             addLog("Name and Host are required.", "error");
             return;
           }
+          // An emptied Port field would save as no port at all.
+          if (!Number.isInteger(newNode.port) || newNode.port < 1 || newNode.port > 65535) {
+            setFormError("Port must be a number from 1 to 65535.");
+            return;
+          }
           if (newNode.authType === "vault" && !newNode.credentialId && newNode.protocol !== "vnc") {
             setFormError("Please pick a saved login.");
             addLog("Please pick a saved login.", "error");
