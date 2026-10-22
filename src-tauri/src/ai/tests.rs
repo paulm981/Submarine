@@ -233,6 +233,29 @@ async fn each_ai_tab_only_reaches_what_was_shared_with_it() {
 }
 
 #[test]
+fn ai_tools_start_in_a_folder_of_their_own() {
+    let data = std::env::temp_dir().join(format!("submarine-ai-workspace-{}", std::process::id()));
+    let dir = workspace(&data).unwrap();
+    assert_eq!(dir, data.join("ai-workspace"));
+    assert!(dir.is_dir());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |d: &std::path::Path| std::fs::metadata(d).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        // Made otherwise, it's made private again.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(workspace(&data).unwrap(), dir);
+        assert_eq!(mode(&dir), 0o700);
+        // A link isn't followed.
+        std::fs::remove_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(std::env::temp_dir(), &dir).unwrap();
+        assert!(workspace(&data).is_err());
+    }
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+#[test]
 fn names_stay_unique_within_an_ai_tab() {
     let mut servers = Vec::new();
     for _ in 0..3 {

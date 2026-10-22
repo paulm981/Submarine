@@ -1332,7 +1332,41 @@ pub(crate) struct HomeLaunch {
     pub env: Vec<(String, String)>,
     /// Taken out of its environment: CREDENTIAL_ENV, less its own login.
     pub env_remove: Vec<&'static str>,
+    /// Where it starts: its own folder (workspace), not your home folder.
+    pub cwd: PathBuf,
     pub label: String,
+}
+
+/// The folder AI tools start in: `ai-workspace` in Submarine's data folder,
+/// made if it isn't there, and on macOS and Linux only yours (0700). Not
+/// your home folder, where Claude Code would read your files, ~/.ssh and
+/// ~/.aws included, without asking: it asks before reading outside the
+/// folder it started in.
+fn workspace(data_dir: &std::path::Path) -> Result<PathBuf, String> {
+    let dir = data_dir.join("ai-workspace");
+    let fail = |e: std::io::Error| format!("Couldn't make the AI tools' folder {}: {e}", dir.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        match std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(fail(e)),
+        }
+        // A folder of yours, not a link to somewhere else; 0700 even if it
+        // was made otherwise.
+        let m = std::fs::symlink_metadata(&dir).map_err(fail)?;
+        // SAFETY: geteuid can't fail.
+        if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } {
+            return Err(format!("{} isn't a folder of yours.", dir.display()));
+        }
+        if m.mode() & 0o777 != 0o700 {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(fail)?;
+        }
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(&dir).map_err(fail)?;
+    Ok(dir)
 }
 
 /// What Home starts for the AI tool `id` in the terminal `tab_id`.
@@ -1343,11 +1377,12 @@ pub(crate) fn home_launch(app: &tauri::AppHandle, state: &AiState, id: &str, tab
     }
     let path = claude::find().ok_or("Claude Code isn't installed on this computer.")?;
     let helper = helper_path()?;
-    let data = app.path().app_data_dir().ok();
-    let launch = claude::launch(&path, &helper, data.as_deref())?;
+    let data = app.path().app_data_dir().map_err(|e| format!("Couldn't find Submarine's data folder: {e}"))?;
+    let cwd = workspace(&data)?;
+    let launch = claude::launch(&path, &helper, Some(&data))?;
     let (label, mut env) = state.start_tab(tab_id, claude::SHORT)?;
     env.extend(launch.env);
-    Ok(HomeLaunch { program: launch.program, args: launch.args, env, env_remove: launch.env_remove, label })
+    Ok(HomeLaunch { program: launch.program, args: launch.args, env, env_remove: launch.env_remove, cwd, label })
 }
 
 #[cfg(test)]

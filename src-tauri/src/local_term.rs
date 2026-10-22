@@ -85,10 +85,13 @@ pub struct Shell {
     /// cloud logins (ai::CREDENTIAL_ENV). Ordinary shells keep them.
     #[serde(skip)]
     env_remove: Vec<&'static str>,
+    /// Where it starts: an AI tool's own folder. None: your home folder.
+    #[serde(skip)]
+    cwd: Option<PathBuf>,
 }
 
 fn shell(id: impl Into<String>, label: impl Into<String>, group: &'static str, program: PathBuf, args: &[&str]) -> Shell {
-    Shell { id: id.into(), label: label.into(), group, detail: None, program, args: args.iter().map(|a| a.to_string()).collect(), env: Vec::new(), env_remove: Vec::new() }
+    Shell { id: id.into(), label: label.into(), group, detail: None, program, args: args.iter().map(|a| a.to_string()).collect(), env: Vec::new(), env_remove: Vec::new(), cwd: None }
 }
 
 impl Shell {
@@ -593,7 +596,7 @@ mod pty {
             terms,
             id,
             shell,
-            app.path().home_dir().ok(),
+            start_dir(shell, app.path().home_dir().ok()),
             (cols, rows),
             move |batch: &mut Vec<u8>| {
                 limiter.filter(batch, &mut cut);
@@ -888,22 +891,31 @@ fn open_ai_tool(
     }
     let ai = app.state::<crate::ai::AiState>();
     let launch = crate::ai::home_launch(app, &ai, tool, terminal_id)?;
-    let s = ai_shell(tool, launch.label.clone(), launch.program, launch.args, launch.env, launch.env_remove);
+    let label = launch.label.clone();
+    let s = ai_shell(tool, launch);
     if let Err(e) = pty::open(app, terms, terminal_id, &s, cols, rows, on_output) {
         ai.end_tab(terminal_id);
         return Err(e);
     }
-    Ok(launch.label)
+    Ok(label)
+}
+
+/// Where a shell starts: an AI tool in its own folder, the rest in your
+/// home folder.
+#[cfg(not(target_os = "android"))]
+fn start_dir(shell: &Shell, home: Option<PathBuf>) -> Option<PathBuf> {
+    shell.cwd.clone().or(home)
 }
 
 /// An AI tool's terminal: its program, with what to add to its environment
-/// and what to take out.
+/// and what to take out, started in its own folder.
 #[cfg(not(target_os = "android"))]
-fn ai_shell(tool: &str, label: String, program: PathBuf, args: Vec<String>, env: Vec<(String, String)>, env_remove: Vec<&'static str>) -> Shell {
-    let mut s = shell(tool, label, GROUP_AI, program, &[]);
-    s.args = args;
-    s.env = env;
-    s.env_remove = env_remove;
+fn ai_shell(tool: &str, launch: crate::ai::HomeLaunch) -> Shell {
+    let mut s = shell(tool, launch.label, GROUP_AI, launch.program, &[]);
+    s.args = launch.args;
+    s.env = launch.env;
+    s.env_remove = launch.env_remove;
+    s.cwd = Some(launch.cwd);
     s
 }
 
@@ -1001,6 +1013,29 @@ mod tests {
         assert_eq!(find_shell(&config, "custom").map(|s| s.program), Some(here));
     }
 
+    /// What home_launch gives for an AI tool.
+    #[cfg(not(target_os = "android"))]
+    fn ai_launch() -> crate::ai::HomeLaunch {
+        crate::ai::HomeLaunch {
+            program: PathBuf::from("/bin/claude"),
+            args: vec![],
+            env: vec![("SUBMARINE_AI_TOKEN".into(), "t".into()), ("SSH_AUTH_SOCK".into(), "/dev/null".into())],
+            env_remove: crate::ai::CREDENTIAL_ENV.to_vec(),
+            cwd: PathBuf::from("/data/submarine/ai-workspace"),
+            label: "Claude".into(),
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn an_ai_tool_starts_in_its_own_folder_and_a_shell_at_home() {
+        let home = Some(PathBuf::from("/home/me"));
+        let ai = ai_shell("ai:claude", ai_launch());
+        assert_eq!(start_dir(&ai, home.clone()), Some(PathBuf::from("/data/submarine/ai-workspace")));
+        let sh = shell("t", "sh", GROUP_SYSTEM, PathBuf::from("/bin/sh"), &[]);
+        assert_eq!(start_dir(&sh, home.clone()), home);
+    }
+
     #[cfg(not(target_os = "android"))]
     #[test]
     fn an_ai_tool_starts_without_your_ssh_agent_or_cloud_logins() {
@@ -1014,14 +1049,7 @@ mod tests {
         };
         // As start_tab and home_launch give it: SSH_AUTH_SOCK points where
         // no agent is.
-        let ai = ai_shell(
-            "ai:claude",
-            "Claude".into(),
-            PathBuf::from("/bin/claude"),
-            vec![],
-            vec![("SUBMARINE_AI_TOKEN".into(), "t".into()), ("SSH_AUTH_SOCK".into(), "/dev/null".into())],
-            crate::ai::CREDENTIAL_ENV.to_vec(),
-        );
+        let ai = ai_shell("ai:claude", ai_launch());
         let mut cmd = CommandBuilder::new("claude");
         inherited(&mut cmd);
         pty::environment(&mut cmd, &ai);
