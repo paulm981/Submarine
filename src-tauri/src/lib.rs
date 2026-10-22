@@ -49,6 +49,7 @@ mod applog;
 mod term_output;
 mod proxy_command;
 mod diagnose;
+mod hop_policy;
 mod ai;
 mod open_policy;
 mod rdp;
@@ -11378,8 +11379,8 @@ impl HopCtx<'_> {
 
 /// How long a jump host's login may take, prompts included (login_hop).
 const JUMP_LOGIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-/// How long a jump host may take to open the channel to the server behind it,
-/// as for telnet through an SSH server.
+/// How long a jump host may take to open the channel to the next hop or the
+/// server behind it (hop_channel), as for telnet through an SSH server.
 const JUMP_CHANNEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// One jump host to log in to.
 struct Hop {
@@ -11477,8 +11478,9 @@ mod proxy_jump_tests {
 }
 
 /// A `direct-tcpip` channel through `via` to `host:port`, as a transport.
-async fn hop_channel(
-    via: &russh::client::Handle<ssh_manager::ClientHandler>,
+// fork: the timeout (JUMP_CHANNEL_TIMEOUT) and any handler; upstream's has neither.
+async fn hop_channel<H: russh::client::Handler>(
+    via: &russh::client::Handle<H>,
     host: &str,
     port: u16,
 ) -> Result<tunnel::DrainedChannelStream, String> {
@@ -11486,10 +11488,22 @@ async fn hop_channel(
     // could fill this channel's queue while the next session waits for a
     // window, block the previous hop's protocol task — which is what delivers
     // that window — and deadlock the route.
-    via.channel_open_direct_tcpip(host.to_string(), u32::from(port), "127.0.0.1", 0)
-        .await
-        .map(tunnel::drained_stream)
-        .map_err(|e| format!("could not open a channel to {host}:{port} through the jump host: {e}"))
+    hop_channel_within(via, host, port, JUMP_CHANNEL_TIMEOUT).await
+}
+
+/// `hop_channel`, given `limit` to open the channel in.
+async fn hop_channel_within<H: russh::client::Handler>(
+    via: &russh::client::Handle<H>,
+    host: &str,
+    port: u16,
+    limit: std::time::Duration,
+) -> Result<tunnel::DrainedChannelStream, String> {
+    let open = via.channel_open_direct_tcpip(host.to_string(), u32::from(port), "127.0.0.1", 0);
+    match tokio::time::timeout(limit, open).await {
+        Ok(Ok(channel)) => Ok(tunnel::drained_stream(channel)),
+        Ok(Err(e)) => Err(format!("could not open a channel to {host}:{port} through the jump host: {e}")),
+        Err(_) => Err(format!("the jump host didn't open a channel to {host}:{port} within {} seconds", limit.as_secs())),
+    }
 }
 
 /// Establish + authenticate the connection to a ProxyJump intermediate
@@ -12605,10 +12619,7 @@ async fn initiate_connection(
         let stream_res: Result<Box<dyn AsyncStream>, String> = if let Some(chain) = chain {
             match chain {
                 Ok(chain) => match chain.last() {
-                    Some(last) => match tokio::time::timeout(JUMP_CHANNEL_TIMEOUT, hop_channel(last, &host, port as u16))
-                        .await
-                        .unwrap_or_else(|_| Err(format!("{host}:{port} didn't open a channel through the jump host in time")))
-                    {
+                    Some(last) => match hop_channel(last, &host, port as u16).await {
                         Ok(channel) => {
                             emit_log(&format!("ProxyJump: opened tunnel to {}:{} through the jump host.", host, port), "success");
                             jump_handles = chain;
