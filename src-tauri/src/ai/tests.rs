@@ -355,6 +355,60 @@ async fn locking_or_turning_off_forgets_what_ran() {
     }
 }
 
+/// A request asked while every AI tab's access is ending (here, from the
+/// page's change notice, between one tab ending and the next) leaves no
+/// row in the cleared history: the tabs and the history go in one step.
+#[tokio::test]
+async fn a_request_asked_while_access_ends_leaves_no_row() {
+    use futures::FutureExt;
+    use std::sync::{Mutex as StdMutex, OnceLock};
+    type Asked = std::pin::Pin<Box<dyn std::future::Future<Output = mcp::ToolResult> + Send>>;
+
+    let state: Arc<OnceLock<AiState>> = Arc::new(OnceLock::new());
+    let asked: Arc<StdMutex<Option<Asked>>> = Arc::new(StdMutex::new(None));
+    let (_cancel_tx, cancel) = watch::channel(false);
+    let ending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let on_change = {
+        let (state, asked, ending) = (Arc::clone(&state), Arc::clone(&asked), Arc::clone(&ending));
+        Box::new(move || {
+            // Once, at the first notice while access ends (not again from
+            // inside the request's own notice).
+            if !ending.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let Some(s) = state.get() else { return };
+            // Asked by whichever tab is still there, run up to where it
+            // waits for you.
+            let Some(tab) = s.lock().tabs.first().map(|t| t.id.clone()) else { return };
+            let (s, cancel) = (s.clone(), cancel.clone());
+            let server = if tab == "local-1" { "xyz" } else { "abc" };
+            let mut f: Asked = Box::pin(async move { s.run_command(&tab, server, "uptime", None, cancel).await });
+            if let Some(r) = (&mut f).now_or_never() {
+                assert!(r.is_error, "refused at once: {}", r.text);
+            }
+            *asked.lock().unwrap() = Some(f);
+        }) as Box<dyn Fn() + Send + Sync>
+    };
+    let exec: Executor = Arc::new(|_, _, _, _| Box::pin(async { Err("no servers in this test".to_string()) }));
+    let s = AiState::new(exec, on_change, None);
+    assert!(state.set(s.clone()).is_ok());
+    s.turn_on().unwrap();
+    s.start_tab("local-1", "Claude").unwrap();
+    s.share("local-1", "sess-1", "xyz").unwrap();
+    s.start_tab("local-2", "Claude").unwrap();
+    s.share("local-2", "sess-2", "abc").unwrap();
+
+    ending.store(true, Ordering::SeqCst);
+    s.end_all_tabs();
+    let f = asked.lock().unwrap().take();
+    if let Some(f) = f {
+        assert!(f.await.is_error);
+    }
+    assert!(s.snapshot().tabs.is_empty());
+    assert!(s.snapshot().pending.is_empty());
+    assert!(s.snapshot().history.is_empty(), "{:?}", s.snapshot().history.iter().map(|d| d.outcome).collect::<Vec<_>>());
+}
+
 /// The AI can't flush the audit log: every call counts toward the rate
 /// limit, refused or not; past it one line is logged a minute, not one a
 /// call; and a refused command is logged cut short.

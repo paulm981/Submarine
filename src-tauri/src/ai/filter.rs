@@ -10,7 +10,7 @@
 //! keys, and the password in a URL; and in config files that write it after
 //! a space: Cisco's `password 7 …` and `secret 5 …`, Redis's `requirepass`,
 //! `.netrc`, Juniper's `$9$…` and `encrypted-password`, Docker's `"auth"`,
-//! `.pgpass` lines and Wi-Fi `psk=`. They catch the common shapes, not
+//! `.pgpass` lines, Wi-Fi `psk=` and Debian's `wpa-psk`. They catch the common shapes, not
 //! everything, and the app says so where it shows them.
 
 use regex::Regex;
@@ -144,12 +144,12 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
         rule(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@]+:([^\s/@]+)@", 1),
         // Config lines that give the value after a space, not `=` or `:`:
         // Cisco's `enable secret 5 …` and `password 7 …` (the digit is the
-        // kind, the value follows), Redis's `requirepass` and `masterauth`,
+        // kind, the value follows; `enable` may name a `level N` first), Redis's `requirepass` and `masterauth`,
         // a `.netrc` password on a line of its own. Only a line that starts
         // with the word, in lower case, and ends with the value: not prose
         // ("password reset link sent"), nor PAM's `password required pam_unix.so`.
         rule(
-            r#"(?m)^[ \t]*(?:enable[ \t]+)?(?:password|secret|requirepass|masterauth)[ \t]+(?:[0-9][ \t]+)?("[^"\r\n]*"|'[^'\r\n]*'|\S+)[ \t]*\r?$"#,
+            r#"(?m)^[ \t]*(?:enable[ \t]+(?:password|secret)(?:[ \t]+level[ \t]+[0-9]+)?|password|secret|requirepass|masterauth)[ \t]+(?:[0-9][ \t]+)?("[^"\r\n]*"|'[^'\r\n]*'|\S+)[ \t]*\r?$"#,
             1,
         ),
         // Cisco's `username NAME [privilege N] [algorithm-type T] password|secret [N] VALUE`.
@@ -166,15 +166,19 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
         // Docker's config.json: `"auth": "<base64 of user:password>"`.
         rule(r#""auth"[ \t]*:[ \t]*("[^"\r\n]+")"#, 1),
         // A `.pgpass` line, `host:port:database:user:password`: the last
-        // field. Five fields exactly, the port a number or `*`, so
-        // /etc/passwd and /etc/shadow lines aren't taken for one.
+        // field, which is the rest of the line, spaces and all. Five fields
+        // exactly (a colon in the password is escaped), the port a number
+        // or `*`, so /etc/passwd and /etc/shadow lines aren't taken for one.
         rule(
-            r"(?m)^(?:[^\s:\\]|\\.)+:(?:[0-9]+|\*):(?:[^\s:\\]|\\.)+:(?:[^\s:\\]|\\.)+:((?:[^\s:\\]|\\.)+)[ \t]*\r?$",
+            r"(?m)^(?:[^\s:\\]|\\.)+:(?:[0-9]+|\*):(?:[^\s:\\]|\\.)+:(?:[^\s:\\]|\\.)+:((?:[^\s:\\]|\\.)(?:[^\r\n:\\]|\\.)*?)[ \t]*\r?$",
             1,
         ),
         // Wi-Fi: wpa_supplicant's and NetworkManager's `psk=…`, hostapd's
         // `wpa_psk=…`.
         rule(r#"(?im)(?:^|[\s{;,-])(?:wpa_)?psk[ \t]*=[ \t]*("[^"\r\n]*"|[^\s"]+)"#, 1),
+        // Debian's /etc/network/interfaces: `wpa-psk VALUE` (and
+        // `wpa-password` for 802.1X), the value the rest of the line.
+        rule(r"(?m)^[ \t]*wpa-(?:psk|password)[ \t]+(\S(?:[^\r\n]*\S)?)[ \t]*\r?$", 1),
     ]
 });
 
@@ -364,6 +368,8 @@ mod tests {
             1,
         );
         hides("requirepass foobared\nmasterauth \"two words\"", &format!("requirepass {HIDDEN}\nmasterauth {HIDDEN}"), 2);
+        hides("enable password level 15 cisco", &format!("enable password level 15 {HIDDEN}"), 1);
+        hides("enable secret level 15 5 $1$mERr$hx5rVt7rPNoS4wqbXKX7m0", &format!("enable secret level 15 5 {HIDDEN}"), 1);
     }
 
     #[test]
@@ -378,6 +384,13 @@ mod tests {
         hides("db.internal:5432:app:paul:hunter2\n*:*:*:paul:pa\\:ss", &format!("db.internal:5432:app:paul:{HIDDEN}\n*:*:*:paul:{HIDDEN}"), 2);
         hides("network={\n\tssid=\"home\"\n\tpsk=\"correct horse\"\n}", &format!("network={{\n\tssid=\"home\"\n\tpsk={HIDDEN}\n}}"), 1);
         hides("wpa_psk=0123456789abcdef", &format!("wpa_psk={HIDDEN}"), 1);
+        hides("db:5432:app:paul:correct horse battery\r\n", &format!("db:5432:app:paul:{HIDDEN}\r\n"), 1);
+        hides("*:*:*:paul:two words \\: one colon  \n", &format!("*:*:*:paul:{HIDDEN}  \n"), 1);
+        hides(
+            "iface wlan0 inet dhcp\n    wpa-ssid home\n    wpa-psk correct horse battery\n    wpa-password hunter2\n",
+            &format!("iface wlan0 inet dhcp\n    wpa-ssid home\n    wpa-psk {HIDDEN}\n    wpa-password {HIDDEN}\n"),
+            2,
+        );
     }
 
     /// The space-separated rules leave prose and look-alikes alone.
@@ -399,6 +412,11 @@ mod tests {
             "machine learning password manager review",
             "\"auth\": {\"type\": \"oauth\"}",
             "upsk=1 pskreport",
+            "enable password level 15",
+            "wpa-psk",
+            "daemon:*:19000:0:99999:7:::",
+            "nobody:*:0:0:Unprivileged User:/var/empty:/usr/bin/false",
+            "00:11:22:33:44:55 permanent",
         ] {
             hides(plain, plain, 0);
         }

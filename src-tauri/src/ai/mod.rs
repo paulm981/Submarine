@@ -499,12 +499,17 @@ impl AiState {
             let Some(at) = s.tabs.iter().position(|t| t.id == id) else { return };
             s.tabs.remove(at)
         };
-        // Its requests first, so they're told access ended before its
-        // connections close (which withdraws them).
-        self.cancel_where(|tab_id, _| tab_id == id);
+        self.tab_ended(tab);
+        self.changed();
+    }
+
+    /// What follows a tab taken off the list: its requests are cancelled
+    /// first, so they're told access ended before its connections close
+    /// (which withdraws them).
+    fn tab_ended(&self, tab: Tab) {
+        self.cancel_where(|tab_id, _| tab_id == tab.id);
         let _ = tab.closed.send(true);
         self.audit(audit::Entry::new("ai_tab_ended", &tab.label));
-        self.changed();
     }
 
     /// Every AI tab's access ends, as when each one closes: its token stops
@@ -514,26 +519,21 @@ impl AiState {
     ///
     /// The panel's history goes too, outputs wiped: it shows what ran on the
     /// profile's servers, which the next profile (or whoever is at the
-    /// picker) mustn't see. First, so a request this cancels doesn't add its
-    /// row back.
+    /// picker) mustn't see. In the same step as the tabs come off the list,
+    /// so every request either was asked before (and the row it adds when
+    /// this cancels it is kept out) or finds its tab gone and adds none.
     pub(crate) fn end_all_tabs(&self) {
-        self.forget_history();
-        let ids: Vec<String> = self.lock().tabs.iter().map(|t| t.id.clone()).collect();
-        for id in ids {
-            self.end_tab(&id);
-        }
-        self.changed();
-    }
-
-    /// Empty the panel's history (each output wiped as it's dropped), and
-    /// keep out rows of requests asked before now.
-    fn forget_history(&self) {
-        let gone = {
+        let (tabs, gone) = {
             let mut s = self.lock();
             s.epoch += 1;
-            std::mem::take(&mut s.history)
+            (std::mem::take(&mut s.tabs), std::mem::take(&mut s.history))
         };
+        // Each output wiped as it's dropped.
         drop(gone);
+        for tab in tabs {
+            self.tab_ended(tab);
+        }
+        self.changed();
     }
 
     /// The tab whose token this is, and its "access ended" signal.
