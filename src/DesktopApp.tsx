@@ -569,20 +569,24 @@ function DesktopApp() {
   }, [refreshServers]);
   // Allow what this device holds back for a server (see the review dialog in
   // the server list), then show the list as it now is.
-  const allowHeld = useCallback(async (serverId: number, items: string[]) => {
+  // `runOnConnect` is the on-connect text the review showed, needed to allow
+  // those commands: when they changed again meanwhile, the OK is refused and
+  // the review shows the new text.
+  const allowHeld = useCallback(async (serverId: number, items: string[], runOnConnect?: string) => {
     try {
-      await invoke("allow_held", { serverId, items });
+      await invoke("allow_held", { serverId, items, runOnConnect: runOnConnect ?? null });
       addLog(items.length ? `Allowed ${items.length} held change${items.length === 1 ? "" : "s"}.` : "Allowed the held changes.", "success");
     } catch (e) {
-      addLog(`ALLOW_FAILED: ${e}`, "error");
+      if (String(e).includes("HELD_CHANGED")) addLog("Those on-connect commands were changed again. Look at them again before you allow them.", "warn");
+      else addLog(`ALLOW_FAILED: ${e}`, "error");
     }
     await refreshServers();
   }, [addLog, refreshServers]);
-  // Decline a held switch to telnet or VNC: the server stays SSH, and the
-  // other computers get it back as SSH with the next sync.
+  // Decline a held switch to telnet or VNC: the server stays SSH (or RDP),
+  // and the other computers get it back as that with the next sync.
   const keepServerSsh = useCallback(async (serverId: number) => {
     try {
-      if (await invoke<boolean>("keep_server_ssh", { serverId })) addLog("Kept it an SSH server.", "success");
+      if (await invoke<boolean>("keep_server_ssh", { serverId })) addLog("Kept the server as it was.", "success");
     } catch (e) {
       addLog(`KEEP_SSH_FAILED: ${e}`, "error");
     }

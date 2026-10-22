@@ -13,6 +13,8 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - **A jump host that stops answering no longer keeps a tab connecting.** Reaching the server behind it has 15 seconds, and logging in to it 5 minutes, prompts included. Other servers behind it stop waiting for their turn. ([#84](https://github.com/paulm981/Submarine/issues/84))
 - **Home terminals and AI tabs** leave out escape sequences that would freeze the window, as SSH terminals do. So does a container's terminal opened as root. ([#84](https://github.com/paulm981/Submarine/issues/84))
 - **Two windows syncing through the same folder or git repository take turns**, now that each profile can have a window of its own. A file in that storage that's far too big is skipped, and the log says why. ([#84](https://github.com/paulm981/Submarine/issues/84))
+- **A server switched from RDP to telnet or VNC by another computer waits for your OK too**, in a shared profile, as one switched from SSH does. It stays an RDP server here until you allow the switch, or keep it RDP. Before, switching it to RDP first got round the hold. ([#95](https://github.com/paulm981/Submarine/issues/95))
+- **Allowing on-connect commands counts only for the commands you were shown.** In a shared profile, if someone changes them again while you're looking at them, Allow is refused and you're shown the new ones to check. Before, the OK went to whatever had come in last. ([#95](https://github.com/paulm981/Submarine/issues/95))
 
 ### From the original project ([#41](https://github.com/paulm981/Submarine/issues/41))
 

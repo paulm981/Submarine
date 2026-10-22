@@ -7545,10 +7545,10 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
     Ok(list)
 }
 
-/// "Keep it SSH" for a server whose switch to telnet or VNC is held: it stays
-/// SSH on its old port, saved as this device's own edit, so the next sync
-/// takes it back to SSH everywhere (approvals::keep_ssh). False when no
-/// switch was held.
+/// "Keep it SSH" (or RDP) for a server whose switch to telnet or VNC is held:
+/// it stays as it was on its old port, saved as this device's own edit, so the
+/// next sync takes it back to that everywhere (approvals::keep_ssh). False
+/// when no switch was held.
 #[tauri::command]
 async fn keep_server_ssh(db_state: tauri::State<'_, DbState>, server_id: i32) -> Result<bool, String> {
     let kept = {
@@ -7570,6 +7570,9 @@ async fn keep_server_ssh(db_state: tauri::State<'_, DbState>, server_id: i32) ->
 /// connect starts them (as does the Start button now). Autostart counts from
 /// the next unlock; the frontend types allowed on-connect commands itself.
 /// An allowed switch to telnet or VNC is made at once (approvals::allow).
+/// `run_on_connect` is the on-connect text the user was shown: allowing the
+/// commands needs it, and it's refused when the commands have changed since
+/// (approvals::check_seen_run_on_connect), so the user is asked again.
 #[tauri::command]
 async fn allow_held(
     db_state: tauri::State<'_, DbState>,
@@ -7577,6 +7580,7 @@ async fn allow_held(
     map: tauri::State<'_, MonitorMap>,
     server_id: i32,
     items: Vec<String>,
+    run_on_connect: Option<String>,
 ) -> Result<usize, String> {
     let (allowed, customs) = {
         let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
@@ -7588,6 +7592,8 @@ async fn allow_held(
         } else {
             items.into_iter().filter(|i| held.contains(i)).collect()
         };
+        let allowing_commands = allowed.iter().any(|i| i == approvals::RUN_ON_CONNECT);
+        approvals::check_seen_run_on_connect(conn, &uuid, allowing_commands, run_on_connect.as_deref())?;
         if allowed.is_empty() {
             return Ok(0);
         }

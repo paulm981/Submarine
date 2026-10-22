@@ -11,6 +11,7 @@ type HeldServer = {
   id: number;
   name: string;
   port?: number;
+  protocol?: string;
   run_on_connect?: string;
   edited_by?: string | null;
   held?: string[];
@@ -29,6 +30,9 @@ function switchOf(item: string): { protocol: string; label: string; port: string
   return { protocol, label: protocol === "vnc" ? "VNC" : "telnet", port };
 }
 
+/** What the server is on this device while a switch is held: SSH or RDP. */
+const keptLabel = (server: HeldServer) => (server.protocol === "rdp" ? "RDP" : "SSH");
+
 /** One held item, in words, with the text it would run when there is one. */
 function describe(item: string, server: HeldServer): { what: string; detail?: string } {
   if (item === "run_on_connect") {
@@ -45,7 +49,7 @@ function describe(item: string, server: HeldServer): { what: string; detail?: st
     const to = `${sw.label}${sw.port ? ` on port ${sw.port}` : ""}`;
     return {
       what: `Another computer changed this server to ${sw.label}. ${why}`,
-      detail: `Until you choose, it stays SSH here${server.port ? `, on port ${server.port}` : ""}. Allow makes it ${to} here too. Keep it SSH changes it back to SSH on the other computers as well.`,
+      detail: `Until you choose, it stays ${keptLabel(server)} here${server.port ? `, on port ${server.port}` : ""}. Allow makes it ${to} here too. Keep it ${keptLabel(server)} changes it back to ${keptLabel(server)} on the other computers as well.`,
     };
   }
   if (item.startsWith("tunnel:")) {
@@ -63,8 +67,9 @@ function describe(item: string, server: HeldServer): { what: string; detail?: st
 
 export function HeldReview({ servers, onAllow, onKeepSsh, onClose }: {
   servers: HeldServer[];
-  onAllow: (serverId: number, items: string[]) => Promise<void>;
-  /** A held switch to telnet or VNC, declined: the server stays SSH, everywhere. */
+  /** `runOnConnect`: the on-connect text shown, when those commands are among the items. */
+  onAllow: (serverId: number, items: string[], runOnConnect?: string) => Promise<void>;
+  /** A held switch to telnet or VNC, declined: the server stays SSH (or RDP), everywhere. */
   onKeepSsh?: (serverId: number) => Promise<void>;
   onClose: () => void;
 }) {
@@ -86,9 +91,12 @@ export function HeldReview({ servers, onAllow, onKeepSsh, onClose }: {
     if (held.length === 0) onClose();
   }, [held.length, onClose]);
 
-  const allow = async (serverId: number, items: string[]) => {
+  // Allowing the on-connect commands carries the text shown here, so an OK
+  // never counts for a newer text that came in after it was shown.
+  const allow = async (server: HeldServer, items: string[]) => {
+    const commands = items.length === 0 ? (server.held || []).includes("run_on_connect") : items.includes("run_on_connect");
     setBusy(true);
-    try { await onAllow(serverId, items); } finally { setBusy(false); }
+    try { await onAllow(server.id, items, commands ? server.run_on_connect || "" : undefined); } finally { setBusy(false); }
   };
   const keepSsh = async (serverId: number) => {
     if (!onKeepSsh) return;
@@ -120,7 +128,7 @@ export function HeldReview({ servers, onAllow, onKeepSsh, onClose }: {
         <p className="px-4 pb-3 text-[12px] text-zinc-400 leading-relaxed">
           Someone you share this profile with made these changes. Until you allow one, it doesn't run on this
           device: commands aren't typed, forwards stay stopped, autostart doesn't connect, monitor commands
-          don't run, and a server changed to telnet or VNC stays an SSH server. Allowing counts for this device only.
+          don't run, and a server changed to telnet or VNC stays what it was. Allowing counts for this device only.
         </p>
         <div className="flex-1 overflow-y-auto custom-scrollbar px-4 pb-2 space-y-3">
           {held.map((s) => (
@@ -133,7 +141,7 @@ export function HeldReview({ servers, onAllow, onKeepSsh, onClose }: {
                 {(s.held || []).length > 1 && (
                   <button
                     disabled={busy}
-                    onClick={() => allow(s.id, [])}
+                    onClick={() => allow(s, [])}
                     className="shrink-0 px-2.5 h-7 rounded text-[10.5px] font-bold uppercase tracking-wider bg-white/[0.04] border border-white/10 text-zinc-300 hover:bg-white/[0.08] hover:text-white disabled:opacity-50"
                   >
                     Allow all
@@ -158,7 +166,7 @@ export function HeldReview({ servers, onAllow, onKeepSsh, onClose }: {
                       <div className="shrink-0 flex flex-col items-stretch gap-1">
                         <button
                           disabled={busy}
-                          onClick={() => allow(s.id, [item])}
+                          onClick={() => allow(s, [item])}
                           aria-label={`Allow: ${d.what}`}
                           className="px-2.5 h-7 rounded text-[10.5px] font-bold uppercase tracking-wider bg-primary/15 border border-primary/40 text-primary hover:bg-primary/25 disabled:opacity-50"
                         >
@@ -168,10 +176,10 @@ export function HeldReview({ servers, onAllow, onKeepSsh, onClose }: {
                           <button
                             disabled={busy}
                             onClick={() => keepSsh(s.id)}
-                            aria-label={`Keep ${s.name} an SSH server`}
+                            aria-label={`Keep ${s.name} an ${keptLabel(s)} server`}
                             className="px-2.5 h-7 rounded text-[10.5px] font-bold uppercase tracking-wider bg-white/[0.04] border border-white/10 text-zinc-300 hover:bg-white/[0.08] hover:text-white disabled:opacity-50"
                           >
-                            Keep it SSH
+                            Keep it {keptLabel(s)}
                           </button>
                         )}
                       </div>

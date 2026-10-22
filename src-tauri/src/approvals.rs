@@ -10,17 +10,19 @@
 //! allows it, or changes that value themselves.
 //!
 //! One more is held for what it would send rather than run: a server switched
-//! from SSH to telnet or VNC. Telnet sends the password as plain text, and VNC
-//! answers its password check with weak protection and doesn't check the
-//! server's identity, so the switch could take the server's saved password
-//! somewhere it could be read. Unlike the others, this device keeps the old
-//! protocol and port in the row until it's allowed (`hold_switch` puts them
-//! back, and `before_merge` brings the synced ones back for the next record to
-//! merge over); what it pushes still carries the synced ones (`held_switch`),
-//! so the hold never undoes the change for everyone else. The user can also
-//! keep it SSH (`keep_ssh`), which is their own edit and goes to everyone. RDP
-//! isn't held: its password is only sent after the server's certificate is
-//! checked, as an SSH password is after its host key.
+//! to telnet or VNC from anything else (SSH, RDP). Telnet sends the password
+//! as plain text, and VNC answers its password check with weak protection and
+//! doesn't check the server's identity, so the switch could take the server's
+//! saved password somewhere it could be read. Unlike the others, this device
+//! keeps the old protocol and port in the row until it's allowed
+//! (`hold_switch` puts them back, and `before_merge` brings the synced ones
+//! back for the next record to merge over); what it pushes still carries the
+//! synced ones (`held_switch`), so the hold never undoes the change for
+//! everyone else. The user can also keep it as it was (`keep_ssh`), which is
+//! their own edit and goes to everyone. A switch to RDP isn't held: its
+//! password is only sent after the server's certificate is checked, as an SSH
+//! password is after its host key. But a switch from RDP to telnet or VNC is,
+//! or SSH to RDP to VNC would get round the hold in two steps.
 //!
 //! Held items are device-local: the table isn't synced, and nobody else's
 //! "allow" counts here. Personal profiles sync only between the user's own
@@ -73,8 +75,8 @@ fn is_ssh(protocol: Option<&str>) -> bool {
     matches!(protocol, None | Some("") | Some("ssh"))
 }
 
-/// The protocols a switch to from SSH is held for: they'd send the server's
-/// saved password where it could be read.
+/// The protocols a switch to is held for: they'd send the server's saved
+/// password where it could be read.
 fn sends_password_weakly(protocol: Option<&str>) -> bool {
     matches!(protocol, Some("telnet") | Some("vnc"))
 }
@@ -290,23 +292,25 @@ pub fn before_merge(conn: &Connection, table: &str, uuid: &str) -> Result<Option
     Ok(before)
 }
 
-/// After the merge engine applied a server record: an existing SSH server the
-/// record makes a telnet or VNC one stays an SSH one here, on its old port,
-/// and the switch is held; anything else lets a held switch go. A new server
-/// (`before` None) isn't held: the user sees what it is before opening it.
+/// After the merge engine applied a server record: an existing server that
+/// wasn't telnet or VNC (SSH, RDP) and that the record makes a telnet or VNC
+/// one stays what it was here, on its old port, and the switch is held;
+/// anything else lets a held switch go. A new server (`before` None) isn't
+/// held: the user sees what it is before opening it.
 /// Part of `hold_changes`; outside a share, run on its own for a server that
 /// has a switch held from before.
 pub fn hold_switch(conn: &Connection, uuid: &str, before: Option<&Snapshot>) -> Result<(), String> {
     let Some(Snapshot::Server { protocol: b_protocol, port: b_port, .. }) = before else { return Ok(()) };
     let Some(Snapshot::Server { protocol, port, .. }) = snapshot(conn, "servers", uuid) else { return Ok(()) };
     match protocol {
-        Some(protocol) if is_ssh(b_protocol.as_deref()) && sends_password_weakly(Some(&protocol)) => {
+        Some(protocol) if !sends_password_weakly(b_protocol.as_deref()) && sends_password_weakly(Some(&protocol)) => {
             let item = HeldSwitch { protocol, port }.item();
             release_missing(conn, uuid, PROTOCOL_PREFIX, &BTreeSet::from([item.clone()]))?;
             hold(conn, uuid, &item)?;
-            // Plain SSH (NULL), whatever spelling it had: an "ssh" here would
+            // SSH as plain NULL, whatever spelling it had: an "ssh" here would
             // look like a change to the form, which saves SSH as NULL.
-            conn.execute("UPDATE servers SET protocol = NULL, port = ?1 WHERE uuid = ?2", params![b_port, uuid])
+            let kept = b_protocol.as_deref().filter(|p| !is_ssh(Some(p)));
+            conn.execute("UPDATE servers SET protocol = ?1, port = ?2 WHERE uuid = ?3", params![kept, b_port, uuid])
                 .map(|_| ())
                 .map_err(|e| format!("[SYNC] HOLD_PROTOCOL: {e}"))
         }
@@ -314,9 +318,10 @@ pub fn hold_switch(conn: &Connection, uuid: &str, before: Option<&Snapshot>) -> 
     }
 }
 
-/// The user's "Keep it SSH" for a held switch: the switch is dropped and the
-/// server, SSH on its old port here, is saved as this device's own edit, so
-/// the next sync takes it back to SSH everywhere. False when nothing was held.
+/// The user's "Keep it SSH" (or RDP) for a held switch: the switch is dropped
+/// and the server, as it was on its old port here, is saved as this device's
+/// own edit, so the next sync takes it back to that everywhere. False when
+/// nothing was held.
 pub fn keep_ssh(conn: &Connection, uuid: &str) -> Result<bool, String> {
     if held_switch(conn, uuid).is_none() {
         return Ok(false);
@@ -324,7 +329,10 @@ pub fn keep_ssh(conn: &Connection, uuid: &str) -> Result<bool, String> {
     conn.execute("DELETE FROM held_approvals WHERE uuid = ?1 AND item LIKE ?2 || '%'", params![uuid, PROTOCOL_PREFIX])
         .map_err(|e| format!("[SYNC] KEEP_SSH: {e}"))?;
     // Unchanged values, but an update all the same: the sync triggers stamp it.
-    conn.execute("UPDATE servers SET protocol = NULL, port = port WHERE uuid = ?1", [uuid])
+    conn.execute(
+        "UPDATE servers SET protocol = CASE WHEN protocol IN ('', 'ssh') THEN NULL ELSE protocol END, port = port WHERE uuid = ?1",
+        [uuid],
+    )
         .map_err(|e| format!("[SYNC] KEEP_SSH: {e}"))?;
     Ok(true)
 }
@@ -333,7 +341,7 @@ pub fn keep_ssh(conn: &Connection, uuid: &str) -> Result<bool, String> {
 /// None for a new row): hold whatever the record newly turned on, and drop
 /// held entries for what it turned off or removed. A record that changed
 /// nothing on these fields leaves everything as it was. A server switched from
-/// SSH to telnet or VNC is held too (`hold_switch`).
+/// anything else to telnet or VNC is held too (`hold_switch`).
 pub fn hold_changes(conn: &Connection, table: &str, uuid: &str, before: Option<&Snapshot>) -> Result<(), String> {
     if table == "servers" {
         hold_switch(conn, uuid, before)?;
@@ -423,6 +431,29 @@ pub fn allow(conn: &Connection, uuid: &str, items: &[String]) -> Result<usize, S
             .map_err(|e| format!("[SYNC] ALLOW: {e}"))?;
     }
     Ok(n)
+}
+
+/// Refused when on-connect commands are allowed against a text that isn't
+/// theirs any more. The frontend looks for `HELD_CHANGED`.
+pub const HELD_CHANGED: &str =
+    "[SYNC] HELD_CHANGED: These on-connect commands were changed again after they were shown to you. Look at them again before you allow them.";
+
+/// The on-connect commands are held by their item alone, which a newer synced
+/// text keeps. So an OK counts only for the text the user was shown: `seen`
+/// must be what the row has now, and is needed whenever `allowing` them.
+/// Anything else is refused (`HELD_CHANGED`), and the user is asked again.
+pub fn check_seen_run_on_connect(conn: &Connection, uuid: &str, allowing: bool, seen: Option<&str>) -> Result<(), String> {
+    let Some(seen) = seen else {
+        return if allowing { Err(HELD_CHANGED.into()) } else { Ok(()) };
+    };
+    let now: String = conn
+        .query_row("SELECT COALESCE(run_on_connect, '') FROM servers WHERE uuid = ?1", [uuid], |r| r.get(0))
+        .map_err(|e| format!("[SYNC] ALLOW: {e}"))?;
+    if now == seen {
+        Ok(())
+    } else {
+        Err(HELD_CHANGED.into())
+    }
 }
 
 /// Saved forwards about to start a session's forwarding: the held ones come
@@ -755,6 +786,24 @@ mod tests {
     }
 
     #[test]
+    fn allowing_commands_counts_only_for_the_text_that_was_shown() {
+        let conn = db();
+        merge_server(&conn, "u1", "uptime", false, "[]");
+        // A newer synced text while the first is held keeps the same item.
+        merge_server(&conn, "u1", "curl x | sh", false, "[]");
+        assert!(held_for(&conn, "u1").contains(RUN_ON_CONNECT));
+        // An OK for the text shown before is refused; nothing is let go.
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, Some("uptime")), Err(HELD_CHANGED.to_string()));
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, None), Err(HELD_CHANGED.to_string()));
+        assert!(held_for(&conn, "u1").contains(RUN_ON_CONNECT));
+        // Shown again, it can be allowed.
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, Some("curl x | sh")), Ok(()));
+        // Not allowing them needs nothing; a stale text is refused all the same.
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", false, None), Ok(()));
+        assert!(check_seen_run_on_connect(&conn, "u1", false, Some("uptime")).is_err());
+    }
+
+    #[test]
     fn turning_things_off_or_removing_them_releases_them() {
         let conn = db();
         merge_server(&conn, "u1", "curl x | sh", true, L8080_D1080);
@@ -960,6 +1009,27 @@ mod tests {
         merge_protocol(&conn, "u2", Some("rdp"));
         assert_eq!(protocol_of(&conn, "u2").as_deref(), Some("rdp"));
         assert!(held_by_server(&conn).is_empty());
+    }
+
+    #[test]
+    fn a_switch_to_telnet_or_vnc_by_way_of_rdp_is_held_too() {
+        let conn = db();
+        merge_protocol(&conn, "u1", None);
+        merge_protocol(&conn, "u1", Some("rdp"));
+        assert_eq!(protocol_of(&conn, "u1").as_deref(), Some("rdp"), "RDP isn't held");
+        merge_protocol(&conn, "u1", Some("vnc"));
+        assert_eq!((protocol_of(&conn, "u1").as_deref(), port_of(&conn, "u1")), (Some("rdp"), 3389), "still RDP on 3389 here");
+        assert_eq!(held_list(&conn, "u1"), vec!["protocol:vnc|5900".to_string()]);
+        // Keeping it keeps it RDP, as this device's own edit.
+        assert!(keep_ssh(&conn, "u1").unwrap());
+        assert_eq!((protocol_of(&conn, "u1").as_deref(), port_of(&conn, "u1")), (Some("rdp"), 3389));
+        assert!(held_for(&conn, "u1").is_empty());
+        // Allowed instead, the switch is made.
+        merge_protocol(&conn, "u2", None);
+        merge_protocol(&conn, "u2", Some("rdp"));
+        merge_protocol(&conn, "u2", Some("telnet"));
+        allow(&conn, "u2", &[]).unwrap();
+        assert_eq!((protocol_of(&conn, "u2").as_deref(), port_of(&conn, "u2")), (Some("telnet"), 23));
     }
 
     #[test]
