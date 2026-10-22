@@ -21535,14 +21535,24 @@ fn parse_ssh_config_text(contents: &str) -> Vec<ImportedHost> {
             for b in blocks.iter().filter(|b| matches(&b.patterns, alias)) {
                 s.fill_from(&b.settings);
             }
+            // `%h` in a HostName (often from a wildcard block: `HostName
+            // %h.prod.example`) is the alias. A HostName with a token it
+            // doesn't take is left out, as is a key path or jump with a token
+            // other than `%h` and `%%`, rather than saved with the `%` in it.
+            let hostname = s
+                .hostname
+                .and_then(|h| ssh_config::expand_hostname(&h, alias).ok())
+                .filter(|h| !h.trim().is_empty())
+                .unwrap_or_else(|| alias.clone());
+            let identity_file = s.identity_file.and_then(|f| ssh_config::expand_hostname(&f, &hostname).ok());
             out.push(ImportedHost {
                 host_alias: alias.clone(),
-                hostname: s.hostname.unwrap_or_else(|| alias.clone()),
+                hostname,
                 port: s.port.unwrap_or(22),
                 user: s.user.unwrap_or_default(),
-                identity_file: s.identity_file,
+                identity_file,
                 // `none` turns off a ProxyJump set by a wildcard block.
-                proxy_jump: s.proxy_jump.filter(|j| !j.eq_ignore_ascii_case("none")),
+                proxy_jump: s.proxy_jump.filter(|j| !j.eq_ignore_ascii_case("none") && !j.contains('%')),
                 ..Default::default()
             });
         }
@@ -22332,6 +22342,34 @@ mod client_import_tests {
         assert_eq!((db.hostname.as_str(), db.port, db.user.as_str()), ("db.example", 2022, "everyone"));
         assert_eq!(db.identity_file, None);
         assert_eq!(db.proxy_jump, None, "ProxyJump none wins over Host *");
+    }
+
+    #[test]
+    fn ssh_config_import_expands_percent_h() {
+        let hosts = super::parse_ssh_config_text(
+            "Host web1 web2 odd\n\
+             Host odd\n\
+             \tHostName %r.example\n\
+             \tIdentityFile ~/.ssh/%u_key\n\
+             \tProxyJump %r@gate\n\
+             Host web*\n\
+             \tHostName %h.prod.example.com\n\
+             \tIdentityFile ~/.ssh/%h-100%%\n\
+             \tProxyJump gate.example\n",
+        );
+        let got: Vec<(&str, &str, Option<&str>, Option<&str>)> = hosts
+            .iter()
+            .map(|h| (h.host_alias.as_str(), h.hostname.as_str(), h.identity_file.as_deref(), h.proxy_jump.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("web1", "web1.prod.example.com", Some("~/.ssh/web1.prod.example.com-100%"), Some("gate.example")),
+                ("web2", "web2.prod.example.com", Some("~/.ssh/web2.prod.example.com-100%"), Some("gate.example")),
+                ("odd", "odd", None, None),
+            ],
+            "%h is the alias in HostName and the host in IdentityFile; other tokens are left out"
+        );
     }
 
     #[test]

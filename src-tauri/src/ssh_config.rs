@@ -546,7 +546,7 @@ pub(crate) fn glob_matches(pattern: &str, name: &str, ignore_case: bool) -> bool
 }
 
 /// `HostName` takes `%h` (the address as given) and `%%`.
-fn expand_hostname(value: &str, address: &str) -> Result<String, String> {
+pub(crate) fn expand_hostname(value: &str, address: &str) -> Result<String, String> {
     let mut out = String::new();
     let mut chars = value.chars();
     while let Some(c) = chars.next() {
