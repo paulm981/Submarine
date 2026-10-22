@@ -93,6 +93,15 @@ impl HostTrust {
         if self.is_revoked(ca_key) || self.is_revoked(&cert_key) {
             return Verdict::Refused("its certificate (or the CA that signed it) is marked @revoked in your known_hosts".into());
         }
+        // fork (#43): as OpenSSH's host-certificate check. A host certificate
+        // has no critical options, and a CA's RSA signature over SHA-1
+        // (ssh-rsa) isn't accepted, as OpenSSH 8.2 and later by default.
+        if !cert.critical_options().is_empty() {
+            return Verdict::Refused("its certificate has critical options, which host certificates can't have".into());
+        }
+        if let russh::keys::Algorithm::Rsa { hash: None } = cert.signature().algorithm() {
+            return Verdict::Refused("its certificate is signed with ssh-rsa (SHA-1), which isn't accepted any more".into());
+        }
         let fingerprint = ca_key.fingerprint(HashAlg::Sha256);
         if let Err(e) = cert.validate_at(now, [&fingerprint]) {
             return Verdict::Refused(format!("its certificate isn't valid ({e})"));
@@ -105,7 +114,8 @@ impl HostTrust {
                 principals.iter().take(6).cloned().collect::<Vec<_>>().join(", ")
             ));
         }
-        Verdict::Trusted(format!("Host certificate signed by a CA trusted in {file}. Verified."))
+        let any = if principals.is_empty() { " (the certificate names no hosts, so it's valid for any)" } else { "" };
+        Verdict::Trusted(format!("Host certificate signed by a CA trusted in {file}. Verified{any}."))
     }
 
     fn is_revoked(&self, key: &PublicKey) -> bool {

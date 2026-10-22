@@ -373,4 +373,53 @@ mod tests {
         keep_kinds_first(&mut p, &[], &mut Vec::new());
         assert_eq!(order(&p)[0], "rsa-sha2-256");
     }
+
+    /// A certificate re-encoded with its CA signature labelled `alg`, as a
+    /// server could send it.
+    fn with_signature_algorithm(c: &Certificate, alg: russh::keys::Algorithm) -> Certificate {
+        use russh::keys::ssh_encoding::Encode;
+        let bytes = c.to_bytes().unwrap();
+        let old = c.signature().encode_vec().unwrap();
+        let new = russh::keys::ssh_key::Signature::new(alg, c.signature().as_bytes().to_vec()).unwrap().encode_vec().unwrap();
+        let mut out = bytes[..bytes.len() - old.len() - 4].to_vec();
+        new.encode(&mut out).unwrap();
+        Certificate::from_bytes(&out).unwrap()
+    }
+
+    #[tokio::test]
+    async fn host_certificates_follow_openssh_more_closely() {
+        use russh::keys::ssh_key::private::RsaKeypair;
+        let host = "node1.sublab.test";
+        let valid = (NOW - 3600, NOW + 3600);
+        // Critical options: refused.
+        let ca = key();
+        let t = known_hosts(&format!("@cert-authority *.sublab.test {}\n", line(ca.public_key())), host, 22).await;
+        let mut b = Builder::new_with_random_nonce(&mut rand::rng(), key().public_key(), valid.0, valid.1).unwrap();
+        b.cert_type(CertType::Host).unwrap();
+        b.valid_principal(host).unwrap();
+        b.critical_option("force-command", "true").unwrap();
+        match decide_certificate(HostKeyVerdict::New, Some(&t), &b.sign(&ca).unwrap(), NOW) {
+            HostKeyDecision::Refused(why) => assert!(why.contains("critical options"), "{why}"),
+            other => panic!("refused, not {other:?}"),
+        }
+        // An RSA CA: rsa-sha2-512 passes; the same certificate labelled ssh-rsa (SHA-1) doesn't.
+        let rsa_ca = PrivateKey::from(RsaKeypair::random(&mut rand::rng(), 2048).unwrap());
+        let t = known_hosts(&format!("@cert-authority *.sublab.test {}\n", line(rsa_ca.public_key())), host, 22).await;
+        let good = cert(&rsa_ca, &[host], valid, CertType::Host);
+        assert!(matches!(decide_certificate(HostKeyVerdict::New, Some(&t), &good, NOW), HostKeyDecision::Trusted { .. }));
+        let sha1 = with_signature_algorithm(&good, russh::keys::Algorithm::Rsa { hash: None });
+        match decide_certificate(HostKeyVerdict::New, Some(&t), &sha1, NOW) {
+            HostKeyDecision::Refused(why) => assert!(why.contains("SHA-1"), "{why}"),
+            other => panic!("refused, not {other:?}"),
+        }
+        // No hosts named: valid for any, and the log says so.
+        let ed_t = known_hosts(&format!("@cert-authority *.sublab.test {}\n", line(ca.public_key())), host, 22).await;
+        let mut b = Builder::new_with_random_nonce(&mut rand::rng(), key().public_key(), valid.0, valid.1).unwrap();
+        b.cert_type(CertType::Host).unwrap();
+        b.all_principals_valid().unwrap();
+        match decide_certificate(HostKeyVerdict::New, Some(&ed_t), &b.sign(&ca).unwrap(), NOW) {
+            HostKeyDecision::Trusted { why, .. } => assert!(why.contains("names no hosts, so it's valid for any"), "{why}"),
+            other => panic!("trusted, not {other:?}"),
+        }
+    }
 }
