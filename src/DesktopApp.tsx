@@ -337,6 +337,10 @@ function DesktopApp() {
   const [isKeyPanelOpen, setIsKeyPanelOpen] = useState(false);
   const [editKeyData, setEditKeyData] = useState<any>({ id: null, name: "", public_key: "", private_key: "", passphrase: "" });
   const [formError, setFormError] = useState("");
+  // The five panels share one error line: a panel opening or closing (by ✕,
+  // the backdrop or Escape) starts it empty, so one panel's error never
+  // shows in the next.
+  useEffect(() => { setFormError(""); }, [isPanelOpen, isCommandPanelOpen, isNotePanelOpen, isCredPanelOpen, isKeyPanelOpen]);
   const commandPanelRef = useSlideOverFocus(isCommandPanelOpen);
   const notePanelRef = useSlideOverFocus(isNotePanelOpen);
   const credPanelRef = useSlideOverFocus(isCredPanelOpen);
@@ -875,6 +879,7 @@ function DesktopApp() {
       ...defaultNode,
       folderId: folderId != null ? String(folderId) : "",
     });
+    setFormError("");
     setIsPanelOpen(true);
   };
 
@@ -1688,6 +1693,7 @@ function DesktopApp() {
       // and a real overwrite.
       password_dirty: false,
     });
+    setFormError("");
     setIsPanelOpen(true);
   };
 
@@ -3552,7 +3558,7 @@ function DesktopApp() {
             <button 
               onClick={async () => {
                 if (!editCommandData.title || !editCommandData.content) {
-                  addLog("Title and Content are required.", "error");
+                  setFormError("Give the command a title and the command to run.");
                   return;
                 }
                 const scope = editCommandData.scope;
