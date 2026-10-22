@@ -109,7 +109,25 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     const dropsLogin = (protocol !== "ssh" && newNode.authType === "custom_key") || (protocol === "vnc" && newNode.authType === "vault");
     const authType = dropsLogin ? "custom_pass" : newNode.authType;
     const credentialId = protocol === "vnc" ? "" : newNode.credentialId;
-    setNewNode({ ...newNode, protocol, port, authType, credentialId });
+    // An SSH password isn't sent over VNC (weakly protected) or telnet (not
+    // protected at all): leaving SSH for either empties the field, and the
+    // save clears the saved one too. It's held here, so going back to SSH
+    // before saving brings it back.
+    let password = {};
+    if (isSsh && (protocol === "vnc" || protocol === "telnet")) {
+      password = {
+        password: "",
+        password_dirty: true,
+        heldSshPassword: { password: newNode.password || "", dirty: !!newNode.password_dirty },
+      };
+    } else if (protocol === "ssh" && newNode.heldSshPassword) {
+      password = {
+        password: newNode.heldSshPassword.password,
+        password_dirty: newNode.heldSshPassword.dirty,
+        heldSshPassword: undefined,
+      };
+    }
+    setNewNode({ ...newNode, protocol, port, authType, credentialId, ...password });
   };
   const [newFolderName, setNewFolderName] = useState("");
   // Set while the native key picker is open so the Browse button can't be
@@ -686,6 +704,13 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                     className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner"
                     placeholder="••••••"
                   />
+                  {(isTelnet || isVnc) && newNode.heldSshPassword?.password && !newNode.password && (
+                    <p className="text-[10px] text-amber-300/90 ml-1">
+                      {isVnc
+                        ? "The SSH password was taken out, so it isn't sent over VNC. VNC servers have a password of their own: type it here."
+                        : "The SSH password was taken out, so it isn't sent over telnet, which doesn't protect it. Type one here if you want it saved."}
+                    </p>
+                  )}
                   <p className="text-[10px] text-zinc-500 ml-1">
                     {isTelnet
                       ? "A telnet server asks for the login in the terminal. Type it there; at the password prompt, the terminal's key button types the saved one."
