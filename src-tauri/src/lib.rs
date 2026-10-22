@@ -16109,7 +16109,7 @@ async fn ssh_iptables_chain(
     let args = ["iptables", "-t", table.as_str(), "-n", "-v", "-L", chain.as_str(), "--line-numbers"]
         .map(String::from);
     if password.is_none() {
-        let direct = format!("{} 2>/dev/null", remote_sh::quote_words(&args));
+        let direct = sh_user_command(&format!("{} 2>/dev/null", remote_sh::quote_words(&args)));
         let out = run_exec_capture(&state, &session_id, &direct, 15).await?;
         if !out.trim().is_empty() {
             return Ok(out);
@@ -16277,7 +16277,7 @@ async fn ssh_nft_chain(
     }
     let args = ["nft", "list", "chain", family.as_str(), table.as_str(), chain.as_str()].map(String::from);
     if password.is_none() {
-        let direct = format!("{} 2>/dev/null", remote_sh::quote_words(&args));
+        let direct = sh_user_command(&format!("{} 2>/dev/null", remote_sh::quote_words(&args)));
         let out = run_exec_capture(&state, &session_id, &direct, 15).await?;
         if !out.trim().is_empty() {
             return Ok(out);
@@ -16378,6 +16378,15 @@ struct SystemctlActionResult {
     root_tool: Option<String>,
 }
 
+/// The user's own try at an Info panel action before root (a service
+/// action, a kill, a firewall read), run by sh whatever the login shell is:
+/// csh and tcsh read `2>&1` and `$?` their own way (remote_sh), and the
+/// answer decides whether root is asked for. Not for what must also work
+/// on Windows (server_os's probe runs in cmd.exe there).
+fn sh_user_command(cmd: &str) -> String {
+    remote_sh::sh_command(&[], cmd, &[])
+}
+
 async fn run_exec_capture(
     state: &SshState,
     session_id: &str,
@@ -16396,11 +16405,6 @@ async fn run_exec_capture(
         let session = session_arc.lock().await;
         session.channel_open_session().await.map_err(|e| e.to_string())?
     };
-    // Run by sh whatever the login shell is: csh and tcsh read `2>&1` and
-    // `$?` their own way (remote_sh). These are the user's own tries before
-    // root (a service action, a kill, a firewall read), and their answer
-    // decides whether root is asked for.
-    let cmd = remote_sh::sh_command(&[], cmd, &[]);
     channel.exec(true, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
     let mut stream = channel.into_stream();
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
@@ -17319,7 +17323,7 @@ async fn ssh_systemctl_action(
     // a password when they need one). A call with `password` is that second
     // try, so it goes straight to root.
     if password.is_none() {
-        let plain_cmd = systemctl_command(false, &action, &unit);
+        let plain_cmd = sh_user_command(&systemctl_command(false, &action, &unit));
         let raw1 = run_exec_capture(&state, &session_id, &plain_cmd, 30).await?;
         let (code1, out1) = parse_exit_marker(&raw1);
         let needs_root = code1 != 0 && (
@@ -17376,7 +17380,7 @@ async fn ssh_kill_process(
 
     // As ssh_systemctl_action: the user's own kill, then as root.
     if password.is_none() {
-        let plain = format!("kill -{} {} 2>&1; echo __SUB_EXITCODE:$?", sig, pid);
+        let plain = sh_user_command(&format!("kill -{} {} 2>&1; echo __SUB_EXITCODE:$?", sig, pid));
         let raw1 = run_exec_capture(&state, &session_id, &plain, 15).await?;
         let (code1, out1) = parse_exit_marker(&raw1);
         let low = out1.to_lowercase();
