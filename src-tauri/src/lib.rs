@@ -1298,7 +1298,11 @@ fn apply_remote_inner(
             // record to merge over, and hold_switch keeps this device's again
             // after it, whether the record applied or not.
             let before = if watch || held_switch { approvals::before_merge(&tx, spec.table, &rec.uuid)? } else { None };
+            let tunnels_before = if spec.table == "servers" { stored_tunnels(&tx, &rec.uuid) } else { None };
             let applied = apply_entity(&tx, key, spec, rec, &mut fk_fixups);
+            if let Some(old) = tunnels_before {
+                note_synced_tunnels(&tx, &rec.uuid, &old)?;
+            }
             if watch {
                 approvals::hold_changes(&tx, spec.table, &rec.uuid, before.as_ref())?;
             } else if held_switch {
@@ -3760,6 +3764,52 @@ mod sync_engine_tests {
         approvals::create_schema(&c).unwrap();
         apply_remote_records(&c, &KEY, &recs, &hc).unwrap();
         assert!(approvals::held_by_server(&c).is_empty(), "a personal profile holds nothing");
+    }
+
+    // A forward a co-member adds while this device has a session open on the
+    // server: the session's next save keeps it (and its hold) instead of
+    // writing the list it read before over it.
+    #[test]
+    fn a_sessions_save_keeps_a_forward_that_came_by_sync() {
+        let l8080 = r#"[{"type":"L","local":"127.0.0.1:8080","remote":"db:5432"}]"#;
+        let (a, ha) = device("A");
+        a.execute("INSERT INTO servers(name,host,port,tunnels) VALUES('web','h',22,?1)", [l8080]).unwrap();
+        let (b, hb) = device("B");
+        approvals::create_schema(&b).unwrap();
+        b.execute("INSERT INTO sync_meta(key,value) VALUES('share_id','s1')", []).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let (id, uuid): (i32, String) = b.query_row("SELECT id, uuid FROM servers WHERE name='web'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        approvals::allow(&b, &uuid, &[]).unwrap();
+        assert!(take_synced_tunnels_base(&b, id).is_none(), "a new server has no session to be out of date");
+        // B's session reads the rules; then A adds a SOCKS forward.
+        let ours: Vec<tunnel::TunnelSpec> = serde_json::from_str(l8080).unwrap();
+        a.execute(
+            "UPDATE servers SET tunnels=?1 WHERE name='web'",
+            [r#"[{"type":"L","local":"127.0.0.1:8080","remote":"db:5432"},{"type":"D","local":"0.0.0.0:1080"}]"#],
+        )
+        .unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        assert!(approvals::held_for(&b, &uuid).contains("tunnel:D|0.0.0.0:1080|"));
+        // B stops its forward and saves, as persist_session_tunnels does.
+        let mut ours = ours;
+        let first = ours[0].clone();
+        tunnel::rule_stopped(&mut ours, &first);
+        let base = take_synced_tunnels_base(&b, id).expect("sync changed the saved forwards");
+        let saved: Vec<tunnel::TunnelSpec> =
+            serde_json::from_str(&b.query_row("SELECT tunnels FROM servers WHERE id=?1", [id], |r| r.get::<_, String>(0)).unwrap()).unwrap();
+        let merged = tunnel::merge_rules(&base, &ours, &saved);
+        b.execute("UPDATE servers SET tunnels=?1 WHERE id=?2", rusqlite::params![serde_json::to_string(&merged).unwrap(), id]).unwrap();
+        let now: Vec<tunnel::TunnelSpec> =
+            serde_json::from_str(&b.query_row("SELECT tunnels FROM servers WHERE id=?1", [id], |r| r.get::<_, String>(0)).unwrap()).unwrap();
+        assert_eq!(now.len(), 2, "the synced forward stays");
+        assert!(now[0].stopped && !now[1].stopped);
+        assert!(approvals::held_for(&b, &uuid).contains("tunnel:D|0.0.0.0:1080|"), "and stays held");
+        assert!(take_synced_tunnels_base(&b, id).is_none(), "taken once");
+        // A record that leaves the forwards alone marks nothing.
+        apply_remote_records(&a, &KEY, &collect_local_records(&b, &KEY, "").unwrap(), &ha).unwrap();
+        a.execute("UPDATE servers SET host='h2' WHERE name='web'", []).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        assert!(take_synced_tunnels_base(&b, id).is_none());
     }
 
     /// A shared device B with A's SSH server "web" on port 22, and A having
@@ -13329,6 +13379,72 @@ async fn start_tunnel_specs_on(
     }
 }
 
+/// A server's saved `tunnels` JSON, by uuid. None when there's no such row.
+fn stored_tunnels(conn: &Connection, uuid: &str) -> Option<Option<String>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row("SELECT tunnels FROM servers WHERE uuid = ?1", [uuid], |r| r.get::<_, Option<String>>(0))
+        .optional()
+        .ok()
+        .flatten()
+}
+
+/// After the merge engine applied a server record: when it changed the
+/// server's saved forwards, what they were before is kept (the first time
+/// only, until a session takes it), in a table that lives as long as the
+/// connection and is never saved or synced. A session's rule list read before
+/// the sync is out of date then; `refresh_synced_session_rules` and
+/// `persist_session_tunnels` use it so saving the session's list doesn't undo
+/// what sync brought (a forward added elsewhere deleted everywhere, and its
+/// hold let go).
+fn note_synced_tunnels(conn: &Connection, uuid: &str, before: &Option<String>) -> Result<(), String> {
+    if stored_tunnels(conn, uuid).as_ref() == Some(before) {
+        return Ok(());
+    }
+    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS synced_tunnels_base (uuid TEXT PRIMARY KEY, tunnels TEXT)")
+        .map_err(|e| format!("[SYNC] TUNNELS_BASE: {e}"))?;
+    conn.execute(
+        "INSERT OR IGNORE INTO temp.synced_tunnels_base (uuid, tunnels) VALUES (?1, ?2)",
+        rusqlite::params![uuid, before],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("[SYNC] TUNNELS_BASE: {e}"))
+}
+
+/// Takes what a server's saved forwards were before sync changed them (see
+/// `note_synced_tunnels`): Some when they changed since a session last read
+/// or saved them.
+fn take_synced_tunnels_base(conn: &Connection, server_id: i32) -> Option<Vec<tunnel::TunnelSpec>> {
+    let uuid = approvals::server_uuid(conn, server_id as i64)?;
+    let before: Option<String> = conn
+        .query_row("SELECT tunnels FROM temp.synced_tunnels_base WHERE uuid = ?1", [&uuid], |r| r.get(0))
+        .ok()?;
+    let _ = conn.execute("DELETE FROM temp.synced_tunnels_base WHERE uuid = ?1", [&uuid]);
+    Some(before.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default())
+}
+
+/// A session whose server's saved forwards changed by sync since it read them
+/// starts again from the saved ones (with this device's holds), before the
+/// user sees or changes its rules. The session saves after every change, so
+/// it has nothing of its own that isn't saved.
+async fn refresh_synced_session_rules(state: &SshState, db_state: &DbState, session_id: &str, server_id: Option<i32>) -> Result<(), String> {
+    let server_id = server_id.unwrap_or(0);
+    if server_id <= 0 {
+        return Ok(());
+    }
+    let stale = {
+        let conn_guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+        let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        take_synced_tunnels_base(conn, server_id).is_some()
+    };
+    if stale {
+        let saved = saved_tunnel_rules(db_state, server_id)?;
+        if let Some(rules) = state.session_tunnel_specs.lock().await.get_mut(session_id) {
+            *rules = saved;
+        }
+    }
+    Ok(())
+}
+
 /// The forwarding rules saved on a node (its `tunnels` column).
 fn saved_tunnel_rules(db_state: &DbState, server_id: i32) -> Result<Vec<tunnel::TunnelSpec>, String> {
     let conn_guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
@@ -13360,6 +13476,7 @@ async fn ensure_session_rules(
     session_id: &str,
     server_id: Option<i32>,
 ) -> Result<(), String> {
+    refresh_synced_session_rules(state, db_state, session_id, server_id).await?;
     let server_id = server_id.unwrap_or(0);
     if server_id <= 0 || state.session_tunnel_specs.lock().await.contains_key(session_id) {
         return Ok(());
@@ -13464,6 +13581,7 @@ async fn list_tunnel_rules(
     session_id: String,
     server_id: Option<i32>,
 ) -> Result<Vec<tunnel::TunnelSpec>, String> {
+    refresh_synced_session_rules(state.inner(), db_state.inner(), &session_id, server_id).await?;
     if let Some(rules) = state.session_tunnel_specs.lock().await.get(&session_id) {
         return Ok(rules.clone());
     }
@@ -13556,22 +13674,23 @@ async fn persist_session_tunnels(
     let Some(mut specs) = state.session_tunnel_specs.lock().await.get(&session_id).cloned() else {
         return Ok(());
     };
+    let mut merged = false;
     {
         // Scoped so the non-Send rusqlite guard drops before save_vault_internal.
         let conn_guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        let saved: Vec<tunnel::TunnelSpec> = conn
+            .query_row("SELECT tunnels FROM servers WHERE id=?1", [server_id], |r| r.get::<_, Option<String>>(0))
+            .ok()
+            .flatten()
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
         // A forward held for this device's OK sits stopped in the session only
         // on this device. What is saved keeps the node's own stopped flag for
         // it, so the hold never reaches the people the profile is shared with.
         if let Some(uuid) = approvals::server_uuid(conn, server_id as i64) {
             let held = approvals::held_for(conn, &uuid);
             if held.iter().any(|i| i.starts_with("tunnel:")) {
-                let saved: Vec<tunnel::TunnelSpec> = conn
-                    .query_row("SELECT tunnels FROM servers WHERE id=?1", [server_id], |r| r.get::<_, Option<String>>(0))
-                    .ok()
-                    .flatten()
-                    .and_then(|j| serde_json::from_str(&j).ok())
-                    .unwrap_or_default();
                 for spec in specs.iter_mut().filter(|s| held.contains(&approvals::tunnel_item(s))) {
                     if let Some(s) = saved.iter().find(|s| *s == &*spec) {
                         spec.stopped = s.stopped;
@@ -13579,12 +13698,26 @@ async fn persist_session_tunnels(
                 }
             }
         }
+        // Sync changed the saved forwards after this session last read them
+        // (between the change and this save): the session's change goes on
+        // top of what's saved now, rather than its whole list over it.
+        if let Some(base) = take_synced_tunnels_base(conn, server_id) {
+            specs = tunnel::merge_rules(&base, &specs, &saved);
+            merged = true;
+        }
         let json = serde_json::to_string(&specs).unwrap_or_else(|_| "[]".to_string());
         conn.execute(
             "UPDATE servers SET tunnels=?1 WHERE id=?2",
             rusqlite::params![json, server_id],
         )
         .map_err(|e| format!("[DATABASE] TUNNELS_SAVE_FAILED: SQL_ERROR={}", e))?;
+    }
+    if merged {
+        // The session lists what was saved, with this device's holds.
+        let saved = saved_tunnel_rules(db_state.inner(), server_id)?;
+        if let Some(rules) = state.session_tunnel_specs.lock().await.get_mut(&session_id) {
+            *rules = saved;
+        }
     }
     save_vault_internal(&db_state)?;
     Ok(())
@@ -13608,6 +13741,7 @@ async fn restart_session_tunnels(
     // list (even empty) is authoritative (user stopped everything); only seed
     // from the node's saved tunnels when the key is ABSENT (first engagement),
     // so explicitly-stopped tunnels don't resurrect on a restore.
+    refresh_synced_session_rules(state.inner(), db_state.inner(), &session_id, Some(server_id)).await?;
     let existing: Option<Vec<tunnel::TunnelSpec>> =
         state.session_tunnel_specs.lock().await.get(&session_id).cloned();
     let mut specs: Vec<tunnel::TunnelSpec> = existing.clone().unwrap_or_default();
