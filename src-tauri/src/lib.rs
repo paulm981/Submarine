@@ -23936,6 +23936,7 @@ fn resolve_node_auth_row(
             proxy_host: proxy_host.filter(|s| !s.is_empty()),
             proxy_port: proxy_port.map(|p| p as u16),
             jump: None,
+            name: server_display_name(conn, node_id),
         },
         jump_host_id,
     ))
