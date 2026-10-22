@@ -9,6 +9,19 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Every jump host waits its turn to log in, in a ProxyJump chain too.** **Settings › Logins at a time per jump host** now applies to each jump host on the way, one line per jump host address. A saved jump host and the same machine in a chain from `~/.ssh/config` share one line. A jump host waits only while it logs in, so it never holds up the next one. ([#43](https://github.com/paulm981/Submarine/issues/43))
+- **Your saved jump host still comes first.** A server with its own saved jump host, SOCKS proxy or HTTP proxy goes that way, not through the ProxyJump in `~/.ssh/config`, and the log says so. A saved jump host that `~/.ssh/config` reaches through a ProxyJump is reached through it. ([#43](https://github.com/paulm981/Submarine/issues/43))
+- **A ProxyJump with `%` in it is refused, with a message.** OpenSSH fills in `%h`, `%r` and the like there; Submarine doesn't yet, so it asks you to write the jump hosts out in full instead of trying a host called `%h`. ([#43](https://github.com/paulm981/Submarine/issues/43))
+- **Monitoring says when it can't check a server because of a ProxyJump.** A server whose jump host `~/.ssh/config` reaches through a ProxyJump isn't checked, and its card says why, as for a server behind a ProxyJump of its own. It used to go to the jump host directly, a different way from the terminal's. ([#43](https://github.com/paulm981/Submarine/issues/43))
+- **Each jump host gets 15 seconds to open the way to the next one.** A jump host that never answers ends the attempt, and the tab tries again, as it already did for the last jump host. ([#43](https://github.com/paulm981/Submarine/issues/43))
+- **When a connect through a ProxyJump fails, the check under the error looks at the first jump host**, the one the app dials, rather than the server behind the chain. ([#43](https://github.com/paulm981/Submarine/issues/43))
+
+### From the original project ([#41](https://github.com/paulm981/Submarine/issues/41))
+
+- **Servers are reached through the ProxyJump in `~/.ssh/config`** ([#169](https://github.com/SinaXhpm/submarine/pull/169)). A chain of jump hosts, as with `ssh -J`. Each jump host uses its own `~/.ssh/config` entry and logs in with an ssh-agent key or a password it asks for once per tab. Each one's host key is checked, and its own password is never sent to another. More than 8 jump hosts (a loop in the config) ends the attempt. With "Use settings from ~/.ssh/config" off, nothing changes.
+
+## v0.4.0-fork.6
+
 - **Closing a Wall can remember what to do with the tabs Broadcast took.** The question now has a **Remember my answer** box, and **Settings › Walls** has the same choice: **Ask each time**, **Put them back as tabs** or **Close them all**. It's kept on this computer only. **Close them all** still asks when one of those servers is busy: a file uploading or downloading, an archive being made or unpacked on the server, a mirror running, a Live Edit file with changes not sent yet, or an AI command running or waiting for you. **Back to tabs** on the Wall's bar still puts them back in one click. ([#101](https://github.com/paulm981/Submarine/issues/101))
 - **An AI tab can sit beside your server.** A server tab shared with an AI tab shows that AI on the right, beside the terminal, so you don't have to go back to Home to talk to it. It's the conversation from Home itself, not a copy, and it goes back there when you go to Home. A Wall with a server shared with it shows it too. ([#100](https://github.com/paulm981/Submarine/issues/100))
 - **Fold it to a thin bar** with a click or **Ctrl+Shift+L**, and drag its left edge to make it wider. It stays open or folded as you left it when you change tabs, and keeps its width. ([#100](https://github.com/paulm981/Submarine/issues/100))
