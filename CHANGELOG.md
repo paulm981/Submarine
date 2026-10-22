@@ -9,6 +9,21 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Importing thousands of servers takes a moment.** Checking which ones are already saved used to take seconds for 10,000 rows, with the app waiting. ([#94](https://github.com/paulm981/Submarine/issues/94))
+- **The `~/.ssh/config` import reads settings as `ssh` does.** A `Host *` block, and other wildcard blocks that match a host, give it their settings as defaults. When a setting appears twice, the first one counts. A `Match` block's lines are left out instead of being added to the host above them. ([#94](https://github.com/paulm981/Submarine/issues/94))
+- **The PuTTY import brings in telnet sessions** as telnet servers, and leaves out "Default Settings" and other sessions with no host. Serial, raw and rlogin sessions are listed as not imported instead of coming in as SSH servers. ([#94](https://github.com/paulm981/Submarine/issues/94))
+- **Two imported servers with the same name are picked one at a time.** Ticking one used to tick both, and **Select all** didn't count as all. ([#94](https://github.com/paulm981/Submarine/issues/94))
+- **Switching a server from SSH to VNC or telnet empties its password,** and the form says so. Saving clears the saved one, so the SSH password is never sent over VNC or telnet. VNC needs its own password anyway. ([#94](https://github.com/paulm981/Submarine/issues/94))
+- **An error in a side panel goes when you close it,** and doesn't show up in the next panel you open. A command with no title or nothing to run says so in the panel. ([#94](https://github.com/paulm981/Submarine/issues/94))
+- **Smaller fixes:** ([#94](https://github.com/paulm981/Submarine/issues/94))
+  - deleting servers from the session tree also forgets their SFTP bookmarks;
+  - a duplicated RDP server keeps its window and sharing options on this computer;
+  - the Remote Desktop link dialog closes with Escape and keeps Tab inside it;
+  - an empty Port field in the server form asks for a port instead of saving none;
+  - a command for servers that were all deleted says "For servers that were deleted".
+
+## v0.4.0-fork.3
+
 - **Search for the jump host.** In a server's form, **Jump via** is now a search box: type part of a name, address or folder, and pick with the arrow keys and Enter or a click. Servers already used as a jump host are listed first. ([#102](https://github.com/paulm981/Submarine/issues/102))
 
 ## v0.4.0-fork.2

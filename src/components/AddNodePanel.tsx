@@ -41,8 +41,8 @@ type ImportedHost = {
   user: string;
   identity_file: string | null;
   proxy_jump: string | null;
-  // Unique within one parse (MobaXterm repeats names across folders); empty
-  // means host_alias is.
+  // Unique within one parse, as names can repeat: MobaXterm's folder and
+  // name, else the row's place in the list. Empty means host_alias is.
   key?: string;
   folder?: string[];
   // MobaXterm saved login (`[name]` as the user): becomes a shared Login.
@@ -53,6 +53,8 @@ type ImportedHost = {
   jump_credential?: string | null;
   // A Remote Desktop session: becomes an RDP link, not a server.
   rdp?: boolean;
+  // A PuTTY telnet session: becomes a telnet server.
+  telnet?: boolean;
 };
 
 // What `parse_client_import` hands back: the hosts, and a line about the
@@ -107,7 +109,25 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     const dropsLogin = (protocol !== "ssh" && newNode.authType === "custom_key") || (protocol === "vnc" && newNode.authType === "vault");
     const authType = dropsLogin ? "custom_pass" : newNode.authType;
     const credentialId = protocol === "vnc" ? "" : newNode.credentialId;
-    setNewNode({ ...newNode, protocol, port, authType, credentialId });
+    // An SSH password isn't sent over VNC (weakly protected) or telnet (not
+    // protected at all): leaving SSH for either empties the field, and the
+    // save clears the saved one too. It's held here, so going back to SSH
+    // before saving brings it back.
+    let password = {};
+    if (isSsh && (protocol === "vnc" || protocol === "telnet")) {
+      password = {
+        password: "",
+        password_dirty: true,
+        heldSshPassword: { password: newNode.password || "", dirty: !!newNode.password_dirty },
+      };
+    } else if (protocol === "ssh" && newNode.heldSshPassword) {
+      password = {
+        password: newNode.heldSshPassword.password,
+        password_dirty: newNode.heldSshPassword.dirty,
+        heldSshPassword: undefined,
+      };
+    }
+    setNewNode({ ...newNode, protocol, port, authType, credentialId, ...password });
   };
   const [newFolderName, setNewFolderName] = useState("");
   // Set while the native key picker is open so the Browse button can't be
@@ -619,7 +639,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               </div>
               <div className="space-y-1.5">
                 <label className="text-[11px] font-bold text-zinc-400 ml-1">Port</label>
-                <input type="number" className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" value={newNode.port} onChange={e => setNewNode({ ...newNode, port: parseInt(e.target.value) })} />
+                <input type="number" className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" value={newNode.port ?? ""} onChange={e => setNewNode({ ...newNode, port: e.target.value === "" ? "" : parseInt(e.target.value, 10) })} />
               </div>
             </div>
 
@@ -684,6 +704,13 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                     className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner"
                     placeholder="••••••"
                   />
+                  {(isTelnet || isVnc) && newNode.heldSshPassword?.password && !newNode.password && (
+                    <p className="text-[10px] text-amber-300/90 ml-1">
+                      {isVnc
+                        ? "The SSH password was taken out, so it isn't sent over VNC. VNC servers have a password of their own: type it here."
+                        : "The SSH password was taken out, so it isn't sent over telnet, which doesn't protect it. Type one here if you want it saved."}
+                    </p>
+                  )}
                   <p className="text-[10px] text-zinc-500 ml-1">
                     {isTelnet
                       ? "A telnet server asks for the login in the terminal. Type it there; at the password prompt, the terminal's key button types the saved one."
@@ -1413,6 +1440,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                           <div className="flex-1 min-w-0">
                             <div className="text-[12.5px] font-bold text-white truncate">
                               {h.rdp && <span className="mr-1.5 px-1 py-px rounded text-[9.5px] font-black tracking-wider bg-sky-500/15 text-sky-300 border border-sky-500/30 align-middle">RDP</span>}
+                              {h.telnet && <span className="mr-1.5 px-1 py-px rounded text-[9.5px] font-black tracking-wider bg-amber-500/15 text-amber-300 border border-amber-500/30 align-middle">TELNET</span>}
                               {h.host_alias}
                             </div>
                             <div className="text-[11px] font-mono text-zinc-400 truncate">

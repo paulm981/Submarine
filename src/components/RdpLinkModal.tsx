@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, MonitorSmartphone, X } from "lucide-react";
 import { FolderRow, folderOptions } from "../util/folderPath";
+import { useFocusTrap } from "../ui/confirm";
 
 // Add or edit a Remote Desktop link (src-tauri/src/rdp_links.rs). The link only
 // stores where to connect; the system's Remote Desktop client does the rest
@@ -29,6 +30,17 @@ const RdpLinkModal = ({ link, folders, onSave, onClose }: {
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const set = (patch: Partial<RdpLink>) => setDraft((d) => ({ ...d, ...patch }));
+  // A dialog like the app's others: Tab stays inside it, Escape closes it,
+  // and focus goes back where it was.
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  useFocusTrap(1, panelRef);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { e.preventDefault(); onClose(); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
 
   const save = async () => {
     setErr(null);
@@ -48,12 +60,19 @@ const RdpLinkModal = ({ link, folders, onSave, onClose }: {
 
   return (
     <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-3" onClick={onClose}>
-      <div className="w-full max-w-md max-h-[90vh] flex flex-col bg-[#121214] border border-white/10 rounded-xl shadow-2xl" onClick={(e) => e.stopPropagation()}>
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="rdp-link-modal-title"
+        className="w-full max-w-md max-h-[90vh] flex flex-col bg-[#121214] border border-white/10 rounded-xl shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="shrink-0 px-4 py-3 border-b border-white/5 flex items-center justify-between">
-          <span className="text-[12px] font-bold uppercase tracking-widest text-white flex items-center gap-2">
+          <span id="rdp-link-modal-title" className="text-[12px] font-bold uppercase tracking-widest text-white flex items-center gap-2">
             <MonitorSmartphone size={13} className="text-sky-300" /> {link.id ? "Edit Remote Desktop link" : "New Remote Desktop link"}
           </span>
-          <button onClick={onClose} className="text-zinc-400 hover:text-white"><X size={16} /></button>
+          <button aria-label="Close" onClick={onClose} className="text-zinc-400 hover:text-white"><X size={16} /></button>
         </div>
 
         <div className="flex-1 overflow-y-auto custom-scrollbar p-5 space-y-3">
@@ -65,7 +84,7 @@ const RdpLinkModal = ({ link, folders, onSave, onClose }: {
 
           <div className="space-y-1">
             <label className={label}>Name</label>
-            <input value={draft.name} onChange={(e) => set({ name: e.target.value })} placeholder="e.g. Build box (defaults to the host)" className={field} autoFocus />
+            <input value={draft.name} onChange={(e) => set({ name: e.target.value })} placeholder="e.g. Build box (defaults to the host)" className={field} data-default-focus />
           </div>
 
           <div className="grid grid-cols-4 gap-2">
