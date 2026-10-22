@@ -202,9 +202,11 @@ const TunnelsPanel = ({ sessionId, serverId, disabled = false }: TunnelsPanelPro
   // Save the session's rules back to the node so changes survive to the next
   // open. No-op for quick-connect (no node); best-effort (a save failure must
   // never block the action the user just took).
-  const persistTunnels = () => {
+  // Awaited before the list is read again: the save and a reload after a
+  // sync would otherwise race for the forwards that came by sync.
+  const persistTunnels = async () => {
     if (!nodeId) return;
-    invoke("persist_session_tunnels", { sessionId, serverId: nodeId }).catch(() => {});
+    await invoke("persist_session_tunnels", { sessionId, serverId: nodeId }).catch(() => {});
   };
 
   // Run one change to the rules: no two at once, the error (if any) shown,
@@ -220,7 +222,7 @@ const TunnelsPanel = ({ sessionId, serverId, disabled = false }: TunnelsPanelPro
       setError(String(e));
       ok = false;
     } finally {
-      persistTunnels();
+      await persistTunnels();
       await reloadRules();
       busyRef.current = false;
       setBusy(false);
