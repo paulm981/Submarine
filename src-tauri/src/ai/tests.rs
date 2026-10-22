@@ -260,7 +260,7 @@ fn names_stay_unique_within_an_ai_tab() {
     let mut servers = Vec::new();
     for _ in 0..3 {
         let name = unique_name(&servers, "web");
-        servers.push(SharedServer { session_id: name.clone(), name, user: None });
+        servers.push(SharedServer { session_id: name.clone(), name, user: None, server_id: None, allow_all: false, level: 1 });
     }
     let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, ["web", "web (2)", "web (3)"]);
@@ -570,6 +570,112 @@ async fn withdrawn_requests_are_logged_cut_short() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An AiState whose commands all fail, with `policy` for every server and
+/// a count of the times it drew your eye.
+fn state_with_policy(policy: trust::Policy) -> (AiState, Arc<Mutex<trust::Policy>>, Arc<AtomicUsize>) {
+    let exec: Executor = Arc::new(|_, _, _, _| Box::pin(async { Err("no servers in this test".to_string()) }));
+    let shared = Arc::new(Mutex::new(policy));
+    let p = shared.clone();
+    let flashes = Arc::new(AtomicUsize::new(0));
+    let f = flashes.clone();
+    let s = AiState::with(
+        exec,
+        Box::new(|| {}),
+        None,
+        Arc::new(move |_| p.lock().unwrap().clone()),
+        Box::new(move || {
+            f.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    s.turn_on().unwrap();
+    s.start_tab("local-1", "Claude").unwrap();
+    s.share_as("local-1", "sess-1", "xyz", Some("deploy".into()), Some(7)).unwrap();
+    (s, shared, flashes)
+}
+
+fn policy(level: u8, allow: &[&str], ask: &[&str]) -> trust::Policy {
+    trust::Policy { level, allow: allow.iter().map(|s| s.to_string()).collect(), ask: ask.iter().map(|s| s.to_string()).collect() }
+}
+
+/// Ask for `command` on `xyz`, and wait until it's waiting for you.
+async fn ask_for(s: &AiState, command: &str) -> (tokio::task::JoinHandle<mcp::ToolResult>, PendingView) {
+    let (s2, cmd) = (s.clone(), command.to_string());
+    let before: Vec<u64> = s.snapshot().pending.iter().map(|p| p.id).collect();
+    let req = tokio::spawn(async move {
+        let (_c, cancel) = watch::channel(false);
+        s2.run_command("local-1", "xyz", &cmd, None, cancel).await
+    });
+    wait_for("the request", || s.snapshot().pending.iter().any(|p| !before.contains(&p.id))).await;
+    let p = s.snapshot().pending.into_iter().find(|p| !before.contains(&p.id)).unwrap();
+    (req, p)
+}
+
+/// The card offers "Always allow this command here" only for one simple
+/// command on a saved server, not asking for root, that no always-ask rule
+/// caught; and says which always-ask rule made it wait.
+#[tokio::test]
+async fn the_card_says_what_can_be_allowed_always() {
+    let (s, _, flashes) = state_with_policy(policy(1, &[], &["reboot"]));
+    for (cmd, offered, rule) in [
+        ("uptime", true, None),
+        ("ls -la /var/log", true, None),
+        ("uptime; id", false, None),
+        ("sudo uptime", false, None),
+        ("echo $HOME", false, None),
+        ("true && reboot", false, Some("reboot")),
+    ] {
+        let (req, p) = ask_for(&s, cmd).await;
+        assert_eq!((p.can_allow_always, p.ask_rule.as_deref()), (offered, rule), "{cmd}");
+        assert_eq!(p.server_id, Some(7));
+        s.decide(p.id, false).unwrap();
+        req.await.unwrap();
+    }
+    assert_eq!(flashes.load(Ordering::SeqCst), 6, "each request that waits draws your eye");
+    // Not on a server that isn't saved (a quick connect).
+    s.share_as("local-1", "sess-2", "quick", None, None).unwrap();
+    let s2 = s.clone();
+    let req = tokio::spawn(async move {
+        let (_c, cancel) = watch::channel(false);
+        s2.run_command("local-1", "quick", "uptime", None, cancel).await
+    });
+    wait_for("the request", || !s.snapshot().pending.is_empty()).await;
+    let p = s.snapshot().pending[0].clone();
+    assert!(!p.can_allow_always);
+    s.decide(p.id, false).unwrap();
+    req.await.unwrap();
+}
+
+/// Deny with a note: the AI gets it, tidied and cut short; without one,
+/// the plain answer. A note never allows anything.
+#[tokio::test]
+async fn deny_with_a_note_tells_the_ai_why() {
+    let (s, _, _) = state_with_policy(policy(1, &[], &[]));
+    let (req, p) = ask_for(&s, "rm -r /srv/old").await;
+    s.deny(p.id, Some("  use the  trash\nfolder instead ".into())).unwrap();
+    let r = req.await.unwrap();
+    assert!(r.is_error);
+    assert_eq!(r.text, "Denied by the user: use the trash folder instead");
+    let (req, p) = ask_for(&s, "uptime").await;
+    s.deny(p.id, Some("   ".into())).unwrap();
+    assert_eq!(req.await.unwrap().text, "Denied by the user.");
+    let (req, p) = ask_for(&s, "uptime").await;
+    s.deny(p.id, Some("x".repeat(5000))).unwrap();
+    let r = req.await.unwrap();
+    assert_eq!(r.text.len(), "Denied by the user: ".len() + MAX_DENY_NOTE);
+    assert_eq!(s.snapshot().history[0].outcome, "denied");
+}
+
+/// The marker's level, per shared server, follows the settings as they
+/// change.
+#[tokio::test]
+async fn the_snapshot_says_each_shared_server_s_level() {
+    let (s, shared, _) = state_with_policy(policy(1, &[], &[]));
+    assert_eq!(s.snapshot().tabs[0].servers[0].level, 1);
+    *shared.lock().unwrap() = policy(3, &[], &[]);
+    let snap = s.snapshot();
+    assert_eq!((snap.tabs[0].servers[0].level, snap.tabs[0].servers[0].allow_all, snap.tabs[0].servers[0].server_id), (3, false, Some(7)));
+}
+
 // -- Against the test SSH server (it runs commands with this machine's sh) --
 
 #[cfg(unix)]
@@ -731,7 +837,7 @@ mod ssh {
     async fn the_login_user_is_on_the_card_and_root_is_marked() {
         let (s, dir, _) = state().await;
         s.start_tab("local-1", "Claude").unwrap();
-        s.share_as("local-1", "sess-1", "xyz", Some("root".into())).unwrap();
+        s.share_as("local-1", "sess-1", "xyz", Some("root".into()), None).unwrap();
         let (_c, cancel) = watch::channel(false);
         let s2 = s.clone();
         let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "uptime", None, cancel).await });
@@ -742,7 +848,7 @@ mod ssh {
         assert!(audit_lines(&dir).iter().any(|l| l["event"] == "request" && l["root"] == true && l["user"] == "root"));
         // Another login isn't, unless the command asks.
         s.start_tab("local-2", "Claude 2").unwrap();
-        s.share_as("local-2", "sess-1", "xyz", Some("deploy".into())).unwrap();
+        s.share_as("local-2", "sess-1", "xyz", Some("deploy".into()), None).unwrap();
         let (_c, cancel) = watch::channel(false);
         let s2 = s.clone();
         let req = tokio::spawn(async move { s2.run_command("local-2", "xyz", "uptime", None, cancel).await });
@@ -902,6 +1008,186 @@ mod ssh {
         let fin = log.iter().find(|l| l["event"] == "finished").unwrap();
         assert_eq!(fin["note"], "stopped: withdrawn by the AI tool");
         assert!(!log.iter().any(|l| l["note"] == "access ended"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// An AiState on the test server, as `state_and_server`, whose servers'
+    /// level and rules are `policy` (changed through the handle).
+    async fn state_with(policy: trust::Policy) -> (AiState, PathBuf, Arc<Mutex<trust::Policy>>) {
+        let (handle, _) = exec::tests::server_with(Default::default()).await;
+        let exec: Executor = Arc::new(move |_, cmd, limit, stop| {
+            let h = handle.clone();
+            Box::pin(async move { exec::run(&h, &cmd, limit, OUTPUT_CAP, stop).await })
+        });
+        let dir = std::env::temp_dir().join(format!("submarine-ai-test-{}", channel::random_hex(6)));
+        let shared = Arc::new(Mutex::new(policy));
+        let p = shared.clone();
+        let s = AiState::with(exec, Box::new(|| {}), Some(dir.clone()), Arc::new(move |_| p.lock().unwrap().clone()), Box::new(|| {}));
+        s.turn_on().unwrap();
+        (s, dir, shared)
+    }
+
+    /// One tools/call of run_command through the helper.
+    async fn call_run(h: &mut Helper, id: u64, command: &str) {
+        h.send(json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+            "name": "run_command", "arguments": { "server": "xyz", "command": command }
+        }}))
+        .await;
+    }
+
+    fn answer_text(r: &Value) -> (bool, String) {
+        (r["result"]["isError"].as_bool().unwrap(), r["result"]["content"][0]["text"].as_str().unwrap().to_string())
+    }
+
+    /// run_command through the helper, at each level: 1 always waits for
+    /// you; 2 runs what your rules allow and waits for the rest (and for
+    /// sudo); 3 runs anything but what the always-ask list catches. What
+    /// ran without asking is marked so in the panel and the log.
+    #[tokio::test]
+    async fn run_command_at_each_level() {
+        let allow = ["echo two", "sudo *"];
+        let ask = ["reboot"];
+        let (s, dir, shared) = state_with(policy(1, &allow, &ask)).await;
+        let (_, env) = s.start_tab("local-1", "Claude").unwrap();
+        s.share_as("local-1", "sess-1", "xyz", None, Some(1)).unwrap();
+        let mut h = helper(var(&env, channel::ENV_ADDR), var(&env, channel::ENV_TOKEN));
+        h.call(1, "initialize", json!({ "protocolVersion": "2025-06-18" })).await;
+
+        // Level 1: even an allowed command waits.
+        call_run(&mut h, 2, "echo two").await;
+        let p = wait_pending(&s).await;
+        assert_eq!(p.command, "echo two");
+        s.decide(p.id, true).unwrap();
+        let (err, text) = answer_text(&h.recv().await);
+        assert!(!err && text.contains("two"), "{text}");
+        assert_eq!(s.snapshot().history[0].ran_without_asking, None);
+
+        // Level 2: the allowed command runs at once...
+        *shared.lock().unwrap() = policy(2, &allow, &ask);
+        call_run(&mut h, 3, "echo two").await;
+        let (err, text) = answer_text(&h.recv().await);
+        assert!(!err && text.contains("two"), "{text}");
+        assert!(s.snapshot().pending.is_empty());
+        assert_eq!(s.snapshot().history[0].ran_without_asking.as_deref(), Some("rule: echo two"));
+        // ...anything more waits, and so does sudo, whatever the rules say.
+        for (n, cmd) in [(4, "echo two; id"), (5, "sudo -n true"), (6, "echo three")] {
+            call_run(&mut h, n, cmd).await;
+            let p = wait_pending(&s).await;
+            assert_eq!(p.command, cmd);
+            s.decide(p.id, false).unwrap();
+            let (err, text) = answer_text(&h.recv().await);
+            assert!(err && text == "Denied by the user.", "{cmd}: {text}");
+        }
+
+        // Level 3: anything runs, but what the always-ask list catches.
+        *shared.lock().unwrap() = policy(3, &allow, &ask);
+        call_run(&mut h, 7, "echo three | tr a-z A-Z").await;
+        let (err, text) = answer_text(&h.recv().await);
+        assert!(!err && text.contains("THREE"), "{text}");
+        assert_eq!(s.snapshot().history[0].ran_without_asking.as_deref(), Some("level: run anything"));
+        call_run(&mut h, 8, "true || reboot").await;
+        let p = wait_pending(&s).await;
+        assert_eq!(p.ask_rule.as_deref(), Some("reboot"));
+        s.deny(p.id, Some("not now".into())).unwrap();
+        let (err, text) = answer_text(&h.recv().await);
+        assert!(err && text == "Denied by the user: not now", "{text}");
+
+        let log = audit_lines(&dir);
+        let allowed: Vec<(&str, &str)> = log
+            .iter()
+            .filter(|l| l["event"] == "request" && l["decision"] == "allowed")
+            .map(|l| (l["by"].as_str().unwrap(), l["approved_by"].as_str().unwrap()))
+            .collect();
+        assert_eq!(allowed, [("you", "you"), ("your settings", "rule: echo two"), ("your settings", "level: run anything")]);
+        assert!(log.iter().any(|l| l["decision"] == "denied" && l["note"] == "note: not now"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// "Allow everything here until this AI tab closes": this request and
+    /// the others waiting there run, and so does what comes next, but for
+    /// the always-ask list; unsharing ends it.
+    #[tokio::test]
+    async fn allow_everything_until_the_ai_tab_closes() {
+        let (s, dir, _) = state_with(policy(1, &[], &["reboot"])).await;
+        s.start_tab("local-1", "Claude").unwrap();
+        s.share_as("local-1", "sess-1", "xyz", None, Some(1)).unwrap();
+        let (a, pa) = ask_for(&s, "echo a").await;
+        let (b, _) = ask_for(&s, "echo b").await;
+        let (c, pc) = ask_for(&s, "echo c; reboot --help >/dev/null || true").await;
+        s.allow_session(pa.id).unwrap();
+        assert!(a.await.unwrap().text.contains('a'));
+        assert!(b.await.unwrap().text.contains('b'));
+        let snap = s.snapshot();
+        assert!(snap.tabs[0].servers[0].allow_all);
+        let b_row = snap.history.iter().find(|d| d.command == "echo b").unwrap();
+        assert_eq!(b_row.ran_without_asking.as_deref(), Some("session: allow everything"));
+        let a_row = snap.history.iter().find(|d| d.command == "echo a").unwrap();
+        assert_eq!(a_row.ran_without_asking, None, "you clicked for this one");
+        // The always-ask list still holds.
+        assert_eq!(snap.pending.len(), 1);
+        s.decide(pc.id, false).unwrap();
+        c.await.unwrap();
+        // What comes next runs at once.
+        let (_c, cancel) = watch::channel(false);
+        let r = s.run_command("local-1", "xyz", "echo d && echo e", None, cancel.clone()).await;
+        assert!(!r.is_error && r.text.contains('e'), "{}", r.text);
+        // Unshared and shared again, it asks again.
+        s.unshare("sess-1", Some("local-1"), "stopped sharing");
+        s.share_as("local-1", "sess-1", "xyz", None, Some(1)).unwrap();
+        let (f, pf) = ask_for(&s, "echo f").await;
+        s.decide(pf.id, false).unwrap();
+        f.await.unwrap();
+        assert!(audit_lines(&dir).iter().any(|l| l["event"] == "allow_everything"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The session allow ends with every end of access: the AI tab
+    /// closing, the server's tab reconnecting or closing, AI tools off, the
+    /// profile locked.
+    #[tokio::test]
+    async fn allow_everything_ends_with_access() {
+        for how in ["close", "gone", "off", "lock"] {
+            let (s, dir, _) = state_with(policy(1, &[], &[])).await;
+            s.start_tab("local-1", "Claude").unwrap();
+            s.share_as("local-1", "sess-1", "xyz", None, Some(1)).unwrap();
+            let (a, pa) = ask_for(&s, "echo a").await;
+            s.allow_session(pa.id).unwrap();
+            a.await.unwrap();
+            match how {
+                "close" => s.end_tab("local-1"),
+                "gone" => s.session_gone("sess-1", "reconnected"),
+                "off" => {
+                    s.turn_off().await;
+                    s.turn_on().unwrap();
+                }
+                _ => s.end_all_tabs(),
+            }
+            if how != "gone" {
+                s.start_tab("local-1", "Claude").unwrap();
+            }
+            s.share_as("local-1", "sess-1", "xyz", None, Some(1)).unwrap();
+            assert!(!s.snapshot().tabs[0].servers[0].allow_all, "{how}");
+            let (b, pb) = ask_for(&s, "echo b").await;
+            s.decide(pb.id, false).unwrap();
+            b.await.unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A command that runs without asking still stops when access ends, on
+    /// the server too.
+    #[tokio::test]
+    async fn what_runs_without_asking_still_stops() {
+        let (s, dir, _) = state_with(policy(3, &[], &[])).await;
+        s.start_tab("local-1", "Claude").unwrap();
+        s.share_as("local-1", "sess-1", "xyz", None, Some(1)).unwrap();
+        let (_c, cancel) = watch::channel(false);
+        let s2 = s.clone();
+        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "echo begun; exec sleep 30", None, cancel).await });
+        wait_for("it to run", || !s.snapshot().running.is_empty()).await;
+        assert_eq!(s.snapshot().running[0].ran_without_asking.as_deref(), Some("level: run anything"));
+        s.stop_tab("local-1");
+        let r = tokio::time::timeout(Duration::from_secs(10), req).await.expect("stopped").unwrap();
+        assert!(r.is_error && r.text.starts_with("Stopped"), "{}", r.text);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

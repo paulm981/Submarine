@@ -507,7 +507,8 @@ fn save_vault_blocking(
 /// The vault tables that participate in per-entity Last-Write-Wins sync. Each
 /// carries the `uuid` (portable identity) / `updated_at` (HLC) / `deleted`
 /// (tombstone) columns. `known_hosts`, `cmd_history`, `monitor_settings`,
-/// `walls` and `schema_meta` are intentionally device-local and NOT synced.
+/// `walls`, `ai_levels`, `ai_rules` and `schema_meta` are intentionally
+/// device-local and NOT synced.
 const SYNCED_TABLES: &[&str] = &[
     "folders", "ssh_keys", "credentials", "servers", "commands", "notes", "monitor_configs", "rdp_links", "highlight_rules",
 ];
@@ -6290,6 +6291,9 @@ async fn setup_master_db_with(
     conn.execute(highlight::SCHEMA, []).map_err(|e| format!("[DATABASE] HIGHLIGHT_TABLE_FAILED: {}", e))?;
     // Saved walls (multiexec.rs): device-local too, added the same way.
     conn.execute(multiexec::SCHEMA, []).map_err(|e| format!("[DATABASE] WALLS_TABLE_FAILED: {}", e))?;
+    // The AI's approval levels and rules (ai/trust.rs, #115): device-local
+    // too, so a shared profile never changes how much the AI may do here.
+    ai::trust::create_schema(&conn)?;
     // The OS each server last reported (server_os.rs), for its badge.
     // Device-local, not a synced column. Added here for both vault paths too;
     // on a vault that has it already this answers "duplicate column".
@@ -25923,6 +25927,8 @@ pub fn run() {
             local_term::local_terminal_open, local_term::local_terminal_write,
             local_term::local_terminal_resize, local_term::local_terminal_close,
             ai::ai_settings, ai::ai_set_enabled, ai::ai_state, ai::ai_share, ai::ai_unshare, ai::ai_stop, ai::ai_decide, ai::ai_output,
+            ai::ai_set_flash, ai::ai_allow_session, ai::ai_allow_always, ai::ai_trust_view, ai::ai_trust_scope,
+            ai::ai_trust_set_level, ai::ai_trust_add_rule, ai::ai_trust_remove_rule,
             ssh_info_probe_section, ssh_systemctl_action, ssh_kill_process,
             ssh_iptables_chain, ssh_nft_chain, ssh_firewall_as_root,
             applog::app_log, applog::ui_heartbeat, applog::open_log_folder, diagnostics_report,

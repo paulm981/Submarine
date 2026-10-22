@@ -65,9 +65,14 @@ pub(crate) struct Entry {
     /// allowed, denied, cancelled, refused.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<&'static str>,
-    /// Who decided: "you", or "Submarine" for one refused before it was shown.
+    /// Who decided: "you", "your settings" for one that ran without asking
+    /// (#115), or "Submarine" for one refused before it was shown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub by: Option<&'static str>,
+    /// How one that runs was allowed: `you`, `rule: <pattern>`, `level: run
+    /// anything` or `session: allow everything`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approved_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -2,7 +2,8 @@
 //! from Home's menu reaches Submarine over a local channel (channel.rs,
 //! through `submarine --mcp`, helper.rs) and asks it to run commands on the
 //! servers you've shared with that AI tab. Submarine shows each request in
-//! the AI panel, runs it only once you click Allow, on its own SSH channel
+//! the AI panel and runs it once you click Allow, or at once where your
+//! approval level and rules say so (trust.rs, #115), on its own SSH channel
 //! (exec.rs), and gives back the output with known secrets hidden
 //! (filter.rs). Every request and decision goes in the audit log (audit.rs).
 //!
@@ -25,7 +26,12 @@
 //! - **Access ends** when the AI tab closes, when the server's tab closes or
 //!   reconnects, when you stop sharing, or when Submarine quits; anything
 //!   still waiting for approval is cancelled and anything running stopped,
-//!   on the server too.
+//!   on the server too. "Allow everything here until this AI tab closes"
+//!   (SharedServer::allow_all) ends with it: it's kept on the server's place
+//!   in the AI tab's list, which every end of access takes away.
+//! - **The AI can't change how much it may do.** Levels and rules are read
+//!   here, as each request comes (`policy`), and changed only by the Tauri
+//!   commands the app's own pages call. No MCP tool reaches them.
 
 mod audit;
 mod channel;
@@ -34,12 +40,14 @@ mod exec;
 mod filter;
 pub mod helper;
 mod mcp;
+pub(crate) mod trust;
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch};
@@ -135,6 +143,8 @@ const MAX_LOGGED_NAME: usize = 256;
 const MAX_LOGGED_NOTE: usize = 2 * 1024;
 /// Finished requests the panel keeps.
 const HISTORY: usize = 20;
+/// A note you give with Deny, at most, in characters.
+const MAX_DENY_NOTE: usize = 500;
 /// How long a second connection for an AI tab waits for the first to end
 /// before it's refused: Claude Code reconnecting (`/mcp`) ends its old
 /// helper and starts a new one, which may connect a moment before the app
@@ -143,16 +153,33 @@ const RECONNECT_GRACE: Duration = Duration::from_secs(5);
 /// The panel's event.
 const CHANGED: &str = "ai-changed";
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 struct Settings {
     #[serde(default)]
     enabled: bool,
+    /// Flash the taskbar when a request waits for you and Submarine isn't
+    /// in front. On unless turned off.
+    #[serde(default = "on")]
+    flash: bool,
+}
+
+fn on() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { enabled: false, flash: true }
+    }
 }
 
 type ExecFuture = Pin<Box<dyn Future<Output = Result<exec::Exec, String>> + Send>>;
 /// Runs a command on a session's connection: the real one over SshState, or
 /// a test server's. `(session_id, command, timeout, stop)`; see exec::run.
 type Executor = Arc<dyn Fn(String, String, Duration, watch::Receiver<bool>) -> ExecFuture + Send + Sync>;
+/// What holds for a saved server (its local id; None for one not saved):
+/// read from the vault in the app, set by hand in tests. Read only.
+type PolicyLookup = Arc<dyn Fn(Option<i64>) -> trust::Policy + Send + Sync>;
 
 /// A server shared with an AI tab.
 #[derive(Serialize, Clone, Debug)]
@@ -162,6 +189,14 @@ struct SharedServer {
     name: String,
     /// Who its tab logged in as, which commands run as; None if not known.
     user: Option<String>,
+    /// The saved server its tab was opened for (its local id), whose level
+    /// and rules hold; None for one not saved.
+    server_id: Option<i64>,
+    /// "Allow everything here until this AI tab closes": as level 3, for
+    /// this AI tab only. In memory only, and gone when this goes.
+    allow_all: bool,
+    /// Its level now, for the tab's marker: filled in by `snapshot`.
+    level: u8,
 }
 
 struct Tab {
@@ -197,11 +232,30 @@ struct PendingView {
     root: bool,
     timeout_secs: u64,
     asked_at: String,
+    /// The saved server it's for, whose lists "Always allow" adds to.
+    server_id: Option<i64>,
+    /// The always-ask rule that made it wait, if one did.
+    ask_rule: Option<String>,
+    /// "Always allow this command here" is offered: it's one simple command
+    /// (trust::is_simple), on a saved server, that doesn't ask for root and
+    /// no always-ask rule caught.
+    can_allow_always: bool,
 }
+
+/// Your answer to a request.
+#[derive(Debug)]
+enum Answer {
+    /// Allowed; how (Decision::approved_by, or "you").
+    Allow(String),
+    /// Denied, with your note, if you gave one.
+    Deny(Option<String>),
+}
+
+const BY_YOU: &str = "you";
 
 struct Pending {
     view: PendingView,
-    decide: oneshot::Sender<bool>,
+    decide: oneshot::Sender<Answer>,
     /// Its stop signal, moved to `Running` when you allow it.
     stop: watch::Sender<bool>,
 }
@@ -214,6 +268,8 @@ struct RunningView {
     server: String,
     command: String,
     started_at: String,
+    /// Why it runs without your Allow, if it does.
+    ran_without_asking: Option<String>,
 }
 
 struct Running {
@@ -243,6 +299,9 @@ struct DoneView {
     timed_out: bool,
     error: Option<String>,
     at: String,
+    /// It ran without asking you, and why: `rule: <pattern>`, `level: run
+    /// anything` or `session: allow everything`.
+    ran_without_asking: Option<String>,
 }
 
 /// A finished request: its row, everything you see, and what the AI was
@@ -297,6 +356,11 @@ struct Inner {
     exec: Executor,
     changed: Box<dyn Fn() + Send + Sync>,
     audit: audit::AuditLog,
+    policy: PolicyLookup,
+    /// Draws your eye to Submarine when a request waits for you (the
+    /// taskbar flashing), if `flash` is on.
+    attention: Box<dyn Fn() + Send + Sync>,
+    flash: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -428,13 +492,28 @@ fn unique_name(servers: &[SharedServer], wanted: &str) -> String {
 }
 
 impl AiState {
+    /// Every server asks every time, and nothing flashes.
+    #[cfg(test)]
     fn new(exec: Executor, changed: Box<dyn Fn() + Send + Sync>, audit_dir: Option<PathBuf>) -> AiState {
+        AiState::with(exec, changed, audit_dir, Arc::new(|_| trust::Policy::default()), Box::new(|| {}))
+    }
+
+    fn with(
+        exec: Executor,
+        changed: Box<dyn Fn() + Send + Sync>,
+        audit_dir: Option<PathBuf>,
+        policy: PolicyLookup,
+        attention: Box<dyn Fn() + Send + Sync>,
+    ) -> AiState {
         AiState(Arc::new(Inner {
             shared: Mutex::new(Shared::default()),
             listener: Mutex::new(None),
             exec,
             changed,
             audit: audit::AuditLog::new(audit_dir),
+            policy,
+            attention,
+            flash: AtomicBool::new(true),
         }))
     }
 
@@ -456,8 +535,32 @@ impl AiState {
         let changed = Box::new(move || {
             let _ = emit_app.emit(CHANGED, ());
         });
-        let state = AiState::new(exec, changed, app.path().app_log_dir().ok());
+        // The open profile's levels and rules, read as each request comes.
+        // No profile open (or the vault busy failing): ask every time.
+        let db_app = app.clone();
+        let policy: PolicyLookup = Arc::new(move |server_id| {
+            let db = db_app.state::<crate::DbState>();
+            let guard = db.conn.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().map(|conn| trust::policy_for(conn, server_id)).unwrap_or_default()
+        });
+        let attention_app = app.clone();
+        let attention = Box::new(move || {
+            #[cfg(not(target_os = "android"))]
+            {
+                let windows = attention_app.webview_windows();
+                let window = windows.get("main").or_else(|| windows.values().next());
+                if let Some(w) = window.filter(|w| !w.is_focused().unwrap_or(false)) {
+                    // The taskbar button flashes until Submarine is in front
+                    // (Windows), or is marked urgent (Linux).
+                    let _ = w.request_user_attention(Some(tauri::UserAttentionType::Informational));
+                }
+            }
+            #[cfg(target_os = "android")]
+            let _ = &attention_app;
+        });
+        let state = AiState::with(exec, changed, app.path().app_log_dir().ok(), policy, attention);
         let settings: Settings = crate::local_open::read_setting(app, SETTINGS_FILE).unwrap_or_default();
+        state.0.flash.store(settings.flash, Ordering::Relaxed);
         if settings.enabled {
             let s = state.clone();
             tauri::async_runtime::spawn(async move {
@@ -683,18 +786,26 @@ impl AiState {
 
     #[cfg(test)]
     fn share(&self, tab_id: &str, session_id: &str, name: &str) -> Result<(), String> {
-        self.share_as(tab_id, session_id, name, None)
+        self.share_as(tab_id, session_id, name, None, None)
     }
 
-    /// Share `session_id`, whose tab logged in as `user`, with `tab_id`.
-    fn share_as(&self, tab_id: &str, session_id: &str, name: &str, user: Option<String>) -> Result<(), String> {
+    /// Share `session_id`, whose tab logged in as `user` and was opened for
+    /// the saved server `server_id`, with `tab_id`.
+    fn share_as(&self, tab_id: &str, session_id: &str, name: &str, user: Option<String>, server_id: Option<i64>) -> Result<(), String> {
         let mut s = self.lock();
         let tab = s.tabs.iter_mut().find(|t| t.id == tab_id).ok_or("That AI tab isn't open any more.")?;
         if tab.servers.iter().any(|x| x.session_id == session_id) {
             return Ok(());
         }
         let name = unique_name(&tab.servers, name);
-        tab.servers.push(SharedServer { session_id: session_id.to_string(), name: name.clone(), user });
+        tab.servers.push(SharedServer {
+            session_id: session_id.to_string(),
+            name: name.clone(),
+            user,
+            server_id,
+            allow_all: false,
+            level: trust::ASK_EVERY_TIME,
+        });
         let label = tab.label.clone();
         drop(s);
         let mut e = audit::Entry::new("shared", &label);
@@ -767,57 +878,136 @@ impl AiState {
         });
     }
 
-    /// Your Allow or Deny. Allowed, the request moves from waiting to
-    /// running in the same step, with its stop signal, and only while its
-    /// AI tab still has the server shared: so unsharing, Stop or a
-    /// reconnect at the same moment either comes first (and it never runs)
-    /// or finds it running (and stops it).
+    /// Your Allow or Deny, as a click on the card.
+    #[cfg(test)]
     fn decide(&self, id: u64, allow: bool) -> Result<(), String> {
+        self.answer(id, if allow { Answer::Allow(BY_YOU.into()) } else { Answer::Deny(None) })
+    }
+
+    /// Your answer to a request. Allowed, it moves from waiting to running
+    /// in the same step, with its stop signal, and only while its AI tab
+    /// still has the server shared: so unsharing, Stop or a reconnect at the
+    /// same moment either comes first (and it never runs) or finds it
+    /// running (and stops it).
+    fn answer(&self, id: u64, answer: Answer) -> Result<(), String> {
         let result = {
             let mut s = self.lock();
             let at = s.pending.iter().position(|p| p.view.id == id).ok_or("That request isn't waiting any more.")?;
             let p = s.pending.remove(at);
             let still_shared = s.tabs.iter().any(|t| t.id == p.view.tab_id && t.servers.iter().any(|x| x.session_id == p.view.session_id));
-            if !allow {
-                let _ = p.decide.send(false);
-                Ok(())
-            } else if !still_shared {
-                // Dropped: cancelled, as access has ended.
-                Err("That server isn't shared with the AI any more.".to_string())
-            } else {
-                let v = &p.view;
-                s.running.push(Running {
-                    view: RunningView {
-                        id: v.id,
-                        tab_label: v.tab_label.clone(),
-                        session_id: v.session_id.clone(),
-                        server: v.server.clone(),
-                        command: v.command.clone(),
-                        started_at: now(),
-                    },
-                    tab_id: v.tab_id.clone(),
-                    session_id: v.session_id.clone(),
-                    stop: p.stop.clone(),
-                });
-                if p.decide.send(true).is_err() {
-                    // Nobody is waiting for the answer any more.
-                    s.running.pop();
+            match answer {
+                Answer::Deny(note) => {
+                    let _ = p.decide.send(Answer::Deny(note));
+                    Ok(())
                 }
-                Ok(())
+                // Dropped: cancelled, as access has ended.
+                Answer::Allow(_) if !still_shared => Err("That server isn't shared with the AI any more.".to_string()),
+                Answer::Allow(by) => {
+                    let v = &p.view;
+                    s.running.push(Running {
+                        view: RunningView {
+                            id: v.id,
+                            tab_label: v.tab_label.clone(),
+                            session_id: v.session_id.clone(),
+                            server: v.server.clone(),
+                            command: v.command.clone(),
+                            started_at: now(),
+                            ran_without_asking: Some(by.clone()).filter(|b| b != BY_YOU),
+                        },
+                        tab_id: v.tab_id.clone(),
+                        session_id: v.session_id.clone(),
+                        stop: p.stop.clone(),
+                    });
+                    if p.decide.send(Answer::Allow(by)).is_err() {
+                        // Nobody is waiting for the answer any more.
+                        s.running.pop();
+                    }
+                    Ok(())
+                }
             }
         };
         self.changed();
         result
     }
 
+    /// Deny, with a note the AI gets, so it can try another way. The note is
+    /// only words for the AI: it can't allow anything.
+    fn deny(&self, id: u64, note: Option<String>) -> Result<(), String> {
+        let note = note
+            .map(|n| n.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|n| !n.is_empty())
+            .map(|n| if n.chars().count() > MAX_DENY_NOTE { n.chars().take(MAX_DENY_NOTE).collect() } else { n });
+        self.answer(id, Answer::Deny(note))
+    }
+
+    /// A waiting request's card, as it is now.
+    fn pending_view(&self, id: u64) -> Result<PendingView, String> {
+        self.lock().pending.iter().find(|p| p.view.id == id).map(|p| p.view.clone()).ok_or_else(|| "That request isn't waiting any more.".to_string())
+    }
+
+    /// "Allow everything here until this AI tab closes": this request is
+    /// allowed, and from now on, as long as the server stays shared with
+    /// this AI tab, its requests there run without asking, but for what the
+    /// always-ask list catches. What else is waiting there now runs too,
+    /// unless an always-ask rule made it wait.
+    fn allow_session(&self, id: u64) -> Result<(), String> {
+        let (others, label, server) = {
+            let mut s = self.lock();
+            let p = s.pending.iter().find(|p| p.view.id == id).ok_or("That request isn't waiting any more.")?;
+            let (tab_id, session_id) = (p.view.tab_id.clone(), p.view.session_id.clone());
+            let others: Vec<u64> = s
+                .pending
+                .iter()
+                .filter(|o| o.view.id != id && o.view.tab_id == tab_id && o.view.session_id == session_id && o.view.ask_rule.is_none())
+                .map(|o| o.view.id)
+                .collect();
+            let tab = s.tabs.iter_mut().find(|t| t.id == tab_id).ok_or("That AI tab isn't open any more.")?;
+            let label = tab.label.clone();
+            let shared = tab.servers.iter_mut().find(|x| x.session_id == session_id).ok_or("That server isn't shared with the AI any more.")?;
+            shared.allow_all = true;
+            (others, label, shared.name.clone())
+        };
+        let mut e = audit::Entry::new("allow_everything", &label);
+        e.server = Some(server);
+        e.by = Some(BY_YOU);
+        e.note = Some("allow everything here until this AI tab closes".into());
+        self.audit(e);
+        let result = self.answer(id, Answer::Allow(BY_YOU.into()));
+        for other in others {
+            let _ = self.answer(other, Answer::Allow(trust::Decision::Session.approved_by().unwrap_or_default()));
+        }
+        result
+    }
+
+    /// A line in the audit log for a change you made to the levels or
+    /// rules.
+    fn log_setting(&self, note: String) {
+        let mut e = audit::Entry::new("approval_setting", "");
+        e.by = Some(BY_YOU);
+        e.note = Some(note);
+        self.audit(e);
+    }
+
     pub(crate) fn snapshot(&self) -> Snapshot {
+        // Each shared server's level, for its marker: read before the lock,
+        // as the vault has its own.
+        let mut ids: Vec<Option<i64>> = self.lock().tabs.iter().flat_map(|t| t.servers.iter().map(|x| x.server_id)).collect();
+        ids.sort();
+        ids.dedup();
+        let levels: Vec<(Option<i64>, u8)> = ids.into_iter().map(|id| (id, (self.0.policy)(id).level)).collect();
+        let level_of = |id: Option<i64>| levels.iter().find(|(i, _)| *i == id).map(|(_, l)| *l).unwrap_or(trust::ASK_EVERY_TIME);
         let s = self.lock();
         Snapshot {
             enabled: s.enabled,
             tabs: s
                 .tabs
                 .iter()
-                .map(|t| TabView { id: t.id.clone(), label: t.label.clone(), servers: t.servers.clone(), intruder_at: t.intruder_at.clone() })
+                .map(|t| TabView {
+                    id: t.id.clone(),
+                    label: t.label.clone(),
+                    servers: t.servers.iter().map(|x| SharedServer { level: level_of(x.server_id), ..x.clone() }).collect(),
+                    intruder_at: t.intruder_at.clone(),
+                })
                 .collect(),
             pending: s.pending.iter().map(|p| p.view.clone()).collect(),
             running: s.running.iter().map(|r| r.view.clone()).collect(),
@@ -926,8 +1116,16 @@ impl AiState {
     }
 
     async fn run_command(&self, tab_id: &str, server: &str, command: &str, timeout: Option<u64>, mut cancel: watch::Receiver<bool>) -> ToolResult {
-        // Checked before anything is shown to you.
-        let (label, session_id, server, user, id, epoch, mut rx, stop_tx, stop_rx) = {
+        // The named server's settings, read before the lock (the vault has
+        // its own) and checked again under it.
+        let looked_up = {
+            let s = self.lock();
+            s.tabs.iter().find(|t| t.id == tab_id).and_then(|t| t.servers.iter().find(|x| x.name == server)).map(|x| x.server_id)
+        };
+        let policy = looked_up.map(|id| (self.0.policy)(id));
+        let root_cmd = asks_for_root(command);
+        // Checked before anything is shown to you or runs.
+        let (label, session_id, server, user, id, epoch, rx, stop_tx, stop_rx, auto) = {
             let mut s = self.lock();
             let next_id = s.next_id + 1;
             let epoch = s.epoch;
@@ -977,11 +1175,7 @@ impl AiState {
                         format!("{asked} isn't shared with you. Shared: {}. Ask the user to click Share with AI on its tab.", names.join(", "))
                     }));
                 };
-                let found = found.clone();
-                if waiting >= MAX_WAITING {
-                    return Err(refuse(format!("{MAX_WAITING} requests are already waiting for the user. Wait for them first.")));
-                }
-                Ok(found)
+                Ok(found.clone())
             })();
             let found = match checked {
                 Ok(f) => f,
@@ -990,28 +1184,76 @@ impl AiState {
                     return self.refuse(&label, server, command, why);
                 }
             };
+            // Whether it waits for you (trust.rs). Settings read for another
+            // server than this one (it was shared again meanwhile) count
+            // for nothing: it asks.
+            let decision = match &policy {
+                Some(p) if looked_up == Some(found.server_id) => {
+                    trust::decide(p.level, found.allow_all, &p.allow, &p.ask, command, root_cmd)
+                }
+                _ => trust::Decision::Ask { rule: None },
+            };
+            let auto = decision.approved_by();
+            if auto.is_none() && waiting >= MAX_WAITING {
+                drop(s);
+                return self.refuse(&label, server, command, format!("{MAX_WAITING} requests are already waiting for the user. Wait for them first."));
+            }
             s.next_id = next_id;
-            let (tx, rx) = oneshot::channel();
             let (stop_tx, stop_rx) = watch::channel(false);
-            s.pending.push(Pending {
-                view: PendingView {
-                    id: next_id,
-                    tab_id: tab_id.to_string(),
-                    tab_label: label.clone(),
-                    session_id: found.session_id.clone(),
-                    server: found.name.clone(),
-                    user: found.user.clone(),
-                    command: command.to_string(),
-                    root: runs_as_root(found.user.as_deref(), command),
-                    timeout_secs: timeout.unwrap_or(DEFAULT_TIMEOUT),
-                    asked_at: now(),
-                },
-                decide: tx,
-                stop: stop_tx.clone(),
-            });
-            (label, found.session_id, found.name, found.user, next_id, epoch, rx, stop_tx, stop_rx)
+            let rx = match &auto {
+                // Runs now: in the running list with its stop signal, in
+                // this same step, so any end of access stops it.
+                Some(by) => {
+                    s.running.push(Running {
+                        view: RunningView {
+                            id: next_id,
+                            tab_label: label.clone(),
+                            session_id: found.session_id.clone(),
+                            server: found.name.clone(),
+                            command: command.to_string(),
+                            started_at: now(),
+                            ran_without_asking: Some(by.clone()),
+                        },
+                        tab_id: tab_id.to_string(),
+                        session_id: found.session_id.clone(),
+                        stop: stop_tx.clone(),
+                    });
+                    None
+                }
+                None => {
+                    let ask_rule = match decision {
+                        trust::Decision::Ask { rule } => rule,
+                        _ => None,
+                    };
+                    let (tx, rx) = oneshot::channel();
+                    s.pending.push(Pending {
+                        view: PendingView {
+                            id: next_id,
+                            tab_id: tab_id.to_string(),
+                            tab_label: label.clone(),
+                            session_id: found.session_id.clone(),
+                            server: found.name.clone(),
+                            user: found.user.clone(),
+                            command: command.to_string(),
+                            root: runs_as_root(found.user.as_deref(), command),
+                            timeout_secs: timeout.unwrap_or(DEFAULT_TIMEOUT),
+                            asked_at: now(),
+                            server_id: found.server_id,
+                            can_allow_always: found.server_id.is_some() && ask_rule.is_none() && !root_cmd && trust::is_simple(command),
+                            ask_rule,
+                        },
+                        decide: tx,
+                        stop: stop_tx.clone(),
+                    });
+                    Some(rx)
+                }
+            };
+            (label, found.session_id, found.name, found.user, next_id, epoch, rx, stop_tx, stop_rx, auto)
         };
         self.changed();
+        if rx.is_some() && self.0.flash.load(Ordering::Relaxed) {
+            (self.0.attention)();
+        }
         let root = runs_as_root(user.as_deref(), command);
         let limit = Duration::from_secs(timeout.unwrap_or(DEFAULT_TIMEOUT));
         let entry_for = |event: &'static str| {
@@ -1040,72 +1282,91 @@ impl AiState {
                 timed_out: false,
                 error: None,
                 at: now(),
+                ran_without_asking: None,
             },
             output: Zeroizing::default(),
             ai_output: Zeroizing::default(),
         };
 
-        // Waiting for you. The answer: Some(allowed), or None when access
-        // ended first (the request dropped by cancel_where or decide).
-        let decision: Result<Option<bool>, ()> = tokio::select! {
-            biased;
-            d = &mut rx => Ok(d.ok()),
-            _ = withdrawal(&mut cancel) => Err(()),
-        };
-        let decision = match decision {
-            Ok(d) => d,
-            // The AI withdrew it: unless you or an end of access got to it
-            // first, it's taken off the waiting list here.
-            Err(()) => {
-                let was_waiting = {
-                    let mut s = self.lock();
-                    let before = s.pending.len();
-                    s.pending.retain(|p| p.view.id != id);
-                    before != s.pending.len()
+        // How it was allowed: at once (`auto`), or by your answer.
+        let approved_by = match (auto, rx) {
+            (Some(by), _) => by,
+            (None, None) => unreachable!("a request either runs now or waits"),
+            (None, Some(mut rx)) => {
+                // Waiting for you. The answer: Some, or None when access
+                // ended first (the request dropped by cancel_where or answer).
+                let decision: Result<Option<Answer>, ()> = tokio::select! {
+                    biased;
+                    d = &mut rx => Ok(d.ok()),
+                    _ = withdrawal(&mut cancel) => Err(()),
                 };
-                if was_waiting {
-                    let mut e = entry();
-                    e.decision = Some("cancelled");
-                    e.note = Some("cancelled by the AI tool".into());
-                    self.audit(e);
-                    self.remember(epoch, done("cancelled"));
-                    self.changed();
-                    return ToolResult::err("Cancelled before the user decided: the request was withdrawn.");
+                let decision = match decision {
+                    Ok(d) => d,
+                    // The AI withdrew it: unless you or an end of access got
+                    // to it first, it's taken off the waiting list here.
+                    Err(()) => {
+                        let was_waiting = {
+                            let mut s = self.lock();
+                            let before = s.pending.len();
+                            s.pending.retain(|p| p.view.id != id);
+                            before != s.pending.len()
+                        };
+                        if was_waiting {
+                            let mut e = entry();
+                            e.decision = Some("cancelled");
+                            e.note = Some("cancelled by the AI tool".into());
+                            self.audit(e);
+                            self.remember(epoch, done("cancelled"));
+                            self.changed();
+                            return ToolResult::err("Cancelled before the user decided: the request was withdrawn.");
+                        }
+                        // Taken off under the same lock as the answer was
+                        // given, so it's there now (or the request was
+                        // dropped).
+                        rx.try_recv().ok()
+                    }
+                };
+                match decision {
+                    None => {
+                        let mut e = entry();
+                        e.decision = Some("cancelled");
+                        e.note = Some("access ended".into());
+                        self.audit(e);
+                        self.remember(epoch, done("cancelled"));
+                        self.changed();
+                        return ToolResult::err("Cancelled before the user decided: the server isn't shared any more.");
+                    }
+                    Some(Answer::Deny(note)) => {
+                        let mut e = entry();
+                        e.decision = Some("denied");
+                        e.by = Some(BY_YOU);
+                        e.note = note.as_ref().map(|n| format!("note: {n}"));
+                        self.audit(e);
+                        self.remember(epoch, done("denied"));
+                        self.changed();
+                        return ToolResult::err(match note {
+                            Some(n) => format!("Denied by the user: {n}"),
+                            None => "Denied by the user.".to_string(),
+                        });
+                    }
+                    Some(Answer::Allow(by)) => by,
                 }
-                // Taken off under the same lock as the answer was given, so
-                // it's there now (or the request was dropped).
-                rx.try_recv().ok()
             }
         };
-        let Some(allowed) = decision else {
-            let mut e = entry();
-            e.decision = Some("cancelled");
-            e.note = Some("access ended".into());
-            self.audit(e);
-            self.remember(epoch, done("cancelled"));
-            self.changed();
-            return ToolResult::err("Cancelled before the user decided: the server isn't shared any more.");
-        };
-        if !allowed {
-            let mut e = entry();
-            e.decision = Some("denied");
-            e.by = Some("you");
-            self.audit(e);
-            self.remember(epoch, done("denied"));
-            self.changed();
-            return ToolResult::err("Denied by the user.");
-        }
+        let ran_without_asking = Some(approved_by.clone()).filter(|b| b != BY_YOU);
 
-        // Logged now, as you allowed it: a long command, or one that hangs,
+        // Logged now, as it's allowed: a long command, or one that hangs,
         // is in the log while it runs, not only once it ends. Its "finished"
         // line follows, with the same id.
         let mut e = entry();
         e.decision = Some("allowed");
-        e.by = Some("you");
+        e.by = Some(if ran_without_asking.is_some() { "your settings" } else { BY_YOU });
+        e.approved_by = Some(approved_by);
         self.audit(e);
 
-        // Allowed: decide() has put it in the running list with its stop
-        // signal, which an end of access sets. The AI withdrawing it sets it
+        // Allowed: answer() (or the step above, when it runs without asking)
+        // has put it in the running list with its stop signal, which an end
+        // of access sets. The AI withdrawing it sets it
         // too. Either way exec::run ends it on the server before returning;
         // it runs as a task of its own, so it does even if this is dropped.
         let withdrawn = |c: &watch::Receiver<bool>| *c.borrow();
@@ -1132,6 +1393,7 @@ impl AiState {
 
         let mut e = entry_for("finished");
         let mut d = done("done");
+        d.view.ran_without_asking = ran_without_asking;
         let answer = match result {
             Ok(out) if out.stopped => {
                 e.note = Some(if stopped_by_ai { "stopped: withdrawn by the AI tool" } else { "stopped: access ended" }.into());
@@ -1224,6 +1486,8 @@ impl AiState {
 #[derive(Serialize)]
 pub struct AiSettings {
     enabled: bool,
+    /// Flash the taskbar when the AI needs you.
+    flash: bool,
     /// Where Claude Code is, when it's installed.
     claude: Option<String>,
     available: bool,
@@ -1232,6 +1496,7 @@ pub struct AiSettings {
 fn settings_view(state: &AiState) -> AiSettings {
     AiSettings {
         enabled: state.enabled(),
+        flash: state.0.flash.load(Ordering::Relaxed),
         claude: claude::find().map(|p| p.to_string_lossy().into_owned()),
         available: cfg!(not(target_os = "android")),
     }
@@ -1247,12 +1512,22 @@ pub async fn ai_set_enabled(app: tauri::AppHandle, state: tauri::State<'_, AiSta
     if cfg!(target_os = "android") {
         return Err("AI tools aren't available on Android.".into());
     }
-    crate::local_open::write_setting(&app, SETTINGS_FILE, &Settings { enabled }, "the AI tools setting")?;
+    let flash = state.0.flash.load(Ordering::Relaxed);
+    crate::local_open::write_setting(&app, SETTINGS_FILE, &Settings { enabled, flash }, "the AI tools setting")?;
     if enabled {
         state.turn_on()?;
     } else {
         state.turn_off().await;
     }
+    Ok(settings_view(&state))
+}
+
+/// "Flash the taskbar when the AI needs you", on this device.
+#[tauri::command]
+pub async fn ai_set_flash(app: tauri::AppHandle, state: tauri::State<'_, AiState>, flash: bool) -> Result<AiSettings, String> {
+    let enabled = state.enabled();
+    crate::local_open::write_setting(&app, SETTINGS_FILE, &Settings { enabled, flash }, "the AI tools setting")?;
+    state.0.flash.store(flash, Ordering::Relaxed);
     Ok(settings_view(&state))
 }
 
@@ -1269,7 +1544,8 @@ pub async fn ai_share(state: tauri::State<'_, AiState>, ssh: tauri::State<'_, cr
         return Err("That server's tab isn't connected.".into());
     }
     let user = ssh.session_users.lock().await.get(&session_id).cloned();
-    state.share_as(&tab_id, &session_id, &name, user)
+    let server_id = ssh.session_servers.lock().await.get(&session_id).map(|&id| i64::from(id));
+    state.share_as(&tab_id, &session_id, &name, user, server_id)
 }
 
 /// Stop sharing a server: with one AI tab, or (no `tab_id`) with any.
@@ -1300,9 +1576,139 @@ pub async fn ai_output(state: tauri::State<'_, AiState>, id: u64) -> Result<Done
     Ok(DoneOutput { output: d.output.to_string(), ai_output: d.ai_output.to_string() })
 }
 
+/// Allow or Deny, from the card. `note`, with Deny: what the AI is told,
+/// so it can try another way.
 #[tauri::command]
-pub async fn ai_decide(state: tauri::State<'_, AiState>, id: u64, allow: bool) -> Result<(), String> {
-    state.decide(id, allow)
+pub async fn ai_decide(state: tauri::State<'_, AiState>, id: u64, allow: bool, note: Option<String>) -> Result<(), String> {
+    if allow {
+        state.answer(id, Answer::Allow(BY_YOU.into()))
+    } else {
+        state.deny(id, note)
+    }
+}
+
+/// "Allow everything here until this AI tab closes", from the card.
+#[tauri::command]
+pub async fn ai_allow_session(state: tauri::State<'_, AiState>, id: u64) -> Result<(), String> {
+    state.allow_session(id)
+}
+
+// ---------------------------------------------------------------------------
+// Approval levels and rules (trust.rs): changed only from here, by you
+// ---------------------------------------------------------------------------
+
+/// Run `f` on the open profile's vault.
+fn with_vault<T>(db: &crate::DbState, f: impl FnOnce(&rusqlite::Connection) -> Result<T, String>) -> Result<T, String> {
+    let guard = db.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+    let conn = guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+    f(conn)
+}
+
+const LEVEL_NAMES: [&str; 3] = ["ask every time", "run my allowed commands, ask for the rest", "run anything, just log it"];
+
+fn level_name(level: Option<u8>) -> &'static str {
+    match level {
+        Some(l @ 1..=3) => LEVEL_NAMES[l as usize - 1],
+        _ => "follows its folder or the default",
+    }
+}
+
+/// "Always allow this command here", from the card: `pattern` (the command,
+/// or it with ` *` for any arguments) goes on the server's allow list, and
+/// this request is allowed. A server still at "Ask every time" goes to "Run
+/// my allowed commands", or the rule would do nothing; the card says so.
+#[tauri::command]
+pub async fn ai_allow_always(
+    state: tauri::State<'_, AiState>,
+    db: tauri::State<'_, crate::DbState>,
+    id: u64,
+    pattern: String,
+) -> Result<(), String> {
+    let p = state.pending_view(id)?;
+    let server_id = p.server_id.filter(|_| p.can_allow_always).ok_or("This command can't be allowed with a rule: it isn't one simple command on a saved server.")?;
+    let pattern = trust::check_rule("allow", &pattern)?;
+    if !trust::allow_matches(&pattern, &p.command) {
+        return Err("That rule doesn't match this command.".into());
+    }
+    let (raised, what) = with_vault(&db, |conn| {
+        let pattern = trust::add_rule(conn, "server", server_id, "allow", &pattern)?;
+        let raised = trust::policy_for(conn, Some(server_id)).level == trust::ASK_EVERY_TIME;
+        if raised {
+            trust::set_level(conn, "server", server_id, Some(trust::ALLOWED_COMMANDS))?;
+        }
+        Ok((raised, format!("{}: always allow `{pattern}`", trust::describe(conn, "server", server_id))))
+    })?;
+    crate::save_vault_internal(&db)?;
+    state.log_setting(if raised { format!("{what}; level set to {}", LEVEL_NAMES[1]) } else { what });
+    state.answer(id, Answer::Allow(BY_YOU.into()))
+}
+
+/// Everything set, for Settings › AI tools.
+#[tauri::command]
+pub async fn ai_trust_view(db: tauri::State<'_, crate::DbState>) -> Result<trust::TrustView, String> {
+    with_vault(&db, trust::view)
+}
+
+/// One server's or folder's settings (or the default's), for its editor.
+#[tauri::command]
+pub async fn ai_trust_scope(db: tauri::State<'_, crate::DbState>, scope: String, id: i64) -> Result<trust::ScopeView, String> {
+    with_vault(&db, |conn| trust::scope_view(conn, &scope, id))
+}
+
+/// Set the level of a server, a folder or the default; None takes it off.
+#[tauri::command]
+pub async fn ai_trust_set_level(
+    state: tauri::State<'_, AiState>,
+    db: tauri::State<'_, crate::DbState>,
+    scope: String,
+    id: i64,
+    level: Option<u8>,
+) -> Result<(), String> {
+    let what = with_vault(&db, |conn| {
+        trust::set_level(conn, &scope, id, level)?;
+        Ok(format!("{}: {}", trust::describe(conn, &scope, id), level_name(level)))
+    })?;
+    crate::save_vault_internal(&db)?;
+    state.log_setting(what);
+    state.changed();
+    Ok(())
+}
+
+/// Add an allow (`kind` "allow") or always-ask ("ask") rule.
+#[tauri::command]
+pub async fn ai_trust_add_rule(
+    state: tauri::State<'_, AiState>,
+    db: tauri::State<'_, crate::DbState>,
+    scope: String,
+    id: i64,
+    kind: String,
+    pattern: String,
+) -> Result<String, String> {
+    let (pattern, what) = with_vault(&db, |conn| {
+        let pattern = trust::add_rule(conn, &scope, id, &kind, &pattern)?;
+        let what = format!("{}: {} `{pattern}`", trust::describe(conn, &scope, id), if kind == "allow" { "always allow" } else { "always ask" });
+        Ok((pattern, what))
+    })?;
+    crate::save_vault_internal(&db)?;
+    state.log_setting(what);
+    state.changed();
+    Ok(pattern)
+}
+
+#[tauri::command]
+pub async fn ai_trust_remove_rule(state: tauri::State<'_, AiState>, db: tauri::State<'_, crate::DbState>, id: i64) -> Result<(), String> {
+    let what = with_vault(&db, |conn| {
+        Ok(trust::remove_rule(conn, id)?.map(|r| {
+            let list = if r.kind == "allow" { "always allow" } else { "always ask" };
+            format!("{}: removed {list} `{}`", trust::describe(conn, &r.scope, r.scope_id), r.pattern)
+        }))
+    })?;
+    crate::save_vault_internal(&db)?;
+    if let Some(what) = what {
+        state.log_setting(what);
+    }
+    state.changed();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
