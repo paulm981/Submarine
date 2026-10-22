@@ -800,7 +800,12 @@ pub async fn open_container_terminal(
 ) -> Result<(), String> {
     use crate::ssh_manager::TerminalCommand;
 
+    // A close while this waits (on a lock or on the server) is kept, and the
+    // shell is then closed here rather than left running (TerminalOpenings,
+    // ssh_manager.rs). First of all, so no wait comes before it.
+    let opening = state.terminal_openings.lock().await.begin(&terminal_id);
     if !is_safe_name(&container) {
+        state.terminal_openings.lock().await.finish(&terminal_id, opening);
         return Err("invalid container name".into());
     }
     // Shell auto-detect runs inside the container: prefer bash, fall back to
@@ -813,9 +818,6 @@ pub async fn open_container_terminal(
     // As root as this tab's other docker commands are (run_docker_smart).
     // `password`: the page asked for it when root wanted one (rootInvoke).
     let as_root = use_sudo || password.is_some() || state.docker_root.lock().await.contains(&session_id);
-    // A close while this waits on the server is kept, and the shell is then
-    // closed here rather than left running (TerminalOpenings, ssh_manager.rs).
-    let opening = state.terminal_openings.lock().await.begin(&terminal_id);
     let opened = async {
         let opened = if as_root {
             let (channel, _, early) = crate::root_channel(&state, &session_id, &args, password, Some((cols, rows))).await?;

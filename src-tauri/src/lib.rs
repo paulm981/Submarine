@@ -15614,20 +15614,20 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
     use std::sync::Arc;
     use crate::ssh_manager::TerminalCommand;
 
-    let session_arc = {
-        let mut connections = state.connections.lock().await;
-        if let Some(sess) = connections.get_mut(&session_id) {
-            Arc::clone(sess)
-        } else {
-            return Err("Session not connected".into());
-        }
-    };
-
     // The page can close the terminal while this waits on the server (the
     // tab closed as it opened): that close is kept (TerminalOpenings), and
-    // then the shell is closed here rather than left running.
+    // then the shell is closed here rather than left running. First of all,
+    // so a close that comes while this waits for a lock is kept too.
     let opening = state.terminal_openings.lock().await.begin(&terminal_id);
     let opened = async {
+        let session_arc = {
+            let connections = state.connections.lock().await;
+            match connections.get(&session_id) {
+                Some(sess) => Arc::clone(sess),
+                None => return Err("Session not connected".to_string()),
+            }
+        };
+
         // Settings → Terminal → "Use my default shell": this computer's shell,
         // started on the server as a login shell in place of the account's own
         // (LOGIN_SHELL_SCRIPT), where the server can (server_runs_login_shell);
