@@ -20544,6 +20544,14 @@ fn transfer_id() -> String {
     format!("{}-{}", ts, seq)
 }
 
+/// Whether a name in the system's temp folder is one of this app's temp
+/// roots: `submarine-` and the hex app_temp_root mints (24 digits; 32 is
+/// accepted too). Nothing else there is swept.
+fn is_app_temp_name(name: &str) -> bool {
+    name.strip_prefix("submarine-")
+        .is_some_and(|h| (h.len() == 24 || h.len() == 32) && h.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// Remove this run's temp root (live-edit / drag staging), and any left by a
 /// run that didn't get to. Called on exit, and on startup for the old ones.
 /// Only `submarine-<hex>` dirs older than a day are swept on startup: a newer
@@ -20558,9 +20566,7 @@ fn sweep_app_temp(include_own: bool) {
     for e in entries.flatten() {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
-        // `submarine-<32 hex>`, the shape app_temp_root mints.
-        let is_ours = name.strip_prefix("submarine-").is_some_and(|h| h.len() == 32 && h.bytes().all(|b| b.is_ascii_hexdigit()));
-        if !is_ours {
+        if !is_app_temp_name(name) {
             continue;
         }
         let old = e
@@ -20648,6 +20654,11 @@ async fn read_remote_capped(
     Ok(data)
 }
 
+/// The name of a temp root: `submarine-` and its random bytes in hex.
+fn app_temp_name(bytes: &[u8]) -> String {
+    format!("submarine-{}", hex::encode(bytes))
+}
+
 /// Process-global, UNPREDICTABLE temp root for SFTP live-edit / drag staging,
 /// created once with a random name (and 0700 on Unix). The old code used a
 /// fully predictable `submarine_sftp_<session_id>` directory directly in the
@@ -20661,7 +20672,7 @@ fn app_temp_root() -> &'static std::path::PathBuf {
     ROOT.get_or_init(|| {
         let mut bytes = [0u8; 12];
         rand::rng().fill_bytes(&mut bytes);
-        let root = std::env::temp_dir().join(format!("submarine-{}", hex::encode(bytes)));
+        let root = std::env::temp_dir().join(app_temp_name(&bytes));
         let _ = std::fs::create_dir_all(&root);
         #[cfg(unix)]
         {
@@ -20792,6 +20803,19 @@ fn live_edit_dir_name(remote_path: &str) -> String {
 #[cfg(test)]
 mod live_edit_tests {
     use super::live_edit_dir_name;
+
+    /// The startup sweep recognises the temp roots this app makes (it used
+    /// to look for 32 hex digits where 24 are made, and swept nothing), and
+    /// nothing else.
+    #[test]
+    fn the_startup_sweep_knows_its_own_temp_folders() {
+        use super::{app_temp_name, is_app_temp_name};
+        assert!(is_app_temp_name(&app_temp_name(&[0xab; 12])));
+        assert!(is_app_temp_name(&format!("submarine-{}", "0f".repeat(16))));
+        for other in ["submarine-", "submarine-xyz", "submarine-liveedit-test-1", "submarine-0123456789abcdef0123456", "other-abababababababababababab", "submarine-abababababababababababab/x"] {
+            assert!(!is_app_temp_name(other), "{other}");
+        }
+    }
 
     #[test]
     fn same_named_files_in_different_folders_get_different_copies() {

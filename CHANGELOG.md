@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Old temporary folders are cleared at startup.** Live Edit and drag copies left behind by a run that crashed more than a day ago stayed in the system's temp folder; the check for them never matched. ([#93](https://github.com/paulm981/Submarine/issues/93))
+
+## v0.4.0-fork.4
+
 - **Importing thousands of servers takes a moment.** Checking which ones are already saved used to take seconds for 10,000 rows, with the app waiting. ([#94](https://github.com/paulm981/Submarine/issues/94))
 - **The `~/.ssh/config` import reads settings as `ssh` does.** A `Host *` block, and other wildcard blocks that match a host, give it their settings as defaults. When a setting appears twice, the first one counts. A `Match` block's lines are left out instead of being added to the host above them. ([#94](https://github.com/paulm981/Submarine/issues/94))
 - **The PuTTY import brings in telnet sessions** as telnet servers, and leaves out "Default Settings" and other sessions with no host. Serial, raw and rlogin sessions are listed as not imported instead of coming in as SSH servers. ([#94](https://github.com/paulm981/Submarine/issues/94))
