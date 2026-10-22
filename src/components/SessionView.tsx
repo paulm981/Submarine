@@ -11,7 +11,9 @@ import InfoPanel from "./InfoPanel";
 import { CmdsPanel } from "./CmdsPanel";
 import { RenameInput } from "../ui/renameInput";
 import { useIsCompact } from "../hooks/useViewport";
-import { useAi, sharedWith } from "../util/ai";
+import { useAi, sharedWith, findAiTools } from "../util/ai";
+import { launchAiTool } from "../ui/aiPane";
+import { IS_ANDROID } from "../util/platform";
 import { fontFamilyCss, readFontFamily, readFontSize } from "../util/terminalFont";
 import { readShellSyncPairs, useShellSyncServer, type ShellSyncPair } from "../util/shellSync";
 import { readUseLocalShell } from "../util/terminalShell";
@@ -984,6 +986,24 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   };
   const stopSharingWithAi = () => {
     invoke("ai_unshare", { sessionId: session.id }).catch((e) => addLog(`AI_UNSHARE: ${e}`, "error"));
+  };
+  // The + menu's "Claude Code beside this" (#100): the AI tools Home's menu
+  // offers, looked for as the menu opens. Picked, it starts in Home, this tab
+  // is shared with it, and the AI side pane shows it beside this tab.
+  const [aiTools, setAiTools] = useState<{ id: string; label: string }[]>([]);
+  useEffect(() => {
+    if (!plusMenu || !ai.enabled || IS_ANDROID) return;
+    let live = true;
+    void findAiTools().then((t) => { if (live) setAiTools(t); });
+    return () => { live = false; };
+  }, [plusMenu, ai.enabled]);
+  const startAiBeside = (tool: { id: string; label: string }) => {
+    setPlusMenu(null);
+    const name = displayName ?? session.serverName;
+    launchAiTool(tool.id, tool.label, session.id, (tabId) => {
+      invoke("ai_share", { tabId, sessionId: session.id, name })
+        .catch((e) => addLog(`AI_SHARE: ${e}`, "error"));
+    });
   };
   // SFTP pane: the file browser or Mirror (the button in its title bar).
   const [sftpView, setSftpView] = useState<SftpView>("files");
@@ -1963,6 +1983,22 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                 )}
               </>
             )}
+            {ai.enabled && !IS_ANDROID && aiTools.map((tool, i) => (
+              <button
+                key={tool.id}
+                onClick={() => startAiBeside(tool)}
+                disabled={status !== 'connected'}
+                title={status !== 'connected'
+                  ? `${tool.label} beside this: once this tab is connected`
+                  : `Start ${tool.label} in Home, share this tab with it, and show it beside this tab`}
+                className={`w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left disabled:opacity-40 disabled:pointer-events-none ${
+                  i === 0 && !isCompact ? 'mt-1 pt-1.5 border-t border-white/5' : ''
+                }`}
+              >
+                <Bot size={13} className="text-primary/70" />
+                <span className="flex-1">{tool.label} beside this</span>
+              </button>
+            ))}
             {/* Splitting THIS session's view with another server's tab
                 lives on the session tab strip (right-click the tab).
                 That way the picker is anchored to the tab it operates
