@@ -5559,6 +5559,7 @@ async fn close_profile(
     ssh.docker_root.lock().await.clear();
     ssh.sftp_shell.lock().await.clear();
     ssh.session_servers.lock().await.clear();
+    ssh.session_users.lock().await.clear();
     ssh.terminal_servers.lock().await.clear();
     // Wipe every connect-time secret the user typed this profile (issue #30).
     ssh.prompted_secrets.lock().await.clear();
@@ -13365,6 +13366,9 @@ async fn initiate_connection(
                                     .lock()
                                     .await
                                     .insert(session_id_clone.clone(), Arc::clone(&session_arc));
+                                // Who it logged in as: the AI panel's cards say
+                                // who a command runs as (#116).
+                                app.state::<SshState>().session_users.lock().await.insert(session_id_clone.clone(), effective_user.to_string());
                                 // ProxyJump: park the route's Handles with the
                                 // session, under the same check, so they stay
                                 // alive for the whole session (the last one's

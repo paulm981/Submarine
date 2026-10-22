@@ -155,6 +155,8 @@ struct SharedServer {
     session_id: String,
     /// What the AI calls it: the tab's name, made unique for this AI tab.
     name: String,
+    /// Who its tab logged in as, which commands run as; None if not known.
+    user: Option<String>,
 }
 
 struct Tab {
@@ -182,7 +184,11 @@ struct PendingView {
     tab_label: String,
     session_id: String,
     server: String,
+    /// Who it runs as: the server tab's login user, if known.
+    user: Option<String>,
     command: String,
+    /// It runs as root: the login user is root, or the command asks for
+    /// root (asks_for_root).
     root: bool,
     timeout_secs: u64,
     asked_at: String,
@@ -328,7 +334,9 @@ fn now() -> String {
 }
 
 /// A command that asks for root: one of the tools that give it, as a word
-/// of its own (`sudo x`, `/usr/bin/sudo`, `(su -)`), anywhere in it.
+/// of its own (`sudo x`, `/usr/bin/sudo`, `(su -)`), anywhere in it. Where
+/// sudo or dzdo needs no password, that's root with no question asked, and
+/// Submarine can't always tell.
 ///
 /// A warning for you on the request's card, NOT a gate: it's easy to dodge
 /// (`s\udo`, `$(echo sudo)`, `runuser`, a script that calls sudo), so
@@ -340,6 +348,12 @@ pub(crate) fn asks_for_root(command: &str) -> bool {
     static RE: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r#"(?:^|[\s;|&(){}`'"/!])(?:sudo|dzdo|su|doas|pkexec)(?:$|[\s;|&(){}`'"])"#).unwrap());
     RE.is_match(command)
+}
+
+/// A request runs as root: its server's tab logged in as root, or its
+/// command asks for root. A warning, as asks_for_root is.
+fn runs_as_root(user: Option<&str>, command: &str) -> bool {
+    user == Some("root") || asks_for_root(command)
 }
 
 /// Equal without saying where they differ.
@@ -658,14 +672,20 @@ impl AiState {
 
     // -- Sharing -----------------------------------------------------------
 
+    #[cfg(test)]
     fn share(&self, tab_id: &str, session_id: &str, name: &str) -> Result<(), String> {
+        self.share_as(tab_id, session_id, name, None)
+    }
+
+    /// Share `session_id`, whose tab logged in as `user`, with `tab_id`.
+    fn share_as(&self, tab_id: &str, session_id: &str, name: &str, user: Option<String>) -> Result<(), String> {
         let mut s = self.lock();
         let tab = s.tabs.iter_mut().find(|t| t.id == tab_id).ok_or("That AI tab isn't open any more.")?;
         if tab.servers.iter().any(|x| x.session_id == session_id) {
             return Ok(());
         }
         let name = unique_name(&tab.servers, name);
-        tab.servers.push(SharedServer { session_id: session_id.to_string(), name: name.clone() });
+        tab.servers.push(SharedServer { session_id: session_id.to_string(), name: name.clone(), user });
         let label = tab.label.clone();
         drop(s);
         let mut e = audit::Entry::new("shared", &label);
@@ -898,7 +918,7 @@ impl AiState {
 
     async fn run_command(&self, tab_id: &str, server: &str, command: &str, timeout: Option<u64>, mut cancel: watch::Receiver<bool>) -> ToolResult {
         // Checked before anything is shown to you.
-        let (label, session_id, server, id, epoch, mut rx, stop_tx, stop_rx) = {
+        let (label, session_id, server, user, id, epoch, mut rx, stop_tx, stop_rx) = {
             let mut s = self.lock();
             let next_id = s.next_id + 1;
             let epoch = s.epoch;
@@ -971,24 +991,26 @@ impl AiState {
                     tab_label: label.clone(),
                     session_id: found.session_id.clone(),
                     server: found.name.clone(),
+                    user: found.user.clone(),
                     command: command.to_string(),
-                    root: asks_for_root(command),
+                    root: runs_as_root(found.user.as_deref(), command),
                     timeout_secs: timeout.unwrap_or(DEFAULT_TIMEOUT),
                     asked_at: now(),
                 },
                 decide: tx,
                 stop: stop_tx.clone(),
             });
-            (label, found.session_id, found.name, next_id, epoch, rx, stop_tx, stop_rx)
+            (label, found.session_id, found.name, found.user, next_id, epoch, rx, stop_tx, stop_rx)
         };
         self.changed();
-        let root = asks_for_root(command);
+        let root = runs_as_root(user.as_deref(), command);
         let limit = Duration::from_secs(timeout.unwrap_or(DEFAULT_TIMEOUT));
         let entry_for = |event: &'static str| {
             let mut e = audit::Entry::new(event, &label);
             e.id = Some(id);
             e.request = Some("run_command");
             e.server = Some(server.clone());
+            e.user = user.clone();
             e.command = Some(for_log(command, MAX_LOGGED_COMMAND));
             e.root = root;
             e
@@ -1237,7 +1259,8 @@ pub async fn ai_share(state: tauri::State<'_, AiState>, ssh: tauri::State<'_, cr
     if session_id.contains("::") || !ssh.connections.lock().await.contains_key(&session_id) {
         return Err("That server's tab isn't connected.".into());
     }
-    state.share(&tab_id, &session_id, &name)
+    let user = ssh.session_users.lock().await.get(&session_id).cloned();
+    state.share_as(&tab_id, &session_id, &name, user)
 }
 
 /// Stop sharing a server: with one AI tab, or (no `tab_id`) with any.

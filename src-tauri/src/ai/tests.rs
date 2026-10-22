@@ -209,7 +209,7 @@ fn names_stay_unique_within_an_ai_tab() {
     let mut servers = Vec::new();
     for _ in 0..3 {
         let name = unique_name(&servers, "web");
-        servers.push(SharedServer { session_id: name.clone(), name });
+        servers.push(SharedServer { session_id: name.clone(), name, user: None });
     }
     let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, ["web", "web (2)", "web (3)"]);
@@ -671,6 +671,34 @@ mod ssh {
         s.decide(p.id, false).unwrap();
         req.await.unwrap();
         assert!(audit_lines(&dir).iter().any(|l| l["event"] == "request" && l["root"] == true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The card says who a command runs as, and a root login is root
+    /// whatever the command.
+    #[tokio::test]
+    async fn the_login_user_is_on_the_card_and_root_is_marked() {
+        let (s, dir, _) = state().await;
+        s.start_tab("local-1", "Claude").unwrap();
+        s.share_as("local-1", "sess-1", "xyz", Some("root".into())).unwrap();
+        let (_c, cancel) = watch::channel(false);
+        let s2 = s.clone();
+        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "uptime", None, cancel).await });
+        let p = wait_pending(&s).await;
+        assert_eq!((p.user.as_deref(), p.root), (Some("root"), true));
+        s.decide(p.id, false).unwrap();
+        req.await.unwrap();
+        assert!(audit_lines(&dir).iter().any(|l| l["event"] == "request" && l["root"] == true && l["user"] == "root"));
+        // Another login isn't, unless the command asks.
+        s.start_tab("local-2", "Claude 2").unwrap();
+        s.share_as("local-2", "sess-1", "xyz", Some("deploy".into())).unwrap();
+        let (_c, cancel) = watch::channel(false);
+        let s2 = s.clone();
+        let req = tokio::spawn(async move { s2.run_command("local-2", "xyz", "uptime", None, cancel).await });
+        let p = wait_pending(&s).await;
+        assert_eq!((p.user.as_deref(), p.root), (Some("deploy"), false));
+        s.decide(p.id, false).unwrap();
+        req.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

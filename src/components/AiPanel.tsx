@@ -130,17 +130,23 @@ export const PendingCard = ({ p, decide, onGoToServer }: { p: AiPending; decide:
     return ok;
   };
   const down = () => { downHere.current = !moved() && performance.now() >= settledAt.current; };
+  const loginIsRoot = p.user === "root";
   return (
     <div ref={ref} className="m-2 rounded-xl border border-primary/30 bg-primary/[0.06] p-3 space-y-2">
       <div className="text-[11.5px] text-zinc-300">
         <span className="font-bold text-white">{p.tab_label}</span> wants to run on{" "}
         <NoFocusButton onPick={() => onGoToServer(p.session_id)} className="font-bold text-white hover:underline">{p.server}</NoFocusButton>
+        {p.user && <> as <span className={`font-bold ${loginIsRoot ? "text-amber-300" : "text-white"}`}>{p.user}</span></>}
         {p.timeout_secs !== 60 && <span className="text-zinc-500"> · stops after {p.timeout_secs}s</span>}
       </div>
       {p.root && (
         <div className="flex items-start gap-1.5 text-[11px] text-amber-300">
           <ShieldAlert size={13} className="shrink-0 mt-px" />
-          <span>Asks for root (sudo, dzdo, su, doas or pkexec). Where those need no password, it runs as root.</span>
+          <span>
+            {loginIsRoot
+              ? "Runs as root: this server's tab is logged in as root."
+              : "Asks for root (sudo, dzdo, su, doas or pkexec). Where those need no password, it runs as root and nothing asks first."}
+          </span>
         </div>
       )}
       {hasHidden(p.command) && (
