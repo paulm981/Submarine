@@ -11418,7 +11418,8 @@ fn parse_proxy_jump(spec: &str) -> Result<Vec<JumpHop>, String> {
         let item = raw.trim();
         let item = item.strip_prefix("ssh://").unwrap_or(item).trim_end_matches('/');
         let bad = || format!("ProxyJump {spec:?} in ~/.ssh/config isn't a list of [user@]host[:port]");
-        if item.is_empty() {
+        // As OpenSSH: an ssh:// URI has no path.
+        if item.is_empty() || (raw.trim().starts_with("ssh://") && item.contains('/')) {
             return Err(bad());
         }
         let (user, rest) = match item.rsplit_once('@') {
@@ -11468,6 +11469,7 @@ mod proxy_jump_tests {
             parse_proxy_jump("a, bob@b:22,ssh://c@d:2200/").unwrap(),
             vec![hop(None, "a", None), hop(Some("bob"), "b", Some(22)), hop(Some("c"), "d", Some(2200))]
         );
+        assert_eq!(parse_proxy_jump("ssh://h/").unwrap(), vec![hop(None, "h", None)], "a URI's closing / is no path");
         assert_eq!(parse_proxy_jump("[::1]:2222").unwrap(), vec![hop(None, "::1", Some(2222))]);
         assert_eq!(parse_proxy_jump("u@[fe80::1]").unwrap(), vec![hop(Some("u"), "fe80::1", None)]);
         assert_eq!(parse_proxy_jump("fe80::1").unwrap(), vec![hop(None, "fe80::1", None)], "a bare IPv6 address has no port");
@@ -11477,7 +11479,7 @@ mod proxy_jump_tests {
 
     #[test]
     fn bad_proxy_jump_lists_are_refused() {
-        for bad in ["", "a,,b", "u@", "@h", ":22", "h:x", "h:0", "h:70000", "[::1", "[::1]x"] {
+        for bad in ["", "a,,b", "u@", "@h", ":22", "h:x", "h:0", "h:70000", "[::1", "[::1]x", "ssh://h/x", "ssh://u@h:22/x/"] {
             assert!(parse_proxy_jump(bad).is_err(), "{bad:?}");
         }
     }
