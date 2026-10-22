@@ -898,7 +898,21 @@ impl client::Handler for ClientHandler {
         };
         let server_public_key = match offered {
             PublicKeyOrCertificate::Certificate(cert) => {
-                return match crate::trust_policy::decide_certificate(self.host_trust.as_deref(), cert, crate::trust_policy::now()) {
+                // The app's trusted keys first, as for a plain key: the key
+                // inside the certificate against those on file (D3). A
+                // database that can't be read refuses.
+                let inner = PublicKey::from(cert.public_key().clone());
+                let on_file = match self.db.lock() {
+                    Ok(guard) => match guard.as_ref() {
+                        Some(conn) => judge_host_key(conn, &self.server_host, self.server_port, &host_key_fingerprint(&inner)).ok(),
+                        None => Some(HostKeyVerdict::New),
+                    },
+                    Err(_) => None,
+                };
+                let Some(on_file) = on_file else {
+                    return refuse("the trusted host keys couldn't be read".into());
+                };
+                return match crate::trust_policy::decide_certificate(on_file, self.host_trust.as_deref(), cert, crate::trust_policy::now()) {
                     crate::trust_policy::HostKeyDecision::Trusted { why, .. } => {
                         log(&why, "success");
                         self.fp_outcome.store(1, std::sync::atomic::Ordering::SeqCst);
