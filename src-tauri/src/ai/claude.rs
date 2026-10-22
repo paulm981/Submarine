@@ -112,10 +112,41 @@ const CLOUD_LOGINS: &[(&str, &str)] = &[
     ("CLAUDE_CODE_USE_FOUNDRY", "AZURE_"),
 ];
 
+/// A switch that's on, as Claude Code reads one: 1, true, yes or on, in any
+/// case. "0", "no", "off", "false" and anything else are off.
+fn switched_on(value: &str) -> bool {
+    ["1", "true", "yes", "on"].iter().any(|on| value.trim().eq_ignore_ascii_case(on))
+}
+
+/// Your Claude Code settings file: in CLAUDE_CONFIG_DIR, or ~/.claude.
+fn settings_file() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).filter(|p| p.is_absolute()) {
+        return Some(dir.join("settings.json"));
+    }
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
+    Some(PathBuf::from(home).join(".claude").join("settings.json"))
+}
+
+/// The `env` block of a Claude Code settings file, where a cloud login can
+/// be turned on too. Nothing, if the file isn't there or isn't JSON.
+fn settings_env(file: &Path) -> std::collections::HashMap<String, String> {
+    let Ok(body) = std::fs::read(file) else { return Default::default() };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) else { return Default::default() };
+    let Some(env) = v.get("env").and_then(|e| e.as_object()) else { return Default::default() };
+    env.iter()
+        .filter_map(|(k, v)| match v {
+            serde_json::Value::String(s) => Some((k.clone(), s.clone())),
+            serde_json::Value::Bool(_) | serde_json::Value::Number(_) => Some((k.clone(), v.to_string())),
+            _ => None,
+        })
+        .collect()
+}
+
 /// What Claude Code starts without (super::CREDENTIAL_ENV), less the
-/// cloud's variables it logs in with, if it does. `var`: the environment.
+/// cloud's variables it logs in with, if it does. `var`: the environment,
+/// with the settings file's `env` block over it, as Claude Code sees it.
 fn env_remove(var: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
-    let on = |k: &str| var(k).is_some_and(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"));
+    let on = |k: &str| var(k).is_some_and(|v| switched_on(&v));
     let kept: Vec<&str> = CLOUD_LOGINS.iter().filter(|(switch, _)| on(switch)).map(|(_, prefix)| *prefix).collect();
     super::CREDENTIAL_ENV.iter().copied().filter(|name| !kept.iter().any(|p| name.starts_with(p))).collect()
 }
@@ -125,7 +156,8 @@ fn env_remove(var: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
 pub(crate) fn launch(claude: &Path, helper: &Path, data_dir: Option<&Path>) -> Result<Launch, String> {
     let config = mcp_config(helper);
     let mut env = Vec::new();
-    let env_remove = env_remove(|k| std::env::var(k).ok());
+    let from_settings = settings_file().map(|f| settings_env(&f)).unwrap_or_default();
+    let env_remove = env_remove(|k| from_settings.get(k).cloned().or_else(|| std::env::var(k).ok()));
     // An npm install is a script run by node: node is often next to it
     // (nvm, Homebrew), and an app started from the desktop may not have that
     // folder in its PATH.
@@ -243,7 +275,8 @@ mod tests {
         #[cfg(not(windows))]
         {
             let l = launch(Path::new("/home/me/.local/bin/claude"), Path::new("/usr/bin/submarine"), None).unwrap();
-            let without = env_remove(|k| std::env::var(k).ok());
+            let from_settings = settings_file().map(|f| settings_env(&f)).unwrap_or_default();
+            let without = env_remove(|k| from_settings.get(k).cloned().or_else(|| std::env::var(k).ok()));
             assert_eq!(l.env_remove, without);
             assert!(l.env_remove.contains(&"SSH_AGENT_PID"));
         }
@@ -262,8 +295,39 @@ mod tests {
         assert!(!vertex.contains(&"GOOGLE_APPLICATION_CREDENTIALS") && vertex.contains(&"AWS_PROFILE"));
         let foundry = env_remove(|k| (k == "CLAUDE_CODE_USE_FOUNDRY").then(|| "1".to_string()));
         assert!(!foundry.contains(&"AZURE_CLIENT_SECRET") && foundry.contains(&"GH_TOKEN"));
-        // Off is off.
-        assert_eq!(env_remove(|k| (k == "CLAUDE_CODE_USE_BEDROCK").then(|| "0".to_string())), super::super::CREDENTIAL_ENV);
+        // Off is off, as Claude Code reads it.
+        for off in ["0", "false", "no", "off", "", "maybe"] {
+            assert_eq!(env_remove(|k| (k == "CLAUDE_CODE_USE_BEDROCK").then(|| off.to_string())), super::super::CREDENTIAL_ENV, "{off:?}");
+        }
+        for on in ["1", "true", "TRUE", "yes", "On", " on "] {
+            assert!(switched_on(on), "{on:?}");
+        }
+    }
+
+    #[test]
+    fn a_cloud_login_in_claude_codes_settings_counts_too() {
+        let dir = std::env::temp_dir().join(format!("submarine-claude-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("settings.json");
+        std::fs::write(&file, r#"{ "env": { "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CODE_USE_VERTEX": true, "AWS_REGION": "eu-west-1", "X": {} } }"#).unwrap();
+        let from = settings_env(&file);
+        assert_eq!(from.get("CLAUDE_CODE_USE_BEDROCK").map(String::as_str), Some("1"));
+        assert_eq!(from.get("CLAUDE_CODE_USE_VERTEX").map(String::as_str), Some("true"));
+        assert!(!from.contains_key("X"));
+        let kept = env_remove(|k| from.get(k).cloned());
+        assert!(!kept.iter().any(|n| n.starts_with("AWS_") || n.starts_with("GOOGLE_")));
+        assert!(kept.contains(&"AZURE_CLIENT_SECRET"));
+        // The settings file's value wins over the environment's, as in
+        // Claude Code: one turned off there is off.
+        std::fs::write(&file, r#"{ "env": { "CLAUDE_CODE_USE_BEDROCK": "" } }"#).unwrap();
+        let from = settings_env(&file);
+        let removed = env_remove(|k| from.get(k).cloned().or_else(|| (k == "CLAUDE_CODE_USE_BEDROCK").then(|| "1".into())));
+        assert!(removed.contains(&"AWS_PROFILE"));
+        // A file that isn't there, or isn't JSON, is no settings.
+        std::fs::write(&file, "not json").unwrap();
+        assert!(settings_env(&file).is_empty());
+        assert!(settings_env(&dir.join("none.json")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
