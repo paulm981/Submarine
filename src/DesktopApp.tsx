@@ -885,7 +885,21 @@ function DesktopApp() {
 
   // Rethrows so the session tree can say it failed; the grid ignores that.
   const cloneServer = async (id: number) => {
-    try { await invoke("clone_server", { id }); refreshServers(); bumpSync(); addLog("Node cloned.", "success"); }
+    try {
+      const copyId = await invoke<number>("clone_server", { id });
+      // An RDP server's window and sharing options are this device's own,
+      // kept by sync id (util/rdpOptions): the copy starts with the same.
+      const original = (servers || []).find((s: any) => s.id === id);
+      if (original?.protocol === "rdp" && original.uuid) {
+        try {
+          const copy = (await invoke<any[]>("get_servers")).find((s) => s.id === copyId);
+          if (copy?.uuid) writeRdpOptions(copy.uuid, readRdpOptions(original.uuid));
+        } catch (e) {
+          addLog(`CLONE_RDP_OPTIONS_FAILED: ${e}`, "error");
+        }
+      }
+      refreshServers(); bumpSync(); addLog("Node cloned.", "success");
+    }
     catch (e) { addLog(`CLONE_ERROR: ${e}`, "error"); throw e; }
   };
 
@@ -913,8 +927,17 @@ function DesktopApp() {
   // one vault save however much is selected. Rethrows so the tree can say
   // what failed.
   const deleteItems = async (items: TreeItems) => {
+    // The servers that go, the picked ones and those in the picked folders,
+    // for the same per-server cleanup removeServer does.
+    const tree = folderTree(folders);
+    const insideFolders = new Set<number>(items.folders.flatMap((f) => [...tree.subtreeOf(f)]));
+    const gone = new Set<number>([
+      ...items.servers,
+      ...(servers || []).filter((s: any) => insideFolders.has(tree.serverFolder(s) as number)).map((s: any) => s.id as number),
+    ]);
     try {
       await invoke("delete_tree_items", { servers: items.servers, links: items.links, folders: items.folders });
+      if (activeProfile) gone.forEach((sid) => forgetServerBookmarks(activeProfile, sid));
       addLog("Removed from the session tree.", "info");
     } finally {
       await Promise.all([refreshFolders(), refreshServers(), refreshRdpLinks()]);
