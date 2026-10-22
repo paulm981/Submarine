@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
-  ArrowLeftRight, ChevronRight, ChevronsDownUp, Copy, CopyPlus, Folder, FolderInput, FolderOpen, FolderPlus,
+  ArrowLeftRight, Bot, ChevronRight, ChevronsDownUp, Copy, CopyPlus, Folder, FolderInput, FolderOpen, FolderPlus,
   Eye, LayoutGrid, Monitor, MonitorSmartphone, Pencil, Play, Plus, Search, ShieldAlert, TerminalSquare, Trash2, X,
 } from "lucide-react";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
@@ -10,6 +10,7 @@ import { sessionDot } from "../util/sessionStatus";
 import RdpLinkModal, { type RdpLink } from "./RdpLinkModal";
 import MoveToFolderModal from "./MoveToFolderModal";
 import { OsBadge, osName } from "./OsBadge";
+import { openAiTrust, useAi } from "../util/ai";
 
 // The session tree beside the main view, in the spirit of MobaXterm's
 // Sessions sidebar: every folder, server and Remote Desktop link as one
@@ -125,6 +126,8 @@ export const SessionTree = ({
 }) => {
   const confirm = useConfirm();
   const prompt = useTextPrompt();
+  // "AI approval…" in the menus, while AI tools are on (#115).
+  const aiOn = useAi().enabled;
   const [search, setSearch] = useState("");
   const [openOnly, setOpenOnly] = useState(readOpenOnly);
   const [expanded, setExpanded] = useState<Set<number>>(() => readExpanded(profile));
@@ -903,6 +906,11 @@ export const SessionTree = ({
                 <button className={menuItem} onClick={run(() => toggleFolder(f.id))}>
                   <ChevronRight size={13} className={menuIcon} /> {f.open ? "Collapse" : "Expand"}
                 </button>
+                {aiOn && !many && (
+                  <button className={menuItem} onClick={run(() => openAiTrust({ scope: "folder", id: f.id, name: f.name }))}>
+                    <Bot size={13} className={menuIcon} /> AI approval for this folder…
+                  </button>
+                )}
                 {menuSep}
                 {newItems(f.id)}
                 {menuSep}
@@ -955,6 +963,11 @@ export const SessionTree = ({
                 {!many && (
                   <button className={menuItem} onClick={run(() => { navigator.clipboard?.writeText(String(host)).catch(() => {}); })}>
                     <Copy size={13} className={menuIcon} /> Copy host name
+                  </button>
+                )}
+                {aiOn && !many && r.kind === "server" && (r.server.protocol ?? "ssh") === "ssh" && (
+                  <button className={menuItem} onClick={run(() => openAiTrust({ scope: "server", id: r.server.id, name: r.server.name }))}>
+                    <Bot size={13} className={menuIcon} /> AI approval…
                   </button>
                 )}
                 {menuSep}

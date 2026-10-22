@@ -20,7 +20,8 @@ const VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-0
 const MAX_MESSAGE: usize = 1024 * 1024;
 
 const INSTRUCTIONS: &str = "Submarine runs commands on servers the user has shared with you, over the SSH connections it already holds. \
-You never get credentials. Every command waits until the user clicks Allow in Submarine's AI panel, and may be denied. \
+You never get credentials. Depending on the approval level the user chose for each server, a command runs at once or waits until \
+the user clicks Allow in Submarine, and may be denied, sometimes with a note saying why. \
 Call list_shared to see the servers you can use. Output you get back is filtered: secrets it recognises are replaced with [hidden by Submarine].";
 
 /// The tools, with MCP's standard hints (ToolAnnotations, from 2025-03-26):
@@ -36,7 +37,8 @@ pub(crate) fn tools() -> Value {
         },
         {
             "name": "run_command",
-            "description": "Run a shell command on a shared server, as the user's SSH login, once the user allows it in Submarine. \
+            "description": "Run a shell command on a shared server, as the user's SSH login, once the user allows it in Submarine \
+(or at once, where the user's settings for that server say so). \
 No terminal is attached and nothing is on stdin, so interactive programs and pagers won't work; use non-interactive forms \
 (e.g. `journalctl -n 50 --no-pager`, `top -bn1`). The command is stopped at its timeout or past 1 MB of output. \
 Returns the exit code and the output (stdout and stderr together), with secrets replaced by [hidden by Submarine].",

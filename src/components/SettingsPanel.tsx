@@ -21,6 +21,7 @@ import { DEFAULT_SCHEME } from "../ui/terminalThemes";
 import { windowSummary } from "../util/diagnostics";
 import { MAX_SCROLLBACK, MIN_SCROLLBACK, clampScrollback } from "../util/terminalScrollback";
 import type { WallCloseTaken } from "../util/wallClose";
+import { AiTrustOverview } from "./AiTrust";
 
 // Where this install keeps its data (see src-tauri/src/portable.rs). `portable`
 // means a `submarine-data` folder next to the executable is in use; `warning`
@@ -256,7 +257,7 @@ function HomeTerminalSettings() {
 // AI tools (#32, src-tauri/src/ai): off by default, on this device only.
 // On, Home's menu lists Claude Code under AI tools, started already connected
 // to Submarine; off, nothing listens and every AI tab's access ends.
-interface AiSettings { enabled: boolean; claude: string | null; available: boolean }
+interface AiSettings { enabled: boolean; flash: boolean; claude: string | null; available: boolean }
 // Claude Code's own settings that keep it out of your keys: deny rules for
 // its Read tool, and the sandbox's `credentials` for the commands it runs
 // (code.claude.com/docs/en/permissions and /sandboxing).
@@ -276,6 +277,11 @@ function AiToolsSettings() {
     setError(null);
     invoke<AiSettings>("ai_set_enabled", { enabled: !info.enabled }).then(setInfo).catch((e) => setError(String(e)));
   };
+  const toggleFlash = () => {
+    if (!info) return;
+    setError(null);
+    invoke<AiSettings>("ai_set_flash", { flash: !info.flash }).then(setInfo).catch((e) => setError(String(e)));
+  };
   if (!info) return error ? <p className="text-[11.5px] text-red-400">{error}</p> : null;
   return (
     <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-3 shadow-xl">
@@ -285,8 +291,8 @@ function AiToolsSettings() {
           <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
             Let an AI tool started from Home ask Submarine to run commands on server tabs you share with it.
             It never gets a key or a password, and never connects to a server itself: Submarine runs each command
-            on its own connection, only after you click Allow in the AI panel. Each AI tab only reaches the tabs
-            shared with it, and closing it ends its access.
+            on its own connection, after you click Allow in the AI panel, or at once where you've said it may (below).
+            Each AI tab only reaches the tabs shared with it, and closing it ends its access.
           </p>
         </div>
         <button
@@ -333,6 +339,32 @@ function AiToolsSettings() {
         or a virtual machine.
       </p>
       <pre className="whitespace-pre-wrap break-all rounded-lg bg-black/40 border border-white/5 p-2 font-mono text-[10.5px] text-zinc-400 select-text">{CLAUDE_KEYS_OUT}</pre>
+      <div className="flex items-center justify-between gap-4 pt-3 border-t border-white/5">
+        <div className="min-w-0">
+          <div className="text-[12.5px] font-semibold text-zinc-100">Flash the taskbar when the AI needs you</div>
+          <p className="text-[11.5px] text-zinc-500 leading-relaxed mt-0.5">
+            When a command waits for your Allow and Submarine isn't the window in front, its taskbar button flashes.
+            Nothing else moves or takes the keyboard.
+          </p>
+        </div>
+        <button
+          role="switch"
+          aria-checked={info.flash}
+          aria-label="Flash the taskbar when the AI needs you"
+          onClick={toggleFlash}
+          className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${info.flash ? 'bg-primary' : 'bg-zinc-700'}`}
+        >
+          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${info.flash ? 'left-[22px]' : 'left-0.5'}`} />
+        </button>
+      </div>
+      <div className="pt-3 border-t border-white/5 space-y-2">
+        <div className="text-sm font-semibold text-zinc-100">How much the AI may run without asking</div>
+        <p className="text-[11.5px] text-zinc-500 leading-relaxed">
+          Kept on this computer only: never synced, so a shared profile can't change it, and the AI can't either.
+          Whatever you choose, every command is in the AI panel and the audit log, and Stop ends it.
+        </p>
+        <AiTrustOverview />
+      </div>
       {error && <p className="text-[11.5px] text-red-400">{error}</p>}
     </div>
   );

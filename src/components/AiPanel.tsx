@@ -1,8 +1,9 @@
 import { ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Bot, Check, ChevronDown, ChevronRight, Loader2, ShieldAlert, Square, X } from "lucide-react";
+import { Bot, Check, ChevronDown, ChevronRight, Loader2, ShieldAlert, Square, X, Zap } from "lucide-react";
 import { AiDone, AiPending, AiSnapshot } from "../util/ai";
 import { HIDDEN_CONTROLS } from "../util/fileName";
+import { WILDCARD_WARNING } from "./AiTrust";
 
 // The AI panel (#32): one for the whole app, docked on the right and opened
 // from the title bar's AI button. It holds what every AI tab does, on every
@@ -12,7 +13,10 @@ import { HIDDEN_CONTROLS } from "../util/fileName";
 //
 // A request never takes the keyboard: nothing here takes focus, the buttons
 // can't be reached with Tab, and only a click (never Enter or Space) allows
-// or denies, so typing in a terminal can't approve anything.
+// or denies, so typing in a terminal can't approve anything. The two fields
+// a card can show (a note with Deny, the rule for "Always allow") take the
+// keyboard only when clicked, and Enter in them does nothing: they never
+// approve anything by themselves.
 
 /// A click with the mouse (or a tap), not a key: a keyboard "click" has no
 /// detail count.
@@ -81,8 +85,23 @@ const SETTLE_MS = 500;
 /// moving. So when a card above it goes (the AI can withdraw one) and this
 /// one slides up under the pointer, a click meant for the other can't
 /// decide it.
-export const PendingCard = ({ p, decide, onGoToServer }: { p: AiPending; decide: (allow: boolean) => void; onGoToServer: (sessionId: string) => void }) => {
+export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
+  p: AiPending;
+  /// The server's approval level now (#115).
+  level: number;
+  /// Allow, or Deny with an optional note for the AI.
+  decide: (allow: boolean, note?: string) => void;
+  /// The card's other actions: "Always allow this command here" and "Allow
+  /// everything here until this AI tab closes".
+  act: (cmd: string, args: Record<string, unknown>) => void;
+  onGoToServer: (sessionId: string) => void;
+}) => {
   const ref = useRef<HTMLDivElement>(null);
+  // Which of the card's extra parts is open: the rule to save, or the note
+  // to deny with.
+  const [extra, setExtra] = useState<"rule" | "note" | null>(null);
+  const [rule, setRule] = useState(p.command.trim());
+  const [note, setNote] = useState("");
   const settledAt = useRef(0);
   const lastTop = useRef<number | null>(null);
   const downHere = useRef(false);
@@ -131,6 +150,13 @@ export const PendingCard = ({ p, decide, onGoToServer }: { p: AiPending; decide:
   };
   const down = () => { downHere.current = !moved() && performance.now() >= settledAt.current; };
   const loginIsRoot = p.user === "root";
+  // The fields: Enter does nothing, and no key in them reaches the app.
+  const fieldKeys = (e: React.KeyboardEvent) => {
+    e.stopPropagation();
+    if (e.key === "Enter") e.preventDefault();
+  };
+  const link = "text-[10.5px] text-zinc-400 hover:text-white underline-offset-2 hover:underline text-left";
+  const field = "w-full h-7 px-2 bg-black/40 border border-white/10 rounded-md font-mono text-[11px] text-zinc-100 outline-none focus:border-primary/50 placeholder:text-zinc-600";
   return (
     <div ref={ref} className="m-2 rounded-xl border border-primary/30 bg-primary/[0.06] p-3 space-y-2">
       <div className="text-[11.5px] text-zinc-300">
@@ -155,6 +181,12 @@ export const PendingCard = ({ p, decide, onGoToServer }: { p: AiPending; decide:
           <span>It has hidden or control characters, shown below as ⟨U+…⟩.</span>
         </div>
       )}
+      {p.ask_rule && (
+        <div className="flex items-start gap-1.5 text-[11px] text-amber-300">
+          <ShieldAlert size={13} className="shrink-0 mt-px" />
+          <span>Asks because of your always-ask rule <code className="text-amber-200">{p.ask_rule}</code>.</span>
+        </div>
+      )}
       {/* The whole command, never cut off. */}
       <pre className="whitespace-pre-wrap break-all rounded-lg bg-black/50 border border-white/10 p-2 font-mono text-[11.5px] text-zinc-100 select-text">
         {showPlainly(p.command)}
@@ -177,9 +209,82 @@ export const PendingCard = ({ p, decide, onGoToServer }: { p: AiPending; decide:
           <X size={13} /> Deny
         </NoFocusButton>
       </div>
+      <div className="flex flex-col items-start gap-1">
+        {p.can_allow_always && extra !== "rule" && (
+          <NoFocusButton onPick={() => setExtra("rule")} className={link}>Always allow this command here…</NoFocusButton>
+        )}
+        {extra === "rule" && (
+          <div className="w-full space-y-1.5 rounded-lg border border-white/10 bg-black/20 p-2">
+            <div className="text-[10.5px] text-zinc-400">Always allow on {p.server}:</div>
+            <input value={rule} onChange={(e) => setRule(e.target.value)} onKeyDown={fieldKeys} spellCheck={false} aria-label="The command to always allow" className={field} />
+            <p className="text-[10.5px] text-zinc-500 leading-snug">
+              Exactly this command. End it with <code>&nbsp;*</code> to allow any arguments.
+              {level < 2 && " This server asks every time now: saving also sets it to “Run my allowed commands, ask for the rest”."}
+            </p>
+            {rule.trim().endsWith("*") && <p className="text-[10.5px] text-amber-300 leading-snug">{WILDCARD_WARNING}</p>}
+            <div className="flex gap-2">
+              <NoFocusButton
+                onPick={() => act("ai_allow_always", { id: p.id, pattern: rule })}
+                onDown={down}
+                accept={accept}
+                className="h-7 px-2.5 rounded-md bg-primary/15 border border-primary/40 text-primary text-[10.5px] font-bold uppercase tracking-wider hover:bg-primary hover:text-zinc-950"
+              >
+                Save and allow
+              </NoFocusButton>
+              <NoFocusButton onPick={() => setExtra(null)} className="h-7 px-2.5 rounded-md border border-white/10 text-zinc-400 text-[10.5px] font-bold uppercase tracking-wider hover:text-white">
+                Cancel
+              </NoFocusButton>
+            </div>
+          </div>
+        )}
+        <NoFocusButton
+          onPick={() => act("ai_allow_session", { id: p.id })}
+          onDown={down}
+          accept={accept}
+          title="Runs this, and what this AI tab asks for on this server from now on, without asking, but for your always-ask list. Ends when the AI tab closes, or the server stops being shared."
+          className={`${link} flex items-center gap-1`}
+        >
+          <Zap size={11} className="shrink-0" /> Allow everything here until this AI tab closes
+        </NoFocusButton>
+        {extra !== "note" && (
+          <NoFocusButton onPick={() => setExtra("note")} className={link}>Deny with a note…</NoFocusButton>
+        )}
+        {extra === "note" && (
+          <div className="w-full space-y-1.5 rounded-lg border border-white/10 bg-black/20 p-2">
+            <input
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              onKeyDown={fieldKeys}
+              maxLength={500}
+              placeholder="Why, so the AI can try another way"
+              aria-label="A note for the AI"
+              className={`${field} font-sans`}
+            />
+            <div className="flex gap-2">
+              <NoFocusButton
+                onPick={() => decide(false, note)}
+                onDown={down}
+                accept={accept}
+                className="h-7 px-2.5 rounded-md bg-zinc-900 border border-white/10 text-zinc-300 text-[10.5px] font-bold uppercase tracking-wider hover:border-red-400/50 hover:text-red-300"
+              >
+                Deny with this note
+              </NoFocusButton>
+              <NoFocusButton onPick={() => setExtra(null)} className="h-7 px-2.5 rounded-md border border-white/10 text-zinc-400 text-[10.5px] font-bold uppercase tracking-wider hover:text-white">
+                Cancel
+              </NoFocusButton>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 };
+
+/// A shared server's level, for its requests' cards.
+export const levelOf = (snap: AiSnapshot, tabId: string, sessionId: string): number =>
+  snap.tabs.find((t) => t.id === tabId)?.servers.find((s) => s.session_id === sessionId)?.level ?? 1;
+
+const ranWithoutAsking = (why: string) => <span className="text-amber-300/90">ran without asking: {why}</span>;
 
 const outcomeLabel = (d: AiDone) => {
   switch (d.outcome) {
@@ -221,6 +326,7 @@ const DoneRow = ({ d }: { d: AiDone }) => {
           <span className="block font-mono text-[11px] text-zinc-200 truncate">{showPlainly(d.command)}</span>
           <span className={`block text-[10.5px] ${ok ? "text-emerald-400" : ran ? "text-amber-300" : "text-zinc-500"}`}>
             {outcomeLabel(d)}
+            {d.ran_without_asking && <> · {ranWithoutAsking(d.ran_without_asking)}</>}
             {d.hidden > 0 && <span className="text-sky-300"> · {d.hidden} hidden from the AI</span>}
             {d.cut && <span> · stopped at 1 MB</span>}
           </span>
@@ -329,7 +435,14 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
 
         {/* Waiting for you. */}
         {snap.pending.map((p) => (
-          <PendingCard key={p.id} p={p} decide={(allow) => run("ai_decide", { id: p.id, allow })} onGoToServer={onGoToServer} />
+          <PendingCard
+            key={p.id}
+            p={p}
+            level={levelOf(snap, p.tab_id, p.session_id)}
+            decide={(allow, note) => run("ai_decide", { id: p.id, allow, note: note ?? null })}
+            act={run}
+            onGoToServer={onGoToServer}
+          />
         ))}
 
         {/* Running now. */}
@@ -337,7 +450,10 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
           <div key={r.id} className="px-3 py-2 border-t border-white/5 flex items-start gap-2">
             <Loader2 size={12} className="mt-0.5 shrink-0 animate-spin text-primary" />
             <span className="flex-1 min-w-0">
-              <span className="block text-[10.5px] text-zinc-500"><span className="font-semibold text-zinc-300">{r.tab_label}</span> {r.server} · running</span>
+              <span className="block text-[10.5px] text-zinc-500">
+                <span className="font-semibold text-zinc-300">{r.tab_label}</span> {r.server} · running
+                {r.ran_without_asking && <> · {ranWithoutAsking(r.ran_without_asking)}</>}
+              </span>
               <span className="block font-mono text-[11px] text-zinc-200 truncate">{showPlainly(r.command)}</span>
             </span>
           </div>
