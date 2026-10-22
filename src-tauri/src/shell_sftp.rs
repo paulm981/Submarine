@@ -346,8 +346,8 @@ fn outcome(o: &Output) -> Result<(), StatusReply> {
 fn from_stderr(err: &[u8]) -> StatusReply {
     let text = String::from_utf8_lossy(err);
     let line = text.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("");
-    if text.contains("sudo:") || text.contains("sudo-rs:") {
-        let sudo = crate::classify_sudo_failure(&text.replace('\n', " "));
+    if text.lines().any(crate::is_tool_line) {
+        let sudo = crate::classify_tool_output(&text);
         if !sudo.starts_with(crate::SUDO_FAILED) {
             return failure(sudo);
         }

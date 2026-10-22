@@ -16267,7 +16267,7 @@ async fn root_shell_probe(session_arc: &SessionHandleArc, tool: &'static str, fo
     } else if out.contains("__SUB_SU_UID:") {
         Err(SUDO_NOT_ALLOWED.into())
     } else {
-        Err(classify_sudo_failure(&out))
+        Err(classify_tool_output(&out))
     }
 }
 
@@ -16318,7 +16318,7 @@ async fn root_run(session_arc: &SessionHandleArc, access: &ssh_manager::RootAcce
         )));
         let out = exec_with_stdin_capture_upto(session_arc, &format!("{} {} {}", tool, flags, form), Some(stdin.as_bytes()), timeout_secs, ROOT_OUTPUT_MAX).await?;
         let Some(start) = out.find("__SUB_ROOT_OUT__:") else {
-            return Err(classify_sudo_failure(&out));
+            return Err(classify_tool_output(&out));
         };
         let rest = &out[start + "__SUB_ROOT_OUT__:".len()..];
         let (uid, after) = rest.split_once('\n').unwrap_or((rest, ""));
@@ -16462,7 +16462,7 @@ async fn root_channel_start(
                     decide_by.get_or_insert_with(|| Instant::now() + Duration::from_millis(500));
                 }
                 Ok(Some(ChannelMsg::Close | ChannelMsg::Eof)) | Ok(None) => {
-                    return Err(classify_sudo_failure(&String::from_utf8_lossy(&seen)));
+                    return Err(classify_tool_output(&String::from_utf8_lossy(&seen)));
                 }
                 Ok(Some(_)) => {}
                 // Output and no prompt: it runs without the password.
@@ -16620,7 +16620,7 @@ pub(crate) async fn run_as_root(
             // `-l` answers without a password where any of the user's rules
             // has NOPASSWD (sudo's `listpw`), even for a command that needs
             // one; running it says so. Then the tab asks for the password.
-            if code != 0 && access.password.is_none() && access.shell.is_none() && classify_sudo_failure(&out) == SUDO_NEED_PASSWORD {
+            if code != 0 && access.password.is_none() && access.shell.is_none() && classify_tool_output(&out) == SUDO_NEED_PASSWORD {
                 state.root_access.lock().await.remove(session_id);
                 return Err(SUDO_NEED_PASSWORD.into());
             }
@@ -16947,6 +16947,24 @@ fn classify_sudo_failure(msg: &str) -> String {
     } else {
         format!("{}: {}", SUDO_FAILED, msg.trim())
     }
+}
+
+/// Is this line of output one of sudo's, dzdo's or sudo-rs's own? Those
+/// start with the tool's name, or are its refusals ("Sorry, try again.",
+/// "Sorry, user bob may not run sudo", "bob is not in the sudoers file").
+fn is_tool_line(line: &str) -> bool {
+    let l = line.trim().to_ascii_lowercase();
+    ["sudo:", "dzdo:", "sudo-rs:", "sorry, try again", "sorry, user "].iter().any(|p| l.starts_with(p))
+        || l.contains(" is not in the sudoers file")
+}
+
+/// classify_sudo_failure for output that also holds what the command (or a
+/// root shell's start-up) printed: only the tool's own lines (is_tool_line)
+/// are read, so a command that prints "incorrect password" is never taken
+/// for the tool turning the password down.
+fn classify_tool_output(out: &str) -> String {
+    let lines: Vec<&str> = out.lines().map(str::trim).filter(|l| is_tool_line(l)).collect();
+    classify_sudo_failure(&lines.join(" "))
 }
 
 /// Run a command on its own exec channel, optionally feeding stdin, and
@@ -17400,6 +17418,23 @@ mod elevated_sftp_tests {
         assert_eq!(classify_sudo_failure("bob is not in the sudoers file."), SUDO_NOT_ALLOWED);
         assert_eq!(classify_sudo_failure(""), SUDO_NOT_ALLOWED);
         assert!(classify_sudo_failure("sudo: something odd").starts_with(SUDO_FAILED));
+    }
+
+    /// What a command prints is never taken for the tool's answer (#96).
+    #[test]
+    fn only_the_tools_own_lines_are_read() {
+        // A container's log, a unit's status text.
+        let noise = "app: incorrect password for user admin\nauth: a password is required\nlogin: authentication failure\n";
+        assert_eq!(classify_tool_output(noise), SUDO_NOT_ALLOWED);
+        assert_eq!(classify_tool_output(&format!("{noise}sudo: a password is required\n")), SUDO_NEED_PASSWORD);
+        assert_eq!(classify_tool_output("Sorry, try again.\r\nSorry, try again.\r\ndzdo: 2 incorrect password attempts\r\n"), SUDO_WRONG_PASSWORD);
+        assert_eq!(classify_tool_output("  sudo-rs: interactive authentication is required"), SUDO_NEED_PASSWORD);
+        assert_eq!(classify_tool_output("bob is not in the sudoers file.  This incident will be reported.\n"), SUDO_NOT_ALLOWED);
+        assert_eq!(
+            classify_tool_output("Last login: today\nSorry, user bob is not allowed to execute '/bin/su -' as root on web1.\n"),
+            SUDO_NOT_ALLOWED
+        );
+        assert_eq!(classify_tool_output("sudo: sorry, you must have a tty to run sudo\n"), SUDO_REQUIRETTY);
     }
 
     #[test]
