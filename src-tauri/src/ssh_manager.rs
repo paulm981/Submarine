@@ -918,27 +918,16 @@ impl client::Handler for ClientHandler {
             self.fp_outcome.store(0, std::sync::atomic::Ordering::SeqCst);
             Ok(false)
         };
-        let server_public_key = match offered {
+        // A certificate is judged by the key inside it, against the app's
+        // trusted keys, as a plain key is; the prompt and what's saved on
+        // approval are that key's.
+        let inner_key: PublicKey;
+        let (server_public_key, certificate) = match offered {
             PublicKeyOrCertificate::Certificate(cert) => {
-                // The app's trusted keys first, as for a plain key: the key
-                // inside the certificate against those on file (D3). A
-                // database that can't be read refuses.
-                let inner = PublicKey::from(cert.public_key().clone());
-                let on_file = match self.keys_on_file(&host_key_fingerprint(&inner)) {
-                    Ok(v) => v,
-                    Err(why) => return refuse(why),
-                };
-                return match crate::trust_policy::decide_certificate(on_file, self.host_trust.as_deref(), cert, crate::trust_policy::now()) {
-                    crate::trust_policy::HostKeyDecision::Trusted { why, .. } => {
-                        log(&why, "success");
-                        self.fp_outcome.store(1, std::sync::atomic::Ordering::SeqCst);
-                        Ok(true)
-                    }
-                    crate::trust_policy::HostKeyDecision::Refused(why) => refuse(why),
-                    crate::trust_policy::HostKeyDecision::Ask { .. } => refuse("a host certificate can't be approved by hand".into()),
-                };
+                inner_key = PublicKey::from(cert.public_key().clone());
+                (&inner_key, Some(cert))
             }
-            PublicKeyOrCertificate::PublicKey { key, .. } => key,
+            PublicKeyOrCertificate::PublicKey { key, .. } => (key, None),
         };
         // The key's own algorithm (`ssh-rsa` for any RSA key).
         let key_type = server_public_key.algorithm().to_string();
@@ -946,7 +935,11 @@ impl client::Handler for ClientHandler {
         let fp_str = host_key_fingerprint(server_public_key);
 
         let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
-            "msg": format!("Server offered key ({}): {}", key_type, fp_str),
+            "msg": if certificate.is_some() {
+                format!("Server offered a host certificate holding the key ({}): {}", key_type, fp_str)
+            } else {
+                format!("Server offered key ({}): {}", key_type, fp_str)
+            },
             "type": "info"
         }));
 
@@ -961,8 +954,12 @@ impl client::Handler for ClientHandler {
             Ok(v) => v,
             Err(why) => return refuse(why),
         };
+        let decision = match certificate {
+            Some(cert) => crate::trust_policy::decide_certificate(verdict, self.host_trust.as_deref(), cert, crate::trust_policy::now()),
+            None => crate::trust_policy::decide_plain_key(verdict, self.host_trust.as_deref(), server_public_key),
+        };
         let (mismatch, prior_fingerprints) =
-            match crate::trust_policy::decide_plain_key(verdict, self.host_trust.as_deref(), server_public_key) {
+            match decision {
                 crate::trust_policy::HostKeyDecision::Trusted { why, save } => {
                     // Vouched for by known_hosts with nothing on file here:
                     // saved as if approved, so Monitoring and the changed-key
@@ -1140,6 +1137,9 @@ impl client::Handler for ClientHandler {
                     // otherwise the next connection would see "any row matches
                     // the OLD fingerprint = trusted" because of the loop above,
                     // defeating the warning. See save_approved_host_key.
+                    // For a host certificate this is the key inside it: you
+                    // approved it by hand, so it's saved like a plain key. D4's
+                    // "certificates aren't saved" is about saving without asking.
                     if let Ok(guard) = self.db.lock() {
                         if let Some(ref conn) = *guard {
                             let _ = save_approved_host_key(

@@ -76,25 +76,33 @@ pub(crate) fn decide_plain_key(on_file: HostKeyVerdict, known_hosts: Option<&Hos
 /// against it (known_hosts::HostTrust::check_certificate: a host certificate,
 /// signed by that CA, valid now, issued for the name connected to, nothing
 /// revoked). russh's key exchange separately checks that the server holds
-/// the certificate's key. Never saved.
+/// the certificate's key. Never saved without asking.
 ///
-/// `on_file` is what the app's trusted keys say about the key inside the
-/// certificate: when keys are on file for the server and it isn't one of
-/// them, it's refused, whatever the CA says (D3).
+/// The certificate is checked first: one that fails is refused, whatever
+/// the app's trusted keys say, and no answer can override that. `on_file`
+/// is what those keys say about the key inside the certificate: when keys
+/// are on file for the server and it isn't one of them, it's the usual
+/// changed-key warning, as for a plain key (D3; servers get reinstalled).
 pub(crate) fn decide_certificate(on_file: HostKeyVerdict, known_hosts: Option<&HostTrust>, cert: &Certificate, now: u64) -> HostKeyDecision {
-    if let HostKeyVerdict::Changed { .. } = on_file {
-        return HostKeyDecision::Refused(
-            "this server's certificate holds a different key from the one Submarine trusts for it, \
-             so the certificate isn't enough: the key may have been replaced, or this isn't the same server"
-                .into(),
-        );
-    }
-    match known_hosts.map(|t| t.check_certificate(cert, now)) {
-        Some(Verdict::Trusted(why)) => HostKeyDecision::Trusted { why, save: false },
-        Some(Verdict::Refused(why)) => HostKeyDecision::Refused(why),
-        Some(Verdict::Undecided(_)) | None => HostKeyDecision::Refused(
-            "the server presented a host certificate, and no @cert-authority line in your known_hosts covers this host".into(),
-        ),
+    let why = match known_hosts.map(|t| t.check_certificate(cert, now)) {
+        Some(Verdict::Trusted(why)) => why,
+        Some(Verdict::Refused(why)) => return HostKeyDecision::Refused(why),
+        Some(Verdict::Undecided(_)) | None => {
+            return HostKeyDecision::Refused(
+                "the server presented a host certificate, and no @cert-authority line in your known_hosts covers this host".into(),
+            )
+        }
+    };
+    match on_file {
+        HostKeyVerdict::Changed { prior } => HostKeyDecision::Ask {
+            mismatch: true,
+            prior,
+            note: Some(format!(
+                "The server showed a certificate signed by a CA your known_hosts trusts ({why}), \
+                 but the key in it isn't the one this app trusts for the server."
+            )),
+        },
+        HostKeyVerdict::Known | HostKeyVerdict::New => HostKeyDecision::Trusted { why, save: false },
     }
 }
 
@@ -325,13 +333,26 @@ mod tests {
         let elsewhere = known_hosts(&ca_line, "db.example.com", 22).await;
         assert!(refused(&good, &elsewhere));
         assert!(matches!(decide_certificate(HostKeyVerdict::New, None, &good, NOW), HostKeyDecision::Refused(_)));
-        // The app trusts another key for the server: refused, whatever the CA
-        // says. Its own key inside, or nothing on file: as the CA says.
-        let changed = HostKeyVerdict::Changed { prior: vec!["OLDFP (ssh-ed25519)".into()] };
-        match decide_certificate(changed, Some(&t), &good, NOW) {
-            HostKeyDecision::Refused(why) => assert!(why.contains("different key from the one Submarine trusts"), "{why}"),
-            other => panic!("refused, not {other:?}"),
+        // The app trusts another key for the server: a good certificate gets
+        // the changed-key warning, as a plain key would, with the old keys
+        // and a line about the certificate; a bad one is refused all the same.
+        let changed = || HostKeyVerdict::Changed { prior: vec!["OLDFP (ssh-ed25519)".into()] };
+        match decide_certificate(changed(), Some(&t), &good, NOW) {
+            HostKeyDecision::Ask { mismatch: true, prior, note: Some(note) } => {
+                assert_eq!(prior, vec!["OLDFP (ssh-ed25519)".to_string()]);
+                assert!(note.contains("certificate signed by a CA your known_hosts trusts"), "{note}");
+            }
+            other => panic!("the changed-key warning, not {other:?}"),
         }
+        for bad in [
+            cert(&ca, &["node2.sublab.test"], valid, CertType::Host),
+            cert(&ca, &["node1.sublab.test"], (NOW - 7200, NOW - 3600), CertType::Host),
+            cert(&key(), &["node1.sublab.test"], valid, CertType::Host),
+        ] {
+            assert!(matches!(decide_certificate(changed(), Some(&t), &bad, NOW), HostKeyDecision::Refused(_)));
+        }
+        assert!(matches!(decide_certificate(changed(), Some(&revoked), &good, NOW), HostKeyDecision::Refused(_)));
+        assert!(matches!(decide_certificate(changed(), None, &good, NOW), HostKeyDecision::Refused(_)));
         assert!(matches!(decide_certificate(HostKeyVerdict::Known, Some(&t), &good, NOW), HostKeyDecision::Trusted { save: false, .. }));
     }
 
