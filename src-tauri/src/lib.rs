@@ -20391,6 +20391,9 @@ struct ImportedHost {
     /// (rdp_links.rs), not a server.
     #[serde(default)]
     rdp: bool,
+    /// A telnet session (PuTTY's): imported as a telnet server.
+    #[serde(default)]
+    telnet: bool,
 }
 
 /// What the pasted-import parser found: the hosts, and a line about the
@@ -20654,6 +20657,8 @@ fn resolve_proxy_jump_aliases(hosts: &mut [ImportedHost]) {
 fn parse_client_import(text: String) -> Result<ClientImport, String> {
     let skipped = if text.lines().any(|l| l.trim_start().starts_with("[Bookmarks")) {
         mobaxterm_skipped(&text)
+    } else if is_putty_reg(text.trim()) {
+        putty_skipped(&putty_sessions(text.trim()).1)
     } else {
         None
     };
@@ -20730,52 +20735,90 @@ fn parse_client_hosts(text: String) -> Result<Vec<ImportedHost>, String> {
     }
 
     // ── PuTTY .reg export
-    if trimmed.to_ascii_lowercase().contains("windows registry editor")
-        || trimmed.contains("[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions")
-        || trimmed.contains("[HKEY_USERS\\") && trimmed.contains("SimonTatham\\PuTTY\\Sessions")
-    {
+    if is_putty_reg(trimmed) {
         return parse_putty_reg(trimmed);
     }
 
     Err("Unrecognised format — paste a JSON array, a PuTTY .reg export, or a MobaXterm .mxtsessions block.".into())
 }
 
-/// Parse `regedit /e` output of PuTTY's session key. The format is
-/// deterministic (one `[...]` header line per session, then `"key"=type:val`
-/// lines) so a line-oriented walk covers it. We only pull the three fields
-/// that translate to a Submarine row: HostName, PortNumber, UserName.
-/// Session-name percent-escapes (%20 for space, etc.) are undone so the
-/// alias reads naturally.
+fn is_putty_reg(trimmed: &str) -> bool {
+    trimmed.to_ascii_lowercase().contains("windows registry editor")
+        || trimmed.contains("[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions")
+        || trimmed.contains("[HKEY_USERS\\") && trimmed.contains("SimonTatham\\PuTTY\\Sessions")
+}
+
+/// Parse `regedit /e` output of PuTTY's session key: the SSH and telnet
+/// sessions (`putty_sessions`), or why there are none.
 fn parse_putty_reg(text: &str) -> Result<Vec<ImportedHost>, String> {
+    let (out, skipped) = putty_sessions(text);
+    if out.is_empty() {
+        return Err(match putty_skipped(&skipped) {
+            Some(why) => format!("No PuTTY SSH or telnet sessions found. {}", why),
+            None => "No PuTTY sessions found in the pasted text.".into(),
+        });
+    }
+    Ok(out)
+}
+
+/// The sessions in a PuTTY `.reg` export, and how many of each other kind
+/// (serial, raw, rlogin, …) were left out. The format is deterministic (one
+/// `[...]` header line per session, then `"key"=type:val` lines) so a
+/// line-oriented walk covers it. We pull the fields that translate to a
+/// Submarine row: HostName, PortNumber, UserName and Protocol. An SSH
+/// session becomes an SSH server, a telnet one a telnet server. A session
+/// with no host name ("Default Settings", say) isn't one to connect to and
+/// is left out. Session-name percent-escapes (%20 for space, etc.) are
+/// undone so the alias reads naturally.
+fn putty_sessions(text: &str) -> (Vec<ImportedHost>, std::collections::BTreeMap<String, usize>) {
+    struct Session {
+        name: String,
+        host: String,
+        port: u16,
+        user: String,
+        /// PuTTY's own word; a session without one is SSH, PuTTY's default.
+        protocol: String,
+    }
     let mut out: Vec<ImportedHost> = Vec::new();
-    let mut current: Option<(String, String, u16, String)> = None; // (alias, host, port, user)
-    let close = |cur: &mut Option<(String, String, u16, String)>, out: &mut Vec<ImportedHost>| {
-        if let Some((alias, host, port, user)) = cur.take() {
-            if !host.is_empty() || !alias.is_empty() {
-                out.push(ImportedHost {
-                    host_alias: alias.clone(),
-                    hostname: if host.is_empty() { alias } else { host },
-                    port: if port == 0 { 22 } else { port },
-                    user,
-                    identity_file: None,
-                    proxy_jump: None,
-                    ..Default::default()
-                });
-            }
+    let mut skipped: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut current: Option<Session> = None;
+    let mut close = |cur: &mut Option<Session>| {
+        let Some(s) = cur.take() else { return };
+        if s.host.trim().is_empty() {
+            return;
         }
+        let telnet = match s.protocol.as_str() {
+            "" | "ssh" => false,
+            "telnet" => true,
+            other => {
+                *skipped.entry(other.to_string()).or_default() += 1;
+                return;
+            }
+        };
+        let usual = if telnet { 23 } else { 22 };
+        out.push(ImportedHost {
+            host_alias: s.name,
+            hostname: s.host.trim().to_string(),
+            port: if s.port == 0 { usual } else { s.port },
+            user: s.user,
+            identity_file: None,
+            proxy_jump: None,
+            telnet,
+            ..Default::default()
+        });
     };
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() { continue; }
         if line.starts_with('[') && line.ends_with(']') {
-            close(&mut current, &mut out);
+            close(&mut current);
             // Only sessions — skip other PuTTY keys (SshHostKeys, Jumplist).
             let inner = &line[1..line.len() - 1];
             let Some(idx) = inner.rfind("\\Sessions\\") else { continue; };
             let name_raw = &inner[idx + "\\Sessions\\".len()..];
             let name = putty_unescape(name_raw);
             if name.is_empty() { continue; }
-            current = Some((name, String::new(), 0, String::new()));
+            current = Some(Session { name, host: String::new(), port: 0, user: String::new(), protocol: String::new() });
             continue;
         }
         let Some((key, val_raw)) = line.split_once('=') else { continue; };
@@ -20784,24 +20827,43 @@ fn parse_putty_reg(text: &str) -> Result<Vec<ImportedHost>, String> {
         let val = val_raw.trim();
         match key {
             "HostName" => {
-                if let Some(v) = strip_reg_string(val) { cur.1 = v; }
+                if let Some(v) = strip_reg_string(val) { cur.host = v; }
             }
             "PortNumber" => {
                 if let Some(n) = strip_reg_dword(val) {
-                    if let Ok(p) = u16::try_from(n) { cur.2 = p; }
+                    if let Ok(p) = u16::try_from(n) { cur.port = p; }
                 }
             }
             "UserName" => {
-                if let Some(v) = strip_reg_string(val) { cur.3 = v; }
+                if let Some(v) = strip_reg_string(val) { cur.user = v; }
+            }
+            "Protocol" => {
+                if let Some(v) = strip_reg_string(val) { cur.protocol = v.trim().to_ascii_lowercase(); }
             }
             _ => {}
         }
     }
-    close(&mut current, &mut out);
-    if out.is_empty() {
-        return Err("No PuTTY sessions found in the pasted text.".into());
+    close(&mut current);
+    (out, skipped)
+}
+
+/// "Not imported: 2 serial and 1 raw sessions — …" for the PuTTY sessions
+/// `putty_sessions` left out; None when it left out none.
+fn putty_skipped(counts: &std::collections::BTreeMap<String, usize>) -> Option<String> {
+    if counts.is_empty() {
+        return None;
     }
-    Ok(out)
+    let parts: Vec<String> = counts.iter().map(|(k, n)| format!("{} {}", n, k)).collect();
+    let total: usize = counts.values().sum();
+    let list = match parts.len() {
+        1 => parts[0].clone(),
+        _ => format!("{} and {}", parts[..parts.len() - 1].join(", "), parts[parts.len() - 1]),
+    };
+    Some(format!(
+        "Not imported: {} {} — Submarine imports PuTTY's SSH and telnet sessions.",
+        list,
+        if total == 1 { "session" } else { "sessions" }
+    ))
 }
 
 /// PuTTY registry keys with special characters (space, backslash, non-
@@ -21043,6 +21105,7 @@ fn parse_mobaxterm_sessions_in(text: &str, profile_dir: Option<&str>, documents:
             jump_identity_file,
             jump_credential,
             rdp,
+            telnet: false,
         });
     }
     if out.is_empty() {
@@ -21101,7 +21164,7 @@ fn mobaxterm_jump_hosts(hosts: &str, ports: &str, users: &str) -> Option<String>
 
 #[cfg(test)]
 mod client_import_tests {
-    use super::{parse_client_hosts, parse_mobaxterm_sessions_in, mobaxterm_skipped, expand_mobaxterm_path};
+    use super::{parse_client_hosts, parse_client_import, parse_mobaxterm_sessions_in, mobaxterm_skipped, expand_mobaxterm_path};
 
     #[test]
     fn a_startup_command_comes_back_as_it_was_typed() {
@@ -21359,6 +21422,46 @@ mod client_import_tests {
         let hosts = parse_client_hosts(export(&[s("web"), s("web (2)"), s("web"), s("web"), s("web (2)")])).unwrap();
         let names: Vec<&str> = hosts.iter().map(|h| h.host_alias.as_str()).collect();
         assert_eq!(names, vec!["web", "web (2)", "web (3)", "web (4)", "web (2) (2)"]);
+    }
+
+    #[test]
+    fn putty_import_takes_ssh_and_telnet_and_counts_the_rest() {
+        let session = |name: &str, host: &str, protocol: Option<&str>, port: Option<u32>| {
+            let mut s = format!("[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions\\{name}]\r\n\"HostName\"=\"{host}\"\r\n");
+            if let Some(p) = protocol {
+                s.push_str(&format!("\"Protocol\"=\"{p}\"\r\n"));
+            }
+            if let Some(p) = port {
+                s.push_str(&format!("\"PortNumber\"=dword:{p:08x}\r\n"));
+            }
+            s
+        };
+        let text = [
+            "Windows Registry Editor Version 5.00\r\n".to_string(),
+            session("Default%20Settings", "", Some("ssh"), Some(22)),
+            session("web", "web.example", Some("ssh"), Some(2222)),
+            session("old", "old.example", None, None),
+            session("switch", "10.0.0.9", Some("telnet"), None),
+            session("console", "COM1", Some("serial"), None),
+            session("raw1", "r.example", Some("raw"), Some(7)),
+            session("raw2", "r.example", Some("raw"), Some(8)),
+            session("legacy", "l.example", Some("rlogin"), Some(513)),
+        ]
+        .concat();
+        let hosts = parse_client_hosts(text.clone()).unwrap();
+        let got: Vec<(&str, &str, u16, bool)> = hosts.iter().map(|h| (h.host_alias.as_str(), h.hostname.as_str(), h.port, h.telnet)).collect();
+        assert_eq!(
+            got,
+            vec![("web", "web.example", 2222, false), ("old", "old.example", 22, false), ("switch", "10.0.0.9", 23, true)],
+            "no Default Settings; a session with no Protocol is SSH; telnet on 23"
+        );
+        assert_eq!(
+            parse_client_import(text).unwrap().skipped.as_deref(),
+            Some("Not imported: 2 raw, 1 rlogin and 1 serial sessions — Submarine imports PuTTY's SSH and telnet sessions.")
+        );
+        let only_serial = ["Windows Registry Editor Version 5.00\r\n".to_string(), session("console", "COM1", Some("serial"), None)].concat();
+        let err = parse_client_hosts(only_serial).err().expect("nothing to import");
+        assert!(err.contains("1 serial session"), "{err}");
     }
 
     #[test]

@@ -53,6 +53,8 @@ type ImportedHost = {
   jump_credential?: string | null;
   // A Remote Desktop session: becomes an RDP link, not a server.
   rdp?: boolean;
+  // A PuTTY telnet session: becomes a telnet server.
+  telnet?: boolean;
 };
 
 // What `parse_client_import` hands back: the hosts, and a line about the
@@ -1413,6 +1415,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                           <div className="flex-1 min-w-0">
                             <div className="text-[12.5px] font-bold text-white truncate">
                               {h.rdp && <span className="mr-1.5 px-1 py-px rounded text-[9.5px] font-black tracking-wider bg-sky-500/15 text-sky-300 border border-sky-500/30 align-middle">RDP</span>}
+                              {h.telnet && <span className="mr-1.5 px-1 py-px rounded text-[9.5px] font-black tracking-wider bg-amber-500/15 text-amber-300 border border-amber-500/30 align-middle">TELNET</span>}
                               {h.host_alias}
                             </div>
                             <div className="text-[11px] font-mono text-zinc-400 truncate">

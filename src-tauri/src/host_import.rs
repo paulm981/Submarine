@@ -203,6 +203,7 @@ fn insert_server(
     key_id: Option<i64>,
     folder_id: Option<i64>,
     run_on_connect: &str,
+    telnet: bool,
 ) -> rusqlite::Result<i64> {
     // Its own key wins over a Login; then add_server's rule decides which
     // fields the row keeps (normalize_server_identity).
@@ -221,9 +222,9 @@ fn insert_server(
     // To the bottom of its folder, as add_server does.
     let position = saved.next_position(folder_id);
     conn.execute(
-        "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, position)
-         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, 'none', '', 1080, '[]', ?7, ?8, 0, '[]', NULL, '', ?9, ?10)",
-        params![name, host, port, username, credential_id, folder_id, auth_type, key_id, run_on_connect, position],
+        "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, position, protocol)
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, 'none', '', 1080, '[]', ?7, ?8, 0, '[]', NULL, '', ?9, ?10, ?11)",
+        params![name, host, port, username, credential_id, folder_id, auth_type, key_id, run_on_connect, position, telnet.then_some("telnet")],
     )?;
     let id = conn.last_insert_rowid();
     saved.servers.entry(saved_key(name, host, port, folder_id)).or_insert(id);
@@ -303,7 +304,7 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
             None => None,
         };
         let run = h.run_on_connect.as_deref().map(str::trim).unwrap_or("");
-        let id = insert_server(conn, &mut saved, name, host, port, &h.user, credential_id, row.key_id, folder_id, run).map_err(db)?;
+        let id = insert_server(conn, &mut saved, name, host, port, &h.user, credential_id, row.key_id, folder_id, run, h.telnet).map_err(db)?;
         report.added += 1;
         by_alias.entry(name.to_lowercase()).or_insert(id);
         // `none` is OpenSSH's "no jump host", e.g. to override a wildcard block.
@@ -358,7 +359,7 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
                         Some(c) => Some(login_id(conn, &mut logins, c, &mut report).map_err(db)?),
                         None => None,
                     };
-                    let j = insert_server(conn, &mut saved, &name, &host, port, &user, login, row.jump_key_id, None, "").map_err(db)?;
+                    let j = insert_server(conn, &mut saved, &name, &host, port, &user, login, row.jump_key_id, None, "", false).map_err(db)?;
                     report.jump_hosts_created.push(name);
                     j
                 }
@@ -466,7 +467,7 @@ mod tests {
             "CREATE TABLE folders(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, parent_id INTEGER, color TEXT);
              CREATE TABLE ssh_keys(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, public_key TEXT, private_key TEXT, passphrase TEXT);
              CREATE TABLE credentials(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, auth_type TEXT, username TEXT, password TEXT, key_id INTEGER);
-             CREATE TABLE servers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT, key_id INTEGER, autostart INTEGER, mirrors TEXT, color TEXT, notes TEXT, run_on_connect TEXT, jump_host_id INTEGER, position INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE servers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT, key_id INTEGER, autostart INTEGER, mirrors TEXT, color TEXT, notes TEXT, run_on_connect TEXT, jump_host_id INTEGER, position INTEGER NOT NULL DEFAULT 0, protocol TEXT);
              INSERT INTO ssh_keys(name, private_key) VALUES ('id_jump', 'k1'), ('own', 'k2');",
         )
         .unwrap();
@@ -611,6 +612,26 @@ mod tests {
         assert_eq!(pos("other", 22, false), 0, "a new folder starts at 0");
         let again = import_rows(&conn, &rows).unwrap();
         assert_eq!((again.added, again.already_there), (0, 8));
+    }
+
+    #[test]
+    fn a_telnet_session_becomes_a_telnet_server() {
+        let conn = vault();
+        let row = ImportRow {
+            host: ImportedHost { host_alias: "switch".into(), hostname: "10.0.0.9".into(), port: 23, telnet: true, ..Default::default() },
+            key_id: None,
+            jump_key_id: None,
+        };
+        let r = import_rows(&conn, &[row, moba("web1", &[], "web1.example", None, None)]).unwrap();
+        assert_eq!(r.added, 2);
+        let kinds: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT name, protocol FROM servers ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(kinds, vec![("switch".into(), Some("telnet".into())), ("web1".into(), None)]);
     }
 
     #[test]
