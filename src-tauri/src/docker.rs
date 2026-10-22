@@ -82,6 +82,25 @@ async fn run_capture(
     cmd: &str,
     timeout_secs: u64,
 ) -> Result<(i32, String), String> {
+    // Run by sh whatever the login shell is: csh and tcsh read `2>&1` and
+    // `$?` their own way (remote_sh). A Windows server (OpenSSH's cmd.exe or
+    // PowerShell) has no sh: there it runs as it was before.
+    let wrapped = crate::remote_sh::sh_command(&[], &format!("{}\necho __DOCK_EXIT:$?", cmd), &[]);
+    let (code, out) = run_capture_raw(state, session_id, &wrapped, timeout_secs).await?;
+    if code != 0 && out.contains("'sh' is not recognized") {
+        return run_capture_raw(state, session_id, &format!("{}\necho __DOCK_EXIT:$?", cmd), timeout_secs).await;
+    }
+    Ok((code, out))
+}
+
+/// Run `wrapped` (which ends by echoing `__DOCK_EXIT:<code>`) and split the
+/// code from the output.
+async fn run_capture_raw(
+    state: &SshState,
+    session_id: &str,
+    wrapped: &str,
+    timeout_secs: u64,
+) -> Result<(i32, String), String> {
     let session_arc = {
         let connections = state.connections.lock().await;
         connections
@@ -96,9 +115,6 @@ async fn run_capture(
             .await
             .map_err(|e| e.to_string())?
     };
-    // Run by sh whatever the login shell is: csh and tcsh read `2>&1` and
-    // `$?` their own way (remote_sh).
-    let wrapped = crate::remote_sh::sh_command(&[], &format!("{}\necho __DOCK_EXIT:$?", cmd), &[]);
     channel
         .exec(true, wrapped.as_bytes())
         .await
