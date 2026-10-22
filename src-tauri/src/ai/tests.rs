@@ -490,12 +490,18 @@ mod ssh {
         assert!(!serde_json::to_string(&s.snapshot()).unwrap().contains("hunter2"), "outputs aren't in the panel's every update");
         assert_eq!((done.outcome, done.exit_code, done.hidden), ("done", Some(4), 1));
         let log = audit_lines(&dir);
-        let req = log.iter().find(|l| l["event"] == "request").unwrap();
+        // Logged as you allowed it, and again once it ended.
+        let req = log.iter().position(|l| l["event"] == "request").unwrap();
+        let fin = log.iter().position(|l| l["event"] == "finished").unwrap();
+        assert!(req < fin);
+        let (req, fin) = (&log[req], &log[fin]);
         assert_eq!(req["decision"], "allowed");
         assert_eq!(req["by"], "you");
-        assert_eq!(req["exit_code"], 4);
-        assert_eq!(req["items_hidden"], 1);
-        assert_eq!(req["ai_tab"], "Claude");
+        assert!(req.get("exit_code").is_none());
+        assert_eq!(fin["id"], req["id"]);
+        assert_eq!(fin["exit_code"], 4);
+        assert_eq!(fin["items_hidden"], 1);
+        assert_eq!((&req["ai_tab"], &fin["ai_tab"]), (&json!("Claude"), &json!("Claude")));
         assert!(!std::fs::read_to_string(dir.join(audit::FILE_NAME)).unwrap().contains("hunter2"), "no output in the log");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -610,6 +616,27 @@ mod ssh {
         }
     }
 
+    /// Allowed, a command is in the log while it runs, not only once it ends.
+    #[tokio::test]
+    async fn allowed_is_logged_before_it_ends() {
+        let (s, dir, _, running) = state_and_server(Default::default()).await;
+        s.start_tab("local-1", "Claude").unwrap();
+        s.share("local-1", "sess-1", "xyz").unwrap();
+        let (_c, cancel) = watch::channel(false);
+        let s2 = s.clone();
+        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "exec sleep 30", None, cancel).await });
+        let p = wait_pending(&s).await;
+        s.decide(p.id, true).unwrap();
+        wait_for("it to run on the server", || running.load(Ordering::SeqCst) == 1).await;
+        let log = audit_lines(&dir);
+        assert!(log.iter().any(|l| l["event"] == "request" && l["decision"] == "allowed" && l["id"] == p.id), "{log:?}");
+        assert!(!log.iter().any(|l| l["event"] == "finished"));
+        s.stop_tab("local-1");
+        tokio::time::timeout(Duration::from_secs(10), req).await.expect("stopped").unwrap();
+        assert!(audit_lines(&dir).iter().any(|l| l["event"] == "finished" && l["id"] == p.id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The AI withdrawing a running request ends it on the server too.
     #[tokio::test]
     async fn the_ai_withdrawing_a_running_request_ends_it() {
@@ -684,7 +711,8 @@ mod ssh {
         let log = audit_lines(&dir);
         let req = log.iter().find(|l| l["event"] == "request").unwrap();
         assert_eq!(req["decision"], "allowed");
-        assert_eq!(req["note"], "stopped: withdrawn by the AI tool");
+        let fin = log.iter().find(|l| l["event"] == "finished").unwrap();
+        assert_eq!(fin["note"], "stopped: withdrawn by the AI tool");
         assert!(!log.iter().any(|l| l["note"] == "access ended"));
         let _ = std::fs::remove_dir_all(&dir);
     }

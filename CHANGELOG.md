@@ -10,6 +10,7 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 ## Next release
 
 - **Locking the profile or turning AI tools off clears the AI panel's list of what ran.** The commands and their whole output used to stay in the panel after a lock, where the next profile could open them. ([#97](https://github.com/paulm981/Submarine/issues/97))
+- **An AI command you allow is in `ai-audit.log` straight away,** and gets a second line when it ends, with its exit code. Before, nothing was written until it ended, so a command still running when Submarine quit or crashed was never logged. ([#97](https://github.com/paulm981/Submarine/issues/97))
 
 ## v0.4.0-fork.4
 

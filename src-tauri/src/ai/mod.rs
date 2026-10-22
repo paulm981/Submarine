@@ -814,14 +814,16 @@ impl AiState {
         self.changed();
         let root = asks_for_root(command);
         let limit = Duration::from_secs(timeout.unwrap_or(DEFAULT_TIMEOUT));
-        let entry = || {
-            let mut e = audit::Entry::new("request", &label);
+        let entry_for = |event: &'static str| {
+            let mut e = audit::Entry::new(event, &label);
+            e.id = Some(id);
             e.request = Some("run_command");
             e.server = Some(server.clone());
             e.command = Some(for_log(command, MAX_LOGGED_COMMAND));
             e.root = root;
             e
         };
+        let entry = || entry_for("request");
         let done = |outcome: &'static str| Done {
             view: DoneView {
                 id,
@@ -893,6 +895,14 @@ impl AiState {
             return ToolResult::err("Denied by the user.");
         }
 
+        // Logged now, as you allowed it: a long command, or one that hangs,
+        // is in the log while it runs, not only once it ends. Its "finished"
+        // line follows, with the same id.
+        let mut e = entry();
+        e.decision = Some("allowed");
+        e.by = Some("you");
+        self.audit(e);
+
         // Allowed: decide() has put it in the running list with its stop
         // signal, which an end of access sets. The AI withdrawing it sets it
         // too. Either way exec::run ends it on the server before returning;
@@ -919,9 +929,7 @@ impl AiState {
         };
         let stopped_by_ai = still_listed && withdrawn(&cancel);
 
-        let mut e = entry();
-        e.decision = Some("allowed");
-        e.by = Some("you");
+        let mut e = entry_for("finished");
         let mut d = done("done");
         let answer = match result {
             Ok(out) if out.stopped => {
