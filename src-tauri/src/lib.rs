@@ -11539,18 +11539,6 @@ async fn connect_jump_host(
     for line in &target.log {
         ctx.log(line, "info");
     }
-
-    // Wait for a turn to log in to this jump host (multiexec.rs), held until
-    // this login is done, so opening a folder of servers behind it doesn't
-    // trip its limit on logins in progress.
-    let _login_turn = multiexec::login_turn(ctx.app, jump_server_id, ctx.attempt, |limit| {
-        ctx.log(
-            &format!("Waiting for a login slot on the jump host ({} logging in at a time)...", limit),
-            "info",
-        )
-    })
-    .await?;
-
     let hop = Hop { target, password, key_data, cache_id: format!("jump{jump_server_id}") };
     reach_hop(ctx, hop, route, 0).await
 }
@@ -11610,6 +11598,7 @@ fn config_jump_chain<'a>(
                 chain = reach_hop(ctx, hop, route, depth + 1).await?;
             } else {
                 let via = chain.last().ok_or("ProxyJump: no previous hop")?;
+                let _turn = hop_policy::hop_turn(ctx, &hop.target).await?; // fork (#43, D1): login queue per hop
                 let stream = hop_channel(via, &hop.target.host, hop.target.port).await.map_err(|e| ctx.network_error(e))?;
                 chain.push(login_hop(ctx, hop, HopStream::Channel(stream), None).await?);
             }
@@ -11634,6 +11623,7 @@ fn reach_hop<'a>(
                 ctx.log(&format!("~/.ssh/config: reaching the jump host {host} through ProxyJump {spec}..."), "info");
                 let mut chain = config_jump_chain(ctx, &spec, depth).await?;
                 let via = chain.last().ok_or("ProxyJump: no hops")?;
+                let _turn = hop_policy::hop_turn(ctx, &hop.target).await?; // fork (#43, D1): login queue per hop
                 let stream = hop_channel(via, &host, port).await.map_err(|e| ctx.network_error(e))?;
                 let handle = login_hop(ctx, hop, HopStream::Channel(stream), None).await?;
                 chain.push(handle);
@@ -11645,10 +11635,12 @@ fn reach_hop<'a>(
                     "info",
                 );
                 let user = hop.target.user.trim().to_string();
+                let _turn = hop_policy::hop_turn(ctx, &hop.target).await?; // fork (#43, D1): login queue per hop
                 let (stream, watch) = start_proxy_command(ctx.app, ctx.session_id, ctx.attempt, &command, &hop.target, &user)?;
                 Ok(vec![login_hop(ctx, hop, HopStream::Command(stream), Some(watch)).await?])
             }
             _ => {
+                let _turn = hop_policy::hop_turn(ctx, &hop.target).await?; // fork (#43, D1): login queue per hop
                 ctx.log(&format!("Connecting to jump host {host}:{port}..."), "info");
                 let tcp = match tokio::time::timeout(Duration::from_secs(10), tokio::net::TcpStream::connect((host.as_str(), port))).await {
                     Ok(Ok(s)) => {
@@ -24760,7 +24752,6 @@ fn resolve_node_auth_row(
             proxy_port: proxy_port.map(|p| p as u16),
             jump: None,
             name: server_display_name(conn, node_id),
-            server_id: Some(node_id),
         },
         jump_host_id,
     ))

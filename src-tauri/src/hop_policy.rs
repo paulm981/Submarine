@@ -20,6 +20,32 @@ pub(crate) fn refuse_tokens(spec: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The login queue a jump host waits in (multiexec::login_turn): its address
+/// as dialled, so a saved jump host and the same bastion in a ProxyJump chain
+/// share one queue (#43, D1).
+pub(crate) fn queue_key(host: &str, port: u16) -> String {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    format!("[{host}]:{port}")
+}
+
+/// A turn to log in to `target`, a hop of `ctx`'s route, from the moment its
+/// transport opens until its login is over (drop it then). One hop's turn is
+/// never held while the next hop waits for one: two routes through the same
+/// bastions in opposite orders would wait on each other for good.
+pub(crate) async fn hop_turn(
+    ctx: &crate::HopCtx<'_>,
+    target: &crate::ConfigTarget,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, String> {
+    let key = queue_key(&target.host, target.port);
+    crate::multiexec::login_turn(ctx.app, &key, ctx.attempt, |limit| {
+        ctx.log(
+            &format!("Waiting for a login slot on the jump host {} ({limit} logging in at a time)...", target.host),
+            "info",
+        )
+    })
+    .await
+}
+
 /// Where a route through a `ProxyJump` list first dials.
 #[derive(Debug, PartialEq)]
 pub(crate) enum FirstHop {
@@ -155,6 +181,14 @@ mod tests {
 
     fn jump(spec: &str) -> Option<Proxy> {
         Some(Proxy::Jump(spec.into()))
+    }
+
+    #[test]
+    fn a_bastion_has_one_queue_whatever_the_spelling() {
+        assert_eq!(queue_key("Bastion.Example", 22), queue_key(" bastion.example", 22));
+        assert_eq!(queue_key("::1", 22), queue_key("[::1]", 22));
+        assert_ne!(queue_key("::1", 22), queue_key("::1:22", 22));
+        assert_ne!(queue_key("bastion", 22), queue_key("bastion", 2222));
     }
 
     #[tokio::test]

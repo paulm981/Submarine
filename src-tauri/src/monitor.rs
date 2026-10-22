@@ -203,10 +203,6 @@ pub struct NodeAuth {
     /// Host patterns, as the terminal matches it.
     #[serde(default)]
     pub name: Option<String>,
-    /// The server's id. A jump host's picks its login queue, the one the
-    /// terminals behind it wait in (multiexec::login_turn).
-    #[serde(default)]
-    pub server_id: Option<i32>,
 }
 
 /// A user-defined metric. The probe loop wraps each command in BEGIN/END
@@ -547,10 +543,13 @@ async fn run_poller(
             // terminals behind it take one, so resuming a hundred monitors
             // doesn't log in to it a hundred times at once. The wait isn't
             // part of the connect's budget: a busy queue isn't an outage.
-            let jump_turn = match target.jump.as_ref().and_then(|j| j.server_id) {
-                Some(jump_id) => tokio::select! {
+            // Its queue is its address (hop_policy::queue_key), as the
+            // terminals' and any ProxyJump chain's through it are.
+            let jump_queue = target.jump.as_ref().map(|j| crate::hop_policy::queue_key(&j.host, j.port));
+            let jump_turn = match jump_queue.as_deref() {
+                Some(key) => tokio::select! {
                     _ = &mut stop_rx => break,
-                    turn = crate::multiexec::login_turn_until_dropped(&app, jump_id) => turn,
+                    turn = crate::multiexec::login_turn_until_dropped(&app, key) => turn,
                 },
                 None => None,
             };
@@ -1879,7 +1878,6 @@ mod jump_host_tests {
             proxy_port: None,
             jump: jump.map(Box::new),
             name: None,
-            server_id: None,
         }
     }
 
@@ -1903,8 +1901,7 @@ mod jump_host_tests {
     // HostName, Port and (for a blank username) User.
     #[test]
     fn a_jump_hosts_ssh_config_alias_is_followed() {
-        let mut saved = node("bastion", 22, None);
-        saved.server_id = Some(7);
+        let saved = node("bastion", 22, None);
         let mut auth = node("inner.example", 22, Some(saved));
         auth.jump.as_mut().unwrap().username = String::new();
         let target = crate::ConfigTarget::apply("inner.example", 22, "test", None);
@@ -1920,7 +1917,6 @@ mod jump_host_tests {
         let j = resolved.jump.expect("still through the jump host");
         assert_eq!((j.host.as_str(), j.port, j.username.as_str()), ("10.0.0.9", 2222, "hop"));
         assert_eq!(j.password.as_deref(), Some("test"), "the jump host's own login is kept");
-        assert_eq!(j.server_id, Some(7), "and its login queue");
         assert_eq!((resolved.host.as_str(), resolved.port), ("inner.example", 22));
     }
 
