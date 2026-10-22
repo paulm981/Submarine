@@ -419,6 +419,9 @@ pub struct SshState {
     /// server's own saved password is typed only into that server's
     /// terminals (type_saved_password).
     pub session_servers: Arc<Mutex<HashMap<String, i32>>>,
+    /// Per tab: one password the user typed is tried at a time, and one
+    /// just turned down isn't tried again (lib.rs, typed_root_access).
+    pub root_gates: Arc<Mutex<HashMap<String, Arc<Mutex<RootGate>>>>>,
     pub terminal_servers: Arc<Mutex<HashMap<String, i32>>>,
     /// Tabs whose cached SFTP session is file access over shell commands (the
     /// server has no SFTP, see `shell_sftp`): the pane says so.
@@ -448,6 +451,14 @@ pub struct RootAccess {
     /// instead of each signing in with a password that may have stopped
     /// working (lib.rs, password_turn).
     pub checked: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
+}
+
+/// A tab's gate for passwords the user types (SshState::root_gates).
+#[derive(Default)]
+pub struct RootGate {
+    /// A salted digest of the last password sudo or dzdo turned down, and
+    /// when.
+    pub rejected: Option<([u8; 32], std::time::Instant)>,
 }
 
 impl RootAccess {
@@ -528,6 +539,7 @@ impl SshState {
             root_access: Arc::new(Mutex::new(HashMap::new())),
             docker_root: Arc::new(Mutex::new(HashSet::new())),
             session_servers: Arc::new(Mutex::new(HashMap::new())),
+            root_gates: Arc::new(Mutex::new(HashMap::new())),
             terminal_servers: Arc::new(Mutex::new(HashMap::new())),
             sftp_shell: Arc::new(Mutex::new(HashSet::new())),
             prompted_secrets: Arc::new(Mutex::new(HashMap::new())),
