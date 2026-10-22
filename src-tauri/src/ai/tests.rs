@@ -64,6 +64,27 @@ async fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
     }
 }
 
+/// An AI tool's SSH_AUTH_SOCK names a place with no agent: set, not
+/// unset, so Windows OpenSSH doesn't fall back to its own agent's pipe.
+#[tokio::test]
+async fn an_ai_tool_is_pointed_at_no_ssh_agent() {
+    let s = state_without_servers();
+    let (_, env) = s.start_tab("local-1", "Claude").unwrap();
+    let sock = var(&env, "SSH_AUTH_SOCK");
+    #[cfg(windows)]
+    assert_eq!(sock, r"\\.\pipe\submarine-no-ssh-agent");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let addr = std::path::Path::new(var(&env, channel::ENV_ADDR));
+        let sock = std::path::Path::new(sock);
+        assert_eq!(sock.parent(), addr.parent(), "in the channel's own folder");
+        assert!(!sock.exists());
+        assert_eq!(std::fs::metadata(sock.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+    assert!(!CREDENTIAL_ENV.contains(&"SSH_AUTH_SOCK"));
+}
+
 #[tokio::test]
 async fn the_helper_talks_mcp_over_stdin_and_stdout() {
     let s = state_without_servers();

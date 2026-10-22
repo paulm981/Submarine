@@ -155,6 +155,15 @@ pub(crate) fn peer_is_me(stream: &tokio::net::UnixStream) -> bool {
     stream.peer_cred().is_ok_and(|c| c.uid() == my_uid())
 }
 
+/// Where an AI tool's SSH_AUTH_SOCK points: a name in the channel's own
+/// folder (0700, only you can open it) that's never made, so ssh finds no
+/// agent there. `addr`: the channel's socket.
+#[cfg(unix)]
+pub(crate) fn no_agent_at(addr: &str) -> String {
+    let dir = std::path::Path::new(addr).parent().unwrap_or(std::path::Path::new("/nonexistent"));
+    dir.join("no-ssh-agent").to_string_lossy().into_owned()
+}
+
 /// Listen on a new socket; each connection from a process running as you
 /// goes to `on_connect`.
 #[cfg(unix)]
@@ -318,6 +327,14 @@ pub(crate) mod pipe {
                 .create_with_security_attributes_raw(name, &mut sa as *mut SECURITY_ATTRIBUTES as *mut c_void)
         }
     }
+}
+
+/// Where an AI tool's SSH_AUTH_SOCK points: a pipe nothing serves, which
+/// Windows OpenSSH's ssh looks in rather than its own agent's
+/// (`\\.\pipe\openssh-ssh-agent`, used only when the variable is unset).
+#[cfg(windows)]
+pub(crate) fn no_agent_at(_addr: &str) -> String {
+    r"\\.\pipe\submarine-no-ssh-agent".to_string()
 }
 
 #[cfg(windows)]

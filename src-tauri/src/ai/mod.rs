@@ -20,7 +20,8 @@
 //!   (channel.rs), so such a program can't stand in for the app; the rest
 //!   is FORK.md's advice to run the AI tool in its sandbox.
 //! - **The AI tool starts without your SSH agent** and the usual cloud
-//!   logins (CREDENTIAL_ENV), so what it runs doesn't find them there.
+//!   logins (CREDENTIAL_ENV): SSH_AUTH_SOCK names a place with no agent,
+//!   and the logins are taken out, so what it runs doesn't find them there.
 //! - **Access ends** when the AI tab closes, when the server's tab closes or
 //!   reconnects, when you stop sharing, or when Submarine quits; anything
 //!   still waiting for approval is cancelled and anything running stopped,
@@ -53,21 +54,23 @@ const SETTINGS_FILE: &str = "ai_tools.json";
 /// The id Home's menu names Claude Code by.
 pub(crate) const CLAUDE_ID: &str = "ai:claude";
 
-/// What an AI tool starts without (#116): your SSH agent, and the usual
-/// cloud and code-host logins kept in the environment. With them, a script
-/// it writes could reach your servers or accounts itself, with no approval
-/// and no log. It keeps everything else it needs: PATH, HOME, proxies, and
-/// its own login (claude.rs keeps a cloud's variables when Claude Code
-/// logs in through that cloud).
+/// What an AI tool starts without (#116): your SSH agent's process id, and
+/// the usual cloud and code-host logins kept in the environment. With them,
+/// a script it writes could reach your servers or accounts itself, with no
+/// approval and no log. It keeps everything else it needs: PATH, HOME,
+/// proxies, and its own login (claude.rs keeps a cloud's variables when
+/// Claude Code logs in through that cloud).
+///
+/// SSH_AUTH_SOCK isn't taken out but set to where no agent is
+/// (channel::no_agent_at, in start_tab): Windows OpenSSH's ssh looks for
+/// its agent's pipe (`\\.\pipe\openssh-ssh-agent`) when the variable is
+/// unset, not when it names somewhere else.
 ///
 /// Not a wall: a program the AI tool runs can still look for the agent's
-/// socket, or read key files on disk, unless the tool's own sandbox stops
-/// it. On Windows, ssh finds the Windows OpenSSH agent's pipe
-/// (`\\.\pipe\openssh-ssh-agent`) without SSH_AUTH_SOCK, so there this
-/// only stops other agents.
+/// socket or pipe itself (Pageant's too), or read key files on disk,
+/// unless the tool's own sandbox stops it.
 pub(crate) const CREDENTIAL_ENV: &[&str] = &[
-    // Your SSH agent.
-    "SSH_AUTH_SOCK",
+    // Your SSH agent (SSH_AUTH_SOCK: see above).
     "SSH_AGENT_PID",
     // AWS.
     "AWS_ACCESS_KEY_ID",
@@ -538,10 +541,13 @@ impl AiState {
             .map(|n| if n == 1 { short.to_string() } else { format!("{short} {n}") })
             .find(|l| !s.tabs.iter().any(|t| &t.label == l))
             .unwrap();
+        let no_agent = channel::no_agent_at(&addr);
         let env = vec![
             (channel::ENV_ADDR.to_string(), addr),
             (channel::ENV_TOKEN.to_string(), token.to_string()),
             (channel::ENV_PID.to_string(), std::process::id().to_string()),
+            // ssh run by the AI tool finds no agent (CREDENTIAL_ENV).
+            ("SSH_AUTH_SOCK".to_string(), no_agent),
         ];
         s.tabs.push(Tab {
             id: id.to_string(),

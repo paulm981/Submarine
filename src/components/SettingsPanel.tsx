@@ -311,12 +311,12 @@ function AiToolsSettings() {
         Every request and decision is logged on this computer, in ai-audit.log in the log folder (Troubleshooting).
       </p>
       <p className="text-[11.5px] text-zinc-500 leading-relaxed">
-        The AI tool starts without your SSH agent and the usual cloud logins (AWS, Azure, Google Cloud, GitHub), so it
-        doesn't find them there. It still runs as you: unless its own sandbox stops it (in Claude Code,{" "}
-        <span className="font-mono text-zinc-400 select-text">/sandbox</span>, on macOS and Linux), what it runs can read
-        key files such as those in ~/.ssh, look for your SSH agent itself, and use the network. On Windows, ssh finds the
-        Windows OpenSSH agent without being told where it is, and Claude Code has no sandbox: for production servers, run
-        Submarine and its AI tools in WSL2 or a virtual machine.
+        The AI tool starts without your SSH agent and the usual cloud logins (AWS, Azure, Google Cloud, GitHub): ssh it
+        runs finds no agent, on Windows too. It still runs as you: unless its own sandbox stops it (in Claude Code,{" "}
+        <span className="font-mono text-zinc-400 select-text">/sandbox</span>, on macOS and Linux), a program it runs can
+        look for your SSH agent or Pageant by itself, read key files such as those in ~/.ssh, and use the network. Claude
+        Code has no sandbox on Windows: for production servers there, run Submarine and its AI tools in WSL2 or a virtual
+        machine.
       </p>
       {error && <p className="text-[11.5px] text-red-400">{error}</p>}
     </div>

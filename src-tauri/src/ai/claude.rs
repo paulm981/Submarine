@@ -228,7 +228,9 @@ mod tests {
 
     #[test]
     fn it_starts_without_your_ssh_agent_or_cloud_logins() {
-        for name in ["SSH_AUTH_SOCK", "SSH_AGENT_PID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE", "AZURE_CLIENT_SECRET", "GOOGLE_APPLICATION_CREDENTIALS", "GITHUB_TOKEN", "GH_TOKEN"] {
+        // SSH_AUTH_SOCK is set to where no agent is instead (start_tab).
+        assert!(!super::super::CREDENTIAL_ENV.contains(&"SSH_AUTH_SOCK"));
+        for name in ["SSH_AGENT_PID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE", "AZURE_CLIENT_SECRET", "GOOGLE_APPLICATION_CREDENTIALS", "GITHUB_TOKEN", "GH_TOKEN"] {
             assert!(super::super::CREDENTIAL_ENV.contains(&name), "{name}");
         }
         assert_eq!(env_remove(|_| None), super::super::CREDENTIAL_ENV);
@@ -237,7 +239,7 @@ mod tests {
             let l = launch(Path::new("/home/me/.local/bin/claude"), Path::new("/usr/bin/submarine"), None).unwrap();
             let without = env_remove(|k| std::env::var(k).ok());
             assert_eq!(l.env_remove, without);
-            assert!(l.env_remove.contains(&"SSH_AUTH_SOCK"));
+            assert!(l.env_remove.contains(&"SSH_AGENT_PID"));
         }
         // What it needs to work stays.
         for name in ["PATH", "HOME", "USERPROFILE", "HTTPS_PROXY", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"] {
@@ -249,7 +251,7 @@ mod tests {
     fn a_cloud_claude_code_logs_in_with_keeps_its_variables() {
         let bedrock = env_remove(|k| (k == "CLAUDE_CODE_USE_BEDROCK").then(|| "1".to_string()));
         assert!(!bedrock.iter().any(|n| n.starts_with("AWS_")));
-        assert!(bedrock.contains(&"SSH_AUTH_SOCK") && bedrock.contains(&"AZURE_CLIENT_SECRET") && bedrock.contains(&"GOOGLE_APPLICATION_CREDENTIALS"));
+        assert!(bedrock.contains(&"SSH_AGENT_PID") && bedrock.contains(&"AZURE_CLIENT_SECRET") && bedrock.contains(&"GOOGLE_APPLICATION_CREDENTIALS"));
         let vertex = env_remove(|k| (k == "CLAUDE_CODE_USE_VERTEX").then(|| "true".to_string()));
         assert!(!vertex.contains(&"GOOGLE_APPLICATION_CREDENTIALS") && vertex.contains(&"AWS_PROFILE"));
         let foundry = env_remove(|k| (k == "CLAUDE_CODE_USE_FOUNDRY").then(|| "1".to_string()));
