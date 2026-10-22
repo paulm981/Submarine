@@ -243,7 +243,14 @@ impl Remote {
         if let Some(e) = self.sudo_failed.lock().unwrap().clone() {
             return Err(e);
         }
-        let mut input = Zeroizing::new(Vec::new());
+        let encoded = encode_script(&format!("{}{}", PRELUDE, script));
+        let pw = match &self.sudo {
+            Sudo::Password(pw) => pw.as_str(),
+            _ => "",
+        };
+        // Its final size at once: a buffer that grows would leave a copy of
+        // the password behind, unzeroised.
+        let mut input = Zeroizing::new(Vec::with_capacity(pw.len() + 1 + encoded.len()));
         if let Sudo::Password(pw) = &self.sudo {
             // RUNNER would take such a line for the script.
             if pw.contains(['\n', '\r', '\0']) || pw.starts_with(SCRIPT_TAG) {
@@ -252,7 +259,7 @@ impl Remote {
             input.extend_from_slice(pw.as_bytes());
             input.push(b'\n');
         }
-        input.extend_from_slice(encode_script(&format!("{}{}", PRELUDE, script)).as_bytes());
+        input.extend_from_slice(encoded.as_bytes());
         let channel = (self.open)().await.map_err(|e| failure(format!("Couldn't run a command: {}", e)))?;
         let sent = async {
             channel.exec(true, self.command()).await?;

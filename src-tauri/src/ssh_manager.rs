@@ -437,6 +437,22 @@ pub struct RootAccess {
     /// the command on its stdin, where the tool's rules allow only that.
     /// `None` = the tool runs the command itself.
     pub shell: Option<&'static str>,
+    /// When the password last worked. Held while one not known to work
+    /// lately is tried, so the tab's other calls wait for that answer
+    /// instead of each signing in with a password that may have stopped
+    /// working (lib.rs, password_turn).
+    pub checked: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
+}
+
+impl RootAccess {
+    pub fn new(
+        tool: &'static str,
+        password: Option<zeroize::Zeroizing<String>>,
+        shell: Option<&'static str>,
+        checked: Option<std::time::Instant>,
+    ) -> Self {
+        RootAccess { tool, password, shell, checked: Arc::new(tokio::sync::Mutex::new(checked)) }
+    }
 }
 
 /// How an elevated SFTP channel is started. The sudo password (if any) lives
@@ -455,6 +471,10 @@ pub struct SftpElevation {
     pub password: Option<zeroize::Zeroizing<String>>,
     /// Through a root shell, as for RootAccess.
     pub shell: Option<&'static str>,
+    /// The password stopped working (sudo or dzdo said so): it isn't tried
+    /// again, and root mode says so until it's turned on again with the
+    /// password.
+    pub password_failed: bool,
 }
 
 /// Connect-time secrets the user typed when a saved node / login / key had none

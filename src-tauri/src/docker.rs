@@ -597,10 +597,12 @@ pub async fn ssh_docker_logs_start(
         let (code, out) = run_capture(&state, &session_id, &probe, 10).await.unwrap_or((1, String::new()));
         as_root = code != 0 && daemon_refused(&out);
     }
-    let (channel, marker) = if as_root {
-        let (channel, marker, _) = crate::root_channel(&state, &session_id, &args, password, None).await?;
+    // `early`: what the logs already said while sudo's answer to the
+    // password was waited for (root_channel).
+    let (channel, marker, early) = if as_root {
+        let (channel, marker, early) = crate::root_channel(&state, &session_id, &args, password, None).await?;
         state.docker_root.lock().await.insert(session_id.clone());
-        (channel, marker)
+        (channel, marker, early)
     } else {
         let session_arc = {
             let connections = state.connections.lock().await;
@@ -621,7 +623,7 @@ pub async fn ssh_docker_logs_start(
             .exec(true, cmd.as_bytes())
             .await
             .map_err(|e| e.to_string())?;
-        (channel, None)
+        (channel, None, Vec::new())
     };
     let mut stream = channel.into_stream();
 
@@ -647,7 +649,8 @@ pub async fn ssh_docker_logs_start(
         // select! never drops data.
         const FLUSH_CAP: usize = 256 * 1024;
         let mut buf = [0u8; 8192];
-        let mut out: Vec<u8> = Vec::new();
+        // Through a root shell, what came before its line isn't the logs.
+        let mut out: Vec<u8> = if marker.is_none() { early } else { Vec::new() };
         let mut flush = tokio::time::interval(std::time::Duration::from_millis(30));
         flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Emit only the complete-UTF-8 PREFIX per streaming flush and KEEP any
