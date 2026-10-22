@@ -39,15 +39,12 @@ pub(crate) fn key_type_family(key_type: &str) -> String {
 }
 
 /// The plain host key offered by the server, or `None` for a host
-/// CERTIFICATE. Certificates are refused, fail-closed: there is no CA trust
-/// store yet (no `@cert-authority` equivalent), so a certificate's CA
-/// signature, principals and validity window can't be verified — and trusting
-/// the key embedded in it would answer a question russh never asked. In
-/// practice this never fires: `ssh_preferred_algorithms` leaves
-/// `host_key_certificates` empty, so no `*-cert-v01@openssh.com` host-key
-/// algorithm is advertised and a compliant server presents its plain host key
-/// (the TOFU path).
-// fork: until upstream #170 (it trusts host certificates from a known_hosts CA).
+/// CERTIFICATE. Monitoring refuses certificates, fail-closed: it trusts only
+/// host keys on file, and trusting the key embedded in a certificate would
+/// answer a question russh never asked. A connection checks a certificate
+/// against the `@cert-authority` lines in known_hosts instead
+/// (trust_policy::decide_certificate); host certificates are only asked for
+/// when such a line covers the host (`client_config_for_target`).
 pub fn plain_host_key(offered: &PublicKeyOrCertificate) -> Option<&PublicKey> {
     match offered {
         PublicKeyOrCertificate::PublicKey { key, .. } => Some(key),

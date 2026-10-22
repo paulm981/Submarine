@@ -690,11 +690,12 @@ impl client::Handler for MonitorHandler {
         &mut self,
         offered: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        // Host certificates are refused (no CA trust store) — same policy as
-        // the interactive ClientHandler; see ssh_manager::plain_host_key.
+        // Host certificates are refused: the monitor trusts only host keys on
+        // file, and a certificate is never put there (see
+        // ssh_manager::plain_host_key; Monitoring says so before connecting).
         let Some(server_public_key) = crate::ssh_manager::plain_host_key(offered) else {
             eprintln!(
-                "[monitor] {}:{} presented a host certificate; certificates can't be verified (no trusted CA), refusing",
+                "[monitor] {}:{} presented a host certificate; the monitor only trusts host keys on file, refusing",
                 self.host, self.port
             );
             return Ok(false);

@@ -10969,11 +10969,10 @@ pub(crate) fn ssh_preferred_algorithms() -> russh::Preferred {
     russh::Preferred {
         kex: Cow::Borrowed(KEX),
         key: Cow::Borrowed(KEY),
-        // Never advertise `*-cert-v01@openssh.com` host-key algorithms: there
-        // is no CA trust store, so servers must present their plain host key
-        // (TOFU via known_hosts). See ssh_manager::plain_host_key.
-        // fork: until upstream #170 (host certificates checked against
-        // @cert-authority lines in known_hosts).
+        // No `*-cert-v01@openssh.com` host-key algorithms by default: they're
+        // added only for a host an @cert-authority line in known_hosts covers
+        // (client_config_for_target), so a server otherwise presents its plain
+        // host key (TOFU). See ssh_manager::plain_host_key.
         host_key_certificates: Cow::Borrowed(&[]),
         cipher: Cow::Borrowed(CIPHER),
         mac: Cow::Borrowed(MAC),
@@ -11489,7 +11488,7 @@ mod ssh_config_tests {
             keys[..5],
             ["ssh-ed25519", "ecdsa-sha2-nistp256", "rsa-sha2-512", "rsa-sha2-256", "ssh-rsa"]
         );
-        // No host certificates advertised (no CA trust store).
+        // No host certificates advertised unless a CA covers the host.
         assert!(p.host_key_certificates.is_empty());
     }
 
