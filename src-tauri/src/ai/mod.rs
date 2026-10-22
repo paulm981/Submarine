@@ -19,6 +19,8 @@
 //!   click for you. The helper checks it reaches the app's own process
 //!   (channel.rs), so such a program can't stand in for the app; the rest
 //!   is FORK.md's advice to run the AI tool in its sandbox.
+//! - **The AI tool starts without your SSH agent** and the usual cloud
+//!   logins (CREDENTIAL_ENV), so what it runs doesn't find them there.
 //! - **Access ends** when the AI tab closes, when the server's tab closes or
 //!   reconnects, when you stop sharing, or when Submarine quits; anything
 //!   still waiting for approval is cancelled and anything running stopped,
@@ -50,6 +52,60 @@ const SETTINGS_FILE: &str = "ai_tools.json";
 
 /// The id Home's menu names Claude Code by.
 pub(crate) const CLAUDE_ID: &str = "ai:claude";
+
+/// What an AI tool starts without (#116): your SSH agent, and the usual
+/// cloud and code-host logins kept in the environment. With them, a script
+/// it writes could reach your servers or accounts itself, with no approval
+/// and no log. It keeps everything else it needs: PATH, HOME, proxies, and
+/// its own login (claude.rs keeps a cloud's variables when Claude Code
+/// logs in through that cloud).
+///
+/// Not a wall: a program the AI tool runs can still look for the agent's
+/// socket, or read key files on disk, unless the tool's own sandbox stops
+/// it. On Windows, ssh finds the Windows OpenSSH agent's pipe
+/// (`\\.\pipe\openssh-ssh-agent`) without SSH_AUTH_SOCK, so there this
+/// only stops other agents.
+pub(crate) const CREDENTIAL_ENV: &[&str] = &[
+    // Your SSH agent.
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    // AWS.
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    // Azure (and Terraform's name for its secret).
+    "AZURE_CLIENT_SECRET",
+    "AZURE_CLIENT_ID",
+    "AZURE_TENANT_ID",
+    "AZURE_CLIENT_CERTIFICATE_PATH",
+    "AZURE_CLIENT_CERTIFICATE_PASSWORD",
+    "AZURE_USERNAME",
+    "AZURE_PASSWORD",
+    "ARM_CLIENT_SECRET",
+    // Google Cloud.
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CREDENTIALS",
+    "GOOGLE_OAUTH_ACCESS_TOKEN",
+    "CLOUDSDK_AUTH_ACCESS_TOKEN",
+    // GitHub and GitLab.
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GITLAB_TOKEN",
+    // Other clouds and secret stores.
+    "DIGITALOCEAN_TOKEN",
+    "DIGITALOCEAN_ACCESS_TOKEN",
+    "HCLOUD_TOKEN",
+    "LINODE_TOKEN",
+    "CLOUDFLARE_API_TOKEN",
+    "OS_PASSWORD",
+    "VAULT_TOKEN",
+];
 
 // The limits (#32 row 11).
 const MAX_COMMAND: usize = 16 * 1024;
@@ -1245,6 +1301,8 @@ pub(crate) struct HomeLaunch {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Taken out of its environment: CREDENTIAL_ENV, less its own login.
+    pub env_remove: Vec<&'static str>,
     pub label: String,
 }
 
@@ -1260,7 +1318,7 @@ pub(crate) fn home_launch(app: &tauri::AppHandle, state: &AiState, id: &str, tab
     let launch = claude::launch(&path, &helper, data.as_deref())?;
     let (label, mut env) = state.start_tab(tab_id, claude::SHORT)?;
     env.extend(launch.env);
-    Ok(HomeLaunch { program: launch.program, args: launch.args, env, label })
+    Ok(HomeLaunch { program: launch.program, args: launch.args, env, env_remove: launch.env_remove, label })
 }
 
 #[cfg(test)]

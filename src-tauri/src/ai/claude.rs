@@ -77,12 +77,32 @@ pub(crate) fn find() -> Option<PathBuf> {
     places.into_iter().find(|p| p.is_absolute() && p.is_file())
 }
 
-/// What Home starts: a program and its arguments, and what to add to its
-/// environment besides the address and the token.
+/// What Home starts: a program and its arguments, what to add to its
+/// environment besides the address and the token, and what to take out.
 pub(crate) struct Launch {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    pub env_remove: Vec<&'static str>,
+}
+
+/// The variables Claude Code logs in with when it's set to use a cloud
+/// rather than Anthropic: `CLAUDE_CODE_USE_*`, and the prefix of the
+/// credentials that cloud reads.
+const CLOUD_LOGINS: &[(&str, &str)] = &[
+    ("CLAUDE_CODE_USE_BEDROCK", "AWS_"),
+    ("CLAUDE_CODE_USE_MANTLE", "AWS_"),
+    ("CLAUDE_CODE_USE_ANTHROPIC_AWS", "AWS_"),
+    ("CLAUDE_CODE_USE_VERTEX", "GOOGLE_"),
+    ("CLAUDE_CODE_USE_FOUNDRY", "AZURE_"),
+];
+
+/// What Claude Code starts without (super::CREDENTIAL_ENV), less the
+/// cloud's variables it logs in with, if it does. `var`: the environment.
+fn env_remove(var: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    let on = |k: &str| var(k).is_some_and(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"));
+    let kept: Vec<&str> = CLOUD_LOGINS.iter().filter(|(switch, _)| on(switch)).map(|(_, prefix)| *prefix).collect();
+    super::CREDENTIAL_ENV.iter().copied().filter(|name| !kept.iter().any(|p| name.starts_with(p))).collect()
 }
 
 /// Claude Code at `claude`, with Submarine's MCP settings. `data_dir`:
@@ -90,6 +110,7 @@ pub(crate) struct Launch {
 pub(crate) fn launch(claude: &Path, helper: &Path, data_dir: Option<&Path>) -> Result<Launch, String> {
     let config = mcp_config(helper);
     let mut env = Vec::new();
+    let env_remove = env_remove(|k| std::env::var(k).ok());
     // An npm install is a script run by node: node is often next to it
     // (nvm, Homebrew), and an app started from the desktop may not have that
     // folder in its PATH.
@@ -112,14 +133,14 @@ pub(crate) fn launch(claude: &Path, helper: &Path, data_dir: Option<&Path>) -> R
         let file = file.to_string_lossy().into_owned();
         let is_cmd = claude.extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
         if is_cmd {
-            return cmd_launch(claude, &file, env);
+            return cmd_launch(claude, &file, env, env_remove);
         }
-        Ok(Launch { program: claude.to_path_buf(), args: vec!["--mcp-config".into(), file], env })
+        Ok(Launch { program: claude.to_path_buf(), args: vec!["--mcp-config".into(), file], env, env_remove })
     }
     #[cfg(not(windows))]
     {
         let _ = data_dir;
-        Ok(Launch { program: claude.to_path_buf(), args: vec!["--mcp-config".into(), config.to_string()], env })
+        Ok(Launch { program: claude.to_path_buf(), args: vec!["--mcp-config".into(), config.to_string()], env, env_remove })
     }
 }
 
@@ -128,13 +149,13 @@ pub(crate) fn launch(claude: &Path, helper: &Path, data_dir: Option<&Path>) -> R
 /// off. cmd.exe reads `%`, `^`, `&`, `|`, `<`, `>`, `!` and `"` even in
 /// paths, so a path with any of them is refused rather than passed.
 #[cfg(windows)]
-fn cmd_launch(claude: &Path, file: &str, env: Vec<(String, String)>) -> Result<Launch, String> {
+fn cmd_launch(claude: &Path, file: &str, env: Vec<(String, String)>, env_remove: Vec<&'static str>) -> Result<Launch, String> {
     let claude = claude.to_string_lossy().into_owned();
     if !cmd_safe(&claude) || !cmd_safe(file) {
         return Err("Claude Code's path has a character cmd.exe can't pass on (% ^ & | < > ! \"). Install Claude Code with its own installer (claude.exe) instead.".into());
     }
     let cmd = crate::local_open::system32().join("cmd.exe");
-    Ok(Launch { program: cmd, args: vec!["/d".into(), "/c".into(), "call".into(), claude, "--mcp-config".into(), file.to_string()], env })
+    Ok(Launch { program: cmd, args: vec!["/d".into(), "/c".into(), "call".into(), claude, "--mcp-config".into(), file.to_string()], env, env_remove })
 }
 
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
@@ -180,6 +201,38 @@ mod tests {
         assert!(l.program.ends_with("cmd.exe"));
         assert_eq!(&l.args[..4], &["/d", "/c", "call", r"C:\Users\Paul M\AppData\Roaming\npm\claude.cmd"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn it_starts_without_your_ssh_agent_or_cloud_logins() {
+        for name in ["SSH_AUTH_SOCK", "SSH_AGENT_PID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE", "AZURE_CLIENT_SECRET", "GOOGLE_APPLICATION_CREDENTIALS", "GITHUB_TOKEN", "GH_TOKEN"] {
+            assert!(super::super::CREDENTIAL_ENV.contains(&name), "{name}");
+        }
+        assert_eq!(env_remove(|_| None), super::super::CREDENTIAL_ENV);
+        #[cfg(not(windows))]
+        {
+            let l = launch(Path::new("/home/me/.local/bin/claude"), Path::new("/usr/bin/submarine"), None).unwrap();
+            let without = env_remove(|k| std::env::var(k).ok());
+            assert_eq!(l.env_remove, without);
+            assert!(l.env_remove.contains(&"SSH_AUTH_SOCK"));
+        }
+        // What it needs to work stays.
+        for name in ["PATH", "HOME", "USERPROFILE", "HTTPS_PROXY", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"] {
+            assert!(!super::super::CREDENTIAL_ENV.contains(&name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_cloud_claude_code_logs_in_with_keeps_its_variables() {
+        let bedrock = env_remove(|k| (k == "CLAUDE_CODE_USE_BEDROCK").then(|| "1".to_string()));
+        assert!(!bedrock.iter().any(|n| n.starts_with("AWS_")));
+        assert!(bedrock.contains(&"SSH_AUTH_SOCK") && bedrock.contains(&"AZURE_CLIENT_SECRET") && bedrock.contains(&"GOOGLE_APPLICATION_CREDENTIALS"));
+        let vertex = env_remove(|k| (k == "CLAUDE_CODE_USE_VERTEX").then(|| "true".to_string()));
+        assert!(!vertex.contains(&"GOOGLE_APPLICATION_CREDENTIALS") && vertex.contains(&"AWS_PROFILE"));
+        let foundry = env_remove(|k| (k == "CLAUDE_CODE_USE_FOUNDRY").then(|| "1".to_string()));
+        assert!(!foundry.contains(&"AZURE_CLIENT_SECRET") && foundry.contains(&"GH_TOKEN"));
+        // Off is off.
+        assert_eq!(env_remove(|k| (k == "CLAUDE_CODE_USE_BEDROCK").then(|| "0".to_string())), super::super::CREDENTIAL_ENV);
     }
 
     #[test]
