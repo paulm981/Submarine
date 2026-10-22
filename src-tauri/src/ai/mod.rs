@@ -66,9 +66,11 @@ pub(crate) const CLAUDE_ID: &str = "ai:claude";
 /// its agent's pipe (`\\.\pipe\openssh-ssh-agent`) when the variable is
 /// unset, not when it names somewhere else.
 ///
-/// Not a wall: a program the AI tool runs can still look for the agent's
-/// socket or pipe itself (Pageant's too), or read key files on disk,
-/// unless the tool's own sandbox stops it.
+/// Not a wall. ssh run by the AI tool still uses an agent named by
+/// IdentityAgent in ~/.ssh/config, an open ControlMaster connection, and
+/// key files with no passphrase (or one in the macOS Keychain); and a
+/// program it runs can look for an agent's socket or pipe itself, or read
+/// key files, unless the tool's own sandbox stops it.
 pub(crate) const CREDENTIAL_ENV: &[&str] = &[
     // Your SSH agent (SSH_AUTH_SOCK: see above).
     "SSH_AGENT_PID",
@@ -546,7 +548,8 @@ impl AiState {
             (channel::ENV_ADDR.to_string(), addr),
             (channel::ENV_TOKEN.to_string(), token.to_string()),
             (channel::ENV_PID.to_string(), std::process::id().to_string()),
-            // ssh run by the AI tool finds no agent (CREDENTIAL_ENV).
+            // ssh run by the AI tool doesn't find your agent through it
+            // (CREDENTIAL_ENV).
             ("SSH_AUTH_SOCK".to_string(), no_agent),
         ];
         s.tabs.push(Tab {
