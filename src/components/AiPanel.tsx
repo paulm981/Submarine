@@ -282,6 +282,15 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
             <Bot size={13} className="mt-0.5 shrink-0 text-zinc-400" />
             <div className="flex-1 min-w-0">
               <div className="font-semibold text-zinc-200">{t.label}</div>
+              {t.intruder_at && (
+                <div className="my-1 flex items-start gap-1.5 text-[11px] text-amber-300 leading-snug">
+                  <ShieldAlert size={13} className="shrink-0 mt-px" />
+                  <span>
+                    Another program tried to connect as this AI tab{time(t.intruder_at) && <> at {time(t.intruder_at)}</>}, and was refused.
+                    Only the AI tool in that tab should connect: another program running as you may have copied its access. If you didn't expect this, close the AI tab.
+                  </span>
+                </div>
+              )}
               <div className="text-[11px] text-zinc-500 flex flex-wrap gap-x-2">
                 {t.servers.length === 0 ? "nothing shared" : (
                   <>

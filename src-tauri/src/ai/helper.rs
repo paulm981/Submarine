@@ -26,6 +26,7 @@ const LAST_ANSWERS: Duration = Duration::from_secs(1);
 pub fn main() -> i32 {
     let addr = std::env::var(channel::ENV_ADDR).unwrap_or_default();
     let token = zeroize::Zeroizing::new(std::env::var(channel::ENV_TOKEN).unwrap_or_default());
+    let app_pid = std::env::var(channel::ENV_PID).ok().and_then(|p| p.trim().parse::<u32>().ok());
     if addr.is_empty() || token.is_empty() {
         eprintln!("submarine --mcp: only an AI tool started from Submarine's Home menu can connect to Submarine.");
         return 2;
@@ -37,7 +38,7 @@ pub fn main() -> i32 {
             return 1;
         }
     };
-    let result = rt.block_on(relay(tokio::io::stdin(), tokio::io::stdout(), &addr, &token));
+    let result = rt.block_on(relay(tokio::io::stdin(), tokio::io::stdout(), &addr, &token, app_pid));
     // stdin's reader thread may still be blocked on a read: don't wait for it.
     rt.shutdown_background();
     match result {
@@ -51,14 +52,18 @@ pub fn main() -> i32 {
 
 /// Connect to the app at `addr` as the AI tab `token` names, then pass
 /// `input` to it and what it sends to `output`, until either side ends.
-pub(crate) async fn relay<I, O>(mut input: I, mut output: O, addr: &str, token: &str) -> Result<(), String>
+/// `app_pid`: the app's process id; the token isn't sent to another.
+pub(crate) async fn relay<I, O>(mut input: I, mut output: O, addr: &str, token: &str, app_pid: Option<u32>) -> Result<(), String>
 where
     I: AsyncRead + Unpin,
     O: AsyncWrite + Unpin,
 {
-    let stream = channel::connect(addr)
+    let (stream, server_pid) = channel::connect_to(addr)
         .await
         .map_err(|e| format!("Couldn't reach Submarine ({e}). Is it running, with AI tools on in Settings?"))?;
+    if !channel::may_be_the_app(server_pid, app_pid) {
+        return Err("Another program has taken the place of Submarine's AI channel, so nothing was sent to it. Close this AI tab in Submarine and start a new one.".into());
+    }
     let mut stream = BufReader::new(stream);
     channel::hello(&mut stream, token).await?;
     let (mut from_app, mut to_app) = tokio::io::split(stream);

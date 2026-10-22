@@ -72,9 +72,17 @@ fn rand_suffix() -> String {
 }
 
 fn helper(addr: Option<&str>, token: Option<&str>) -> std::process::Child {
+    helper_for(addr, token, None)
+}
+
+/// The same, told `pid` is the app's process id.
+fn helper_for(addr: Option<&str>, token: Option<&str>, pid: Option<u32>) -> std::process::Child {
     let mut c = Command::new(EXE);
     c.arg("--mcp").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    c.env_remove("SUBMARINE_AI_ADDR").env_remove("SUBMARINE_AI_TOKEN");
+    c.env_remove("SUBMARINE_AI_ADDR").env_remove("SUBMARINE_AI_TOKEN").env_remove("SUBMARINE_AI_PID");
+    if let Some(p) = pid {
+        c.env("SUBMARINE_AI_PID", p.to_string());
+    }
     if let Some(a) = addr {
         c.env("SUBMARINE_AI_ADDR", a);
     }
@@ -144,6 +152,26 @@ async fn a_refused_token_ends_it_with_the_reason() {
     assert_eq!(code, 1);
     assert_eq!(out, "", "nothing on stdout");
     assert!(err.contains("not this one"), "{err}");
+    server.await.unwrap();
+}
+
+/// The channel's other end is this test's process: told the app is another
+/// one, the helper sends nothing and says why; told it's this one, it
+/// connects.
+#[tokio::test(flavor = "multi_thread")]
+async fn it_only_talks_to_the_app_s_own_process() {
+    let (addr, server) = listen();
+    let child = helper_for(Some(&addr), Some("good"), Some(std::process::id() + 1));
+    let (code, out, err) = tokio::task::spawn_blocking(move || finish(child)).await.unwrap();
+    assert_eq!(code, 1);
+    assert_eq!(out, "");
+    assert!(err.contains("taken the place"), "{err}");
+    server.abort();
+    let (addr, server) = listen();
+    let mut child = helper_for(Some(&addr), Some("good"), Some(std::process::id()));
+    drop(child.stdin.take());
+    let (code, _, err) = tokio::task::spawn_blocking(move || finish(child)).await.unwrap();
+    assert_eq!(code, 0, "stderr: {err}");
     server.await.unwrap();
 }
 

@@ -31,7 +31,7 @@ fn helper(addr: &str, token: &str) -> Helper {
     let (to, stdin) = tokio::io::duplex(1 << 20);
     let (stdout, from) = tokio::io::duplex(1 << 20);
     let (addr, token) = (addr.to_string(), token.to_string());
-    let task = tokio::spawn(async move { helper::relay(stdin, stdout, &addr, &token).await });
+    let task = tokio::spawn(async move { helper::relay(stdin, stdout, &addr, &token, Some(std::process::id())).await });
     Helper { to, from: BufReader::new(from), task }
 }
 
@@ -99,10 +99,10 @@ async fn the_channel_refuses_a_wrong_token() {
     let (_, env) = s.start_tab("local-1", "Claude").unwrap();
     let addr = var(&env, channel::ENV_ADDR).to_string();
     let wrong = channel::random_hex(32);
-    let err = helper::relay(tokio::io::empty(), tokio::io::sink(), &addr, &wrong).await.unwrap_err();
+    let err = helper::relay(tokio::io::empty(), tokio::io::sink(), &addr, &wrong, None).await.unwrap_err();
     assert!(err.contains("doesn't know this AI tab"), "{err}");
     // Nor an empty one, or garbage instead of a hello.
-    assert!(helper::relay(tokio::io::empty(), tokio::io::sink(), &addr, "").await.is_err());
+    assert!(helper::relay(tokio::io::empty(), tokio::io::sink(), &addr, "", None).await.is_err());
     let mut raw = BufReader::new(channel::connect(&addr).await.unwrap());
     raw.get_mut().write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
     let answer = channel::read_line(&mut raw, 4096).await.unwrap().unwrap();
@@ -120,7 +120,62 @@ async fn a_closed_ai_tab_s_token_stops_working_and_its_connection_closes() {
     // The open connection ends...
     assert!(tokio::time::timeout(Duration::from_secs(5), h.task).await.expect("the helper ended").unwrap().is_ok());
     // ...and the token can't connect again.
-    assert!(helper::relay(tokio::io::empty(), tokio::io::sink(), &addr, &token).await.is_err());
+    assert!(helper::relay(tokio::io::empty(), tokio::io::sink(), &addr, &token, None).await.is_err());
+}
+
+/// One live connection per AI tab: a second with the same token, while the
+/// first is open, is refused and the panel warns; the first carries on.
+#[tokio::test]
+async fn a_second_connection_with_a_tab_s_token_is_refused() {
+    let s = state_without_servers();
+    let (_, env) = s.start_tab("local-1", "Claude").unwrap();
+    let (addr, token) = (var(&env, channel::ENV_ADDR).to_string(), var(&env, channel::ENV_TOKEN).to_string());
+    let mut first = helper(&addr, &token);
+    first.call(1, "ping", json!({})).await;
+    assert!(s.snapshot().tabs[0].intruder_at.is_none());
+    let t = Instant::now();
+    let err = helper::relay(tokio::io::empty(), tokio::io::sink(), &addr, &token, None).await.unwrap_err();
+    assert!(err.contains("already connected"), "{err}");
+    assert!(t.elapsed() >= RECONNECT_GRACE - Duration::from_millis(100), "waited for the first to end");
+    assert!(s.snapshot().tabs[0].intruder_at.is_some(), "the panel warns");
+    first.call(2, "ping", json!({})).await;
+}
+
+/// The AI tool reconnecting (its old helper ends, a new one starts) gets
+/// through: once the first has ended, and also when the new one comes
+/// before the app has seen the old one close.
+#[tokio::test]
+async fn a_reconnect_after_the_first_helper_ends_gets_through() {
+    let s = state_without_servers();
+    let (_, env) = s.start_tab("local-1", "Claude").unwrap();
+    let (addr, token) = (var(&env, channel::ENV_ADDR).to_string(), var(&env, channel::ENV_TOKEN).to_string());
+    let mut first = helper(&addr, &token);
+    first.call(1, "ping", json!({})).await;
+    drop(first.to);
+    assert!(tokio::time::timeout(Duration::from_secs(5), first.task).await.expect("ended").unwrap().is_ok());
+    let mut second = helper(&addr, &token);
+    second.call(1, "ping", json!({})).await;
+    // At once, without waiting for it to end.
+    drop(second.to);
+    let mut third = helper(&addr, &token);
+    third.call(1, "ping", json!({})).await;
+    assert!(s.snapshot().tabs[0].intruder_at.is_none(), "no warning for a reconnect");
+}
+
+/// The helper sends nothing to a channel whose other end isn't the app's
+/// process (another program listening in its place).
+#[tokio::test]
+async fn the_helper_wont_talk_to_another_process() {
+    let s = state_without_servers();
+    let (_, env) = s.start_tab("local-1", "Claude").unwrap();
+    let (addr, token) = (var(&env, channel::ENV_ADDR).to_string(), var(&env, channel::ENV_TOKEN).to_string());
+    assert_eq!(var(&env, channel::ENV_PID), std::process::id().to_string());
+    let err = helper::relay(tokio::io::empty(), tokio::io::sink(), &addr, &token, Some(std::process::id() + 1)).await.unwrap_err();
+    assert!(err.contains("taken the place"), "{err}");
+    // Nothing reached the app: the token was never used.
+    let mut h = helper(&addr, &token);
+    h.call(1, "ping", json!({})).await;
+    assert!(s.snapshot().tabs[0].intruder_at.is_none());
 }
 
 #[tokio::test]

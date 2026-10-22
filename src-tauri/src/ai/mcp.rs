@@ -99,8 +99,10 @@ fn valid_id(id: &Value) -> Option<String> {
 type Calls = HashMap<String, (u64, watch::Sender<bool>)>;
 
 /// Serve one connection for the AI tab `tab_id` until the client goes, or
-/// the tab's access ends (`closed`).
-pub(crate) async fn serve<R, W>(state: AiState, tab_id: String, mut closed: watch::Receiver<bool>, mut reader: BufReader<R>, mut writer: W)
+/// the tab's access ends (`closed`). `held` is dropped as soon as nothing
+/// more is read, before what's answered goes out: the AI tab's claim on its
+/// one live connection, so a new one (Claude Code reconnecting) may start.
+pub(crate) async fn serve<R, W, H>(state: AiState, tab_id: String, mut closed: watch::Receiver<bool>, mut reader: BufReader<R>, mut writer: W, held: H)
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -240,6 +242,7 @@ where
         _ = read_loop => {}
         _ = closed.wait_for(|c| *c) => {}
     }
+    drop(held);
     // Leaving cancels what's still waiting.
     if let Ok(mut c) = calls.lock() {
         for (_, (_, tx)) in c.drain() {
@@ -281,7 +284,7 @@ mod tests {
         let (client_w, server_r) = tokio::io::duplex(pipe);
         let (server_w, client_r) = tokio::io::duplex(pipe);
         let closed = state.closed_of("local-1");
-        let task = tokio::spawn(serve(state.clone(), "local-1".into(), closed, BufReader::new(server_r), server_w));
+        let task = tokio::spawn(serve(state.clone(), "local-1".into(), closed, BufReader::new(server_r), server_w, ()));
         (state, client_w, BufReader::new(client_r), task)
     }
 
