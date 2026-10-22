@@ -955,11 +955,11 @@ impl AiState {
             let mut s = self.lock();
             let p = s.pending.iter().find(|p| p.view.id == id).ok_or("That request isn't waiting any more.")?;
             let (tab_id, session_id) = (p.view.tab_id.clone(), p.view.session_id.clone());
-            let others: Vec<u64> = s
+            let others: Vec<(u64, String, Option<i64>)> = s
                 .pending
                 .iter()
                 .filter(|o| o.view.id != id && o.view.tab_id == tab_id && o.view.session_id == session_id && o.view.ask_rule.is_none())
-                .map(|o| o.view.id)
+                .map(|o| (o.view.id, o.view.command.clone(), o.view.server_id))
                 .collect();
             let tab = s.tabs.iter_mut().find(|t| t.id == tab_id).ok_or("That AI tab isn't open any more.")?;
             let label = tab.label.clone();
@@ -973,8 +973,14 @@ impl AiState {
         e.note = Some("allow everything here until this AI tab closes".into());
         self.audit(e);
         let result = self.answer(id, Answer::Allow(BY_YOU.into()));
-        for other in others {
-            let _ = self.answer(other, Answer::Allow(trust::Decision::Session.approved_by().unwrap_or_default()));
+        // Each as it would be decided now (an always-ask rule added since
+        // it was asked still holds it).
+        for (other, command, server_id) in others {
+            let p = (self.0.policy)(server_id);
+            let d = trust::decide(p.level, true, &p.allow, &p.ask, &command, asks_for_root(&command));
+            if let Some(by) = d.approved_by() {
+                let _ = self.answer(other, Answer::Allow(by));
+            }
         }
         result
     }
