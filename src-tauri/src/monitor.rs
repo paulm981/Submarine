@@ -203,6 +203,20 @@ pub struct NodeAuth {
     /// Host patterns, as the terminal matches it.
     #[serde(default)]
     pub name: Option<String>,
+    /// What the user's known_hosts says about this host (with_ssh_config):
+    /// a key marked `@revoked` there is refused (trust_policy.rs, #43).
+    #[serde(skip)]
+    pub known_hosts: KnownHosts,
+}
+
+/// A host's known_hosts entries, carried with its `NodeAuth`.
+#[derive(Clone, Default)]
+pub struct KnownHosts(Option<Arc<crate::known_hosts::HostTrust>>);
+
+impl std::fmt::Debug for KnownHosts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "KnownHosts(read)" } else { "KnownHosts(none)" })
+    }
 }
 
 /// A user-defined metric. The probe loop wraps each command in BEGIN/END
@@ -681,6 +695,7 @@ pub struct MonitorHandler {
     db: Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
     host: String,
     port: u16,
+    known_hosts: KnownHosts,
 }
 
 impl client::Handler for MonitorHandler {
@@ -705,21 +720,28 @@ impl client::Handler for MonitorHandler {
         // matched by fingerprint alone (the key identity), so the RSA key_type
         // spelling change between russh versions is moot here.
         let fp = crate::ssh_manager::host_key_fingerprint(server_public_key);
-        let mut ok = false;
-        if let Ok(guard) = self.db.lock() {
-            if let Some(conn) = guard.as_ref() {
-                if let Ok(mut stmt) = conn.prepare(
-                    "SELECT 1 FROM known_hosts WHERE host=?1 AND port=?2 AND fingerprint=?3",
-                ) {
-                    if let Ok(mut rows) = stmt.query(rusqlite::params![self.host, self.port, fp]) {
-                        if let Ok(Some(_)) = rows.next() {
-                            ok = true;
-                        }
-                    }
-                }
+        let on_file = match self.db.lock() {
+            Ok(guard) => match guard.as_ref() {
+                Some(conn) => crate::ssh_manager::judge_host_key(conn, &self.host, self.port, &fp).ok(),
+                None => None,
+            },
+            Err(_) => None,
+        };
+        let Some(on_file) = on_file else {
+            eprintln!("[monitor] {}:{}: the trusted host keys couldn't be read, refusing", self.host, self.port);
+            return Ok(false);
+        };
+        // Only a key the app trusts, and that known_hosts doesn't mark
+        // @revoked: the same rules as a terminal's (trust_policy.rs), with no
+        // question to ask and nothing to save.
+        match crate::trust_policy::decide_plain_key(on_file, self.known_hosts.0.as_deref(), server_public_key) {
+            crate::trust_policy::HostKeyDecision::Trusted { save: false, .. } => Ok(true),
+            crate::trust_policy::HostKeyDecision::Refused(why) => {
+                eprintln!("[monitor] {}:{}: host key refused: {why}", self.host, self.port);
+                Ok(false)
             }
+            _ => Ok(false),
         }
-        Ok(ok)
     }
 
     // A monitor connection only opens its own exec channels, so every
@@ -992,7 +1014,7 @@ async fn with_ssh_config(
     node_name: &str,
 ) -> Result<NodeAuth, String> {
     let mut target = crate::ConfigTarget::resolve(&auth.host, auth.port, &auth.username, Some(node_name.to_string())).await;
-    let node_trust = known_hosts_for(&mut target).await;
+    let node_trust = known_hosts_for(&mut target).await.map(Arc::new);
     let mut jump = match auth.jump.as_deref() {
         Some(j) => Some(
             crate::ConfigTarget::resolve_jump_host(&j.host, i32::from(j.port), &j.username, j.name.clone())
@@ -1002,14 +1024,18 @@ async fn with_ssh_config(
         None => None,
     };
     let jump_trust = match jump.as_mut() {
-        Some((j, _)) => known_hosts_for(j).await,
+        Some((j, _)) => known_hosts_for(j).await.map(Arc::new),
         None => None,
     };
-    let resolved = apply_ssh_config(auth, target, jump)?;
+    let mut resolved = apply_ssh_config(auth, target, jump)?;
+    resolved.known_hosts = KnownHosts(node_trust.clone());
+    if let Some(j) = resolved.jump.as_deref_mut() {
+        j.known_hosts = KnownHosts(jump_trust.clone());
+    }
     if let Ok(guard) = db.lock() {
         if let Some(conn) = guard.as_ref() {
-            let only_cert = |trust: &Option<crate::known_hosts::HostTrust>, host: &str, port: u16| {
-                crate::trust_policy::known_only_by_certificate(trust.as_ref(), conn, host, port)
+            let only_cert = |trust: &Option<Arc<crate::known_hosts::HostTrust>>, host: &str, port: u16| {
+                crate::trust_policy::known_only_by_certificate(trust.as_deref(), conn, host, port)
             };
             if only_cert(&node_trust, &resolved.host, resolved.port) {
                 return Err(NOT_CHECKED_CERTIFICATE.into());
@@ -1156,6 +1182,7 @@ async fn login_for_monitor(
         db: Arc::clone(db),
         host: auth.host.clone(),
         port: auth.port,
+        known_hosts: auth.known_hosts.clone(),
     };
 
     // Handshake budget mirrors the interactive path. We don't expose it
@@ -1920,6 +1947,7 @@ mod jump_host_tests {
             proxy_port: None,
             jump: jump.map(Box::new),
             name: None,
+            known_hosts: KnownHosts::default(),
         }
     }
 
@@ -2052,6 +2080,41 @@ mod jump_host_tests {
             .err()
             .expect("an unknown host key behind the jump host must be refused");
         assert!(!err.starts_with("jump host"), "the server's own key failed, not the jump host's: {err}");
+    }
+
+    /// known_hosts marking the test servers' key @revoked, read as a
+    /// connection reads it.
+    async fn revoking_the_test_key(host: &str, port: u16) -> KnownHosts {
+        use russh::keys::PublicKeyBase64;
+        let key = crate::ssh_test_server::host_key();
+        let k = key.public_key();
+        let dir = std::env::temp_dir().join(format!("submarine-mon-kh-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("known_hosts");
+        std::fs::write(&file, format!("@revoked * {} {}\n", k.algorithm(), k.public_key_base64())).unwrap();
+        let trust = crate::known_hosts::for_host(Some(vec![file.to_string_lossy().into_owned()]), host, port).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        KnownHosts(Some(Arc::new(trust.expect("read"))))
+    }
+
+    // A key the app trusts but known_hosts marks @revoked is refused by the
+    // monitor too, for the server and for its jump host.
+    #[tokio::test]
+    async fn monitoring_refuses_a_revoked_key() {
+        let port = listen(TestServer::default()).await;
+        let db = known_hosts(&[("127.0.0.1", port), ("inner.example", 22)]);
+        let mut direct = node("127.0.0.1", port, None);
+        assert!(connect_for_monitor(&db, &direct, Duration::from_secs(10), None).await.is_ok(), "trusted, not revoked");
+        direct.known_hosts = revoking_the_test_key("127.0.0.1", port).await;
+        assert!(connect_for_monitor(&db, &direct, Duration::from_secs(10), None).await.is_err(), "revoked");
+
+        let mut jump = node("127.0.0.1", port, None);
+        jump.known_hosts = revoking_the_test_key("127.0.0.1", port).await;
+        let err = connect_for_monitor(&db, &node("inner.example", 22, Some(jump)), Duration::from_secs(10), None)
+            .await
+            .err()
+            .expect("a revoked jump host key must be refused");
+        assert!(err.starts_with("jump host 127.0.0.1"), "{err}");
     }
 
     #[tokio::test]
