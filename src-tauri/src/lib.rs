@@ -18229,7 +18229,8 @@ case "$rules" in
   *) [ -n "$l" ] && exit 1; echo "Sorry, user bob may not run $T on test." >&2; exit 1;;
 esac
 [ -n "$l" ] && exit 0
-if [ "$1" = su ]; then exec sh; fi
+# A real `su -` is root: in its shell `id -u` says 0, whoever runs the tests.
+if [ "$1" = su ]; then PATH="$D/root:$PATH" exec sh; fi
 exec "$@"
 "#;
 
@@ -18248,6 +18249,9 @@ exec "$@"
                 std::fs::write(&path, FAKE_TOOL).unwrap();
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
+            std::fs::create_dir_all(dir.join("root")).unwrap();
+            std::fs::write(dir.join("root/id"), "#!/bin/sh\nif [ \"$1\" = -u ]; then echo 0; else exec /usr/bin/env -u PATH id \"$@\"; fi\n").unwrap();
+            std::fs::set_permissions(dir.join("root/id"), std::fs::Permissions::from_mode(0o755)).unwrap();
             std::fs::write(dir.join("rules.dzdo"), dzdo).unwrap();
             std::fs::write(dir.join("rules.sudo"), sudo).unwrap();
             std::fs::write(dir.join("password"), "s3cret pass\n").unwrap();
