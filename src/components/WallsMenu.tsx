@@ -14,7 +14,13 @@ import type { Wall, WallMember } from "./WallView";
 /// A saved wall (src-tauri/src/multiexec.rs): servers to open as a Wall.
 export interface SavedWall { id: number | null; name: string; server_ids: number[]; cols: number; }
 
-interface SessionRow { id: string; serverId: number; serverName: string; wallId?: string; }
+/// `label`: the tab's name, when it was renamed (else the server's name).
+interface SessionRow { id: string; serverId: number; serverName: string; wallId?: string; label?: string; }
+/// What a session is called in its tab.
+const labelOf = (s: SessionRow) => s.label ?? s.serverName;
+/// A search finds a session by its tab's name or its server's.
+const sessionMatches = (s: SessionRow, query: string) =>
+  labelOf(s).toLowerCase().includes(query) || s.serverName.toLowerCase().includes(query);
 interface ServerRow { id: number; name: string; host?: string; folder_id?: number | null; }
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
@@ -140,7 +146,7 @@ export const AllTabsMenu = ({
 }) => {
   const [q, setQ] = useState("");
   const query = q.trim().toLowerCase();
-  const shown = query ? sessions.filter((s) => s.serverName.toLowerCase().includes(query)) : sessions;
+  const shown = query ? sessions.filter((s) => sessionMatches(s, query)) : sessions;
   const tabs = shown.filter((s) => !s.wallId);
   const inWalls = walls.map((w) => ({ wall: w, list: shown.filter((s) => s.wallId === w.id) })).filter((g) => g.list.length > 0);
   const dead = sessions.filter((s) => ["failed", "disconnected"].includes(statuses[s.id] ?? "connecting")).map((s) => s.id);
@@ -167,7 +173,7 @@ export const AllTabsMenu = ({
           className={`${menuItem} flex-1 min-w-0 ${activeView === s.id ? "bg-primary/15 text-primary" : "text-zinc-200 hover:bg-white/[0.06]"} ${order[at]?.id === s.id ? "ring-1 ring-inset ring-primary/40" : ""}`}
         >
           <span title={dot.title} className={`w-1.5 h-1.5 rounded-full shrink-0 ${dot.tone}`} />
-          <span className="truncate flex-1">{s.serverName}</span>
+          <span className="truncate flex-1" title={labelOf(s) !== s.serverName ? s.serverName : undefined}>{labelOf(s)}</span>
         </button>
         {walled && (
           <button onClick={() => onShowSession(s.id)} title="Open in its own tab" className={`${iconBtn} hover:text-primary`}>
@@ -365,7 +371,7 @@ export const WallPicker = ({ wall, sessions, terminals, statuses, servers, folde
   const query = q.trim().toLowerCase();
   const openServerIds = new Set(sessions.map((s) => s.serverId));
   const notOpen = useServerRows(servers.filter((s) => !openServerIds.has(s.id)), folders, q);
-  const shownSessions = query ? sessions.filter((s) => s.serverName.toLowerCase().includes(query)) : sessions;
+  const shownSessions = query ? sessions.filter((s) => sessionMatches(s, query)) : sessions;
   const has = (tid: string) => wall.members.some((m) => m.terminalId === tid);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
@@ -406,7 +412,7 @@ export const WallPicker = ({ wall, sessions, terminals, statuses, servers, folde
                   onChange={() => onToggle({ sessionId: s.id, terminalId: t.id })}
                 />
                 <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dot.tone}`} />
-                <span className="text-[11px] text-zinc-200 truncate flex-1">{s.serverName}</span>
+                <span className="text-[11px] text-zinc-200 truncate flex-1" title={labelOf(s) !== s.serverName ? s.serverName : undefined}>{labelOf(s)}</span>
                 {terms.length > 1 && (
                   <span className="text-[10px] text-zinc-500 flex items-center gap-1 shrink-0">
                     <TerminalSquare size={10} /> {t.title}
