@@ -978,9 +978,10 @@ impl MonitorSession {
 /// the terminal does and finds the host key the terminal stored under it.
 /// The monitor takes nothing else from the config (no ProxyCommand /
 /// ProxyJump, key files or agent): in the background it never runs commands
-/// or asks for anything. A node, or a jump host, the config sends through a
-/// ProxyCommand or ProxyJump (and that has no proxy of its own) isn't
-/// checked at all: `Err` says why.
+/// or asks for anything. A node the config sends through a ProxyCommand or
+/// ProxyJump (and that has no proxy of its own), or a jump host it sends
+/// through a ProxyCommand, isn't checked at all: `Err` says why. A jump
+/// host's ProxyJump is dialled past, as the terminal does.
 async fn with_ssh_config(auth: &NodeAuth, node_name: &str) -> Result<NodeAuth, String> {
     let target = crate::ConfigTarget::resolve(&auth.host, auth.port, &auth.username, Some(node_name.to_string())).await;
     let jump = match auth.jump.as_deref() {
@@ -1015,10 +1016,10 @@ fn apply_ssh_config(
     }
     let jump = match (auth.jump.as_deref(), jump) {
         (Some(saved), Some((j, proxy))) => {
-            match proxy {
-                Some(crate::ssh_config::Proxy::Command(_)) => return Err(NOT_CHECKED_JUMP_PROXY_COMMAND.into()),
-                Some(crate::ssh_config::Proxy::Jump(_)) => return Err(NOT_CHECKED_JUMP_PROXY_JUMP.into()),
-                _ => {}
+            // A ProxyJump the config gives the jump host is dialled past, as
+            // the terminal does (`connect_jump_host`: "isn't used yet").
+            if let Some(crate::ssh_config::Proxy::Command(_)) = proxy {
+                return Err(NOT_CHECKED_JUMP_PROXY_COMMAND.into());
             }
             Some(Box::new(NodeAuth { host: j.host, port: j.port, username: j.user, ..saved.clone() }))
         }
@@ -1033,8 +1034,6 @@ const NOT_CHECKED_PROXY_JUMP: &str =
     "Not checked: ~/.ssh/config reaches this server through a ProxyJump, which status checks don't use.";
 const NOT_CHECKED_JUMP_PROXY_COMMAND: &str =
     "Not checked: ~/.ssh/config reaches this server's jump host through a ProxyCommand, which status checks don't run.";
-const NOT_CHECKED_JUMP_PROXY_JUMP: &str =
-    "Not checked: ~/.ssh/config reaches this server's jump host through a ProxyJump, which status checks don't use.";
 
 /// `jump_turn`: the turn in the jump host's login queue, let go once the jump
 /// host has logged this one in (or failed to).
@@ -1921,20 +1920,27 @@ mod jump_host_tests {
         assert_eq!((resolved.host.as_str(), resolved.port), ("inner.example", 22));
     }
 
-    // A jump host the config reaches through a ProxyCommand or ProxyJump
-    // isn't checked, as for the server itself.
+    // A jump host the config reaches through a ProxyCommand isn't checked,
+    // as for the server itself. One it reaches through a ProxyJump is dialled
+    // straight, as the terminal does.
     #[test]
     fn a_jump_host_behind_a_config_proxy_is_not_checked() {
         let auth = node("inner.example", 22, Some(node("bastion", 22, None)));
         let saved = auth.jump.clone().unwrap();
-        for (proxy, why) in [
-            (crate::ssh_config::Proxy::Command("nc %h %p".into()), NOT_CHECKED_JUMP_PROXY_COMMAND),
-            (crate::ssh_config::Proxy::Jump("outer".into()), NOT_CHECKED_JUMP_PROXY_JUMP),
-        ] {
-            let target = crate::ConfigTarget::apply("inner.example", 22, "test", None);
-            let jump = jump_target(&saved, config(|c| c.proxy = Some(proxy)));
-            assert_eq!(apply_ssh_config(&auth, target, jump).err().as_deref(), Some(why));
-        }
+        let target = crate::ConfigTarget::apply("inner.example", 22, "test", None);
+        let jump = jump_target(&saved, config(|c| c.proxy = Some(crate::ssh_config::Proxy::Command("nc %h %p".into()))));
+        assert_eq!(apply_ssh_config(&auth, target, jump).err().as_deref(), Some(NOT_CHECKED_JUMP_PROXY_COMMAND));
+
+        let target = crate::ConfigTarget::apply("inner.example", 22, "test", None);
+        let jump = jump_target(
+            &saved,
+            config(|c| {
+                c.hostname = Some("10.0.0.9".into());
+                c.proxy = Some(crate::ssh_config::Proxy::Jump("outer".into()));
+            }),
+        );
+        let resolved = apply_ssh_config(&auth, target, jump).expect("checked, past the ProxyJump");
+        assert_eq!(resolved.jump.expect("through the jump host").host, "10.0.0.9");
         // The server's own ProxyJump gives way to its saved jump host.
         let target = crate::ConfigTarget::apply(
             "inner.example",
