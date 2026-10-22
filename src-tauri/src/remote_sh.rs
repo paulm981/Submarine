@@ -86,6 +86,7 @@ mod tests {
         ["a b", "it's", "$(id)", "!x", "back\\slash", "line\nbreak", "100%"].map(String::from).to_vec()
     }
 
+    #[cfg(unix)]
     const EXPECTED: &str = "one\na b|it's|$(id)|!x|back\\slash|line\nbreak|100%|v w \ndone!\n";
 
     #[test]
