@@ -18,6 +18,7 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - **A mirror keeps a file's permissions on the server.** Sending a changed file used to replace it with one anyone on the server could read, and a script lost its permission to run. The new copy now has the old one's permissions, owner and group (where the server allows it), and a new file has the one on your computer's. ([#93](https://github.com/paulm981/Submarine/issues/93))
 - **On macOS and Linux, the Local pane asks before it opens any file marked as executable**, not only ones whose name says they run. A program or script without an extension used to run straight away. ([#93](https://github.com/paulm981/Submarine/issues/93))
 - **Files unpacked from a downloaded archive are marked as downloaded too**, on Windows and macOS, when the Local pane extracts an archive that's marked that way. The system then asks before a program from it runs, as it does for the archive. ([#93](https://github.com/paulm981/Submarine/issues/93))
+- **Characters that disguise a file name are left out in more places**: the transfer cards, the name shown while you drag, the question before a file is replaced, and the notice about kept Live Edit changes. ([#93](https://github.com/paulm981/Submarine/issues/93))
 - **Old temporary folders are cleared at startup.** Live Edit and drag copies left behind by a run that crashed more than a day ago stayed in the system's temp folder; the check for them never matched. ([#93](https://github.com/paulm981/Submarine/issues/93))
 
 ## v0.4.0-fork.4
