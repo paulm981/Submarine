@@ -10,7 +10,9 @@ import type { Terminal } from "@xterm/xterm";
 // moved into that Wall's tile (`claimTerminal`) and back when the Wall goes
 // away. Like MobaXterm's MultiExec, the Wall shows the terminals themselves —
 // their whole scrollback, sized to the tile (the shell wraps at the tile's
-// width, not the tab's) — rather than copies that start empty.
+// width, not the tab's) — rather than copies that start empty. An AI tab's
+// terminal, which lives in Home, moves the same way into the AI side pane
+// beside a server tab (AiSidePane) — one place at a time, never a copy.
 //
 // The registry is also how the Wall types to many terminals at once: it
 // finds each one here to ask whether it can take input, which cursor-key
@@ -115,11 +117,13 @@ export const useDockVersion = (): number => useSyncExternalStore(subscribe, () =
 /// Keys the app takes before a terminal sees them (xterm would otherwise
 /// turn Ctrl+Shift+B into Ctrl+B for the shell): Ctrl+Shift+B turns
 /// broadcast on or off, Ctrl+Shift+P pauses a terminal in a broadcast,
-/// Ctrl+Shift+K jumps to a session by name, Ctrl+Tab and Ctrl+Shift+Tab
-/// go to the next and previous tab. For those two xterm would send the shell
-/// Tab and back-tab, which it still gets from Tab and Shift+Tab. The shifted
-/// letters are free: the shell only ever sees the plain Ctrl+letter.
-export type AppHotkey = "broadcast" | "pause" | "jump" | "next" | "prev";
+/// Ctrl+Shift+K jumps to a session by name, Ctrl+Shift+L opens or folds the
+/// AI side pane (AiSidePane; Ctrl+Shift+A is the terminal's Select all),
+/// Ctrl+Tab and Ctrl+Shift+Tab go to the next and previous tab. For those two
+/// xterm would send the shell Tab and back-tab, which it still gets from Tab
+/// and Shift+Tab. The shifted letters are free: the shell only ever sees the
+/// plain Ctrl+letter.
+export type AppHotkey = "broadcast" | "pause" | "jump" | "aiPane" | "next" | "prev";
 export const appHotkey = (e: KeyboardEvent): AppHotkey | null => {
   if (!e.ctrlKey || e.altKey || e.metaKey) return null;
   if (e.code === "Tab") return e.shiftKey ? "prev" : "next";
@@ -127,6 +131,7 @@ export const appHotkey = (e: KeyboardEvent): AppHotkey | null => {
   if (e.code === "KeyB") return "broadcast";
   if (e.code === "KeyP") return "pause";
   if (e.code === "KeyK") return "jump";
+  if (e.code === "KeyL") return "aiPane";
   return null;
 };
 

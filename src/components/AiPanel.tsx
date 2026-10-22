@@ -81,7 +81,7 @@ const SETTLE_MS = 500;
 /// moving. So when a card above it goes (the AI can withdraw one) and this
 /// one slides up under the pointer, a click meant for the other can't
 /// decide it.
-const PendingCard = ({ p, decide, onGoToServer }: { p: AiPending; decide: (allow: boolean) => void; onGoToServer: (sessionId: string) => void }) => {
+export const PendingCard = ({ p, decide, onGoToServer }: { p: AiPending; decide: (allow: boolean) => void; onGoToServer: (sessionId: string) => void }) => {
   const ref = useRef<HTMLDivElement>(null);
   const settledAt = useRef(0);
   const lastTop = useRef<number | null>(null);

@@ -203,7 +203,7 @@ const TerminalView = ({
   /// `shell` is a list_local_shells id, or null for the default; `onOpened` gets
   /// the label of the shell that started. A local terminal is never shown in
   /// a Wall or broadcast to, and keeps no command history — it isn't a
-  /// server session.
+  /// server session. An AI tab's can be moved into the AI side pane.
   local?: { shell: string | null; onOpened?: (label: string) => void };
   /// Called each time this terminal's SSH shell has been opened (first
   /// connect and every reconnect) and has printed what it prints on login,
@@ -1466,7 +1466,10 @@ const TerminalView = ({
     const onTextBlur = () => { focused = false; };
     term.textarea?.addEventListener('focus', onTextFocus);
     term.textarea?.addEventListener('blur', onTextBlur);
-    const unregister = local ? null : registerTerminal({
+    // Server terminals, for Walls; and an AI tab's, which the AI side pane
+    // shows beside a server tab. Other Home shells stay in Home.
+    const dockable = !local || !!local.shell?.startsWith('ai:');
+    const unregister = !dockable ? null : registerTerminal({
       terminalId,
       sessionId,
       term,
