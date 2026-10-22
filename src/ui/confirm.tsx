@@ -101,6 +101,10 @@ export interface ChoiceOptions extends ConfirmOptions {
   /** The third button is red (it closes or deletes something); otherwise a
    *  plain grey one. `destructive` is for the OK button only. */
   altDestructive?: boolean;
+  /** Shows a "Remember my answer" box; called with the button that closed
+   *  the dialog when it's ticked and the answer is OK or the third button
+   *  (the caller saves it as its setting). Cancel remembers nothing. */
+  remember?: (answer: "ok" | "alt") => void;
 }
 export type ChoiceResult = "ok" | "alt" | null;
 
@@ -184,7 +188,8 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
   const chainedAtRef = useRef(-Infinity);
   const [, repaint] = useReducer((n: number) => n + 1, 0);
   const [tpValue, setTpValue] = useState("");
-  // The confirm's "Don't ask again" box, unticked for each new confirm.
+  // The confirm's "Don't ask again" or "Remember my answer" box, unticked
+  // for each new confirm.
   const [dontAsk, setDontAsk] = useState(false);
   const [tpError, setTpError] = useState<string | null>(null);
 
@@ -265,6 +270,7 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
   const close = (value: ChoiceResult) => {
     if (state && advance(state)) {
       if (value === "ok" && dontAsk) state.opts.dontAskAgain?.();
+      if (value !== null && dontAsk) state.opts.remember?.(value);
       state.resolve(value);
     }
   };
@@ -435,11 +441,12 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
             <p className="text-[12px] text-zinc-300 leading-relaxed mb-4 whitespace-pre-wrap break-words">
               {state.opts.message}
             </p>
-            <div className="flex items-center justify-end gap-2">
-              {state.opts.dontAskAgain && (
-                <label className="mr-auto flex items-center gap-2 text-[11px] text-zinc-400 cursor-pointer select-none">
+            {/* With three buttons the box has a line of its own above them. */}
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              {(state.opts.dontAskAgain || state.opts.remember) && (
+                <label className={`mr-auto flex items-center gap-2 text-[11px] text-zinc-400 cursor-pointer select-none ${state.opts.altLabel ? "basis-full mb-1" : ""}`}>
                   <input type="checkbox" className="accent-primary" checked={dontAsk} onChange={(e) => setDontAsk(e.target.checked)} />
-                  Don't ask again
+                  {state.opts.remember ? "Remember my answer" : "Don't ask again"}
                 </label>
               )}
               <button onClick={() => close(null)}
