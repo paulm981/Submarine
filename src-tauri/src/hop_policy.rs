@@ -73,7 +73,10 @@ pub(crate) fn first_hop<'a>(
     Box::pin(async move {
         refuse_tokens(spec)?;
         let hops = crate::parse_proxy_jump(spec)?;
-        if depth + hops.len() > crate::MAX_JUMP_HOPS {
+        // As config_jump_chain: every hop of this list counts before the
+        // first hop's own ProxyJump adds its own.
+        let depth = depth + hops.len();
+        if depth > crate::MAX_JUMP_HOPS {
             return Err(too_many_hops());
         }
         let Some(first) = hops.into_iter().next() else { return Err(format!("ProxyJump {spec:?} names no host")) };
@@ -81,7 +84,7 @@ pub(crate) fn first_hop<'a>(
         // As OpenSSH: the list's own port wins over the hop's config.
         let port = first.port.unwrap_or(port);
         match proxy {
-            Some(Proxy::Jump(next)) => first_hop(&next, depth + 1, resolve).await,
+            Some(Proxy::Jump(next)) => first_hop(&next, depth, resolve).await,
             Some(Proxy::Command(_)) => Ok(FirstHop::Command),
             _ => Ok(FirstHop::Address { label: first.host, host, port }),
         }
@@ -218,8 +221,21 @@ mod tests {
         let nine = "h1,h2,h3,h4,h5,h6,h7,h8,h9";
         assert!(first_hop(nine, 0, &config(&[])).await.unwrap_err().contains("more than 8 hops"));
         assert!(first_hop("h1,h2,h3,h4,h5,h6,h7,h8", 0, &config(&[])).await.is_ok());
-        // A saved jump host's chain starts at depth 0, as connect_jump_host's does.
-        assert!(first_hop("h1,h2", 7, &config(&[])).await.is_err());
+        // A saved jump host's chain starts at depth 1 (the saved one is a hop).
+        assert!(first_hop("h1,h2,h3,h4,h5,h6,h7", 1, &config(&[])).await.is_ok());
+        assert!(first_hop("h1,h2,h3,h4,h5,h6,h7,h8", 1, &config(&[])).await.is_err());
+    }
+
+    /// The limit counts hops, not lists: a list whose first hop has a
+    /// ProxyJump list of its own counts the hops of both.
+    #[tokio::test]
+    async fn hops_of_nested_lists_all_count_towards_eight() {
+        let inner = |n: usize| (1..=n).map(|i| format!("g{i}")).collect::<Vec<_>>().join(",");
+        let outer = |n: usize| (1..=n).map(|i| format!("h{i}")).collect::<Vec<_>>().join(",");
+        for (o, i, ok) in [(4, 4, true), (8, 7, false), (4, 5, false), (1, 7, true), (2, 7, false)] {
+            let cfg = config(&[("h1", "h1", 22, jump(&inner(i)))]);
+            assert_eq!(first_hop(&outer(o), 0, &cfg).await.is_ok(), ok, "{o} hops, the first behind {i} more");
+        }
     }
 
     #[tokio::test]

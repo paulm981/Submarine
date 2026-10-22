@@ -11543,7 +11543,8 @@ async fn connect_jump_host(
         ctx.log(line, "info");
     }
     let hop = Hop { target, password, key_data, cache_id: format!("jump{jump_server_id}") };
-    reach_hop(ctx, hop, route, 0).await
+    // The saved jump host is a hop of the route: 1.
+    reach_hop(ctx, hop, route, 1).await
 }
 
 /// A route's hops being connected, boxed: the steps below call each other.
@@ -11563,7 +11564,10 @@ fn config_jump_chain<'a>(
     Box::pin(async move {
         hop_policy::refuse_tokens(spec)?; // fork (#43, D7): no % tokens yet
         let hops = parse_proxy_jump(spec)?;
-        if depth + hops.len() > MAX_JUMP_HOPS {
+        // `depth`: the hops already in the route. Every hop of this list
+        // counts before the first hop's own ProxyJump adds its own.
+        let depth = depth + hops.len();
+        if depth > MAX_JUMP_HOPS {
             return Err(format!(
                 "ProxyJump in ~/.ssh/config: more than {MAX_JUMP_HOPS} hops — a loop between its Host blocks?"
             ));
@@ -11598,7 +11602,7 @@ fn config_jump_chain<'a>(
                 key_data: None,
             };
             if i == 0 {
-                chain = reach_hop(ctx, hop, route, depth + 1).await?;
+                chain = reach_hop(ctx, hop, route, depth).await?;
             } else {
                 let via = chain.last().ok_or("ProxyJump: no previous hop")?;
                 let _turn = hop_policy::hop_turn(ctx, &hop.target).await?; // fork (#43, D1): login queue per hop
@@ -12039,7 +12043,7 @@ async fn diagnose_connect(
             // ProxyJump when it has one.
             match proxy {
                 Some(ssh_config::Proxy::Command(_)) => diagnose::Route::Command,
-                Some(ssh_config::Proxy::Jump(spec)) => match first_hop_route(&spec).await {
+                Some(ssh_config::Proxy::Jump(spec)) => match first_hop_route(&spec, 1).await {
                     Some(route) => route,
                     None => return Ok(Vec::new()),
                 },
@@ -12052,7 +12056,7 @@ async fn diagnose_connect(
         // No proxy address to check: the connect says the proxy host is empty.
         ConnectRoute::Proxy { host: None, .. } => return Ok(Vec::new()),
         ConnectRoute::Command(_) => diagnose::Route::Command,
-        ConnectRoute::ConfigJump(spec) => match first_hop_route(&spec).await {
+        ConnectRoute::ConfigJump(spec) => match first_hop_route(&spec, 0).await {
             Some(route) => route,
             None => return Ok(Vec::new()),
         },
@@ -12062,10 +12066,11 @@ async fn diagnose_connect(
 }
 
 /// What `diagnose_connect` checks for a route through the ProxyJump `spec`:
-/// the first hop the connect dials (`hop_policy::first_hop`). `None` when the
+/// the first hop the connect dials (`hop_policy::first_hop`), with `depth`
+/// hops already in the route (1 behind a saved jump host). `None` when the
 /// list can't be used; the connect says why.
-async fn first_hop_route(spec: &str) -> Option<diagnose::Route> {
-    match hop_policy::first_hop_in_config(spec, 0).await.ok()? {
+async fn first_hop_route(spec: &str, depth: usize) -> Option<diagnose::Route> {
+    match hop_policy::first_hop_in_config(spec, depth).await.ok()? {
         hop_policy::FirstHop::Address { label, host, port } => Some(diagnose::Route::Jump { name: label, host, port }),
         hop_policy::FirstHop::Command => Some(diagnose::Route::Command),
     }
