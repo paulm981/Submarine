@@ -359,7 +359,14 @@ async fn sftp_download_file(
     remote: &str,
     local: &Path,
     remote_mtime_secs: Option<u64>,
+    login_folders: &crate::LoginFolders,
 ) -> Result<(), String> {
+    // The server names the files and folders below the mirror's folder: one
+    // that would land in a folder this computer runs programs from at login
+    // is left out, as a folder download leaves it out (LoginFolders).
+    if !login_folders.may_hold_server_file(local) {
+        return Err(LOGIN_FOLDER_SKIPPED.into());
+    }
     if let Some(parent) = local.parent() {
         tokio::fs::create_dir_all(parent).await
             .map_err(|e| format!("local mkdir {:?}: {}", parent, e))?;
@@ -414,6 +421,9 @@ async fn sftp_download_file(
     }
     Ok(())
 }
+
+/// Why a file from the server wasn't written (sftp_download_file).
+const LOGIN_FOLDER_SKIPPED: &str = "left out: it would land in a folder this computer runs programs from at login";
 
 /// Move a remote path into `<remote_root>/.submarine-trash/<timestamp>/`
 /// preserving the relative layout. Cheaper than a full delete and lets the
@@ -1413,9 +1423,11 @@ async fn run_mirror(
         let mut set: JoinSet<(DryRunEntry, Result<(), String>, bool)> = JoinSet::new();
         let mut iter = work.into_iter();
 
+        let login_folders = Arc::new(crate::LoginFolders::new());
         let spawn_one = |js: &mut JoinSet<_>, entry: DryRunEntry| {
             let is_download = entry.action.starts_with("download-");
             let sftp = Arc::clone(&sftp);
+            let login_folders = Arc::clone(&login_folders);
             let local_root = local_root.clone();
             let remote_root = spec.remote.clone();
             js.spawn(async move {
@@ -1426,7 +1438,7 @@ async fn run_mirror(
                 };
                 let res = if is_download {
                     let mt = sftp_remote_mtime(&*sftp, &remote_path).await;
-                    sftp_download_file(&*sftp, &remote_path, &local_path, mt).await
+                    sftp_download_file(&*sftp, &remote_path, &local_path, mt, &login_folders).await
                 } else {
                     sftp_upload_file(&*sftp, &local_path, &remote_path).await
                 };

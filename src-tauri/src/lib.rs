@@ -19743,10 +19743,10 @@ async fn sftp_download_dir(
     // AppData\…\Startup\x.bat in the real Startup folder. Files that would
     // land in a folder the system runs things from at login are left out and
     // counted on the card.
-    let autorun = autorun_dirs();
+    let login_folders = LoginFolders::new();
     let dest_root = std::path::PathBuf::from(&local_path).join(&folder_name);
     let before = files.len();
-    files.retain(|(_, rel, _)| !lands_in(&dest_root.join(rel), &autorun));
+    files.retain(|(_, rel, _)| login_folders.may_hold_server_file(&dest_root.join(rel)));
     let skipped_autorun = (before - files.len()) as u64;
     // Where upper and lower case are the same name (Windows, and macOS as
     // usually set up), two files whose names differ only in case would land
@@ -23324,6 +23324,48 @@ fn lands_in(path: &std::path::Path, dirs: &[std::path::PathBuf]) -> bool {
     dirs.iter().map(|d| norm(d)).any(|d| !d.is_empty() && (p == d || p.starts_with(&format!("{}/", d))))
 }
 
+/// The folders this system runs programs from at login (autorun_dirs), as
+/// written and as resolved, for asking whether a file a server named may be
+/// written somewhere. Every writer that puts files the server names below a
+/// folder the user chose asks it: folder downloads, and a mirror's downloads
+/// (mirror.rs).
+pub(crate) struct LoginFolders(Vec<std::path::PathBuf>);
+
+impl LoginFolders {
+    pub(crate) fn new() -> Self {
+        Self::of(autorun_dirs())
+    }
+
+    fn of(dirs: Vec<std::path::PathBuf>) -> Self {
+        let resolved: Vec<std::path::PathBuf> = dirs.iter().filter_map(|d| d.canonicalize().ok()).collect();
+        Self(dirs.into_iter().chain(resolved).collect())
+    }
+
+    /// Whether a file a server named may be written at `path`: not in or
+    /// under a login folder. Checked as written and, for the part of the path
+    /// that exists, as resolved, so a link or junction to a login folder
+    /// (`~/Downloads/x -> ~/.config/autostart`) doesn't get around it.
+    pub(crate) fn may_hold_server_file(&self, path: &std::path::Path) -> bool {
+        !lands_in(path, &self.0) && !resolve_existing_part(path).is_some_and(|p| lands_in(&p, &self.0))
+    }
+}
+
+/// `path` with the longest part of it that exists resolved (links followed,
+/// `..` taken out), and the rest, which doesn't exist yet, as written. None
+/// when nothing of it resolves.
+fn resolve_existing_part(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut rest = Vec::new();
+    let mut part = path;
+    loop {
+        if let Ok(mut real) = part.canonicalize() {
+            real.extend(rest.iter().rev());
+            return Some(real);
+        }
+        rest.push(part.file_name()?.to_os_string());
+        part = part.parent()?;
+    }
+}
+
 /// The note on a finished folder-download card for files left out because
 /// they would land in a login folder (see autorun_dirs).
 fn autorun_skipped_note(skipped: u64) -> Option<String> {
@@ -25211,6 +25253,27 @@ mod tests {
         assert!(!lands_in(std::path::Path::new("/home/me/.config/autostart-old/x"), &dirs));
         assert!(!lands_in(std::path::Path::new("/anything"), &[std::path::PathBuf::new()]));
         assert_eq!(autorun_skipped_note(0), None);
+        let folders = LoginFolders::of(dirs.clone());
+        assert!(!folders.may_hold_server_file(std::path::Path::new("/home/me/.config/autostart/x.desktop")));
+        assert!(folders.may_hold_server_file(std::path::Path::new("/home/me/Downloads/alice/.config/autostart/x.desktop")));
+    }
+
+    /// A link to a login folder, below the folder a download or a mirror
+    /// writes into, is seen through.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_login_folder_is_caught_too() {
+        let root = std::env::temp_dir().join(format!("submarine-login-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let autostart = root.join("home/.config/autostart");
+        std::fs::create_dir_all(&autostart).unwrap();
+        std::fs::create_dir_all(root.join("mirror")).unwrap();
+        std::os::unix::fs::symlink(&autostart, root.join("mirror/startup")).unwrap();
+        let folders = LoginFolders::of(vec![autostart.clone()]);
+        assert!(!folders.may_hold_server_file(&root.join("mirror/startup/x.desktop")));
+        assert!(!folders.may_hold_server_file(&root.join("mirror/startup/new/deeper/x.desktop")));
+        assert!(folders.may_hold_server_file(&root.join("mirror/other/x.desktop")));
+        let _ = std::fs::remove_dir_all(&root);
         assert!(autorun_skipped_note(2).unwrap().starts_with("2 files skipped"));
     }
 

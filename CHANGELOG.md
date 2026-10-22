@@ -14,6 +14,7 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - **Kept copies are private.** On macOS and Linux, a copy kept in **Submarine unsent edits** can be read only by you, and so can the folder. ([#93](https://github.com/paulm981/Submarine/issues/93))
 - **Two downloads to the same name don't replace each other.** If a file of that name was saved there while a download ran, you're asked before it's replaced, as when it was there at the start. In a folder download it's left as it was, and the card says how many. ([#93](https://github.com/paulm981/Submarine/issues/93))
 - **On Windows and macOS, a folder download keeps files whose names differ only in case apart.** Those systems treat `Readme.md` and `README.md` as one name, so the second used to replace the first. It's now left out, and the card says how many. ([#93](https://github.com/paulm981/Submarine/issues/93))
+- **A mirror never puts a server's file in a folder that runs programs at login**, such as the Startup folder on Windows or `~/.config/autostart` on Linux. Folder downloads already left such files out; a mirror now does too, and its log says why. A link to such a folder is seen through, in both. ([#93](https://github.com/paulm981/Submarine/issues/93))
 - **Old temporary folders are cleared at startup.** Live Edit and drag copies left behind by a run that crashed more than a day ago stayed in the system's temp folder; the check for them never matched. ([#93](https://github.com/paulm981/Submarine/issues/93))
 
 ## v0.4.0-fork.4
