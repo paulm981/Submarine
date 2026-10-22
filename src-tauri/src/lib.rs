@@ -1298,7 +1298,11 @@ fn apply_remote_inner(
             // record to merge over, and hold_switch keeps this device's again
             // after it, whether the record applied or not.
             let before = if watch || held_switch { approvals::before_merge(&tx, spec.table, &rec.uuid)? } else { None };
+            let tunnels_before = if spec.table == "servers" { stored_tunnels(&tx, &rec.uuid) } else { None };
             let applied = apply_entity(&tx, key, spec, rec, &mut fk_fixups);
+            if let Some(old) = tunnels_before {
+                note_synced_tunnels(&tx, &rec.uuid, &old)?;
+            }
             if watch {
                 approvals::hold_changes(&tx, spec.table, &rec.uuid, before.as_ref())?;
             } else if held_switch {
@@ -1877,6 +1881,19 @@ async fn sync_with(
     session: &cloud::Session,
     pinned: Option<u64>,
 ) -> Result<SyncReport, String> {
+    sync_with_from(app, db_state, cloud, session, pinned, true).await
+}
+
+/// `sync_with`, from the delta cursor when `use_cursor`, or in full: every
+/// row, and a personal profile's key escrow, whatever the cursor says.
+async fn sync_with_from(
+    app: &tauri::AppHandle,
+    db_state: &DbState,
+    cloud: &cloud::CloudState,
+    session: &cloud::Session,
+    pinned: Option<u64>,
+    use_cursor: bool,
+) -> Result<SyncReport, String> {
     // Checked before anything goes out, the shared key refresh below included:
     // a server the profile isn't linked to could hand back a key it knows,
     // and every record pushed after that would be readable to it.
@@ -1931,7 +1948,7 @@ async fn sync_with(
         }
     }
 
-    let (report, reset) = sync_round(app, db_state, cloud, session, &profile, unlinked, generation, true).await?;
+    let (report, reset) = sync_round(app, db_state, cloud, session, &profile, unlinked, generation, use_cursor).await?;
     if !reset {
         return Ok(report);
     }
@@ -2914,7 +2931,7 @@ async fn import_shared_profile(
     // and nowhere else.
     let opened = {
         use tauri::Manager as _;
-        match setup_master_db_inner(app.clone(), VaultSecret::Password(vault_password), app.state::<DbState>(), true).await {
+        match setup_master_db_with(app.clone(), VaultSecret::Password(vault_password), app.state::<DbState>(), true, true).await {
             Ok(generation) => generation,
             Err(e) => {
                 discard_half_built_profile(&app, &local_name, None);
@@ -2982,9 +2999,18 @@ async fn import_shared_profile(
 /// `opened` is the generation the half-built profile was opened at (None when
 /// opening it is what failed). If another profile has been opened since, that
 /// one stays open; only the half-built file goes.
+///
+/// Only a file this call made goes: the callers open with `must_create`, so
+/// it's this call's when the profile was opened (`opened`), or when opening
+/// got as far as setting it up here (its last step, the first save, failed).
+/// A profile that another window made or opened meanwhile stays, and so does
+/// one open in another window now.
 fn discard_half_built_profile(app: &tauri::AppHandle, name: &str, opened: Option<u64>) {
     use tauri::Manager as _;
     let state = app.state::<DbState>();
+    let path = profile_path(app, name).ok();
+    let made_here = opened.is_some()
+        || path.is_some() && state.db_path.lock().ok().is_some_and(|g| g.as_ref() == path.as_ref());
     // Under the connection's lock when it can be had, as in close_profile.
     let mut conn = state.conn.lock().ok();
     let ours = opened.is_none_or(|g| state.generation_now() == g);
@@ -3000,17 +3026,26 @@ fn discard_half_built_profile(app: &tauri::AppHandle, name: &str, opened: Option
     if ours {
         if let Ok(mut g) = state.active_profile.lock() { *g = None; }
     }
-    if let Ok(p) = profile_path(app, name) {
-        // Its one-window lock (#204) goes with it, or the name would stay
-        // "open in another window" in this one until it quit.
-        if let Ok(mut held) = state.profile_lock.lock() {
-            if held.as_ref().is_some_and(|(locked, _)| *locked == p) {
-                *held = None;
-            }
-        }
-        let _ = fs::remove_file(p.with_extension("submarine.lock"));
-        let _ = fs::remove_file(p);
-    }
+    let Some(p) = path.filter(|_| made_here) else { return };
+    let lock_path = p.with_extension("submarine.lock");
+    // Its one-window lock (#204) goes with it, or the name would stay "open in
+    // another window" in this one until it quit. Not held here any more
+    // (another profile opened here since): only when no other window has it.
+    let ours = state
+        .profile_lock
+        .lock()
+        .ok()
+        .and_then(|mut held| if held.as_ref().is_some_and(|(locked, _)| *locked == p) { held.take() } else { None });
+    let lock = match ours {
+        Some((_, file)) => ProfileLock::New(file),
+        None => match try_lock_file(&lock_path) {
+            Ok(lock) => lock,
+            Err(_) => return,
+        },
+    };
+    let _ = fs::remove_file(&p);
+    drop(lock);
+    let _ = fs::remove_file(lock_path);
 }
 
 /// New device: restore one of YOUR OWN personal cloud profiles using nothing but
@@ -3073,7 +3108,7 @@ async fn restore_personal_profile(
         use tauri::Manager as _;
         // No strength floor here: the escrow above already proved this is the
         // profile's real password. A pre-existing short one must still restore.
-        match setup_master_db_inner(app.clone(), VaultSecret::Password(vault_password), app.state::<DbState>(), false).await {
+        match setup_master_db_with(app.clone(), VaultSecret::Password(vault_password), app.state::<DbState>(), false, true).await {
             Ok(generation) => generation,
             Err(e) => {
                 discard_half_built_profile(&app, &local_name, None);
@@ -3760,6 +3795,52 @@ mod sync_engine_tests {
         approvals::create_schema(&c).unwrap();
         apply_remote_records(&c, &KEY, &recs, &hc).unwrap();
         assert!(approvals::held_by_server(&c).is_empty(), "a personal profile holds nothing");
+    }
+
+    // A forward a co-member adds while this device has a session open on the
+    // server: the session's next save keeps it (and its hold) instead of
+    // writing the list it read before over it.
+    #[test]
+    fn a_sessions_save_keeps_a_forward_that_came_by_sync() {
+        let l8080 = r#"[{"type":"L","local":"127.0.0.1:8080","remote":"db:5432"}]"#;
+        let (a, ha) = device("A");
+        a.execute("INSERT INTO servers(name,host,port,tunnels) VALUES('web','h',22,?1)", [l8080]).unwrap();
+        let (b, hb) = device("B");
+        approvals::create_schema(&b).unwrap();
+        b.execute("INSERT INTO sync_meta(key,value) VALUES('share_id','s1')", []).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let (id, uuid): (i32, String) = b.query_row("SELECT id, uuid FROM servers WHERE name='web'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        approvals::allow(&b, &uuid, &[]).unwrap();
+        assert!(take_synced_tunnels_base(&b, id).is_none(), "a new server has no session to be out of date");
+        // B's session reads the rules; then A adds a SOCKS forward.
+        let ours: Vec<tunnel::TunnelSpec> = serde_json::from_str(l8080).unwrap();
+        a.execute(
+            "UPDATE servers SET tunnels=?1 WHERE name='web'",
+            [r#"[{"type":"L","local":"127.0.0.1:8080","remote":"db:5432"},{"type":"D","local":"0.0.0.0:1080"}]"#],
+        )
+        .unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        assert!(approvals::held_for(&b, &uuid).contains("tunnel:D|0.0.0.0:1080|"));
+        // B stops its forward and saves, as persist_session_tunnels does.
+        let mut ours = ours;
+        let first = ours[0].clone();
+        tunnel::rule_stopped(&mut ours, &first);
+        let base = take_synced_tunnels_base(&b, id).expect("sync changed the saved forwards");
+        let saved: Vec<tunnel::TunnelSpec> =
+            serde_json::from_str(&b.query_row("SELECT tunnels FROM servers WHERE id=?1", [id], |r| r.get::<_, String>(0)).unwrap()).unwrap();
+        let merged = tunnel::merge_rules(&base, &ours, &saved);
+        b.execute("UPDATE servers SET tunnels=?1 WHERE id=?2", rusqlite::params![serde_json::to_string(&merged).unwrap(), id]).unwrap();
+        let now: Vec<tunnel::TunnelSpec> =
+            serde_json::from_str(&b.query_row("SELECT tunnels FROM servers WHERE id=?1", [id], |r| r.get::<_, String>(0)).unwrap()).unwrap();
+        assert_eq!(now.len(), 2, "the synced forward stays");
+        assert!(now[0].stopped && !now[1].stopped);
+        assert!(approvals::held_for(&b, &uuid).contains("tunnel:D|0.0.0.0:1080|"), "and stays held");
+        assert!(take_synced_tunnels_base(&b, id).is_none(), "taken once");
+        // A record that leaves the forwards alone marks nothing.
+        apply_remote_records(&a, &KEY, &collect_local_records(&b, &KEY, "").unwrap(), &ha).unwrap();
+        a.execute("UPDATE servers SET host='h2' WHERE name='web'", []).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        assert!(take_synced_tunnels_base(&b, id).is_none());
     }
 
     /// A shared device B with A's SSH server "web" on port 22, and A having
@@ -5341,11 +5422,19 @@ async fn force_push_profile(
     }
     let removed = cloud::delete_sync_profile(&app, &cloud, &session, &cloud_profile).await?;
     eprintln!("[SYNC] force push: server dropped {removed} record(s) for '{cloud_profile}'");
-    // Pushes are always a full set, so the very next sync repopulates the
-    // partition from this vault — including a fresh DEK escrow record. Only
-    // this profile's, though: if another opened meanwhile, the sync refuses,
-    // and this profile's next sync fills its partition back up.
-    sync_with(&app, &db_state, &cloud, &session, Some(generation)).await
+    // The delta cursor describes the copy just deleted: forget it, or the next
+    // round would send only what changed since, and no key escrow. Then a full
+    // sync fills the partition from this vault, DEK escrow record included.
+    // Only this profile's, though: if another opened meanwhile, the sync
+    // refuses, and with no cursor this profile's next sync is a full one.
+    forget_sync_cursor(&db_state)?;
+    sync_with_from(&app, &db_state, &cloud, &session, Some(generation), false).await
+}
+
+/// Drops the open profile's delta-sync cursor: the next round is a full one.
+fn forget_sync_cursor(db_state: &DbState) -> Result<(), String> {
+    *db_state.sync_cursor.lock().map_err(|_| "[STATE] LOCK_SYNC_CURSOR")? = None;
+    Ok(())
 }
 
 /// Mark a profile as the active one. Subsequent `check_db_exists` /
@@ -5512,6 +5601,9 @@ async fn delete_profile(app_handle: tauri::AppHandle, name: String, state: tauri
     // the profile itself is already gone, so a locked tmp shouldn't fail the
     // delete the user asked for.
     let _ = fs::remove_file(path.with_extension("submarine.tmp"));
+    // And the copies a deleting sync kept of it (vault_backup.rs): they hold
+    // the same servers, logins and keys.
+    vault_backup::remove_all(&path);
     // And its quick unlock on this device (#166), with its Windows Hello key.
     quick_unlock::forget(&app_handle, &name);
     Ok(())
@@ -5863,6 +5955,21 @@ async fn setup_master_db_inner(
     state: tauri::State<'_, DbState>,
     enforce_strength: bool,
 ) -> Result<u64, String> {
+    setup_master_db_with(app_handle, secret, state, enforce_strength, false).await
+}
+
+/// `setup_master_db_inner`, and with `must_create` only for a profile that
+/// isn't there yet: one that appeared since the caller looked (another window
+/// made or restored it) is refused once this window holds its lock, so a
+/// restore or import that then fails never removes a profile it didn't make
+/// (`discard_half_built_profile`).
+async fn setup_master_db_with(
+    app_handle: tauri::AppHandle,
+    secret: VaultSecret,
+    state: tauri::State<'_, DbState>,
+    enforce_strength: bool,
+    must_create: bool,
+) -> Result<u64, String> {
     let (mut password, known_key) = match secret {
         VaultSecret::Password(p) => (p, None),
         VaultSecret::Key(k) => (String::new(), Some(k)),
@@ -5884,6 +5991,9 @@ async fn setup_master_db_inner(
     // Before anything is read: another window on this profile stops it here.
     // If the password turns out wrong the lock is let go with this function.
     let profile_lock = lock_profile(&state, &path)?;
+    if must_create && path.exists() {
+        return Err(format!("Profile '{}' already exists", profile_name));
+    }
     let mut conn;
     let salt_bytes: [u8; SALT_LEN];
     // Wrap the derived AES key so it's wiped on every early-return path
@@ -7545,10 +7655,10 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
     Ok(list)
 }
 
-/// "Keep it SSH" for a server whose switch to telnet or VNC is held: it stays
-/// SSH on its old port, saved as this device's own edit, so the next sync
-/// takes it back to SSH everywhere (approvals::keep_ssh). False when no
-/// switch was held.
+/// "Keep it SSH" (or RDP) for a server whose switch to telnet or VNC is held:
+/// it stays as it was on its old port, saved as this device's own edit, so the
+/// next sync takes it back to that everywhere (approvals::keep_ssh). False
+/// when no switch was held.
 #[tauri::command]
 async fn keep_server_ssh(db_state: tauri::State<'_, DbState>, server_id: i32) -> Result<bool, String> {
     let kept = {
@@ -7570,6 +7680,9 @@ async fn keep_server_ssh(db_state: tauri::State<'_, DbState>, server_id: i32) ->
 /// connect starts them (as does the Start button now). Autostart counts from
 /// the next unlock; the frontend types allowed on-connect commands itself.
 /// An allowed switch to telnet or VNC is made at once (approvals::allow).
+/// `run_on_connect` is the on-connect text the user was shown: allowing the
+/// commands needs it, and it's refused when the commands have changed since
+/// (approvals::check_seen_run_on_connect), so the user is asked again.
 #[tauri::command]
 async fn allow_held(
     db_state: tauri::State<'_, DbState>,
@@ -7577,6 +7690,7 @@ async fn allow_held(
     map: tauri::State<'_, MonitorMap>,
     server_id: i32,
     items: Vec<String>,
+    run_on_connect: Option<String>,
 ) -> Result<usize, String> {
     let (allowed, customs) = {
         let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
@@ -7588,6 +7702,8 @@ async fn allow_held(
         } else {
             items.into_iter().filter(|i| held.contains(i)).collect()
         };
+        let allowing_commands = allowed.iter().any(|i| i == approvals::RUN_ON_CONNECT);
+        approvals::check_seen_run_on_connect(conn, &uuid, allowing_commands, run_on_connect.as_deref())?;
         if allowed.is_empty() {
             return Ok(0);
         }
@@ -13323,6 +13439,72 @@ async fn start_tunnel_specs_on(
     }
 }
 
+/// A server's saved `tunnels` JSON, by uuid. None when there's no such row.
+fn stored_tunnels(conn: &Connection, uuid: &str) -> Option<Option<String>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row("SELECT tunnels FROM servers WHERE uuid = ?1", [uuid], |r| r.get::<_, Option<String>>(0))
+        .optional()
+        .ok()
+        .flatten()
+}
+
+/// After the merge engine applied a server record: when it changed the
+/// server's saved forwards, what they were before is kept (the first time
+/// only, until a session takes it), in a table that lives as long as the
+/// connection and is never saved or synced. A session's rule list read before
+/// the sync is out of date then; `refresh_synced_session_rules` and
+/// `persist_session_tunnels` use it so saving the session's list doesn't undo
+/// what sync brought (a forward added elsewhere deleted everywhere, and its
+/// hold let go).
+fn note_synced_tunnels(conn: &Connection, uuid: &str, before: &Option<String>) -> Result<(), String> {
+    if stored_tunnels(conn, uuid).as_ref() == Some(before) {
+        return Ok(());
+    }
+    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS synced_tunnels_base (uuid TEXT PRIMARY KEY, tunnels TEXT)")
+        .map_err(|e| format!("[SYNC] TUNNELS_BASE: {e}"))?;
+    conn.execute(
+        "INSERT OR IGNORE INTO temp.synced_tunnels_base (uuid, tunnels) VALUES (?1, ?2)",
+        rusqlite::params![uuid, before],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("[SYNC] TUNNELS_BASE: {e}"))
+}
+
+/// Takes what a server's saved forwards were before sync changed them (see
+/// `note_synced_tunnels`): Some when they changed since a session last read
+/// or saved them.
+fn take_synced_tunnels_base(conn: &Connection, server_id: i32) -> Option<Vec<tunnel::TunnelSpec>> {
+    let uuid = approvals::server_uuid(conn, server_id as i64)?;
+    let before: Option<String> = conn
+        .query_row("SELECT tunnels FROM temp.synced_tunnels_base WHERE uuid = ?1", [&uuid], |r| r.get(0))
+        .ok()?;
+    let _ = conn.execute("DELETE FROM temp.synced_tunnels_base WHERE uuid = ?1", [&uuid]);
+    Some(before.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default())
+}
+
+/// A session whose server's saved forwards changed by sync since it read them
+/// starts again from the saved ones (with this device's holds), before the
+/// user sees or changes its rules. The session saves after every change, so
+/// it has nothing of its own that isn't saved.
+async fn refresh_synced_session_rules(state: &SshState, db_state: &DbState, session_id: &str, server_id: Option<i32>) -> Result<(), String> {
+    let server_id = server_id.unwrap_or(0);
+    if server_id <= 0 {
+        return Ok(());
+    }
+    let stale = {
+        let conn_guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+        let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        take_synced_tunnels_base(conn, server_id).is_some()
+    };
+    if stale {
+        let saved = saved_tunnel_rules(db_state, server_id)?;
+        if let Some(rules) = state.session_tunnel_specs.lock().await.get_mut(session_id) {
+            *rules = saved;
+        }
+    }
+    Ok(())
+}
+
 /// The forwarding rules saved on a node (its `tunnels` column).
 fn saved_tunnel_rules(db_state: &DbState, server_id: i32) -> Result<Vec<tunnel::TunnelSpec>, String> {
     let conn_guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
@@ -13354,6 +13536,7 @@ async fn ensure_session_rules(
     session_id: &str,
     server_id: Option<i32>,
 ) -> Result<(), String> {
+    refresh_synced_session_rules(state, db_state, session_id, server_id).await?;
     let server_id = server_id.unwrap_or(0);
     if server_id <= 0 || state.session_tunnel_specs.lock().await.contains_key(session_id) {
         return Ok(());
@@ -13458,6 +13641,7 @@ async fn list_tunnel_rules(
     session_id: String,
     server_id: Option<i32>,
 ) -> Result<Vec<tunnel::TunnelSpec>, String> {
+    refresh_synced_session_rules(state.inner(), db_state.inner(), &session_id, server_id).await?;
     if let Some(rules) = state.session_tunnel_specs.lock().await.get(&session_id) {
         return Ok(rules.clone());
     }
@@ -13550,22 +13734,23 @@ async fn persist_session_tunnels(
     let Some(mut specs) = state.session_tunnel_specs.lock().await.get(&session_id).cloned() else {
         return Ok(());
     };
+    let mut merged = false;
     {
         // Scoped so the non-Send rusqlite guard drops before save_vault_internal.
         let conn_guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        let saved: Vec<tunnel::TunnelSpec> = conn
+            .query_row("SELECT tunnels FROM servers WHERE id=?1", [server_id], |r| r.get::<_, Option<String>>(0))
+            .ok()
+            .flatten()
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
         // A forward held for this device's OK sits stopped in the session only
         // on this device. What is saved keeps the node's own stopped flag for
         // it, so the hold never reaches the people the profile is shared with.
         if let Some(uuid) = approvals::server_uuid(conn, server_id as i64) {
             let held = approvals::held_for(conn, &uuid);
             if held.iter().any(|i| i.starts_with("tunnel:")) {
-                let saved: Vec<tunnel::TunnelSpec> = conn
-                    .query_row("SELECT tunnels FROM servers WHERE id=?1", [server_id], |r| r.get::<_, Option<String>>(0))
-                    .ok()
-                    .flatten()
-                    .and_then(|j| serde_json::from_str(&j).ok())
-                    .unwrap_or_default();
                 for spec in specs.iter_mut().filter(|s| held.contains(&approvals::tunnel_item(s))) {
                     if let Some(s) = saved.iter().find(|s| *s == &*spec) {
                         spec.stopped = s.stopped;
@@ -13573,12 +13758,26 @@ async fn persist_session_tunnels(
                 }
             }
         }
+        // Sync changed the saved forwards after this session last read them
+        // (between the change and this save): the session's change goes on
+        // top of what's saved now, rather than its whole list over it.
+        if let Some(base) = take_synced_tunnels_base(conn, server_id) {
+            specs = tunnel::merge_rules(&base, &specs, &saved);
+            merged = true;
+        }
         let json = serde_json::to_string(&specs).unwrap_or_else(|_| "[]".to_string());
         conn.execute(
             "UPDATE servers SET tunnels=?1 WHERE id=?2",
             rusqlite::params![json, server_id],
         )
         .map_err(|e| format!("[DATABASE] TUNNELS_SAVE_FAILED: SQL_ERROR={}", e))?;
+    }
+    if merged {
+        // The session lists what was saved, with this device's holds.
+        let saved = saved_tunnel_rules(db_state.inner(), server_id)?;
+        if let Some(rules) = state.session_tunnel_specs.lock().await.get_mut(&session_id) {
+            *rules = saved;
+        }
     }
     save_vault_internal(&db_state)?;
     Ok(())
@@ -13602,6 +13801,7 @@ async fn restart_session_tunnels(
     // list (even empty) is authoritative (user stopped everything); only seed
     // from the node's saved tunnels when the key is ABSENT (first engagement),
     // so explicitly-stopped tunnels don't resurrect on a restore.
+    refresh_synced_session_rules(state.inner(), db_state.inner(), &session_id, Some(server_id)).await?;
     let existing: Option<Vec<tunnel::TunnelSpec>> =
         state.session_tunnel_specs.lock().await.get(&session_id).cloned();
     let mut specs: Vec<tunnel::TunnelSpec> = existing.clone().unwrap_or_default();
