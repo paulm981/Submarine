@@ -15,6 +15,8 @@ When the `## Next release` heading has entries from a release that has already b
 
 - Rust, in `src-tauri`: `cargo test --locked` and `cargo clippy --locked --lib` with no more warnings than `.github/clippy-warnings` allows. The tests need a stand-in page: `mkdir -p dist && [ -f dist/index.html ] || echo '<!doctype html><title>Submarine</title>' > dist/index.html`.
 - Frontend: `npm run typecheck` and `npm run build`.
+- `src-tauri/src/lib.rs` keeps CRLF line endings on every line, as the original project has it: `grep -c $'\r$'` must equal `wc -l`. An editor or tool that writes LF there makes every line conflict at the next merge.
+- Syncing with the original project: FORK.md's "Keeping up with the original project".
 - The pull request template's checklist, including saying plainly when something wasn't tried in the app.
 
 ## Writing

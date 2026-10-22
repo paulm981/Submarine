@@ -17,7 +17,7 @@
 
 ## What this fork adds
 
-The tour with more pictures is in [FORK.md](FORK.md), along with where the fork differs from the original project and how it keeps up with it. What changed in each build is in [CHANGELOG.md](CHANGELOG.md).
+The tour with more pictures is in [FORK.md](FORK.md), along with where the fork differs from the original project and how it keeps up with it. What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
 <table>
   <tr>
@@ -46,9 +46,10 @@ The tour with more pictures is in [FORK.md](FORK.md), along with where the fork 
 - **Session import that keeps your setup**: from MobaXterm, nested folders, saved logins, jump hosts and their keys, startup commands such as `dzdo su -`, and Remote Desktop sessions come over as they were, and a result screen says what came in. PuTTY and OpenSSH config imports are there too.
 
 **Work on many servers at once**
-- **Walls with broadcast input**: terminals from many servers side by side. With Broadcast on, typing goes to all of them. Click into one to type to it alone, pause the ones to leave out (several at once: Ctrl-click their titles, or **Pause all** and resume the few you want), or paste or send a set of commands to all. A server that connects or reconnects partway through a line waits for the next one, so it never gets only the end of a command. Walls can be saved by name, and a whole folder opens as one.
+- **Walls with broadcast input**: terminals from many servers side by side. With Broadcast on, typing goes to all of them. Click into one to type to it alone, pause the ones to leave out (several at once: Ctrl-click their titles, or **Pause all** and resume the few you want), or paste or send a set of commands to all. A server that connects or reconnects partway through a line waits for the next one, so it never gets only the end of a command. Walls can be saved by name, and a whole folder opens as one. Closing a Wall can remember whether to put its tabs back or close them, and still asks first when a transfer, archive job, mirror or unsent Live Edit change is under way.
 - **Many tabs, easily**: **Ctrl+Shift+K** jumps to a tab by typing part of its name, **Ctrl+Tab** moves between tabs, and a tab's right-click menu closes the others, those to the right, the disconnected ones, or all of them.
-- **Jump hosts at scale**: a hundred servers behind one jump host log in a few at a time (the limit is a setting), and Monitoring reaches servers through their jump host too.
+- **Jump hosts at scale**: a hundred servers behind one jump host log in a few at a time (the limit is a setting), and Monitoring reaches servers through their jump host too. **Jump via** in the server form is a search box.
+- **Your `~/.ssh/config`**: ProxyJump chains, IdentityFile keys and certificates (Teleport included), and your known_hosts. Submarine's own trusted host keys always come first, so a changed key always gets the warning. [More in FORK.md](FORK.md#jump-hosts-and-your-ssh-config).
 - **Split**: a second shell on the same server beside the first, to watch a log in one and work in the other.
 
 **Organize them**
@@ -57,10 +58,12 @@ The tour with more pictures is in [FORK.md](FORK.md), along with where the fork 
 - **OS badges** on servers, and a look of their own for Remote Desktop links.
 
 **AI help, without sharing keys** (a first test, off by default)
-- **Claude Code from Home's menu**, already connected to Submarine. Share a server's tab with it, and it can ask to run commands there. Each one waits in the **AI panel** until you click Allow; the AI never gets a key or password, and the output it gets has known secrets hidden. Every request is logged. The design, and what comes next, is in [#32](https://github.com/paulm981/Submarine/issues/32).
+- **Turn it on** in **Settings › AI tools**, then start **Claude Code** from Home's menu (the arrow beside **+**, then **AI tools**). It opens already connected to Submarine, through a local channel only your account can use.
+- **Share with AI** on a server's tab, and it can ask to run commands there. Each one waits in the **AI panel** until you click Allow. **Ctrl+Shift+L** shows the AI beside the tab.
+- **How it stays safe**: Submarine runs each command on its own connection, so the AI never gets a key or password. The output it gets has known secrets hidden, and every request is logged. A hostile program running as you could still get round it, so run Claude Code with its sandbox on. [More in FORK.md](FORK.md#ai-help-without-sharing-keys); what comes next is in [#32](https://github.com/paulm981/Submarine/issues/32).
 
 **Root when you need it**
-- **SFTP root mode and Info panel actions as root** through `sudo` or `dzdo` (Centrify / Delinea): without a password where the server allows it, including servers that only allow `dzdo su -`.
+- **SFTP root mode, Info panel actions and Docker as root** through `sudo` or `dzdo` (Centrify / Delinea): without a password where the server allows it, including servers that only allow `dzdo su -`, and with csh or tcsh logins. A password you type goes only to sudo or dzdo, and a wrong one costs a single failed attempt, so it can't lock your account.
 
 **A better terminal**
 - **xterm.js 6** with color schemes (Campbell, One Half, Solarized, Dracula, Nord, Tokyo Night, Catppuccin, Gruvbox), and a scheme per server that syncs with it.
@@ -73,9 +76,10 @@ The tour with more pictures is in [FORK.md](FORK.md), along with where the fork 
 - **Sync through storage you own**: a folder that OneDrive, Dropbox, Nextcloud, Syncthing or a network share keeps the same on your computers, or a private git repository, with no third-party service. Profiles are encrypted with their password first, and Remote Desktop links sync too. The original project's hosted cloud stays off unless you turn it on.
 
 **Ready to roll out to a team**
-- **A release from every change**, numbered like `v0.4.0-fork.2` and shown in the title bar, with a notice when there's a newer one.
+- **A release from every change**, numbered like `v0.4.0-fork.8` and shown in the title bar, with a notice when there's a newer one.
+- **Shared profiles that can't act behind your back**: when someone you share a profile with changes on-connect commands, autostart, forwards or monitor commands, or switches a server to telnet or VNC, it waits for your OK on your computer. [More in FORK.md](FORK.md#shared-profiles).
 - **Troubleshooting**: a log on your computer, a watchdog that notes when the window froze and why, and **Copy diagnostics** with server, user and host names replaced, ready to send to whoever is helping. When a connect fails, Submarine says whether the name resolved and the port answered.
-- **Hardening**: characters that disguise a file name are shown plainly, and a trusted server that shows a different kind of key is a warning, not a silent change. Live Edit opens a file in an editor and never runs it, and the Local pane asks before it opens a file that would run, on Windows, macOS and Linux. Downloads are marked as from the internet on Windows and macOS. As in the original project, a program on a server isn't opened from the file pane at all.
+- **Hardening**: characters that disguise a file name are shown plainly, and a trusted server that shows a different kind of key is a warning, not a silent change. Live Edit opens a file in an editor and never runs it, and keeps changes that didn't reach the server in **Submarine unsent edits** in your Downloads folder. The Local pane asks before it opens a file that would run, on Windows, macOS and Linux. Downloads never replace each other, and are marked as from the internet on Windows and macOS. A mirror keeps a file's permissions on the server. As in the original project, a program on a server isn't opened from the file pane at all.
 - **Close to the original project**: its changes come in through regular sync pull requests, and [FORK.md](FORK.md) lists where the fork differs and what it hasn't taken yet.
 
 The original project's README follows.
@@ -188,7 +192,7 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 - **Per-pane filter input** — type to filter the listing live with an N/M counter, Esc to clear
 - **Multi-select with Ctrl/Shift-click** plus **Select-All button and Ctrl+A** for bulk download, move, or delete
 - **Overwrite confirmation** before clobbering an existing file (both uploads AND downloads — no more silent drag-drop clobber), with "apply to all" for batches
-- **Live edit** — double-click any remote file to open it in your default editor; saves auto-upload back to the server
+- **Live edit** — double-click any remote file to open it in an editor (the one picked in Settings › Live Edit, or the system's text editor; it's never run); saves auto-upload back to the server
 - **Direct download** to the local folder you already have open — no folder picker every time
 - Permissions editor with a checkbox grid (chmod / chown)
 - Drag files in from your OS file manager to upload
@@ -226,7 +230,7 @@ Manage Docker on any session host without typing a single `docker` command.
 - **Compose viewer per container** — reads the compose file path from container labels and shows the YAML inline
 - **Safe Prune** scopes only (containers / images / networks / builder / system) — never `--volumes`, never `-a` so nothing important gets eaten
 - **Container terminal** — open an interactive `docker exec` shell as a new session tab
-- Cross-platform (Linux / macOS / Windows hosts) — tries `docker` first, falls back to `sudo -n docker` on permission errors
+- Cross-platform (Linux / macOS / Windows hosts) — tries `docker` first; where only root may use Docker, runs it as root through `sudo` or `dzdo`, asking for the password when the server needs one
 
 ### Port Forwarding
 
@@ -249,7 +253,7 @@ Manage Docker on any session host without typing a single `docker` command.
 - **Autostart**: flag a server and it opens and connects when the app launches
 - **Resource monitor**: live CPU, RAM, disk, and network sparklines per host
 - **Quick connect**: one-off sessions without saving
-- **TOFU host keys**: first-use prompt with fingerprint, pinned afterwards
+- **TOFU host keys**: first-use prompt with fingerprint, pinned afterwards. With **Use settings from ~/.ssh/config** on (the default), a key your `~/.ssh/known_hosts` lists skips the first prompt, but a changed key always gets the warning
 
 ## Install
 
@@ -264,7 +268,7 @@ Download from the **[latest release](https://github.com/paulm981/Submarine/relea
 | Arch / Manjaro / EndeavourOS | `Submarine-linux-x86_64.pkg.tar.zst` — `sudo pacman -U Submarine-linux-x86_64.pkg.tar.zst` |
 | Any Linux | `Submarine-linux-x86_64.AppImage` — `chmod +x` and double-click |
 
-To update, run the newer setup `.exe` over the installed one. Submarine tells you when there is one: the profile screen shows *"New version v0.4.0-fork.3 available"*. Each release has the original project's version and the fork's count, `v0.4.0-fork.1`, `v0.4.0-fork.2` and so on, in the title bar and at the bottom of the profile screen. To install on many PCs, the setup `.exe` runs silently with `/S`.
+To update, run the newer setup `.exe` over the installed one. Submarine tells you when there is one: the profile screen shows *"New version v0.4.0-fork.9 available"*. Each release has the original project's version and the fork's count, `v0.4.0-fork.1`, `v0.4.0-fork.2` and so on, in the title bar and at the bottom of the profile screen. To install on many PCs, the setup `.exe` runs silently with `/S`.
 
 Every release is on the [releases page](https://github.com/paulm981/Submarine/releases). The Android `.apk` comes from the [original project's releases](https://github.com/sinaxhpm/submarine/releases).
 
