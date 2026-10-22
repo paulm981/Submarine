@@ -27,12 +27,13 @@ import { PendingCard } from "./AiPanel";
 // it, and has its requests' Allow and Deny — the AI panel's own cards, with
 // the same care: a single click only, never a key, not just after they move.
 //
-// The keyboard goes into the AI only when you ask (#116): Ctrl+Shift+L, or
-// the pane opened from the keyboard. A click leaves it where it was, and an
-// AI tool still starting doesn't take it once you've typed or clicked
-// elsewhere: its own questions are answered with Enter, so typing meant for
-// the server mustn't land there. Of the two terminals, the one with the
-// keyboard is bright and the other dimmed.
+// The keyboard goes into the AI only when you put it there (#116): a click
+// in its terminal, or the pane opened with a key on its own button. Opening
+// or folding it otherwise (a click, Ctrl+Shift+L, an AI tool started from
+// the + menu) leaves the keyboard where it was: the AI tool's own questions
+// are answered with Enter, so typing meant for the server mustn't land
+// there. Of the two terminals, the one with the keyboard is bright and the
+// other dimmed.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// What's on screen, as the pane needs it (DesktopApp).
@@ -162,9 +163,9 @@ export const AiSidePane = ({ v, onHome, onGoToServer }: {
   const started = pane.starting && ai.tabs.some((t) => t.id === pane.starting!.id) ? pane.starting.id : null;
   useEffect(() => { if (started) aiStarted(started); }, [started]);
 
-  // Where the keyboard goes as it opens or folds: into the AI when you open
-  // it from the keyboard, back to this tab's terminal when you fold it from
-  // inside. Opened with a click, it stays where it was.
+  // Where the keyboard goes as it opens or folds: into the AI only when you
+  // open it with a key on its own button, back to this tab's terminal when
+  // you fold it from inside. Otherwise it stays where it was.
   const paneRef = useRef<HTMLElement | null>(null);
   // Keys pressed and clicks anywhere, counted: the AI takes the keyboard
   // only if nothing was pressed or clicked since it was asked to.
@@ -181,27 +182,16 @@ export const AiSidePane = ({ v, onHome, onGoToServer }: {
   // The count when the AI was asked to take the keyboard, until it has.
   const focusAi = useRef<number | null>(null);
   const askFocus = () => { focusAi.current = inputs.current; };
-  /// `fromKeys`: Ctrl+Shift+L, or a button pressed with the keyboard.
-  /// `hotkey`: Ctrl+Shift+L, which with the pane open and the keyboard
-  /// elsewhere moves the keyboard into the AI rather than folding it.
-  const act = (fromKeys: boolean, hotkey = false) => {
+  /// `intoAi`: the pane's own button, pressed with a key: opening it puts
+  /// the keyboard in the AI.
+  const act = (intoAi: boolean) => {
     const fromInside = !!paneRef.current?.contains(document.activeElement);
-    if (hotkey && m.open && !fromInside && current) {
-      askFocus();
-      const entry = dockedTerminal(current.id);
-      if (entry) requestAnimationFrame(() => { if (focusAi.current !== null) { focusAi.current = null; entry.term.focus(); } });
-      return;
-    }
     const opening = toggle(v, m);
-    if (opening && fromKeys) askFocus();
+    if (opening && intoAi) askFocus();
     else if (!opening && fromInside && v.session) {
       requestAnimationFrame(() => dockedTerminal(v.session!.terminalId)?.term.focus());
     }
   };
-  // Started from this tab's + menu: it takes the keyboard once it's here,
-  // unless you've typed or clicked since.
-  const startingId = pane.starting?.id;
-  useEffect(() => { if (startingId) askFocus(); }, [startingId]);
   const keysIn = useKeysIn(paneRef, m.open);
   const actRef = useRef(act);
   actRef.current = act;
@@ -216,7 +206,7 @@ export const AiSidePane = ({ v, onHome, onGoToServer }: {
       if (e.repeat || inField()) return;
       if (document.querySelector('[aria-modal="true"]')) return;
       e.preventDefault();
-      actRef.current(true, true);
+      actRef.current(false);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -436,9 +426,8 @@ const AiTerminalSlot = ({ terminalId, wantFocus, inputs, dim }: {
     return claimTerminal(terminalId, slot);
   }, [terminalId]);
   const entry = dockedTerminal(terminalId);
-  // Opened from the keyboard, or just started from this tab: the keyboard
-  // goes to the AI once its terminal is here, unless a key was pressed or a
-  // click made since.
+  // Opened with a key on its button: the keyboard goes to the AI once its
+  // terminal is here, unless a key was pressed or a click made since.
   useEffect(() => {
     if (!entry || wantFocus.current === null) return;
     const id = requestAnimationFrame(() => {
