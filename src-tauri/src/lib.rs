@@ -10716,6 +10716,8 @@ pub(crate) fn ssh_preferred_algorithms() -> russh::Preferred {
         // Never advertise `*-cert-v01@openssh.com` host-key algorithms: there
         // is no CA trust store, so servers must present their plain host key
         // (TOFU via known_hosts). See ssh_manager::plain_host_key.
+        // fork: until upstream #170 (host certificates checked against
+        // @cert-authority lines in known_hosts).
         host_key_certificates: Cow::Borrowed(&[]),
         cipher: Cow::Borrowed(CIPHER),
         mac: Cow::Borrowed(MAC),
@@ -11239,8 +11241,9 @@ mod ssh_config_tests {
 /// path but returns only what a jump hop needs (host, port, user, password,
 /// optional key). Deliberately kept separate from `initiate_connection`'s
 /// inline resolver so the primary connection path is byte-for-byte untouched.
-/// It never reads `jump_host_id`, which makes ProxyJump strictly single-hop —
-/// there is no way for it to recurse.
+/// It never reads `jump_host_id`: a saved jump host's own saved jump host
+/// isn't followed, so saved rows (synced, maybe shared) never make a chain.
+/// Chains come only from this device's ~/.ssh/config (`config_jump_chain`).
 ///
 /// Runs fully synchronously (no `.await`) so the non-`Send` rusqlite
 /// `Connection` never has to be held across a suspension point.

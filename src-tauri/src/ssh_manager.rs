@@ -47,6 +47,7 @@ pub(crate) fn key_type_family(key_type: &str) -> String {
 /// `host_key_certificates` empty, so no `*-cert-v01@openssh.com` host-key
 /// algorithm is advertised and a compliant server presents its plain host key
 /// (the TOFU path).
+// fork: until upstream #170 (it trusts host certificates from a known_hosts CA).
 pub fn plain_host_key(offered: &PublicKeyOrCertificate) -> Option<&PublicKey> {
     match offered {
         PublicKeyOrCertificate::PublicKey { key, .. } => Some(key),
