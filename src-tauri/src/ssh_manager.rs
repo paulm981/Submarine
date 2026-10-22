@@ -431,6 +431,52 @@ pub struct SshState {
     /// or a dedicated `::sftp` / `::fwd` secondary reuses what the user already
     /// supplied instead of prompting again. See `PromptedSecrets`.
     pub prompted_secrets: Arc<Mutex<HashMap<String, PromptedSecrets>>>,
+    /// Terminals whose shell is still opening (open_terminal,
+    /// open_container_terminal). Locked before `terminal_txs` when both are.
+    pub terminal_openings: Arc<Mutex<TerminalOpenings>>,
+}
+
+/// Which terminals are still opening, so a close that arrives while one is
+/// (the page closed the tab before the server answered) isn't lost: opening
+/// a shell waits on the server, and the terminal is registered only at the
+/// end. Without this, the close found nothing, the open then registered the
+/// terminal, and its shell kept running on the server with nobody to see it.
+/// As local_term.rs does for Home terminals.
+///
+/// Each open gets a number. A close forgets the terminal's number, as does a
+/// newer open of the same terminal (a reconnect): at the end, an open whose
+/// number isn't the terminal's any more closes its channel and registers
+/// nothing.
+#[derive(Default)]
+pub struct TerminalOpenings {
+    last: u64,
+    opening: HashMap<String, u64>,
+}
+
+impl TerminalOpenings {
+    /// An open of `terminal_id` starts; keep the number for `finish`.
+    pub fn begin(&mut self, terminal_id: &str) -> u64 {
+        self.last += 1;
+        self.opening.insert(terminal_id.to_string(), self.last);
+        self.last
+    }
+
+    /// The page closed `terminal_id`: an open still under way is let go.
+    pub fn close(&mut self, terminal_id: &str) {
+        self.opening.remove(terminal_id);
+    }
+
+    /// The open numbered `n` ended (opened or failed). True when the
+    /// terminal is still wanted from it: register it, holding this lock
+    /// until it's in `terminal_txs` so a close can't come in between.
+    pub fn finish(&mut self, terminal_id: &str, n: u64) -> bool {
+        if self.opening.get(terminal_id) == Some(&n) {
+            self.opening.remove(terminal_id);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// How an Info panel action gets root on a tab's server: the tool that let
@@ -543,6 +589,7 @@ impl SshState {
             terminal_servers: Arc::new(Mutex::new(HashMap::new())),
             sftp_shell: Arc::new(Mutex::new(HashSet::new())),
             prompted_secrets: Arc::new(Mutex::new(HashMap::new())),
+            terminal_openings: Arc::new(Mutex::new(TerminalOpenings::default())),
         }
     }
 }
@@ -1215,6 +1262,45 @@ impl client::Handler for ClientHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_terminal_closed_while_opening_is_not_registered() {
+        let mut t = TerminalOpenings::default();
+        let n = t.begin("s-term-0");
+        t.close("s-term-0");
+        assert!(!t.finish("s-term-0", n));
+        // Nothing left behind for the next open of that terminal.
+        let m = t.begin("s-term-0");
+        assert!(t.finish("s-term-0", m));
+        assert!(t.opening.is_empty());
+    }
+
+    #[test]
+    fn a_terminal_left_open_is_registered_once() {
+        let mut t = TerminalOpenings::default();
+        let n = t.begin("a");
+        let other = t.begin("b");
+        assert!(t.finish("a", n));
+        // A late close of another terminal, or a second finish, changes nothing.
+        t.close("c");
+        assert!(!t.finish("a", n));
+        assert!(t.finish("b", other));
+    }
+
+    #[test]
+    fn a_newer_open_of_the_same_terminal_wins() {
+        let mut t = TerminalOpenings::default();
+        let old = t.begin("a");
+        let new = t.begin("a");
+        assert!(!t.finish("a", old));
+        assert!(t.finish("a", new));
+        // Closed between two opens: only the open after the close counts.
+        let first = t.begin("a");
+        t.close("a");
+        let second = t.begin("a");
+        assert!(!t.finish("a", first));
+        assert!(t.finish("a", second));
+    }
 
     #[tokio::test]
     async fn one_host_key_question_at_a_time() {

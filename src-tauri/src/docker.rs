@@ -813,34 +813,49 @@ pub async fn open_container_terminal(
     // As root as this tab's other docker commands are (run_docker_smart).
     // `password`: the page asked for it when root wanted one (rootInvoke).
     let as_root = use_sudo || password.is_some() || state.docker_root.lock().await.contains(&session_id);
-    let (channel, early) = if as_root {
-        let (channel, _, early) = crate::root_channel(&state, &session_id, &args, password, Some((cols, rows))).await?;
-        (channel, early)
-    } else {
-        let session_arc = {
-            let connections = state.connections.lock().await;
-            connections
-                .get(&session_id)
-                .map(Arc::clone)
-                .ok_or_else(|| "Session not connected".to_string())?
-        };
-        let channel = {
-            let session = session_arc.lock().await;
-            session
-                .channel_open_session()
+    // A close while this waits on the server is kept, and the shell is then
+    // closed here rather than left running (TerminalOpenings, ssh_manager.rs).
+    let opening = state.terminal_openings.lock().await.begin(&terminal_id);
+    let opened = async {
+        let opened = if as_root {
+            let (channel, _, early) = crate::root_channel(&state, &session_id, &args, password, Some((cols, rows))).await?;
+            (channel, early)
+        } else {
+            let session_arc = {
+                let connections = state.connections.lock().await;
+                connections
+                    .get(&session_id)
+                    .map(Arc::clone)
+                    .ok_or_else(|| "Session not connected".to_string())?
+            };
+            let channel = {
+                let session = session_arc.lock().await;
+                session
+                    .channel_open_session()
+                    .await
+                    .map_err(|e| e.to_string())?
+            };
+            channel
+                .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
                 .await
-                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            channel
+                .exec(true, Cmd::Docker(args).shell().as_bytes())
+                .await
+                .map_err(|e| e.to_string())?;
+            (channel, Vec::new())
         };
-        channel
-            .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
-            .await
-            .map_err(|e| e.to_string())?;
-        channel
-            .exec(true, Cmd::Docker(args).shell().as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-        (channel, Vec::new())
-    };
+        Ok::<_, String>(opened)
+    }
+    .await;
+    let mut openings = state.terminal_openings.lock().await;
+    let wanted = openings.finish(&terminal_id, opening);
+    let (channel, early) = opened?;
+    if !wanted {
+        drop(openings);
+        let _ = channel.close().await;
+        return Ok(());
+    }
 
     let (tx, rx) = tokio::sync::mpsc::channel::<TerminalCommand>(32);
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(crate::ssh_manager::PtySize {
@@ -857,6 +872,7 @@ pub async fn open_container_terminal(
         .lock()
         .await
         .insert(terminal_id.clone(), resize_tx);
+    drop(openings);
 
     // Same pump as the SSH terminal (see open_terminal): coalesced output,
     // paced to the page (term_output.rs), and a split read/write channel
