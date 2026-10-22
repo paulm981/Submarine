@@ -20814,24 +20814,110 @@ fn is_app_temp_name(name: &str) -> bool {
 /// installed app beside a test build, say), whose live files must not go.
 fn sweep_app_temp(include_own: bool) {
     if include_own {
+        // Let go of this run's lock first: on Windows a file held open
+        // keeps its folder from being removed.
+        drop(APP_TEMP_LOCK.lock().unwrap_or_else(|e| e.into_inner()).take());
         remove_own_temp(app_temp_root());
     }
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
-    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    sweep_old_temp_roots(&std::env::temp_dir(), std::time::Duration::from_secs(24 * 60 * 60));
+}
+
+/// The file in each run's temp root that the run holds locked for as long
+/// as it lives (lock_temp_root). The system lets go of it when the process
+/// ends, however it ends.
+const TEMP_ROOT_LOCK: &str = ".submarine-run.lock";
+
+/// This run's lock on its temp root, taken when the root is made.
+static APP_TEMP_LOCK: StdMutex<Option<std::fs::File>> = StdMutex::new(None);
+
+/// Makes the lock file in `root` and locks it; None where that can't be done.
+fn lock_temp_root(root: &Path) -> Option<std::fs::File> {
+    let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(root.join(TEMP_ROOT_LOCK)).ok()?;
+    file.try_lock().ok()?;
+    Some(file)
+}
+
+/// Removes the temp roots in `temp` that other runs left: ones older than
+/// `age` whose run is over. A run that's still going holds its root's lock
+/// (another copy of the app beside this one), and its root is left alone;
+/// so is one whose lock can't be looked at, or that isn't this user's. A
+/// root from before the lock (no lock file) goes by its age only. Live Edit
+/// copies in a root are kept in `unsent_edits_dir` before it goes: which of
+/// them had edits that never reached the server isn't known any more.
+fn sweep_old_temp_roots(temp: &Path, age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(temp) else { return };
     for e in entries.flatten() {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
         if !is_app_temp_name(name) {
             continue;
         }
-        let old = e
-            .metadata()
-            .and_then(|m| m.modified())
-            .map(|t| t.elapsed().map(|age| age > day).unwrap_or(false))
-            .unwrap_or(false);
-        if old {
-            let _ = std::fs::remove_dir_all(e.path());
+        // The folder itself, never what a link leads to.
+        let Ok(meta) = std::fs::symlink_metadata(e.path()) else { continue };
+        if !meta.is_dir() {
+            continue;
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid has no preconditions and can't fail.
+            if meta.uid() != unsafe { libc::geteuid() } {
+                continue;
+            }
+        }
+        let old = meta.modified().map(|t| t.elapsed().map(|a| a > age).unwrap_or(false)).unwrap_or(false);
+        if !old {
+            continue;
+        }
+        let lock = match std::fs::OpenOptions::new().read(true).open(e.path().join(TEMP_ROOT_LOCK)) {
+            Ok(file) => match file.try_lock() {
+                Ok(()) => Some(file),
+                // Held: that run is still going. Or locks don't work there,
+                // and nothing says it's over.
+                Err(_) => continue,
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => continue,
+        };
+        keep_live_edit_copies_of(&e.path());
+        drop(lock);
+        let _ = std::fs::remove_dir_all(e.path());
+    }
+}
+
+/// Moves every Live Edit copy in another run's temp root
+/// (`sftp_<session>/<hash>/<file>`) to `unsent_edits_dir`, and says so.
+/// Only real folders and regular files: a link is never followed.
+fn keep_live_edit_copies_of(root: &Path) {
+    let real_dirs = |dir: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|rd| rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).collect())
+            .unwrap_or_default()
+    };
+    let Some(folder) = unsent_edits_dir() else { return };
+    let mut kept = Vec::new();
+    for session in real_dirs(root) {
+        if !session.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("sftp_")) {
+            continue;
+        }
+        for copy_dir in real_dirs(&session) {
+            let Ok(files) = std::fs::read_dir(&copy_dir) else { continue };
+            for file in files.flatten() {
+                if !file.file_type().is_ok_and(|t| t.is_file()) {
+                    continue;
+                }
+                if kept.is_empty() && make_unsent_edits_dir(&folder).is_err() {
+                    return;
+                }
+                let name = file.file_name().to_string_lossy().into_owned();
+                if let Some(dest) = move_to_free_name(&file.path(), &folder, &name) {
+                    kept.push(dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name));
+                }
+            }
+        }
+    }
+    if !kept.is_empty() {
+        report_kept(&folder, &kept);
     }
 }
 
@@ -20934,6 +21020,9 @@ fn app_temp_root() -> &'static std::path::PathBuf {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
         }
+        // Held for as long as this run lives, so another copy of the app
+        // sweeping old roots leaves this one alone (sweep_old_temp_roots).
+        *APP_TEMP_LOCK.lock().unwrap_or_else(|e| e.into_inner()) = lock_temp_root(&root);
         root
     })
 }
@@ -21519,6 +21608,37 @@ mod unsent_edits_tests {
         }
         let _ = std::fs::remove_file(kept_dir.join("reopen-edited.txt"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Another run's temp root that's still in use (its lock is held) is
+    /// left alone; one whose run is over goes, its Live Edit copies kept first.
+    #[test]
+    fn the_startup_sweep_leaves_running_copies_alone_and_keeps_live_edit_copies() {
+        let temp = fresh("sweep");
+        let pid = std::process::id();
+        let busy = temp.join(super::app_temp_name(&[1; 12]));
+        let done = temp.join(super::app_temp_name(&[2; 12]));
+        for root in [&busy, &done] {
+            std::fs::create_dir_all(root.join("sftp_session-1/0123456789abcdef")).unwrap();
+            std::fs::create_dir_all(root.join("drag_session-1")).unwrap();
+            std::fs::write(root.join("drag_session-1/dragged.bin"), "x").unwrap();
+        }
+        let busy_copy = busy.join(format!("sftp_session-1/0123456789abcdef/sweep-busy-{pid}.txt"));
+        let done_copy = done.join(format!("sftp_session-1/0123456789abcdef/sweep-done-{pid}.txt"));
+        std::fs::write(&busy_copy, "busy").unwrap();
+        std::fs::write(&done_copy, "edited").unwrap();
+        let held = super::lock_temp_root(&busy).expect("a lock");
+        // The other run's lock file, no longer held by anyone.
+        drop(super::lock_temp_root(&done).expect("a lock"));
+        super::sweep_old_temp_roots(&temp, std::time::Duration::ZERO);
+        assert!(busy_copy.exists(), "a run that's still going keeps its folder");
+        assert!(!done.exists(), "a finished run's folder is removed");
+        let kept_dir = super::unsent_edits_dir().unwrap();
+        assert_eq!(std::fs::read_to_string(kept_dir.join(format!("sweep-done-{pid}.txt"))).unwrap(), "edited");
+        assert!(!kept_dir.join("dragged.bin").exists(), "drag copies aren't edits");
+        drop(held);
+        let _ = std::fs::remove_file(kept_dir.join(format!("sweep-done-{pid}.txt")));
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     /// Quitting the app removes its temp folder; a Live Edit copy in it with
