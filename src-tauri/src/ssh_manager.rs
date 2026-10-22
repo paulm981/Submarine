@@ -47,6 +47,7 @@ pub(crate) fn key_type_family(key_type: &str) -> String {
 /// `host_key_certificates` empty, so no `*-cert-v01@openssh.com` host-key
 /// algorithm is advertised and a compliant server presents its plain host key
 /// (the TOFU path).
+// fork: until upstream #170 (it trusts host certificates from a known_hosts CA).
 pub fn plain_host_key(offered: &PublicKeyOrCertificate) -> Option<&PublicKey> {
     match offered {
         PublicKeyOrCertificate::PublicKey { key, .. } => Some(key),
@@ -369,7 +370,7 @@ pub struct SshState {
     /// here purely to keep it (and thus the direct-tcpip channel carrying the
     /// target's transport) alive for the session's lifetime. Removed — and so
     /// dropped/closed — on reconnect teardown, disconnect, and profile close.
-    pub jump_connections: Arc<Mutex<HashMap<String, client::Handle<ClientHandler>>>>,
+    pub jump_connections: Arc<Mutex<HashMap<String, Vec<client::Handle<ClientHandler>>>>>,
     pub terminal_txs: Arc<Mutex<HashMap<String, mpsc::Sender<TerminalCommand>>>>,
     /// Per-terminal "last requested PTY size" watch. The PTY task selects
     /// on this in parallel with `terminal_txs` and forwards `window_change`

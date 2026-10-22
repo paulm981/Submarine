@@ -65,7 +65,8 @@ function JumpLoginLimit() {
         <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
           When many servers behind one jump host open at once (a folder opened as a wall), this many log in to it
           together and the rest wait their turn — a jump host turns away logins past its own limit (OpenSSH starts
-          at 10). 0 means no limit. Servers reached directly aren't held back.
+          at 10). Each jump host in a ProxyJump chain from ~/.ssh/config has its own line too: shared with a saved
+          jump host at the same address, or, behind another jump host, its own for that way there. 0 means no limit. Servers reached directly aren't held back.
         </p>
         {error && <p className="text-[11px] text-red-400 mt-1">{error}</p>}
       </div>
@@ -438,7 +439,8 @@ function SshConfigSetting({ settings, setSettings }: any) {
             Connect the way the OpenSSH client would: a server whose address is an alias in
             ~/.ssh/config connects to its HostName and Port, takes its User when no username is
             saved, uses the ssh-agent IdentityAgent names, and goes through its ProxyCommand (such
-            as cloudflared or tsh) unless the server has a jump host or proxy of its own. Host
+            as cloudflared or tsh) or ProxyJump unless the server has a jump host or proxy of its
+            own. Host
             blocks are matched against a server's address and its name; Include and Match are
             followed, Match exec is never run. The file is only read, and nothing from it is
             synced. Turn off to use only what's saved for each server.

@@ -50,6 +50,8 @@ pub(crate) struct TestServer {
     /// After an `open-back` exec: each kind of channel the server tried to
     /// open towards the client, and whether the client accepted it.
     pub opened_back: Arc<std::sync::Mutex<Vec<(&'static str, bool)>>>,
+    /// A `direct-tcpip` open is never answered (a jump host that hangs).
+    stall_direct_tcpip: bool,
 }
 
 /// How the test server runs `exec` commands with the local `sh` (unix only).
@@ -94,6 +96,11 @@ impl TestServer {
     /// password is asked for too. Passwords are always accepted.
     pub(crate) fn accepting_key(key: Option<russh::keys::PublicKey>, second_factor: bool) -> Self {
         Self { accept_key: key, second_factor, ..Self::default() }
+    }
+
+    /// A jump host that never answers a `direct-tcpip` open.
+    pub(crate) fn stalling_direct_tcpip() -> Self {
+        Self { stall_direct_tcpip: true, ..Self::default() }
     }
 
     /// A server that answers an `sftp` subsystem request with `answer`.
@@ -241,6 +248,14 @@ impl server::Handler for TestServer {
         reply: server::ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self.stall_direct_tcpip {
+            // Kept, never answered.
+            tokio::spawn(async move {
+                let _reply = reply;
+                std::future::pending::<()>().await;
+            });
+            return Ok(());
+        }
         reply.accept().await;
         let (jump_end, target_end) = tokio::io::duplex(256 * 1024);
         let target = TestServer {

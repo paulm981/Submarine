@@ -49,6 +49,7 @@ mod applog;
 mod term_output;
 mod proxy_command;
 mod diagnose;
+mod hop_policy;
 mod ai;
 mod open_policy;
 mod rdp;
@@ -9087,9 +9088,10 @@ enum ConnectRoute {
     Proxy { socks5: bool, host: Option<String>, port: u16 },
     /// Through the ProxyCommand ~/.ssh/config gives the host.
     Command(String),
-    /// Straight there. `unused_jump` is a ProxyJump from ~/.ssh/config,
-    /// which isn't used yet.
-    Direct { unused_jump: Option<String> },
+    /// Through the ProxyJump chain ~/.ssh/config gives the host.
+    ConfigJump(String),
+    /// Straight there.
+    Direct,
 }
 
 /// The route for a server saved with this jump host and proxy, and the
@@ -9123,15 +9125,17 @@ fn connect_route(
     }
     match config_proxy {
         Some(ssh_config::Proxy::Command(command)) => ConnectRoute::Command(command),
-        Some(ssh_config::Proxy::Jump(spec)) => ConnectRoute::Direct { unused_jump: Some(spec) },
-        _ => ConnectRoute::Direct { unused_jump: None },
+        Some(ssh_config::Proxy::Jump(spec)) => ConnectRoute::ConfigJump(spec),
+        _ => ConnectRoute::Direct,
     }
 }
 
-/// A jump host's transport: TCP, or a ProxyCommand.
+/// A jump host's transport: TCP, a ProxyCommand, or a channel through the
+/// previous hop.
 enum HopStream {
     Tcp(tokio::net::TcpStream),
     Command(proxy_command::ProxyStream),
+    Channel(tunnel::DrainedChannelStream),
 }
 
 impl tokio::io::AsyncRead for HopStream {
@@ -9143,6 +9147,7 @@ impl tokio::io::AsyncRead for HopStream {
         match self.get_mut() {
             HopStream::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             HopStream::Command(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            HopStream::Channel(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -9156,18 +9161,21 @@ impl tokio::io::AsyncWrite for HopStream {
         match self.get_mut() {
             HopStream::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             HopStream::Command(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            HopStream::Channel(s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
     fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             HopStream::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
             HopStream::Command(s) => std::pin::Pin::new(s).poll_flush(cx),
+            HopStream::Channel(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
     fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             HopStream::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             HopStream::Command(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            HopStream::Channel(s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -10708,6 +10716,8 @@ pub(crate) fn ssh_preferred_algorithms() -> russh::Preferred {
         // Never advertise `*-cert-v01@openssh.com` host-key algorithms: there
         // is no CA trust store, so servers must present their plain host key
         // (TOFU via known_hosts). See ssh_manager::plain_host_key.
+        // fork: until upstream #170 (host certificates checked against
+        // @cert-authority lines in known_hosts).
         host_key_certificates: Cow::Borrowed(&[]),
         cipher: Cow::Borrowed(CIPHER),
         mac: Cow::Borrowed(MAC),
@@ -11231,8 +11241,9 @@ mod ssh_config_tests {
 /// path but returns only what a jump hop needs (host, port, user, password,
 /// optional key). Deliberately kept separate from `initiate_connection`'s
 /// inline resolver so the primary connection path is byte-for-byte untouched.
-/// It never reads `jump_host_id`, which makes ProxyJump strictly single-hop —
-/// there is no way for it to recurse.
+/// It never reads `jump_host_id`: a saved jump host's own saved jump host
+/// isn't followed, so saved rows (synced, maybe shared) never make a chain.
+/// Chains come only from this device's ~/.ssh/config (`config_jump_chain`).
 ///
 /// Runs fully synchronously (no `.await`) so the non-`Send` rusqlite
 /// `Connection` never has to be held across a suspension point.
@@ -11315,11 +11326,8 @@ fn resolve_jump_auth(
     Ok(Some((host, port, username, password, key_data)))
 }
 
-/// What a connection through a jump host shares with it: the target session's
-/// prompt plumbing and attempt, and whether the jump host's login may ask for
-/// anything. The original project's shape (it chains several hops, from #169,
-/// which the fork hasn't taken), so its RDP, telnet and VNC code fits as is.
-/// Its fields are connect_jump_host's arguments, spelt as they are there.
+/// What every hop of one connection shares: the target session's prompt
+/// plumbing and attempt, and whether its own login may ask for anything.
 #[allow(clippy::type_complexity)]
 struct HopCtx<'a> {
     app: &'a tauri::AppHandle,
@@ -11332,113 +11340,199 @@ struct HopCtx<'a> {
             std::collections::HashMap<String, tokio::sync::oneshot::Sender<Option<Vec<String>>>>,
         >,
     >,
+    // Per-tab prompted-secret cache + whether this connection may prompt at all
+    // (true only for a primary target; secondaries reuse the cache). Issue #30.
     cache: &'a PromptedSecretsMap,
     allow_prompt: bool,
+    // Set when a hop's login itself failed (rejected or cancelled), so the
+    // caller reports an auth error — auto-reconnect then stops instead of
+    // re-prompting every few seconds.
     auth_failed: &'a std::sync::atomic::AtomicBool,
+    // Set when a hop couldn't be reached or its link broke (a timeout, a
+    // refusal, a dropped handshake), so the caller reports a failure worth
+    // retrying. Not for a host key, a login or a setting, which waiting won't fix.
     network_failed: &'a std::sync::atomic::AtomicBool,
+    // The target session's connect attempt; the hops' prompts belong to it.
     attempt: &'a ssh_manager::ConnectAttempt,
     session_id: &'a str,
+    // The device's "Use keys from an ssh-agent" setting (see AgentSlot).
     use_agent: bool,
+    // fork (#43, D1): which login queue the route's last hop was in.
+    queues: hop_policy::RouteQueues,
 }
 
-/// The jump host `jump_server_id`, logged in, as a chain of one hop: the
-/// fork's jump host is one server (see `connect_jump_host`).
-async fn connect_jump_chain(
+impl HopCtx<'_> {
+    fn log(&self, msg: &str, ty: &str) {
+        use tauri::Emitter;
+        println!("[LOG-{}] [jump] {}", self.session_id, msg);
+        // A superseded attempt stays out of the tab's log.
+        if !self.attempt.is_current_now() {
+            return;
+        }
+        let _ = self.app.emit(
+            &format!("session-log-{}", self.session_id),
+            serde_json::json!({"msg": msg, "type": ty}),
+        );
+    }
+
+    /// `msg` as the error of a hop that couldn't be reached or whose link
+    /// broke (see `network_failed`).
+    fn network_error(&self, msg: String) -> String {
+        self.network_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+        msg
+    }
+}
+
+/// How long a jump host's login may take, prompts included (login_hop).
+const JUMP_LOGIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// How long a jump host may take to open the channel to the next hop or the
+/// server behind it (hop_channel), as for telnet through an SSH server.
+const JUMP_CHANNEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// One jump host to log in to.
+struct Hop {
+    /// Where it is and who logs in, after its own `~/.ssh/config`.
+    target: ConfigTarget,
+    password: Option<String>,
+    key_data: Option<(String, Option<String>, Option<String>)>,
+    /// What the prompted-secret cache knows it as (with its address and user):
+    /// a secret typed for one hop never reaches another host.
+    cache_id: String,
+}
+
+/// More hops than this in one route is a loop in `~/.ssh/config`.
+const MAX_JUMP_HOPS: usize = 8;
+
+/// One `[user@]host[:port]` of a `ProxyJump` list.
+#[derive(Debug, PartialEq)]
+struct JumpHop {
+    user: Option<String>,
+    host: String,
+    port: Option<u16>,
+}
+
+/// A `ProxyJump` value: `[user@]host[:port]` or `ssh://[user@]host[:port]`,
+/// comma-separated, an IPv6 address in brackets.
+fn parse_proxy_jump(spec: &str) -> Result<Vec<JumpHop>, String> {
+    let mut hops = Vec::new();
+    for raw in spec.split(',') {
+        let item = raw.trim();
+        let item = item.strip_prefix("ssh://").unwrap_or(item).trim_end_matches('/');
+        let bad = || format!("ProxyJump {spec:?} in ~/.ssh/config isn't a list of [user@]host[:port]");
+        // As OpenSSH: an ssh:// URI has no path.
+        if item.is_empty() || (raw.trim().starts_with("ssh://") && item.contains('/')) {
+            return Err(bad());
+        }
+        let (user, rest) = match item.rsplit_once('@') {
+            Some((u, r)) if !u.is_empty() => (Some(u.to_string()), r),
+            Some(_) => return Err(bad()),
+            None => (None, item),
+        };
+        let (host, port) = if let Some(inner) = rest.strip_prefix('[') {
+            let (h, after) = inner.split_once(']').ok_or_else(bad)?;
+            match after.strip_prefix(':') {
+                Some(p) => (h.to_string(), Some(p)),
+                None if after.is_empty() => (h.to_string(), None),
+                None => return Err(bad()),
+            }
+        } else {
+            match rest.rsplit_once(':') {
+                // A bare IPv6 address has more than one colon: no port.
+                Some((h, p)) if !h.contains(':') => (h.to_string(), Some(p)),
+                _ => (rest.to_string(), None),
+            }
+        };
+        let port = match port {
+            Some(p) => Some(p.parse::<u16>().ok().filter(|&p| p > 0).ok_or_else(bad)?),
+            None => None,
+        };
+        if host.is_empty() {
+            return Err(bad());
+        }
+        hops.push(JumpHop { user, host, port });
+    }
+    Ok(hops)
+}
+
+#[cfg(test)]
+mod proxy_jump_tests {
+    use super::*;
+
+    fn hop(user: Option<&str>, host: &str, port: Option<u16>) -> JumpHop {
+        JumpHop { user: user.map(str::to_string), host: host.into(), port }
+    }
+
+    #[test]
+    fn proxy_jump_lists_parse_like_openssh() {
+        assert_eq!(parse_proxy_jump("bastion").unwrap(), vec![hop(None, "bastion", None)]);
+        assert_eq!(parse_proxy_jump("alice@bastion:2222").unwrap(), vec![hop(Some("alice"), "bastion", Some(2222))]);
+        assert_eq!(
+            parse_proxy_jump("a, bob@b:22,ssh://c@d:2200/").unwrap(),
+            vec![hop(None, "a", None), hop(Some("bob"), "b", Some(22)), hop(Some("c"), "d", Some(2200))]
+        );
+        assert_eq!(parse_proxy_jump("ssh://h/").unwrap(), vec![hop(None, "h", None)], "a URI's closing / is no path");
+        assert_eq!(parse_proxy_jump("[::1]:2222").unwrap(), vec![hop(None, "::1", Some(2222))]);
+        assert_eq!(parse_proxy_jump("u@[fe80::1]").unwrap(), vec![hop(Some("u"), "fe80::1", None)]);
+        assert_eq!(parse_proxy_jump("fe80::1").unwrap(), vec![hop(None, "fe80::1", None)], "a bare IPv6 address has no port");
+        // A user name may hold an @ (Teleport); the last one splits.
+        assert_eq!(parse_proxy_jump("a@corp.example@b").unwrap(), vec![hop(Some("a@corp.example"), "b", None)]);
+    }
+
+    #[test]
+    fn bad_proxy_jump_lists_are_refused() {
+        for bad in ["", "a,,b", "u@", "@h", ":22", "h:x", "h:0", "h:70000", "[::1", "[::1]x", "ssh://h/x", "ssh://u@h:22/x/"] {
+            assert!(parse_proxy_jump(bad).is_err(), "{bad:?}");
+        }
+    }
+}
+
+/// A `direct-tcpip` channel through `via` to `host:port`, as a transport.
+// fork: the timeout (JUMP_CHANNEL_TIMEOUT) and any handler; upstream's has neither.
+async fn hop_channel<H: russh::client::Handler>(
+    via: &russh::client::Handle<H>,
+    host: &str,
+    port: u16,
+) -> Result<tunnel::DrainedChannelStream, String> {
+    // Always-drained (see tunnel::DrainedChannelStream): a plain ChannelStream
+    // could fill this channel's queue while the next session waits for a
+    // window, block the previous hop's protocol task — which is what delivers
+    // that window — and deadlock the route.
+    hop_channel_within(via, host, port, JUMP_CHANNEL_TIMEOUT).await
+}
+
+/// `hop_channel`, given `limit` to open the channel in.
+async fn hop_channel_within<H: russh::client::Handler>(
+    via: &russh::client::Handle<H>,
+    host: &str,
+    port: u16,
+    limit: std::time::Duration,
+) -> Result<tunnel::DrainedChannelStream, String> {
+    let open = via.channel_open_direct_tcpip(host.to_string(), u32::from(port), "127.0.0.1", 0);
+    match tokio::time::timeout(limit, open).await {
+        Ok(Ok(channel)) => Ok(tunnel::drained_stream(channel)),
+        Ok(Err(e)) => Err(format!("could not open a channel to {host}:{port} through the jump host: {e}")),
+        Err(_) => Err(format!("the jump host didn't open a channel to {host}:{port} within {} seconds", limit.as_secs())),
+    }
+}
+
+/// Establish + authenticate the connection to a ProxyJump intermediate
+/// ("bastion") saved as a server, and return the live `Handle`s of the route
+/// to it, the bastion last. The caller opens a `direct-tcpip` channel over the
+/// last one to reach the real target, then keeps them all alive for the target
+/// session's lifetime (see `SshState::jump_connections`).
+///
+/// Its own SOCKS / HTTP proxy isn't honored; what `~/.ssh/config` says about it
+/// is (its alias, agent, ProxyCommand or ProxyJump). Its host key is verified
+/// through the SAME frontend prompt as the target (events emitted under the
+/// target's `session_id`, keyed by a distinct nonce), and it supports the full
+/// key → password → keyboard-interactive auth ladder.
+async fn connect_jump_host(
     ctx: &HopCtx<'_>,
     jump_server_id: i32,
 ) -> Result<Vec<russh::client::Handle<ssh_manager::ClientHandler>>, String> {
-    connect_jump_host(
-        ctx.app,
-        ctx.db,
-        ctx.fp_txs,
-        ctx.kbi_txs,
-        ctx.cache,
-        ctx.allow_prompt,
-        ctx.auth_failed,
-        ctx.network_failed,
-        ctx.attempt,
-        ctx.session_id,
-        jump_server_id,
-        ctx.use_agent,
-    )
-    .await
-    .map(|handle| vec![handle])
-}
-
-/// How long a jump host's login may take, prompts included (connect_jump_host).
-const JUMP_LOGIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-/// How long a jump host may take to open the channel to the server behind it,
-/// as for telnet through an SSH server.
-const JUMP_CHANNEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// Establish + authenticate an SSH connection to a ProxyJump intermediate
-/// ("bastion") host and return its live `Handle`. The caller opens a
-/// `direct-tcpip` channel over this handle to reach the real target, then keeps
-/// the handle alive for the target session's lifetime (see
-/// `SshState::jump_connections`).
-///
-/// The bastion is reached by a DIRECT TCP connection — its own proxy config, if
-/// any, is not honored (bastions are normally directly reachable). Its host key
-/// is verified through the SAME frontend prompt as the target (events emitted
-/// under the target's `session_id`, keyed by a distinct nonce), and it supports
-/// the full key → password → keyboard-interactive auth ladder.
-#[allow(clippy::too_many_arguments)]
-async fn connect_jump_host(
-    app: &tauri::AppHandle,
-    db: &std::sync::Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
-    fp_txs: &std::sync::Arc<
-        tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
-    >,
-    kbi_txs: &std::sync::Arc<
-        tokio::sync::Mutex<
-            std::collections::HashMap<String, tokio::sync::oneshot::Sender<Option<Vec<String>>>>,
-        >,
-    >,
-    // Per-tab prompted-secret cache + whether this connection may prompt at all
-    // (true only for a primary target; secondaries reuse the cache). Issue #30.
-    cache: &PromptedSecretsMap,
-    allow_prompt: bool,
-    // Set when the bastion login itself failed (rejected or cancelled), so the
-    // caller reports an auth error — auto-reconnect then stops instead of
-    // re-prompting every few seconds.
-    auth_failed: &std::sync::atomic::AtomicBool,
-    // Set when the jump host couldn't be reached or its link broke (a
-    // timeout, a refusal, a dropped handshake), so the caller reports a
-    // failure worth retrying. Not for a host key, a login or a setting,
-    // which waiting won't fix.
-    network_failed: &std::sync::atomic::AtomicBool,
-    // The target session's connect attempt; the bastion's prompts belong to it.
-    attempt: &ssh_manager::ConnectAttempt,
-    session_id: &str,
-    jump_server_id: i32,
-    // The device's "Use keys from an ssh-agent" setting (see AgentSlot).
-    use_agent: bool,
-) -> Result<russh::client::Handle<ssh_manager::ClientHandler>, String> {
-    use tokio::time::Duration;
-    use tauri::Emitter;
-
-    let log = |msg: &str, ty: &str| {
-        println!("[LOG-{}] [jump] {}", session_id, msg);
-        // A superseded attempt stays out of the tab's log.
-        if !attempt.is_current_now() {
-            return;
-        }
-        let _ = app.emit(
-            &format!("session-log-{}", session_id),
-            serde_json::json!({"msg": msg, "type": ty}),
-        );
-    };
-    // `msg` as the error of a jump host that couldn't be reached or whose
-    // link broke (see `network_failed`).
-    let network_error = |msg: String| {
-        network_failed.store(true, std::sync::atomic::Ordering::Relaxed);
-        msg
-    };
-
-    // 1. Resolve the bastion's config synchronously and drop the DB guard
-    //    before any await (rusqlite Connection is not Send).
+    // Resolve the bastion synchronously and drop the DB guard before any await
+    // (rusqlite Connection is not Send).
     let ((host, port, user, password, key_data), jump_name) = {
-        let guard = db.lock().map_err(|_| "[STATE] LOCK_FAILED".to_string())?;
+        let guard = ctx.db.lock().map_err(|_| "[STATE] LOCK_FAILED".to_string())?;
         let conn = guard
             .as_ref()
             .ok_or_else(|| "[STATE] DATABASE_NOT_INITIALIZED".to_string())?;
@@ -11448,65 +11542,156 @@ async fn connect_jump_host(
         }
     };
     // What ~/.ssh/config says about the bastion (its alias, agent, proxy).
-    let (target, bastion_proxy) = ConfigTarget::resolve_jump_host(&host, port, &user, jump_name).await?;
+    let (target, route) = ConfigTarget::resolve_jump_host(&host, port, &user, jump_name).await?;
     for line in &target.log {
-        log(line, "info");
+        ctx.log(line, "info");
     }
+    let hop = Hop { target, password, key_data, cache_id: format!("jump{jump_server_id}") };
+    // The saved jump host is a hop of the route: 1.
+    reach_hop(ctx, hop, route, 1).await
+}
+
+/// A route's hops being connected, boxed: the steps below call each other.
+type HopChain<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<russh::client::Handle<ssh_manager::ClientHandler>>, String>> + Send + 'a>>;
+
+/// The `Handle`s of a `ProxyJump` list from `~/.ssh/config`, in order. Each
+/// hop's own config applies (its alias, user, agent); the first one is reached
+/// the way its config says (directly, its ProxyCommand, or its own ProxyJump),
+/// each later one through the one before. A hop logs in with an ssh-agent key,
+/// else a password asked for (cached for the tab like a saved bastion's).
+fn config_jump_chain<'a>(
+    ctx: &'a HopCtx<'a>,
+    spec: &'a str,
+    depth: usize,
+) -> HopChain<'a> {
+    Box::pin(async move {
+        hop_policy::refuse_tokens(spec)?; // fork (#43, D7): no % tokens yet
+        let hops = parse_proxy_jump(spec)?;
+        // `depth`: the hops already in the route. Every hop of this list
+        // counts before the first hop's own ProxyJump adds its own.
+        let depth = depth + hops.len();
+        if depth > MAX_JUMP_HOPS {
+            return Err(format!(
+                "ProxyJump in ~/.ssh/config: more than {MAX_JUMP_HOPS} hops — a loop between its Host blocks?"
+            ));
+        }
+        let mut chain: Vec<russh::client::Handle<ssh_manager::ClientHandler>> = Vec::new();
+        for (i, jh) in hops.into_iter().enumerate() {
+            let mut target =
+                ConfigTarget::resolve(&jh.host, jh.port.unwrap_or(22), jh.user.as_deref().unwrap_or(""), None).await;
+            // As OpenSSH: the list's own port wins over the hop's config.
+            if let Some(p) = jh.port {
+                target.log.retain(|l| !l.starts_with("~/.ssh/config: Port "));
+                target.port = p;
+            }
+            // Later hops are reached through the list, whatever their config says.
+            let route = if i == 0 { target.proxy(None) } else { None };
+            ctx.log(
+                &format!(
+                    "~/.ssh/config: ProxyJump hop {}{}:{}",
+                    if target.user.trim().is_empty() { String::new() } else { format!("{}@", target.user.trim()) },
+                    target.host,
+                    target.port
+                ),
+                "info",
+            );
+            for line in &target.log {
+                ctx.log(line, "info");
+            }
+            let hop = Hop {
+                cache_id: format!("cfgjump|{}", jh.host),
+                target,
+                password: None,
+                key_data: None,
+            };
+            if i == 0 {
+                chain = reach_hop(ctx, hop, route, depth).await?;
+            } else {
+                let via = chain.last().ok_or("ProxyJump: no previous hop")?;
+                let _turn = hop_policy::hop_turn(ctx, &hop.target, true).await?; // fork (#43, D1): login queue per hop
+                let stream = hop_channel(via, &hop.target.host, hop.target.port).await.map_err(|e| ctx.network_error(e))?;
+                chain.push(login_hop(ctx, hop, HopStream::Channel(stream), None).await?);
+            }
+        }
+        Ok(chain)
+    })
+}
+
+/// Reach `hop` the way `route` (its config's ProxyCommand / ProxyJump, if
+/// any) says, log in, and return the route's `Handle`s ending with it.
+fn reach_hop<'a>(
+    ctx: &'a HopCtx<'a>,
+    hop: Hop,
+    route: Option<ssh_config::Proxy>,
+    depth: usize,
+) -> HopChain<'a> {
+    Box::pin(async move {
+        use tokio::time::Duration;
+        let (host, port) = (hop.target.host.clone(), hop.target.port);
+        match route {
+            Some(ssh_config::Proxy::Jump(spec)) => {
+                ctx.log(&format!("~/.ssh/config: reaching the jump host {host} through ProxyJump {spec}..."), "info");
+                let mut chain = config_jump_chain(ctx, &spec, depth).await?;
+                let via = chain.last().ok_or("ProxyJump: no hops")?;
+                let _turn = hop_policy::hop_turn(ctx, &hop.target, true).await?; // fork (#43, D1): login queue per hop
+                let stream = hop_channel(via, &host, port).await.map_err(|e| ctx.network_error(e))?;
+                let handle = login_hop(ctx, hop, HopStream::Channel(stream), None).await?;
+                chain.push(handle);
+                Ok(chain)
+            }
+            Some(ssh_config::Proxy::Command(command)) => {
+                ctx.log(
+                    &format!("~/.ssh/config: reaching the jump host through ProxyCommand ({})...", proxy_command::program_name(&command)),
+                    "info",
+                );
+                let user = hop.target.user.trim().to_string();
+                let _turn = hop_policy::hop_turn(ctx, &hop.target, false).await?; // fork (#43, D1): login queue per hop
+                let (stream, watch) = start_proxy_command(ctx.app, ctx.session_id, ctx.attempt, &command, &hop.target, &user)?;
+                Ok(vec![login_hop(ctx, hop, HopStream::Command(stream), Some(watch)).await?])
+            }
+            _ => {
+                let _turn = hop_policy::hop_turn(ctx, &hop.target, false).await?; // fork (#43, D1): login queue per hop
+                ctx.log(&format!("Connecting to jump host {host}:{port}..."), "info");
+                let tcp = match tokio::time::timeout(Duration::from_secs(10), tokio::net::TcpStream::connect((host.as_str(), port))).await {
+                    Ok(Ok(s)) => {
+                        let _ = s.set_nodelay(true);
+                        apply_tcp_keepalive(&s);
+                        s
+                    }
+                    Ok(Err(e)) => {
+                        return Err(ctx.network_error(humanize_network_err(&e.to_string(), &host, i32::from(port), "Jump host connection")))
+                    }
+                    Err(_) => return Err(ctx.network_error(format!("jump host {host}:{port} did not respond within 10 seconds"))),
+                };
+                Ok(vec![login_hop(ctx, hop, HopStream::Tcp(tcp), None).await?])
+            }
+        }
+    })
+}
+
+/// The SSH handshake and login with one jump host over `transport`.
+async fn login_hop(
+    ctx: &HopCtx<'_>,
+    hop: Hop,
+    transport: HopStream,
+    proxy_watch: Option<proxy_command::Watch>,
+) -> Result<russh::client::Handle<ssh_manager::ClientHandler>, String> {
+    use tokio::time::Duration;
+    let Hop { target, password, key_data, cache_id } = hop;
     let identity_agent = target.identity_agent();
-    let (host, port, user) = (target.host.clone(), i32::from(target.port), target.user.clone());
-    // A blank bastion username is resolved after the handshake (issue #54).
+    let (host, port, user) = (target.host.clone(), target.port, target.user.clone());
+    // A blank username is resolved after the handshake (issue #54).
     let saved_user = user.trim().to_string();
 
-    // Wait for a turn to log in to this jump host (multiexec.rs), held until
-    // this login is done, so opening a folder of servers behind it doesn't
-    // trip its limit on logins in progress.
-    let _login_turn = multiexec::login_turn(app, jump_server_id, attempt, |limit| {
-        log(
-            &format!("Waiting for a login slot on the jump host ({} logging in at a time)...", limit),
-            "info",
-        )
-    })
-    .await?;
-
-    // 2. TCP to the bastion, or the ProxyCommand ~/.ssh/config gives it.
-    let mut proxy_watch: Option<proxy_command::Watch> = None;
-    let transport = if let Some(ssh_config::Proxy::Command(command)) = &bastion_proxy {
-        log(
-            &format!("~/.ssh/config: reaching the jump host through ProxyCommand ({})...", proxy_command::program_name(command)),
-            "info",
-        );
-        let (stream, watch) = start_proxy_command(app, session_id, attempt, command, &target, &saved_user)?;
-        proxy_watch = Some(watch);
-        HopStream::Command(stream)
-    } else {
-        if let Some(ssh_config::Proxy::Jump(spec)) = &bastion_proxy {
-            log(&format!("~/.ssh/config: ProxyJump {spec} isn't used yet; connecting without it."), "info");
-        }
-        log(&format!("Connecting to jump host {}:{}...", host, port), "info");
-        match tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::net::TcpStream::connect((host.as_str(), port as u16)),
-        )
-        .await
-        {
-            Ok(Ok(s)) => {
-                let _ = s.set_nodelay(true);
-                apply_tcp_keepalive(&s);
-                HopStream::Tcp(s)
-            }
-            Ok(Err(e)) => return Err(network_error(humanize_network_err(&e.to_string(), &host, port, "Jump host connection"))),
-            Err(_) => return Err(network_error(format!("jump host {}:{} did not respond within 10 seconds", host, port))),
-        }
-    };
-
-    // 3. Host-key round-trip: own nonce, shared fp_txs map + frontend session.
+    // Host-key round-trip: own nonce, shared fp_txs map + frontend session.
     let (fp_tx, fp_rx) = tokio::sync::oneshot::channel();
     let jump_nonce: String = {
         let mut bytes = [0u8; 16];
         rand::rng().fill_bytes(&mut bytes);
         hex::encode(bytes)
     };
-    fp_txs.lock().await.insert(jump_nonce.clone(), fp_tx);
+    ctx.fp_txs.lock().await.insert(jump_nonce.clone(), fp_tx);
     let fp_outcome = std::sync::Arc::new(std::sync::atomic::AtomicI8::new(-1));
     let fp_outcome_for_driver = std::sync::Arc::clone(&fp_outcome);
     // Shared with the connect driver so the 15s handshake cap doesn't kill a
@@ -11517,12 +11702,12 @@ async fn connect_jump_host(
     let prompt_epoch_for_driver = std::sync::Arc::clone(&prompt_epoch);
 
     let handler = ssh_manager::ClientHandler {
-        app: app.clone(),
-        session_id: session_id.to_string(),
+        app: ctx.app.clone(),
+        session_id: ctx.session_id.to_string(),
         connect_nonce: jump_nonce.clone(),
         server_host: host.clone(),
-        server_port: port as u16,
-        db: std::sync::Arc::clone(db),
+        server_port: port,
+        db: std::sync::Arc::clone(ctx.db),
         fp_rx: Some(fp_rx),
         forwarded_targets: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         fp_outcome,
@@ -11530,15 +11715,14 @@ async fn connect_jump_host(
         prompt_epoch,
         // Dedicated `::sftp` / `::fwd` connections carry a `::` suffix and
         // have no prompt of their own (see ClientHandler::prompt_allowed).
-        prompt_allowed: !session_id.contains("::"),
-        attempt: attempt.clone(),
+        prompt_allowed: !ctx.session_id.contains("::"),
+        attempt: ctx.attempt.clone(),
         // The watcher probes the session, not the bastion hop.
         last_heard: ssh_manager::LastHeard::default(),
     };
 
-    // 4. Handshake.
-    let config = std::sync::Arc::new(build_ssh_client_config_for(db, &host, port as u16));
-    log("Jump host: SSH handshake...", "info");
+    let config = std::sync::Arc::new(build_ssh_client_config_for(ctx.db, &host, port));
+    ctx.log("Jump host: SSH handshake...", "info");
     // The 15s handshake cap bounds only the pre-prompt transport+kex phase;
     // once check_server_key shows a first-time fingerprint prompt the wait
     // extends to the hard cap so the 90s human window — not this timer — rules.
@@ -11551,19 +11735,19 @@ async fn connect_jump_host(
             &prompt_epoch_for_driver,
             if proxy_watch.is_some() { PROXY_COMMAND_TIMEOUT_CAPS } else { CONNECT_TIMEOUT_CAPS },
         ) => r,
-        _ = attempt.superseded() => {
-            attempt.abandon();
-            fp_txs.lock().await.remove(&jump_nonce);
+        _ = ctx.attempt.superseded() => {
+            ctx.attempt.abandon();
+            ctx.fp_txs.lock().await.remove(&jump_nonce);
             return Err("jump host: the connection attempt was cancelled".into());
         }
     };
     // Given up on: russh's handshake task may still reach the host-key check
     // later, and must not prompt for an attempt nobody is waiting on.
     if connect_res.is_err() {
-        attempt.abandon();
+        ctx.attempt.abandon();
     }
     // The host-key prompt (if any) is resolved by now — drop the sender.
-    fp_txs.lock().await.remove(&jump_nonce);
+    ctx.fp_txs.lock().await.remove(&jump_nonce);
 
     // What the bastion's ProxyCommand said, when there's one.
     let proxy_said = async {
@@ -11582,38 +11766,32 @@ async fn connect_jump_host(
         Ok(Err(e)) if matches!(fp_outcome_for_driver.load(std::sync::atomic::Ordering::SeqCst), 0 | 2) => {
             return Err(format!("jump host handshake failed: {}.{}", e, proxy_said.await))
         }
-        Ok(Err(e)) => return Err(network_error(format!("jump host handshake failed: {}.{}", e, proxy_said.await))),
+        Ok(Err(e)) => return Err(ctx.network_error(format!("jump host handshake failed: {}.{}", e, proxy_said.await))),
         Err(ConnectTimeout::HandshakeStall) => {
-            return Err(network_error(format!("jump host handshake timed out.{}", proxy_said.await)))
+            return Err(ctx.network_error(format!("jump host handshake timed out.{}", proxy_said.await)))
         }
         Err(ConnectTimeout::PromptHardCap) => {
             return Err("jump host host-key prompt timed out — reconnect and approve the fingerprint within 90 seconds".into())
         }
     };
 
-    // 5. Auth ladder: key → password → keyboard-interactive. A bastion saved
-    //    with no secret is prompted for here too (primary target only), cached
-    //    under the target tab's JumpPassword / JumpPassphrase slot (issue #30),
-    //    keyed by this bastion so its secrets never reach another host.
-    let base_id = format!(
-        "{}|jump{}|{}:{}|{}",
-        base_session_id(session_id),
-        jump_server_id,
-        host,
-        port,
-        user.trim()
-    );
+    // Auth ladder: key → password → keyboard-interactive. A hop saved with no
+    // secret (or one from ~/.ssh/config) is prompted for here too (primary
+    // target only), cached under the target tab's JumpPassword /
+    // JumpPassphrase slot (issue #30), keyed by this hop so its secrets never
+    // reach another host.
+    let base_id = format!("{}|{}|{}:{}|{}", base_session_id(ctx.session_id), cache_id, host, port, user.trim());
     let prompt_ctx = SecretPromptCtx {
-        app,
-        session_id,
+        app: ctx.app,
+        session_id: ctx.session_id,
         nonce: &jump_nonce,
-        kbi_txs,
-        cache,
+        kbi_txs: ctx.kbi_txs,
+        cache: ctx.cache,
         base: &base_id,
-        allow_prompt,
-        attempt,
+        allow_prompt: ctx.allow_prompt,
+        attempt: ctx.attempt,
         cancelled: std::sync::atomic::AtomicBool::new(false),
-        agent: AgentSlot::new(use_agent, identity_agent),
+        agent: AgentSlot::new(ctx.use_agent, identity_agent),
         session_unusable: std::sync::atomic::AtomicBool::new(false),
     };
     let (effective_user, user_prompted, login_cancelled) =
@@ -11635,7 +11813,7 @@ async fn connect_jump_host(
         let mut auth_res = if login_cancelled {
             Ok(false)
         } else if let Some((private_key, passphrase, key_name)) = key_data {
-            log("Jump host: private key authentication...", "info");
+            ctx.log("Jump host: private key authentication...", "info");
             let key_label = key_name
                 .filter(|n| !n.trim().is_empty())
                 .unwrap_or_else(|| format!("{}@{}", effective_user.as_str(), host));
@@ -11650,7 +11828,7 @@ async fn connect_jump_host(
             )
             .await
         } else {
-            log("Jump host: password authentication...", "info");
+            ctx.log("Jump host: password authentication...", "info");
             authenticate_password_prompting(
                 &mut session,
                 &effective_user,
@@ -11672,13 +11850,13 @@ async fn connect_jump_host(
             if let Some(kbi_res) = run_keyboard_interactive(
                 &mut session,
                 &effective_user,
-                app,
-                session_id,
+                ctx.app,
+                ctx.session_id,
                 &jump_nonce,
-                kbi_txs,
-                attempt,
+                ctx.kbi_txs,
+                ctx.attempt,
                 kbi_password.as_ref().map(|p| p.as_str()),
-                (!allow_prompt).then_some(&kbi_unasked),
+                (!ctx.allow_prompt).then_some(&kbi_unasked),
             )
             .await
             {
@@ -11690,9 +11868,9 @@ async fn connect_jump_host(
     let ladder_res = tokio::time::timeout(JUMP_LOGIN_DEADLINE, ladder).await;
     release_agent(&prompt_ctx).await;
     // Belt-and-suspenders: no dangling interactive sender for this hop.
-    kbi_txs.lock().await.remove(&jump_nonce);
+    ctx.kbi_txs.lock().await.remove(&jump_nonce);
     let Ok(auth_res) = ladder_res else {
-        return Err(network_error(format!(
+        return Err(ctx.network_error(format!(
             "jump host {}:{} didn't finish the login within {} minutes",
             host,
             port,
@@ -11701,38 +11879,38 @@ async fn connect_jump_host(
     };
 
     if user_prompted && matches!(auth_res, Ok(true)) {
-        cache_store_secret(cache, &base_id, SecretSlot::JumpUsername, effective_user.clone()).await;
+        cache_store_secret(ctx.cache, &base_id, SecretSlot::JumpUsername, effective_user.clone()).await;
     }
 
     match auth_res {
         Ok(true) => {
-            log("Jump host authenticated.", "success");
+            ctx.log("Jump host authenticated.", "success");
             Ok(session)
         }
         Ok(false) if prompt_ctx.cancelled.load(std::sync::atomic::Ordering::Relaxed) => {
-            auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            ctx.auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
             Err("jump host login cancelled".into())
         }
         Ok(false) if kbi_unasked.load(std::sync::atomic::Ordering::Relaxed) => {
-            auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            ctx.auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
             Err(JUMP_ASKS_UNASKED.into())
         }
         Ok(false) => {
-            auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            ctx.auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
             Err("jump host authentication failed".into())
         }
         Err(e) => {
             let kind = classify_russh_error(&e);
             let is_auth = kind.is_auth();
             if is_auth {
-                auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                ctx.auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             if is_auth && prompt_ctx.session_unusable.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(format!("jump host: {}", AGENT_DID_NOT_SIGN));
             }
             let msg = format!("jump host auth error: {}", e);
             if kind.retries() && !prompt_ctx.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(network_error(msg));
+                return Err(ctx.network_error(msg));
             }
             Err(msg)
         }
@@ -11865,11 +12043,15 @@ async fn diagnose_connect(
             let label = hop.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| hop.host.clone());
             let (resolved, proxy) =
                 ConfigTarget::resolve_jump_host(&hop.host, hop.port, hop.user.as_deref().unwrap_or(""), hop.name).await?;
-            // connect_jump_host takes the jump host's ProxyCommand when it has one.
-            if matches!(proxy, Some(ssh_config::Proxy::Command(_))) {
-                diagnose::Route::Command
-            } else {
-                diagnose::Route::Jump { name: label, host: resolved.host, port: resolved.port }
+            // connect_jump_host takes the jump host's ProxyCommand or
+            // ProxyJump when it has one.
+            match proxy {
+                Some(ssh_config::Proxy::Command(_)) => diagnose::Route::Command,
+                Some(ssh_config::Proxy::Jump(spec)) => match first_hop_route(&spec, 1).await {
+                    Some(route) => route,
+                    None => return Ok(Vec::new()),
+                },
+                _ => diagnose::Route::Jump { name: label, host: resolved.host, port: resolved.port },
             }
         }
         ConnectRoute::Proxy { socks5, host: Some(host), port } => {
@@ -11878,9 +12060,24 @@ async fn diagnose_connect(
         // No proxy address to check: the connect says the proxy host is empty.
         ConnectRoute::Proxy { host: None, .. } => return Ok(Vec::new()),
         ConnectRoute::Command(_) => diagnose::Route::Command,
-        ConnectRoute::Direct { .. } => diagnose::Route::Direct,
+        ConnectRoute::ConfigJump(spec) => match first_hop_route(&spec, 0).await {
+            Some(route) => route,
+            None => return Ok(Vec::new()),
+        },
+        ConnectRoute::Direct => diagnose::Route::Direct,
     };
     Ok(diagnose::diagnose(&target.host, target.port, route).await)
+}
+
+/// What `diagnose_connect` checks for a route through the ProxyJump `spec`:
+/// the first hop the connect dials (`hop_policy::first_hop`), with `depth`
+/// hops already in the route (1 behind a saved jump host). `None` when the
+/// list can't be used; the connect says why.
+async fn first_hop_route(spec: &str, depth: usize) -> Option<diagnose::Route> {
+    match hop_policy::first_hop_in_config(spec, depth).await.ok()? {
+        hop_policy::FirstHop::Address { label, host, port } => Some(diagnose::Route::Jump { name: label, host, port }),
+        hop_policy::FirstHop::Command => Some(diagnose::Route::Command),
+    }
 }
 
 #[tauri::command]
@@ -12400,14 +12597,9 @@ async fn initiate_connection(
             }
         }
 
-        // ProxyJump takes precedence over a direct / proxied transport. When a
-        // bastion is configured we connect+auth to it first, then open a
-        // `direct-tcpip` channel to the REAL target over that connection and
-        // use the channel as the transport for the primary handshake — exactly
-        // what `ssh -J bastion target` does. The bastion's own Handle is parked
-        // in `jump_handle_holder` so it lives through the target handshake; on
-        // success it moves into `state_jump_connections` for the session's life.
-        let mut jump_handle_holder: Option<russh::client::Handle<ssh_manager::ClientHandler>> = None;
+        // ProxyJump takes precedence over a direct / proxied transport (see
+        // the route below).
+        let mut jump_handles: Vec<russh::client::Handle<ssh_manager::ClientHandler>> = Vec::new();
         // Set by connect_jump_host when the bastion login itself failed.
         let jump_auth_failed = std::sync::atomic::AtomicBool::new(false);
         // Set by it when a hop couldn't be reached or its link broke.
@@ -12419,41 +12611,52 @@ async fn initiate_connection(
         // The ProxyCommand this connection goes through, if any: what it said
         // when the handshake fails.
         let mut proxy_watch: Option<proxy_command::Watch> = None;
-        let stream_res: Result<Box<dyn AsyncStream>, String> = if let ConnectRoute::Jump(jid) = route {
-            emit_log(&format!("ProxyJump: routing through jump host (server id {})...", jid), "info");
-            match connect_jump_host(&app, &db_for_jump, &fp_txs_clone, &kbi_txs_clone, &prompted_secrets_clone, allow_kbi, &jump_auth_failed, &jump_network_failed, &attempt, &session_id_clone, jid, use_agent).await {
-                Ok(jump_handle) => {
-                    // Originator address is cosmetic (logged by the bastion); the
-                    // pair below is what OpenSSH sends for a -J hop.
-                    match tokio::time::timeout(
-                        JUMP_CHANNEL_TIMEOUT,
-                        jump_handle.channel_open_direct_tcpip(host.clone(), port as u32, "127.0.0.1", 0),
-                    )
-                    .await
-                    .unwrap_or_else(|_| Err(russh::Error::ConnectionTimeout))
-                    {
+        let hop_ctx = HopCtx {
+            app: &app,
+            db: &db_for_jump,
+            fp_txs: &fp_txs_clone,
+            kbi_txs: &kbi_txs_clone,
+            cache: &prompted_secrets_clone,
+            allow_prompt: allow_kbi,
+            auth_failed: &jump_auth_failed,
+            network_failed: &jump_network_failed,
+            attempt: &attempt,
+            session_id: &session_id_clone,
+            use_agent,
+            queues: Default::default(),
+        };
+        // The jump hosts (a saved one, or ProxyJump from ~/.ssh/config), then a
+        // direct-tcpip channel through the last one to the target: what
+        // `ssh -J` does. Their Handles stay in `jump_handles` through the
+        // target handshake; on success they move into `state_jump_connections`
+        // for the session's life.
+        let chain: Option<Result<Vec<russh::client::Handle<ssh_manager::ClientHandler>>, String>> = match &route {
+            ConnectRoute::Jump(jid) => {
+                emit_log(&format!("ProxyJump: routing through jump host (server id {})...", jid), "info");
+                Some(connect_jump_host(&hop_ctx, *jid).await)
+            }
+            ConnectRoute::ConfigJump(spec) => {
+                emit_log(&format!("~/.ssh/config: connecting through ProxyJump {spec}..."), "info");
+                Some(config_jump_chain(&hop_ctx, spec, 0).await)
+            }
+            _ => None,
+        };
+        let stream_res: Result<Box<dyn AsyncStream>, String> = if let Some(chain) = chain {
+            match chain {
+                Ok(chain) => match chain.last() {
+                    Some(last) => match hop_channel(last, &host, port as u16).await {
                         Ok(channel) => {
                             emit_log(&format!("ProxyJump: opened tunnel to {}:{} through the jump host.", host, port), "success");
-                            // Always-drained (see tunnel::DrainedChannelStream):
-                            // the target session's protocol task stops reading its
-                            // transport while a write waits for the bastion's
-                            // window. A plain ChannelStream would then fill this
-                            // channel's queue, block the bastion connection's
-                            // protocol task — which is what delivers that window
-                            // adjust — and deadlock the whole ProxyJump session.
-                            let boxed: Box<dyn AsyncStream> = Box::new(crate::tunnel::drained_stream(channel));
-                            jump_handle_holder = Some(jump_handle);
-                            Ok(boxed)
+                            jump_handles = chain;
+                            Ok(Box::new(channel) as Box<dyn AsyncStream>)
                         }
                         Err(e) => {
                             reach_retry = true;
-                            Err(format!(
-                                "ProxyJump: could not open a channel to {}:{} through the jump host: {}",
-                                host, port, e
-                            ))
+                            Err(format!("ProxyJump: {e}"))
                         }
-                    }
-                }
+                    },
+                    None => Err("ProxyJump: no jump host".into()),
+                },
                 Err(e) => {
                     reach_retry = jump_network_failed.load(std::sync::atomic::Ordering::Relaxed);
                     Err(format!("ProxyJump: {}", e))
@@ -12472,9 +12675,6 @@ async fn initiate_connection(
                 Err(e) => Err(e),
             }
         } else {
-        if let ConnectRoute::Direct { unused_jump: Some(spec) } = &route {
-            emit_log(&format!("~/.ssh/config: ProxyJump {spec} isn't used yet; connecting without it."), "info");
-        }
         // Any failure below is the network's: the proxy or the server didn't
         // answer, refused, or couldn't be reached. (An empty proxy host is
         // reported on its own.)
@@ -12784,13 +12984,14 @@ async fn initiate_connection(
                                     .lock()
                                     .await
                                     .insert(session_id_clone.clone(), Arc::clone(&session_arc));
-                                // ProxyJump: park the bastion's Handle with the
-                                // session, under the same check, so it stays
-                                // alive for the whole session (its direct-tcpip
-                                // channel carries our transport) and a later
-                                // reconnect / disconnect / close drops it.
-                                if let Some(jh) = jump_handle_holder.take() {
-                                    state_jump_connections.lock().await.insert(session_id_clone.clone(), jh);
+                                // ProxyJump: park the route's Handles with the
+                                // session, under the same check, so they stay
+                                // alive for the whole session (the last one's
+                                // direct-tcpip channel carries our transport)
+                                // and a later reconnect / disconnect / close
+                                // drops them together.
+                                if !jump_handles.is_empty() {
+                                    state_jump_connections.lock().await.insert(session_id_clone.clone(), std::mem::take(&mut jump_handles));
                                 }
                                 true
                             } else {
@@ -14296,8 +14497,9 @@ async fn initiate_rdp(
                     attempt: &attempt,
                     session_id: &session_id,
                     use_agent,
+                    queues: Default::default(),
                 };
-                let chain = match connect_jump_chain(&ctx, jid).await {
+                let chain = match connect_jump_host(&ctx, jid).await {
                     Ok(chain) => chain,
                     Err(e) => {
                         let reason = format!("The SSH server {via_name}: {e}");
@@ -14597,8 +14799,9 @@ async fn rdp_builtin_open(
                     attempt: &attempt,
                     session_id: &session_id,
                     use_agent,
+                    queues: Default::default(),
                 };
-                let chain = match connect_jump_chain(&ctx, jid).await {
+                let chain = match connect_jump_host(&ctx, jid).await {
                     Ok(chain) => chain,
                     Err(e) => {
                         let reason = format!("The SSH server {via_name}: {e}");
@@ -15044,8 +15247,9 @@ async fn telnet_connect(
                     attempt: &attempt,
                     session_id: &session_id,
                     use_agent,
+                    queues: Default::default(),
                 };
-                let chain = match connect_jump_chain(&ctx, jid).await {
+                let chain = match connect_jump_host(&ctx, jid).await {
                     Ok(chain) => chain,
                     Err(e) => {
                         let reason = format!("The SSH server {via_name}: {e}");
@@ -15272,8 +15476,9 @@ async fn vnc_open(
                     attempt: &attempt,
                     session_id: &session_id,
                     use_agent,
+                    queues: Default::default(),
                 };
-                let chain = match connect_jump_chain(&ctx, jid).await {
+                let chain = match connect_jump_host(&ctx, jid).await {
                     Ok(chain) => chain,
                     Err(e) => {
                         let reason = format!("The SSH server {via_name}: {e}");
@@ -24564,7 +24769,6 @@ fn resolve_node_auth_row(
             proxy_port: proxy_port.map(|p| p as u16),
             jump: None,
             name: server_display_name(conn, node_id),
-            server_id: Some(node_id),
         },
         jump_host_id,
     ))
@@ -25625,8 +25829,21 @@ mod connect_route_tests {
     fn otherwise_the_config_decides() {
         assert_eq!(connect_route(None, "none", None, None, &mut target(command())), ConnectRoute::Command("nc %h %p".into()));
         let jump = Some(ssh_config::Proxy::Jump("bastion".into()));
-        assert_eq!(connect_route(None, "none", None, None, &mut target(jump)), ConnectRoute::Direct { unused_jump: Some("bastion".into()) });
-        assert_eq!(connect_route(None, "none", None, None, &mut target(None)), ConnectRoute::Direct { unused_jump: None });
+        assert_eq!(connect_route(None, "none", None, None, &mut target(jump)), ConnectRoute::ConfigJump("bastion".into()));
+        assert_eq!(connect_route(None, "none", None, None, &mut target(None)), ConnectRoute::Direct);
+    }
+
+    // D2: the server's own saved jump host wins over its config ProxyJump,
+    // and the log says so; so does its own SOCKS / HTTP proxy.
+    #[test]
+    fn the_servers_own_route_wins_over_a_config_proxy_jump() {
+        let jump = || Some(ssh_config::Proxy::Jump("bastion".into()));
+        let mut t = target(jump());
+        assert_eq!(connect_route(Some(7), "none", None, None, &mut t), ConnectRoute::Jump(7));
+        assert!(t.log.iter().any(|l| l.contains("ProxyJump isn't used: this server goes through its own jump host")), "{:?}", t.log);
+        let mut t = target(jump());
+        assert!(matches!(connect_route(None, "http", Some("p".into()), None, &mut t), ConnectRoute::Proxy { socks5: false, .. }));
+        assert!(t.log.iter().any(|l| l.contains("ProxyJump isn't used: this server goes through its own HTTP proxy")), "{:?}", t.log);
     }
 }
 

@@ -152,14 +152,18 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | Terminal colors ([#183](https://github.com/SinaXhpm/submarine/pull/183)) | One scheme per device, or one of your own | The fork's schemes, per device or per server (synced). A scheme of your own is for this device only. "Keep text readable" is on by default |
 | Key exchange ([#189](https://github.com/SinaXhpm/submarine/pull/189)) | Offers the 1024-bit `diffie-hellman-group1-sha1` last | Never offers it (Logjam). Group exchange over SHA-1 is offered, with groups of 2048 bits or more |
 | Privacy policy ([#225](https://github.com/SinaXhpm/submarine/pull/225)) | The **Privacy** links open the policy on its website | They open this fork's [PRIVACY.md](PRIVACY.md): the same policy, with a note on where the fork differs. **Delete Submarine Cloud account** only deletes the hosted cloud account; profiles on the computer and sync through your own storage stay |
+| Logins to a jump host ([#169](https://github.com/SinaXhpm/submarine/pull/169)) | No queue: every server opened behind a jump host logs in to it at once | Each jump host on the way waits its turn (**Settings › Logins at a time per jump host**), one line per jump host address, shared by a saved jump host and the same machine in a chain; a jump host reached through another has its own line for that way there. A jump host holds its turn only while it logs in ([#43](https://github.com/paulm981/Submarine/issues/43)) |
+| A saved jump host and `~/.ssh/config` ([#169](https://github.com/SinaXhpm/submarine/pull/169)) | A server's own jump host or proxy wins over its config's ProxyJump; a saved jump host's own ProxyJump is followed | The same. A saved jump host's own saved jump host still isn't followed, so chains only ever come from this computer's `~/.ssh/config`, never from synced servers ([#43](https://github.com/paulm981/Submarine/issues/43)) |
+| Jump hosts in one route ([#169](https://github.com/SinaXhpm/submarine/pull/169)) | At most 8 levels of ProxyJump lists, so lists inside lists can add up to many more jump hosts | At most 8 jump hosts in all, counting every list and a saved jump host ([#43](https://github.com/paulm981/Submarine/issues/43)) |
+| `%` in a ProxyJump | Taken as written | Refused with a message: Submarine doesn't fill in `%h`, `%r` and the like there yet ([#43](https://github.com/paulm981/Submarine/issues/43)) |
+| Monitoring and ProxyJump | A server behind a config ProxyJump isn't checked; monitoring has no jump hosts | Monitoring goes through saved jump hosts. A server or a jump host that `~/.ssh/config` reaches through a ProxyJump isn't checked, and the card says why: monitoring can't ask for the jump hosts' passwords ([#43](https://github.com/paulm981/Submarine/issues/43)) |
 | Website ([#229](https://github.com/SinaXhpm/submarine/pull/229)) | `website/` is published at `submarine.sinaxhpm.com` | The folder comes along with merges, unchanged, but the fork doesn't publish it: no workflow builds or deploys it |
 
 ## Changes in the original project not taken yet
 
 | Change | Why not yet | What's next |
 |---|---|---|
-| [#169](https://github.com/SinaXhpm/submarine/pull/169) ProxyJump from `~/.ssh/config` | It changes the connect path that the fork's jump hosts are built on: their login queue, and Monitoring through a jump host. | A careful merge that keeps both. |
-| [#170](https://github.com/SinaXhpm/submarine/pull/170) Teleport and OpenSSH certificates; trusting `known_hosts` | It builds on #169, and changes how host keys are trusted. | With #169. |
+| [#170](https://github.com/SinaXhpm/submarine/pull/170) Teleport and OpenSSH certificates; trusting `known_hosts` | It changes how host keys are trusted: as written, a key listed in `~/.ssh/known_hosts` would be accepted even where the app's own trusted keys say it has changed. | To be taken next, with that changed, as decided in [#43](https://github.com/paulm981/Submarine/issues/43): the app's "key has changed" warning always wins. |
 
 ## Keeping up with the original project
 

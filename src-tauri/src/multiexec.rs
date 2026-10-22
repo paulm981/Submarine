@@ -127,9 +127,11 @@ const MAX_LOGIN_LIMIT: i64 = 256;
 /// -1 until read from the settings file.
 static LOGIN_LIMIT: AtomicI64 = AtomicI64::new(-1);
 
-/// Jump host id → (the limit it was made with, its slots). A changed limit
-/// gets new slots; logins holding the old ones finish as they were.
-type SlotMap = HashMap<i32, (i64, Arc<Semaphore>)>;
+/// Jump host → (the limit it was made with, its slots). A changed limit
+/// gets new slots; logins holding the old ones finish as they were. A jump
+/// host is known by its address (`hop_policy::queue_key`), so a saved jump
+/// host and the same bastion in a ~/.ssh/config ProxyJump share one queue.
+type SlotMap = HashMap<String, (i64, Arc<Semaphore>)>;
 static LOGIN_SLOTS: Mutex<Option<SlotMap>> = Mutex::new(None);
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -149,20 +151,21 @@ fn login_limit(app: &tauri::AppHandle) -> i64 {
     limit
 }
 
-fn slots_for(jump_server_id: i32, limit: i64) -> Arc<Semaphore> {
+fn slots_for(key: &str, limit: i64) -> Arc<Semaphore> {
     let mut guard = LOGIN_SLOTS.lock().unwrap_or_else(|p| p.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
-    match map.get(&jump_server_id) {
+    match map.get(key) {
         Some((made_with, sem)) if *made_with == limit => Arc::clone(sem),
         _ => {
             let sem = Arc::new(Semaphore::new(limit as usize));
-            map.insert(jump_server_id, (limit, Arc::clone(&sem)));
+            map.insert(key.to_string(), (limit, Arc::clone(&sem)));
             sem
         }
     }
 }
 
-/// A turn to log in to this jump host, held until dropped: right away while
+/// A turn to log in to the jump host `key` (`hop_policy::queue_key`), held
+/// until dropped: right away while
 /// fewer than the limit are logging in, otherwise once one of them is done —
 /// first come, first served. `None` with no limit set. `waiting` is called
 /// once if the turn doesn't come straight away (for the session's log).
@@ -171,31 +174,33 @@ fn slots_for(jump_server_id: i32, limit: i64) -> Arc<Semaphore> {
 /// it (0 lets them all go).
 pub(crate) async fn login_turn(
     app: &tauri::AppHandle,
-    jump_server_id: i32,
+    key: &str,
     attempt: &ConnectAttempt,
     waiting: impl FnOnce(i64),
 ) -> Result<Option<OwnedSemaphorePermit>, String> {
-    queue_for_login(app, jump_server_id, Some(attempt), waiting).await
+    queue_for_login(key, Some(attempt), waiting, || login_limit(app)).await
 }
 
 /// A turn to log in to this jump host, for a connection with no connect
 /// attempt (a monitor's): as `login_turn`, but it waits until it gets one
 /// or is dropped (the monitor's stop signal drops it).
-pub(crate) async fn login_turn_until_dropped(app: &tauri::AppHandle, jump_server_id: i32) -> Option<OwnedSemaphorePermit> {
+pub(crate) async fn login_turn_until_dropped(app: &tauri::AppHandle, key: &str) -> Option<OwnedSemaphorePermit> {
     // Without an attempt nothing gives up but a closed queue, and the queues
     // are never closed.
-    queue_for_login(app, jump_server_id, None, |_| {}).await.ok().flatten()
+    queue_for_login(key, None, |_| {}, || login_limit(app)).await.ok().flatten()
 }
 
+/// `limit`: the setting, read again while waiting.
 async fn queue_for_login(
-    app: &tauri::AppHandle,
-    jump_server_id: i32,
+    key: &str,
     attempt: Option<&ConnectAttempt>,
     waiting: impl FnOnce(i64),
+    limit: impl Fn() -> i64,
 ) -> Result<Option<OwnedSemaphorePermit>, String> {
     let mut waiting = Some(waiting);
+    let login_limit = limit;
     loop {
-        let limit = login_limit(app);
+        let limit = login_limit();
         if limit == 0 {
             return Ok(None);
         }
@@ -204,7 +209,7 @@ async fn queue_for_login(
                 w(limit)
             }
         };
-        let turn = wait_for_turn(slots_for(jump_server_id, limit), attempt, on_wait, || login_limit(app) == limit).await?;
+        let turn = wait_for_turn(slots_for(key, limit), attempt, on_wait, || login_limit() == limit).await?;
         if let Turn::Got(permit) = turn {
             return Ok(Some(permit));
         }
@@ -419,16 +424,16 @@ mod tests {
 
     #[test]
     fn slots_follow_the_limit() {
-        let a = slots_for(-7, 2);
-        assert!(Arc::ptr_eq(&a, &slots_for(-7, 2)));
+        let a = slots_for("test-slots:7", 2);
+        assert!(Arc::ptr_eq(&a, &slots_for("test-slots:7", 2)));
         let p1 = Arc::clone(&a).try_acquire_owned().unwrap();
         let _p2 = Arc::clone(&a).try_acquire_owned().unwrap();
         assert!(Arc::clone(&a).try_acquire_owned().is_err());
         drop(p1);
         assert!(Arc::clone(&a).try_acquire_owned().is_ok());
         // A new limit, new slots; another jump host has its own.
-        assert!(!Arc::ptr_eq(&a, &slots_for(-7, 3)));
-        assert!(!Arc::ptr_eq(&slots_for(-7, 3), &slots_for(-8, 3)));
+        assert!(!Arc::ptr_eq(&a, &slots_for("test-slots:7", 3)));
+        assert!(!Arc::ptr_eq(&slots_for("test-slots:7", 3), &slots_for("test-slots:8", 3)));
     }
 
     #[tokio::test]
@@ -484,6 +489,59 @@ mod tests {
         drop(held);
         let got = tokio::time::timeout(std::time::Duration::from_secs(5), next).await.expect("the next login's turn");
         assert!(matches!(got.unwrap(), Ok(Turn::Got(_))));
+    }
+
+    /// Many tabs opening at once behind one bastion: no more than the limit
+    /// log in to it together, every one gets its turn, and another bastion
+    /// isn't held up by them (#43, D1).
+    #[tokio::test]
+    async fn many_opens_behind_one_bastion_keep_to_the_limit() {
+        use std::sync::atomic::AtomicUsize;
+        let key = crate::hop_policy::queue_key("Bastion.Example", 22);
+        let (now, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let mut logins = Vec::new();
+        for _ in 0..20 {
+            let (key, now, most) = (key.clone(), Arc::clone(&now), Arc::clone(&most));
+            logins.push(tokio::spawn(async move {
+                let _turn = queue_for_login(&key, None, |_| {}, || 3).await.unwrap().expect("a turn");
+                let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(n, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                now.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        // Another bastion gets its turn at once meanwhile.
+        let other = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            queue_for_login(&crate::hop_policy::queue_key("other.example", 22), None, |_| {}, || 3),
+        )
+        .await
+        .expect("not held up by another bastion's queue");
+        assert!(other.unwrap().is_some());
+        for l in logins {
+            tokio::time::timeout(std::time::Duration::from_secs(10), l).await.expect("every login gets a turn").unwrap();
+        }
+        assert_eq!(most.load(Ordering::SeqCst), 3);
+        // No limit: no queue.
+        assert!(queue_for_login(&key, None, |_| {}, || 0).await.unwrap().is_none());
+    }
+
+    /// Two routes through the same two bastions in opposite orders, with one
+    /// login at a time on each: as each hop lets go of its turn once it's
+    /// logged in, before the next hop queues, neither waits on the other.
+    #[tokio::test]
+    async fn routes_through_the_same_bastions_in_opposite_orders_both_get_through() {
+        let a = crate::hop_policy::queue_key("a.example", 22);
+        let b = crate::hop_policy::queue_key("b.example", 22);
+        let route = |hops: Vec<String>| async move {
+            for hop in hops {
+                let turn = queue_for_login(&hop, None, |_| {}, || 1).await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await; // the login
+                drop(turn);
+            }
+        };
+        let both = async { tokio::join!(route(vec![a.clone(), b.clone()]), route(vec![b, a])) };
+        tokio::time::timeout(std::time::Duration::from_secs(5), both).await.expect("no deadlock between the routes");
     }
 
     #[tokio::test]
