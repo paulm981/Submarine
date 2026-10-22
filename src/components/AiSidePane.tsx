@@ -364,7 +364,7 @@ const ShareLine = ({ v, tab, shared, starting, onShare, onUnshare }: {
           ? `Once ${tab.label} has started`
           : !v.session.connected
             ? "Once this tab is connected"
-            : `Let ${tab.label} ask to run commands on this tab, each one only after you allow it`}
+            : `Let ${tab.label} ask to run commands on this tab: each one waits for your Allow, unless you have set this server to run commands without asking`}
         className={`${btn} bg-primary/15 border-primary/40 text-primary hover:bg-primary hover:text-zinc-950`}
       >
         Share

@@ -1881,7 +1881,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                   ? "Share with AI: start an AI tool from Home's menu first"
                   : status !== 'connected'
                     ? "Share with AI: once this tab is connected"
-                    : "Share with AI: let an AI tab ask to run commands here, each one only after you allow it"}
+                    : "Share with AI: let an AI tab ask to run commands here. Each one waits for your Allow, unless you have set this server to run commands without asking"}
               aria-label="Share with AI"
               aria-pressed={aiSharedWith.length > 0}
               className={`h-10 sm:h-8 px-2.5 rounded-lg flex items-center gap-1.5 transition-all disabled:opacity-40 disabled:pointer-events-none ${
