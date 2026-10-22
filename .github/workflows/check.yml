@@ -158,13 +158,14 @@ jobs:
       - name: lib.rs keeps its CRLF line endings
         run: |
           f=src-tauri/src/lib.rs
-          crlf=$(grep -c $'\r$' "$f" || true)
-          lines=$(wc -l < "$f")
-          if [ "$crlf" -ne "$lines" ]; then
-            echo "::error file=$f::$f has $lines lines but only $crlf end with CRLF. It must keep Windows line endings on every line, as the original project's does, or every line conflicts at the next sync. Convert it back, e.g. with: sed -i 's/\r\?\$/\r/' $f"
+          # Every line without a CR before its newline, a last line with no
+          # newline included (grep sees it as a line too).
+          bad=$(grep -nv $'\r$' "$f" | cut -d: -f1 | head -5 | paste -sd, - || true)
+          if [ -n "$bad" ]; then
+            echo "::error file=$f::$f must end every line with CRLF (Windows line endings), as the original project's does, or every line conflicts at the next sync. Lines without: $bad (at most five shown). Convert it back, e.g. with: sed -i 's/\r\?\$/\r/' $f"
             exit 1
           fi
-          echo "$f: all $lines lines end with CRLF."
+          echo "$f: every line ends with CRLF."
 
       - name: Install Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
