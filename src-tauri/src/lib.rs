@@ -5601,6 +5601,9 @@ async fn delete_profile(app_handle: tauri::AppHandle, name: String, state: tauri
     // the profile itself is already gone, so a locked tmp shouldn't fail the
     // delete the user asked for.
     let _ = fs::remove_file(path.with_extension("submarine.tmp"));
+    // And the copies a deleting sync kept of it (vault_backup.rs): they hold
+    // the same servers, logins and keys.
+    vault_backup::remove_all(&path);
     // And its quick unlock on this device (#166), with its Windows Hello key.
     quick_unlock::forget(&app_handle, &name);
     Ok(())

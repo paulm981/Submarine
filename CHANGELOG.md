@@ -18,6 +18,7 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - **Stopping, starting or renaming a forward no longer deletes forwards that came by sync.** With a tab open, a forward someone added on another computer was dropped everywhere the next time you changed one in the Ports panel, and in a shared profile it stopped waiting for your OK. The panel now shows the synced forwards and keeps them. ([#95](https://github.com/paulm981/Submarine/issues/95))
 - **Replace the cloud copy with this device uploads everything again.** After an earlier sync, it uploaded only recent changes, so the cloud copy could end up missing most of the profile and the key other devices unlock it with. ([#95](https://github.com/paulm981/Submarine/issues/95))
 - **A restore or import that fails no longer deletes a profile of the same name** that another window made or opened while it ran. It's refused instead, and only what the failed restore made itself is cleaned up. ([#95](https://github.com/paulm981/Submarine/issues/95))
+- **Deleting a profile deletes the copies a sync kept of it too**, the `<name>.submarine.bak-<time>` files next to it. They hold the same servers, logins and keys. ([#95](https://github.com/paulm981/Submarine/issues/95))
 
 ### From the original project ([#41](https://github.com/paulm981/Submarine/issues/41))
 

@@ -73,6 +73,27 @@ pub fn keep(vault: &Path, now_unix: u64) -> Result<Option<String>, String> {
     Ok(Some(name))
 }
 
+/// Removes every backup of `vault`, and any copy of one left half made, when
+/// the profile itself is deleted: they hold its servers, logins and keys.
+/// Best effort, like the rest. Returns how many went.
+pub fn remove_all(vault: &Path) -> usize {
+    let (Some(dir), Some(stem)) = (vault.parent(), stem(vault)) else {
+        return 0;
+    };
+    fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            e.file_name().to_str().and_then(|n| n.strip_prefix(&stem)).is_some_and(|rest| {
+                let when = rest.strip_suffix(".tmp").unwrap_or(rest);
+                !when.is_empty() && when.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
+        .filter(|e| fs::remove_file(e.path()).is_ok())
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +117,27 @@ mod tests {
         assert!(!name.ends_with(".submarine"));
         // No half-copy is left lying around.
         assert!(fs::read_dir(&dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_a_profile_takes_its_backups_along_and_no_one_elses() {
+        let dir = temp_dir("remove");
+        let vault = dir.join("p.submarine");
+        let other = dir.join("p-2.submarine");
+        fs::write(&vault, b"p").unwrap();
+        fs::write(&other, b"q").unwrap();
+        keep(&vault, 4_000_000_000).unwrap();
+        keep(&vault, 4_000_000_000 + MIN_GAP_SECS).unwrap();
+        keep(&other, 4_000_000_000).unwrap();
+        fs::write(dir.join("p.submarine.bak-4000009999.tmp"), b"half").unwrap();
+        fs::write(dir.join("p.submarine.bak-notes"), b"not a backup").unwrap();
+        assert_eq!(remove_all(&vault), 3);
+        assert!(existing(&vault).is_empty());
+        assert!(!dir.join("p.submarine.bak-4000009999.tmp").exists());
+        assert!(dir.join("p.submarine.bak-notes").exists(), "only the backups' names");
+        assert_eq!(existing(&other).len(), 1, "another profile's backup stays");
+        assert!(vault.exists(), "the profile itself is the caller's");
         let _ = fs::remove_dir_all(&dir);
     }
 
