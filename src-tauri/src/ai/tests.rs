@@ -72,7 +72,13 @@ async fn an_ai_tool_is_pointed_at_no_ssh_agent() {
     let (_, env) = s.start_tab("local-1", "Claude").unwrap();
     let sock = var(&env, "SSH_AUTH_SOCK");
     #[cfg(windows)]
-    assert_eq!(sock, r"\\.\pipe\submarine-no-ssh-agent");
+    {
+        // A name no one could have made ahead of it: new each AI tab.
+        let suffix = sock.strip_prefix(r"\\.\pipe\submarine-no-ssh-agent-").expect(sock);
+        assert!(suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_hexdigit()), "{sock}");
+        let (_, env2) = s.start_tab("local-2", "Claude").unwrap();
+        assert_ne!(var(&env2, "SSH_AUTH_SOCK"), sock);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

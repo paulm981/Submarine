@@ -332,9 +332,12 @@ pub(crate) mod pipe {
 /// Where an AI tool's SSH_AUTH_SOCK points: a pipe nothing serves, which
 /// Windows OpenSSH's ssh looks in rather than its own agent's
 /// (`\\.\pipe\openssh-ssh-agent`, used only when the variable is unset).
+/// A new random name each time (random_hex: the thread's CSPRNG), so
+/// another account on the computer can't make it first and pose as an
+/// agent.
 #[cfg(windows)]
 pub(crate) fn no_agent_at(_addr: &str) -> String {
-    r"\\.\pipe\submarine-no-ssh-agent".to_string()
+    format!(r"\\.\pipe\submarine-no-ssh-agent-{}", random_hex(8))
 }
 
 #[cfg(windows)]
