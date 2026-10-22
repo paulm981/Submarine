@@ -32,6 +32,10 @@
 //! state, until the user allows them; a held switch goes on being kept through
 //! the merges that follow.
 //!
+//! A forward is held when a synced record makes it run: a new one, or one this
+//! device's user stopped and someone else started again. One that comes in
+//! stopped, or is stopped again, runs nothing and isn't held.
+//!
 //! An entry is (server uuid, item), the item being one of
 //!   `run_on_connect`, `autostart`, `tunnel:<type>|<local>|<remote>`,
 //!   `metric:<command>`, `protocol:<telnet|vnc>|<port>`.
@@ -164,13 +168,21 @@ pub fn watches(table: &str) -> bool {
 /// What a row would set off by itself, read just before and just after the
 /// merge engine applies a record to it.
 pub enum Snapshot {
-    Server { run_on_connect: String, autostart: bool, tunnels: BTreeSet<String>, protocol: Option<String>, port: Option<i64> },
+    /// `running`: the forwards that aren't stopped.
+    Server {
+        run_on_connect: String,
+        autostart: bool,
+        running: BTreeSet<String>,
+        protocol: Option<String>,
+        port: Option<i64>,
+    },
     Monitor { server_uuid: Option<String>, metrics: BTreeSet<String> },
 }
 
-fn tunnel_items_of(json: &str) -> BTreeSet<String> {
+/// The items of the forwards that aren't stopped: what would start by itself.
+fn running_items_of(json: &str) -> BTreeSet<String> {
     serde_json::from_str::<Vec<TunnelSpec>>(json)
-        .map(|specs| specs.iter().map(tunnel_item).collect())
+        .map(|specs| specs.iter().filter(|s| !s.stopped).map(tunnel_item).collect())
         .unwrap_or_default()
 }
 
@@ -210,7 +222,7 @@ pub fn snapshot(conn: &Connection, table: &str, uuid: &str) -> Option<Snapshot> 
             .map(|(roc, auto, tunnels, protocol, port)| Snapshot::Server {
                 run_on_connect: roc,
                 autostart: auto != 0,
-                tunnels: tunnel_items_of(&tunnels),
+                running: running_items_of(&tunnels),
                 protocol,
                 port,
             }),
@@ -347,10 +359,10 @@ pub fn hold_changes(conn: &Connection, table: &str, uuid: &str, before: Option<&
         hold_switch(conn, uuid, before)?;
     }
     match (table, snapshot(conn, table, uuid)) {
-        ("servers", Some(Snapshot::Server { run_on_connect, autostart, tunnels, .. })) => {
-            let (b_roc, b_auto, b_tunnels) = match before {
-                Some(Snapshot::Server { run_on_connect, autostart, tunnels, .. }) => {
-                    (Some(run_on_connect.as_str()), *autostart, Some(tunnels))
+        ("servers", Some(Snapshot::Server { run_on_connect, autostart, running, .. })) => {
+            let (b_roc, b_auto, b_running) = match before {
+                Some(Snapshot::Server { run_on_connect, autostart, running, .. }) => {
+                    (Some(run_on_connect.as_str()), *autostart, Some(running))
                 }
                 _ => (None, false, None),
             };
@@ -364,10 +376,13 @@ pub fn hold_changes(conn: &Connection, table: &str, uuid: &str, before: Option<&
             } else if !b_auto {
                 hold(conn, uuid, AUTOSTART)?;
             }
-            for item in tunnels.iter().filter(|t| b_tunnels.map_or(true, |b| !b.contains(*t))) {
+            // A forward that runs now and didn't: a new one, or one this
+            // device's user stopped and someone else started again. One that
+            // is stopped, or gone, runs nothing, and isn't held.
+            for item in running.iter().filter(|t| b_running.map_or(true, |b| !b.contains(*t))) {
                 hold(conn, uuid, item)?;
             }
-            release_missing(conn, uuid, "tunnel:", &tunnels)
+            release_missing(conn, uuid, "tunnel:", &running)
         }
         ("monitor_configs", Some(Snapshot::Monitor { server_uuid: Some(server_uuid), metrics })) => {
             let b_metrics = match before {
@@ -801,6 +816,28 @@ mod tests {
         // Not allowing them needs nothing; a stale text is refused all the same.
         assert_eq!(check_seen_run_on_connect(&conn, "u1", false, None), Ok(()));
         assert!(check_seen_run_on_connect(&conn, "u1", false, Some("uptime")).is_err());
+    }
+
+    #[test]
+    fn a_forward_stopped_here_and_started_again_by_sync_is_held() {
+        let conn = db();
+        conn.execute("INSERT INTO servers(name, tunnels, uuid) VALUES('s', ?1, 'u1')", [L8080]).unwrap();
+        // Stopped on this device, and synced that way.
+        let stopped = r#"[{"type":"L","local":"127.0.0.1:8080","remote":"db:5432","stopped":true}]"#;
+        conn.execute("UPDATE servers SET tunnels=?1 WHERE uuid='u1'", [stopped]).unwrap();
+        // Someone else's record starts it again (and names it): held.
+        merge_server(&conn, "u1", "", false, r#"[{"type":"L","local":"127.0.0.1:8080","remote":"db:5432","name":"db"}]"#);
+        assert_eq!(held_list(&conn, "u1"), vec!["tunnel:L|127.0.0.1:8080|db:5432".to_string()]);
+        let mut specs: Vec<TunnelSpec> = serde_json::from_str(L8080).unwrap();
+        assert_eq!(hold_tunnels(&conn, Some("u1"), &mut specs), 1, "it starts stopped here");
+        // Renaming it there keeps it held; stopping it there lets it go.
+        merge_server(&conn, "u1", "", false, r#"[{"type":"L","local":"127.0.0.1:8080","remote":"db:5432","name":"x"}]"#);
+        assert!(!held_for(&conn, "u1").is_empty());
+        merge_server(&conn, "u1", "", false, stopped);
+        assert!(held_for(&conn, "u1").is_empty());
+        // A new forward that comes in stopped runs nothing: not held.
+        merge_server(&conn, "u1", "", false, r#"[{"type":"L","local":"127.0.0.1:8080","remote":"db:5432","stopped":true},{"type":"D","local":"0.0.0.0:1080","stopped":true}]"#);
+        assert!(held_for(&conn, "u1").is_empty());
     }
 
     #[test]
