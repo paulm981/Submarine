@@ -1,15 +1,16 @@
 //! Claude Code, the AI tool in Home's menu (#32, Decision 5): where it's
 //! installed, and how it starts already connected (Decision 1).
 //!
-//! It starts with `--mcp-config` naming one MCP server, `submarine`, which
-//! runs this program with `--mcp` (helper.rs). That adds to your own MCP
+//! It starts with `--mcp-config` naming one MCP server,
+//! `submarine-ssh-bridge` (SERVER), which runs this program with `--mcp`
+//! (helper.rs). That adds to your own MCP
 //! servers rather than replacing them. The entry's `env` names
 //! `${SUBMARINE_AI_ADDR}`, `${SUBMARINE_AI_TOKEN}` and `${SUBMARINE_AI_PID}`
 //! (the app's process id, which the helper checks the channel by), which Claude Code fills
 //! in from its own environment, where Submarine put them: the token is never
 //! on a command line or in a file.
 //!
-//! It also starts with `--allowedTools mcp__submarine__*`, so Claude Code
+//! It also starts with `--allowedTools mcp__submarine-ssh-bridge__*`, so Claude Code
 //! doesn't ask before it uses Submarine's tools: Submarine asks before each
 //! command, and asking twice is one too many (#116). Claude Code still asks
 //! before anything it does on this computer.
@@ -25,16 +26,21 @@ use std::path::{Path, PathBuf};
 pub(crate) const LABEL: &str = "Claude Code";
 /// The name its tabs go by in the AI panel ("Claude", "Claude 2").
 pub(crate) const SHORT: &str = "Claude";
-/// Claude Code's rule for every tool of the `submarine` MCP server, which it
-/// then uses without asking. Claude Code's flag takes several values, so it
-/// goes last, after `--mcp-config`'s.
-const ALLOW_SUBMARINE: [&str; 2] = ["--allowedTools", "mcp__submarine__*"];
+/// The MCP server's name in Claude Code. Not plain "submarine": the allow
+/// rule below would also let through a server of your own by that name.
+/// Claude Code keeps the hyphens in its tools' names
+/// (`mcp__submarine-ssh-bridge__run_command`).
+const SERVER: &str = "submarine-ssh-bridge";
+/// Claude Code's rule for every tool of SERVER, which it then uses without
+/// asking. Claude Code's flag takes several values, so it goes last, after
+/// `--mcp-config`'s.
+const ALLOW_SUBMARINE: [&str; 2] = ["--allowedTools", "mcp__submarine-ssh-bridge__*"];
 
 /// The MCP settings Claude Code is given: Submarine's helper, by full path.
 pub(crate) fn mcp_config(helper: &Path) -> serde_json::Value {
     serde_json::json!({
         "mcpServers": {
-            "submarine": {
+            SERVER: {
                 "type": "stdio",
                 "command": helper.to_string_lossy(),
                 "args": ["--mcp"],
@@ -159,7 +165,7 @@ fn with_allowed(mut args: Vec<String>) -> Vec<String> {
 }
 
 /// A `.cmd` wrapper runs through cmd.exe: `cmd /d /c call "<claude.cmd>"
-/// --mcp-config "<file>" --allowedTools mcp__submarine__*`. `call` keeps
+/// --mcp-config "<file>" --allowedTools mcp__submarine-ssh-bridge__*`. `call` keeps
 /// cmd from taking the first quote off. cmd.exe reads `%`, `^`, `&`, `|`,
 /// `<`, `>`, `!` and `"` even in paths, so a path with any of them is
 /// refused rather than passed. The `*` means nothing to cmd.exe, and the
@@ -187,7 +193,7 @@ mod tests {
     #[test]
     fn the_config_names_the_helper_and_no_secret() {
         let c = mcp_config(Path::new("/Applications/Submarine.app/Contents/MacOS/submarine"));
-        let s = &c["mcpServers"]["submarine"];
+        let s = &c["mcpServers"]["submarine-ssh-bridge"];
         assert_eq!(s["command"], "/Applications/Submarine.app/Contents/MacOS/submarine");
         assert_eq!(s["args"], serde_json::json!(["--mcp"]));
         assert_eq!(s["env"][ENV_TOKEN], "${SUBMARINE_AI_TOKEN}");
@@ -204,7 +210,7 @@ mod tests {
         assert_eq!(l.args[0], "--mcp-config");
         let v: serde_json::Value = serde_json::from_str(&l.args[1]).unwrap();
         assert_eq!(v, mcp_config(Path::new("/usr/bin/submarine")));
-        assert_eq!(&l.args[2..], &["--allowedTools", "mcp__submarine__*"]);
+        assert_eq!(&l.args[2..], &["--allowedTools", "mcp__submarine-ssh-bridge__*"]);
         assert!(l.env.iter().any(|(k, v)| k == "PATH" && v.starts_with("/home/me/.local/bin")));
     }
 
@@ -217,12 +223,12 @@ mod tests {
         assert_eq!(l.args[0], "--mcp-config");
         let body: serde_json::Value = serde_json::from_slice(&std::fs::read(&l.args[1]).unwrap()).unwrap();
         assert_eq!(body, mcp_config(Path::new(r"C:\Program Files\Submarine\submarine.exe")));
-        assert_eq!(&l.args[2..], &["--allowedTools", "mcp__submarine__*"]);
+        assert_eq!(&l.args[2..], &["--allowedTools", "mcp__submarine-ssh-bridge__*"]);
         let l = launch(Path::new(r"C:\Users\Paul M\AppData\Roaming\npm\claude.cmd"), Path::new(r"C:\s\submarine.exe"), Some(&dir)).unwrap();
         assert!(l.program.ends_with("cmd.exe"));
         assert_eq!(&l.args[..4], &["/d", "/c", "call", r"C:\Users\Paul M\AppData\Roaming\npm\claude.cmd"]);
         assert_eq!(l.args[4], "--mcp-config");
-        assert_eq!(&l.args[6..], &["--allowedTools", "mcp__submarine__*"]);
+        assert_eq!(&l.args[6..], &["--allowedTools", "mcp__submarine-ssh-bridge__*"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -273,7 +279,14 @@ mod tests {
     #[test]
     fn claude_code_doesnt_ask_before_submarines_tools() {
         // Its rule for every tool of one MCP server, named as in mcp_config.
-        assert_eq!(ALLOW_SUBMARINE[1], "mcp__submarine__*");
-        assert!(mcp_config(Path::new("/x"))["mcpServers"].get("submarine").is_some());
+        assert_eq!(ALLOW_SUBMARINE[1], format!("mcp__{SERVER}__*"));
+        assert_eq!(ALLOW_SUBMARINE[1], "mcp__submarine-ssh-bridge__*");
+        let config = mcp_config(Path::new("/x"));
+        let servers = config["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.keys().collect::<Vec<_>>(), [SERVER]);
+        // Not a name a server of your own is likely to have, and nothing
+        // Claude Code would change (only `.` and spaces become `_`).
+        assert_ne!(SERVER, "submarine");
+        assert!(SERVER.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'));
     }
 }
