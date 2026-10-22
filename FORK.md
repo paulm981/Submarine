@@ -170,7 +170,7 @@ None: every change in the original project up to [#229](https://github.com/SinaX
 
 ## Keeping up with the original project
 
-**Seeing what's new.** In Settings › Updates, turn on **Watch the original project**. The profile screen then says when the original project has changes the fork doesn't have yet, and links to GitHub's view of them. The maintainer also gets a weekly check, Monday mornings, that lists them with a recommendation for each. Don't use GitHub's **Sync fork** button: the fork has commits of its own, and Sync fork offers to discard them.
+**Seeing what's new.** In Settings › Updates, turn on **Watch the original project**. The profile screen then says when the original project has changes the fork doesn't have yet, and links to GitHub's view of them. Nothing checks on a schedule: when the maintainer wants a rundown, with a recommendation for each change, they ask for one, and nothing is merged until they say so. Don't use GitHub's **Sync fork** button: the fork has commits of its own, and Sync fork offers to discard them.
 
 **Bringing it in.** A sync pull request, the same way every time:
 
