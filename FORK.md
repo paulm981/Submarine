@@ -11,7 +11,7 @@ This page covers:
 
 What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
-The fork is based on the original project's **0.4.0**, with every change up to [#229](https://github.com/SinaXhpm/submarine/pull/229) brought in or recorded as not taken.
+The fork is based on the original project's **0.4.0**, with every change up to [#229](https://github.com/SinaXhpm/submarine/pull/229) brought in.
 
 ## What this fork adds
 
@@ -157,13 +157,16 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | Jump hosts in one route ([#169](https://github.com/SinaXhpm/submarine/pull/169)) | At most 8 levels of ProxyJump lists, so lists inside lists can add up to many more jump hosts | At most 8 jump hosts in all, counting every list and a saved jump host ([#43](https://github.com/paulm981/Submarine/issues/43)) |
 | `%` in a ProxyJump | Taken as written | Refused with a message: Submarine doesn't fill in `%h`, `%r` and the like there yet ([#43](https://github.com/paulm981/Submarine/issues/43)) |
 | Monitoring and ProxyJump | A server behind a config ProxyJump isn't checked; monitoring has no jump hosts | Monitoring goes through saved jump hosts. A server or a jump host that `~/.ssh/config` reaches through a ProxyJump isn't checked, and the card says why: monitoring can't ask for the jump hosts' passwords ([#43](https://github.com/paulm981/Submarine/issues/43)) |
+| Host keys in `~/.ssh/known_hosts` ([#170](https://github.com/SinaXhpm/submarine/pull/170)) | A key listed there is trusted, before the app's own trusted keys are looked at | The app's own trusted keys (in your vault) come first. A key listed in known_hosts only skips the first-time question: a key that changed still gets the warning, even if known_hosts lists the new one. If known_hosts lists a different key for the server, you get the changed-key warning. A host certificate whose key isn't the one the app trusts gets the same changed-key warning; a certificate that doesn't check out is refused. A key marked `@revoked` is always refused, by Monitoring too ([#43](https://github.com/paulm981/Submarine/issues/43)) |
+| Keys known_hosts vouches for ([#170](https://github.com/SinaXhpm/submarine/pull/170)) | Trusted each time, never saved | Saved to the app's trusted keys the first time, as if you had approved it, so Monitoring can check the server and a later change gets the warning. A host certificate isn't saved unless you accept its key at the changed-key warning; Monitoring says it can't check a server only a certificate vouches for, until its key is saved ([#43](https://github.com/paulm981/Submarine/issues/43)) |
+| Key files and certificates from `~/.ssh/config` ([#170](https://github.com/SinaXhpm/submarine/pull/170)) | IdentityFile and CertificateFile are offered, certificates whatever their dates | The same, with "Use settings from ~/.ssh/config" on. A certificate that has expired or isn't valid yet is skipped, and the log says so. As with ssh-agent keys, they're offered to every server the setting applies to, including servers from a shared profile. A key file goes through the same cost limit as a saved key ([#43](https://github.com/paulm981/Submarine/issues/43)) |
+| Turning known_hosts on and off ([#170](https://github.com/SinaXhpm/submarine/pull/170)) | Follows "Use settings from ~/.ssh/config" | The same, with no separate switch: off, known_hosts and the config's key files aren't read at all ([#43](https://github.com/paulm981/Submarine/issues/43)) |
+| `HostKeyAlgorithms` in `~/.ssh/config` ([#170](https://github.com/SinaXhpm/submarine/pull/170)) | Its list decides which host keys are asked for first | Within its list, the kinds of key the app already trusts for the server are still asked for first, so a server with several keys doesn't look changed ([#43](https://github.com/paulm981/Submarine/issues/43)) |
 | Website ([#229](https://github.com/SinaXhpm/submarine/pull/229)) | `website/` is published at `submarine.sinaxhpm.com` | The folder comes along with merges, unchanged, but the fork doesn't publish it: no workflow builds or deploys it |
 
 ## Changes in the original project not taken yet
 
-| Change | Why not yet | What's next |
-|---|---|---|
-| [#170](https://github.com/SinaXhpm/submarine/pull/170) Teleport and OpenSSH certificates; trusting `known_hosts` | It changes how host keys are trusted: as written, a key listed in `~/.ssh/known_hosts` would be accepted even where the app's own trusted keys say it has changed. | To be taken next, with that changed, as decided in [#43](https://github.com/paulm981/Submarine/issues/43): the app's "key has changed" warning always wins. |
+None: every change in the original project up to [#229](https://github.com/SinaXhpm/submarine/pull/229) is taken. Where the fork takes one differently, the table above says so. When a change isn't taken, it's listed here with the reason.
 
 ## Keeping up with the original project
 

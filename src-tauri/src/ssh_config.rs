@@ -545,6 +545,71 @@ pub(crate) fn glob_matches(pattern: &str, name: &str, ignore_case: bool) -> bool
     p[pi..].iter().all(|&c| c == '*')
 }
 
+/// OpenSSH's host patterns, case ignored (known_hosts uses them too).
+pub(crate) fn pattern_matches(pattern: &str, name: &str) -> bool {
+    glob_matches(pattern, name, true)
+}
+
+/// What `%` tokens in IdentityFile, CertificateFile and UserKnownHostsFile
+/// stand for.
+pub(crate) struct PathTokens<'a> {
+    /// `%h`: the host connected to (after HostName).
+    pub host: &'a str,
+    /// `%n`: the address as saved.
+    pub original: &'a str,
+    pub port: u16,
+    /// `%r`: the remote user; blank when it's only asked for later.
+    pub user: &'a str,
+}
+
+/// A file named in the config, as OpenSSH reads it: `~`, `${VAR}`, and the
+/// tokens `%%`, `%d` (home), `%u` (local user), `%h`, `%n`, `%p`, `%r` and
+/// `%l` (this computer's name). A relative path is taken from the home folder.
+pub(crate) fn expand_path(value: &str, t: &PathTokens) -> Result<String, String> {
+    let env = RealEnv { home: home_dir().unwrap_or_default() };
+    let base = expand_basic(value, &env)?;
+    let mut out = String::new();
+    let mut chars = base.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('%') => out.push('%'),
+            Some('d') => out.push_str(&env.home),
+            Some('u') => out.push_str(path_part('u', "the local user name", &env.local_user().ok_or("uses %u, and the local user name isn't known")?)?),
+            Some('h') => out.push_str(path_part('h', "the host name", t.host)?),
+            Some('n') => out.push_str(path_part('n', "the server's address", t.original)?),
+            Some('p') => out.push_str(&t.port.to_string()),
+            Some('r') if t.user.is_empty() => return Err("uses %r, and the username is only asked for after connecting".into()),
+            Some('r') => out.push_str(path_part('r', "the username", t.user)?),
+            Some('l') => out.push_str(path_part(
+                'l',
+                "this computer's name",
+                &std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).map_err(|_| "uses %l, and this computer's name isn't known")?,
+            )?),
+            Some(x) => return Err(format!("uses %{x}, which Submarine doesn't fill in here")),
+            None => return Err("ends with a lone %".into()),
+        }
+    }
+    if !is_absolute(&out) {
+        out = Path::new(&env.home).join(out).to_string_lossy().into_owned();
+    }
+    Ok(out)
+}
+
+/// A token's value as part of a file path. `%h`, `%n` and `%r` come from a
+/// server's saved row, which another member of a shared profile may write:
+/// a value with a path separator or `..` could point the path at another
+/// file, so it's refused (#43).
+fn path_part<'v>(token: char, what: &str, value: &'v str) -> Result<&'v str, String> {
+    if value.contains('/') || value.contains('\\') || value.contains("..") {
+        return Err(format!("uses %{token}, and {what} has characters a file path can't take"));
+    }
+    Ok(value)
+}
+
 /// `HostName` takes `%h` (the address as given) and `%%`.
 pub(crate) fn expand_hostname(value: &str, address: &str) -> Result<String, String> {
     let mut out = String::new();
@@ -776,6 +841,26 @@ mod tests {
 
     fn cfg(config: &str, address: &str) -> HostConfig {
         eval(&Fixture::new(config), &lookup(address))
+    }
+
+    // %h, %n and %r come from a server's saved row (in a shared profile,
+    // another member may have written it): a value that would walk out of
+    // the folder the path names is refused.
+    #[test]
+    fn path_tokens_from_a_server_cant_point_elsewhere() {
+        let tokens = |host: &'static str, original: &'static str, user: &'static str| PathTokens { host, original, port: 22, user };
+        let ok = expand_path("/keys/%r@%h-%n-%p", &tokens("db.example.com", "db", "alice")).unwrap();
+        assert!(ok.ends_with("/keys/alice@db.example.com-db-22"), "{ok}");
+        for (value, t) in [
+            ("/keys/%r", tokens("h", "h", "../../etc/passwd")),
+            ("/keys/%r", tokens("h", "h", "a/b")),
+            ("/keys/%r", tokens("h", "h", "a\\b")),
+            ("/keys/%h", tokens("x/../../y", "h", "u")),
+            ("/keys/%n", tokens("h", "..", "u")),
+        ] {
+            let err = expand_path(value, &t).unwrap_err();
+            assert!(err.contains("characters a file path can't take"), "{err}");
+        }
     }
 
     #[test]
