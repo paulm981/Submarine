@@ -215,7 +215,7 @@ export const WallView = ({
   const ghostRef = useRef<Terminal | null>(null);
   const focusGhost = useCallback(() => {
     requestAnimationFrame(() => {
-      if (document.querySelector('[aria-modal="true"]')) return;
+      if (document.querySelector('[aria-modal="true"]') || !wallRef.current.broadcast) return;
       ghostRef.current?.focus();
     });
   }, []);
@@ -322,6 +322,17 @@ export const WallView = ({
     if (!wall.broadcast) {
       if (wall.solo) onChange({ solo: null });
       setParked(false);
+      // The keyboard terminal had the keys: with Broadcast off it types to
+      // nobody, so they'd be lost without a word. The terminal under the
+      // mouse gets them, or the Wall says to click one.
+      const ghost = ghostBox.current;
+      const active = document.activeElement;
+      if (ghost && active instanceof Node && ghost.contains(active)) {
+        ghostRef.current?.blur();
+        const under = hoveredRef.current ? dockedTerminal(hoveredRef.current) : undefined;
+        if (under) under.term.focus();
+        else flash("Broadcast is off. Click a terminal to type.");
+      }
       return;
     }
     if (solo) {
