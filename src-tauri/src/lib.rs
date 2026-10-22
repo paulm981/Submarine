@@ -19525,9 +19525,16 @@ async fn sftp_download_file(
         drop(local_file); scrap_temp(&temp_path).await; emit_progress(transferred, "error", Some(e.to_string())); return Err(format!("flush: {e}"));
     }
     drop(local_file);
-    // The one touch of the destination: the full download replaces it atomically.
-    if let Err(e) = tokio::fs::rename(&temp_path, &local_path).await {
+    // The one touch of the destination: the full download replaces it
+    // atomically when the user chose to replace it, and otherwise goes there
+    // only if nothing is there yet. Another download of the same name that
+    // finished first is then asked about, as one that was there at the start.
+    if let Err(e) = finalize_download(&temp_path, std::path::Path::new(&local_path), overwrite == Some(true)).await {
         scrap_temp(&temp_path).await;
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            emit_progress(transferred, "cancelled", Some("a file of this name was saved there meanwhile".into()));
+            return Err(format!("EXISTS:{}", local_path));
+        }
         emit_progress(transferred, "error", Some(e.to_string()));
         return Err(format!("finalize: {e}"));
     }
@@ -19741,10 +19748,26 @@ async fn sftp_download_dir(
     let before = files.len();
     files.retain(|(_, rel, _)| !lands_in(&dest_root.join(rel), &autorun));
     let skipped_autorun = (before - files.len()) as u64;
-
-    let skipped_note = match (skipped_names_note(skipped_names), autorun_skipped_note(skipped_autorun)) {
-        (Some(a), Some(b)) => Some(format!("{}; {}", a, b)),
-        (a, b) => a.or(b),
+    // Where upper and lower case are the same name (Windows, and macOS as
+    // usually set up), two files whose names differ only in case would land
+    // on one file, the second replacing the first. The second is left out.
+    let skipped_case = drop_case_twins(&mut files, cfg!(any(windows, target_os = "macos")));
+    // Files left out at the end because something of that name was there
+    // (another download finished first): nothing is replaced unless the user
+    // chose to.
+    let mut skipped_existing: u64 = 0;
+    let replace = overwrite == Some(true);
+    let notes = |skipped_existing: u64| {
+        let notes: Vec<String> = [
+            skipped_names_note(skipped_names),
+            autorun_skipped_note(skipped_autorun),
+            case_twins_note(skipped_case),
+            existing_skipped_note(skipped_existing),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!notes.is_empty()).then(|| notes.join("; "))
     };
 
     if files.is_empty() {
@@ -19752,7 +19775,7 @@ async fn sftp_download_dir(
         // shape — otherwise the user sees "done" with nothing to show for it.
         let local_root = std::path::PathBuf::from(&local_path).join(&folder_name);
         let _ = tokio::fs::create_dir_all(&local_root).await;
-        emit_progress(0, 0, "done", skipped_note);
+        emit_progress(0, 0, "done", notes(0));
         return Ok(());
     }
 
@@ -19851,16 +19874,131 @@ async fn sftp_download_dir(
             drop(local_file); scrap(&temp).await; emit_progress(transferred, total_bytes, "error", Some(format!("flush {}: {}", dest.display(), e))); return Err(format!("flush {}: {}", dest.display(), e));
         }
         drop(local_file);
-        if let Err(e) = tokio::fs::rename(&temp, &dest).await {
+        if let Err(e) = finalize_download(&temp, &dest, replace).await {
             scrap(&temp).await;
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                skipped_existing += 1;
+                continue;
+            }
             emit_progress(transferred, total_bytes, "error", Some(format!("finalize {}: {}", dest.display(), e)));
             return Err(format!("finalize {}: {}", dest.display(), e));
         }
         local_open::mark_from_internet(&dest);
     }
 
-    emit_progress(transferred, total_bytes, "done", skipped_note);
+    emit_progress(transferred, total_bytes, "done", notes(skipped_existing));
     Ok(())
+}
+
+/// Puts a finished download at `dest`: over what's there when the user chose
+/// to replace it (an atomic rename), and otherwise only if nothing is there,
+/// failing with `AlreadyExists` if something is (move_no_replace). That also
+/// catches a second download of the same name that finished first, and on a
+/// file system that ignores case, a file whose name differs only in case.
+async fn finalize_download(temp: &std::path::Path, dest: &std::path::Path, replace: bool) -> std::io::Result<()> {
+    if replace {
+        return tokio::fs::rename(temp, dest).await;
+    }
+    let (temp, dest) = (temp.to_path_buf(), dest.to_path_buf());
+    tokio::task::spawn_blocking(move || move_no_replace(&temp, &dest, false))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
+/// Leaves out the files of a folder download whose path, ignoring case, is
+/// one an earlier file has, when `ignores_case` (the local file system treats
+/// them as one name). Returns how many were left out.
+fn drop_case_twins(files: &mut Vec<(String, String, u64)>, ignores_case: bool) -> u64 {
+    if !ignores_case {
+        return 0;
+    }
+    let before = files.len();
+    let mut seen = std::collections::HashSet::new();
+    files.retain(|(_, rel, _)| seen.insert(rel.to_lowercase()));
+    (before - files.len()) as u64
+}
+
+/// The note on a finished folder-download card for files left out because
+/// another file's name differs from theirs only in case (drop_case_twins).
+fn case_twins_note(skipped: u64) -> Option<String> {
+    match skipped {
+        0 => None,
+        1 => Some("1 file skipped: its name differs from another file's only in upper and lower case, which this computer treats as the same name".into()),
+        n => Some(format!("{} files skipped: their names differ from other files' only in upper and lower case, which this computer treats as the same name", n)),
+    }
+}
+
+/// The note on a finished folder-download card for files left out because a
+/// file of that name was saved there meanwhile (finalize_download).
+fn existing_skipped_note(skipped: u64) -> Option<String> {
+    match skipped {
+        0 => None,
+        1 => Some("1 file skipped: a file of that name was already there, and was left as it was".into()),
+        n => Some(format!("{} files skipped: files of those names were already there, and were left as they were", n)),
+    }
+}
+
+#[cfg(test)]
+mod download_finalize_tests {
+    use super::{drop_case_twins, finalize_download};
+
+    fn fresh(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("submarine-finalize-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Two downloads to the same name: the one that finishes second doesn't
+    /// replace the first unless the user chose to replace it.
+    #[tokio::test]
+    async fn a_finished_download_replaces_nothing_unless_asked_to() {
+        let dir = fresh("one");
+        let dest = dir.join("report.txt");
+        let (first, second) = (dir.join("report.txt.sub-tmp-1"), dir.join("report.txt.sub-tmp-2"));
+        std::fs::write(&first, "first").unwrap();
+        std::fs::write(&second, "second").unwrap();
+        finalize_download(&first, &dest, false).await.unwrap();
+        assert!(!first.exists(), "the temp file is gone once it's in place");
+        let err = finalize_download(&second, &dest, false).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "first");
+        finalize_download(&second, &dest, true).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "second", "replaced when asked to");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_in_the_way_is_not_written_through() {
+        let dir = fresh("link");
+        let target = dir.join("elsewhere");
+        std::os::unix::fs::symlink(&target, dir.join("x.txt")).unwrap();
+        let temp = dir.join("x.txt.sub-tmp-1");
+        std::fs::write(&temp, "data").unwrap();
+        assert_eq!(finalize_download(&temp, &dir.join("x.txt"), false).await.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(!target.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn names_that_differ_only_in_case_are_one_name_where_case_is_ignored() {
+        let list = || {
+            ["Docs/Readme.md", "docs/README.md", "docs/other.md", "Makefile", "makefile"]
+                .iter()
+                .map(|rel| (format!("/srv/{rel}"), rel.to_string(), 1))
+                .collect::<Vec<_>>()
+        };
+        let mut files = list();
+        assert_eq!(drop_case_twins(&mut files, true), 2);
+        let kept: Vec<&str> = files.iter().map(|(_, rel, _)| rel.as_str()).collect();
+        assert_eq!(kept, ["Docs/Readme.md", "docs/other.md", "Makefile"]);
+        let mut files = list();
+        assert_eq!(drop_case_twins(&mut files, false), 0, "where case counts, they're different files");
+        assert_eq!(files.len(), 5);
+        assert!(super::case_twins_note(2).unwrap().starts_with("2 files skipped"));
+        assert_eq!(super::existing_skipped_note(0), None);
+    }
 }
 
 #[tauri::command]
