@@ -63,6 +63,8 @@ const MAX_WAITING: usize = 3;
 /// 1 MB, and may ask, withdraw and ask again without you allowing anything.
 const MAX_LOGGED_COMMAND: usize = 4 * 1024;
 const MAX_LOGGED_NAME: usize = 256;
+/// And of a note (why it was refused, an error), which may quote either.
+const MAX_LOGGED_NOTE: usize = 2 * 1024;
 /// Finished requests the panel keeps.
 const HISTORY: usize = 20;
 /// The panel's event.
@@ -348,7 +350,16 @@ impl AiState {
         (self.0.changed)();
     }
 
-    fn audit(&self, entry: audit::Entry) {
+    /// Every line goes through here: whatever a caller put in them, the
+    /// server's name and the note are cut to their limits.
+    fn audit(&self, mut entry: audit::Entry) {
+        for (field, max) in [(&mut entry.server, MAX_LOGGED_NAME), (&mut entry.note, MAX_LOGGED_NOTE)] {
+            if let Some(text) = field.as_mut() {
+                if text.len() > max {
+                    *text = for_log(text, max);
+                }
+            }
+        }
         self.0.audit.write(&entry);
     }
 
@@ -759,10 +770,12 @@ impl AiState {
                 }
                 let Some(found) = tab.servers.iter().find(|x| x.name == server) else {
                     let names: Vec<&str> = tab.servers.iter().map(|x| x.name.as_str()).collect();
+                    // The name as the AI sent it, cut: it may be a megabyte.
+                    let asked = for_log(server, MAX_LOGGED_NAME);
                     return Err(refuse(if names.is_empty() {
-                        format!("{server} isn't shared with you, and no server is. Ask the user to click Share with AI on its tab.")
+                        format!("{asked} isn't shared with you, and no server is. Ask the user to click Share with AI on its tab.")
                     } else {
-                        format!("{server} isn't shared with you. Shared: {}. Ask the user to click Share with AI on its tab.", names.join(", "))
+                        format!("{asked} isn't shared with you. Shared: {}. Ask the user to click Share with AI on its tab.", names.join(", "))
                     }));
                 };
                 let found = found.clone();

@@ -330,6 +330,36 @@ async fn refusals_count_toward_the_limit_and_are_logged_cut_short() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A server name of a megabyte, sent again and again, can't fill the log:
+/// the name is cut in the line, and in the note that says why it was
+/// refused.
+#[tokio::test]
+async fn long_server_names_are_logged_cut_short() {
+    let dir = std::env::temp_dir().join(format!("submarine-ai-test-{}", channel::random_hex(6)));
+    let exec: Executor = Arc::new(|_, _, _, _| Box::pin(async { Err("no servers in this test".to_string()) }));
+    let s = AiState::new(exec, Box::new(|| {}), Some(dir.clone()));
+    s.turn_on().unwrap();
+    s.start_tab("local-1", "Claude").unwrap();
+    let (_c, cancel) = watch::channel(false);
+    let huge = "\"".repeat(1024 * 1024);
+    for shared in [false, true] {
+        if shared {
+            s.share("local-1", "sess-1", "xyz").unwrap();
+        }
+        let r = s.run_command("local-1", &huge, "uptime", None, cancel.clone()).await;
+        assert!(r.is_error && r.text.contains("isn't shared with you"), "{}", &r.text[..200.min(r.text.len())]);
+        assert!(r.text.len() < 4 * 1024, "the AI's answer is cut too: {} bytes", r.text.len());
+    }
+    let text = std::fs::read_to_string(dir.join(audit::FILE_NAME)).unwrap();
+    let refused: Vec<&str> = text.lines().filter(|l| l.contains("\"refused\"")).collect();
+    assert_eq!(refused.len(), 2);
+    for l in refused {
+        assert!(l.len() < MAX_LOGGED_NAME + MAX_LOGGED_NOTE + 1024, "{} bytes", l.len());
+        assert!(l.contains("sha256 "));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn commands_are_logged_cut_short() {
     assert_eq!(for_log("abc", 10), "abc");
