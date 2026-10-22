@@ -83,7 +83,24 @@ A first test, off by default. To try it, install Claude Code, turn on **Settings
 
 AI tabs are kept apart from each other, from other accounts on the computer, and from the network. They aren't kept apart from a hostile program running as you: it could read an AI tab's access, edit the log, or click Allow for you.
 
-Claude Code starts without your SSH agent and the usual cloud and GitHub logins kept in the environment, so a script it writes doesn't find them there. Its `SSH_AUTH_SOCK` names a place where no agent is, so `ssh` it runs finds none, on Windows too (unset, Windows OpenSSH would go to its own agent). Its own `git` over SSH doesn't get your agent either. It still runs as you, though: unless its sandbox stops it (`/sandbox`, on macOS, Linux and WSL2), a program it runs can look for your agent's socket or pipe, or Pageant, by itself, read key files such as those in `~/.ssh`, and use the network. Claude Code has no sandbox on Windows: for production servers there, run Submarine and Claude Code in WSL2 or a virtual machine.
+Claude Code starts in a folder of its own (`ai-workspace` in Submarine's data folder), not your home folder, where it would read files without asking. Its `SSH_AUTH_SOCK` points where no agent is (on Windows too, where Windows OpenSSH would otherwise go to its own agent), and the usual cloud and GitHub logins are taken out of its environment.
+
+It still runs as you, though. `ssh` run by it can still log in with an agent named by `IdentityAgent` in `~/.ssh/config` (1Password, Secretive, Bitwarden, Pageant), a connection your own terminal keeps open (`ControlMaster`), or a key file with no passphrase or with its passphrase in the macOS Keychain. What it runs can also look for an agent itself, read your files and use the network. To keep Claude Code out of your keys, deny reading them in `~/.claude/settings.json`, both for its Read tool and in its sandbox, which by default can read them:
+
+```json
+{
+  "permissions": { "deny": ["Read(~/.ssh/**)", "Read(~/.aws/**)", "Read(~/.config/gcloud/**)", "Read(~/.azure/**)"] },
+  "sandbox": {
+    "enabled": true,
+    "credentials": { "files": [
+      { "path": "~/.ssh", "mode": "deny" }, { "path": "~/.aws", "mode": "deny" },
+      { "path": "~/.config/gcloud", "mode": "deny" }, { "path": "~/.azure", "mode": "deny" }
+    ] }
+  }
+}
+```
+
+The sandbox runs on macOS, Linux and WSL2, not on Windows itself: for production servers on Windows, run Submarine and Claude Code in WSL2 or a virtual machine.
 
 What comes next is in [#32](https://github.com/paulm981/Submarine/issues/32). First, you choose per server how much the AI may do without asking: ask every time, run the commands you've allowed, or run anything, with everything logged ([#115](https://github.com/paulm981/Submarine/issues/115)). Then any AI tool from a list, not only Claude Code ([#117](https://github.com/paulm981/Submarine/issues/117)).
 
