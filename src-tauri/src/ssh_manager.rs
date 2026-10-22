@@ -38,20 +38,6 @@ pub(crate) fn key_type_family(key_type: &str) -> String {
     }
 }
 
-/// The plain host key offered by the server, or `None` for a host
-/// CERTIFICATE. Monitoring refuses certificates, fail-closed: it trusts only
-/// host keys on file, and trusting the key embedded in a certificate would
-/// answer a question russh never asked. A connection checks a certificate
-/// against the `@cert-authority` lines in known_hosts instead
-/// (trust_policy::decide_certificate); host certificates are only asked for
-/// when such a line covers the host (`client_config_for_target`).
-pub fn plain_host_key(offered: &PublicKeyOrCertificate) -> Option<&PublicKey> {
-    match offered {
-        PublicKeyOrCertificate::PublicKey { key, .. } => Some(key),
-        PublicKeyOrCertificate::Certificate(_) => None,
-    }
-}
-
 /// The kinds of host key (`key_type_family`) on file for host:port, so a
 /// connection can ask the server for those first (`prefer_known_host_keys`).
 pub(crate) fn known_host_families(conn: &rusqlite::Connection, host: &str, port: u16) -> Vec<String> {
@@ -1519,9 +1505,6 @@ mod tests {
     const ECDSA_P256_FP_OLD_FORMAT: &str = "sv9PmqdzTou9hi/MJot5kkVRp1RlTzczpZBY9K1oNpY";
     const RSA_2048: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDV+BvzoBQWSFqUzFzroKlwFUmPsTDHZt3JKIX+S7eHR9CaLFSaUdxPgpf/s9BF5Ivm8sV4NiKGUbWzbwItcTzNk3JYEidewYxXb1B3drU7lt5aXWb2WkLQ3LNh+h7oyrJS9y6juLi4KYDceNwACb7gPJHiQYx187b9lfQhPr7YBAm6p17EQPp0p5mfdjXRR4fp/9bdGfjo32H+gdYlKUstcWM3h7/9t4D8DqVP+AGWdOav30dvqJkZecV81g7vCtFqGbpo6xw03yQ71BQJCcvaquptGtjJiA59iHql5D/KKM0zRN+r5lxNuduQIasBGc+GGdhioEqzmeYTI250PSAJ fixture";
     const RSA_2048_FP_OLD_FORMAT: &str = "nxrXMG0NyO+gdFkxT/vcYRg0no5urQPoiP7rc75QHow";
-    // `ssh-keygen -s ca -I fixture-host -h -n fixture.example` over ED25519:
-    // a host certificate whose embedded key IS the ED25519 fixture.
-    const ED25519_HOST_CERT: &str = "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAILjv1QmqwKn8aXSULcG7kSL388pMiSjUZFMt7oFciUGlAAAAIDUtueMG6aRvJ5KvL2MdRTSJvjovFlJSkevE6M2STKJoAAAAAAAAAAAAAAACAAAADGZpeHR1cmUtaG9zdAAAABMAAAAPZml4dHVyZS5leGFtcGxlAAAAAAAAAAD//////////wAAAAAAAAAAAAAAAAAAADMAAAALc3NoLWVkMjU1MTkAAAAgwN6B0Tf3VF3rFiFU8qAOsYLC4fwgl+GFWGKHkzLdHgEAAABTAAAAC3NzaC1lZDI1NTE5AAAAQMcDmzwGhVWC1D/LhuYLi21OWAuN+VB5BUziWq3uWh0onmWkyuDEw0FwWeTlwq0BexJbTIZr7bcNEBECVX71BQ0= fixture";
 
     fn key(openssh: &str) -> PublicKey {
         PublicKey::from_openssh(openssh).expect("fixture key parses")
@@ -1587,20 +1570,6 @@ mod tests {
             }
         }
         assert_eq!(key_type_family("ssh-ed25519-cert-v01@openssh.com"), all[0]);
-    }
-
-    #[test]
-    fn plain_keys_pass_through_and_certificates_are_refused() {
-        let k = key(ED25519);
-        let offered = PublicKeyOrCertificate::from(k.clone());
-        assert_eq!(plain_host_key(&offered).map(host_key_fingerprint), Some(host_key_fingerprint(&k)));
-
-        // Even though the certificate wraps an already-known key, it must NOT
-        // be reduced to that key: without a CA store it is refused.
-        let cert = russh::keys::Certificate::from_openssh(ED25519_HOST_CERT).expect("fixture cert parses");
-        assert_eq!(cert.public_key(), k.key_data());
-        let offered = PublicKeyOrCertificate::from(cert);
-        assert!(plain_host_key(&offered).is_none());
     }
 
     /// known_hosts exactly as `setup_master_db_inner` creates it.

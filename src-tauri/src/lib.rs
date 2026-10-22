@@ -10972,7 +10972,7 @@ pub(crate) fn ssh_preferred_algorithms() -> russh::Preferred {
         // No `*-cert-v01@openssh.com` host-key algorithms by default: they're
         // added only for a host an @cert-authority line in known_hosts covers
         // (client_config_for_target), so a server otherwise presents its plain
-        // host key (TOFU). See ssh_manager::plain_host_key.
+        // host key (TOFU). See trust_policy::decide_certificate.
         host_key_certificates: Cow::Borrowed(&[]),
         cipher: Cow::Borrowed(CIPHER),
         mac: Cow::Borrowed(MAC),

@@ -705,15 +705,35 @@ impl client::Handler for MonitorHandler {
         &mut self,
         offered: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        // Host certificates are refused: the monitor trusts only host keys on
-        // file, and a certificate is never put there (see
-        // ssh_manager::plain_host_key; Monitoring says so before connecting).
-        let Some(server_public_key) = crate::ssh_manager::plain_host_key(offered) else {
-            eprintln!(
-                "[monitor] {}:{} presented a host certificate; the monitor only trusts host keys on file, refusing",
-                self.host, self.port
-            );
-            return Ok(false);
+        // A host certificate passes only when it checks out against a CA
+        // known_hosts trusts for the host AND the key inside it is on file in
+        // the app (you approved it in a terminal): the monitor never asks.
+        let server_public_key = match offered {
+            PublicKeyOrCertificate::Certificate(cert) => {
+                let inner = russh::keys::PublicKey::from(cert.public_key().clone());
+                let fp = crate::ssh_manager::host_key_fingerprint(&inner);
+                let on_file = match self.db.lock() {
+                    Ok(guard) => guard.as_ref().and_then(|c| crate::ssh_manager::judge_host_key(c, &self.host, self.port, &fp).ok()),
+                    Err(_) => None,
+                };
+                let known = matches!(on_file, Some(crate::ssh_manager::HostKeyVerdict::Known));
+                let decision = on_file.map(|v| crate::trust_policy::decide_certificate(v, self.known_hosts.0.as_deref(), cert, crate::trust_policy::now()));
+                return Ok(match decision {
+                    Some(crate::trust_policy::HostKeyDecision::Trusted { .. }) if known => true,
+                    Some(crate::trust_policy::HostKeyDecision::Refused(why)) => {
+                        eprintln!("[monitor] {}:{}: host certificate refused: {why}", self.host, self.port);
+                        false
+                    }
+                    _ => {
+                        eprintln!(
+                            "[monitor] {}:{}: the key in its host certificate isn't one the app trusts for it, refusing",
+                            self.host, self.port
+                        );
+                        false
+                    }
+                });
+            }
+            PublicKeyOrCertificate::PublicKey { key, .. } => key,
         };
         // Must be byte-identical to what the interactive path stored in
         // known_hosts — this handler only trusts fingerprints already on file,
@@ -1170,6 +1190,11 @@ async fn login_for_monitor(
     // Asks the host for the kinds of host key on file for it first, as the
     // session does, so both negotiate the key that's trusted.
     let mut config = monitor_client_config();
+    // Host certificates are asked for only where known_hosts has a CA for
+    // the host, as a terminal asks (client_config_for_target).
+    if auth.known_hosts.0.as_ref().is_some_and(|t| t.has_cas()) {
+        crate::apply_host_key_algorithms(&mut config.preferred, true, None, &mut Vec::new());
+    }
     if let Ok(guard) = db.lock() {
         if let Some(conn) = guard.as_ref() {
             let families = crate::ssh_manager::known_host_families(conn, &auth.host, auth.port);
@@ -2115,6 +2140,59 @@ mod jump_host_tests {
             .err()
             .expect("a revoked jump host key must be refused");
         assert!(err.starts_with("jump host 127.0.0.1"), "{err}");
+    }
+
+    /// A TestServer that also shows a host certificate for its key, signed
+    /// by `ca` for 127.0.0.1.
+    async fn listen_with_certificate(ca: &russh::keys::PrivateKey) -> u16 {
+        use russh::keys::ssh_key::certificate::{Builder, CertType};
+        let host_key = crate::ssh_test_server::host_key();
+        let now = crate::trust_policy::now();
+        let mut b = Builder::new_with_random_nonce(&mut rand::rng(), host_key.public_key(), now - 60, now + 3600).unwrap();
+        b.cert_type(CertType::Host).unwrap();
+        b.valid_principal("127.0.0.1").unwrap();
+        let cert = b.sign(ca).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let cert = cert.clone();
+                serve(TestServer::default(), move |c| c.certificates = vec![cert], socket);
+            }
+        });
+        port
+    }
+
+    async fn known_hosts_text(text: String, host: &str, port: u16) -> KnownHosts {
+        let dir = std::env::temp_dir().join(format!("submarine-mon-kh-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("known_hosts");
+        std::fs::write(&file, text).unwrap();
+        let trust = crate::known_hosts::for_host(Some(vec![file.to_string_lossy().into_owned()]), host, port).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        KnownHosts(Some(Arc::new(trust.expect("read"))))
+    }
+
+    // A server showing a host certificate: checked once you've approved the
+    // key in it (it's on file), never otherwise; a revoked CA is refused even
+    // then, so it was the certificate that was checked.
+    #[tokio::test]
+    async fn monitoring_checks_a_certificate_whose_key_is_on_file() {
+        use russh::keys::PublicKeyBase64;
+        let ca = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519).unwrap();
+        let ca_line = format!("{} {}", ca.public_key().algorithm(), ca.public_key().public_key_base64());
+        let port = listen_with_certificate(&ca).await;
+        let mut auth = node("127.0.0.1", port, None);
+        auth.known_hosts = known_hosts_text(format!("@cert-authority 127.0.0.1 {ca_line}\n"), "127.0.0.1", port).await;
+
+        let on_file = known_hosts(&[("127.0.0.1", port)]);
+        assert!(connect_for_monitor(&on_file, &auth, Duration::from_secs(10), None).await.is_ok(), "the key in it is on file");
+        let nothing = known_hosts(&[]);
+        assert!(connect_for_monitor(&nothing, &auth, Duration::from_secs(10), None).await.is_err(), "nothing on file: not trusted");
+
+        auth.known_hosts =
+            known_hosts_text(format!("@cert-authority 127.0.0.1 {ca_line}\n@revoked * {ca_line}\n"), "127.0.0.1", port).await;
+        assert!(connect_for_monitor(&on_file, &auth, Duration::from_secs(10), None).await.is_err(), "a revoked CA");
     }
 
     #[tokio::test]
