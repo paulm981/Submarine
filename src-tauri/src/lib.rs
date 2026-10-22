@@ -5452,6 +5452,8 @@ async fn close_profile(
     ssh.root_access.lock().await.clear();
     ssh.docker_root.lock().await.clear();
     ssh.sftp_shell.lock().await.clear();
+    ssh.session_servers.lock().await.clear();
+    ssh.terminal_servers.lock().await.clear();
     // Wipe every connect-time secret the user typed this profile (issue #30).
     ssh.prompted_secrets.lock().await.clear();
     ssh.connections.lock().await.clear();
@@ -11748,6 +11750,7 @@ async fn initiate_connection(
     let start_tunnels_inline = role == "primary" && !separate;
 
     println!("[BACKEND] initiate_connection invoked for session_id: {} (role: {}, separate: {}), server_id: {}", session_id, role, separate, server_id);
+    state.session_servers.lock().await.insert(session_id.clone(), server_id);
 
     // Reconnect path: if a previous session under this id is still registered,
     // tear it down before starting the fresh handshake. Without this, the
@@ -14647,6 +14650,7 @@ async fn telnet_connect(
     server_id: i32,
     use_ssh_agent: Option<bool>,
 ) -> Result<(), String> {
+    state.session_servers.lock().await.insert(session_id.clone(), server_id);
     use std::sync::Arc;
     use tauri::Emitter;
 
@@ -14801,6 +14805,7 @@ async fn telnet_open_terminal(
     let (tx, rx) = tokio::sync::mpsc::channel::<TerminalCommand>(32);
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(PtySize { cols, rows });
     state.terminal_txs.lock().await.insert(terminal_id.clone(), tx);
+    note_terminal_server(&state, &session_id, &terminal_id).await;
     state.resize_txs.lock().await.insert(terminal_id.clone(), resize_tx);
     // The output goes to the page's channel, paced like an SSH terminal's
     // (term_output.rs).
@@ -15347,6 +15352,7 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
         crate::ssh_manager::PtySize { cols, rows },
     );
     state.terminal_txs.lock().await.insert(terminal_id.clone(), tx);
+    note_terminal_server(&state, &session_id, &terminal_id).await;
     state.resize_txs.lock().await.insert(terminal_id.clone(), resize_tx);
 
     // Output coalescing, keystroke / resize forwarding and the split,
@@ -15387,11 +15393,24 @@ async fn write_terminal_data(state: tauri::State<'_, SshState>, terminal_id: Str
     Ok(())
 }
 
+/// The saved server a shell terminal's session was opened for, kept for
+/// type_saved_password. A container's terminal isn't the server's shell and
+/// isn't noted.
+async fn note_terminal_server(state: &SshState, session_id: &str, terminal_id: &str) {
+    let server = state.session_servers.lock().await.get(session_id).copied();
+    let mut terminals = state.terminal_servers.lock().await;
+    match server {
+        Some(id) => terminals.insert(terminal_id.to_string(), id),
+        None => terminals.remove(terminal_id),
+    };
+}
+
 /// Types a saved password into a terminal, for a password prompt there (sudo,
 /// su, …) that the user picked it for (#28): a server's own saved password
-/// (`server_id`) or a saved login's (`credential_id`). It goes from the
-/// profile to the terminal and never reaches the webview. No Enter after it:
-/// the user sees where it went and presses Enter themselves.
+/// (`server_id`), only into one of that server's own terminals, or a saved
+/// login's (`credential_id`). It goes from the profile to the terminal and
+/// never reaches the webview. No Enter after it: the user sees where it went
+/// and presses Enter themselves.
 #[tauri::command]
 async fn type_saved_password(
     ssh: tauri::State<'_, SshState>,
@@ -15401,6 +15420,11 @@ async fn type_saved_password(
     credential_id: Option<i32>,
 ) -> Result<(), String> {
     use crate::ssh_manager::TerminalCommand;
+    if let Some(id) = server_id {
+        if ssh.terminal_servers.lock().await.get(&terminal_id) != Some(&id) {
+            return Err("That's another server's password: it's only typed into that server's own terminals".into());
+        }
+    }
     let saved = {
         let conn_guard = db.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
@@ -15440,6 +15464,7 @@ async fn resize_terminal(state: tauri::State<'_, SshState>, terminal_id: String,
 async fn close_terminal(state: tauri::State<'_, SshState>, terminal_id: String) -> Result<(), String> {
     state.terminal_txs.lock().await.remove(&terminal_id);
     state.resize_txs.lock().await.remove(&terminal_id);
+    state.terminal_servers.lock().await.remove(&terminal_id);
     Ok(())
 }
 

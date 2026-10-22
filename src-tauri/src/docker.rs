@@ -779,6 +779,7 @@ pub async fn open_container_terminal(
     cols: u32,
     rows: u32,
     use_sudo: bool,
+    password: Option<String>,
     on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Result<(), String> {
     use crate::ssh_manager::TerminalCommand;
@@ -794,9 +795,10 @@ pub async fn open_container_terminal(
         unreachable!()
     };
     // As root as this tab's other docker commands are (run_docker_smart).
-    let as_root = use_sudo || state.docker_root.lock().await.contains(&session_id);
+    // `password`: the page asked for it when root wanted one (rootInvoke).
+    let as_root = use_sudo || password.is_some() || state.docker_root.lock().await.contains(&session_id);
     let (channel, early) = if as_root {
-        let (channel, _, early) = crate::root_channel(&state, &session_id, &args, None, Some((cols, rows))).await?;
+        let (channel, _, early) = crate::root_channel(&state, &session_id, &args, password, Some((cols, rows))).await?;
         (channel, early)
     } else {
         let session_arc = {

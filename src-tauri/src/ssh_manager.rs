@@ -414,6 +414,12 @@ pub struct SshState {
     /// group): the Docker tab's commands go straight to root there
     /// (docker.rs). Dropped when the tab closes, like `root_access`.
     pub docker_root: Arc<Mutex<HashSet<String>>>,
+    /// The saved server each session was opened for (initiate_connection,
+    /// telnet_connect), and the server of each of its shell terminals: a
+    /// server's own saved password is typed only into that server's
+    /// terminals (type_saved_password).
+    pub session_servers: Arc<Mutex<HashMap<String, i32>>>,
+    pub terminal_servers: Arc<Mutex<HashMap<String, i32>>>,
     /// Tabs whose cached SFTP session is file access over shell commands (the
     /// server has no SFTP, see `shell_sftp`): the pane says so.
     pub sftp_shell: Arc<Mutex<HashSet<String>>>,
@@ -521,6 +527,8 @@ impl SshState {
             sftp_elevation: Arc::new(Mutex::new(HashMap::new())),
             root_access: Arc::new(Mutex::new(HashMap::new())),
             docker_root: Arc::new(Mutex::new(HashSet::new())),
+            session_servers: Arc::new(Mutex::new(HashMap::new())),
+            terminal_servers: Arc::new(Mutex::new(HashMap::new())),
             sftp_shell: Arc::new(Mutex::new(HashSet::new())),
             prompted_secrets: Arc::new(Mutex::new(HashMap::new())),
         }
