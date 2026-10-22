@@ -53,6 +53,7 @@ mod ai;
 mod open_policy;
 mod rdp;
 mod quick_unlock;
+mod busy;
 mod rdp_client;
 mod term_filter;
 mod vault_backup;
@@ -19312,6 +19313,7 @@ async fn sftp_remove_dir(
     };
 
     let id = transfer_id();
+    let _running = busy::RunningTransfer::start(&session_id);
     let cancel = Arc::new(AtomicBool::new(false));
     let cancels_map = Arc::clone(&state.transfer_cancels);
     cancels_map.lock().await.insert(id.clone(), Arc::clone(&cancel));
@@ -19548,6 +19550,7 @@ async fn sftp_download_file(
         .unwrap_or("file")
         .to_string();
     let id = transfer_id();
+    let _running = busy::RunningTransfer::start(&session_id);
     let event_name = format!("sftp-transfer-{}", session_id);
     let emit_progress = |bytes: u64, status: &str, error: Option<String>| {
         let _ = app.emit(
@@ -19730,6 +19733,7 @@ async fn sftp_download_dir(
     let folder_name = if folder_name.is_empty() { "folder".to_string() } else { folder_name };
 
     let id = transfer_id();
+    let _running = busy::RunningTransfer::start(&session_id);
     let event_name = format!("sftp-transfer-{}", session_id);
 
     // Register cancel flag early so the user can abort even during the
@@ -20148,6 +20152,7 @@ async fn sftp_upload_file(
         .unwrap_or("file")
         .to_string();
     let id = transfer_id();
+    let _running = busy::RunningTransfer::start(&session_id);
     let event_name = format!("sftp-transfer-{}", session_id);
     let emit_progress = |bytes: u64, status: &str, error: Option<String>| {
         let _ = app.emit(
@@ -20394,6 +20399,7 @@ async fn sftp_upload_dir(
     }
 
     let id = transfer_id();
+    let _running = busy::RunningTransfer::start(&session_id);
     let event_name = format!("sftp-transfer-{}", session_id);
 
     // Cancel flag registered before the slow enumeration so the user can
@@ -21355,6 +21361,16 @@ fn make_unsent_edits_dir(folder: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Whether the Live Edit copy at `path`, under `under`, has edits that were
+/// never uploaded: its content isn't `synced`, the hash of what was last
+/// uploaded or downloaded.
+fn is_unsent_under(path: &Path, synced: &[u8], under: &Path) -> bool {
+    use sha2::{Digest, Sha256};
+    path.starts_with(under)
+        && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+        && std::fs::read(path).is_ok_and(|c| Sha256::digest(&c).as_slice() != synced)
+}
+
 /// Before Live Edit copies are deleted, the ones under `under` with edits
 /// that were never uploaded (their content isn't what was last uploaded, or
 /// downloaded) are moved to `unsent_edits_dir`, and the page is told
@@ -21366,16 +21382,11 @@ fn make_unsent_edits_dir(folder: &Path) -> std::io::Result<()> {
 /// stopped) the entry stays: the editor may still have the file open, and a
 /// save after this is kept at the sweep, not deleted with the folder.
 fn keep_unsent_edits(under: &Path, sweep: bool) -> Option<PathBuf> {
-    use sha2::{Digest, Sha256};
     let unsent: Vec<PathBuf> = {
         let mut copies = live_edit_copies().lock().unwrap_or_else(|e| e.into_inner());
         let found: Vec<PathBuf> = copies
             .iter()
-            .filter(|(path, synced)| {
-                path.starts_with(under)
-                    && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
-                    && std::fs::read(path).is_ok_and(|c| Sha256::digest(&c).as_slice() != synced.as_slice())
-            })
+            .filter(|(path, synced)| is_unsent_under(path, synced, under))
             .map(|(path, _)| path.clone())
             .collect();
         if sweep {
@@ -25343,7 +25354,7 @@ pub fn run() {
             import_hosts, host_import::pick_client_import_file,
             sftp_list_dir, sftp_create_dir, sftp_remove_file, sftp_remove_dir,
             sftp_rename, sftp_set_permissions, sftp_set_owner, sftp_stat,
-            sftp_download_file, sftp_download_dir, sftp_upload_file, sftp_upload_dir, sftp_cancel_transfer, sftp_open_remote_file,
+            sftp_download_file, sftp_download_dir, sftp_upload_file, sftp_upload_dir, sftp_cancel_transfer, busy::sessions_busy, sftp_open_remote_file,
             sftp_set_elevated, sftp_elevation_status, sftp_login_user, sftp_resolve_owners,
             archive::local_archive, archive::local_extract, archive::sftp_archive, archive::sftp_extract,
             local_open_file, local_open_in_explorer, sftp_prepare_drag,
