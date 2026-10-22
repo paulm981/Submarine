@@ -25,7 +25,7 @@ The fork is based on the original project's **0.4.0**, with every change up to [
 - pause the terminals to leave out: one with its chip, several by Ctrl-clicking (⌘-clicking) their titles or Shift-clicking a run, or **Pause all** and then resume the few you want;
 - paste, or **Send** a set of commands, to all of them.
 
-A server that connects or reconnects partway through a line waits for the next line, so it never gets only the end of a command. Walls can be saved by name, and a whole folder opens as one.
+A server that connects or reconnects partway through a line waits for the next line, so it never gets only the end of a command. Walls can be saved by name, and a whole folder opens as one. Closing a Wall that took your tabs asks whether to put them back or close them, and can remember the answer (**Settings › Walls**).
 
 - **Jump hosts at scale.** A hundred servers behind one jump host log in a few at a time, in terminals and in Monitoring; the number is a setting. Monitoring reaches servers through their jump host too, by the same `~/.ssh/config` name as the terminal.
 - **Split.** A second shell on the same server opens beside the first, so you can watch a log in one and work in the other.
@@ -57,6 +57,7 @@ A first test, off by default: turn it on in **Settings › AI tools**.
 
 - **Claude Code from Home's menu**, under AI tools, opens already connected to Submarine through a local channel only your account can use. Nothing listens on the network.
 - **Share with AI** on a server's tab lets that AI tab ask to run commands there. Each one waits in the **AI panel** (the title bar's AI button) until you click Allow or Deny; typing can't approve anything.
+- **The AI side pane** shows an AI tab beside a server tab or Wall shared with it: the same terminal as in Home, open or folded to a bar (**Ctrl+Shift+L**), with Share, Unshare, Allow and Deny in its header. A server tab's **+** menu has **Claude Code beside this**, to start one there.
 - Submarine runs the command over its own connection, so the AI never gets a key or password. You see the full output; the AI gets it with known secrets hidden, and you see how many.
 - Every request and decision goes in `ai-audit.log` in the log folder.
 
