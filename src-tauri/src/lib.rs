@@ -11991,9 +11991,11 @@ async fn initiate_connection(
     // deleted one, say), the list starts again from the saved ones first, so
     // the reconnect doesn't bring back a forward that's gone. The list is
     // kept under the base session id, which the `::fwd` connection replays
-    // too; other connections (`::sftp`) have none, and mustn't use up the change.
-    if role == "primary" || role == "forward" {
-        let rules_key = session_id.strip_suffix("::fwd").unwrap_or(&session_id);
+    // too. A first connect (no list yet) reads the saved ones anyway, and
+    // other connections (`::sftp`) have none: neither may use up the change,
+    // which another tab on this server may still need.
+    let rules_key = session_id.strip_suffix("::fwd").unwrap_or(&session_id);
+    if (role == "primary" || role == "forward") && state.session_tunnel_specs.lock().await.contains_key(rules_key) {
         if let Err(e) = refresh_synced_session_rules(state.inner(), db_state.inner(), rules_key, Some(server_id)).await {
             println!("[BACKEND] {}: the saved forwards weren't read again: {}", session_id, e);
         }
