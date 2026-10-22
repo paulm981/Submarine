@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { Bot, ChevronDown, Plus, TerminalSquare, X } from "lucide-react";
 import TerminalView from "./TerminalView";
-import { takeAiLaunches, takeHomeTabAsk, watchAiLaunches, watchHomeTabAsk } from "../ui/aiPane";
+import { aiStartEnded, takeAiLaunches, takeHomeTabAsk, watchAiLaunches, watchHomeTabAsk } from "../ui/aiPane";
 
 // The Home view: terminals on this computer (src-tauri/src/local_term.rs),
 // started in the home folder — PowerShell, Command Prompt, WSL or Git Bash on
@@ -130,9 +130,12 @@ export const HomePane = ({ visible, onLiveShells }: { visible: boolean; onLiveSh
     const ids = new Set(tabs.map((t) => t.id));
     for (const id of ids) {
       if (closedListeners.current.has(id)) continue;
-      closedListeners.current.set(id, listen(`terminal-closed-${id}`, () =>
-        setTabs((prev) => prev.map((x) => (x.id === id ? { ...x, ended: true } : x))),
-      ));
+      closedListeners.current.set(id, listen(`terminal-closed-${id}`, () => {
+        setTabs((prev) => prev.map((x) => (x.id === id ? { ...x, ended: true } : x)));
+        // An AI tool that ended before it started isn't waited for.
+        onAiStarted.current.delete(id);
+        aiStartEnded(id);
+      }));
     }
     for (const [id, unlisten] of closedListeners.current) {
       if (ids.has(id)) continue;
@@ -151,6 +154,7 @@ export const HomePane = ({ visible, onLiveShells }: { visible: boolean; onLiveSh
     const at = tabs.findIndex((t) => t.id === id);
     const next = tabs.filter((t) => t.id !== id);
     onAiStarted.current.delete(id);
+    aiStartEnded(id);
     setTabs(next);
     if (active === id) setActive(next.length ? next[Math.max(0, at - 1)].id : null);
   };
@@ -239,6 +243,12 @@ export const HomePane = ({ visible, onLiveShells }: { visible: boolean; onLiveSh
                   const started = onAiStarted.current.get(t.id);
                   onAiStarted.current.delete(t.id);
                   started?.(t.id);
+                },
+                // Couldn't start (the error is in the tab): the AI side
+                // pane stops waiting for it.
+                onFailed: () => {
+                  onAiStarted.current.delete(t.id);
+                  aiStartEnded(t.id);
                 },
               }}
             />

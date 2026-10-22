@@ -3,10 +3,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { Bot, Home, Loader2, PanelRightClose, PanelRightOpen, X } from "lucide-react";
 import { AiTab, sharedWith, useAi } from "../util/ai";
 import {
-  PANE_MIN_WIDTH, aiStarted, aiPaneState, choosePaneAi, leftView, resetAiPane, setPaneFolded, setPaneHere,
+  PANE_MIN_WIDTH, aiStarted, aiPaneState, choosePaneAi, closePaneHere, leftView, resetAiPane, setPaneFolded, setPaneHere,
   setPaneWidth, showHomeTab, useAiPane,
 } from "../ui/aiPane";
-import { appHotkey, claimTerminal, dockedTerminal, useDockVersion } from "../ui/terminalDock";
+import { appHotkey, claimTerminal, dockedTerminal, setAiPaneKeyLive, useDockVersion } from "../ui/terminalDock";
 import { IS_ANDROID } from "../util/platform";
 import { PendingCard } from "./AiPanel";
 
@@ -83,7 +83,7 @@ const useModel = (v: AiPaneView): Model => {
 const toggle = (v: AiPaneView, m: Model) => {
   if (!m.allowed) return false;
   if (m.shows) {
-    if (m.relevant.length === 0) setPaneHere(null);
+    if (m.relevant.length === 0) closePaneHere();
     else if (m.open) { setPaneFolded(true); setPaneHere(null); }
     else setPaneFolded(false);
     return !m.open;
@@ -171,12 +171,17 @@ export const AiSidePane = ({ v, onHome, onGoToServer }: {
   useEffect(() => { if (startingId) focusAi.current = true; }, [startingId]);
   const actRef = useRef(act);
   actRef.current = act;
+  // Ctrl+Shift+L is taken from the terminals only while it does something
+  // here (see appHotkey); this pane isn't mounted in a narrow window.
+  const keyLive = m.allowed && (m.shows || m.all.length > 0);
+  useLayoutEffect(() => { setAiPaneKeyLive(keyLive); }, [keyLive]);
+  useLayoutEffect(() => () => setAiPaneKeyLive(false), []);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (appHotkey(e) !== "aiPane") return;
-      e.preventDefault();
       if (e.repeat || inField()) return;
       if (document.querySelector('[aria-modal="true"]')) return;
+      e.preventDefault();
       actRef.current();
     };
     window.addEventListener("keydown", onKey);

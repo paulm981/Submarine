@@ -90,7 +90,12 @@ export const leftView = (view: string) => {
 /// Locking the profile: nothing carries over to the next one.
 export const resetAiPane = () => {
   launches = [];
-  set({ here: null, chosen: null, starting: null });
+  set({ here: null, chosen: null, starting: null, homeNeeded: false });
+};
+/// The pane closed where it was opened by itself: an AI tool still starting
+/// there is no longer waited for in it.
+export const closePaneHere = () => {
+  if (state.here !== null || state.starting !== null) set({ here: null, starting: null });
 };
 
 // ── Requests to Home ────────────────────────────────────────────────────────
@@ -121,6 +126,10 @@ export const watchAiLaunches = (w: () => void) => {
 };
 /// The AI tab has started (it's in the AI state): the pane goes on to show
 /// it as any other.
+/// …or never will: its Home tab closed, or it failed to start.
+export const aiStartEnded = (id: string) => {
+  if (state.starting?.id === id) set({ starting: null });
+};
 export const aiStarted = (id: string) => {
   if (state.starting?.id === id) set({ starting: null });
 };
