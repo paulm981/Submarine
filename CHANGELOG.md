@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Closing a Wall can remember what to do with the tabs Broadcast took.** The question now has a **Remember my answer** box, and **Settings › Walls** has the same choice: **Ask each time**, **Put them back as tabs** or **Close them all**. It's kept on this computer only. **Close them all** still asks when one of those servers is busy: a file uploading or downloading, a Live Edit file with changes not sent yet, or an AI command running or waiting for you. **Back to tabs** on the Wall's bar still puts them back in one click. ([#101](https://github.com/paulm981/Submarine/issues/101))
+
+## v0.4.0-fork.5
+
 - **Opening a Live Edit file again keeps your unsent changes.** If the copy on this computer has changes that never reached the server, it's copied to **Submarine unsent edits** in your Downloads folder before the server's version is opened, and the window says so. A file opened twice is also uploaded once per save, not twice. ([#93](https://github.com/paulm981/Submarine/issues/93))
 - **Quitting the app keeps unsent Live Edit changes too**, in the same folder, as disconnecting and locking already did. ([#93](https://github.com/paulm981/Submarine/issues/93))
 - **Kept copies are private.** On macOS and Linux, a copy kept in **Submarine unsent edits** can be read only by you, and so can the folder. ([#93](https://github.com/paulm981/Submarine/issues/93))
