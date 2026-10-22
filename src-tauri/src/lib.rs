@@ -11953,6 +11953,20 @@ async fn initiate_connection(
     // reconnect attempt and the UI would just sit on "connecting…" forever.
     // Tunnels + forwarded_targets get the same treatment further down via the
     // stop_all_for_session call, so we don't duplicate that here.
+    //
+    // Bump the generation FIRST, as teardown_connection_key and
+    // disconnect_session do, so any watcher task still alive from the prior
+    // attempt sees a newer value next tick and bails silently instead of
+    // racing the new connect to emit `session-disconnected-{id}`, and a prior
+    // attempt still logging in fails its "still wanted?" check instead of
+    // registering itself (and its jump host) after the removals below, where
+    // nothing would watch or close it.
+    let connect_generation: u64 = {
+        let mut g = state.session_generation.lock().await;
+        let next = g.get(&session_id).copied().unwrap_or(0).wrapping_add(1);
+        g.insert(session_id.clone(), next);
+        next
+    };
     {
         let mut conns = state.connections.lock().await;
         if conns.remove(&session_id).is_some() {
@@ -11972,15 +11986,6 @@ async fn initiate_connection(
     let term_prefix = format!("{}-term-", session_id);
     state.terminal_txs.lock().await.retain(|k, _| !k.starts_with(&term_prefix));
     state.resize_txs.lock().await.retain(|k, _| !k.starts_with(&term_prefix));
-    // Bump the generation so any watcher task still alive from the prior
-    // attempt sees a newer value next tick and bails silently instead of
-    // racing the new connect to emit `session-disconnected-{id}`.
-    let connect_generation: u64 = {
-        let mut g = state.session_generation.lock().await;
-        let next = g.get(&session_id).copied().unwrap_or(0).wrapping_add(1);
-        g.insert(session_id.clone(), next);
-        next
-    };
     // This attempt, as its prompts and failure report see it: once a newer
     // attempt starts (or the tab disconnects) they stay quiet.
     let attempt = ssh_manager::ConnectAttempt::new(
@@ -12764,6 +12769,14 @@ async fn initiate_connection(
                                     .lock()
                                     .await
                                     .insert(session_id_clone.clone(), Arc::clone(&session_arc));
+                                // ProxyJump: park the bastion's Handle with the
+                                // session, under the same check, so it stays
+                                // alive for the whole session (its direct-tcpip
+                                // channel carries our transport) and a later
+                                // reconnect / disconnect / close drops it.
+                                if let Some(jh) = jump_handle_holder.take() {
+                                    state_jump_connections.lock().await.insert(session_id_clone.clone(), jh);
+                                }
                                 true
                             } else {
                                 false
@@ -12783,13 +12796,6 @@ async fn initiate_connection(
                         // transport preference. Live migration, no re-keying.
                         if let Some(base) = session_id_clone.strip_suffix("::sftp") {
                             state_sftp_sessions.lock().await.remove(base);
-                        }
-                        // ProxyJump: now that the target session is live, park
-                        // the bastion's Handle so it stays alive for the whole
-                        // session (its direct-tcpip channel carries our
-                        // transport). Dropped on reconnect / disconnect / close.
-                        if let Some(jh) = jump_handle_holder.take() {
-                            state_jump_connections.lock().await.insert(session_id_clone.clone(), jh);
                         }
                         let _ = app.emit(
                             &format!("connection-success-{}", session_id_clone),
