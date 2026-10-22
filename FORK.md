@@ -11,7 +11,7 @@ This page covers:
 
 What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
-The fork is based on the original project's **0.4.0**, with every change up to [#224](https://github.com/SinaXhpm/submarine/pull/224) brought in or recorded as not taken.
+The fork is based on the original project's **0.4.0**, with every change up to [#229](https://github.com/SinaXhpm/submarine/pull/229) brought in or recorded as not taken.
 
 ## What this fork adds
 
@@ -148,6 +148,8 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | Saved password at a prompt ([#182](https://github.com/SinaXhpm/submarine/pull/182)) | Offers this server's password and every saved login | Offers this server's password and its own login; another saved login only when the prompt names its user. Not in Home's local shells |
 | Terminal colors ([#183](https://github.com/SinaXhpm/submarine/pull/183)) | One scheme per device, or one of your own | The fork's schemes, per device or per server (synced). A scheme of your own is for this device only. "Keep text readable" is on by default |
 | Key exchange ([#189](https://github.com/SinaXhpm/submarine/pull/189)) | Offers the 1024-bit `diffie-hellman-group1-sha1` last | Never offers it (Logjam). Group exchange over SHA-1 is offered, with groups of 2048 bits or more |
+| Privacy policy ([#225](https://github.com/SinaXhpm/submarine/pull/225)) | The **Privacy** links open the policy on its website | They open this fork's [PRIVACY.md](PRIVACY.md): the same policy, with a note on where the fork differs. **Delete Submarine Cloud account** only deletes the hosted cloud account; profiles on the computer and sync through your own storage stay |
+| Website ([#229](https://github.com/SinaXhpm/submarine/pull/229)) | `website/` is published at `submarine.sinaxhpm.com` | The folder comes along with merges, unchanged, but the fork doesn't publish it: no workflow builds or deploys it |
 
 ## Changes in the original project not taken yet
 

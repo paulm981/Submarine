@@ -28,9 +28,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to build as a test (e.g. v0.0.0-test); nothing is published"
+        description: "Version to build as a test (e.g. v0.0.1-test; at least 0.0.1, the lowest an Android package may have); nothing is published"
         required: true
-        default: "v0.0.0-test"
+        default: "v0.0.1-test"
       macos:
         description: "Build macOS too"
         type: boolean

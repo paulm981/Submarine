@@ -3,13 +3,14 @@ import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import {
   AlertTriangle, ArrowBigUp, ArrowRight, ArrowUpCircle, Check, CheckCircle2, ChevronDown, Cloud, CloudOff, Download,
-  Eye, EyeOff, Fingerprint, FolderSync, Github, HardDrive, Loader2, MoreHorizontal, Plus, RefreshCw, Trash2, Upload, X,
+  Eye, EyeOff, Fingerprint, FolderSync, Github, HardDrive, Loader2, MoreHorizontal, Plus, RefreshCw, ShieldCheck, Trash2, Upload, X,
 } from "lucide-react";
 import CloudPanel from "./CloudPanel";
 import { StoreRestoreModal } from "./StoreSync";
 import { CloudConfigView, hostOf } from "./SyncServerSetting";
 import logoUrl from "../assets/logo.png";
 import { IS_ANDROID } from "../util/platform";
+import { PRIVACY_URL } from "../util/links";
 import { useTextPrompt, useConfirm } from "../ui/confirm";
 import { forgetProfileBookmarks } from "../util/sftpBookmarks";
 
@@ -1116,6 +1117,8 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
         <footer className="mt-4 flex flex-col items-center gap-2.5">
           <div aria-live="polite" className="flex flex-wrap items-center justify-center gap-1 text-[11.5px]">
             <FooterButton onClick={openRepo} title="Open Submarine on GitHub" icon={<Github size={12} />} label="GitHub" />
+            <FooterDot />
+            <FooterButton onClick={() => openLink(PRIVACY_URL)} title="What Submarine stores and sends: the privacy policy" icon={<ShieldCheck size={12} />} label="Privacy" />
             {!update && (
               <>
                 <FooterDot />

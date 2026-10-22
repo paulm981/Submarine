@@ -30,6 +30,15 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - **A forward you stopped stays stopped until you start it.** In a shared profile, someone else starting it again now waits for your OK, like a forward they add. A forward that arrives stopped doesn't need your OK, since it runs nothing. ([#95](https://github.com/paulm981/Submarine/issues/95))
 - **A token given as the user name in a git address** (`https://TOKEN@host/…`) is no longer on git's command line, where other users of the computer could read it. It's handed to git the way a password in the address already is. ([#95](https://github.com/paulm981/Submarine/issues/95))
 
+### From the original project ([#41](https://github.com/paulm981/Submarine/issues/41))
+
+- **The last column of a full line shows whole** ([#227](https://github.com/SinaXhpm/submarine/pull/227)). Its right edge was sometimes cut off when the terminal draws without the GPU. On a Wall too.
+- **Delete your Submarine Cloud account from the app** ([#225](https://github.com/SinaXhpm/submarine/pull/225)). If you turned Submarine Cloud on, its panel has **Delete Submarine Cloud account…**, confirmed with the account password. It deletes the account and what the server holds for it. The profiles on your computer, and sync through your own folder or git repository, stay as they are.
+- **A privacy policy** ([#225](https://github.com/SinaXhpm/submarine/pull/225)). **Privacy** at the bottom of the profile screen opens it. It's the original project's, with a note on where this fork differs.
+- **Submarine Cloud's new address** ([#228](https://github.com/SinaXhpm/submarine/pull/228)). When it's on, the app asks the sync service at its new address, under `/api`, as the original project's app now does. Nobody is signed out, and no profile has to move.
+- **Test builds** ([#226](https://github.com/SinaXhpm/submarine/pull/226)). A build started by hand now has a version Android accepts.
+- **The original project's website** ([#229](https://github.com/SinaXhpm/submarine/pull/229)) comes with its source, in `website/`. It isn't part of the app, and this fork doesn't publish it.
+
 ## v0.4.0-fork.3
 
 - **Search for the jump host.** In a server's form, **Jump via** is now a search box: type part of a name, address or folder, and pick with the arrow keys and Enter or a click. Servers already used as a jump host are listed first. ([#102](https://github.com/paulm981/Submarine/issues/102))
