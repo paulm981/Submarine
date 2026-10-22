@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { Bot, ChevronDown, Plus, TerminalSquare, X } from "lucide-react";
 import TerminalView from "./TerminalView";
+import { takeAiLaunches, takeHomeTabAsk, watchAiLaunches, watchHomeTabAsk } from "../ui/aiPane";
 
 // The Home view: terminals on this computer (src-tauri/src/local_term.rs),
 // started in the home folder — PowerShell, Command Prompt, WSL or Git Bash on
@@ -15,7 +16,9 @@ import TerminalView from "./TerminalView";
 // The menu's AI tools heading (#32) lists the AI tools Home can start —
 // Claude Code — while AI tools are on in Settings and it's installed. Picked,
 // it opens in a tab of its own, already connected to Submarine; closing the
-// tab ends its access.
+// tab ends its access. A server tab's + menu can start it here too (its
+// "Claude Code beside this", src/ui/aiPane.ts), and the AI side pane shows
+// an AI tab's terminal beside a server tab, moved out of here while it does.
 
 // A shell Home can start (local_term.rs): `group` is the heading it's listed
 // under — "Windows" and "WSL" on Windows, "This computer" elsewhere, "Your
@@ -66,22 +69,47 @@ export const HomePane = ({ visible, onLiveShells }: { visible: boolean; onLiveSh
   const loadShells = () =>
     invoke<LocalShells>("list_local_shells").then(setShells).catch(() => setShells(null));
 
-  const openShell = (shell: string | null) => {
+  const openShell = (shell: string | null, ask?: { id: string; label: string }) => {
     const known = shell ? [...(shells?.shells ?? []), ...(shells?.ai_tools ?? [])].find((s) => s.id === shell) : undefined;
-    const label = known?.label ?? "Terminal";
-    const id = newId();
+    const label = known?.label ?? ask?.label ?? "Terminal";
+    const id = ask?.id ?? newId();
     setTabs((prev) => [...prev, { id, shell, label, ended: false }]);
     setActive(id);
     setMenu(null);
   };
 
+  // AI tools started from a server tab (src/ui/aiPane.ts): each opens here
+  // like one picked from the menu, and is told once it has started.
+  const onAiStarted = useRef(new Map<string, (tabId: string) => void>());
+  useEffect(() => {
+    const take = () => {
+      for (const l of takeAiLaunches()) {
+        onAiStarted.current.set(l.id, l.onStarted);
+        openShell(l.shell, { id: l.id, label: l.label });
+      }
+    };
+    take();
+    return watchAiLaunches(take);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // "Back to Home" in the AI side pane: its AI tab in front.
+  useEffect(() => {
+    const take = () => {
+      const id = takeHomeTabAsk();
+      if (id) { setActive(id); setFocusTick((n) => n + 1); }
+    };
+    take();
+    return watchHomeTabAsk(take);
+  }, []);
+
   // The first time Home is shown, a terminal in the default shell — the
-  // "home pane" — so there is a prompt to type at straight away.
+  // "home pane" — so there is a prompt to type at straight away. Not when
+  // Home already has one: an AI tool started from a server tab.
   useEffect(() => {
     if (!visible || opened.current) return;
     opened.current = true;
     loadShells();
-    openShell(null);
+    if (tabs.length === 0) openShell(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible]);
 
@@ -122,6 +150,7 @@ export const HomePane = ({ visible, onLiveShells }: { visible: boolean; onLiveSh
   const closeTab = (id: string) => {
     const at = tabs.findIndex((t) => t.id === id);
     const next = tabs.filter((t) => t.id !== id);
+    onAiStarted.current.delete(id);
     setTabs(next);
     if (active === id) setActive(next.length ? next[Math.max(0, at - 1)].id : null);
   };
@@ -205,7 +234,12 @@ export const HomePane = ({ visible, onLiveShells }: { visible: boolean; onLiveSh
               focusSignal={focusTick}
               local={{
                 shell: t.shell,
-                onOpened: (label) => setTabs((prev) => prev.map((x) => (x.id === t.id ? { ...x, label } : x))),
+                onOpened: (label) => {
+                  setTabs((prev) => prev.map((x) => (x.id === t.id ? { ...x, label } : x)));
+                  const started = onAiStarted.current.get(t.id);
+                  onAiStarted.current.delete(t.id);
+                  started?.(t.id);
+                },
               }}
             />
           </div>

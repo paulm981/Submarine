@@ -37,6 +37,8 @@ import { NodeGrid } from "./components/NodeGrid";
 import { SessionTree, type TreeItems } from "./components/SessionTree";
 import HomePane from "./components/HomePane";
 import AiPanel from "./components/AiPanel";
+import AiSidePane, { AiPaneButton, type AiPaneView } from "./components/AiSidePane";
+import { useAiPane } from "./ui/aiPane";
 import { useAi, sharedWith } from "./util/ai";
 import { IS_ANDROID } from "./util/platform";
 import type { RdpLink } from "./components/RdpLinkModal";
@@ -108,6 +110,9 @@ function DesktopApp() {
   // whether the AI panel is open (the title bar's AI button).
   const ai = useAi();
   const [aiOpen, setAiOpen] = useState(false);
+  // The AI side pane beside a server tab (#100, AiSidePane). Starting an AI
+  // tool from a server tab mounts Home, where it runs, if it never was.
+  const aiPane = useAiPane();
   // Tracks the live status of each open session ('connecting' | 'connected'
   // | 'failed' | 'disconnected', or 'idle' for an RDP tab on Android that
   // has nothing to connect yet). Updated via the callback every SessionView
@@ -221,6 +226,19 @@ function DesktopApp() {
     return id;
   };
   const activeWall = walls.find(w => w.id === activeView) ?? null;
+  // What the AI side pane needs of the view on screen.
+  const paneSession = sessions.find(s => s.id === activeView);
+  const aiPaneView: AiPaneView = {
+    view: activeView,
+    session: paneSession ? {
+      id: paneSession.id,
+      name: tabLabel(paneSession),
+      ssh: onWallable(paneSession),
+      connected: sessionStatuses[paneSession.id] === "connected",
+      terminalId: terminalOf(paneSession.id),
+    } : null,
+    wallSessions: activeWall ? activeWall.members.map(m => m.sessionId) : null,
+  };
   // The tab strip scrolls the tab on screen into view — with dozens open, a
   // tab popped out of a Wall or picked from All tabs lands past the edge.
   const tabStripRef = useRef<HTMLDivElement>(null);
@@ -2279,7 +2297,8 @@ function DesktopApp() {
       )}
       {/* AI: opens the AI panel; counts the requests waiting for you. */}
       {isUnlocked && ai.enabled && (
-        <div className="relative no-drag shrink-0 mx-1">
+        <div className="relative no-drag shrink-0 mx-1 flex items-center gap-1">
+          {HAS_HOME && !isMobile && <AiPaneButton v={aiPaneView} />}
           <button
             type="button"
             onClick={() => setAiOpen(o => !o)}
@@ -3059,7 +3078,7 @@ function DesktopApp() {
             {/* Home — terminals on this computer. Mounted the first time
                 it's shown and only hidden after that (like the sessions
                 canvas above), so its shells keep running. */}
-            {HAS_HOME && homeShown && (
+            {HAS_HOME && (homeShown || aiPane.homeNeeded) && (
               <div className={`absolute inset-0 flex flex-col overflow-hidden bg-background ${activeView === "home" ? "" : "opacity-0 pointer-events-none"}`}>
                 <HomePane visible={activeView === "home"} onLiveShells={(n) => { homeShellsRef.current = n; }} />
               </div>
@@ -3375,6 +3394,13 @@ function DesktopApp() {
             )}
 
           </main>
+          {HAS_HOME && !isMobile && (
+            <AiSidePane
+              v={aiPaneView}
+              onHome={() => setActiveView("home")}
+              onGoToServer={(sid) => { if (sessions.some(x => x.id === sid)) setActiveView(sid); }}
+            />
+          )}
           {!isMobile && treeOpen && treeSide === "right" && sessionTree}
           {aiOpen && ai.enabled && (
             <AiPanel

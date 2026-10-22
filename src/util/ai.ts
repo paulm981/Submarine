@@ -74,3 +74,10 @@ export const useAi = (): AiSnapshot => useSyncExternalStore(subscribe, () => cur
 /// The AI tabs a server's tab is shared with.
 export const sharedWith = (snap: AiSnapshot, sessionId: string): AiTab[] =>
   snap.tabs.filter((t) => t.servers.some((s) => s.session_id === sessionId));
+
+/// The AI tools this computer can start (Home's menu, under AI tools): none
+/// while AI tools are off or none is installed.
+export const findAiTools = (): Promise<{ id: string; label: string }[]> =>
+  invoke<{ ai_tools?: { id: string; label: string }[] }>("list_local_shells")
+    .then((s) => s.ai_tools ?? [])
+    .catch(() => []);

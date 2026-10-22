@@ -57,6 +57,7 @@ A first test, off by default: turn it on in **Settings › AI tools**.
 
 - **Claude Code from Home's menu**, under AI tools, opens already connected to Submarine through a local channel only your account can use. Nothing listens on the network.
 - **Share with AI** on a server's tab lets that AI tab ask to run commands there. Each one waits in the **AI panel** (the title bar's AI button) until you click Allow or Deny; typing can't approve anything.
+- **The AI side pane** shows an AI tab beside a server tab or Wall shared with it: the same terminal as in Home, open or folded to a bar (**Ctrl+Shift+L**), with Share, Unshare, Allow and Deny in its header. A server tab's **+** menu has **Claude Code beside this**, to start one there.
 - Submarine runs the command over its own connection, so the AI never gets a key or password. You see the full output; the AI gets it with known secrets hidden, and you see how many.
 - Every request and decision goes in `ai-audit.log` in the log folder.
 
