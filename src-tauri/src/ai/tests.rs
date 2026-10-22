@@ -290,7 +290,7 @@ async fn locking_or_turning_off_forgets_what_ran() {
         }
         assert!(waiting.await.unwrap().is_error);
         assert!(s.snapshot().history.is_empty(), "off: {off}");
-        assert!(s.lock().history.iter().all(|d| d.id != id));
+        assert!(s.lock().history.iter().all(|d| d.view.id != id));
         // A new AI tab starts with an empty history, and fills it again.
         if off {
             s.turn_on().unwrap();
@@ -455,8 +455,8 @@ mod ssh {
         assert!(text.contains(&format!("password={}", filter::HIDDEN)) && !text.contains("hunter2"), "{text}");
         assert!(text.contains("hid 1 item"), "{text}");
         // You see all of it.
+        assert!(s.lock().history[0].output.contains("hunter2"));
         let done = &s.snapshot().history[0];
-        assert!(done.output.contains("hunter2"));
         assert!(!serde_json::to_string(&s.snapshot()).unwrap().contains("hunter2"), "outputs aren't in the panel's every update");
         assert_eq!((done.outcome, done.exit_code, done.hidden), ("done", Some(4), 1));
         let log = audit_lines(&dir);

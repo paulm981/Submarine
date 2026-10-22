@@ -139,11 +139,11 @@ struct Running {
     stop: watch::Sender<bool>,
 }
 
-/// A finished request, for the panel: everything you see, and what the AI
-/// was given. The outputs are fetched one at a time (`ai_output`), when you
-/// open the row, not sent with every change.
+/// A finished request's row in the panel. Its outputs are kept beside it
+/// (`Done`) and fetched one at a time (`ai_output`), when you open the row:
+/// not sent, or copied, with every change.
 #[derive(Serialize, Clone)]
-struct Done {
+struct DoneView {
     id: u64,
     tab_label: String,
     server: String,
@@ -152,18 +152,22 @@ struct Done {
     /// denied, cancelled, done, failed, stopped.
     outcome: &'static str,
     exit_code: Option<i64>,
-    /// The whole output, up to OUTPUT_CAP. Wiped when it's dropped.
-    #[serde(skip)]
-    output: Zeroizing<String>,
-    /// What the AI got.
-    #[serde(skip)]
-    ai_output: Zeroizing<String>,
     output_bytes: usize,
     hidden: usize,
     cut: bool,
     timed_out: bool,
     error: Option<String>,
     at: String,
+}
+
+/// A finished request: its row, everything you see, and what the AI was
+/// given.
+struct Done {
+    view: DoneView,
+    /// The whole output, up to OUTPUT_CAP. Wiped when it's dropped.
+    output: Zeroizing<String>,
+    /// What the AI got.
+    ai_output: Zeroizing<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -180,7 +184,7 @@ pub(crate) struct Snapshot {
     tabs: Vec<TabView>,
     pending: Vec<PendingView>,
     running: Vec<RunningView>,
-    history: Vec<Done>,
+    history: Vec<DoneView>,
     audit_log: Option<String>,
 }
 
@@ -617,7 +621,7 @@ impl AiState {
             tabs: s.tabs.iter().map(|t| TabView { id: t.id.clone(), label: t.label.clone(), servers: t.servers.clone() }).collect(),
             pending: s.pending.iter().map(|p| p.view.clone()).collect(),
             running: s.running.iter().map(|r| r.view.clone()).collect(),
-            history: s.history.iter().rev().cloned().collect(),
+            history: s.history.iter().rev().map(|d| d.view.clone()).collect(),
             audit_log: self.0.audit.path().map(|p| p.to_string_lossy().into_owned()),
         }
     }
@@ -806,21 +810,23 @@ impl AiState {
             e
         };
         let done = |outcome: &'static str| Done {
-            id,
-            tab_label: label.clone(),
-            server: server.clone(),
-            command: command.to_string(),
-            root,
-            outcome,
-            exit_code: None,
+            view: DoneView {
+                id,
+                tab_label: label.clone(),
+                server: server.clone(),
+                command: command.to_string(),
+                root,
+                outcome,
+                exit_code: None,
+                output_bytes: 0,
+                hidden: 0,
+                cut: false,
+                timed_out: false,
+                error: None,
+                at: now(),
+            },
             output: Zeroizing::default(),
             ai_output: Zeroizing::default(),
-            output_bytes: 0,
-            hidden: 0,
-            cut: false,
-            timed_out: false,
-            error: None,
-            at: now(),
         };
 
         // Waiting for you. The answer: Some(allowed), or None when access
@@ -907,7 +913,7 @@ impl AiState {
         let answer = match result {
             Ok(out) if out.stopped => {
                 e.note = Some(if stopped_by_ai { "stopped: withdrawn by the AI tool" } else { "stopped: access ended" }.into());
-                d.outcome = "stopped";
+                d.view.outcome = "stopped";
                 ToolResult::err(if stopped_by_ai {
                     "Stopped: the request was withdrawn."
                 } else {
@@ -930,8 +936,8 @@ impl AiState {
                 .await;
                 let Ok((text, hidden, ai)) = filtered else {
                     e.note = Some("filtering the output failed".into());
-                    d.outcome = "failed";
-                    d.error = Some("Submarine couldn't filter the output, so the AI wasn't given it.".into());
+                    d.view.outcome = "failed";
+                    d.view.error = Some("Submarine couldn't filter the output, so the AI wasn't given it.".into());
                     self.audit(e);
                     self.remember(epoch, d);
                     self.changed();
@@ -966,19 +972,19 @@ impl AiState {
                 } else if out.cut {
                     e.note = Some("output cap reached".into());
                 }
-                d.exit_code = exit;
-                d.output_bytes = output_bytes;
+                d.view.exit_code = exit;
+                d.view.output_bytes = output_bytes;
                 d.output = text;
                 d.ai_output = ai;
-                d.hidden = hidden;
-                d.cut = out.cut;
-                d.timed_out = out.timed_out;
+                d.view.hidden = hidden;
+                d.view.cut = out.cut;
+                d.view.timed_out = out.timed_out;
                 ToolResult::ok(answer)
             }
             Err(err) => {
                 e.note = Some(err.clone());
-                d.outcome = "failed";
-                d.error = Some(err.clone());
+                d.view.outcome = "failed";
+                d.view.error = Some(err.clone());
                 ToolResult::err(format!("Couldn't run it: {err}"))
             }
         };
@@ -1067,7 +1073,7 @@ pub struct DoneOutput {
 #[tauri::command]
 pub async fn ai_output(state: tauri::State<'_, AiState>, id: u64) -> Result<DoneOutput, String> {
     let s = state.lock();
-    let d = s.history.iter().find(|d| d.id == id).ok_or("That request's output is no longer kept.")?;
+    let d = s.history.iter().find(|d| d.view.id == id).ok_or("That request's output is no longer kept.")?;
     Ok(DoneOutput { output: d.output.to_string(), ai_output: d.ai_output.to_string() })
 }
 
