@@ -526,7 +526,7 @@ async fn run_poller(
         // a slow or hung handshake tears the poller down at once, instead of
         // waiting out the connect/handshake budget (up to connect_timeout * 2).
         if handle.as_ref().map(|h| h.is_closed()).unwrap_or(true) {
-            let target = match with_ssh_config(&auth, &node_name).await {
+            let target = match with_ssh_config(&db, &auth, &node_name).await {
                 Ok(t) => t,
                 Err(why) => {
                     // Not a failure: no outage count, no alert. Looked at
@@ -981,9 +981,18 @@ impl MonitorSession {
 /// ProxyJump (and that has no proxy of its own), or a jump host it sends
 /// through either, isn't checked at all: `Err` says why. The terminal goes
 /// through them (#169), so dialling past them would check another path.
-async fn with_ssh_config(auth: &NodeAuth, node_name: &str) -> Result<NodeAuth, String> {
-    let target = crate::ConfigTarget::resolve(&auth.host, auth.port, &auth.username, Some(node_name.to_string())).await;
-    let jump = match auth.jump.as_deref() {
+///
+/// A server (or jump host) that proves who it is only with a certificate
+/// isn't checked either: the monitor trusts host keys the app has on file,
+/// and a certificate is never put there (trust_policy.rs, #43 D4).
+async fn with_ssh_config(
+    db: &Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
+    auth: &NodeAuth,
+    node_name: &str,
+) -> Result<NodeAuth, String> {
+    let mut target = crate::ConfigTarget::resolve(&auth.host, auth.port, &auth.username, Some(node_name.to_string())).await;
+    let node_trust = known_hosts_for(&mut target).await;
+    let mut jump = match auth.jump.as_deref() {
         Some(j) => Some(
             crate::ConfigTarget::resolve_jump_host(&j.host, i32::from(j.port), &j.username, j.name.clone())
                 .await
@@ -991,7 +1000,35 @@ async fn with_ssh_config(auth: &NodeAuth, node_name: &str) -> Result<NodeAuth, S
         ),
         None => None,
     };
-    apply_ssh_config(auth, target, jump)
+    let jump_trust = match jump.as_mut() {
+        Some((j, _)) => known_hosts_for(j).await,
+        None => None,
+    };
+    let resolved = apply_ssh_config(auth, target, jump)?;
+    if let Ok(guard) = db.lock() {
+        if let Some(conn) = guard.as_ref() {
+            let only_cert = |trust: &Option<crate::known_hosts::HostTrust>, host: &str, port: u16| {
+                crate::trust_policy::known_only_by_certificate(trust.as_ref(), conn, host, port)
+            };
+            if only_cert(&node_trust, &resolved.host, resolved.port) {
+                return Err(NOT_CHECKED_CERTIFICATE.into());
+            }
+            if let Some(j) = resolved.jump.as_deref() {
+                if only_cert(&jump_trust, &j.host, j.port) {
+                    return Err(NOT_CHECKED_JUMP_CERTIFICATE.into());
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// What the user's known_hosts files say about `t` (None with the
+/// ~/.ssh/config switch off).
+async fn known_hosts_for(t: &mut crate::ConfigTarget) -> Option<crate::known_hosts::HostTrust> {
+    let user = t.user.clone();
+    let files = t.known_hosts_files(&user);
+    crate::known_hosts::for_host(files, &t.host, t.port).await
 }
 
 /// `with_ssh_config` once the config is read: `t` is the node's, `jump` its
@@ -1035,6 +1072,10 @@ const NOT_CHECKED_PROXY_JUMP: &str =
     "Not checked: ~/.ssh/config reaches this server through a ProxyJump, which status checks don't use.";
 const NOT_CHECKED_JUMP_PROXY_COMMAND: &str =
     "Not checked: ~/.ssh/config reaches this server's jump host through a ProxyCommand, which status checks don't run.";
+const NOT_CHECKED_CERTIFICATE: &str =
+    "Not checked: this server proves who it is with a certificate (an @cert-authority line in your known_hosts), and status checks only trust host keys saved in the app.";
+const NOT_CHECKED_JUMP_CERTIFICATE: &str =
+    "Not checked: this server's jump host proves who it is with a certificate (an @cert-authority line in your known_hosts), and status checks only trust host keys saved in the app.";
 const NOT_CHECKED_JUMP_PROXY_JUMP: &str =
     "Not checked: ~/.ssh/config reaches this server's jump host through a ProxyJump, which status checks don't use.";
 

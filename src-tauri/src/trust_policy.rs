@@ -87,6 +87,16 @@ pub(crate) fn decide_certificate(known_hosts: Option<&HostTrust>, cert: &Certifi
     }
 }
 
+/// Whether Monitoring can't check host:port because only a certificate
+/// vouches for it: known_hosts trusts a CA for it and the app has no key on
+/// file for it (a certificate is never saved there, D4).
+pub(crate) fn known_only_by_certificate(known_hosts: Option<&HostTrust>, conn: &rusqlite::Connection, host: &str, port: u16) -> bool {
+    known_hosts.is_some_and(|t| t.has_cas())
+        && !conn
+            .query_row("SELECT 1 FROM known_hosts WHERE host=?1 AND port=?2 LIMIT 1", rusqlite::params![host, port], |_| Ok(()))
+            .is_ok()
+}
+
 /// Seconds since the epoch.
 pub(crate) fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -196,6 +206,23 @@ mod tests {
         for on_file in [HostKeyVerdict::Known, HostKeyVerdict::New, HostKeyVerdict::Changed { prior: vec!["x".into()] }] {
             assert!(matches!(decide_plain_key(on_file, Some(&t), k.public_key()), HostKeyDecision::Refused(_)));
         }
+    }
+
+    #[tokio::test]
+    async fn monitoring_checks_a_server_unless_only_a_certificate_vouches_for_it() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE known_hosts (id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT, port INTEGER, fingerprint TEXT, key_type TEXT);")
+            .unwrap();
+        let ca = key();
+        let with_ca = known_hosts(&format!("@cert-authority *.sublab.test {}\n", line(ca.public_key())), "node1.sublab.test", 3022).await;
+        let without = known_hosts(&format!("other.example {}\n", line(key().public_key())), "node1.sublab.test", 3022).await;
+        assert!(known_only_by_certificate(Some(&with_ca), &conn, "node1.sublab.test", 3022));
+        assert!(!known_only_by_certificate(Some(&without), &conn, "node1.sublab.test", 3022), "no CA: checked as usual");
+        assert!(!known_only_by_certificate(None, &conn, "node1.sublab.test", 3022));
+        // A key on file (approved, or saved because known_hosts listed it): checked.
+        conn.execute("INSERT INTO known_hosts (host, port, fingerprint, key_type) VALUES ('node1.sublab.test', 3022, 'fp', 'ssh-ed25519')", [])
+            .unwrap();
+        assert!(!known_only_by_certificate(Some(&with_ca), &conn, "node1.sublab.test", 3022));
     }
 
     const NOW: u64 = 1_800_000_000;

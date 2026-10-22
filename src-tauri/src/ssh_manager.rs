@@ -947,8 +947,25 @@ impl client::Handler for ClientHandler {
         };
         let (mismatch, prior_fingerprints) =
             match crate::trust_policy::decide_plain_key(verdict, self.host_trust.as_deref(), server_public_key) {
-                crate::trust_policy::HostKeyDecision::Trusted { why, .. } => {
-                    log(&why, "success");
+                crate::trust_policy::HostKeyDecision::Trusted { why, save } => {
+                    // Vouched for by known_hosts with nothing on file here:
+                    // saved as if approved, so Monitoring and the changed-key
+                    // warning know it from now on (#43, D4).
+                    if save {
+                        let saved = match self.db.lock() {
+                            Ok(guard) => match guard.as_ref() {
+                                Some(conn) => save_approved_host_key(conn, &self.server_host, self.server_port, &fp_str, key_type, false).is_ok(),
+                                None => false,
+                            },
+                            Err(_) => false,
+                        };
+                        log(&why, "success");
+                        if saved {
+                            log("Saved to this app's trusted host keys.", "info");
+                        }
+                    } else {
+                        log(&why, "success");
+                    }
                     // Mark as auto-accepted (no prompt was shown) so the connect
                     // driver knows host-key wasn't the failure mode for any
                     // downstream error.
