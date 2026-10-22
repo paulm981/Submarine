@@ -11376,14 +11376,6 @@ impl HopCtx<'_> {
     }
 }
 
-/// The jump host `jump_server_id` and the hops before it, logged in.
-async fn connect_jump_chain(
-    ctx: &HopCtx<'_>,
-    jump_server_id: i32,
-) -> Result<Vec<russh::client::Handle<ssh_manager::ClientHandler>>, String> {
-    connect_jump_host(ctx, jump_server_id).await
-}
-
 /// How long a jump host's login may take, prompts included (login_hop).
 const JUMP_LOGIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 /// How long a jump host may take to open the channel to the server behind it,
@@ -14470,7 +14462,7 @@ async fn initiate_rdp(
                     session_id: &session_id,
                     use_agent,
                 };
-                let chain = match connect_jump_chain(&ctx, jid).await {
+                let chain = match connect_jump_host(&ctx, jid).await {
                     Ok(chain) => chain,
                     Err(e) => {
                         let reason = format!("The SSH server {via_name}: {e}");
@@ -14771,7 +14763,7 @@ async fn rdp_builtin_open(
                     session_id: &session_id,
                     use_agent,
                 };
-                let chain = match connect_jump_chain(&ctx, jid).await {
+                let chain = match connect_jump_host(&ctx, jid).await {
                     Ok(chain) => chain,
                     Err(e) => {
                         let reason = format!("The SSH server {via_name}: {e}");
@@ -15218,7 +15210,7 @@ async fn telnet_connect(
                     session_id: &session_id,
                     use_agent,
                 };
-                let chain = match connect_jump_chain(&ctx, jid).await {
+                let chain = match connect_jump_host(&ctx, jid).await {
                     Ok(chain) => chain,
                     Err(e) => {
                         let reason = format!("The SSH server {via_name}: {e}");
@@ -15446,7 +15438,7 @@ async fn vnc_open(
                     session_id: &session_id,
                     use_agent,
                 };
-                let chain = match connect_jump_chain(&ctx, jid).await {
+                let chain = match connect_jump_host(&ctx, jid).await {
                     Ok(chain) => chain,
                     Err(e) => {
                         let reason = format!("The SSH server {via_name}: {e}");
