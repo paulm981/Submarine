@@ -20,23 +20,50 @@ pub(crate) fn refuse_tokens(spec: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The login queue a jump host waits in (multiexec::login_turn): its address
-/// as dialled, so a saved jump host and the same bastion in a ProxyJump chain
-/// share one queue (#43, D1).
+/// The login queue a jump host dialled from here waits in
+/// (multiexec::login_turn): its address, so a saved jump host and the same
+/// bastion in a ProxyJump chain share one queue, as Monitoring does (#43, D1).
 pub(crate) fn queue_key(host: &str, port: u16) -> String {
     let host = host.trim().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
     format!("[{host}]:{port}")
+}
+
+/// The login queues of one route's hops, in the order they log in.
+#[derive(Default)]
+pub(crate) struct RouteQueues {
+    /// The queue of the hop that logged in last: the one the next hop is
+    /// reached through, since hops log in one after another along the route.
+    last: std::sync::Mutex<Option<String>>,
+}
+
+impl RouteQueues {
+    /// The queue of the next hop, `host:port`. One dialled from here is known
+    /// by its address. One reached through the hop before it is known by that
+    /// hop's queue and its address: `10.0.0.5` behind one gateway isn't the
+    /// same machine as `10.0.0.5` behind another.
+    fn next(&self, through_previous: bool, host: &str, port: u16) -> String {
+        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        let here = queue_key(host, port);
+        let key = match (through_previous, last.as_deref()) {
+            (true, Some(prev)) => format!("{prev} > {here}"),
+            _ => here,
+        };
+        *last = Some(key.clone());
+        key
+    }
 }
 
 /// A turn to log in to `target`, a hop of `ctx`'s route, from the moment its
 /// transport opens until its login is over (drop it then). One hop's turn is
 /// never held while the next hop waits for one: two routes through the same
 /// bastions in opposite orders would wait on each other for good.
+/// `through_previous`: reached over a channel through the hop before it.
 pub(crate) async fn hop_turn(
     ctx: &crate::HopCtx<'_>,
     target: &crate::ConfigTarget,
+    through_previous: bool,
 ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, String> {
-    let key = queue_key(&target.host, target.port);
+    let key = ctx.queues.next(through_previous, &target.host, target.port);
     crate::multiexec::login_turn(ctx.app, &key, ctx.attempt, |limit| {
         ctx.log(
             &format!("Waiting for a login slot on the jump host {} ({limit} logging in at a time)...", target.host),
@@ -192,6 +219,31 @@ mod tests {
         assert_eq!(queue_key("::1", 22), queue_key("[::1]", 22));
         assert_ne!(queue_key("::1", 22), queue_key("::1:22", 22));
         assert_ne!(queue_key("bastion", 22), queue_key("bastion", 2222));
+    }
+
+    /// A hop dialled from here is known by its address, as a saved jump host
+    /// and Monitoring know it; one reached through another hop, by that hop
+    /// and its address, so the same private address behind two gateways
+    /// gets two queues.
+    #[test]
+    fn a_hop_behind_another_is_queued_by_the_way_there() {
+        let route_a = RouteQueues::default();
+        assert_eq!(route_a.next(false, "gwA", 22), queue_key("gwa", 22));
+        let behind_a = route_a.next(true, "10.0.0.5", 22);
+        let route_b = RouteQueues::default();
+        route_b.next(false, "gwB", 22);
+        let behind_b = route_b.next(true, "10.0.0.5", 22);
+        assert_ne!(behind_a, behind_b);
+        assert_ne!(behind_a, queue_key("10.0.0.5", 22), "not the machine dialled directly at that address");
+        // The same way there is the same queue, however deep.
+        let again = RouteQueues::default();
+        again.next(false, "GWA", 22);
+        assert_eq!(again.next(true, "10.0.0.5", 22), behind_a);
+        assert_eq!(again.next(true, "db", 2222), format!("{behind_a} > {}", queue_key("db", 2222)));
+        // A saved jump host behind a chain: through its last hop.
+        let saved = RouteQueues::default();
+        saved.next(false, "gwA", 22);
+        assert_eq!(saved.next(true, "10.0.0.5", 22), behind_a);
     }
 
     #[tokio::test]

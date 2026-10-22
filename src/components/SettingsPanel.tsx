@@ -65,8 +65,8 @@ function JumpLoginLimit() {
         <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
           When many servers behind one jump host open at once (a folder opened as a wall), this many log in to it
           together and the rest wait their turn — a jump host turns away logins past its own limit (OpenSSH starts
-          at 10). Each jump host in a ProxyJump chain from ~/.ssh/config has its own line too, shared with a saved
-          jump host at the same address. 0 means no limit. Servers reached directly aren't held back.
+          at 10). Each jump host in a ProxyJump chain from ~/.ssh/config has its own line too: shared with a saved
+          jump host at the same address, or, behind another jump host, its own for that way there. 0 means no limit. Servers reached directly aren't held back.
         </p>
         {error && <p className="text-[11px] text-red-400 mt-1">{error}</p>}
       </div>

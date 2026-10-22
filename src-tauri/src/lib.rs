@@ -11357,6 +11357,8 @@ struct HopCtx<'a> {
     session_id: &'a str,
     // The device's "Use keys from an ssh-agent" setting (see AgentSlot).
     use_agent: bool,
+    // fork (#43, D1): which login queue the route's last hop was in.
+    queues: hop_policy::RouteQueues,
 }
 
 impl HopCtx<'_> {
@@ -11605,7 +11607,7 @@ fn config_jump_chain<'a>(
                 chain = reach_hop(ctx, hop, route, depth).await?;
             } else {
                 let via = chain.last().ok_or("ProxyJump: no previous hop")?;
-                let _turn = hop_policy::hop_turn(ctx, &hop.target).await?; // fork (#43, D1): login queue per hop
+                let _turn = hop_policy::hop_turn(ctx, &hop.target, true).await?; // fork (#43, D1): login queue per hop
                 let stream = hop_channel(via, &hop.target.host, hop.target.port).await.map_err(|e| ctx.network_error(e))?;
                 chain.push(login_hop(ctx, hop, HopStream::Channel(stream), None).await?);
             }
@@ -11630,7 +11632,7 @@ fn reach_hop<'a>(
                 ctx.log(&format!("~/.ssh/config: reaching the jump host {host} through ProxyJump {spec}..."), "info");
                 let mut chain = config_jump_chain(ctx, &spec, depth).await?;
                 let via = chain.last().ok_or("ProxyJump: no hops")?;
-                let _turn = hop_policy::hop_turn(ctx, &hop.target).await?; // fork (#43, D1): login queue per hop
+                let _turn = hop_policy::hop_turn(ctx, &hop.target, true).await?; // fork (#43, D1): login queue per hop
                 let stream = hop_channel(via, &host, port).await.map_err(|e| ctx.network_error(e))?;
                 let handle = login_hop(ctx, hop, HopStream::Channel(stream), None).await?;
                 chain.push(handle);
@@ -11642,12 +11644,12 @@ fn reach_hop<'a>(
                     "info",
                 );
                 let user = hop.target.user.trim().to_string();
-                let _turn = hop_policy::hop_turn(ctx, &hop.target).await?; // fork (#43, D1): login queue per hop
+                let _turn = hop_policy::hop_turn(ctx, &hop.target, false).await?; // fork (#43, D1): login queue per hop
                 let (stream, watch) = start_proxy_command(ctx.app, ctx.session_id, ctx.attempt, &command, &hop.target, &user)?;
                 Ok(vec![login_hop(ctx, hop, HopStream::Command(stream), Some(watch)).await?])
             }
             _ => {
-                let _turn = hop_policy::hop_turn(ctx, &hop.target).await?; // fork (#43, D1): login queue per hop
+                let _turn = hop_policy::hop_turn(ctx, &hop.target, false).await?; // fork (#43, D1): login queue per hop
                 ctx.log(&format!("Connecting to jump host {host}:{port}..."), "info");
                 let tcp = match tokio::time::timeout(Duration::from_secs(10), tokio::net::TcpStream::connect((host.as_str(), port))).await {
                     Ok(Ok(s)) => {
@@ -12619,6 +12621,7 @@ async fn initiate_connection(
             attempt: &attempt,
             session_id: &session_id_clone,
             use_agent,
+            queues: Default::default(),
         };
         // The jump hosts (a saved one, or ProxyJump from ~/.ssh/config), then a
         // direct-tcpip channel through the last one to the target: what
@@ -14492,6 +14495,7 @@ async fn initiate_rdp(
                     attempt: &attempt,
                     session_id: &session_id,
                     use_agent,
+                    queues: Default::default(),
                 };
                 let chain = match connect_jump_host(&ctx, jid).await {
                     Ok(chain) => chain,
@@ -14793,6 +14797,7 @@ async fn rdp_builtin_open(
                     attempt: &attempt,
                     session_id: &session_id,
                     use_agent,
+                    queues: Default::default(),
                 };
                 let chain = match connect_jump_host(&ctx, jid).await {
                     Ok(chain) => chain,
@@ -15240,6 +15245,7 @@ async fn telnet_connect(
                     attempt: &attempt,
                     session_id: &session_id,
                     use_agent,
+                    queues: Default::default(),
                 };
                 let chain = match connect_jump_host(&ctx, jid).await {
                     Ok(chain) => chain,
@@ -15468,6 +15474,7 @@ async fn vnc_open(
                     attempt: &attempt,
                     session_id: &session_id,
                     use_agent,
+                    queues: Default::default(),
                 };
                 let chain = match connect_jump_host(&ctx, jid).await {
                     Ok(chain) => chain,
