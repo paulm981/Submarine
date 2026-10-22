@@ -31,6 +31,13 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - **A reconnect doesn't bring back a forward deleted on another computer.** It starts the forwards that are saved now. ([#92](https://github.com/paulm981/Submarine/issues/92))
 - **A reconnect can't leave a hidden connection open.** A login from before the reconnect that finished at just the wrong moment could keep a connection, and its jump host, open with nothing watching it. ([#92](https://github.com/paulm981/Submarine/issues/92))
 - **A jump host saved with a port above 65535 is refused** with "Port … isn't a valid port", instead of being reached on another port. So is such a server or jump host in Monitoring. ([#92](https://github.com/paulm981/Submarine/issues/92))
+- **Send to all leaves out control characters**, as a paste does. A Library command someone shared, or text typed into **Send** on a Wall, can't press keys you didn't see. Tab and line breaks stay, and the Wall says when anything was left out. ([#98](https://github.com/paulm981/Submarine/issues/98))
+- **On-connect commands leave out control characters too.** When any were left out, the terminal says so before the commands are typed. ([#98](https://github.com/paulm981/Submarine/issues/98))
+- **Closing a terminal while it opens closes its shell on the server.** It used to keep running there, unseen. This goes for a container's terminal too. ([#98](https://github.com/paulm981/Submarine/issues/98))
+- **Turning Broadcast off on a Wall no longer swallows what you type.** The terminal under the mouse gets the keys, or the Wall says to click one. ([#98](https://github.com/paulm981/Submarine/issues/98))
+- **A terminal on a Wall has its Find box (Ctrl+F), Saved password button and Copied and Pasted notes**, as in its own tab. Ctrl+R opens command history there too. ([#98](https://github.com/paulm981/Submarine/issues/98))
+- **All tabs (Ctrl+Shift+K) shows a renamed tab by its new name**, and finds it by that name or the server's. So does a Wall's **Add**. ([#98](https://github.com/paulm981/Submarine/issues/98))
+- **Ctrl+V, Ctrl+Shift+V and ⌘V ask "Paste N lines?" too**, as a right-click does, when the lines would run one by one. ([#98](https://github.com/paulm981/Submarine/issues/98))
 
 ## v0.4.0-fork.4
 

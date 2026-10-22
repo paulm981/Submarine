@@ -215,7 +215,7 @@ export const WallView = ({
   const ghostRef = useRef<Terminal | null>(null);
   const focusGhost = useCallback(() => {
     requestAnimationFrame(() => {
-      if (document.querySelector('[aria-modal="true"]')) return;
+      if (document.querySelector('[aria-modal="true"]') || !wallRef.current.broadcast) return;
       ghostRef.current?.focus();
     });
   }, []);
@@ -322,6 +322,17 @@ export const WallView = ({
     if (!wall.broadcast) {
       if (wall.solo) onChange({ solo: null });
       setParked(false);
+      // The keyboard terminal had the keys: with Broadcast off it types to
+      // nobody, so they'd be lost without a word. The terminal under the
+      // mouse gets them, or the Wall says to click one.
+      const ghost = ghostBox.current;
+      const active = document.activeElement;
+      if (ghost && active instanceof Node && ghost.contains(active)) {
+        ghostRef.current?.blur();
+        const under = hoveredRef.current ? dockedTerminal(hoveredRef.current) : undefined;
+        if (under) under.term.focus();
+        else flash("Broadcast is off. Click a terminal to type.");
+      }
       return;
     }
     if (solo) {
@@ -424,7 +435,17 @@ export const WallView = ({
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const sendToAll = (text: string, run: boolean) => {
+  // What's sent is typed as it stands, so no escape sequence or other
+  // control character goes in (tab and line breaks stay): a Library command
+  // can come from anyone the profile is shared with, and one could end a
+  // bracketed paste or press keys nobody saw (pasteText.ts).
+  const sendToAll = (raw: string, run: boolean) => {
+    const text = withoutPasteControls(raw);
+    const cleaned = text !== raw;
+    if (!text.trim()) {
+      flash(cleaned ? "Nothing to send: it was only control characters." : "Nothing to send.");
+      return;
+    }
     let body = text.replace(/\r\n?/g, "\n");
     if (run && !body.endsWith("\n")) body += "\n";
     // Into a line half typed, only to those that have the start of it.
@@ -437,7 +458,10 @@ export const WallView = ({
     const ids = sent.map((e) => e.terminalId);
     markTyped(...ids);
     invoke("write_terminals_data", { terminalIds: ids, data: encode(data) })
-      .then(() => flash(`Sent to ${plural(sent.length, "server")}.`), (e) => flash(`Couldn't send: ${e}`));
+      .then(
+        () => flash(`Sent to ${plural(sent.length, "server")}.` + (cleaned ? " Control characters were left out." : "")),
+        (e) => flash(`Couldn't send: ${e}`),
+      );
     afterTyping(data, sent);
   };
 

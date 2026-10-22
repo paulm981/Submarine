@@ -15623,26 +15623,43 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
         }
     };
 
-    // Settings → Terminal → "Use my default shell": this computer's shell,
-    // started on the server as a login shell in place of the account's own
-    // (LOGIN_SHELL_SCRIPT), where the server can (server_runs_login_shell);
-    // otherwise, and with the setting off, the account's own shell. Asked
-    // before the session is locked for the terminal's channel.
-    let login_shell = match use_local_shell.then(local_default_shell).flatten() {
-        Some(shell) if server_runs_login_shell(&session_arc, &shell).await => Some(shell),
-        _ => None,
-    };
+    // The page can close the terminal while this waits on the server (the
+    // tab closed as it opened): that close is kept (TerminalOpenings), and
+    // then the shell is closed here rather than left running.
+    let opening = state.terminal_openings.lock().await.begin(&terminal_id);
+    let opened = async {
+        // Settings → Terminal → "Use my default shell": this computer's shell,
+        // started on the server as a login shell in place of the account's own
+        // (LOGIN_SHELL_SCRIPT), where the server can (server_runs_login_shell);
+        // otherwise, and with the setting off, the account's own shell. Asked
+        // before the session is locked for the terminal's channel.
+        let login_shell = match use_local_shell.then(local_default_shell).flatten() {
+            Some(shell) if server_runs_login_shell(&session_arc, &shell).await => Some(shell),
+            _ => None,
+        };
 
-    let session = session_arc.lock().await;
-    let channel = session.channel_open_session().await.map_err(|e| e.to_string())?;
+        let session = session_arc.lock().await;
+        let channel = session.channel_open_session().await.map_err(|e| e.to_string())?;
 
-    // Request PTY
-    channel.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]).await.map_err(|e| e.to_string())?;
-    match login_shell {
-        Some(shell) => channel.exec(true, login_shell_command(&shell).as_bytes()).await,
-        None => channel.request_shell(true).await,
+        // Request PTY
+        channel.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]).await.map_err(|e| e.to_string())?;
+        match login_shell {
+            Some(shell) => channel.exec(true, login_shell_command(&shell).as_bytes()).await,
+            None => channel.request_shell(true).await,
+        }
+        .map_err(|e| e.to_string())?;
+        Ok::<_, String>(channel)
     }
-    .map_err(|e| e.to_string())?;
+    .await;
+
+    let mut openings = state.terminal_openings.lock().await;
+    let wanted = openings.finish(&terminal_id, opening);
+    let channel = opened?;
+    if !wanted {
+        drop(openings);
+        let _ = channel.close().await;
+        return Ok(());
+    }
 
     let (tx, rx) = tokio::sync::mpsc::channel::<TerminalCommand>(32);
     // Last-wins watch channel for PTY resizes. The PTY task selects on
@@ -15655,6 +15672,7 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
     state.terminal_txs.lock().await.insert(terminal_id.clone(), tx);
     note_terminal_server(&state, &session_id, &terminal_id).await;
     state.resize_txs.lock().await.insert(terminal_id.clone(), resize_tx);
+    drop(openings);
 
     // Output coalescing, keystroke / resize forwarding and the split,
     // always-draining read/write pump (required by russh's channel
@@ -15763,9 +15781,14 @@ async fn resize_terminal(state: tauri::State<'_, SshState>, terminal_id: String,
 
 #[tauri::command]
 async fn close_terminal(state: tauri::State<'_, SshState>, terminal_id: String) -> Result<(), String> {
+    // Held throughout, so an open finishing now either sees this close or
+    // has registered the terminal already (TerminalOpenings).
+    let mut openings = state.terminal_openings.lock().await;
+    openings.close(&terminal_id);
     state.terminal_txs.lock().await.remove(&terminal_id);
     state.resize_txs.lock().await.remove(&terminal_id);
     state.terminal_servers.lock().await.remove(&terminal_id);
+    drop(openings);
     Ok(())
 }
 

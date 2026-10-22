@@ -2212,7 +2212,7 @@ function DesktopApp() {
           </button>
           {allTabsOpen && (
             <AllTabsMenu
-              sessions={sessions}
+              sessions={sessions.map(s => ({ ...s, label: tabLabel(s) }))}
               walls={walls}
               statuses={sessionStatuses}
               waiting={promptSessions}
@@ -3078,7 +3078,7 @@ function DesktopApp() {
                 {wallPickerFor === activeWall.id && (
                   <WallPicker
                     wall={activeWall}
-                    sessions={sessions.filter(onWallable)}
+                    sessions={sessions.filter(onWallable).map(s => ({ ...s, label: tabLabel(s) }))}
                     terminals={sessionTerminals}
                     statuses={sessionStatuses}
                     servers={servers.filter(isSshServer)}
