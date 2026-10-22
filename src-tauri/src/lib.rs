@@ -20367,8 +20367,9 @@ struct ImportedHost {
     /// Resolved `ProxyJump`: `[user@]host[:port]`, comma-separated hops.
     /// The import links a single hop to a saved server (host_import.rs).
     proxy_jump: Option<String>,
-    /// Unique within one parse; the picker keys its rows by it. Empty means
-    /// `host_alias`, which every format but MobaXterm keeps unique.
+    /// Unique within one parse; the picker keys its rows by it (MobaXterm's
+    /// folder and name, else the row's place in the list). Empty means
+    /// `host_alias`.
     #[serde(default)]
     key: String,
     /// Folder path, outermost first (MobaXterm's session folders).
@@ -20587,6 +20588,9 @@ fn parse_ssh_config_text(contents: &str) -> Vec<ImportedHost> {
         }
     }
     resolve_proxy_jump_aliases(&mut out);
+    for (i, h) in out.iter_mut().enumerate() {
+        h.key = i.to_string();
+    }
     out
 }
 
@@ -20719,6 +20723,8 @@ fn parse_client_hosts(text: String) -> Result<Vec<ImportedHost>, String> {
             let identity_file = get_str(&["identity_file", "identityFile", "key", "privateKey"]);
             let proxy_jump = get_str(&["proxy_jump", "proxyJump", "jump"]);
             out.push(ImportedHost {
+                // Names may repeat: the picker keys rows by this.
+                key: i.to_string(),
                 host_alias: alias,
                 hostname,
                 port,
@@ -20751,7 +20757,12 @@ fn is_putty_reg(trimmed: &str) -> bool {
 /// Parse `regedit /e` output of PuTTY's session key: the SSH and telnet
 /// sessions (`putty_sessions`), or why there are none.
 fn parse_putty_reg(text: &str) -> Result<Vec<ImportedHost>, String> {
-    let (out, skipped) = putty_sessions(text);
+    let (mut out, skipped) = putty_sessions(text);
+    // Names may repeat (two exports pasted together): the picker keys rows
+    // by this.
+    for (i, h) in out.iter_mut().enumerate() {
+        h.key = i.to_string();
+    }
     if out.is_empty() {
         return Err(match putty_skipped(&skipped) {
             Some(why) => format!("No PuTTY SSH or telnet sessions found. {}", why),
@@ -21349,6 +21360,8 @@ mod client_import_tests {
         );
         let names: Vec<&str> = hosts.iter().map(|h| h.host_alias.as_str()).collect();
         assert_eq!(names, vec!["web1", "web2", "db"], "no wildcard host, and web1 once");
+        let keys: Vec<&str> = hosts.iter().map(|h| h.key.as_str()).collect();
+        assert_eq!(keys, vec!["0", "1", "2"]);
         let web1 = &hosts[0];
         assert_eq!(web1.hostname, "web.example", "the first HostName wins");
         assert_eq!(web1.port, 2200, "the first Port wins; Match's lines don't count");
@@ -21449,6 +21462,8 @@ mod client_import_tests {
         ]
         .concat();
         let hosts = parse_client_hosts(text.clone()).unwrap();
+        let keys: Vec<&str> = hosts.iter().map(|h| h.key.as_str()).collect();
+        assert_eq!(keys, vec!["0", "1", "2"], "each row has a key of its own");
         let got: Vec<(&str, &str, u16, bool)> = hosts.iter().map(|h| (h.host_alias.as_str(), h.hostname.as_str(), h.port, h.telnet)).collect();
         assert_eq!(
             got,
@@ -21487,7 +21502,8 @@ mod client_import_tests {
 
     #[test]
     fn json_arrays_still_import() {
-        let hosts = parse_client_hosts("\n  [ {\"name\": \"box\", \"host\": \"j.example\", \"port\": 2200, \"user\": \"u\"} ]".into()).unwrap();
+        let hosts = parse_client_hosts("\n  [ {\"name\": \"box\", \"host\": \"j.example\", \"port\": 2200, \"user\": \"u\"}, {\"name\": \"box\", \"host\": \"k.example\"} ]".into()).unwrap();
+        assert_eq!((hosts[0].key.as_str(), hosts[1].key.as_str()), ("0", "1"), "two rows called box keep keys of their own");
         assert_eq!((hosts[0].host_alias.as_str(), hosts[0].hostname.as_str(), hosts[0].port), ("box", "j.example", 2200));
         let err = parse_client_hosts("[ {\"name\": ".into()).err().expect("broken JSON must be refused");
         assert!(err.starts_with("JSON parse failed"), "{err}");

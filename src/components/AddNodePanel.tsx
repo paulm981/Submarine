@@ -41,8 +41,8 @@ type ImportedHost = {
   user: string;
   identity_file: string | null;
   proxy_jump: string | null;
-  // Unique within one parse (MobaXterm repeats names across folders); empty
-  // means host_alias is.
+  // Unique within one parse, as names can repeat: MobaXterm's folder and
+  // name, else the row's place in the list. Empty means host_alias is.
   key?: string;
   folder?: string[];
   // MobaXterm saved login (`[name]` as the user): becomes a shared Login.
