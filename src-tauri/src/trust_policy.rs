@@ -422,4 +422,22 @@ mod tests {
             other => panic!("trusted, not {other:?}"),
         }
     }
+
+    // A known_hosts file with bytes that aren't UTF-8 is still read: its
+    // @revoked line still counts. A folder where a file should be is skipped.
+    #[tokio::test]
+    async fn a_known_hosts_file_that_isnt_utf8_still_revokes() {
+        let k = key();
+        let l = line(k.public_key());
+        let dir = std::env::temp_dir().join(format!("submarine-kh-bytes-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(dir.join("a-folder")).unwrap();
+        let file = dir.join("known_hosts");
+        let mut bytes = b"caf\xe9.example ssh-ed25519 AAAA\n".to_vec();
+        bytes.extend_from_slice(format!("@revoked * {l}\ndb.example.com {l}\n").as_bytes());
+        std::fs::write(&file, bytes).unwrap();
+        let files = vec![dir.join("a-folder").to_string_lossy().into_owned(), file.to_string_lossy().into_owned()];
+        let t = crate::known_hosts::for_host(Some(files), "db.example.com", 22).await.expect("read");
+        assert!(matches!(decide_plain_key(HostKeyVerdict::Known, Some(&t), k.public_key()), HostKeyDecision::Refused(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

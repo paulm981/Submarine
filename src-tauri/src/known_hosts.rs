@@ -21,7 +21,8 @@ use russh::keys::ssh_key::HashAlg;
 use russh::keys::{Certificate, PublicKey};
 
 /// The largest known_hosts file read.
-const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+// fork (#43): 64 MiB, so a large file's @revoked lines aren't skipped.
+const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// What the known_hosts files say about one host.
 #[derive(Default)]
@@ -158,11 +159,24 @@ pub(crate) async fn for_host(files: Option<Vec<String>>, host: &str, port: u16) 
 }
 
 fn read_file(path: &str) -> Option<String> {
+    // fork (#43): a file that isn't valid UTF-8 is still read (its bad lines
+    // just don't parse), and one that's there but skipped is logged, since
+    // its @revoked lines then don't count.
     let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
-        return None;
+    let skipped = |why: &str| {
+        eprintln!("[known_hosts] {} {why}; skipped.", display_path(path));
+        None
+    };
+    if !meta.is_file() {
+        return skipped("isn't a regular file");
     }
-    std::fs::read_to_string(path).ok()
+    if meta.len() > MAX_FILE_BYTES {
+        return skipped(&format!("is larger than {} MB", MAX_FILE_BYTES / (1024 * 1024)));
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(e) => skipped(&format!("can't be read ({e})")),
+    }
 }
 
 /// A path for the log, with the home folder shown as `~`.
