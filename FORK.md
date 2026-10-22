@@ -64,7 +64,7 @@ What comes next (root prompts, the AI asking for a server, many servers, downloa
 
 ### Root when you need it
 
-Root works through `sudo` or `dzdo` (Centrify / Delinea), without a password where the server allows it, including servers that only allow `dzdo su -`. Where a password is needed, the app asks for it. It works in three places:
+Root works through `sudo` or `dzdo` (Centrify / Delinea), without a password where the server allows it, including servers that only allow `dzdo su -` or `sudo su -`, with or without your password. Where a password is needed, the app asks for it once per tab, gives it only to sudo's or dzdo's own question, and asks again (rather than retrying it) if it stops working. Any login shell works, csh and tcsh included. It works in three places:
 
 - **SFTP root mode**: browse and edit files as root;
 - **the Info panel**: start, stop and restart services, end processes, and read firewall rules as root;

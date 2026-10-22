@@ -9,6 +9,15 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Root with `dzdo su -` or `sudo su -` that asks for your password.** Where sudo or dzdo lets you in only through a root shell, and wants your password for it, the app now gets root that way once you enter it: in SFTP root mode, the Info panel and the Docker tab. ([#96](https://github.com/paulm981/Submarine/issues/96))
+- **Root works when your login shell is csh or tcsh.** SFTP root mode, the Info panel's actions and Docker as root used to fail on such accounts. ([#96](https://github.com/paulm981/Submarine/issues/96))
+- **A root password that stopped working is tried once, then asked for again.** The app forgets it for the whole tab, SFTP root mode included, instead of trying it on every action and parallel Docker call, which could lock your account. Each action now signs in once, not twice. ([#96](https://github.com/paulm981/Submarine/issues/96))
+- **Your password goes only to sudo's or dzdo's own question.** A command that runs without one never gets it, whatever it prints, and a command's own output is never mistaken for sudo's answer. ([#96](https://github.com/paulm981/Submarine/issues/96))
+- **A container's terminal asks for the root password** when it needs one, as the Docker tab does, instead of showing `[SUDO] NEED_PASSWORD`. ([#96](https://github.com/paulm981/Submarine/issues/96))
+- **A server's saved password is typed only into that server's own terminals.** ([#96](https://github.com/paulm981/Submarine/issues/96))
+
+## v0.4.0-fork.3
+
 - **Search for the jump host.** In a server's form, **Jump via** is now a search box: type part of a name, address or folder, and pick with the arrow keys and Enter or a click. Servers already used as a jump host are listed first. ([#102](https://github.com/paulm981/Submarine/issues/102))
 
 ## v0.4.0-fork.2
