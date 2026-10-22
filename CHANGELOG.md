@@ -20,6 +20,7 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - **A restore or import that fails no longer deletes a profile of the same name** that another window made or opened while it ran. It's refused instead, and only what the failed restore made itself is cleaned up. ([#95](https://github.com/paulm981/Submarine/issues/95))
 - **Deleting a profile deletes the copies a sync kept of it too**, the `<name>.submarine.bak-<time>` files next to it. They hold the same servers, logins and keys. ([#95](https://github.com/paulm981/Submarine/issues/95))
 - **A forward you stopped stays stopped until you start it.** In a shared profile, someone else starting it again now waits for your OK, like a forward they add. A forward that arrives stopped doesn't need your OK, since it runs nothing. ([#95](https://github.com/paulm981/Submarine/issues/95))
+- **A token given as the user name in a git address** (`https://TOKEN@host/…`) is no longer on git's command line, where other users of the computer could read it. It's handed to git the way a password in the address already is. ([#95](https://github.com/paulm981/Submarine/issues/95))
 
 ### From the original project ([#41](https://github.com/paulm981/Submarine/issues/41))
 
