@@ -10,7 +10,7 @@ import TunnelsPanel from "./TunnelsPanel";
 import InfoPanel from "./InfoPanel";
 import { CmdsPanel } from "./CmdsPanel";
 import { RenameInput } from "../ui/renameInput";
-import { useIsCompact } from "../hooks/useViewport";
+import { useIsCompact, useIsNarrow } from "../hooks/useViewport";
 import { useAi, sharedWith, findAiTools } from "../util/ai";
 import { launchAiTool } from "../ui/aiPane";
 import { IS_ANDROID } from "../util/platform";
@@ -864,6 +864,9 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // We collapse to a stacked single-pane view: when a tool is open, the
   // tool takes full width and the terminal is hidden behind a back-chip.
   const isCompact = useIsCompact();
+  // DesktopApp shows the AI side pane only in a window this wide, so
+  // "Claude Code beside this" is offered only then.
+  const isNarrow = useIsNarrow();
 
   // The split is on screen when it has 2+ panes, there's room, and the tab in
   // front is one of them. Picking another tab shows that one alone; picking
@@ -992,11 +995,11 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // is shared with it, and the AI side pane shows it beside this tab.
   const [aiTools, setAiTools] = useState<{ id: string; label: string }[]>([]);
   useEffect(() => {
-    if (!plusMenu || !ai.enabled || IS_ANDROID) return;
+    if (!plusMenu || !ai.enabled || IS_ANDROID || isNarrow) return;
     let live = true;
     void findAiTools().then((t) => { if (live) setAiTools(t); });
     return () => { live = false; };
-  }, [plusMenu, ai.enabled]);
+  }, [plusMenu, ai.enabled, isNarrow]);
   const startAiBeside = (tool: { id: string; label: string }) => {
     setPlusMenu(null);
     const name = displayName ?? session.serverName;
@@ -1983,7 +1986,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                 )}
               </>
             )}
-            {ai.enabled && !IS_ANDROID && aiTools.map((tool, i) => (
+            {ai.enabled && !IS_ANDROID && !isNarrow && aiTools.map((tool, i) => (
               <button
                 key={tool.id}
                 onClick={() => startAiBeside(tool)}

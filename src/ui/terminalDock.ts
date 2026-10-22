@@ -124,6 +124,12 @@ export const useDockVersion = (): number => useSyncExternalStore(subscribe, () =
 /// and Shift+Tab. The shifted letters are free: the shell only ever sees the
 /// plain Ctrl+letter.
 export type AppHotkey = "broadcast" | "pause" | "jump" | "aiPane" | "next" | "prev";
+// Ctrl+Shift+L is the pane's only while it can do something with it (the
+// pane says so as it renders: AI tools on, an AI tab open, not in Home, the
+// window wide enough for it). Otherwise the terminal keeps it, and the shell
+// gets Ctrl+L (clear the screen) as before.
+let aiPaneKeyLive = false;
+export const setAiPaneKeyLive = (on: boolean) => { aiPaneKeyLive = on; };
 export const appHotkey = (e: KeyboardEvent): AppHotkey | null => {
   if (!e.ctrlKey || e.altKey || e.metaKey) return null;
   if (e.code === "Tab") return e.shiftKey ? "prev" : "next";
@@ -131,7 +137,7 @@ export const appHotkey = (e: KeyboardEvent): AppHotkey | null => {
   if (e.code === "KeyB") return "broadcast";
   if (e.code === "KeyP") return "pause";
   if (e.code === "KeyK") return "jump";
-  if (e.code === "KeyL") return "aiPane";
+  if (e.code === "KeyL" && aiPaneKeyLive) return "aiPane";
   return null;
 };
 

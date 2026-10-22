@@ -204,7 +204,7 @@ const TerminalView = ({
   /// the label of the shell that started. A local terminal is never shown in
   /// a Wall or broadcast to, and keeps no command history — it isn't a
   /// server session. An AI tab's can be moved into the AI side pane.
-  local?: { shell: string | null; onOpened?: (label: string) => void };
+  local?: { shell: string | null; onOpened?: (label: string) => void; onFailed?: () => void };
   /// Called each time this terminal's SSH shell has been opened (first
   /// connect and every reconnect) and has printed what it prints on login,
   /// so typed-in commands land at its prompt (SessionView's run-on-connect).
@@ -917,6 +917,7 @@ const TerminalView = ({
             local.onOpened?.(label);
           }, e => {
             term.writeln(`\x1b[31mCouldn't start the shell: ${e}\x1b[0m`);
+            local.onFailed?.();
           });
         } else if (containerExec) {
           // Through root, asking for the password when sudo or dzdo wants one.
