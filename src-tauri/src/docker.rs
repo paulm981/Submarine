@@ -36,14 +36,10 @@ impl DockerStreams {
 
 // ---- helpers ----------------------------------------------------------------
 
-// POSIX-safe quoting: wrap in single quotes, escape internal single quotes.
-// Works on the typical Linux/macOS docker host. Windows servers running
-// docker almost always use WSL2 (POSIX), so this is the right default.
-// `pub(crate)` — lib.rs's `open_terminal` reuses it to quote a shell path
-// for the "use my default shell" setting rather than duplicate the escaping.
-pub(crate) fn shq(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\"'\"'"))
-}
+// POSIX-safe quoting (remote_sh::quote). Works on the typical Linux/macOS
+// docker host. Windows servers running docker almost always use WSL2
+// (POSIX), so this is the right default.
+use crate::remote_sh::quote as shq;
 
 // Validate a docker object name (container/image/volume/network/project).
 // Docker's accepted character set is roughly [a-zA-Z0-9_.-], plus colon

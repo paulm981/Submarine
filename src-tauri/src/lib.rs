@@ -40,6 +40,7 @@ mod tree_moves;
 mod multiexec;
 mod store_sync;
 mod shell_sftp;
+mod remote_sh;
 mod archive;
 mod approvals;
 mod agent_auth;
@@ -15284,7 +15285,7 @@ const LOGIN_SHELL_SCRIPT: &str =
     r#"if [ -x "$1" ]; then SHELL=$1; export SHELL; exec "$1" -l; fi; exec "${SHELL:-/bin/sh}" -l"#;
 
 fn login_shell_command(shell: &str) -> String {
-    format!("sh -c '{}' sh {}", LOGIN_SHELL_SCRIPT, crate::docker::shq(shell))
+    format!("sh -c '{}' sh {}", LOGIN_SHELL_SCRIPT, remote_sh::quote(shell))
 }
 
 // Whether the server can start `shell` that way: it takes exec requests, it
@@ -15293,7 +15294,7 @@ fn login_shell_command(shell: &str) -> String {
 // gets the plain shell request, as with the setting off: a terminal opens in
 // any case. Asked on a channel of its own, before the terminal's.
 async fn server_runs_login_shell(session_arc: &SessionHandleArc, shell: &str) -> bool {
-    let cmd = format!("sh -c '[ -x \"$1\" ] && echo __SUB_SHELL:OK' sh {}", crate::docker::shq(shell));
+    let cmd = format!("sh -c '[ -x \"$1\" ] && echo __SUB_SHELL:OK' sh {}", remote_sh::quote(shell));
     matches!(
         exec_with_stdin_capture(session_arc, &cmd, None, 4).await,
         Ok(out) if out.lines().any(|line| line.trim() == "__SUB_SHELL:OK")
@@ -15872,7 +15873,7 @@ async fn ssh_iptables_chain(
     let args = ["iptables", "-t", table.as_str(), "-n", "-v", "-L", chain.as_str(), "--line-numbers"]
         .map(String::from);
     if password.is_none() {
-        let direct = format!("{} 2>/dev/null", quote_args(&args));
+        let direct = format!("{} 2>/dev/null", remote_sh::quote_words(&args));
         let out = run_exec_capture(&state, &session_id, &direct, 15).await?;
         if !out.trim().is_empty() {
             return Ok(out);
@@ -16040,7 +16041,7 @@ async fn ssh_nft_chain(
     }
     let args = ["nft", "list", "chain", family.as_str(), table.as_str(), chain.as_str()].map(String::from);
     if password.is_none() {
-        let direct = format!("{} 2>/dev/null", quote_args(&args));
+        let direct = format!("{} 2>/dev/null", remote_sh::quote_words(&args));
         let out = run_exec_capture(&state, &session_id, &direct, 15).await?;
         if !out.trim().is_empty() {
             return Ok(out);
@@ -16202,44 +16203,23 @@ fn parse_exit_marker(raw: &str) -> (i32, String) {
 // from the tab's SFTP root mode — so it's asked for once. Commands are fixed
 // words plus validated arguments; the password goes to the tool's stdin.
 
-/// The arguments as single-quoted shell words (a quote inside one closes the
-/// word, adds an escaped quote and reopens it). Every caller also validates
-/// them first: unit names, PIDs, firewall identifiers.
-fn quote_args(args: &[String]) -> String {
-    args.iter()
-        .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+// Every script below is POSIX sh, sent with remote_sh::sh_command so that
+// any login shell (csh and tcsh included) passes it to `sh` unread; the
+// arguments are quoted words (remote_sh::quote_words), validated first by
+// every caller: unit names, PIDs, firewall identifiers.
 
-#[cfg(test)]
-mod quote_args_tests {
-    #[test]
-    fn each_argument_is_one_shell_word() {
-        let args = ["systemctl", "restart", "a b", "it's"].map(String::from);
-        assert_eq!(super::quote_args(&args), r#"'systemctl' 'restart' 'a b' 'it'\''s'"#);
-        // What a POSIX shell (the server's) makes of them.
-        if cfg!(unix) {
-            let out = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("printf '%s|' {}", super::quote_args(&args)))
-                .output()
-                .unwrap();
-            assert_eq!(String::from_utf8_lossy(&out.stdout), "systemctl|restart|a b|it's|");
-        }
-    }
-}
+/// root_probe's script: `$SUB_TOOL -l <command>` (`-l` runs nothing, so all
+/// it prints is the tool's own).
+const ROOT_PROBE_SCRIPT: &str = r#"if command -v "$SUB_TOOL" >/dev/null 2>&1; then :; else echo __SUB_SUDO:NO_SUDO; exit 0; fi
+if [ "$SUB_MODE" = pw ]; then OUT=$("$SUB_TOOL" -S -k -p "" -l "$@" 2>&1); else OUT=$("$SUB_TOOL" -n -l "$@" 2>&1); fi
+if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s "$OUT" | tr "\n" " ")"; fi"#;
 
 /// Can `tool` run `args` as root on this server? `tool -l <command>` asks
 /// without running it, and also answers for sudoers rules scoped to one
 /// command. `Err` is a [SUDO] code (see classify_sudo_failure).
 async fn root_probe(session_arc: &SessionHandleArc, tool: &str, password: Option<&str>, args: &[String]) -> Result<(), String> {
-    // POSIX sh, as `sh -c '<script>' sh <args>`: no single quotes inside.
-    const SCRIPT: &str = r#"if command -v "$SUB_TOOL" >/dev/null 2>&1; then :; else echo __SUB_SUDO:NO_SUDO; exit 0; fi
-if [ "$SUB_MODE" = pw ]; then OUT=$("$SUB_TOOL" -S -k -p "" -l "$@" 2>&1); else OUT=$("$SUB_TOOL" -n -l "$@" 2>&1); fi
-if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s "$OUT" | tr "\n" " ")"; fi"#;
     let mode = if password.is_some() { "pw" } else { "n" };
-    let cmd = format!("env SUB_MODE={} SUB_TOOL={} sh -c '{}' sh {}", mode, tool, SCRIPT, quote_args(args));
+    let cmd = remote_sh::sh_command(&[("SUB_MODE", mode), ("SUB_TOOL", tool)], ROOT_PROBE_SCRIPT, args);
     let stdin = password.map(|p| zeroize::Zeroizing::new(format!("{}\n", p)));
     let out = exec_with_stdin_capture(session_arc, &cmd, stdin.as_ref().map(|s| s.as_bytes()), 20).await?;
     for line in out.lines() {
@@ -16262,12 +16242,11 @@ if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s
 /// the tool, in the order tried. Fixed text, never from input.
 const ROOT_SHELL_FORMS: &[&str] = &["su -", "su - root", "su"];
 
-/// What a root shell is given to run `script` (one line of POSIX sh): root's
-/// own shell may be csh or another, so it starts /bin/sh with the script as
-/// one single-quoted word, which they all read the same way.
+/// What a root shell is given to run `script` (POSIX sh): root's own shell
+/// may be csh or another, so it starts /bin/sh with the script in octal
+/// (remote_sh), which they all pass on unread. One line.
 fn root_shell_line(script: &str) -> String {
-    debug_assert!(!script.contains('\n'));
-    format!("exec /bin/sh -c {}\n", quote_args(&[script.to_string()]))
+    format!("exec {}\n", remote_sh::sh_command_with("/bin/sh", &[], script, &[]))
 }
 
 /// Does `tool <form>` give a root shell without a password? The rules are
@@ -16316,7 +16295,6 @@ async fn find_root_shell(session_arc: &SessionHandleArc, tools: &[&'static str])
 
 /// Run `args` as root with `access`: the command's exit code and output.
 async fn root_run(session_arc: &SessionHandleArc, access: &ssh_manager::RootAccess, args: &[String], timeout_secs: u64) -> Result<(i32, String), String> {
-    const SCRIPT: &str = r#"if [ "$SUB_MODE" = pw ]; then "$SUB_TOOL" -S -k -p "" "$@" 2>&1; else "$SUB_TOOL" -n "$@" 2>&1; fi; echo __SUB_EXITCODE:$?"#;
     let tool = if ELEVATION_TOOLS.contains(&access.tool) { access.tool } else { "sudo" };
     if let Some(form) = access.shell.filter(|s| ROOT_SHELL_FORMS.contains(s)) {
         // The root shell's own start-up (a profile that prints) comes before
@@ -16331,7 +16309,7 @@ async fn root_run(session_arc: &SessionHandleArc, access: &ssh_manager::RootAcce
         // check of its own before each command (run_as_root).
         stdin.push_str(&root_shell_line(&format!(
             "echo __SUB_ROOT_OUT__:$(id -u); {} 2>&1; echo __SUB_EXITCODE:$?",
-            quote_args(args)
+            remote_sh::quote_words(args)
         )));
         let out = exec_with_stdin_capture_upto(session_arc, &format!("{} {} {}", tool, flags, form), Some(stdin.as_bytes()), timeout_secs, ROOT_OUTPUT_MAX).await?;
         let Some(start) = out.find("__SUB_ROOT_OUT__:") else {
@@ -16345,11 +16323,14 @@ async fn root_run(session_arc: &SessionHandleArc, access: &ssh_manager::RootAcce
         return Ok(parse_exit_marker(after));
     }
     let mode = if access.password.is_some() { "pw" } else { "n" };
-    let cmd = format!("env SUB_MODE={} SUB_TOOL={} sh -c '{}' sh {}", mode, tool, SCRIPT, quote_args(args));
+    let cmd = remote_sh::sh_command(&[("SUB_MODE", mode), ("SUB_TOOL", tool)], ROOT_RUN_SCRIPT, args);
     let stdin = access.password.as_ref().map(|p| zeroize::Zeroizing::new(format!("{}\n", p.as_str())));
     let out = exec_with_stdin_capture_upto(session_arc, &cmd, stdin.as_ref().map(|s| s.as_bytes()), timeout_secs, ROOT_OUTPUT_MAX).await?;
     Ok(parse_exit_marker(&out))
 }
+
+/// root_run's script where the tool runs the command itself.
+const ROOT_RUN_SCRIPT: &str = r#"if [ "$SUB_MODE" = pw ]; then "$SUB_TOOL" -S -k -p "" "$@" 2>&1; else "$SUB_TOOL" -n "$@" 2>&1; fi; echo __SUB_EXITCODE:$?"#;
 
 /// What root_run keeps of a command's output: a container's logs or a
 /// firewall's rules can run long.
@@ -16395,22 +16376,27 @@ pub(crate) async fn root_channel(
             .await
             .map_err(|e| e.to_string())?;
     }
-    let to_stderr = if pty.is_some() { "" } else { " 2>&1" };
+    // Without a terminal, what the tool says when it refuses comes on
+    // stderr, which a stream doesn't read: it goes to stdout.
+    let to_stdout = if pty.is_some() { "" } else { "exec 2>&1; " };
     let mut stdin = zeroize::Zeroizing::new(String::new());
     let mut wait_for_prompt = false;
+    let run = |flags: &str, words: &[String]| {
+        let script = format!(r#"{}exec "$SUB_TOOL" {} "$@""#, to_stdout, flags);
+        remote_sh::sh_command(&[("SUB_TOOL", tool), ("SUB_PROMPT", ROOT_PTY_PROMPT)], &script, words)
+    };
     let (cmd, marker) = if let Some(form) = access.shell.filter(|s| ROOT_SHELL_FORMS.contains(s)) {
         // root_access_for gives a root shell only without a password.
         let script = if pty.is_some() {
             // In a terminal the line given to the root shell shows as it's
             // typed; the screen is cleared before the command starts.
-            format!("printf '\\033[H\\033[2J\\033[3J'; exec {}", quote_args(args))
+            format!("printf '\\033[H\\033[2J\\033[3J'; exec {}", remote_sh::quote_words(args))
         } else {
-            format!("echo {}$(id -u); exec {} 2>&1", ROOT_STREAM_MARKER, quote_args(args))
+            format!("echo {}$(id -u); exec {} 2>&1", ROOT_STREAM_MARKER, remote_sh::quote_words(args))
         };
         stdin.push_str(&root_shell_line(&script));
-        // Without a terminal, what the tool says when it refuses comes on
-        // stderr, which a stream doesn't read.
-        (format!("{} -n {}{}", tool, form, to_stderr), pty.is_none().then_some(ROOT_STREAM_MARKER))
+        let words: Vec<String> = form.split(' ').map(String::from).collect();
+        (run("-n", &words), pty.is_none().then_some(ROOT_STREAM_MARKER))
     } else if let Some(p) = &access.password {
         stdin.push_str(p);
         stdin.push('\n');
@@ -16418,12 +16404,12 @@ pub(crate) async fn root_channel(
             // In a terminal the tool reads it from the terminal, with echo
             // off once its prompt shows (`-S` would leave echo on).
             wait_for_prompt = true;
-            (format!("{} -k -p '{}' {}", tool, ROOT_PTY_PROMPT, quote_args(args)), None)
+            (run(r#"-k -p "$SUB_PROMPT""#, args), None)
         } else {
-            (format!("{} -S -k -p '' {}{}", tool, quote_args(args), to_stderr), None)
+            (run(r#"-S -k -p """#, args), None)
         }
     } else {
-        (format!("{} -n {}{}", tool, quote_args(args), to_stderr), None)
+        (run("-n", args), None)
     };
     channel.exec(true, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
     // From here a failure closes the channel: a dropped one stays open on the
@@ -16871,8 +16857,8 @@ const SUDO_NO_SFTP_SERVER: &str = "[SUDO] NO_SFTP_SERVER";
 const SUDO_FAILED: &str = "[SUDO] FAILED";
 const ELEVATED_SFTP_READY: &str = "__SUB_SUDO_READY__";
 
-// POSIX sh, run as `sh -c '<script>'`: no single quotes inside, and no `!`
-// (tcsh history expansion) so it survives any login shell. `SUB_MODE=pw`
+// POSIX sh, sent with remote_sh::sh_command (any login shell passes it on
+// unread). `SUB_MODE=pw`
 // makes sudo read the password from stdin; `-k` ignores a cached ticket so
 // the password is really checked. `sudo -l <cmd>` tests the exact command
 // we will run, which also works for sudoers rules scoped to sftp-server.
@@ -17057,7 +17043,7 @@ async fn probe_sudo_sftp(
 
 /// The server's sftp-server, found as the login user.
 async fn find_sftp_server(session_arc: &SessionHandleArc) -> Result<String, String> {
-    let cmd = format!("sh -c '{}'", SFTP_SERVER_FIND);
+    let cmd = remote_sh::sh_command(&[], SFTP_SERVER_FIND, &[]);
     let out = exec_with_stdin_capture(session_arc, &cmd, None, 20).await?;
     for line in out.lines() {
         match line.trim().strip_prefix("__SUB_SUDO:") {
@@ -17079,7 +17065,7 @@ async fn find_sftp_server(session_arc: &SessionHandleArc) -> Result<String, Stri
 
 async fn probe_sudo_sftp_with(session_arc: &SessionHandleArc, password: Option<&str>, tool: &str) -> Result<String, String> {
     let mode = if password.is_some() { "pw" } else { "n" };
-    let cmd = format!("env SUB_MODE={} SUB_TOOL={} sh -c '{}'", mode, tool, SUDO_SFTP_PROBE);
+    let cmd = remote_sh::sh_command(&[("SUB_MODE", mode), ("SUB_TOOL", tool)], SUDO_SFTP_PROBE, &[]);
     let stdin = password.map(|p| zeroize::Zeroizing::new(format!("{}\n", p)));
     let out = exec_with_stdin_capture(session_arc, &cmd, stdin.as_ref().map(|s| s.as_bytes()), 25).await?;
     let mut path: Option<String> = None;
@@ -17110,7 +17096,7 @@ async fn probe_sudo_sftp_with(session_arc: &SessionHandleArc, password: Option<&
 
 // For a server without sftp-server: file operations as root run as shell
 // commands under sudo (`shell_sftp`), so sudo must allow `sh`. Same rules as
-// SUDO_SFTP_PROBE (sent as `sh -c '<script>'`).
+// SUDO_SFTP_PROBE (sent with remote_sh::sh_command).
 const SUDO_SHELL_PROBE: &str = r#"if command -v sudo >/dev/null 2>&1; then :; else echo __SUB_SUDO:NO_SUDO; exit 0; fi
 if [ "$SUB_MODE" = pw ]; then OUT=$(sudo -S -k -p "" -l sh 2>&1); else OUT=$(sudo -n -l sh 2>&1); fi
 if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s "$OUT" | tr "\n" " ")"; fi"#;
@@ -17128,7 +17114,7 @@ async fn probe_sudo_files(
         Err(e) => return Err(e),
     }
     let mode = if password.is_some() { "pw" } else { "n" };
-    let cmd = format!("env SUB_MODE={} sh -c '{}'", mode, SUDO_SHELL_PROBE);
+    let cmd = remote_sh::sh_command(&[("SUB_MODE", mode)], SUDO_SHELL_PROBE, &[]);
     let stdin = password.map(|p| zeroize::Zeroizing::new(format!("{}\n", p)));
     let out = exec_with_stdin_capture(session_arc, &cmd, stdin.as_ref().map(|s| s.as_bytes()), 25).await?;
     for line in out.lines() {
@@ -17464,34 +17450,64 @@ mod elevated_sftp_tests {
         assert!(!is_safe_remote_exec_path("/usr/lib/$(id)/sftp-server"));
     }
 
-    #[test]
-    fn a_root_shell_gets_one_line_of_posix_sh() {
-        let line = root_shell_line("echo __SUB_ROOT_OUT__; 'systemctl' 'restart' 'it'\\''s' 2>&1; echo __SUB_EXITCODE:$?");
-        assert!(line.ends_with('\n') && line.matches('\n').count() == 1, "{line:?}");
-        // What a shell makes of it: /bin/sh gets the script as one word.
-        if cfg!(unix) {
-            let out = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(line.trim_end().replacen("exec /bin/sh -c", "printf %s", 1))
-                .output()
-                .unwrap();
-            assert_eq!(
-                String::from_utf8_lossy(&out.stdout),
-                "echo __SUB_ROOT_OUT__; 'systemctl' 'restart' 'it'\\''s' 2>&1; echo __SUB_EXITCODE:$?"
-            );
-        }
-        for form in ROOT_SHELL_FORMS {
-            assert!(form.chars().all(|c| c.is_ascii_lowercase() || c == ' ' || c == '-'), "{form}");
-        }
-        assert!(!SFTP_SERVER_FIND.contains('\'') && !SFTP_SERVER_FIND.contains('!'));
+    /// The shells a server may run the app's commands with: its login
+    /// shell (sshd runs `<shell> -c <command>`) or root's (a root shell
+    /// reads its line). sh always; tcsh and csh where this machine has them.
+    #[cfg(unix)]
+    fn shells() -> Vec<&'static str> {
+        ["sh", "tcsh", "csh"]
+            .into_iter()
+            .filter(|s| std::process::Command::new(s).arg("-c").arg("true").output().is_ok_and(|o| o.status.success()))
+            .collect()
     }
 
     #[test]
-    fn probe_script_survives_single_quote_wrapping_in_any_shell() {
-        // It is sent as `sh -c '<script>'`: a single quote would end the
-        // argument early, and `!` triggers history expansion in tcsh.
-        assert!(!SUDO_SFTP_PROBE.contains('\''));
-        assert!(!SUDO_SFTP_PROBE.contains('!'));
+    fn a_root_shell_gets_one_line_of_posix_sh() {
+        let script = format!("echo __SUB_ROOT_OUT__; printf '%s|' {}; echo", remote_sh::quote_words(&["it's".into(), "a b".into()]));
+        let line = root_shell_line(&script);
+        assert!(line.ends_with('\n') && line.matches('\n').count() == 1 && !line.contains('!'), "{line:?}");
+        for form in ROOT_SHELL_FORMS {
+            assert!(form.chars().all(|c| c.is_ascii_lowercase() || c == ' ' || c == '-'), "{form}");
+        }
+        // What root's shell makes of it, whichever it is.
+        #[cfg(unix)]
+        for shell in shells() {
+            let out = std::process::Command::new(shell)
+                .arg("-c")
+                .arg(line.trim_end().strip_prefix("exec ").unwrap())
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "__SUB_ROOT_OUT__\nit's|a b|\n", "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
+    /// Every script the root features send, as the exact command sent, run
+    /// through sh and through tcsh and csh (a login shell that rejected the
+    /// scripts' line breaks inside quotes, #96). `true` and `false` stand in
+    /// for sudo.
+    #[test]
+    fn root_scripts_run_under_any_login_shell() {
+        let args = vec!["systemctl".to_string(), "restart".to_string(), "it's".to_string()];
+        let cases: Vec<(String, &str)> = vec![
+            (remote_sh::sh_command(&[("SUB_MODE", "n"), ("SUB_TOOL", "true")], ROOT_PROBE_SCRIPT, &args), "__SUB_SUDO:OK"),
+            (remote_sh::sh_command(&[("SUB_MODE", "pw"), ("SUB_TOOL", "false")], ROOT_PROBE_SCRIPT, &args), "__SUB_SUDO:FAIL:"),
+            (remote_sh::sh_command(&[("SUB_MODE", "n"), ("SUB_TOOL", "no-such-tool")], ROOT_PROBE_SCRIPT, &args), "__SUB_SUDO:NO_SUDO"),
+            (remote_sh::sh_command(&[("SUB_MODE", "n"), ("SUB_TOOL", "true")], ROOT_RUN_SCRIPT, &args), "__SUB_EXITCODE:0"),
+            (remote_sh::sh_command(&[("SUB_MODE", "n"), ("SUB_TOOL", "true")], SUDO_SFTP_PROBE, &[]), "__SUB_SUDO:"),
+            (remote_sh::sh_command(&[], SFTP_SERVER_FIND, &[]), "__SUB_SUDO:"),
+            (remote_sh::sh_command(&[("SUB_MODE", "n")], SUDO_SHELL_PROBE, &[]), "__SUB_SUDO:"),
+        ];
+        for (cmd, _) in &cases {
+            assert!(!cmd.contains(['\n', '\r', '!']), "{cmd}");
+        }
+        #[cfg(unix)]
+        for shell in shells() {
+            for (cmd, want) in &cases {
+                let out = std::process::Command::new(shell).arg("-c").arg(cmd).output().unwrap();
+                let text = String::from_utf8_lossy(&out.stdout);
+                assert!(text.contains(want), "{shell}: {cmd}\n{text}\n{}", String::from_utf8_lossy(&out.stderr));
+            }
+        }
     }
 }
 

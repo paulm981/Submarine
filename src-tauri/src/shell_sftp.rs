@@ -142,10 +142,7 @@ async fn start_with(open: OpenChannel, sudo: Sudo, portable: bool) -> Result<Sft
 // Commands
 // ---------------------------------------------------------------------------
 
-/// `s` as one word for `sh`.
-fn quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
+use crate::remote_sh::quote;
 
 /// A path as a word that never starts with `-`, so no command takes it for an
 /// option: relative paths get `./`.
@@ -162,16 +159,7 @@ fn qpath(p: &str) -> String {
 /// The script as RUNNER reads it: one line, SCRIPT_TAG then each byte as a
 /// `\ooo` escape.
 fn encode_script(script: &str) -> String {
-    let mut line = String::with_capacity(SCRIPT_TAG.len() + script.len() * 4 + 1);
-    line.push_str(SCRIPT_TAG);
-    for b in script.bytes() {
-        line.push('\\');
-        line.push(char::from(b'0' + (b >> 6)));
-        line.push(char::from(b'0' + ((b >> 3) & 7)));
-        line.push(char::from(b'0' + (b & 7)));
-    }
-    line.push('\n');
-    line
+    format!("{}{}\n", SCRIPT_TAG, crate::remote_sh::octal(script))
 }
 
 /// Drops what the login shell's startup files print before MARKER.
