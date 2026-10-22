@@ -25,7 +25,9 @@ The fork is based on the original project's **0.4.0**, with every change up to [
 - pause the terminals to leave out: one with its chip, several by Ctrl-clicking (⌘-clicking) their titles or Shift-clicking a run, or **Pause all** and then resume the few you want;
 - paste, or **Send** a set of commands, to all of them.
 
-A server that connects or reconnects partway through a line waits for the next line, so it never gets only the end of a command. Walls can be saved by name, and a whole folder opens as one. Closing a Wall that took your tabs asks whether to put them back or close them, and can remember the answer (**Settings › Walls**).
+A server that connects or reconnects partway through a line waits for the next line, so it never gets only the end of a command. Walls can be saved by name, and a whole folder opens as one.
+
+Closing a Wall that took your tabs asks whether to put them back or close them. Tick **Remember my answer**, or choose in **Settings › Walls**: **Ask each time**, **Put them back as tabs** or **Close them all**. The choice stays on this computer. **Close them all** still asks first when one of those servers is busy: a file uploading or downloading, an archive being made or unpacked on the server, a mirror running, a Live Edit file with changes not sent yet, or an AI command running or waiting for you.
 
 - **Jump hosts at scale.** A hundred servers behind one jump host log in a few at a time, in terminals and in Monitoring; the number is a setting. Monitoring reaches servers through their jump host too, by the same `~/.ssh/config` name as the terminal.
 - **Split.** A second shell on the same server opens beside the first, so you can watch a log in one and work in the other.
@@ -51,27 +53,81 @@ A server that connects or reconnects partway through a line waits for the next l
 
 A result screen says what came in. PuTTY and OpenSSH config imports are there too.
 
+### Jump hosts and your SSH config
+
+With **Use settings from ~/.ssh/config** on (**Settings › Authentication**), servers connect the way `ssh` would:
+
+- **ProxyJump.** A server behind a chain of jump hosts connects, as with `ssh -J`. Each jump host waits its turn to log in (**Logins at a time per jump host**, in **Settings › Servers**), so a hundred servers don't all log in to it at once. A server's own saved jump host or proxy still comes first.
+- **Key files and certificates.** The IdentityFile keys the config names are tried, each with its certificate (CertificateFile, or `<key>-cert.pub`), so Teleport nodes connect. An expired certificate is skipped, and the log says so.
+- **known_hosts.** A host key listed there skips the first-time question, and is saved to Submarine's own trusted keys. Those always come first: a key that changed gets the warning, even when known_hosts lists the new one. A key marked `@revoked` is always refused.
+
+Nothing is written to `~/.ssh`. With the setting off, none of these files is read.
+
+**Jump via** in a server's form is a search box: type part of a name, address or folder, then pick with the arrow keys and Enter. Servers already used as a jump host come first.
+
+The details, and where this differs from the original project, are in the [table below](#where-it-behaves-differently).
+
 ### AI help, without sharing keys
 
-A first test, off by default: turn it on in **Settings › AI tools**.
+A first test, off by default. To try it, install Claude Code, turn on **Settings › AI tools**, then start Claude Code from Home's menu (the arrow beside **+**, then **AI tools**).
 
-- **Claude Code from Home's menu**, under AI tools, opens already connected to Submarine through a local channel only your account can use. Nothing listens on the network.
-- **Share with AI** on a server's tab lets that AI tab ask to run commands there. Each one waits in the **AI panel** (the title bar's AI button) until you click Allow or Deny; typing can't approve anything.
-- **The AI side pane** shows an AI tab beside a server tab or Wall shared with it: the same terminal as in Home, open or folded to a bar (**Ctrl+Shift+L**), with Share, Unshare, Allow and Deny in its header. A server tab's **+** menu has **Claude Code beside this**, to start one there.
-- Submarine runs the command over its own connection, so the AI never gets a key or password. You see the full output; the AI gets it with known secrets hidden, and you see how many.
-- Every request and decision goes in `ai-audit.log` in the log folder.
+- **Claude Code from Home's menu** opens already connected to Submarine through a local channel only your account can use. Nothing listens on the network.
+- **Share with AI** on a server's tab lets that AI tab ask to run commands there. Each one waits in the **AI panel** (the title bar's AI button) until you click Allow or Deny; typing can't approve anything. A command with sudo, dzdo, su, doas or pkexec is marked as asking for root.
+- **The AI side pane** shows an AI tab beside a server tab or Wall shared with it: the same terminal as in Home, open or folded to a bar (**Ctrl+Shift+L**), with Share, Unshare, Allow and Deny in its header. A server tab's **+** menu (right-click the **+**) has **Claude Code beside this**, which starts one, shares the tab with it and shows it there.
+- **Commands run on Submarine's own connection**, so the AI never gets a key or password. Each one runs without a terminal, with a time limit and at most 1 MB of output. You see all of it; the AI gets it with known secrets hidden, and you see how many.
+- **Every request and decision goes in `ai-audit.log`** in the log folder. A command you allow is logged at once, and again when it ends.
+- **One program per AI tab.** A second program that tries to connect as the same AI tab is refused, and the AI panel warns you.
+- **Access ends** when you unshare, close the AI tab or the server's tab, the server's tab reconnects, or Submarine quits. Anything waiting is cancelled, and anything running is stopped on the server too. Locking the profile or turning AI tools off also clears the AI panel's list of what ran.
 
-AI tabs are kept apart from each other, from other accounts on the computer, and from the network. They aren't kept apart from a hostile program running as you: it could read an AI tab's access, edit the log, or click Allow for you. Submarine refuses a second connection as the same AI tab and warns you in the AI panel, but can't stop everything. Run Claude Code with its sandbox on (`/sandbox`), which fences in the commands it runs on your computer.
+AI tabs are kept apart from each other, from other accounts on the computer, and from the network. They aren't kept apart from a hostile program running as you: it could read an AI tab's access, edit the log, or click Allow for you. Run Claude Code with its sandbox on (`/sandbox`), which fences in the commands it runs on your computer. Claude Code also runs as you, so it could read `~/.ssh` by itself: **Settings › AI tools** shows the rule that stops it.
 
-What comes next (root prompts, the AI asking for a server, many servers, downloads, more AI tools) is in [#32](https://github.com/paulm981/Submarine/issues/32).
+What comes next is in [#32](https://github.com/paulm981/Submarine/issues/32): root asked for every time, the AI asking for a server, many servers at once, downloads, and more AI tools through one standard, ACP ([#110](https://github.com/paulm981/Submarine/issues/110)).
 
 ### Root when you need it
 
-Root works through `sudo` or `dzdo` (Centrify / Delinea), without a password where the server allows it, including servers that only allow `dzdo su -` or `sudo su -`, with or without your password. Where a password is needed, the app asks for it once per tab, gives it only to sudo's or dzdo's own question, and asks again (rather than retrying it) if it stops working. Any login shell works, csh and tcsh included. It works in three places:
+Root works through `sudo` or `dzdo` (Centrify / Delinea), without a password where the server allows it, including servers that only allow `dzdo su -` or `sudo su -`, with or without your password. Any login shell works, csh and tcsh included.
+
+Where a password is needed, the app asks for it once per tab:
+
+- **It goes only to sudo or dzdo,** checked on its own before anything runs, whatever prompt your server shows. A command that runs without a password never gets it.
+- **Each password you type is tried once.** A wrong one costs one failed attempt, even when several actions were waiting for it, so it can't lock your account. One that stops working is forgotten for the whole tab and asked for again.
+
+It works in three places:
 
 - **SFTP root mode**: browse and edit files as root;
 - **the Info panel**: start, stop and restart services, end processes, and read firewall rules as root;
 - **the Docker tab**: where only root may use Docker, containers, logs, live logs and container terminals work through root.
+
+### Files
+
+- **Live Edit keeps your unsent changes.** If a copy on this computer has changes that never reached the server, it's kept in **Submarine unsent edits** in your Downloads folder when you open the file again, disconnect, lock the profile or quit. The window says so. On macOS and Linux, only you can read that folder.
+- **Live Edit opens a file in an editor and never runs it:** the one picked in **Settings › Live Edit**, or else Notepad on Windows, the default text editor on macOS, and on Linux the text editor set for plain text.
+- **Downloads never replace each other.** If a file of the same name appears while a download runs, you're asked before it's replaced. In a folder download it's left as it was, and the card says how many. On Windows and macOS, which treat `Readme.md` and `README.md` as one name, the second of two such files is left out too, rather than replacing the first.
+- **Two uploads to the same file**, or an upload and a Live Edit save, wait their turn instead of mixing and corrupting it.
+- **A mirror keeps a file's permissions on the server**, with its owner and group where the server allows it, so a script keeps its permission to run. A new file gets the permissions of the one on your computer. A mirror never puts a server's file in a folder that runs programs at login, such as the Startup folder on Windows or `~/.config/autostart` on Linux.
+
+**What may run, on each system.** A file from a server is never run by opening it:
+
+- a program on a server (`.exe`, `.msi`, `.jar`, `.AppImage`, …) isn't opened from the file pane at all, as in the original project ([#212](https://github.com/SinaXhpm/submarine/pull/212));
+- the Local pane asks before it opens a file that would run: a program, a script or a shortcut; on macOS a `.terminal` or `.command` file too; on macOS and Linux, any file marked as executable;
+- downloads are marked as from the internet on Windows and macOS, and so is what the Local pane unpacks from an archive marked that way, so the system asks before a program from them runs.
+
+### Shared profiles
+
+A profile shared through Submarine Cloud (the original project's hosted sync, when you turn it on) is edited by other people too. A change of theirs that would make the app act on its own here waits in **Waiting for your OK**, above the server list, until you allow it:
+
+- on-connect commands, which would be typed into your terminal;
+- autostart, which would connect when you unlock the profile;
+- port forwards, new ones or ones you had stopped;
+- Monitoring's own commands, run on the server at every check;
+- a switch to telnet or VNC, which would send the server's saved password where it could be read. Until you choose, the server stays SSH (or RDP) here, on its old port. **Allow** makes the switch here too. **Keep it SSH** (or **Keep it RDP**) changes it back on the other computers as well.
+
+Allowing counts for this computer only. Allowing on-connect commands counts only for the commands you were shown: if they change while you look, you're shown the new ones. A copy of a server keeps waiting where the original was.
+
+Two more things wait for you:
+
+- **Deleted by someone else.** When one sync would delete much of the profile at once, or any SSH key, the items stay until you choose **Delete here too** or **Keep them**.
+- **Use the new key?** When the profile's key is replaced, usually because its owner removed someone, compare its fingerprint with the one in the owner's Profile panel before you use it.
 
 ### A better terminal
 
@@ -118,15 +174,8 @@ No third-party service is involved. Profiles are encrypted with their password b
 
 - **Troubleshooting.** The app keeps a log on your computer, and a watchdog notes when the window froze and why. **Copy diagnostics** copies the log with server, user and host names replaced, ready to send to whoever is helping.
 - **A failed connect says why:** under the error, whether the name resolved and to what, and whether the port answered, through the jump host or proxy when there is one.
-- **Two uploads to the same file**, or an upload and a Live Edit save, wait their turn instead of mixing and corrupting it.
-- **A release from every change**, numbered like `v0.4.0-fork.2` and shown in the title bar, with a notice when there's a newer one.
-- **Hardening.** On every system:
-  - characters that disguise a file name are shown plainly;
-  - a trusted server that shows a different kind of key is a warning, not a silent change;
-  - Live Edit opens a file in an editor and never runs it: the one picked in Settings, or else Notepad on Windows, the default text editor on macOS, and on Linux the text editor set for plain text;
-  - the Local pane asks before it opens a file that would run (a program, a script, a shortcut; on macOS a `.terminal` or `.command` file too; on macOS and Linux, any file marked as executable).
-
-  Downloads are marked as from the internet on Windows and macOS, and so is what the Local pane unpacks from an archive marked that way. As in the original project ([#212](https://github.com/SinaXhpm/submarine/pull/212)), a program on a server (`.exe`, `.msi`, `.jar`, `.AppImage`, …) isn't opened from the file pane at all.
+- **A release from every change**, numbered like `v0.4.0-fork.8` and shown in the title bar, with a notice when there's a newer one.
+- **Hardening.** On every system, characters that disguise a file name are shown plainly, and a trusted server that shows a different kind of key is a warning, not a silent change. What a file from a server may run is under [Files](#files).
 
 ## Where it behaves differently
 
@@ -195,9 +244,10 @@ None: every change in the original project up to [#229](https://github.com/SinaX
 **Versions.**
 
 - **Every merge to main is a release.** GitHub builds it and publishes it, tagged with the original project's version and the fork's count: `v0.4.0-fork.1`, `v0.4.0-fork.2`, and so on. A higher count is newer. There's nothing to tag by hand.
-- **The title bar shows it,** as in `v0.4.0-fork.2`, and the profile screen says when there's a newer release.
-- **When the original project releases a new version** and it's merged, the count starts again. Releases on 0.3.8 were `v0.3.8-fork.1` and on; with 0.4.0 in, they're `v0.4.0-fork.1` and on.
-- **The installers keep the same names** in every release, so a link to the latest release's `Submarine-windows-x64-setup.exe` always gets the newest. On Windows the installer itself can only say `0.4.0`; the app still knows it's `0.4.0-fork.2`.
+- **The title bar shows it,** as in `v0.4.0-fork.8`, and the profile screen says when there's a newer release.
+- **When the original project releases a new version** and it's merged, the count starts again. Releases on 0.3.8 ran from `v0.3.8-fork.1` to `v0.3.8-fork.11`; with 0.4.0 in, they're `v0.4.0-fork.1` and on.
+- **The installers keep the same names** in every release, so a link to the latest release's `Submarine-windows-x64-setup.exe` always gets the newest. On Windows the installer itself can only say `0.4.0`; the app still knows it's `0.4.0-fork.8`.
+- **Windows and Linux are in every release; macOS only when asked for,** since a macOS minute costs ten of the account's GitHub Actions minutes. The repository variable `BUILD_MACOS` set to `true` adds it to every release, and **Run workflow** with **Build macOS too** ticked builds a Mac test copy. Or build it on your own Mac: [Builds on GitHub](README.md#builds-on-github) says how.
 - **Before `v0.3.8-fork.1`,** the fork numbered its builds instead (build 244 was the last). Those builds are told about the new releases.
 
 **Giving back.** Fixes that apply to the original project too go back to it as pull requests.
