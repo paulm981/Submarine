@@ -1881,6 +1881,19 @@ async fn sync_with(
     session: &cloud::Session,
     pinned: Option<u64>,
 ) -> Result<SyncReport, String> {
+    sync_with_from(app, db_state, cloud, session, pinned, true).await
+}
+
+/// `sync_with`, from the delta cursor when `use_cursor`, or in full: every
+/// row, and a personal profile's key escrow, whatever the cursor says.
+async fn sync_with_from(
+    app: &tauri::AppHandle,
+    db_state: &DbState,
+    cloud: &cloud::CloudState,
+    session: &cloud::Session,
+    pinned: Option<u64>,
+    use_cursor: bool,
+) -> Result<SyncReport, String> {
     // Checked before anything goes out, the shared key refresh below included:
     // a server the profile isn't linked to could hand back a key it knows,
     // and every record pushed after that would be readable to it.
@@ -1935,7 +1948,7 @@ async fn sync_with(
         }
     }
 
-    let (report, reset) = sync_round(app, db_state, cloud, session, &profile, unlinked, generation, true).await?;
+    let (report, reset) = sync_round(app, db_state, cloud, session, &profile, unlinked, generation, use_cursor).await?;
     if !reset {
         return Ok(report);
     }
@@ -5391,11 +5404,19 @@ async fn force_push_profile(
     }
     let removed = cloud::delete_sync_profile(&app, &cloud, &session, &cloud_profile).await?;
     eprintln!("[SYNC] force push: server dropped {removed} record(s) for '{cloud_profile}'");
-    // Pushes are always a full set, so the very next sync repopulates the
-    // partition from this vault — including a fresh DEK escrow record. Only
-    // this profile's, though: if another opened meanwhile, the sync refuses,
-    // and this profile's next sync fills its partition back up.
-    sync_with(&app, &db_state, &cloud, &session, Some(generation)).await
+    // The delta cursor describes the copy just deleted: forget it, or the next
+    // round would send only what changed since, and no key escrow. Then a full
+    // sync fills the partition from this vault, DEK escrow record included.
+    // Only this profile's, though: if another opened meanwhile, the sync
+    // refuses, and with no cursor this profile's next sync is a full one.
+    forget_sync_cursor(&db_state)?;
+    sync_with_from(&app, &db_state, &cloud, &session, Some(generation), false).await
+}
+
+/// Drops the open profile's delta-sync cursor: the next round is a full one.
+fn forget_sync_cursor(db_state: &DbState) -> Result<(), String> {
+    *db_state.sync_cursor.lock().map_err(|_| "[STATE] LOCK_SYNC_CURSOR")? = None;
+    Ok(())
 }
 
 /// Mark a profile as the active one. Subsequent `check_db_exists` /
