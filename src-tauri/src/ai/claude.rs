@@ -9,6 +9,11 @@
 //! in from its own environment, where Submarine put them: the token is never
 //! on a command line or in a file.
 //!
+//! It also starts with `--allowedTools mcp__submarine__*`, so Claude Code
+//! doesn't ask before it uses Submarine's tools: Submarine asks before each
+//! command, and asking twice is one too many (#116). Claude Code still asks
+//! before anything it does on this computer.
+//!
 //! - **macOS and Linux:** the settings go on the command line as JSON.
 //! - **Windows:** `claude` may be a `.cmd` wrapper, which runs through
 //!   cmd.exe, and JSON doesn't survive cmd.exe's quoting. So `--mcp-config`
@@ -20,6 +25,10 @@ use std::path::{Path, PathBuf};
 pub(crate) const LABEL: &str = "Claude Code";
 /// The name its tabs go by in the AI panel ("Claude", "Claude 2").
 pub(crate) const SHORT: &str = "Claude";
+/// Claude Code's rule for every tool of the `submarine` MCP server, which it
+/// then uses without asking. Claude Code's flag takes several values, so it
+/// goes last, after `--mcp-config`'s.
+const ALLOW_SUBMARINE: [&str; 2] = ["--allowedTools", "mcp__submarine__*"];
 
 /// The MCP settings Claude Code is given: Submarine's helper, by full path.
 pub(crate) fn mcp_config(helper: &Path) -> serde_json::Value {
@@ -135,19 +144,26 @@ pub(crate) fn launch(claude: &Path, helper: &Path, data_dir: Option<&Path>) -> R
         if is_cmd {
             return cmd_launch(claude, &file, env, env_remove);
         }
-        Ok(Launch { program: claude.to_path_buf(), args: vec!["--mcp-config".into(), file], env, env_remove })
+        Ok(Launch { program: claude.to_path_buf(), args: with_allowed(vec!["--mcp-config".into(), file]), env, env_remove })
     }
     #[cfg(not(windows))]
     {
         let _ = data_dir;
-        Ok(Launch { program: claude.to_path_buf(), args: vec!["--mcp-config".into(), config.to_string()], env, env_remove })
+        Ok(Launch { program: claude.to_path_buf(), args: with_allowed(vec!["--mcp-config".into(), config.to_string()]), env, env_remove })
     }
 }
 
+fn with_allowed(mut args: Vec<String>) -> Vec<String> {
+    args.extend(ALLOW_SUBMARINE.map(String::from));
+    args
+}
+
 /// A `.cmd` wrapper runs through cmd.exe: `cmd /d /c call "<claude.cmd>"
-/// --mcp-config "<file>"`. `call` keeps cmd from taking the first quote
-/// off. cmd.exe reads `%`, `^`, `&`, `|`, `<`, `>`, `!` and `"` even in
-/// paths, so a path with any of them is refused rather than passed.
+/// --mcp-config "<file>" --allowedTools mcp__submarine__*`. `call` keeps
+/// cmd from taking the first quote off. cmd.exe reads `%`, `^`, `&`, `|`,
+/// `<`, `>`, `!` and `"` even in paths, so a path with any of them is
+/// refused rather than passed. The `*` means nothing to cmd.exe, and the
+/// wrapper passes it on as it is.
 #[cfg(windows)]
 fn cmd_launch(claude: &Path, file: &str, env: Vec<(String, String)>, env_remove: Vec<&'static str>) -> Result<Launch, String> {
     let claude = claude.to_string_lossy().into_owned();
@@ -155,7 +171,8 @@ fn cmd_launch(claude: &Path, file: &str, env: Vec<(String, String)>, env_remove:
         return Err("Claude Code's path has a character cmd.exe can't pass on (% ^ & | < > ! \"). Install Claude Code with its own installer (claude.exe) instead.".into());
     }
     let cmd = crate::local_open::system32().join("cmd.exe");
-    Ok(Launch { program: cmd, args: vec!["/d".into(), "/c".into(), "call".into(), claude, "--mcp-config".into(), file.to_string()], env, env_remove })
+    let args = vec!["/d".into(), "/c".into(), "call".into(), claude, "--mcp-config".into(), file.to_string()];
+    Ok(Launch { program: cmd, args: with_allowed(args), env, env_remove })
 }
 
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
@@ -183,9 +200,11 @@ mod tests {
     fn on_macos_and_linux_the_settings_go_on_the_command_line() {
         let l = launch(Path::new("/home/me/.local/bin/claude"), Path::new("/usr/bin/submarine"), None).unwrap();
         assert_eq!(l.program, PathBuf::from("/home/me/.local/bin/claude"));
+        assert_eq!(l.args.len(), 4);
         assert_eq!(l.args[0], "--mcp-config");
         let v: serde_json::Value = serde_json::from_str(&l.args[1]).unwrap();
         assert_eq!(v, mcp_config(Path::new("/usr/bin/submarine")));
+        assert_eq!(&l.args[2..], &["--allowedTools", "mcp__submarine__*"]);
         assert!(l.env.iter().any(|(k, v)| k == "PATH" && v.starts_with("/home/me/.local/bin")));
     }
 
@@ -194,12 +213,16 @@ mod tests {
     fn on_windows_the_settings_go_in_a_file() {
         let dir = std::env::temp_dir().join(format!("submarine-claude-test-{}", std::process::id()));
         let l = launch(Path::new(r"C:\Users\me\.local\bin\claude.exe"), Path::new(r"C:\Program Files\Submarine\submarine.exe"), Some(&dir)).unwrap();
+        assert_eq!(l.args.len(), 4);
         assert_eq!(l.args[0], "--mcp-config");
         let body: serde_json::Value = serde_json::from_slice(&std::fs::read(&l.args[1]).unwrap()).unwrap();
         assert_eq!(body, mcp_config(Path::new(r"C:\Program Files\Submarine\submarine.exe")));
+        assert_eq!(&l.args[2..], &["--allowedTools", "mcp__submarine__*"]);
         let l = launch(Path::new(r"C:\Users\Paul M\AppData\Roaming\npm\claude.cmd"), Path::new(r"C:\s\submarine.exe"), Some(&dir)).unwrap();
         assert!(l.program.ends_with("cmd.exe"));
         assert_eq!(&l.args[..4], &["/d", "/c", "call", r"C:\Users\Paul M\AppData\Roaming\npm\claude.cmd"]);
+        assert_eq!(l.args[4], "--mcp-config");
+        assert_eq!(&l.args[6..], &["--allowedTools", "mcp__submarine__*"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -241,5 +264,14 @@ mod tests {
         for bad in [r"C:\100%\claude.cmd", r"C:\a&b\claude.cmd", r"C:\x^y\c.cmd", "C:\\q\"\\c.cmd", r"C:\hi!\c.cmd"] {
             assert!(!cmd_safe(bad), "{bad}");
         }
+        // What's added after the paths passes cmd.exe as it is.
+        assert!(ALLOW_SUBMARINE.iter().all(|a| cmd_safe(a) && !a.contains(' ')));
+    }
+
+    #[test]
+    fn claude_code_doesnt_ask_before_submarines_tools() {
+        // Its rule for every tool of one MCP server, named as in mcp_config.
+        assert_eq!(ALLOW_SUBMARINE[1], "mcp__submarine__*");
+        assert!(mcp_config(Path::new("/x"))["mcpServers"].get("submarine").is_some());
     }
 }
