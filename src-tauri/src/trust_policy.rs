@@ -87,6 +87,31 @@ pub(crate) fn decide_certificate(known_hosts: Option<&HostTrust>, cert: &Certifi
     }
 }
 
+/// Whether a client certificate (CertificateFile, `<key>-cert.pub`) is
+/// worth offering at `now`: one that has expired or isn't valid yet would
+/// only be turned down. `Err` says why, for the log.
+pub(crate) fn client_certificate_usable(cert: &Certificate, now: u64) -> Result<(), String> {
+    if now < cert.valid_after() {
+        return Err("isn't valid yet".into());
+    }
+    if now >= cert.valid_before() {
+        return Err("has expired".into());
+    }
+    Ok(())
+}
+
+/// `client_certificate_usable` now, with a log line for one that isn't
+/// (`path`: where it was read from). For `retain` (#43, D6).
+pub(crate) fn offer_client_certificate(path: &str, cert: &Certificate, log: impl FnOnce(&str)) -> bool {
+    match client_certificate_usable(cert, now()) {
+        Ok(()) => true,
+        Err(why) => {
+            log(&format!("The certificate {path} {why}; skipped. Renew it (with tsh login, for Teleport) to use it."));
+            false
+        }
+    }
+}
+
 /// Whether Monitoring can't check host:port because only a certificate
 /// vouches for it: known_hosts trusts a CA for it and the app has no key on
 /// file for it (a certificate is never saved there, D4).
@@ -256,5 +281,20 @@ mod tests {
         let elsewhere = known_hosts(&ca_line, "db.example.com", 22).await;
         assert!(refused(&good, &elsewhere));
         assert!(matches!(decide_certificate(None, &good, NOW), HostKeyDecision::Refused(_)));
+    }
+
+    #[test]
+    fn a_client_certificate_outside_its_window_isnt_offered() {
+        let ca = key();
+        assert!(client_certificate_usable(&cert(&ca, &["u"], (NOW - 10, NOW + 10), CertType::User), NOW).is_ok());
+        assert_eq!(client_certificate_usable(&cert(&ca, &["u"], (NOW - 20, NOW - 10), CertType::User), NOW).unwrap_err(), "has expired");
+        assert_eq!(client_certificate_usable(&cert(&ca, &["u"], (NOW + 10, NOW + 20), CertType::User), NOW).unwrap_err(), "isn't valid yet");
+        // Now: an expired one is skipped with a line saying so.
+        let mut said = String::new();
+        let expired = cert(&ca, &["u"], (1_000, 2_000), CertType::User);
+        assert!(!offer_client_certificate("~/.tsh/u-cert.pub", &expired, |m| said = m.to_string()));
+        assert!(said.contains("~/.tsh/u-cert.pub has expired; skipped"), "{said}");
+        let current = cert(&ca, &["u"], (now() - 60, now() + 3600), CertType::User);
+        assert!(offer_client_certificate("c", &current, |_| panic!("no line for a usable one")));
     }
 }
