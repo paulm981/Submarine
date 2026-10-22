@@ -20424,12 +20424,12 @@ async fn import_hosts(
 
 /// Read the user's OpenSSH client config (default `~/.ssh/config`) and
 /// return one `ImportedHost` per non-wildcard alias so the UI can offer a
-/// checkbox picker. We deliberately keep the parser dumb: no macro
-/// expansion, no `Include` recursion, no token substitution (`%h`/`%u`),
-/// no `Match` blocks. Anything we don't understand is skipped silently
-/// rather than surfaced as an error — a user's config often has many
-/// directives (ForwardAgent, LogLevel, etc.) that are irrelevant to
-/// picking a host to import.
+/// checkbox picker (`parse_ssh_config_text`). We deliberately keep the
+/// parser simple: no `Include` recursion, no token substitution
+/// (`%h`/`%u`), and `Match` blocks are left out. Anything we don't
+/// understand is skipped silently rather than surfaced as an error — a
+/// user's config often has many directives (ForwardAgent, LogLevel, etc.)
+/// that are irrelevant to picking a host to import.
 ///
 /// Desktop-only. Android has no meaningful `~/.ssh/config` path and its
 /// import story goes through profile export/import instead — we return a
@@ -20443,55 +20443,6 @@ async fn parse_ssh_config(path: Option<String>) -> Result<Vec<ImportedHost>, Str
     }
     #[cfg(not(target_os = "android"))]
     {
-        // One in-progress Host block. We accumulate resolved fields as we
-        // walk the file and emit one ImportedHost per alias when the block
-        // ends (either the next `Host` line or EOF).
-        struct Block {
-            aliases: Vec<String>,
-            hostname: Option<String>,
-            port: Option<u16>,
-            user: Option<String>,
-            identity_file: Option<String>,
-            proxy_jump: Option<String>,
-        }
-
-        // Split `Directive value...` into (directive, rest). OpenSSH treats
-        // `=` and whitespace as equivalent separators between the directive
-        // name and its argument, so both `Port 2222` and `Port=2222` parse
-        // the same way.
-        fn split_directive(line: &str) -> (&str, &str) {
-            match line.find(|c: char| c.is_whitespace() || c == '=') {
-                Some(i) => {
-                    let key = &line[..i];
-                    let rest = line[i..]
-                        .trim_start_matches(|c: char| c.is_whitespace() || c == '=');
-                    (key, rest)
-                }
-                None => (line, ""),
-            }
-        }
-
-        // Emit one ImportedHost per non-wildcard alias in the block. Wildcard
-        // (`*` / `?`) and negation (`!prefix`) aliases are OpenSSH's template
-        // mechanism — they don't correspond to a single server the user
-        // would want as a row, so we skip them silently.
-        fn flush_block(b: &Block, out: &mut Vec<ImportedHost>) {
-            for alias in &b.aliases {
-                if alias.contains('*') || alias.contains('?') || alias.starts_with('!') {
-                    continue;
-                }
-                out.push(ImportedHost {
-                    host_alias: alias.clone(),
-                    hostname: b.hostname.clone().unwrap_or_else(|| alias.clone()),
-                    port: b.port.unwrap_or(22),
-                    user: b.user.clone().unwrap_or_default(),
-                    identity_file: b.identity_file.clone(),
-                    proxy_jump: b.proxy_jump.clone(),
-                    ..Default::default()
-                });
-            }
-        }
-
         let config_path: PathBuf = match path {
             Some(p) if !p.trim().is_empty() => PathBuf::from(p),
             _ => directories::UserDirs::new()
@@ -20518,68 +20469,122 @@ async fn parse_ssh_config(path: Option<String>) -> Result<Vec<ImportedHost>, Str
         .await
         .map_err(|e| format!("Failed to read SSH config: {e}"))??;
 
-        let mut out: Vec<ImportedHost> = Vec::new();
-        let mut cur: Option<Block> = None;
+        Ok(parse_ssh_config_text(&contents))
+    }
+}
 
-        for raw_line in contents.lines() {
-            let line = raw_line.trim();
-            if line.is_empty() || line.starts_with('#') {
+/// The hosts in an OpenSSH client config, one per alias that names a single
+/// host (not `*`, `?` or `!`), each with what OpenSSH would use for it:
+///
+/// - every `Host` block whose patterns match the alias counts, in file order,
+///   so a `Host *` (or `Host web*`) block's settings are its defaults;
+/// - the first value found for a setting wins, as in OpenSSH, so a block
+///   further down can't override one above it;
+/// - lines before the first `Host` apply to every host;
+/// - a `Match` block's lines are left out, up to the next `Host`: they
+///   depend on things only known when connecting.
+///
+/// Wildcard blocks are never imported as hosts themselves.
+#[cfg(not(target_os = "android"))]
+fn parse_ssh_config_text(contents: &str) -> Vec<ImportedHost> {
+    #[derive(Default, Clone)]
+    struct Settings {
+        hostname: Option<String>,
+        port: Option<u16>,
+        user: Option<String>,
+        identity_file: Option<String>,
+        /// As written: `none` is kept, so it still wins over a later value.
+        proxy_jump: Option<String>,
+    }
+    impl Settings {
+        fn fill_from(&mut self, other: &Settings) {
+            self.hostname = self.hostname.take().or_else(|| other.hostname.clone());
+            self.port = self.port.or(other.port);
+            self.user = self.user.take().or_else(|| other.user.clone());
+            self.identity_file = self.identity_file.take().or_else(|| other.identity_file.clone());
+            self.proxy_jump = self.proxy_jump.take().or_else(|| other.proxy_jump.clone());
+        }
+    }
+    /// One `Host` block (or the lines before the first one, as `*`). A
+    /// `Match` block has no patterns, so it applies to nothing.
+    struct Block {
+        patterns: Vec<String>,
+        settings: Settings,
+    }
+    fn matches(patterns: &[String], alias: &str) -> bool {
+        let mut hit = false;
+        for p in patterns {
+            match p.strip_prefix('!') {
+                Some(negated) if ssh_config::glob_matches(negated, alias, true) => return false,
+                Some(_) => {}
+                None => hit |= ssh_config::glob_matches(p, alias, true),
+            }
+        }
+        hit
+    }
+
+    let mut blocks = vec![Block { patterns: vec!["*".into()], settings: Settings::default() }];
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // `Directive value` or `Directive=value`.
+        let (key, rest) = match line.find(|c: char| c.is_whitespace() || c == '=') {
+            Some(i) => (&line[..i], line[i..].trim_start_matches(|c: char| c.is_whitespace() || c == '=')),
+            None => (line, ""),
+        };
+        let key = key.to_ascii_lowercase();
+        match key.as_str() {
+            "host" => blocks.push(Block { patterns: ssh_config::arguments(rest), settings: Settings::default() }),
+            "match" => blocks.push(Block { patterns: Vec::new(), settings: Settings::default() }),
+            "hostname" | "port" | "user" | "identityfile" | "proxyjump" => {
+                let Some(val) = ssh_config::arguments(rest).into_iter().next().filter(|v| !v.is_empty()) else {
+                    continue;
+                };
+                let s = &mut blocks.last_mut().expect("the lines before any Host").settings;
+                match key.as_str() {
+                    "hostname" => { s.hostname.get_or_insert(val); }
+                    "port" => {
+                        if s.port.is_none() {
+                            s.port = val.parse::<u16>().ok();
+                        }
+                    }
+                    "user" => { s.user.get_or_insert(val); }
+                    "identityfile" => { s.identity_file.get_or_insert(val); }
+                    _ => { s.proxy_jump.get_or_insert(val); }
+                }
+            }
+            // Include chains and every other directive are out of scope.
+            _ => {}
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<ImportedHost> = Vec::new();
+    for block in &blocks[1..] {
+        for alias in &block.patterns {
+            if alias.contains(['*', '?']) || alias.starts_with('!') || !seen.insert(alias.to_lowercase()) {
                 continue;
             }
-            let (key, rest) = split_directive(line);
-            let key_lc = key.to_ascii_lowercase();
-            match key_lc.as_str() {
-                "host" => {
-                    // Close out the previous block before starting a new one.
-                    if let Some(prev) = cur.take() {
-                        flush_block(&prev, &mut out);
-                    }
-                    let mut b = Block {
-                        aliases: Vec::new(),
-                        hostname: None,
-                        port: None,
-                        user: None,
-                        identity_file: None,
-                        proxy_jump: None,
-                    };
-                    for a in rest.split_whitespace() {
-                        b.aliases.push(a.trim_matches('"').to_string());
-                    }
-                    cur = Some(b);
-                }
-                "hostname" | "port" | "user" | "identityfile" | "proxyjump" => {
-                    if let Some(b) = cur.as_mut() {
-                        let val = rest.trim().trim_matches('"');
-                        if val.is_empty() {
-                            continue;
-                        }
-                        match key_lc.as_str() {
-                            "hostname" => b.hostname = Some(val.to_string()),
-                            "port" => {
-                                if let Ok(p) = val.parse::<u16>() {
-                                    b.port = Some(p);
-                                }
-                            }
-                            "user" => b.user = Some(val.to_string()),
-                            "identityfile" => b.identity_file = Some(val.to_string()),
-                            // `none` turns off a ProxyJump set by a wildcard block.
-                            "proxyjump" => b.proxy_jump = (!val.eq_ignore_ascii_case("none")).then(|| val.to_string()),
-                            _ => {}
-                        }
-                    }
-                }
-                // Include chains, Match blocks, and every other directive
-                // are v1-out-of-scope. Ignoring them keeps the parser
-                // predictable for the "flat list of hosts" use case.
-                _ => {}
+            let mut s = Settings::default();
+            for b in blocks.iter().filter(|b| matches(&b.patterns, alias)) {
+                s.fill_from(&b.settings);
             }
+            out.push(ImportedHost {
+                host_alias: alias.clone(),
+                hostname: s.hostname.unwrap_or_else(|| alias.clone()),
+                port: s.port.unwrap_or(22),
+                user: s.user.unwrap_or_default(),
+                identity_file: s.identity_file,
+                // `none` turns off a ProxyJump set by a wildcard block.
+                proxy_jump: s.proxy_jump.filter(|j| !j.eq_ignore_ascii_case("none")),
+                ..Default::default()
+            });
         }
-        if let Some(last) = cur.take() {
-            flush_block(&last, &mut out);
-        }
-        resolve_proxy_jump_aliases(&mut out);
-        Ok(out)
     }
+    resolve_proxy_jump_aliases(&mut out);
+    out
 }
 
 /// OpenSSH looks up each ProxyJump hop in the same config, so `ProxyJump
@@ -21253,6 +21258,55 @@ mod client_import_tests {
         let text = export(&[session("vnc", 128, "5%e.example%5900%%-1%0")]);
         let err = parse_client_hosts(text).err().expect("a VNC-only export must be refused");
         assert!(err.contains("No MobaXterm SSH or RDP sessions"), "{err}");
+    }
+
+    #[test]
+    fn ssh_config_import_reads_settings_as_openssh_does() {
+        let hosts = super::parse_ssh_config_text(
+            "User everyone\n\
+             Host web1 web2\n\
+             \tHostName web.example\n\
+             \tPort 2200\n\
+             \tPort 2300\n\
+             Match host web1\n\
+             \tUser matched\n\
+             \tPort 9999\n\
+             Host db\n\
+             \tHostName=db.example\n\
+             \tProxyJump none\n\
+             Host web*\n\
+             \tIdentityFile ~/.ssh/web\n\
+             \tProxyJump bastion.example\n\
+             Host *\n\
+             \tUser fallback\n\
+             \tPort 2022\n\
+             \tProxyJump gate.example\n\
+             Host web1\n\
+             \tHostName ignored.example\n",
+        );
+        let names: Vec<&str> = hosts.iter().map(|h| h.host_alias.as_str()).collect();
+        assert_eq!(names, vec!["web1", "web2", "db"], "no wildcard host, and web1 once");
+        let web1 = &hosts[0];
+        assert_eq!(web1.hostname, "web.example", "the first HostName wins");
+        assert_eq!(web1.port, 2200, "the first Port wins; Match's lines don't count");
+        assert_eq!(web1.user, "everyone", "lines before any Host apply to all");
+        assert_eq!(web1.identity_file.as_deref(), Some("~/.ssh/web"), "a matching wildcard block gives defaults");
+        assert_eq!(web1.proxy_jump.as_deref(), Some("bastion.example"));
+        let db = &hosts[2];
+        assert_eq!((db.hostname.as_str(), db.port, db.user.as_str()), ("db.example", 2022, "everyone"));
+        assert_eq!(db.identity_file, None);
+        assert_eq!(db.proxy_jump, None, "ProxyJump none wins over Host *");
+    }
+
+    #[test]
+    fn ssh_config_import_honours_negated_patterns() {
+        let hosts = super::parse_ssh_config_text(
+            "Host prod-a prod-b\n\
+             Host prod-* !prod-b\n\
+             \tUser deploy\n",
+        );
+        assert_eq!(hosts.len(), 2);
+        assert_eq!((hosts[0].user.as_str(), hosts[1].user.as_str()), ("deploy", ""));
     }
 
     #[test]
