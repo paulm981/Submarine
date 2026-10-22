@@ -53,6 +53,9 @@ pub(crate) struct Entry {
     pub id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
+    /// Who the server's tab logged in as, which its commands run as.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]

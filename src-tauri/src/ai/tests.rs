@@ -64,6 +64,30 @@ async fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
     }
 }
 
+/// An AI tool's SSH_AUTH_SOCK names a place with no agent: set, not
+/// unset, so Windows OpenSSH doesn't fall back to its own agent's pipe.
+#[tokio::test]
+async fn an_ai_tool_is_pointed_at_no_ssh_agent() {
+    let s = state_without_servers();
+    let (_, env) = s.start_tab("local-1", "Claude").unwrap();
+    let sock = var(&env, "SSH_AUTH_SOCK");
+    #[cfg(windows)]
+    {
+        // A name no one could have made ahead of it: new each AI tab.
+        let suffix = sock.strip_prefix(r"\\.\pipe\submarine-no-ssh-agent-").expect(sock);
+        assert!(suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_hexdigit()), "{sock}");
+        let (_, env2) = s.start_tab("local-2", "Claude").unwrap();
+        assert_ne!(var(&env2, "SSH_AUTH_SOCK"), sock);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        assert_eq!(sock, "/dev/null");
+        assert!(!std::fs::metadata(sock).unwrap().file_type().is_socket());
+    }
+    assert!(!CREDENTIAL_ENV.contains(&"SSH_AUTH_SOCK"));
+}
+
 #[tokio::test]
 async fn the_helper_talks_mcp_over_stdin_and_stdout() {
     let s = state_without_servers();
@@ -77,6 +101,10 @@ async fn the_helper_talks_mcp_over_stdin_and_stdout() {
     let tools = h.call(2, "tools/list", json!({})).await;
     let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(names, ["list_shared", "run_command"]);
+    // MCP's standard hints.
+    let listed_tools = &tools["result"]["tools"];
+    assert_eq!(listed_tools[0]["annotations"], json!({ "readOnlyHint": true }));
+    assert_eq!(listed_tools[1]["annotations"], json!({ "destructiveHint": true, "openWorldHint": true }));
     let listed = h.call(3, "tools/call", json!({ "name": "list_shared", "arguments": {} })).await;
     assert_eq!(listed["result"]["isError"], false);
     assert!(listed["result"]["content"][0]["text"].as_str().unwrap().contains("No servers are shared"));
@@ -205,11 +233,34 @@ async fn each_ai_tab_only_reaches_what_was_shared_with_it() {
 }
 
 #[test]
+fn ai_tools_start_in_a_folder_of_their_own() {
+    let data = std::env::temp_dir().join(format!("submarine-ai-workspace-{}", std::process::id()));
+    let dir = workspace(&data).unwrap();
+    assert_eq!(dir, data.join("ai-workspace"));
+    assert!(dir.is_dir());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |d: &std::path::Path| std::fs::metadata(d).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        // Made otherwise, it's made private again.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(workspace(&data).unwrap(), dir);
+        assert_eq!(mode(&dir), 0o700);
+        // A link isn't followed.
+        std::fs::remove_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(std::env::temp_dir(), &dir).unwrap();
+        assert!(workspace(&data).is_err());
+    }
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+#[test]
 fn names_stay_unique_within_an_ai_tab() {
     let mut servers = Vec::new();
     for _ in 0..3 {
         let name = unique_name(&servers, "web");
-        servers.push(SharedServer { session_id: name.clone(), name });
+        servers.push(SharedServer { session_id: name.clone(), name, user: None });
     }
     let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, ["web", "web (2)", "web (3)"]);
@@ -671,6 +722,34 @@ mod ssh {
         s.decide(p.id, false).unwrap();
         req.await.unwrap();
         assert!(audit_lines(&dir).iter().any(|l| l["event"] == "request" && l["root"] == true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The card says who a command runs as, and a root login is root
+    /// whatever the command.
+    #[tokio::test]
+    async fn the_login_user_is_on_the_card_and_root_is_marked() {
+        let (s, dir, _) = state().await;
+        s.start_tab("local-1", "Claude").unwrap();
+        s.share_as("local-1", "sess-1", "xyz", Some("root".into())).unwrap();
+        let (_c, cancel) = watch::channel(false);
+        let s2 = s.clone();
+        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "uptime", None, cancel).await });
+        let p = wait_pending(&s).await;
+        assert_eq!((p.user.as_deref(), p.root), (Some("root"), true));
+        s.decide(p.id, false).unwrap();
+        req.await.unwrap();
+        assert!(audit_lines(&dir).iter().any(|l| l["event"] == "request" && l["root"] == true && l["user"] == "root"));
+        // Another login isn't, unless the command asks.
+        s.start_tab("local-2", "Claude 2").unwrap();
+        s.share_as("local-2", "sess-1", "xyz", Some("deploy".into())).unwrap();
+        let (_c, cancel) = watch::channel(false);
+        let s2 = s.clone();
+        let req = tokio::spawn(async move { s2.run_command("local-2", "xyz", "uptime", None, cancel).await });
+        let p = wait_pending(&s).await;
+        assert_eq!((p.user.as_deref(), p.root), (Some("deploy"), false));
+        s.decide(p.id, false).unwrap();
+        req.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

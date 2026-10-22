@@ -155,6 +155,16 @@ pub(crate) fn peer_is_me(stream: &tokio::net::UnixStream) -> bool {
     stream.peer_cred().is_ok_and(|c| c.uid() == my_uid())
 }
 
+/// Where an AI tool's SSH_AUTH_SOCK points: /dev/null, which isn't a
+/// socket, so ssh's connect fails ("Connection refused") and it carries on
+/// without an agent. Nobody can put an agent there, whatever happens to the
+/// channel's folder while the AI tool runs (AI tools turned off removes it,
+/// and without XDG_RUNTIME_DIR it's in /tmp).
+#[cfg(unix)]
+pub(crate) fn no_agent_at(_addr: &str) -> String {
+    "/dev/null".to_string()
+}
+
 /// Listen on a new socket; each connection from a process running as you
 /// goes to `on_connect`.
 #[cfg(unix)]
@@ -318,6 +328,17 @@ pub(crate) mod pipe {
                 .create_with_security_attributes_raw(name, &mut sa as *mut SECURITY_ATTRIBUTES as *mut c_void)
         }
     }
+}
+
+/// Where an AI tool's SSH_AUTH_SOCK points: a pipe nothing serves, which
+/// Windows OpenSSH's ssh looks in rather than its own agent's
+/// (`\\.\pipe\openssh-ssh-agent`, used only when the variable is unset).
+/// A new random name each time (random_hex: the thread's CSPRNG), so
+/// another account on the computer can't make it first and pose as an
+/// agent.
+#[cfg(windows)]
+pub(crate) fn no_agent_at(_addr: &str) -> String {
+    format!(r"\\.\pipe\submarine-no-ssh-agent-{}", random_hex(8))
 }
 
 #[cfg(windows)]

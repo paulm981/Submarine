@@ -19,6 +19,9 @@
 //!   click for you. The helper checks it reaches the app's own process
 //!   (channel.rs), so such a program can't stand in for the app; the rest
 //!   is FORK.md's advice to run the AI tool in its sandbox.
+//! - **The AI tool starts without your SSH agent** and the usual cloud
+//!   logins (CREDENTIAL_ENV): SSH_AUTH_SOCK names a place with no agent,
+//!   and the logins are taken out, so what it runs doesn't find them there.
 //! - **Access ends** when the AI tab closes, when the server's tab closes or
 //!   reconnects, when you stop sharing, or when Submarine quits; anything
 //!   still waiting for approval is cancelled and anything running stopped,
@@ -50,6 +53,64 @@ const SETTINGS_FILE: &str = "ai_tools.json";
 
 /// The id Home's menu names Claude Code by.
 pub(crate) const CLAUDE_ID: &str = "ai:claude";
+
+/// What an AI tool starts without (#116): your SSH agent's process id, and
+/// the usual cloud and code-host logins kept in the environment. With them,
+/// a script it writes could reach your servers or accounts itself, with no
+/// approval and no log. It keeps everything else it needs: PATH, HOME,
+/// proxies, and its own login (claude.rs keeps a cloud's variables when
+/// Claude Code logs in through that cloud).
+///
+/// SSH_AUTH_SOCK isn't taken out but set to where no agent is
+/// (channel::no_agent_at, in start_tab): Windows OpenSSH's ssh looks for
+/// its agent's pipe (`\\.\pipe\openssh-ssh-agent`) when the variable is
+/// unset, not when it names somewhere else.
+///
+/// Not a wall. ssh run by the AI tool still uses an agent named by
+/// IdentityAgent in ~/.ssh/config, an open ControlMaster connection, and
+/// key files with no passphrase (or one in the macOS Keychain); and a
+/// program it runs can look for an agent's socket or pipe itself, or read
+/// key files, unless the tool's own sandbox stops it.
+pub(crate) const CREDENTIAL_ENV: &[&str] = &[
+    // Your SSH agent (SSH_AUTH_SOCK: see above).
+    "SSH_AGENT_PID",
+    // AWS.
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    // Azure (and Terraform's name for its secret).
+    "AZURE_CLIENT_SECRET",
+    "AZURE_CLIENT_ID",
+    "AZURE_TENANT_ID",
+    "AZURE_CLIENT_CERTIFICATE_PATH",
+    "AZURE_CLIENT_CERTIFICATE_PASSWORD",
+    "AZURE_USERNAME",
+    "AZURE_PASSWORD",
+    "ARM_CLIENT_SECRET",
+    // Google Cloud.
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CREDENTIALS",
+    "GOOGLE_OAUTH_ACCESS_TOKEN",
+    "CLOUDSDK_AUTH_ACCESS_TOKEN",
+    // GitHub and GitLab.
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GITLAB_TOKEN",
+    // Other clouds and secret stores.
+    "DIGITALOCEAN_TOKEN",
+    "DIGITALOCEAN_ACCESS_TOKEN",
+    "HCLOUD_TOKEN",
+    "LINODE_TOKEN",
+    "CLOUDFLARE_API_TOKEN",
+    "OS_PASSWORD",
+    "VAULT_TOKEN",
+];
 
 // The limits (#32 row 11).
 const MAX_COMMAND: usize = 16 * 1024;
@@ -99,6 +160,8 @@ struct SharedServer {
     session_id: String,
     /// What the AI calls it: the tab's name, made unique for this AI tab.
     name: String,
+    /// Who its tab logged in as, which commands run as; None if not known.
+    user: Option<String>,
 }
 
 struct Tab {
@@ -126,7 +189,11 @@ struct PendingView {
     tab_label: String,
     session_id: String,
     server: String,
+    /// Who it runs as: the server tab's login user, if known.
+    user: Option<String>,
     command: String,
+    /// It runs as root: the login user is root, or the command asks for
+    /// root (asks_for_root).
     root: bool,
     timeout_secs: u64,
     asked_at: String,
@@ -272,7 +339,9 @@ fn now() -> String {
 }
 
 /// A command that asks for root: one of the tools that give it, as a word
-/// of its own (`sudo x`, `/usr/bin/sudo`, `(su -)`), anywhere in it.
+/// of its own (`sudo x`, `/usr/bin/sudo`, `(su -)`), anywhere in it. Where
+/// sudo or dzdo needs no password, that's root with no question asked, and
+/// Submarine can't always tell.
 ///
 /// A warning for you on the request's card, NOT a gate: it's easy to dodge
 /// (`s\udo`, `$(echo sudo)`, `runuser`, a script that calls sudo), so
@@ -284,6 +353,12 @@ pub(crate) fn asks_for_root(command: &str) -> bool {
     static RE: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r#"(?:^|[\s;|&(){}`'"/!])(?:sudo|dzdo|su|doas|pkexec)(?:$|[\s;|&(){}`'"])"#).unwrap());
     RE.is_match(command)
+}
+
+/// A request runs as root: its server's tab logged in as root, or its
+/// command asks for root. A warning, as asks_for_root is.
+fn runs_as_root(user: Option<&str>, command: &str) -> bool {
+    user == Some("root") || asks_for_root(command)
 }
 
 /// Equal without saying where they differ.
@@ -468,10 +543,14 @@ impl AiState {
             .map(|n| if n == 1 { short.to_string() } else { format!("{short} {n}") })
             .find(|l| !s.tabs.iter().any(|t| &t.label == l))
             .unwrap();
+        let no_agent = channel::no_agent_at(&addr);
         let env = vec![
             (channel::ENV_ADDR.to_string(), addr),
             (channel::ENV_TOKEN.to_string(), token.to_string()),
             (channel::ENV_PID.to_string(), std::process::id().to_string()),
+            // ssh run by the AI tool doesn't find your agent through it
+            // (CREDENTIAL_ENV).
+            ("SSH_AUTH_SOCK".to_string(), no_agent),
         ];
         s.tabs.push(Tab {
             id: id.to_string(),
@@ -602,14 +681,20 @@ impl AiState {
 
     // -- Sharing -----------------------------------------------------------
 
+    #[cfg(test)]
     fn share(&self, tab_id: &str, session_id: &str, name: &str) -> Result<(), String> {
+        self.share_as(tab_id, session_id, name, None)
+    }
+
+    /// Share `session_id`, whose tab logged in as `user`, with `tab_id`.
+    fn share_as(&self, tab_id: &str, session_id: &str, name: &str, user: Option<String>) -> Result<(), String> {
         let mut s = self.lock();
         let tab = s.tabs.iter_mut().find(|t| t.id == tab_id).ok_or("That AI tab isn't open any more.")?;
         if tab.servers.iter().any(|x| x.session_id == session_id) {
             return Ok(());
         }
         let name = unique_name(&tab.servers, name);
-        tab.servers.push(SharedServer { session_id: session_id.to_string(), name: name.clone() });
+        tab.servers.push(SharedServer { session_id: session_id.to_string(), name: name.clone(), user });
         let label = tab.label.clone();
         drop(s);
         let mut e = audit::Entry::new("shared", &label);
@@ -842,7 +927,7 @@ impl AiState {
 
     async fn run_command(&self, tab_id: &str, server: &str, command: &str, timeout: Option<u64>, mut cancel: watch::Receiver<bool>) -> ToolResult {
         // Checked before anything is shown to you.
-        let (label, session_id, server, id, epoch, mut rx, stop_tx, stop_rx) = {
+        let (label, session_id, server, user, id, epoch, mut rx, stop_tx, stop_rx) = {
             let mut s = self.lock();
             let next_id = s.next_id + 1;
             let epoch = s.epoch;
@@ -915,24 +1000,26 @@ impl AiState {
                     tab_label: label.clone(),
                     session_id: found.session_id.clone(),
                     server: found.name.clone(),
+                    user: found.user.clone(),
                     command: command.to_string(),
-                    root: asks_for_root(command),
+                    root: runs_as_root(found.user.as_deref(), command),
                     timeout_secs: timeout.unwrap_or(DEFAULT_TIMEOUT),
                     asked_at: now(),
                 },
                 decide: tx,
                 stop: stop_tx.clone(),
             });
-            (label, found.session_id, found.name, next_id, epoch, rx, stop_tx, stop_rx)
+            (label, found.session_id, found.name, found.user, next_id, epoch, rx, stop_tx, stop_rx)
         };
         self.changed();
-        let root = asks_for_root(command);
+        let root = runs_as_root(user.as_deref(), command);
         let limit = Duration::from_secs(timeout.unwrap_or(DEFAULT_TIMEOUT));
         let entry_for = |event: &'static str| {
             let mut e = audit::Entry::new(event, &label);
             e.id = Some(id);
             e.request = Some("run_command");
             e.server = Some(server.clone());
+            e.user = user.clone();
             e.command = Some(for_log(command, MAX_LOGGED_COMMAND));
             e.root = root;
             e
@@ -1181,7 +1268,8 @@ pub async fn ai_share(state: tauri::State<'_, AiState>, ssh: tauri::State<'_, cr
     if session_id.contains("::") || !ssh.connections.lock().await.contains_key(&session_id) {
         return Err("That server's tab isn't connected.".into());
     }
-    state.share(&tab_id, &session_id, &name)
+    let user = ssh.session_users.lock().await.get(&session_id).cloned();
+    state.share_as(&tab_id, &session_id, &name, user)
 }
 
 /// Stop sharing a server: with one AI tab, or (no `tab_id`) with any.
@@ -1245,7 +1333,43 @@ pub(crate) struct HomeLaunch {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Taken out of its environment: CREDENTIAL_ENV, less its own login.
+    pub env_remove: Vec<&'static str>,
+    /// Where it starts: its own folder (workspace), not your home folder.
+    pub cwd: PathBuf,
     pub label: String,
+}
+
+/// The folder AI tools start in: `ai-workspace` in Submarine's data folder,
+/// made if it isn't there, and on macOS and Linux only yours (0700). Not
+/// your home folder, where Claude Code would read your files, ~/.ssh and
+/// ~/.aws included, without asking: it asks before reading outside the
+/// folder it started in.
+fn workspace(data_dir: &std::path::Path) -> Result<PathBuf, String> {
+    let dir = data_dir.join("ai-workspace");
+    let fail = |e: std::io::Error| format!("Couldn't make the AI tools' folder {}: {e}", dir.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        match std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(fail(e)),
+        }
+        // A folder of yours, not a link to somewhere else; 0700 even if it
+        // was made otherwise.
+        let m = std::fs::symlink_metadata(&dir).map_err(fail)?;
+        // SAFETY: geteuid can't fail.
+        if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } {
+            return Err(format!("{} isn't a folder of yours.", dir.display()));
+        }
+        if m.mode() & 0o777 != 0o700 {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(fail)?;
+        }
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(&dir).map_err(fail)?;
+    Ok(dir)
 }
 
 /// What Home starts for the AI tool `id` in the terminal `tab_id`.
@@ -1256,11 +1380,12 @@ pub(crate) fn home_launch(app: &tauri::AppHandle, state: &AiState, id: &str, tab
     }
     let path = claude::find().ok_or("Claude Code isn't installed on this computer.")?;
     let helper = helper_path()?;
-    let data = app.path().app_data_dir().ok();
-    let launch = claude::launch(&path, &helper, data.as_deref())?;
+    let data = app.path().app_data_dir().map_err(|e| format!("Couldn't find Submarine's data folder: {e}"))?;
+    let cwd = workspace(&data)?;
+    let launch = claude::launch(&path, &helper, Some(&data))?;
     let (label, mut env) = state.start_tab(tab_id, claude::SHORT)?;
     env.extend(launch.env);
-    Ok(HomeLaunch { program: launch.program, args: launch.args, env, label })
+    Ok(HomeLaunch { program: launch.program, args: launch.args, env, env_remove: launch.env_remove, cwd, label })
 }
 
 #[cfg(test)]

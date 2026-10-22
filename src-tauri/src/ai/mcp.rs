@@ -23,12 +23,16 @@ const INSTRUCTIONS: &str = "Submarine runs commands on servers the user has shar
 You never get credentials. Every command waits until the user clicks Allow in Submarine's AI panel, and may be denied. \
 Call list_shared to see the servers you can use. Output you get back is filtered: secrets it recognises are replaced with [hidden by Submarine].";
 
+/// The tools, with MCP's standard hints (ToolAnnotations, from 2025-03-26):
+/// `list_shared` changes nothing; `run_command` may change anything, on
+/// servers out in the world. A client may show them, never trust them.
 pub(crate) fn tools() -> Value {
     json!([
         {
             "name": "list_shared",
             "description": "List the servers the user has shared with you in Submarine. Only these can be used with run_command.",
-            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            "annotations": { "readOnlyHint": true }
         },
         {
             "name": "run_command",
@@ -45,7 +49,8 @@ Returns the exit code and the output (stdout and stderr together), with secrets 
                 },
                 "required": ["server", "command"],
                 "additionalProperties": false
-            }
+            },
+            "annotations": { "destructiveHint": true, "openWorldHint": true }
         }
     ])
 }

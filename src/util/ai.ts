@@ -15,7 +15,12 @@ export interface AiTab {
 }
 export interface AiPending {
   id: number; tab_id: string; tab_label: string; session_id: string; server: string;
-  command: string; root: boolean; timeout_secs: number; asked_at: string;
+  /// Who it runs as: the server tab's login user, if known.
+  user: string | null;
+  command: string;
+  /// It runs as root: the login user is root, or the command asks for root.
+  root: boolean;
+  timeout_secs: number; asked_at: string;
 }
 export interface AiRunning { id: number; tab_label: string; session_id: string; server: string; command: string; started_at: string }
 export interface AiDone {

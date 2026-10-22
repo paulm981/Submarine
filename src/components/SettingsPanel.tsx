@@ -257,6 +257,14 @@ function HomeTerminalSettings() {
 // On, Home's menu lists Claude Code under AI tools, started already connected
 // to Submarine; off, nothing listens and every AI tab's access ends.
 interface AiSettings { enabled: boolean; claude: string | null; available: boolean }
+// Claude Code's own settings that keep it out of your keys: deny rules for
+// its Read tool, and the sandbox's `credentials` for the commands it runs
+// (code.claude.com/docs/en/permissions and /sandboxing).
+const KEY_FOLDERS = ["~/.ssh", "~/.aws", "~/.config/gcloud", "~/.azure"];
+const CLAUDE_KEYS_OUT = JSON.stringify({
+  permissions: { deny: KEY_FOLDERS.map((f) => `Read(${f}/**)`) },
+  sandbox: { enabled: true, credentials: { files: KEY_FOLDERS.map((path) => ({ path, mode: "deny" })) } },
+}, null, 2);
 function AiToolsSettings() {
   const [info, setInfo] = useState<AiSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -291,6 +299,13 @@ function AiToolsSettings() {
           <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${info.enabled ? 'left-[22px]' : 'left-0.5'}`} />
         </button>
       </div>
+      {info.enabled && (
+        <p className="text-[12px] text-amber-200/90 leading-relaxed rounded-lg border border-amber-400/20 bg-amber-400/[0.06] px-3 py-2">
+          Output you allow goes to the AI provider, and so do files the AI tool reads on this computer. Each command's
+          output, with the secrets Submarine recognises hidden, is sent to the AI tool and on to its provider: for Claude
+          Code, Anthropic, or the cloud you've set it to use.
+        </p>
+      )}
       <p className="text-[12px] text-zinc-400 leading-relaxed">
         {info.claude ? (
           <>Claude Code is installed: <span className="font-mono text-[11.5px] text-zinc-300 break-all select-text">{info.claude}</span>.{" "}
@@ -302,11 +317,22 @@ function AiToolsSettings() {
       <p className="text-[11.5px] text-zinc-500 leading-relaxed">
         What the AI gets back is filtered: private keys, password and token values, password hashes, access keys and
         passwords in URLs are replaced with [hidden by Submarine]. The filter catches common shapes, not everything.
-        The AI tool runs as you on this computer, so it could read files such as ~/.ssh by itself: in Claude Code's own
-        settings (~/.claude/settings.json), deny that with{" "}
-        <span className="font-mono text-zinc-400 select-text">{'"permissions": { "deny": ["Read(~/.ssh/**)"] }'}</span>.
         Every request and decision is logged on this computer, in ai-audit.log in the log folder (Troubleshooting).
       </p>
+      <p className="text-[11.5px] text-zinc-500 leading-relaxed">
+        The AI tool starts in a folder of its own, without your SSH agent and the usual cloud logins (AWS, Azure, Google
+        Cloud, GitHub) in its environment. But it runs as you, so ssh run by it can still log in with an agent named by
+        IdentityAgent in ~/.ssh/config (1Password, Secretive, Bitwarden, Pageant), a connection your own terminal keeps
+        open (ControlMaster), or a key file with no passphrase or with its passphrase in the macOS Keychain. What it runs
+        can also read your files and use the network.
+      </p>
+      <p className="text-[11.5px] text-zinc-500 leading-relaxed">
+        To keep Claude Code out of your keys, add this to ~/.claude/settings.json. The deny rules stop its own Read tool;
+        the sandbox stops the commands it runs, which by default can read these folders too. The sandbox runs on macOS,
+        Linux and WSL2, not on Windows itself: for production servers on Windows, run Submarine and its AI tools in WSL2
+        or a virtual machine.
+      </p>
+      <pre className="whitespace-pre-wrap break-all rounded-lg bg-black/40 border border-white/5 p-2 font-mono text-[10.5px] text-zinc-400 select-text">{CLAUDE_KEYS_OUT}</pre>
       {error && <p className="text-[11.5px] text-red-400">{error}</p>}
     </div>
   );

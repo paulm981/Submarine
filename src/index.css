@@ -32,3 +32,13 @@
   scrollbar-width: thin !important;
   scrollbar-color: rgba(96, 165, 250, 0.18) transparent !important;
 }
+
+/* The AI side pane has the keyboard (AiSidePane, useKeysIn): the other
+   terminals on screen dim a little, so it's plain which one you type into. */
+html[data-ai-keys] .xterm {
+  opacity: 0.6;
+  transition: opacity 150ms;
+}
+html[data-ai-keys] [data-ai-pane] .xterm {
+  opacity: 1;
+}

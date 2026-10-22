@@ -73,16 +73,36 @@ The details, and where this differs from the original project, are in the [table
 A first test, off by default. To try it, install Claude Code, turn on **Settings › AI tools**, then start Claude Code from Home's menu (the arrow beside **+**, then **AI tools**).
 
 - **Claude Code from Home's menu** opens already connected to Submarine through a local channel only your account can use. Nothing listens on the network.
-- **Share with AI** on a server's tab lets that AI tab ask to run commands there. Each one waits in the **AI panel** (the title bar's AI button) until you click Allow or Deny; typing can't approve anything. A command with sudo, dzdo, su, doas or pkexec is marked as asking for root.
-- **The AI side pane** shows an AI tab beside a server tab or Wall shared with it: the same terminal as in Home, open or folded to a bar (**Ctrl+Shift+L**), with Share, Unshare, Allow and Deny in its header. A server tab's **+** menu (right-click the **+**) has **Claude Code beside this**, which starts one, shares the tab with it and shows it there.
+- **Share with AI** on a server's tab lets that AI tab ask to run commands there. Each one waits in the **AI panel** (the title bar's AI button) until you click Allow or Deny; typing can't approve anything. Its card says which server it runs on and as whom ("on **web-01** as **root**"). A tab logged in as root, or a command with sudo, dzdo, su, doas or pkexec, is marked as root. Where those need no password, nothing asks first, and Submarine can't always tell.
+- **One question per command.** Claude Code starts with Submarine's tools allowed, so only Submarine asks before a server command. Claude Code still asks before anything it does on your computer.
+- **The AI side pane** shows an AI tab beside a server tab or Wall shared with it: the same terminal as in Home, open or folded to a bar (**Ctrl+Shift+L**), with Share, Unshare, Allow and Deny in its header. The keyboard goes into it only when you click in its terminal; opening or folding it leaves the keyboard where it was. The terminal with the keyboard is bright, and the other dims. A server tab's **+** menu (right-click the **+**) has **Claude Code beside this**, which starts one, shares the tab with it and shows it there.
 - **Commands run on Submarine's own connection**, so the AI never gets a key or password. Each one runs without a terminal, with a time limit and at most 1 MB of output. You see all of it; the AI gets it with known secrets hidden, and you see how many.
 - **Every request and decision goes in `ai-audit.log`** in the log folder. A command you allow is logged at once, and again when it ends.
 - **One program per AI tab.** A second program that tries to connect as the same AI tab is refused, and the AI panel warns you.
 - **Access ends** when you unshare, close the AI tab or the server's tab, the server's tab reconnects, or Submarine quits. Anything waiting is cancelled, and anything running is stopped on the server too. Locking the profile or turning AI tools off also clears the AI panel's list of what ran.
 
-AI tabs are kept apart from each other, from other accounts on the computer, and from the network. They aren't kept apart from a hostile program running as you: it could read an AI tab's access, edit the log, or click Allow for you. Run Claude Code with its sandbox on (`/sandbox`), which fences in the commands it runs on your computer. Claude Code also runs as you, so it could read `~/.ssh` by itself: **Settings › AI tools** shows the rule that stops it.
+AI tabs are kept apart from each other, from other accounts on the computer, and from the network. They aren't kept apart from a hostile program running as you: it could read an AI tab's access, edit the log, or click Allow for you.
 
-What comes next is in [#32](https://github.com/paulm981/Submarine/issues/32). First, Claude Code starts without your SSH agent, so it can't reach servers around Submarine ([#116](https://github.com/paulm981/Submarine/issues/116)). Then you choose per server how much the AI may do without asking: ask every time, run the commands you've allowed, or run anything, with everything logged ([#115](https://github.com/paulm981/Submarine/issues/115)). Then any AI tool from a list, not only Claude Code ([#117](https://github.com/paulm981/Submarine/issues/117)).
+Claude Code starts in a folder of its own (`ai-workspace` in Submarine's data folder), not your home folder, where it would read files without asking. Its `SSH_AUTH_SOCK` points where no agent is (on Windows too, where Windows OpenSSH would otherwise go to its own agent), and the usual cloud and GitHub logins are taken out of its environment.
+
+It still runs as you, though. `ssh` run by it can still log in with an agent named by `IdentityAgent` in `~/.ssh/config` (1Password, Secretive, Bitwarden, Pageant), a connection your own terminal keeps open (`ControlMaster`), or a key file with no passphrase or with its passphrase in the macOS Keychain. What it runs can also look for an agent itself, read your files and use the network. To keep Claude Code out of your keys, deny reading them in `~/.claude/settings.json`, both for its Read tool and in its sandbox, which by default can read them:
+
+```json
+{
+  "permissions": { "deny": ["Read(~/.ssh/**)", "Read(~/.aws/**)", "Read(~/.config/gcloud/**)", "Read(~/.azure/**)"] },
+  "sandbox": {
+    "enabled": true,
+    "credentials": { "files": [
+      { "path": "~/.ssh", "mode": "deny" }, { "path": "~/.aws", "mode": "deny" },
+      { "path": "~/.config/gcloud", "mode": "deny" }, { "path": "~/.azure", "mode": "deny" }
+    ] }
+  }
+}
+```
+
+The sandbox runs on macOS, Linux and WSL2, not on Windows itself: for production servers on Windows, run Submarine and Claude Code in WSL2 or a virtual machine.
+
+What comes next is in [#32](https://github.com/paulm981/Submarine/issues/32). First, you choose per server how much the AI may do without asking: ask every time, run the commands you've allowed, or run anything, with everything logged ([#115](https://github.com/paulm981/Submarine/issues/115)). Then any AI tool from a list, not only Claude Code ([#117](https://github.com/paulm981/Submarine/issues/117)).
 
 ### Root when you need it
 

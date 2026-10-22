@@ -458,6 +458,9 @@ pub struct SshState {
     /// server's own saved password is typed only into that server's
     /// terminals (type_saved_password).
     pub session_servers: Arc<Mutex<HashMap<String, i32>>>,
+    /// The user each session logged in as (initiate_connection): the AI
+    /// panel says who a command runs as (#116).
+    pub session_users: Arc<Mutex<HashMap<String, String>>>,
     /// Per tab: one password the user typed is tried at a time, and one
     /// just turned down isn't tried again (lib.rs, typed_root_access).
     pub root_gates: Arc<Mutex<HashMap<String, Arc<Mutex<RootGate>>>>>,
@@ -624,6 +627,7 @@ impl SshState {
             root_access: Arc::new(Mutex::new(HashMap::new())),
             docker_root: Arc::new(Mutex::new(HashSet::new())),
             session_servers: Arc::new(Mutex::new(HashMap::new())),
+            session_users: Arc::new(Mutex::new(HashMap::new())),
             root_gates: Arc::new(Mutex::new(HashMap::new())),
             terminal_servers: Arc::new(Mutex::new(HashMap::new())),
             sftp_shell: Arc::new(Mutex::new(HashSet::new())),

@@ -5520,6 +5520,7 @@ async fn close_profile(
         ssh.root_gates.lock().await.remove(sid);
         ssh.docker_root.lock().await.remove(sid);
         ssh.sftp_shell.lock().await.remove(sid);
+        ssh.session_users.lock().await.remove(sid);
         ssh.connections.lock().await.remove(sid);
         sweep_session_temp(sid);
     }
@@ -5559,6 +5560,7 @@ async fn close_profile(
     ssh.docker_root.lock().await.clear();
     ssh.sftp_shell.lock().await.clear();
     ssh.session_servers.lock().await.clear();
+    ssh.session_users.lock().await.clear();
     ssh.terminal_servers.lock().await.clear();
     // Wipe every connect-time secret the user typed this profile (issue #30).
     ssh.prompted_secrets.lock().await.clear();
@@ -12323,6 +12325,7 @@ async fn teardown_connection_key(state: &SshState, mirrors: &MirrorMap, key: &st
     if let Some(base) = key.strip_suffix("::sftp") {
         state.sftp_sessions.lock().await.remove(base);
     }
+    state.session_users.lock().await.remove(key);
     state.connections.lock().await.remove(key);
     state.jump_connections.lock().await.remove(key);
     // Wipe temp files the secondary's SFTP downloads / drags left behind.
@@ -12536,6 +12539,7 @@ async fn initiate_connection(
             println!("[BACKEND] Tearing down stale session for reconnect: {}", session_id);
         }
     }
+    state.session_users.lock().await.remove(&session_id);
     // Drop any ProxyJump bastion handle from a prior attempt — dropping it
     // closes the old jump connection so the reconnect opens a fresh one.
     state.jump_connections.lock().await.remove(&session_id);
@@ -13361,6 +13365,10 @@ async fn initiate_connection(
                         let registered = {
                             let g = state_session_generation.lock().await;
                             if g.get(&session_id_clone).copied().unwrap_or(0) == connect_generation {
+                                // Who it logged in as, before the connection is
+                                // there to share: the AI panel's cards say who a
+                                // command runs as (#116).
+                                app.state::<SshState>().session_users.lock().await.insert(session_id_clone.clone(), effective_user.to_string());
                                 state_connections
                                     .lock()
                                     .await
@@ -16044,6 +16052,7 @@ async fn disconnect_session(
     // the dying transport after the purge (get_sftp_session's still-current
     // check would then see the transport gone and refuse to cache).
     if session_id.ends_with("::sftp") {
+        state.session_users.lock().await.remove(&session_id);
         state.connections.lock().await.remove(&session_id);
         if let Some(base) = session_id.strip_suffix("::sftp") {
             state.sftp_sessions.lock().await.remove(base);
@@ -16070,6 +16079,7 @@ async fn disconnect_session(
     state.root_gates.lock().await.remove(&session_id);
     state.docker_root.lock().await.remove(&session_id);
     state.sftp_shell.lock().await.remove(&session_id);
+    state.session_users.lock().await.remove(&session_id);
     state.connections.lock().await.remove(&session_id);
     // Drop any ProxyJump bastion handle for this session — closes the jump
     // connection once the target it was carrying is gone.

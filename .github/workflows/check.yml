@@ -20,7 +20,10 @@ name: Check
 #     runs on a fixed Rust version (CLIPPY_RUST), since each Rust release
 #     adds lints that would raise the count on every pull request at once;
 #     move the version and the count together.
-#   • frontend: the TypeScript check and a build of the page.
+#   • frontend: the TypeScript check and a build of the page. First, that
+#     src-tauri/src/lib.rs still ends every line with CRLF, as the original
+#     project's does: one written with LF conflicts on every line at the next
+#     sync (#112).
 #
 # Not `cargo fmt --check`, for the same reason: the original project's code
 # isn't rustfmt-formatted, and formatting it would rewrite its files.
@@ -149,6 +152,20 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+
+      # lib.rs is the original project's, with Windows line endings (CRLF)
+      # on every line (#112).
+      - name: lib.rs keeps its CRLF line endings
+        run: |
+          f=src-tauri/src/lib.rs
+          # Every line without a CR before its newline, a last line with no
+          # newline included (grep sees it as a line too).
+          bad=$(grep -nv $'\r$' "$f" | cut -d: -f1 | head -5 | paste -sd, - || true)
+          if [ -n "$bad" ]; then
+            echo "::error file=$f::$f must end every line with CRLF (Windows line endings), as the original project's does, or every line conflicts at the next sync. Lines without: $bad (at most five shown). Convert it back, e.g. with: sed -i 's/\r\?\$/\r/' $f"
+            exit 1
+          fi
+          echo "$f: every line ends with CRLF."
 
       - name: Install Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0

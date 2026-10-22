@@ -81,10 +81,17 @@ pub struct Shell {
     /// Added to its environment: an AI tab's address and token.
     #[serde(skip)]
     env: Vec<(String, String)>,
+    /// Taken out of its environment: for an AI tool, your SSH agent and
+    /// cloud logins (ai::CREDENTIAL_ENV). Ordinary shells keep them.
+    #[serde(skip)]
+    env_remove: Vec<&'static str>,
+    /// Where it starts: an AI tool's own folder. None: your home folder.
+    #[serde(skip)]
+    cwd: Option<PathBuf>,
 }
 
 fn shell(id: impl Into<String>, label: impl Into<String>, group: &'static str, program: PathBuf, args: &[&str]) -> Shell {
-    Shell { id: id.into(), label: label.into(), group, detail: None, program, args: args.iter().map(|a| a.to_string()).collect(), env: Vec::new() }
+    Shell { id: id.into(), label: label.into(), group, detail: None, program, args: args.iter().map(|a| a.to_string()).collect(), env: Vec::new(), env_remove: Vec::new(), cwd: None }
 }
 
 impl Shell {
@@ -589,7 +596,7 @@ mod pty {
             terms,
             id,
             shell,
-            app.path().home_dir().ok(),
+            start_dir(shell, app.path().home_dir().ok()),
             (cols, rows),
             move |batch: &mut Vec<u8>| {
                 limiter.filter(batch, &mut cut);
@@ -707,7 +714,26 @@ mod pty {
         if let Some(dir) = cwd {
             cmd.cwd(dir);
         }
+        environment(&mut cmd, shell);
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| format!("[LOCAL_TERM] START_FAILED: {}: {}", shell.label, e))?;
+        drop(pair.slave);
+        let reader = pair.master.try_clone_reader().map_err(|e| format!("[LOCAL_TERM] PTY_FAILED: {}", e))?;
+        let writer = pair.master.take_writer().map_err(|e| format!("[LOCAL_TERM] PTY_FAILED: {}", e))?;
+        let killer = child.clone_killer();
+        let (input, keys) = mpsc::channel();
+        Ok(((Term { master: pair.master, input, killer }, keys), child, reader, writer))
+    }
+
+    /// The shell's environment: the app's own, less the webview's variables
+    /// and what the shell is to start without, plus its own.
+    pub fn environment(cmd: &mut CommandBuilder, shell: &Shell) {
         for name in WEBVIEW_ENV.lock().map(|n| n.clone()).unwrap_or_default() {
+            cmd.env_remove(name);
+        }
+        for name in &shell.env_remove {
             cmd.env_remove(name);
         }
         cmd.env("TERM", "xterm-256color");
@@ -721,16 +747,6 @@ mod pty {
         if std::env::var_os("LANG").is_none() && std::env::var_os("LC_ALL").is_none() {
             cmd.env("LANG", "en_US.UTF-8");
         }
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| format!("[LOCAL_TERM] START_FAILED: {}: {}", shell.label, e))?;
-        drop(pair.slave);
-        let reader = pair.master.try_clone_reader().map_err(|e| format!("[LOCAL_TERM] PTY_FAILED: {}", e))?;
-        let writer = pair.master.take_writer().map_err(|e| format!("[LOCAL_TERM] PTY_FAILED: {}", e))?;
-        let killer = child.clone_killer();
-        let (input, keys) = mpsc::channel();
-        Ok(((Term { master: pair.master, input, killer }, keys), child, reader, writer))
     }
 
     fn pump_reader(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<Vec<u8>>) {
@@ -875,14 +891,32 @@ fn open_ai_tool(
     }
     let ai = app.state::<crate::ai::AiState>();
     let launch = crate::ai::home_launch(app, &ai, tool, terminal_id)?;
-    let mut s = shell(tool, launch.label.clone(), GROUP_AI, launch.program, &[]);
-    s.args = launch.args;
-    s.env = launch.env;
+    let label = launch.label.clone();
+    let s = ai_shell(tool, launch);
     if let Err(e) = pty::open(app, terms, terminal_id, &s, cols, rows, on_output) {
         ai.end_tab(terminal_id);
         return Err(e);
     }
-    Ok(launch.label)
+    Ok(label)
+}
+
+/// Where a shell starts: an AI tool in its own folder, the rest in your
+/// home folder.
+#[cfg(not(target_os = "android"))]
+fn start_dir(shell: &Shell, home: Option<PathBuf>) -> Option<PathBuf> {
+    shell.cwd.clone().or(home)
+}
+
+/// An AI tool's terminal: its program, with what to add to its environment
+/// and what to take out, started in its own folder.
+#[cfg(not(target_os = "android"))]
+fn ai_shell(tool: &str, launch: crate::ai::HomeLaunch) -> Shell {
+    let mut s = shell(tool, launch.label, GROUP_AI, launch.program, &[]);
+    s.args = launch.args;
+    s.env = launch.env;
+    s.env_remove = launch.env_remove;
+    s.cwd = Some(launch.cwd);
+    s
 }
 
 #[tauri::command]
@@ -977,6 +1011,61 @@ mod tests {
         let config = Config { default: None, custom: Some(here.to_string_lossy().into_owned()) };
         assert!(shells(&config, false).0.iter().any(|s| s.id == "custom"));
         assert_eq!(find_shell(&config, "custom").map(|s| s.program), Some(here));
+    }
+
+    /// What home_launch gives for an AI tool.
+    #[cfg(not(target_os = "android"))]
+    fn ai_launch() -> crate::ai::HomeLaunch {
+        crate::ai::HomeLaunch {
+            program: PathBuf::from("/bin/claude"),
+            args: vec![],
+            env: vec![("SUBMARINE_AI_TOKEN".into(), "t".into()), ("SSH_AUTH_SOCK".into(), "/dev/null".into())],
+            env_remove: crate::ai::CREDENTIAL_ENV.to_vec(),
+            cwd: PathBuf::from("/data/submarine/ai-workspace"),
+            label: "Claude".into(),
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn an_ai_tool_starts_in_its_own_folder_and_a_shell_at_home() {
+        let home = Some(PathBuf::from("/home/me"));
+        let ai = ai_shell("ai:claude", ai_launch());
+        assert_eq!(start_dir(&ai, home.clone()), Some(PathBuf::from("/data/submarine/ai-workspace")));
+        let sh = shell("t", "sh", GROUP_SYSTEM, PathBuf::from("/bin/sh"), &[]);
+        assert_eq!(start_dir(&sh, home.clone()), home);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn an_ai_tool_starts_without_your_ssh_agent_or_cloud_logins() {
+        use portable_pty::CommandBuilder;
+        let inherited = |cmd: &mut CommandBuilder| {
+            for name in crate::ai::CREDENTIAL_ENV {
+                cmd.env(name, "from-your-session");
+            }
+            cmd.env("SSH_AUTH_SOCK", "/tmp/ssh-you/agent.1");
+            cmd.env("PATH", "/usr/bin");
+        };
+        // As start_tab and home_launch give it: SSH_AUTH_SOCK points where
+        // no agent is.
+        let ai = ai_shell("ai:claude", ai_launch());
+        let mut cmd = CommandBuilder::new("claude");
+        inherited(&mut cmd);
+        pty::environment(&mut cmd, &ai);
+        for name in crate::ai::CREDENTIAL_ENV {
+            assert_eq!(cmd.get_env(name), None, "{name}");
+        }
+        assert_eq!(cmd.get_env("SSH_AUTH_SOCK").and_then(|v| v.to_str()), Some("/dev/null"));
+        assert_eq!(cmd.get_env("PATH").and_then(|v| v.to_str()), Some("/usr/bin"));
+        assert_eq!(cmd.get_env("SUBMARINE_AI_TOKEN").and_then(|v| v.to_str()), Some("t"));
+        // An ordinary shell keeps them.
+        let sh = shell("t", "sh", GROUP_SYSTEM, PathBuf::from("/bin/sh"), &[]);
+        let mut cmd = CommandBuilder::new("sh");
+        inherited(&mut cmd);
+        pty::environment(&mut cmd, &sh);
+        assert_eq!(cmd.get_env("SSH_AUTH_SOCK").and_then(|v| v.to_str()), Some("/tmp/ssh-you/agent.1"));
+        assert_eq!(cmd.get_env("SSH_AGENT_PID").and_then(|v| v.to_str()), Some("from-your-session"));
     }
 
     #[cfg(unix)]
