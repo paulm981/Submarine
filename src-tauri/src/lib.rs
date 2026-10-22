@@ -2931,7 +2931,7 @@ async fn import_shared_profile(
     // and nowhere else.
     let opened = {
         use tauri::Manager as _;
-        match setup_master_db_inner(app.clone(), VaultSecret::Password(vault_password), app.state::<DbState>(), true).await {
+        match setup_master_db_with(app.clone(), VaultSecret::Password(vault_password), app.state::<DbState>(), true, true).await {
             Ok(generation) => generation,
             Err(e) => {
                 discard_half_built_profile(&app, &local_name, None);
@@ -2999,9 +2999,18 @@ async fn import_shared_profile(
 /// `opened` is the generation the half-built profile was opened at (None when
 /// opening it is what failed). If another profile has been opened since, that
 /// one stays open; only the half-built file goes.
+///
+/// Only a file this call made goes: the callers open with `must_create`, so
+/// it's this call's when the profile was opened (`opened`), or when opening
+/// got as far as setting it up here (its last step, the first save, failed).
+/// A profile that another window made or opened meanwhile stays, and so does
+/// one open in another window now.
 fn discard_half_built_profile(app: &tauri::AppHandle, name: &str, opened: Option<u64>) {
     use tauri::Manager as _;
     let state = app.state::<DbState>();
+    let path = profile_path(app, name).ok();
+    let made_here = opened.is_some()
+        || path.is_some() && state.db_path.lock().ok().is_some_and(|g| g.as_ref() == path.as_ref());
     // Under the connection's lock when it can be had, as in close_profile.
     let mut conn = state.conn.lock().ok();
     let ours = opened.is_none_or(|g| state.generation_now() == g);
@@ -3017,17 +3026,26 @@ fn discard_half_built_profile(app: &tauri::AppHandle, name: &str, opened: Option
     if ours {
         if let Ok(mut g) = state.active_profile.lock() { *g = None; }
     }
-    if let Ok(p) = profile_path(app, name) {
-        // Its one-window lock (#204) goes with it, or the name would stay
-        // "open in another window" in this one until it quit.
-        if let Ok(mut held) = state.profile_lock.lock() {
-            if held.as_ref().is_some_and(|(locked, _)| *locked == p) {
-                *held = None;
-            }
-        }
-        let _ = fs::remove_file(p.with_extension("submarine.lock"));
-        let _ = fs::remove_file(p);
-    }
+    let Some(p) = path.filter(|_| made_here) else { return };
+    let lock_path = p.with_extension("submarine.lock");
+    // Its one-window lock (#204) goes with it, or the name would stay "open in
+    // another window" in this one until it quit. Not held here any more
+    // (another profile opened here since): only when no other window has it.
+    let ours = state
+        .profile_lock
+        .lock()
+        .ok()
+        .and_then(|mut held| if held.as_ref().is_some_and(|(locked, _)| *locked == p) { held.take() } else { None });
+    let lock = match ours {
+        Some((_, file)) => ProfileLock::New(file),
+        None => match try_lock_file(&lock_path) {
+            Ok(lock) => lock,
+            Err(_) => return,
+        },
+    };
+    let _ = fs::remove_file(&p);
+    drop(lock);
+    let _ = fs::remove_file(lock_path);
 }
 
 /// New device: restore one of YOUR OWN personal cloud profiles using nothing but
@@ -3090,7 +3108,7 @@ async fn restore_personal_profile(
         use tauri::Manager as _;
         // No strength floor here: the escrow above already proved this is the
         // profile's real password. A pre-existing short one must still restore.
-        match setup_master_db_inner(app.clone(), VaultSecret::Password(vault_password), app.state::<DbState>(), false).await {
+        match setup_master_db_with(app.clone(), VaultSecret::Password(vault_password), app.state::<DbState>(), false, true).await {
             Ok(generation) => generation,
             Err(e) => {
                 discard_half_built_profile(&app, &local_name, None);
@@ -5934,6 +5952,21 @@ async fn setup_master_db_inner(
     state: tauri::State<'_, DbState>,
     enforce_strength: bool,
 ) -> Result<u64, String> {
+    setup_master_db_with(app_handle, secret, state, enforce_strength, false).await
+}
+
+/// `setup_master_db_inner`, and with `must_create` only for a profile that
+/// isn't there yet: one that appeared since the caller looked (another window
+/// made or restored it) is refused once this window holds its lock, so a
+/// restore or import that then fails never removes a profile it didn't make
+/// (`discard_half_built_profile`).
+async fn setup_master_db_with(
+    app_handle: tauri::AppHandle,
+    secret: VaultSecret,
+    state: tauri::State<'_, DbState>,
+    enforce_strength: bool,
+    must_create: bool,
+) -> Result<u64, String> {
     let (mut password, known_key) = match secret {
         VaultSecret::Password(p) => (p, None),
         VaultSecret::Key(k) => (String::new(), Some(k)),
@@ -5955,6 +5988,9 @@ async fn setup_master_db_inner(
     // Before anything is read: another window on this profile stops it here.
     // If the password turns out wrong the lock is let go with this function.
     let profile_lock = lock_profile(&state, &path)?;
+    if must_create && path.exists() {
+        return Err(format!("Profile '{}' already exists", profile_name));
+    }
     let mut conn;
     let salt_bytes: [u8; SALT_LEN];
     // Wrap the derived AES key so it's wiped on every early-return path
