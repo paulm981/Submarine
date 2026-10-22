@@ -281,7 +281,7 @@ const CloudPanel = ({ isOpen, onClose, onLocalProfilesChanged }: Props) => {
       resetForms();
       setStage("chooser");
       setSignedInEmail(null);
-      setInfo("Your account and everything the server held for it were deleted. The profiles on this device are untouched.");
+      setInfo("Your Submarine Cloud account and everything the server held for it were deleted. The profiles on this computer, and sync through your own folder or git repository, are untouched.");
       onLocalProfilesChanged();
     } catch (e: any) {
       setError(String(e));
@@ -688,17 +688,18 @@ const CloudPanel = ({ isOpen, onClose, onLocalProfilesChanged }: Props) => {
                     onClick={() => { setConfirmDelete(true); setError(null); }}
                     className="text-[11.5px] text-zinc-500 hover:text-rose-300 underline underline-offset-2 flex items-center gap-1.5"
                   >
-                    <Trash2 size={11} /> Delete account…
+                    <Trash2 size={11} /> Delete Submarine Cloud account…
                   </button>
                 ) : (
-                  <div role="group" aria-label="Delete this account" className="rounded-lg border border-rose-500/30 bg-rose-500/5 p-3 space-y-2.5">
-                    <div className="text-[12px] font-bold text-rose-200">Delete this account?</div>
+                  <div role="group" aria-label="Delete this Submarine Cloud account" className="rounded-lg border border-rose-500/30 bg-rose-500/5 p-3 space-y-2.5">
+                    <div className="text-[12px] font-bold text-rose-200">Delete this Submarine Cloud account?</div>
                     <p className="text-[11.5px] text-zinc-300 leading-relaxed">
                       This deletes <span className="font-mono">{signedInEmail}</span>
                       {serverView ? <> on <span className="font-mono">{hostOf(serverView.server)}</span></> : null} and
                       everything stored for it there: the cloud copies of your profiles, your sharing key, and every
-                      profile you shared (the people you shared it with lose access). The profiles on your devices are
-                      not touched. This can't be undone.
+                      profile you shared (the people you shared it with lose access). Only this cloud account goes: the
+                      profiles on your computers, and sync through your own folder or git repository, are not
+                      touched. This can't be undone.
                     </p>
                     <input
                       type="password"

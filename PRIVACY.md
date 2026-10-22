@@ -1,5 +1,13 @@
 # Privacy policy
 
+> **In this fork.** This is the original project's policy, and it holds for [paulm981/Submarine](https://github.com/paulm981/Submarine) too, with these differences:
+>
+> - **Submarine Cloud is off** unless you turn it on in Settings. While it's off, the app never contacts the sync service. When it's on, the sections below about the sync service apply; that service is run by the original project's author, not by this fork.
+> - **Sync through your own storage** sends your profiles, encrypted with their password, only to the folder or git repository you pick. No one else's server is involved.
+> - **Looking for updates** asks GitHub about this fork's releases. With **Watch the original project** on, it also asks GitHub how far the original project is ahead.
+> - **A log file** stays on your computer, in the app's log folder: what the app did, and when AI tools are on, what they asked for. It leaves your computer only if you send it, and **Copy diagnostics** replaces server, user and host names first.
+> - **Questions about this fork** go to [its issues](https://github.com/paulm981/Submarine/issues).
+
 *Last updated: 21 October 2026.*
 
 This policy covers the Submarine app (Windows, macOS, Linux, Android and iOS), the optional Submarine sync service that the app can use, and the website [submarine.sinaxhpm.com](https://submarine.sinaxhpm.com). It is also published, with translations, at [submarine.sinaxhpm.com/privacy/](https://submarine.sinaxhpm.com/privacy/).
