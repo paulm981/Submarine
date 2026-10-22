@@ -29,6 +29,12 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - **Deleting a profile deletes the copies a sync kept of it too**, the `<name>.submarine.bak-<time>` files next to it. They hold the same servers, logins and keys. ([#95](https://github.com/paulm981/Submarine/issues/95))
 - **A forward you stopped stays stopped until you start it.** In a shared profile, someone else starting it again now waits for your OK, like a forward they add. A forward that arrives stopped doesn't need your OK, since it runs nothing. ([#95](https://github.com/paulm981/Submarine/issues/95))
 - **A token given as the user name in a git address** (`https://TOKEN@host/…`) is no longer on git's command line, where other users of the computer could read it. It's handed to git the way a password in the address already is. ([#95](https://github.com/paulm981/Submarine/issues/95))
+- **Root with `dzdo su -` or `sudo su -` that asks for your password.** Where sudo or dzdo lets you in only through a root shell, and wants your password for it, the app now gets root that way once you enter it: in SFTP root mode, the Info panel and the Docker tab. ([#96](https://github.com/paulm981/Submarine/issues/96))
+- **Root works when your login shell is csh or tcsh.** SFTP root mode, the Info panel's actions and Docker as root used to fail on such accounts. ([#96](https://github.com/paulm981/Submarine/issues/96))
+- **A root password that stopped working is tried once, then asked for again.** The app forgets it for the whole tab, SFTP root mode included, instead of trying it on every action and parallel Docker call, which could lock your account. Each action now signs in once, not twice. ([#96](https://github.com/paulm981/Submarine/issues/96))
+- **Your password goes only to sudo's or dzdo's own question.** A command that runs without one never gets it, whatever it prints, and a command's own output is never mistaken for sudo's answer. ([#96](https://github.com/paulm981/Submarine/issues/96))
+- **A container's terminal asks for the root password** when it needs one, as the Docker tab does, instead of showing `[SUDO] NEED_PASSWORD`. ([#96](https://github.com/paulm981/Submarine/issues/96))
+- **A server's saved password is typed only into that server's own terminals.** ([#96](https://github.com/paulm981/Submarine/issues/96))
 
 ### From the original project ([#41](https://github.com/paulm981/Submarine/issues/41))
 

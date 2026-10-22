@@ -36,14 +36,10 @@ impl DockerStreams {
 
 // ---- helpers ----------------------------------------------------------------
 
-// POSIX-safe quoting: wrap in single quotes, escape internal single quotes.
-// Works on the typical Linux/macOS docker host. Windows servers running
-// docker almost always use WSL2 (POSIX), so this is the right default.
-// `pub(crate)` — lib.rs's `open_terminal` reuses it to quote a shell path
-// for the "use my default shell" setting rather than duplicate the escaping.
-pub(crate) fn shq(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\"'\"'"))
-}
+// POSIX-safe quoting (remote_sh::quote). Works on the typical Linux/macOS
+// docker host. Windows servers running docker almost always use WSL2
+// (POSIX), so this is the right default.
+use crate::remote_sh::quote as shq;
 
 // Validate a docker object name (container/image/volume/network/project).
 // Docker's accepted character set is roughly [a-zA-Z0-9_.-], plus colon
@@ -100,7 +96,9 @@ async fn run_capture(
             .await
             .map_err(|e| e.to_string())?
     };
-    let wrapped = format!("{}\necho __DOCK_EXIT:$?", cmd);
+    // Run by sh whatever the login shell is: csh and tcsh read `2>&1` and
+    // `$?` their own way (remote_sh).
+    let wrapped = crate::remote_sh::sh_command(&[], &format!("{}\necho __DOCK_EXIT:$?", cmd), &[]);
     channel
         .exec(true, wrapped.as_bytes())
         .await
@@ -599,10 +597,12 @@ pub async fn ssh_docker_logs_start(
         let (code, out) = run_capture(&state, &session_id, &probe, 10).await.unwrap_or((1, String::new()));
         as_root = code != 0 && daemon_refused(&out);
     }
-    let (channel, marker) = if as_root {
-        let (channel, marker, _) = crate::root_channel(&state, &session_id, &args, password, None).await?;
+    // `early`: what the logs already said while sudo's answer to the
+    // password was waited for (root_channel).
+    let (channel, marker, early) = if as_root {
+        let (channel, marker, early) = crate::root_channel(&state, &session_id, &args, password, None).await?;
         state.docker_root.lock().await.insert(session_id.clone());
-        (channel, marker)
+        (channel, marker, early)
     } else {
         let session_arc = {
             let connections = state.connections.lock().await;
@@ -618,12 +618,12 @@ pub async fn ssh_docker_logs_start(
                 .await
                 .map_err(|e| e.to_string())?
         };
-        let cmd = format!("{} 2>&1", Cmd::Docker(args).shell());
+        let cmd = crate::remote_sh::sh_command(&[], &format!("{} 2>&1", Cmd::Docker(args).shell()), &[]);
         channel
             .exec(true, cmd.as_bytes())
             .await
             .map_err(|e| e.to_string())?;
-        (channel, None)
+        (channel, None, Vec::new())
     };
     let mut stream = channel.into_stream();
 
@@ -649,7 +649,8 @@ pub async fn ssh_docker_logs_start(
         // select! never drops data.
         const FLUSH_CAP: usize = 256 * 1024;
         let mut buf = [0u8; 8192];
-        let mut out: Vec<u8> = Vec::new();
+        // Through a root shell, what came before its line isn't the logs.
+        let mut out: Vec<u8> = if marker.is_none() { early } else { Vec::new() };
         let mut flush = tokio::time::interval(std::time::Duration::from_millis(30));
         flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Emit only the complete-UTF-8 PREFIX per streaming flush and KEEP any
@@ -778,6 +779,7 @@ pub async fn open_container_terminal(
     cols: u32,
     rows: u32,
     use_sudo: bool,
+    password: Option<String>,
     on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Result<(), String> {
     use crate::ssh_manager::TerminalCommand;
@@ -793,9 +795,10 @@ pub async fn open_container_terminal(
         unreachable!()
     };
     // As root as this tab's other docker commands are (run_docker_smart).
-    let as_root = use_sudo || state.docker_root.lock().await.contains(&session_id);
+    // `password`: the page asked for it when root wanted one (rootInvoke).
+    let as_root = use_sudo || password.is_some() || state.docker_root.lock().await.contains(&session_id);
     let (channel, early) = if as_root {
-        let (channel, _, early) = crate::root_channel(&state, &session_id, &args, None, Some((cols, rows))).await?;
+        let (channel, _, early) = crate::root_channel(&state, &session_id, &args, password, Some((cols, rows))).await?;
         (channel, early)
     } else {
         let session_arc = {

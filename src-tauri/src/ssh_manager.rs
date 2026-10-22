@@ -414,6 +414,12 @@ pub struct SshState {
     /// group): the Docker tab's commands go straight to root there
     /// (docker.rs). Dropped when the tab closes, like `root_access`.
     pub docker_root: Arc<Mutex<HashSet<String>>>,
+    /// The saved server each session was opened for (initiate_connection,
+    /// telnet_connect), and the server of each of its shell terminals: a
+    /// server's own saved password is typed only into that server's
+    /// terminals (type_saved_password).
+    pub session_servers: Arc<Mutex<HashMap<String, i32>>>,
+    pub terminal_servers: Arc<Mutex<HashMap<String, i32>>>,
     /// Tabs whose cached SFTP session is file access over shell commands (the
     /// server has no SFTP, see `shell_sftp`): the pane says so.
     pub sftp_shell: Arc<Mutex<HashSet<String>>>,
@@ -437,6 +443,22 @@ pub struct RootAccess {
     /// the command on its stdin, where the tool's rules allow only that.
     /// `None` = the tool runs the command itself.
     pub shell: Option<&'static str>,
+    /// When the password last worked. Held while one not known to work
+    /// lately is tried, so the tab's other calls wait for that answer
+    /// instead of each signing in with a password that may have stopped
+    /// working (lib.rs, password_turn).
+    pub checked: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
+}
+
+impl RootAccess {
+    pub fn new(
+        tool: &'static str,
+        password: Option<zeroize::Zeroizing<String>>,
+        shell: Option<&'static str>,
+        checked: Option<std::time::Instant>,
+    ) -> Self {
+        RootAccess { tool, password, shell, checked: Arc::new(tokio::sync::Mutex::new(checked)) }
+    }
 }
 
 /// How an elevated SFTP channel is started. The sudo password (if any) lives
@@ -455,6 +477,10 @@ pub struct SftpElevation {
     pub password: Option<zeroize::Zeroizing<String>>,
     /// Through a root shell, as for RootAccess.
     pub shell: Option<&'static str>,
+    /// The password stopped working (sudo or dzdo said so): it isn't tried
+    /// again, and root mode says so until it's turned on again with the
+    /// password.
+    pub password_failed: bool,
 }
 
 /// Connect-time secrets the user typed when a saved node / login / key had none
@@ -501,6 +527,8 @@ impl SshState {
             sftp_elevation: Arc::new(Mutex::new(HashMap::new())),
             root_access: Arc::new(Mutex::new(HashMap::new())),
             docker_root: Arc::new(Mutex::new(HashSet::new())),
+            session_servers: Arc::new(Mutex::new(HashMap::new())),
+            terminal_servers: Arc::new(Mutex::new(HashMap::new())),
             sftp_shell: Arc::new(Mutex::new(HashSet::new())),
             prompted_secrets: Arc::new(Mutex::new(HashMap::new())),
         }

@@ -14,6 +14,7 @@ import { appHotkey, markTyped, registerTerminal, terminalStateChanged } from '..
 import { noteOutput, setLooking, watchTerminal } from '../ui/terminalActivity';
 import { forgetTerminal, logLine, noteTerminalOutput, noteTerminalParsed, noteTerminalRenderer } from '../util/diagnostics';
 import { useConfirm } from '../ui/confirm';
+import { useRootInvoke } from '../ui/rootInvoke';
 import HistorySearchOverlay from './HistorySearchOverlay';
 import { DEFAULT_FONT_STACK, fontFamilyCss, readFontFamily, readFontSize } from '../util/terminalFont';
 import { MIN_CONTRAST_RATIO, readBoldBright, readGpu, readMinContrast, schemeForServer } from '../ui/terminalThemes';
@@ -124,6 +125,9 @@ const cycleMod = (s: "off" | "armed" | "locked"): "off" | "armed" | "locked" =>
 // it is given, so each of those left the screen garbled and the cursor out
 // of place.
 const PTY_SIZE_SETTLE_MS = 150;
+
+// A container's terminal that needed root, and the password wasn't given.
+const ROOT_CANCELLED = '\x1b[33mThis container\'s terminal needs root on the server. Close this tab and open it again to enter the password.\x1b[0m';
 
 const TerminalView = ({
   sessionId,
@@ -335,6 +339,8 @@ const TerminalView = ({
   // The app's confirm dialog, for the terminal's long-lived handlers (links,
   // multi-line paste), which would otherwise see a stale function.
   const confirm = useConfirm();
+  // A container's terminal may need root (open_container_terminal).
+  const rootInvoke = useRootInvoke();
   const confirmRef = useRef(confirm);
   confirmRef.current = confirm;
   // The terminal's input handler (what xterm's onData runs), for keys that
@@ -444,7 +450,8 @@ const TerminalView = ({
         term.writeln(`\x1b[31mReconnect failed: ${e}\x1b[0m`);
       });
     } else if (ce) {
-      invoke('open_container_terminal', {
+      // Through root, asking for the password when sudo or dzdo wants one.
+      rootInvoke<void>('open_container_terminal', {
         sessionId,
         terminalId,
         container: ce.container,
@@ -452,8 +459,11 @@ const TerminalView = ({
         rows: term.rows || 24,
         useSudo: ce.useSudo,
         onOutput: outputChannel(),
-      }).then(() => { syncSize(); opened(); }, e => {
-        term.writeln(`\x1b[31mReconnect into container failed: ${e}\x1b[0m`);
+      }, 'Open the container terminal').then((r) => {
+        if (r === null) { term.writeln(ROOT_CANCELLED); return; }
+        syncSize(); opened();
+      }, e => {
+        term.writeln(`\x1b[31mReconnect into container failed: ${e instanceof Error ? e.message : e}\x1b[0m`);
       });
     } else {
       invoke('open_terminal', {
@@ -670,8 +680,11 @@ const TerminalView = ({
   // Which saved passwords are offered (the fork's rule, FORK.md): this
   // server's own password and the saved login it uses, when the prompt asks
   // for their user or names nobody (su); another saved login only when the
-  // prompt names its user. So a prompt a server prints can't fish for the
-  // password of a login it has nothing to do with.
+  // prompt names its user. So the text of a prompt can't get the menu to
+  // offer a login's password the prompt has nothing to do with; the user
+  // still picks what's typed. The backend also types a server's own password
+  // only into that server's own terminals (type_saved_password); a saved
+  // login's goes where the user picks it.
   const openPasswordMenu = async () => {
     try {
       const [servers, logins] = await Promise.all([
@@ -891,7 +904,8 @@ const TerminalView = ({
             term.writeln(`\x1b[31mCouldn't start the shell: ${e}\x1b[0m`);
           });
         } else if (containerExec) {
-          invoke('open_container_terminal', {
+          // Through root, asking for the password when sudo or dzdo wants one.
+          rootInvoke<void>('open_container_terminal', {
             sessionId,
             terminalId,
             container: containerExec.container,
@@ -899,8 +913,11 @@ const TerminalView = ({
             rows: term.rows || 24,
             useSudo: containerExec.useSudo,
             onOutput: outputChannel(),
-          }).then(() => { syncSize(); opened(); }, e => {
-            term.writeln(`\x1b[31mFailed to attach to container: ${e}\x1b[0m`);
+          }, 'Open the container terminal').then((r) => {
+            if (r === null) { term.writeln(ROOT_CANCELLED); return; }
+            syncSize(); opened();
+          }, e => {
+            term.writeln(`\x1b[31mFailed to attach to container: ${e instanceof Error ? e.message : e}\x1b[0m`);
           });
         } else {
           invoke('open_terminal', {
