@@ -1198,23 +1198,36 @@ impl ShellSftp {
         }
     }
 
-    async fn set_attrs(&mut self, path: &str, attrs: &FileAttributes) -> Result<(), StatusReply> {
+    /// SETSTAT, or with `still` FSETSTAT. SFTP's FSETSTAT changes the open
+    /// file itself, but here there is only its path, and chown, chmod and
+    /// touch follow a link put in its place since it was opened: another
+    /// user who can write in the folder could point it at a file of the
+    /// caller's (a key made readable to all) or, for root, at a system file.
+    /// So for a handle, `still` is the test the path must pass (a regular
+    /// file, or a folder, and not a link), made again right before each
+    /// change, and chown and chgrp change a link itself (`-h`). What's left is
+    /// the moment between a test and its change; real SFTP has no such gap.
+    async fn set_attrs(&mut self, path: &str, attrs: &FileAttributes, still: Option<&str>) -> Result<(), StatusReply> {
         if attrs.size.is_some() {
             return Err(status(StatusCode::OpUnsupported, "Changing a file's size isn't possible without SFTP"));
         }
         let p = qpath(path);
         let mut s = format!("p={p}\n[ -e \"$p\" ] || [ -L \"$p\" ] || nf \"$p\"\n");
+        let (check, h) = match still {
+            Some(test) => (format!("{test} && [ ! -L \"$p\" ] || exit 1\n"), "-h "),
+            None => (String::new(), ""),
+        };
         match (attrs.uid, attrs.gid) {
-            (Some(u), Some(g)) => s += &format!("chown {u}:{g} \"$p\" || exit 1\n"),
-            (Some(u), None) => s += &format!("chown {u} \"$p\" || exit 1\n"),
-            (None, Some(g)) => s += &format!("chgrp {g} \"$p\" || exit 1\n"),
+            (Some(u), Some(g)) => s += &format!("{check}chown {h}{u}:{g} \"$p\" || exit 1\n"),
+            (Some(u), None) => s += &format!("{check}chown {h}{u} \"$p\" || exit 1\n"),
+            (None, Some(g)) => s += &format!("{check}chgrp {h}{g} \"$p\" || exit 1\n"),
             (None, None) => {}
         }
         if let Some(m) = attrs.permissions {
-            s += &format!("chmod {:o} \"$p\" || exit 1\n", m & 0o7777);
+            s += &format!("{check}chmod {:o} \"$p\" || exit 1\n", m & 0o7777);
         }
         if let Some(t) = attrs.mtime {
-            s += &format!("TZ=UTC0 touch -t {} \"$p\" || exit 1\n", touch_stamp(t));
+            s += &format!("{check}TZ=UTC0 touch -t {} \"$p\" || exit 1\n", touch_stamp(t));
         }
         self.changed();
         self.remote.ok(&s, 64 * 1024, QUICK).await.map(|_| ())
@@ -1319,13 +1332,18 @@ impl russh_sftp::server::Handler for ShellSftp {
 
     async fn setstat(&mut self, id: u32, path: String, attrs: FileAttributes) -> Result<Status, StatusReply> {
         check_path(&path)?;
-        self.set_attrs(&path, &attrs).await?;
+        self.set_attrs(&path, &attrs, None).await?;
         Ok(ok_status(id))
     }
 
     async fn fsetstat(&mut self, id: u32, handle: String, attrs: FileAttributes) -> Result<Status, StatusReply> {
         let path = self.handle_path(&handle)?;
-        self.set_attrs(&path, &attrs).await?;
+        // Still what was opened, as far as a path can tell (set_attrs).
+        let still = match self.handles.get(&handle) {
+            Some(Open::Dir { .. }) => "[ -d \"$p\" ]",
+            _ => "[ -f \"$p\" ]",
+        };
+        self.set_attrs(&path, &attrs, Some(still)).await?;
         Ok(ok_status(id))
     }
 

@@ -304,24 +304,21 @@ async fn sftp_upload_file(sftp: &SftpSession, local: &Path, remote: &str) -> Res
             sftp_mkdir_p(sftp, &pstr).await?;
         }
     }
-    let existing = sftp.metadata(remote).await.ok();
+    // The file there itself, not what a link leads to (lstat): someone who
+    // can write in the folder could put a link to a setuid program there.
+    // Only a regular file's permissions and owner are taken over.
+    let existing = sftp.symlink_metadata(remote).await.ok().filter(is_plain_file);
     let mode = match &existing {
-        Some(a) => a.permissions.map(|p| p & 0o7777),
+        Some(a) => a.permissions.map(pushed_mode),
         None => tokio::fs::metadata(local).await.ok().and_then(|m| shell_sync_local_mode(&m)),
     };
     let tmp = format!("{}.submarine-tmp", remote);
-    sftp_stream_file(sftp, local, &tmp, FileAttributes { permissions: mode, ..FileAttributes::empty() }).await?;
-    // Owner first: a change of owner can clear the setuid and setgid bits,
-    // which the mode below puts back. Both are best effort. Creating it went
-    // through the server's umask, so it is no more open than `mode` already;
-    // the mode makes it exact.
-    if let Some((uid, gid)) = existing.as_ref().and_then(|a| Some((a.uid?, a.gid?))) {
-        let owner = FileAttributes { uid: Some(uid), gid: Some(gid), ..FileAttributes::empty() };
-        let _ = sftp.set_metadata(tmp.as_str(), owner).await;
-    }
-    if let Some(m) = mode {
-        let _ = sftp.set_metadata(tmp.as_str(), FileAttributes { permissions: Some(m), ..FileAttributes::empty() }).await;
-    }
+    let settle = Settle {
+        owner: existing.as_ref().and_then(|a| Some((a.uid?, a.gid?))),
+        mode,
+        mode_required: false,
+    };
+    sftp_stream_file(sftp, local, &tmp, FileAttributes { permissions: mode, ..FileAttributes::empty() }, settle).await?;
     // Rename over the destination. On POSIX SFTP servers `sftp.rename` errors
     // if the destination already exists, so we unlink the previous copy first.
     // The lost-atomicity window here (destination missing between remove and
@@ -333,10 +330,39 @@ async fn sftp_upload_file(sftp: &SftpSession, local: &Path, remote: &str) -> Res
     Ok(())
 }
 
+/// Whether attributes are a regular file's. russh-sftp's `is_regular` only
+/// asks whether the regular-file bit is among the type bits, which a link's
+/// type (0o120000) and a socket's (0o140000) also have.
+fn is_plain_file(attrs: &FileAttributes) -> bool {
+    attrs.permissions.is_some_and(|p| p & 0o170000 == 0o100000)
+}
+
+/// The permissions a pushed file takes over from the one it replaces:
+/// without setuid and setgid, which would run it as whoever owned the old
+/// file.
+fn pushed_mode(old: u32) -> u32 {
+    old & 0o1777
+}
+
+/// What a pushed file is given before it's closed, through its open handle
+/// (FSETSTAT), never by path: by the time the upload ends, a link to
+/// another file can be in the temporary file's place, and a change by path
+/// would land on that file.
+#[derive(Clone, Copy, Default)]
+struct Settle {
+    /// The replaced file's owner and group; best effort.
+    owner: Option<(u32, u32)>,
+    /// The exact permissions. Creating the file went through the server's
+    /// umask, so it's no more open than this already.
+    mode: Option<u32>,
+    /// Whether failing to set `mode` fails the upload.
+    mode_required: bool,
+}
+
 /// Stream `local` into a new remote file `tmp`, created with `attrs` (none,
-/// or just the permissions), for the caller to rename into place. A partial
-/// file is removed again on an error.
-async fn sftp_stream_file(sftp: &SftpSession, local: &Path, tmp: &str, attrs: FileAttributes) -> Result<(), String> {
+/// or just the permissions), and give it `settle` before it's closed, for the
+/// caller to rename into place. A partial file is removed again on an error.
+async fn sftp_stream_file(sftp: &SftpSession, local: &Path, tmp: &str, attrs: FileAttributes, settle: Settle) -> Result<(), String> {
     let mut f = tokio::fs::File::open(local).await
         .map_err(|e| format!("can't read {}: {}", crate::display_path(local), e))?;
     // A refusal names the folder: the temporary file is ours, the folder is
@@ -362,6 +388,18 @@ async fn sftp_stream_file(sftp: &SftpSession, local: &Path, tmp: &str, attrs: Fi
         }
         // Flush + close errors are real (bytes may not have landed) — propagate.
         handle.flush().await.map_err(|e| format!("the upload broke off: {}", e))?;
+        // Owner first: a change of owner can clear the setuid and setgid
+        // bits, and the mode is set after it.
+        if let Some((uid, gid)) = settle.owner {
+            let _ = handle.set_metadata(FileAttributes { uid: Some(uid), gid: Some(gid), ..FileAttributes::empty() }).await;
+        }
+        if let Some(m) = settle.mode {
+            if let Err(e) = handle.set_metadata(FileAttributes { permissions: Some(m), ..FileAttributes::empty() }).await {
+                if settle.mode_required {
+                    return Err(format!("couldn't give it the permissions {:o}: {}", m, sftp_reason(&e)));
+                }
+            }
+        }
         handle.shutdown().await.map_err(|e| format!("the upload broke off: {}", e))?;
         Ok(())
     }.await;
@@ -999,7 +1037,7 @@ async fn shell_sync_scan(sftp: &SftpSession, targets: &[ShellSyncTarget]) -> Res
                 None => "new",
                 Some(a) if a.is_symlink() => "skip-link",
                 Some(a) if a.is_dir() => "skip-folder",
-                Some(a) if a.permissions.is_some() && !a.is_regular() => "skip-other",
+                Some(a) if a.permissions.is_some() && !is_plain_file(a) => "skip-other",
                 Some(a) => match compare_files(sftp, &local, &remote, &meta, a).await? {
                     CompareResult::Identical => continue,
                     CompareResult::LocalNewer => "update",
@@ -1039,7 +1077,7 @@ async fn shell_sync_put(sftp: &SftpSession, item: &ShellSyncItem, backup_root: &
         }
     }
     let mode = match &item.existing {
-        Some(a) => a.permissions.map(|p| p & 0o7777),
+        Some(a) => a.permissions.map(pushed_mode),
         None => {
             let meta = tokio::fs::metadata(&item.local).await
                 .map_err(|e| format!("{}: {}", crate::display_path(&item.local), e))?;
@@ -1048,15 +1086,8 @@ async fn shell_sync_put(sftp: &SftpSession, item: &ShellSyncItem, backup_root: &
     };
     let tmp = format!("{}.submarine-tmp", item.remote);
     let attrs = FileAttributes { permissions: mode, ..FileAttributes::empty() };
-    sftp_stream_file(sftp, &item.local, &tmp, attrs).await?;
-    // Creating it went through the server's umask: set the exact mode.
-    if let Some(m) = mode {
-        let attrs = FileAttributes { permissions: Some(m), ..FileAttributes::empty() };
-        if let Err(e) = sftp.set_metadata(tmp.as_str(), attrs).await {
-            let _ = sftp.remove_file(tmp.as_str()).await;
-            return Err(format!("couldn't give it the permissions {:o}: {}", m, sftp_reason(&e)));
-        }
-    }
+    // The exact mode is set through the open file (Settle), not by path.
+    sftp_stream_file(sftp, &item.local, &tmp, attrs, Settle { owner: None, mode, mode_required: true }).await?;
     if item.existing.is_none() {
         // Refused if something turned up there since the scan, which is then
         // left as it is.
@@ -1865,6 +1896,59 @@ mod tests {
         assert_eq!(mode(&remote.join("fresh.sh")), 0o750);
         assert!(!root.join("victim").exists(), "nothing written through the link");
         assert!(std::fs::symlink_metadata(remote.join("secret.submarine-tmp")).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Nothing is taken over from what a link leads to, setuid and setgid
+    /// never are, and the permissions are set through the open file: a link
+    /// put in the temporary file's place doesn't get them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_push_gives_nothing_to_a_link_and_takes_no_setuid() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("submarine-mirror-push-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("local")).unwrap();
+        std::fs::create_dir_all(root.join("remote")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let (local, remote) = (root.join("local"), root.join("remote"));
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let set = |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        // The server's copy is a link to a setuid program elsewhere.
+        std::fs::write(root.join("program"), "elf").unwrap();
+        set(&root.join("program"), 0o4755);
+        std::os::unix::fs::symlink(root.join("program"), remote.join("tool")).unwrap();
+        // And a setuid file of its own.
+        std::fs::write(remote.join("helper"), "old").unwrap();
+        set(&remote.join("helper"), 0o4750);
+        for name in ["tool", "helper"] {
+            std::fs::write(local.join(name), "new").unwrap();
+            set(&local.join(name), 0o640);
+        }
+        let sftp = crate::shell_sftp::test_session(&root).await;
+        sftp_upload_file(&sftp, &local.join("tool"), remote.join("tool").to_str().unwrap()).await.unwrap();
+        assert_eq!(mode(&remote.join("tool")), 0o640, "the local file's, not the link target's");
+        assert_eq!(mode(&root.join("program")), 0o4755, "the program is left alone");
+        assert_eq!(std::fs::read_to_string(root.join("program")).unwrap(), "elf");
+        sftp_upload_file(&sftp, &local.join("helper"), remote.join("helper").to_str().unwrap()).await.unwrap();
+        assert_eq!(mode(&remote.join("helper")), 0o750, "setuid isn't taken over");
+
+        // A link swapped in for the open temporary file doesn't get the mode.
+        std::fs::write(root.join("key"), "secret").unwrap();
+        set(&root.join("key"), 0o600);
+        let tmp = remote.join("x.submarine-tmp");
+        let file = sftp
+            .open_with_flags(tmp.to_str().unwrap(), OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE)
+            .await
+            .unwrap();
+        std::fs::remove_file(&tmp).unwrap();
+        std::os::unix::fs::symlink(root.join("key"), &tmp).unwrap();
+        let _ = file.set_metadata(FileAttributes { permissions: Some(0o666), ..FileAttributes::empty() }).await;
+        let _ = file.set_metadata(FileAttributes { uid: Some(1), gid: Some(1), ..FileAttributes::empty() }).await;
+        assert_eq!(mode(&root.join("key")), 0o600, "the key's permissions are its own");
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(std::fs::metadata(root.join("key")).unwrap().uid(), 1, "and so is its owner");
+        drop(file);
         let _ = std::fs::remove_dir_all(&root);
     }
     use russh_sftp::protocol::{Attrs, Status};
