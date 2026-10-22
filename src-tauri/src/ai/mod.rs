@@ -10,8 +10,15 @@
 //!
 //! - **Off by default** (Settings › AI tools). Off, nothing listens, Home
 //!   lists no AI tools, and turning it off ends every AI tab's access.
-//! - **Each AI tab has its own token,** in its tool's environment only.
-//!   Servers are shared with one AI tab, checked on every request.
+//! - **Each AI tab has its own token,** in its tool's environment only,
+//!   and one connection at a time: another with its token is refused, and
+//!   the panel warns. Servers are shared with one AI tab, checked on every
+//!   request.
+//! - **Not kept apart from a hostile program running as you,** which can
+//!   read the token from the tool's environment, edit the audit log, or
+//!   click for you. The helper checks it reaches the app's own process
+//!   (channel.rs), so such a program can't stand in for the app; the rest
+//!   is FORK.md's advice to run the AI tool in its sandbox.
 //! - **Access ends** when the AI tab closes, when the server's tab closes or
 //!   reconnects, when you stop sharing, or when Submarine quits; anything
 //!   still waiting for approval is cancelled and anything running stopped,
@@ -63,8 +70,15 @@ const MAX_WAITING: usize = 3;
 /// 1 MB, and may ask, withdraw and ask again without you allowing anything.
 const MAX_LOGGED_COMMAND: usize = 4 * 1024;
 const MAX_LOGGED_NAME: usize = 256;
+/// And of a note (why it was refused, an error), which may quote either.
+const MAX_LOGGED_NOTE: usize = 2 * 1024;
 /// Finished requests the panel keeps.
 const HISTORY: usize = 20;
+/// How long a second connection for an AI tab waits for the first to end
+/// before it's refused: Claude Code reconnecting (`/mcp`) ends its old
+/// helper and starts a new one, which may connect a moment before the app
+/// has seen the old connection close.
+const RECONNECT_GRACE: Duration = Duration::from_secs(5);
 /// The panel's event.
 const CHANGED: &str = "ai-changed";
 
@@ -99,6 +113,10 @@ struct Tab {
     rate_logged: Option<Instant>,
     /// Set when its access ends: its connections close.
     closed: watch::Sender<bool>,
+    /// The number of its one live connection, 0 for none.
+    live: watch::Sender<u64>,
+    /// When another connection with its token was refused, for the panel.
+    intruder_at: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -139,11 +157,11 @@ struct Running {
     stop: watch::Sender<bool>,
 }
 
-/// A finished request, for the panel: everything you see, and what the AI
-/// was given. The outputs are fetched one at a time (`ai_output`), when you
-/// open the row, not sent with every change.
+/// A finished request's row in the panel. Its outputs are kept beside it
+/// (`Done`) and fetched one at a time (`ai_output`), when you open the row:
+/// not sent, or copied, with every change.
 #[derive(Serialize, Clone)]
-struct Done {
+struct DoneView {
     id: u64,
     tab_label: String,
     server: String,
@@ -152,12 +170,6 @@ struct Done {
     /// denied, cancelled, done, failed, stopped.
     outcome: &'static str,
     exit_code: Option<i64>,
-    /// The whole output, up to OUTPUT_CAP.
-    #[serde(skip)]
-    output: String,
-    /// What the AI got.
-    #[serde(skip)]
-    ai_output: String,
     output_bytes: usize,
     hidden: usize,
     cut: bool,
@@ -166,11 +178,23 @@ struct Done {
     at: String,
 }
 
+/// A finished request: its row, everything you see, and what the AI was
+/// given.
+struct Done {
+    view: DoneView,
+    /// The whole output, up to OUTPUT_CAP. Wiped when it's dropped.
+    output: Zeroizing<String>,
+    /// What the AI got.
+    ai_output: Zeroizing<String>,
+}
+
 #[derive(Serialize, Clone)]
 struct TabView {
     id: String,
     label: String,
     servers: Vec<SharedServer>,
+    /// When another program tried to connect as this AI tab, if one did.
+    intruder_at: Option<String>,
 }
 
 /// The AI panel's view of everything.
@@ -180,7 +204,7 @@ pub(crate) struct Snapshot {
     tabs: Vec<TabView>,
     pending: Vec<PendingView>,
     running: Vec<RunningView>,
-    history: Vec<Done>,
+    history: Vec<DoneView>,
     audit_log: Option<String>,
 }
 
@@ -192,6 +216,12 @@ struct Shared {
     running: Vec<Running>,
     history: VecDeque<Done>,
     next_id: u64,
+    /// Numbers the live connections (Tab::live).
+    next_conn: u64,
+    /// Counts the times the history was cleared: a request remembers its
+    /// row only in the history it was asked in, so one that ends after the
+    /// profile locked doesn't bring the old profile's output back.
+    epoch: u64,
 }
 
 struct Inner {
@@ -204,6 +234,38 @@ struct Inner {
 
 #[derive(Clone)]
 pub struct AiState(Arc<Inner>);
+
+/// What a connection gets as it asks for its AI tab (AiState::claim).
+enum Claim {
+    Got(Live),
+    /// Another connection has it, and kept it past RECONNECT_GRACE.
+    Taken,
+    /// The tab's access has ended.
+    Gone,
+}
+
+/// An AI tab's one live connection: dropped, the tab may take another.
+struct Live {
+    state: AiState,
+    tab_id: String,
+    conn: u64,
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        let s = self.state.lock();
+        if let Some(tab) = s.tabs.iter().find(|t| t.id == self.tab_id) {
+            // Only its own: the tab may be another by the same id by now.
+            tab.live.send_if_modified(|c| {
+                let ours = *c == self.conn;
+                if ours {
+                    *c = 0;
+                }
+                ours
+            });
+        }
+    }
+}
 
 fn now() -> String {
     chrono::Local::now().to_rfc3339()
@@ -340,7 +402,16 @@ impl AiState {
         (self.0.changed)();
     }
 
-    fn audit(&self, entry: audit::Entry) {
+    /// Every line goes through here: whatever a caller put in them, the
+    /// server's name and the note are cut to their limits.
+    fn audit(&self, mut entry: audit::Entry) {
+        for (field, max) in [(&mut entry.server, MAX_LOGGED_NAME), (&mut entry.note, MAX_LOGGED_NOTE)] {
+            if let Some(text) = field.as_mut() {
+                if text.len() > max {
+                    *text = for_log(text, max);
+                }
+            }
+        }
         self.0.audit.write(&entry);
     }
 
@@ -397,7 +468,11 @@ impl AiState {
             .map(|n| if n == 1 { short.to_string() } else { format!("{short} {n}") })
             .find(|l| !s.tabs.iter().any(|t| &t.label == l))
             .unwrap();
-        let env = vec![(channel::ENV_ADDR.to_string(), addr), (channel::ENV_TOKEN.to_string(), token.to_string())];
+        let env = vec![
+            (channel::ENV_ADDR.to_string(), addr),
+            (channel::ENV_TOKEN.to_string(), token.to_string()),
+            (channel::ENV_PID.to_string(), std::process::id().to_string()),
+        ];
         s.tabs.push(Tab {
             id: id.to_string(),
             label: label.clone(),
@@ -406,6 +481,8 @@ impl AiState {
             asked: VecDeque::new(),
             rate_logged: None,
             closed: watch::channel(false).0,
+            live: watch::channel(0).0,
+            intruder_at: None,
         });
         drop(s);
         self.audit(audit::Entry::new("ai_tab_started", &label));
@@ -434,11 +511,29 @@ impl AiState {
     /// working, what it shared and asked for goes. Turning AI tools off does
     /// this, and so does locking the profile (close_profile), so nothing the
     /// profile shared outlives it. The channel itself stays as it is.
+    ///
+    /// The panel's history goes too, outputs wiped: it shows what ran on the
+    /// profile's servers, which the next profile (or whoever is at the
+    /// picker) mustn't see. First, so a request this cancels doesn't add its
+    /// row back.
     pub(crate) fn end_all_tabs(&self) {
+        self.forget_history();
         let ids: Vec<String> = self.lock().tabs.iter().map(|t| t.id.clone()).collect();
         for id in ids {
             self.end_tab(&id);
         }
+        self.changed();
+    }
+
+    /// Empty the panel's history (each output wiped as it's dropped), and
+    /// keep out rows of requests asked before now.
+    fn forget_history(&self) {
+        let gone = {
+            let mut s = self.lock();
+            s.epoch += 1;
+            std::mem::take(&mut s.history)
+        };
+        drop(gone);
     }
 
     /// The tab whose token this is, and its "access ended" signal.
@@ -455,6 +550,48 @@ impl AiState {
             }
         }
         found
+    }
+
+    /// Take the AI tab's one live connection: at once when it has none,
+    /// else once the one it has ends, within RECONNECT_GRACE.
+    async fn claim(&self, tab_id: &str) -> Claim {
+        let deadline = tokio::time::Instant::now() + RECONNECT_GRACE;
+        loop {
+            let mut live = {
+                let mut s = self.lock();
+                s.next_conn += 1;
+                let conn = s.next_conn;
+                let Some(tab) = s.tabs.iter_mut().find(|t| t.id == tab_id) else { return Claim::Gone };
+                if *tab.live.borrow() == 0 {
+                    tab.live.send_replace(conn);
+                    return Claim::Got(Live { state: self.clone(), tab_id: tab_id.to_string(), conn });
+                }
+                tab.live.subscribe()
+            };
+            let freed = tokio::time::timeout_at(deadline, live.wait_for(|c| *c == 0)).await.map(|r| r.is_ok());
+            match freed {
+                Ok(true) => continue,
+                // Its access ended meanwhile.
+                Ok(false) => return Claim::Gone,
+                Err(_) => return Claim::Taken,
+            }
+        }
+    }
+
+    /// Another connection presented an AI tab's token while it had one: it
+    /// was refused, and the panel says so on the tab.
+    fn intruder(&self, tab_id: &str) {
+        let label = {
+            let mut s = self.lock();
+            let Some(tab) = s.tabs.iter_mut().find(|t| t.id == tab_id) else { return };
+            tab.intruder_at = Some(now());
+            tab.label.clone()
+        };
+        let mut e = audit::Entry::new("connection_refused", &label);
+        e.note = Some("another connection with this AI tab's token, while it had one".into());
+        self.audit(e);
+        crate::applog::write_line("ai", &format!("Refused a second connection for the AI tab {label}: only one is allowed."));
+        self.changed();
     }
 
     /// The AI tab `id`'s "access ended" signal.
@@ -592,16 +729,25 @@ impl AiState {
         let s = self.lock();
         Snapshot {
             enabled: s.enabled,
-            tabs: s.tabs.iter().map(|t| TabView { id: t.id.clone(), label: t.label.clone(), servers: t.servers.clone() }).collect(),
+            tabs: s
+                .tabs
+                .iter()
+                .map(|t| TabView { id: t.id.clone(), label: t.label.clone(), servers: t.servers.clone(), intruder_at: t.intruder_at.clone() })
+                .collect(),
             pending: s.pending.iter().map(|p| p.view.clone()).collect(),
             running: s.running.iter().map(|r| r.view.clone()).collect(),
-            history: s.history.iter().rev().cloned().collect(),
+            history: s.history.iter().rev().map(|d| d.view.clone()).collect(),
             audit_log: self.0.audit.path().map(|p| p.to_string_lossy().into_owned()),
         }
     }
 
-    fn remember(&self, done: Done) {
+    /// Keep a finished request's row, unless the history was cleared since
+    /// it was asked (`epoch`, from then).
+    fn remember(&self, epoch: u64, done: Done) {
         let mut s = self.lock();
+        if s.epoch != epoch {
+            return;
+        }
         s.history.push_back(done);
         while s.history.len() > HISTORY {
             s.history.pop_front();
@@ -627,21 +773,31 @@ impl AiState {
             .map(|h| Zeroizing::new(h.token));
         drop(line);
         let tab = token.as_deref().and_then(|t| self.tab_for_token(t));
-        let welcome = match &tab {
-            Some(_) => channel::Welcome { ok: true, error: None },
-            None => channel::Welcome {
-                ok: false,
-                error: Some("Submarine doesn't know this AI tab: its access has ended, or it wasn't started from Submarine's Home menu.".into()),
+        drop(token);
+        // One live connection per AI tab: a second one with its token is
+        // another program that has read it (from the AI tool's environment,
+        // say), and is refused.
+        let unknown = "Submarine doesn't know this AI tab: its access has ended, or it wasn't started from Submarine's Home menu.";
+        let (tab, refused) = match tab {
+            None => (None, Some(unknown)),
+            Some((tab_id, closed)) => match self.claim(&tab_id).await {
+                Claim::Got(live) => (Some((tab_id, closed, live)), None),
+                Claim::Gone => (None, Some(unknown)),
+                Claim::Taken => {
+                    self.intruder(&tab_id);
+                    (None, Some("This AI tab is already connected to Submarine, and only one connection is allowed. Submarine has warned the user."))
+                }
             },
         };
+        let welcome = channel::Welcome { ok: refused.is_none(), error: refused.map(str::to_string) };
         let mut line = serde_json::to_string(&welcome).unwrap_or_default();
         line.push('\n');
         if w.write_all(line.as_bytes()).await.is_err() {
             return;
         }
         let _ = w.flush().await;
-        let Some((tab_id, closed)) = tab else { return };
-        mcp::serve(self.clone(), tab_id, closed, r, w).await;
+        let Some((tab_id, closed, live)) = tab else { return };
+        mcp::serve(self.clone(), tab_id, closed, r, w, live).await;
     }
 
     async fn call_tool(&self, tab_id: &str, name: &str, args: &serde_json::Value, cancel: watch::Receiver<bool>) -> ToolResult {
@@ -686,9 +842,10 @@ impl AiState {
 
     async fn run_command(&self, tab_id: &str, server: &str, command: &str, timeout: Option<u64>, mut cancel: watch::Receiver<bool>) -> ToolResult {
         // Checked before anything is shown to you.
-        let (label, session_id, server, id, mut rx, stop_tx, stop_rx) = {
+        let (label, session_id, server, id, epoch, mut rx, stop_tx, stop_rx) = {
             let mut s = self.lock();
             let next_id = s.next_id + 1;
+            let epoch = s.epoch;
             let waiting = s.pending.iter().filter(|p| p.view.tab_id == tab_id).count();
             let Some(tab) = s.tabs.iter_mut().find(|t| t.id == tab_id) else {
                 return ToolResult::err("This AI tab's access has ended.");
@@ -727,10 +884,12 @@ impl AiState {
                 }
                 let Some(found) = tab.servers.iter().find(|x| x.name == server) else {
                     let names: Vec<&str> = tab.servers.iter().map(|x| x.name.as_str()).collect();
+                    // The name as the AI sent it, cut: it may be a megabyte.
+                    let asked = for_log(server, MAX_LOGGED_NAME);
                     return Err(refuse(if names.is_empty() {
-                        format!("{server} isn't shared with you, and no server is. Ask the user to click Share with AI on its tab.")
+                        format!("{asked} isn't shared with you, and no server is. Ask the user to click Share with AI on its tab.")
                     } else {
-                        format!("{server} isn't shared with you. Shared: {}. Ask the user to click Share with AI on its tab.", names.join(", "))
+                        format!("{asked} isn't shared with you. Shared: {}. Ask the user to click Share with AI on its tab.", names.join(", "))
                     }));
                 };
                 let found = found.clone();
@@ -764,35 +923,39 @@ impl AiState {
                 decide: tx,
                 stop: stop_tx.clone(),
             });
-            (label, found.session_id, found.name, next_id, rx, stop_tx, stop_rx)
+            (label, found.session_id, found.name, next_id, epoch, rx, stop_tx, stop_rx)
         };
         self.changed();
         let root = asks_for_root(command);
         let limit = Duration::from_secs(timeout.unwrap_or(DEFAULT_TIMEOUT));
-        let entry = || {
-            let mut e = audit::Entry::new("request", &label);
+        let entry_for = |event: &'static str| {
+            let mut e = audit::Entry::new(event, &label);
+            e.id = Some(id);
             e.request = Some("run_command");
             e.server = Some(server.clone());
             e.command = Some(for_log(command, MAX_LOGGED_COMMAND));
             e.root = root;
             e
         };
+        let entry = || entry_for("request");
         let done = |outcome: &'static str| Done {
-            id,
-            tab_label: label.clone(),
-            server: server.clone(),
-            command: command.to_string(),
-            root,
-            outcome,
-            exit_code: None,
-            output: String::new(),
-            ai_output: String::new(),
-            output_bytes: 0,
-            hidden: 0,
-            cut: false,
-            timed_out: false,
-            error: None,
-            at: now(),
+            view: DoneView {
+                id,
+                tab_label: label.clone(),
+                server: server.clone(),
+                command: command.to_string(),
+                root,
+                outcome,
+                exit_code: None,
+                output_bytes: 0,
+                hidden: 0,
+                cut: false,
+                timed_out: false,
+                error: None,
+                at: now(),
+            },
+            output: Zeroizing::default(),
+            ai_output: Zeroizing::default(),
         };
 
         // Waiting for you. The answer: Some(allowed), or None when access
@@ -818,7 +981,7 @@ impl AiState {
                     e.decision = Some("cancelled");
                     e.note = Some("cancelled by the AI tool".into());
                     self.audit(e);
-                    self.remember(done("cancelled"));
+                    self.remember(epoch, done("cancelled"));
                     self.changed();
                     return ToolResult::err("Cancelled before the user decided: the request was withdrawn.");
                 }
@@ -832,7 +995,7 @@ impl AiState {
             e.decision = Some("cancelled");
             e.note = Some("access ended".into());
             self.audit(e);
-            self.remember(done("cancelled"));
+            self.remember(epoch, done("cancelled"));
             self.changed();
             return ToolResult::err("Cancelled before the user decided: the server isn't shared any more.");
         };
@@ -841,10 +1004,18 @@ impl AiState {
             e.decision = Some("denied");
             e.by = Some("you");
             self.audit(e);
-            self.remember(done("denied"));
+            self.remember(epoch, done("denied"));
             self.changed();
             return ToolResult::err("Denied by the user.");
         }
+
+        // Logged now, as you allowed it: a long command, or one that hangs,
+        // is in the log while it runs, not only once it ends. Its "finished"
+        // line follows, with the same id.
+        let mut e = entry();
+        e.decision = Some("allowed");
+        e.by = Some("you");
+        self.audit(e);
 
         // Allowed: decide() has put it in the running list with its stop
         // signal, which an end of access sets. The AI withdrawing it sets it
@@ -872,14 +1043,12 @@ impl AiState {
         };
         let stopped_by_ai = still_listed && withdrawn(&cancel);
 
-        let mut e = entry();
-        e.decision = Some("allowed");
-        e.by = Some("you");
+        let mut e = entry_for("finished");
         let mut d = done("done");
         let answer = match result {
             Ok(out) if out.stopped => {
                 e.note = Some(if stopped_by_ai { "stopped: withdrawn by the AI tool" } else { "stopped: access ended" }.into());
-                d.outcome = "stopped";
+                d.view.outcome = "stopped";
                 ToolResult::err(if stopped_by_ai {
                     "Stopped: the request was withdrawn."
                 } else {
@@ -888,21 +1057,24 @@ impl AiState {
             }
             Ok(mut out) => {
                 // Up to a megabyte through every rule: off the async workers.
-                let output = std::mem::take(&mut out.output);
+                // The main copies of it are wiped when they're dropped (not
+                // every one the filter makes on the way).
+                let output = Zeroizing::new(std::mem::take(&mut out.output));
                 let output_bytes = output.len();
                 let filtered = tokio::task::spawn_blocking(move || {
-                    let text = String::from_utf8_lossy(&output).into_owned();
+                    let text = Zeroizing::new(String::from_utf8_lossy(&output).into_owned());
                     let f = filter::filter(&text);
-                    let ai = shorten_for_ai(&f.text);
+                    let filtered = Zeroizing::new(f.text);
+                    let ai = Zeroizing::new(shorten_for_ai(&filtered));
                     (text, f.hidden, ai)
                 })
                 .await;
                 let Ok((text, hidden, ai)) = filtered else {
                     e.note = Some("filtering the output failed".into());
-                    d.outcome = "failed";
-                    d.error = Some("Submarine couldn't filter the output, so the AI wasn't given it.".into());
+                    d.view.outcome = "failed";
+                    d.view.error = Some("Submarine couldn't filter the output, so the AI wasn't given it.".into());
                     self.audit(e);
-                    self.remember(d);
+                    self.remember(epoch, d);
                     self.changed();
                     return ToolResult::err("Submarine couldn't filter the output, so it isn't given.");
                 };
@@ -926,7 +1098,7 @@ impl AiState {
                         filter::HIDDEN
                     ));
                 }
-                let answer = format!("{head}--- output ---\n{ai}");
+                let answer = format!("{head}--- output ---\n{}", ai.as_str());
                 e.exit_code = exit;
                 e.bytes_returned = Some(ai.len());
                 e.items_hidden = Some(hidden);
@@ -935,24 +1107,24 @@ impl AiState {
                 } else if out.cut {
                     e.note = Some("output cap reached".into());
                 }
-                d.exit_code = exit;
-                d.output_bytes = output_bytes;
+                d.view.exit_code = exit;
+                d.view.output_bytes = output_bytes;
                 d.output = text;
                 d.ai_output = ai;
-                d.hidden = hidden;
-                d.cut = out.cut;
-                d.timed_out = out.timed_out;
+                d.view.hidden = hidden;
+                d.view.cut = out.cut;
+                d.view.timed_out = out.timed_out;
                 ToolResult::ok(answer)
             }
             Err(err) => {
                 e.note = Some(err.clone());
-                d.outcome = "failed";
-                d.error = Some(err.clone());
+                d.view.outcome = "failed";
+                d.view.error = Some(err.clone());
                 ToolResult::err(format!("Couldn't run it: {err}"))
             }
         };
         self.audit(e);
-        self.remember(d);
+        self.remember(epoch, d);
         self.changed();
         answer
     }
@@ -1036,8 +1208,8 @@ pub struct DoneOutput {
 #[tauri::command]
 pub async fn ai_output(state: tauri::State<'_, AiState>, id: u64) -> Result<DoneOutput, String> {
     let s = state.lock();
-    let d = s.history.iter().find(|d| d.id == id).ok_or("That request's output is no longer kept.")?;
-    Ok(DoneOutput { output: d.output.clone(), ai_output: d.ai_output.clone() })
+    let d = s.history.iter().find(|d| d.view.id == id).ok_or("That request's output is no longer kept.")?;
+    Ok(DoneOutput { output: d.output.to_string(), ai_output: d.ai_output.to_string() })
 }
 
 #[tauri::command]

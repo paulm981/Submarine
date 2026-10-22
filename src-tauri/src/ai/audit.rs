@@ -39,12 +39,18 @@ fn rotate(dir: &Path) {
 }
 
 /// One line of the log. `event` says what happened: an AI tab started or
-/// ended, a server shared or no longer, a request and its outcome.
+/// ended, a server shared or no longer, a request and what was decided
+/// (`request`), and, for one you allowed, how it ended (`finished`, with
+/// the same `id`, after its `request` line).
 #[derive(Serialize, Default, Clone, Debug)]
 pub(crate) struct Entry {
     pub time: String,
     pub event: &'static str,
     pub ai_tab: String,
+    /// The request's number in this run of the app, on its `request` and
+    /// `finished` lines (not on one refused before it was shown to you).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

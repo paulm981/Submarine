@@ -8,7 +8,11 @@ import { listen } from "@tauri-apps/api/event";
 // on your clicks; `ai-changed` says when to look again.
 
 export interface AiServer { session_id: string; name: string }
-export interface AiTab { id: string; label: string; servers: AiServer[] }
+export interface AiTab {
+  id: string; label: string; servers: AiServer[];
+  /// When another program tried to connect as this AI tab (and was refused).
+  intruder_at: string | null;
+}
 export interface AiPending {
   id: number; tab_id: string; tab_label: string; session_id: string; server: string;
   command: string; root: boolean; timeout_secs: number; asked_at: string;

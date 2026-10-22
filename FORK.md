@@ -60,6 +60,8 @@ A first test, off by default: turn it on in **Settings › AI tools**.
 - Submarine runs the command over its own connection, so the AI never gets a key or password. You see the full output; the AI gets it with known secrets hidden, and you see how many.
 - Every request and decision goes in `ai-audit.log` in the log folder.
 
+AI tabs are kept apart from each other, from other accounts on the computer, and from the network. They aren't kept apart from a hostile program running as you: it could read an AI tab's access, edit the log, or click Allow for you. Submarine refuses a second connection as the same AI tab and warns you in the AI panel, but can't stop everything. Run Claude Code with its sandbox on (`/sandbox`), which fences in the commands it runs on your computer.
+
 What comes next (root prompts, the AI asking for a server, many servers, downloads, more AI tools) is in [#32](https://github.com/paulm981/Submarine/issues/32).
 
 ### Root when you need it
