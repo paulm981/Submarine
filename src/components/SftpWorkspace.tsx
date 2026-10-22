@@ -11,6 +11,7 @@ import { createRemoteProvider } from "../fs/remoteProvider";
 import { useTextPrompt } from "../ui/confirm";
 import { useIsNarrow } from "../hooks/useViewport";
 import { bookmarksKey } from "../util/sftpBookmarks";
+import { visibleName } from "../util/fileName";
 
 // Root (sudo) mode for the remote pane — see `sftp_set_elevated` in lib.rs.
 type ElevationStatus = { elevated: boolean; passwordless: boolean };
@@ -96,7 +97,7 @@ const DragGhost = forwardRef<DragGhostHandle>((_props, ref) => {
         ? <Folder size={12} className="text-indigo-300 shrink-0" />
         : <FileIcon size={12} className="text-indigo-300 shrink-0" />}
       <span className="truncate max-w-[260px]">
-        {drag.entries.length === 1 ? drag.entries[0].name : `${drag.entries.length} items`}
+        {drag.entries.length === 1 ? visibleName(drag.entries[0].name) : `${drag.entries.length} items`}
       </span>
     </div>,
     document.body
@@ -609,7 +610,7 @@ const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfi
               <div key={t.id} className={`w-full max-w-[280px] pointer-events-auto px-2.5 py-1.5 rounded border ${tone} font-mono text-[10.5px] shadow-2xl backdrop-blur-md animate-in fade-in slide-in-from-right-4`}>
                 <div className="flex items-center gap-1.5 mb-1">
                   <Icon size={11} className="shrink-0" />
-                  <span className="truncate flex-1" title={t.name}>{t.name}</span>
+                  <span className="truncate flex-1" title={visibleName(t.name)}>{visibleName(t.name)}</span>
                   <span className="text-[9.5px] opacity-80 shrink-0">{statusLabel}</span>
                   {/* Stop button — only while the transfer is still running.
                       Finished / failed / cancelled cards fade out on their

@@ -1638,6 +1638,17 @@ mod tests {
     }
 }
 
+/// An SFTP session to this machine through the in-process test server's
+/// shell, for other modules' tests of what they do over SFTP. Its home folder
+/// is `dir`.
+#[cfg(all(test, unix))]
+pub(crate) async fn test_session(dir: &std::path::Path) -> SftpSession {
+    use crate::ssh_test_server::{connect, ShellOpts, TestServer};
+    let server = TestServer::with_shell(ShellOpts { cwd: Some(dir.to_path_buf()), ..Default::default() });
+    let session = connect(server, |_| {}, crate::build_ssh_client_config()).await.expect("ssh");
+    start(opener(std::sync::Arc::new(tokio::sync::Mutex::new(session))), Sudo::No).await.expect("sftp over shell")
+}
+
 /// The whole thing over a real SSH connection to the in-process test server,
 /// whose commands run with this machine's `sh` (Linux): GNU tools, the
 /// portable way with the same tools, and BusyBox alone on PATH (what an

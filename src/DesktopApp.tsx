@@ -17,6 +17,7 @@ import { useChoice, useConfirm, useTextPrompt } from "./ui/confirm";
 import { useSlideOverFocus } from "./ui/slideOverFocus";
 import { RenameInput } from "./ui/renameInput";
 import { forgetServerBookmarks } from "./util/sftpBookmarks";
+import { visibleName } from "./util/fileName";
 import { useIsNarrow } from "./hooks/useViewport";
 import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./util/terminalFont";
 import {
@@ -1042,7 +1043,7 @@ function DesktopApp() {
   useEffect(() => {
     const unlisten = listen<{ folder: string; files: string[] }>("live-edit-kept", async (e) => {
       const { folder, files } = e.payload;
-      const what = files.length === 1 ? `${files[0]} has changes` : `${files.length} files have changes`;
+      const what = files.length === 1 ? `${visibleName(files[0])} has changes` : `${files.length} files have changes`;
       addLog(`Live Edit: ${what} that were never uploaded to the server. Kept in ${folder}.`, "info");
       const ok = await confirm({
         title: "Unsent edits kept",

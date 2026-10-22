@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { AlertTriangle, X } from "lucide-react";
+import { visibleName } from "../util/fileName";
 
 // Focus trap for our modal portals. When a prompt opens (`openId` is its id,
 // null while that kind of prompt is closed), remember the element that had
@@ -376,7 +377,7 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
                 : "A file with this name already exists on the remote:"}
             </p>
             <p className="text-[12px] text-amber-300 leading-relaxed mb-4 break-all">
-              {owState.opts.name}
+              {visibleName(owState.opts.name)}
             </p>
             <div className="grid grid-cols-2 gap-2">
               <button onClick={() => closeOverwrite("overwrite")} data-default-focus
