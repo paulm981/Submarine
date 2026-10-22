@@ -23327,7 +23327,7 @@ pub fn run() {
             export_profile, import_profile_pick, import_profile_save, import_profile_bytes,
             get_secure_screen, set_secure_screen,
             cloud::cloud_status, cloud::cloud_signup, cloud::cloud_consume_verify_link,
-            cloud::cloud_set_password, cloud::cloud_login, cloud::cloud_logout,
+            cloud::cloud_set_password, cloud::cloud_login, cloud::cloud_logout, cloud::cloud_delete_account,
             cloud::cloud_request_password_reset, cloud::cloud_reset_password,
             cloud::cloud_request_login_link, cloud::cloud_login_with_link,
             cloud::get_cloud_enabled, cloud::set_cloud_enabled,
