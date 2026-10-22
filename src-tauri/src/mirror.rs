@@ -292,6 +292,11 @@ async fn sftp_remote_mtime(sftp: &SftpSession, path: &str) -> Option<u64> {
 /// truncated because TRUNCATE zeroed it at open time, and any consumer on
 /// the server would read a partial file until the next watcher event
 /// corrects it. The sibling `sftp_download_file` uses the same pattern.
+///
+/// The new file gets the permissions of the one it replaces (a private
+/// `0600` file stays private, a script keeps its `+x`), or the local file's
+/// for a new one, from the moment it's created, and the replaced file's
+/// owner and group where the server lets us set them.
 async fn sftp_upload_file(sftp: &SftpSession, local: &Path, remote: &str) -> Result<(), String> {
     if let Some(parent) = std::path::Path::new(remote).parent() {
         let pstr = parent.to_string_lossy().replace('\\', "/");
@@ -299,8 +304,24 @@ async fn sftp_upload_file(sftp: &SftpSession, local: &Path, remote: &str) -> Res
             sftp_mkdir_p(sftp, &pstr).await?;
         }
     }
+    let existing = sftp.metadata(remote).await.ok();
+    let mode = match &existing {
+        Some(a) => a.permissions.map(|p| p & 0o7777),
+        None => tokio::fs::metadata(local).await.ok().and_then(|m| shell_sync_local_mode(&m)),
+    };
     let tmp = format!("{}.submarine-tmp", remote);
-    sftp_stream_file(sftp, local, &tmp, FileAttributes::empty()).await?;
+    sftp_stream_file(sftp, local, &tmp, FileAttributes { permissions: mode, ..FileAttributes::empty() }).await?;
+    // Owner first: a change of owner can clear the setuid and setgid bits,
+    // which the mode below puts back. Both are best effort. Creating it went
+    // through the server's umask, so it is no more open than `mode` already;
+    // the mode makes it exact.
+    if let Some((uid, gid)) = existing.as_ref().and_then(|a| Some((a.uid?, a.gid?))) {
+        let owner = FileAttributes { uid: Some(uid), gid: Some(gid), ..FileAttributes::empty() };
+        let _ = sftp.set_metadata(tmp.as_str(), owner).await;
+    }
+    if let Some(m) = mode {
+        let _ = sftp.set_metadata(tmp.as_str(), FileAttributes { permissions: Some(m), ..FileAttributes::empty() }).await;
+    }
     // Rename over the destination. On POSIX SFTP servers `sftp.rename` errors
     // if the destination already exists, so we unlink the previous copy first.
     // The lost-atomicity window here (destination missing between remove and
@@ -321,10 +342,15 @@ async fn sftp_stream_file(sftp: &SftpSession, local: &Path, tmp: &str, attrs: Fi
     // A refusal names the folder: the temporary file is ours, the folder is
     // what someone can do something about.
     let folder = Path::new(tmp).parent().map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+    // A new file, never one that's there: one left by an earlier try is
+    // removed first, and anything that appears meanwhile (a link, a file
+    // with other permissions) makes the create fail rather than be written
+    // through or keep its permissions.
+    let _ = sftp.remove_file(tmp).await;
     let write_result: Result<(), String> = async {
         let mut handle = sftp.open_with_flags_and_attributes(
             tmp,
-            OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
+            OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE | OpenFlags::EXCLUDE,
             attrs,
         ).await.map_err(|e| format!("can't write in {}: {}", folder, sftp_reason(&e)))?;
 
@@ -1801,6 +1827,46 @@ async fn process_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pushed file replaces the server's copy with the same permissions,
+    /// so a private file stays private and a script keeps its `+x`; a new one
+    /// takes the local file's. A temporary file in the way is never written
+    /// through.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pushed_file_keeps_the_permissions_of_the_one_it_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("submarine-mirror-push-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (local, remote) = (root.join("local"), root.join("remote"));
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        let root = root.canonicalize().unwrap();
+        let (local, remote) = (root.join("local"), root.join("remote"));
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let set = |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        for (name, m) in [("secret", 0o600), ("run.sh", 0o755)] {
+            std::fs::write(remote.join(name), "old").unwrap();
+            set(&remote.join(name), m);
+            std::fs::write(local.join(name), "new").unwrap();
+            set(&local.join(name), 0o644);
+        }
+        std::fs::write(local.join("fresh.sh"), "new").unwrap();
+        set(&local.join("fresh.sh"), 0o750);
+        // Left by an earlier try, pointing elsewhere.
+        std::os::unix::fs::symlink(root.join("victim"), remote.join("secret.submarine-tmp")).unwrap();
+        let sftp = crate::shell_sftp::test_session(&root).await;
+        for name in ["secret", "run.sh", "fresh.sh"] {
+            sftp_upload_file(&sftp, &local.join(name), remote.join(name).to_str().unwrap()).await.unwrap();
+            assert_eq!(std::fs::read_to_string(remote.join(name)).unwrap(), "new", "{name}");
+        }
+        assert_eq!(mode(&remote.join("secret")), 0o600);
+        assert_eq!(mode(&remote.join("run.sh")), 0o755);
+        assert_eq!(mode(&remote.join("fresh.sh")), 0o750);
+        assert!(!root.join("victim").exists(), "nothing written through the link");
+        assert!(std::fs::symlink_metadata(remote.join("secret.submarine-tmp")).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
     use russh_sftp::protocol::{Attrs, Status};
     use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
