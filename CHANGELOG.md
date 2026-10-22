@@ -9,6 +9,9 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Opening a Live Edit file again keeps your unsent changes.** If the copy on this computer has changes that never reached the server, it's copied to **Submarine unsent edits** in your Downloads folder before the server's version is opened, and the window says so. A file opened twice is also uploaded once per save, not twice. ([#93](https://github.com/paulm981/Submarine/issues/93))
+- **Quitting the app keeps unsent Live Edit changes too**, in the same folder, as disconnecting and locking already did. ([#93](https://github.com/paulm981/Submarine/issues/93))
+- **Kept copies are private.** On macOS and Linux, a copy kept in **Submarine unsent edits** can be read only by you, and so can the folder. ([#93](https://github.com/paulm981/Submarine/issues/93))
 - **Old temporary folders are cleared at startup.** Live Edit and drag copies left behind by a run that crashed more than a day ago stayed in the system's temp folder; the check for them never matched. ([#93](https://github.com/paulm981/Submarine/issues/93))
 
 ## v0.4.0-fork.4
