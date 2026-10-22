@@ -1173,6 +1173,15 @@ const TerminalView = ({
       // says why; the page's own read only fails when it's refused.
       try { text = await readClipboardText(); }
       catch (e) { notify(typeof e === 'string' ? e : 'Clipboard read denied', 'err'); return; }
+      await pasteChecked(text, toast);
+    };
+    // Every paste of the user's goes through here, however it came (the
+    // right-click, the Linux paste keys, the webview's own Ctrl+V,
+    // Ctrl+Shift+V or ⌘V, a phone's paste menu): cleaned, and asked about
+    // when its lines would run one by one.
+    const pasteChecked = async (raw: string, toast: boolean) => {
+      if (disabledRef.current) return;
+      let text = raw;
       if (!text) return;
       // No escape sequence or other control character gets through (see pasteText.ts).
       const clean = withoutPasteControls(text);
@@ -1192,7 +1201,7 @@ const TerminalView = ({
           okLabel: 'Paste',
           safeDefault: true,
         });
-        if (!ok) return;
+        if (!ok || disabledRef.current) return;
       }
       // Hand the text to xterm's own paste path instead of writing it raw to
       // the PTY. xterm collapses CRLF / lone LF to a single CR (one Enter per
@@ -1208,19 +1217,16 @@ const TerminalView = ({
       pasteText(text);
       if (toast) notify('Pasted');
     };
-    // Ctrl+V, Ctrl+Shift+V, Shift+Insert and a phone's paste menu reach xterm's
-    // own paste. When there is something to take out of the text, it is pasted
-    // without it instead (the capture phase runs before xterm's handler); text
-    // with nothing to take out goes the way it always did.
+    // Ctrl+V, Ctrl+Shift+V, Shift+Insert, ⌘V and a phone's paste menu would
+    // reach xterm's own paste, which pastes at once. Taken here instead (the
+    // capture phase runs before xterm's handler) and pasted the way a
+    // right-click pastes: without control characters, and asking first when
+    // its lines would run one by one.
     const onPasteEvent = (ev: ClipboardEvent) => {
       const raw = ev.clipboardData?.getData('text/plain') ?? '';
-      const clean = withoutPasteControls(raw);
-      if (clean === raw) return;
       ev.preventDefault();
       ev.stopImmediatePropagation();
-      if (disabledRef.current || !clean) return;
-      pasteText(clean);
-      notify('Control characters left out of the paste');
+      void pasteChecked(raw, false);
     };
     // Right-click → paste. preventDefault swallows the platform context menu
     // so the user gets the terminal-style behavior they asked for.

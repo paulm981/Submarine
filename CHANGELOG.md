@@ -15,6 +15,7 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - **Turning Broadcast off on a Wall no longer swallows what you type.** The terminal under the mouse gets the keys, or the Wall says to click one. ([#98](https://github.com/paulm981/Submarine/issues/98))
 - **A terminal on a Wall has its Find box (Ctrl+F), Saved password button and Copied and Pasted notes**, as in its own tab. Ctrl+R opens command history there too. ([#98](https://github.com/paulm981/Submarine/issues/98))
 - **All tabs (Ctrl+Shift+K) shows a renamed tab by its new name**, and finds it by that name or the server's. So does a Wall's **Add**. ([#98](https://github.com/paulm981/Submarine/issues/98))
+- **Ctrl+V, Ctrl+Shift+V and ⌘V ask "Paste N lines?" too**, as a right-click does, when the lines would run one by one. ([#98](https://github.com/paulm981/Submarine/issues/98))
 
 ## v0.4.0-fork.4
 
