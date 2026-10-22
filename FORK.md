@@ -82,7 +82,7 @@ A first test, off by default. To try it, install Claude Code, turn on **Settings
 
 AI tabs are kept apart from each other, from other accounts on the computer, and from the network. They aren't kept apart from a hostile program running as you: it could read an AI tab's access, edit the log, or click Allow for you. Run Claude Code with its sandbox on (`/sandbox`), which fences in the commands it runs on your computer. Claude Code also runs as you, so it could read `~/.ssh` by itself: **Settings › AI tools** shows the rule that stops it.
 
-What comes next is in [#32](https://github.com/paulm981/Submarine/issues/32): root asked for every time, the AI asking for a server, many servers at once, downloads, and more AI tools through one standard, ACP ([#110](https://github.com/paulm981/Submarine/issues/110)).
+What comes next is in [#32](https://github.com/paulm981/Submarine/issues/32). First, Claude Code starts without your SSH agent, so it can't reach servers around Submarine ([#116](https://github.com/paulm981/Submarine/issues/116)). Then you choose per server how much the AI may do without asking: ask every time, run the commands you've allowed, or run anything, with everything logged ([#115](https://github.com/paulm981/Submarine/issues/115)). Then any AI tool from a list, not only Claude Code ([#117](https://github.com/paulm981/Submarine/issues/117)).
 
 ### Root when you need it
 
