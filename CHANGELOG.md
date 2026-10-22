@@ -12,6 +12,7 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 - **Locking the profile or turning AI tools off clears the AI panel's list of what ran.** The commands and their whole output used to stay in the panel after a lock, where the next profile could open them. ([#97](https://github.com/paulm981/Submarine/issues/97))
 - **An AI command you allow is in `ai-audit.log` straight away,** and gets a second line when it ends, with its exit code. Before, nothing was written until it ended, so a command still running when Submarine quit or crashed was never logged. ([#97](https://github.com/paulm981/Submarine/issues/97))
 - **The AI is given fewer passwords from config files.** Output it gets now also hides the password in Cisco lines (`enable secret 5 …`, `password 7 …`, `username … secret …`), Redis's `requirepass`, `.netrc`, `.pgpass`, Juniper's `$9$…` and `encrypted-password`, Docker's `config.json` and Wi-Fi `psk=` lines. ([#97](https://github.com/paulm981/Submarine/issues/97))
+- **An AI request's Allow and Deny also wait half a second after the AI panel scrolls,** as they already did after the card moved. A request scrolled under the pointer can't be decided by a click meant for something else. ([#97](https://github.com/paulm981/Submarine/issues/97))
 
 ## v0.4.0-fork.4
 
