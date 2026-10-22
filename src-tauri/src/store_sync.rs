@@ -455,19 +455,33 @@ fn is_plain_file(e: &std::fs::DirEntry) -> bool {
 /// sync takes in one answer (cloud::MAX_SYNC_ANSWER).
 const MAX_DEVICE_FILE: u64 = crate::cloud::MAX_SYNC_ANSWER as u64;
 
-/// A computer's file, read no further than `MAX_DEVICE_FILE`: its size is
-/// looked at first, and the read stops one byte past the limit anyway, as the
-/// file can grow while it's read.
+/// The most a profile's `profile.key` (a sealed key, in hex) may be.
+const MAX_KEY_FILE: u64 = 64 * 1024;
+
+/// A computer's file, read no further than `MAX_DEVICE_FILE`.
 fn read_device_file(path: &Path) -> Result<Vec<u8>, String> {
+    read_capped(path, MAX_DEVICE_FILE)
+}
+
+/// A file in the store, read no further than `max` bytes: its size is looked
+/// at first, and the read stops one byte past the limit anyway, as the file
+/// can grow while it's read.
+fn read_capped(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     use std::io::Read as _;
-    let too_big = || format!("it's more than the {} MB a sync file can be, so it wasn't read", MAX_DEVICE_FILE / (1024 * 1024));
+    let too_big = || {
+        if max >= 1024 * 1024 {
+            format!("it's more than the {} MB a sync file can be, so it wasn't read", max / (1024 * 1024))
+        } else {
+            format!("it's more than the {} KB this file can be, so it wasn't read", max / 1024)
+        }
+    };
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    if file.metadata().map_err(|e| e.to_string())?.len() > MAX_DEVICE_FILE {
+    if file.metadata().map_err(|e| e.to_string())?.len() > max {
         return Err(too_big());
     }
     let mut bytes = Vec::new();
-    file.take(MAX_DEVICE_FILE + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > MAX_DEVICE_FILE {
+    file.take(max + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > max {
         return Err(too_big());
     }
     Ok(bytes)
@@ -1186,7 +1200,7 @@ fn find_same_profile(data: &Path, key: &[u8; 32]) -> Option<String> {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(DEVICE_EXT) && is_plain_file(&entry) && std::fs::read(entry.path()).is_ok_and(|b| unseal(key, &b).is_ok()) {
+            if name.ends_with(DEVICE_EXT) && is_plain_file(&entry) && read_device_file(&entry.path()).is_ok_and(|b| unseal(key, &b).is_ok()) {
                 return Some(id);
             }
         }
@@ -1217,7 +1231,7 @@ fn key_files(dir: &Path) -> Vec<String> {
             let n = e.file_name().to_string_lossy().into_owned();
             n.starts_with("profile") && n.ends_with(".key") && is_plain_file(e)
         })
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|e| read_capped(&e.path(), MAX_KEY_FILE).ok().and_then(|b| String::from_utf8(b).ok()))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
@@ -1539,6 +1553,18 @@ mod tests {
         std::fs::File::create(&over).unwrap().set_len(MAX_DEVICE_FILE + 1).unwrap();
         assert!(read_device_file(&over).unwrap_err().contains("more than"));
         assert!(read_device_file(&dir.join("missing")).is_err());
+    }
+
+    #[test]
+    fn key_files_and_the_same_profile_are_looked_for_within_the_limits() {
+        let data = tmp("capped");
+        let dir = data.join("aaaaaaaaaaaaaaaa");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("profile.key"), "  abcd\n").unwrap();
+        std::fs::File::create(dir.join("profile (conflict).key")).unwrap().set_len(MAX_KEY_FILE + 1).unwrap();
+        assert_eq!(key_files(&dir), ["abcd"], "the oversized one is skipped, not read");
+        std::fs::File::create(dir.join("bbbbbbbbbbbbbbbb.subdev")).unwrap().set_len(MAX_DEVICE_FILE + 1).unwrap();
+        assert_eq!(find_same_profile(&data, &KEY), None);
     }
 
     #[test]
