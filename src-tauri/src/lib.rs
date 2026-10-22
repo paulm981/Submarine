@@ -12040,11 +12040,15 @@ async fn diagnose_connect(
             let label = hop.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| hop.host.clone());
             let (resolved, proxy) =
                 ConfigTarget::resolve_jump_host(&hop.host, hop.port, hop.user.as_deref().unwrap_or(""), hop.name).await?;
-            // connect_jump_host takes the jump host's ProxyCommand when it has one.
-            if matches!(proxy, Some(ssh_config::Proxy::Command(_))) {
-                diagnose::Route::Command
-            } else {
-                diagnose::Route::Jump { name: label, host: resolved.host, port: resolved.port }
+            // connect_jump_host takes the jump host's ProxyCommand or
+            // ProxyJump when it has one.
+            match proxy {
+                Some(ssh_config::Proxy::Command(_)) => diagnose::Route::Command,
+                Some(ssh_config::Proxy::Jump(spec)) => match first_hop_route(&spec).await {
+                    Some(route) => route,
+                    None => return Ok(Vec::new()),
+                },
+                _ => diagnose::Route::Jump { name: label, host: resolved.host, port: resolved.port },
             }
         }
         ConnectRoute::Proxy { socks5, host: Some(host), port } => {
@@ -12053,10 +12057,23 @@ async fn diagnose_connect(
         // No proxy address to check: the connect says the proxy host is empty.
         ConnectRoute::Proxy { host: None, .. } => return Ok(Vec::new()),
         ConnectRoute::Command(_) => diagnose::Route::Command,
-        // fork: until diagnose follows the chain (next commit).
-        ConnectRoute::ConfigJump(_) | ConnectRoute::Direct => diagnose::Route::Direct,
+        ConnectRoute::ConfigJump(spec) => match first_hop_route(&spec).await {
+            Some(route) => route,
+            None => return Ok(Vec::new()),
+        },
+        ConnectRoute::Direct => diagnose::Route::Direct,
     };
     Ok(diagnose::diagnose(&target.host, target.port, route).await)
+}
+
+/// What `diagnose_connect` checks for a route through the ProxyJump `spec`:
+/// the first hop the connect dials (`hop_policy::first_hop`). `None` when the
+/// list can't be used; the connect says why.
+async fn first_hop_route(spec: &str) -> Option<diagnose::Route> {
+    match hop_policy::first_hop_in_config(spec, 0).await.ok()? {
+        hop_policy::FirstHop::Address { label, host, port } => Some(diagnose::Route::Jump { name: label, host, port }),
+        hop_policy::FirstHop::Command => Some(diagnose::Route::Command),
+    }
 }
 
 #[tauri::command]
