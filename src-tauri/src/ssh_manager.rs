@@ -866,6 +866,28 @@ impl ConnectAttempt {
     }
 }
 
+impl ClientHandler {
+    fn keys_on_file(&self, fingerprint: &str) -> Result<HostKeyVerdict, String> {
+        keys_on_file(&self.db, &self.server_host, self.server_port, fingerprint)
+    }
+}
+
+/// What the app's trusted keys say about the key `fingerprint` for
+/// host:port (judge_host_key). Fails closed: a poisoned lock, a failed
+/// lookup, or no profile open (nothing to check against, and nowhere to
+/// save an answer) is an `Err` with the reason, never "first time". The
+/// std mutex guard is dropped before the caller's next `.await`.
+fn keys_on_file(
+    db: &std::sync::Mutex<Option<rusqlite::Connection>>,
+    host: &str,
+    port: u16,
+    fingerprint: &str,
+) -> Result<HostKeyVerdict, String> {
+    let guard = db.lock().map_err(|_| "the trusted host keys couldn't be read; restart the app".to_string())?;
+    let conn = guard.as_ref().ok_or("no profile is open, so the server's key can't be checked")?;
+    judge_host_key(conn, host, port, fingerprint).map_err(|_| "the trusted host keys couldn't be read; restart the app".to_string())
+}
+
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
 
@@ -902,15 +924,9 @@ impl client::Handler for ClientHandler {
                 // inside the certificate against those on file (D3). A
                 // database that can't be read refuses.
                 let inner = PublicKey::from(cert.public_key().clone());
-                let on_file = match self.db.lock() {
-                    Ok(guard) => match guard.as_ref() {
-                        Some(conn) => judge_host_key(conn, &self.server_host, self.server_port, &host_key_fingerprint(&inner)).ok(),
-                        None => Some(HostKeyVerdict::New),
-                    },
-                    Err(_) => None,
-                };
-                let Some(on_file) = on_file else {
-                    return refuse("the trusted host keys couldn't be read".into());
+                let on_file = match self.keys_on_file(&host_key_fingerprint(&inner)) {
+                    Ok(v) => v,
+                    Err(why) => return refuse(why),
                 };
                 return match crate::trust_policy::decide_certificate(on_file, self.host_trust.as_deref(), cert, crate::trust_policy::now()) {
                     crate::trust_policy::HostKeyDecision::Trusted { why, .. } => {
@@ -937,24 +953,13 @@ impl client::Handler for ClientHandler {
         // Every key on file for this host:port (judge_host_key): the offered
         // one among them → trusted; others on file but not it → KEY CHANGED,
         // whatever their kind; nothing on file → the first-time prompt.
-        // Read in a SCOPED block — the std mutex guard mustn't cross any
-        // `.await` (the !Send guard would break the future's Send bound). A
-        // poisoned mutex or a failed lookup fails closed instead of silently
-        // treating the host as unknown (which would re-prompt the user and
-        // hide a possible MITM).
-        let verdict = match self.db.lock() {
-            Ok(guard) => match guard.as_ref() {
-                Some(conn) => judge_host_key(conn, &self.server_host, self.server_port, &fp_str).ok(),
-                None => Some(HostKeyVerdict::New),
-            },
-            Err(_) => None,
-        };
-        let Some(verdict) = verdict else {
-            let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
-                "msg": "Couldn't read the trusted host keys — refusing connection. Restart the app.",
-                "type": "error"
-            }));
-            return Ok(false);
+        // keys_on_file drops the std mutex guard before any `.await`. A
+        // poisoned mutex, a failed lookup or no open profile fails closed
+        // instead of silently treating the host as unknown (which would
+        // re-prompt the user and hide a possible MITM).
+        let verdict = match self.keys_on_file(&fp_str) {
+            Ok(v) => v,
+            Err(why) => return refuse(why),
         };
         let (mismatch, prior_fingerprints) =
             match crate::trust_policy::decide_plain_key(verdict, self.host_trust.as_deref(), server_public_key) {
@@ -1377,6 +1382,22 @@ impl client::Handler for ClientHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // No profile open: the key can't be checked, so it's refused with that
+    // reason, never asked about as if it were new.
+    #[test]
+    fn no_open_profile_means_the_key_cant_be_checked() {
+        let none = std::sync::Mutex::new(None);
+        assert_eq!(keys_on_file(&none, "h", 22, "FP").unwrap_err(), "no profile is open, so the server's key can't be checked");
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE known_hosts (id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT, port INTEGER, fingerprint TEXT, key_type TEXT);")
+            .unwrap();
+        let open = std::sync::Mutex::new(Some(conn));
+        assert_eq!(keys_on_file(&open, "h", 22, "FP").unwrap(), HostKeyVerdict::New);
+        // A broken table fails closed too.
+        open.lock().unwrap().as_ref().unwrap().execute_batch("DROP TABLE known_hosts;").unwrap();
+        assert!(keys_on_file(&open, "h", 22, "FP").is_err());
+    }
 
     #[test]
     fn a_terminal_closed_while_opening_is_not_registered() {
