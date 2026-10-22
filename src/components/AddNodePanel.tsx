@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { folderOptions } from "../util/folderPath";
+import { JumpHostPicker } from "./JumpHostPicker";
 import { IS_ANDROID } from "../util/platform";
 import { Cpu, X, Link2, ArrowLeftRight, Shield, ShieldAlert, Key, User, FolderPlus, Download, CheckSquare, Square, History, Plus, Copy, Play, FlaskConical } from "lucide-react";
 import PasswordField from "./PasswordField";
@@ -799,20 +800,15 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 out so a node can't jump through itself. */}
             <div className="flex justify-between items-center gap-3">
               <label className="text-[11px] font-bold text-zinc-400 shrink-0">{isSsh ? "Jump via" : "Through SSH server"}</label>
-              <select
-                className="flex-1 min-w-0 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner"
+              <JumpHostPicker
+                label={isSsh ? "Jump via" : "Through SSH server"}
+                directLabel={isSsh ? "Direct — no jump host" : "Direct — no SSH server"}
                 value={newNode.jumpHostId || ""}
-                onChange={e => setNewNode({ ...newNode, jumpHostId: e.target.value })}
-              >
-                <option value="" className="bg-[#1a1a1e] text-zinc-500">{isSsh ? "Direct — no jump host" : "Direct — no SSH server"}</option>
-                {(servers || [])
-                  .filter((s: any) => s.id !== newNode.id && (s.protocol ?? "ssh") === "ssh")
-                  .map((s: any) => (
-                    <option key={s.id} value={s.id.toString()} className="bg-[#1a1a1e] text-zinc-300">
-                      {s.name} ({s.host})
-                    </option>
-                  ))}
-              </select>
+                onChange={(id) => setNewNode({ ...newNode, jumpHostId: id })}
+                servers={servers || []}
+                folders={folders || []}
+                selfId={newNode.id}
+              />
             </div>
 
             {/* RDP options: this device's own (util/rdpOptions), not synced. */}

@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Search for the jump host.** In a server's form, **Jump via** is now a search box: type part of a name, address or folder, and pick with the arrow keys and Enter or a click. Servers already used as a jump host are listed first. ([#102](https://github.com/paulm981/Submarine/issues/102))
+
+## v0.4.0-fork.2
+
 - **Enter in a question does what the focused button says.** Tab to Cancel (or Skip, or ✕) and press Enter, and that's what happens. Before, Enter always took the main action, so it could delete a folder or overwrite a file you meant to keep. With no button focused, Enter still takes the main action. ([#94](https://github.com/paulm981/Submarine/issues/94))
 
 ## v0.4.0-fork.1
