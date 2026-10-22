@@ -8963,6 +8963,13 @@ impl AgentSlot {
 
 /// A node's display name. An imported node keeps its `~/.ssh/config` alias as
 /// its name, so `Host` patterns are matched against it as well as the address.
+/// A saved port as one a connection can use. The form only takes 1 to 65535,
+/// but a synced or imported server may carry anything, and a plain cast would
+/// quietly dial another port.
+fn valid_port(port: i32) -> Result<u16, String> {
+    u16::try_from(port).map_err(|_| format!("Port {port} isn't a valid port"))
+}
+
 fn server_display_name(conn: &rusqlite::Connection, server_id: i32) -> Option<String> {
     conn.query_row("SELECT name FROM servers WHERE id = ?1", [server_id], |row| row.get::<_, Option<String>>(0))
         .ok()
@@ -8997,6 +9004,22 @@ impl ConfigTarget {
         };
         let config = ssh_config::for_host(lookup).await;
         Self::apply(host, port, user, config)
+    }
+
+    /// A jump host as `connect_jump_host` reaches it, for the connect, the
+    /// check under a failed one and the monitor alike: its saved port
+    /// checked, `~/.ssh/config` applied, and the ProxyCommand or ProxyJump
+    /// the config gives it (a jump host is reached without its own proxy
+    /// setting, so the config's has nothing to give way to).
+    async fn resolve_jump_host(
+        host: &str,
+        port: i32,
+        user: &str,
+        name: Option<String>,
+    ) -> Result<(Self, Option<ssh_config::Proxy>), String> {
+        let mut target = Self::resolve(host, valid_port(port)?, user, name).await;
+        let proxy = target.proxy(None);
+        Ok((target, proxy))
     }
 
     fn apply(host: &str, port: u16, user: &str, config: Option<ssh_config::HostConfig>) -> Self {
@@ -9786,6 +9809,15 @@ mod key_format_tests {
 
     // ~/.ssh/config: an alias address takes HostName and Port; User only
     // fills a blank username; every change is logged.
+    #[test]
+    fn a_port_out_of_range_is_refused_not_cast() {
+        assert_eq!(valid_port(22), Ok(22));
+        assert_eq!(valid_port(65535), Ok(65535));
+        // 65558 as u16 would have dialled port 22.
+        assert_eq!(valid_port(65558), Err("Port 65558 isn't a valid port".to_string()));
+        assert_eq!(valid_port(-1), Err("Port -1 isn't a valid port".to_string()));
+    }
+
     #[test]
     fn a_config_alias_changes_where_to_connect() {
         let c = host_config(|c| {
@@ -11401,8 +11433,7 @@ async fn connect_jump_host(
         }
     };
     // What ~/.ssh/config says about the bastion (its alias, agent, proxy).
-    let mut target = ConfigTarget::resolve(&host, port as u16, &user, jump_name).await;
-    let bastion_proxy = target.proxy(None);
+    let (target, bastion_proxy) = ConfigTarget::resolve_jump_host(&host, port, &user, jump_name).await?;
     for line in &target.log {
         log(line, "info");
     }
@@ -11787,7 +11818,7 @@ async fn diagnose_connect(
         })
         .map_err(|_| "Server not found".to_string())?
     };
-    let port = u16::try_from(row.port).map_err(|_| format!("Port {} isn't a valid port", row.port))?;
+    let port = valid_port(row.port)?;
 
     // The address an alias in ~/.ssh/config stands for, as the connect uses it.
     let mut target = ConfigTarget::resolve(&row.host, port, row.user.as_deref().unwrap_or(""), row.name).await;
@@ -11795,11 +11826,11 @@ async fn diagnose_connect(
         ConnectRoute::Jump(_) => {
             // The connect fails on its own when the jump host is gone.
             let Some(hop) = row.jump else { return Ok(Vec::new()) };
-            let jump_port = u16::try_from(hop.port).map_err(|_| format!("Port {} isn't a valid port", hop.port))?;
             let label = hop.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| hop.host.clone());
-            let mut resolved = ConfigTarget::resolve(&hop.host, jump_port, hop.user.as_deref().unwrap_or(""), hop.name).await;
+            let (resolved, proxy) =
+                ConfigTarget::resolve_jump_host(&hop.host, hop.port, hop.user.as_deref().unwrap_or(""), hop.name).await?;
             // connect_jump_host takes the jump host's ProxyCommand when it has one.
-            if matches!(resolved.proxy(None), Some(ssh_config::Proxy::Command(_))) {
+            if matches!(proxy, Some(ssh_config::Proxy::Command(_))) {
                 diagnose::Route::Command
             } else {
                 diagnose::Route::Jump { name: label, host: resolved.host, port: resolved.port }
@@ -12151,7 +12182,7 @@ async fn initiate_connection(
         } else {
             db_state.conn.lock().ok().and_then(|g| g.as_ref().and_then(|c| server_display_name(c, server_id)))
         };
-        let port = u16::try_from(port).map_err(|_| format!("Port {port} isn't a valid port"))?;
+        let port = valid_port(port)?;
         ConfigTarget::resolve(&host, port, &user, name).await
     };
     // Its jump host, proxy or ProxyCommand (see connect_route).
@@ -23840,7 +23871,7 @@ fn resolve_node_auth_row(
     Ok((
         monitor::NodeAuth {
             host,
-            port: port as u16,
+            port: valid_port(port)?,
             // Blank stays blank: connect_for_monitor reports it instead of
             // guessing root (#54).
             username,
