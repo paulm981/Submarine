@@ -677,3 +677,37 @@ fn a_vault_without_an_install_keeps_its_levels() {
     let kept: String = conn.query_row("SELECT value FROM sync_meta WHERE key = 'ai_trust_device'", [], |r| r.get(0)).unwrap();
     assert_eq!(kept, "another-install-id-0000000000000");
 }
+
+#[test]
+fn what_counts_as_loosened() {
+    let p = |level: u8, allow: &[&str], ask: &[&str]| Policy { level, allow: rules(allow), ask: rules(ask), windows: false, force_ask: None };
+    assert!(loosened(&p(1, &[], &[]), &p(1, &["uptime"], &[])).is_none(), "allow rules that do nothing at level 1");
+    assert_eq!(loosened(&p(2, &[], &[]), &p(2, &["uptime"], &[])), Some((1, vec![])));
+    assert_eq!(loosened(&p(1, &[], &[]), &p(3, &[], &[])), Some((0, vec![])));
+    assert_eq!(loosened(&p(2, &[], &["reboot"]), &p(2, &[], &[])), Some((0, rules(&["reboot"]))));
+    assert!(loosened(&p(3, &["x"], &[]), &p(2, &[], &["reboot"])).is_none(), "less is never held");
+}
+
+/// While a move is held, the server asks every time, has no allow rules,
+/// and keeps the always-ask rules it lost.
+#[test]
+fn a_held_move_asks_and_keeps_what_it_lost() {
+    let conn = vault();
+    conn.execute_batch(
+        "ALTER TABLE servers ADD COLUMN uuid TEXT; UPDATE servers SET uuid = 'u' || id;
+         CREATE TABLE held_approvals (uuid TEXT NOT NULL, item TEXT NOT NULL, since INTEGER NOT NULL, PRIMARY KEY (uuid, item));",
+    )
+    .unwrap();
+    set_level(&conn, "folder", 11, Some(3)).unwrap();
+    add_rule(&conn, "folder", 11, "allow", "uptime").unwrap();
+    let held = HeldPolicy { level: 3, allow: 1, lost: rules(&["systemctl stop *"]), moved: "web-01".into(), moved_folder: false, into: "Web".into() };
+    conn.execute("INSERT INTO held_approvals VALUES ('u1', ?1, 0)", [format!("{HELD_ITEM}{}", serde_json::to_string(&held).unwrap())]).unwrap();
+    let p = policy_for(&conn, Some(1));
+    assert_eq!((p.level, p.allow.len(), p.force_ask.as_deref()), (1, 0, Some(HELD_NOTE)));
+    assert!(p.ask.contains(&"systemctl stop *".to_string()));
+    assert_eq!(decide(&p, true, "uptime"), Decision::Ask { rule: None });
+    // Setting the server's level yourself lets it go.
+    set_level(&conn, "server", 1, Some(2)).unwrap();
+    let p = policy_for(&conn, Some(1));
+    assert_eq!((p.level, p.force_ask), (2, None));
+}

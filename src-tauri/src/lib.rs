@@ -1290,6 +1290,10 @@ fn apply_remote_inner(
     // of the merge's transaction: if it can't be recorded, nothing lands.
     let approvals_ready = approvals::ready(&tx);
     let shared = approvals_ready && approvals::profile_is_shared(&tx);
+    // And a move (a server's folder, a folder's parent) that lets the AI do
+    // more on a server here is held too (ai/trust.rs): each server's AI
+    // policy as it is before the merge, to compare with after it.
+    let ai_before = if shared { ai::trust::before_sync(&tx) } else { None };
     for spec in ENTITIES {
         let watch = shared && approvals::watches(spec.table);
         for rec in records.iter().filter(|r| !r.deleted && r.entity_type == spec.table) {
@@ -1356,6 +1360,11 @@ fn apply_remote_inner(
         [],
     )
     .map_err(|e| format!("[SYNC] RDP_FOLDER_FIXUP: {e}"))?;
+    // Everything in place: hold each server whose AI policy the merge
+    // loosened, until this device's user allows it.
+    if let Some(before) = ai_before {
+        ai::trust::hold_loosened(&tx, before)?;
+    }
     // Not toward the size the vault can no longer be saved or opened at. An
     // honest server never sends that much, so none of it lands.
     let size_after = vault_bytes(&tx)?;
@@ -3812,6 +3821,103 @@ mod sync_engine_tests {
         approvals::create_schema(&c).unwrap();
         apply_remote_records(&c, &KEY, &recs, &hc).unwrap();
         assert!(approvals::held_by_server(&c).is_empty(), "a personal profile holds nothing");
+    }
+
+    // A co-member's move that lets the AI do more on a server here (into a
+    // folder this device set to "Run anything", or a folder moved there) is
+    // held until this device's user allows it; one that changes nothing for
+    // the AI isn't, and neither is anything in a personal profile.
+    #[test]
+    fn a_shared_profile_holds_a_move_that_loosens_the_ai_s_level() {
+        let (a, _ha) = device("A");
+        a.execute_batch(
+            "INSERT INTO folders(name) VALUES('Prod'), ('Lab'), ('Quiet');
+             INSERT INTO servers(name,host,port,folder_id) VALUES('db-01','h',22,(SELECT id FROM folders WHERE name='Prod'));",
+        )
+        .unwrap();
+        let (b, hb) = device("B");
+        approvals::create_schema(&b).unwrap();
+        ai::trust::create_schema(&b, "this-install-0000").unwrap();
+        b.execute("INSERT INTO sync_meta(key,value) VALUES('share_id','s1')", []).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let id_of = |c: &Connection, t: &str, n: &str| -> i64 { c.query_row(&format!("SELECT id FROM {t} WHERE name=?1"), [n], |r| r.get(0)).unwrap() };
+        let (db, lab) = (id_of(&b, "servers", "db-01"), id_of(&b, "folders", "Lab"));
+        let uuid: String = b.query_row("SELECT uuid FROM servers WHERE id=?1", [db], |r| r.get(0)).unwrap();
+        ai::trust::set_level(&b, "folder", lab, Some(3)).unwrap();
+        let held = |b: &Connection| -> Vec<String> { approvals::held_for(b, &uuid).into_iter().collect() };
+        let sync = |a: &Connection, b: &Connection| apply_remote_records(b, &KEY, &collect_local_records(a, &KEY, "").unwrap(), &hb).unwrap();
+
+        // Into a folder nobody set anything on: nothing to hold.
+        a.execute("UPDATE servers SET folder_id=(SELECT id FROM folders WHERE name='Quiet') WHERE name='db-01'", []).unwrap();
+        sync(&a, &b);
+        assert!(held(&b).is_empty());
+        // Into Lab, at "Run anything" here: held, and every command asks.
+        a.execute("UPDATE servers SET folder_id=(SELECT id FROM folders WHERE name='Lab') WHERE name='db-01'", []).unwrap();
+        sync(&a, &b);
+        let items = held(&b);
+        assert_eq!(items.len(), 1, "{items:?}");
+        let h: ai::trust::HeldPolicy = serde_json::from_str(&items[0][ai::trust::HELD_ITEM.len()..]).unwrap();
+        assert_eq!((h.level, h.moved.as_str(), h.moved_folder, h.into.as_str()), (3, "db-01", false, "Lab"));
+        let p = ai::trust::policy_for(&b, Some(db));
+        assert_eq!(p.level, 1);
+        assert!(p.force_ask.is_some());
+        // Allowed, it's what Lab says.
+        approvals::allow(&b, &uuid, &[]).unwrap();
+        assert_eq!(ai::trust::policy_for(&b, Some(db)), ai::trust::Policy { level: 3, ..ai::trust::policy_for(&b, Some(db)) });
+        assert!(ai::trust::policy_for(&b, Some(db)).force_ask.is_none());
+
+        // Out again, then its old folder moved into Lab: held, naming the
+        // folder.
+        a.execute("UPDATE servers SET folder_id=(SELECT id FROM folders WHERE name='Prod') WHERE name='db-01'", []).unwrap();
+        sync(&a, &b);
+        assert!(held(&b).is_empty(), "a move that lets the AI do less isn't held");
+        a.execute("UPDATE folders SET parent_id=(SELECT id FROM folders WHERE name='Lab') WHERE name='Prod'", []).unwrap();
+        sync(&a, &b);
+        let h: ai::trust::HeldPolicy = serde_json::from_str(&held(&b)[0][ai::trust::HELD_ITEM.len()..]).unwrap();
+        assert_eq!((h.moved.as_str(), h.moved_folder, h.into.as_str()), ("Prod", true, "Lab"));
+        // Kept as it was: no longer held, and "Ask every time" here.
+        ai::trust::keep_as_it_was(&b, db).unwrap();
+        assert!(held(&b).is_empty());
+        let p = ai::trust::policy_for(&b, Some(db));
+        assert_eq!((p.level, p.force_ask.is_none()), (1, true));
+
+        // A personal profile holds nothing.
+        let (c, hc) = device("C");
+        approvals::create_schema(&c).unwrap();
+        ai::trust::create_schema(&c, "this-install-0000").unwrap();
+        a.execute("UPDATE folders SET parent_id=NULL WHERE name='Prod'", []).unwrap();
+        apply_remote_records(&c, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hc).unwrap();
+        ai::trust::set_level(&c, "folder", id_of(&c, "folders", "Lab"), Some(3)).unwrap();
+        a.execute("UPDATE servers SET folder_id=(SELECT id FROM folders WHERE name='Lab') WHERE name='db-01'", []).unwrap();
+        apply_remote_records(&c, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hc).unwrap();
+        assert!(approvals::held_by_server(&c).is_empty());
+    }
+
+    // A move out of a folder set to "Ask every time", where every server
+    // runs anything, is held too.
+    #[test]
+    fn a_move_out_of_a_careful_folder_is_held() {
+        let (a, _ha) = device("A");
+        a.execute_batch(
+            "INSERT INTO folders(name) VALUES('Prod');
+             INSERT INTO servers(name,host,port,folder_id) VALUES('db-01','h',22,(SELECT id FROM folders WHERE name='Prod'));",
+        )
+        .unwrap();
+        let (b, hb) = device("B");
+        approvals::create_schema(&b).unwrap();
+        ai::trust::create_schema(&b, "this-install-0000").unwrap();
+        b.execute("INSERT INTO sync_meta(key,value) VALUES('share_id','s1')", []).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let prod: i64 = b.query_row("SELECT id FROM folders WHERE name='Prod'", [], |r| r.get(0)).unwrap();
+        ai::trust::set_level(&b, "default", 0, Some(3)).unwrap();
+        ai::trust::set_level(&b, "folder", prod, Some(1)).unwrap();
+        a.execute("UPDATE servers SET folder_id=NULL WHERE name='db-01'", []).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let uuid: String = b.query_row("SELECT uuid FROM servers WHERE name='db-01'", [], |r| r.get(0)).unwrap();
+        let items: Vec<String> = approvals::held_for(&b, &uuid).into_iter().collect();
+        assert_eq!(items.len(), 1);
+        let h: ai::trust::HeldPolicy = serde_json::from_str(&items[0][ai::trust::HELD_ITEM.len()..]).unwrap();
+        assert_eq!((h.level, h.into.as_str()), (3, ""), "to the top level");
     }
 
     // A forward a co-member adds while this device has a session open on the
@@ -25931,7 +26037,7 @@ pub fn run() {
             local_term::local_terminal_resize, local_term::local_terminal_close,
             ai::ai_settings, ai::ai_set_enabled, ai::ai_state, ai::ai_share, ai::ai_unshare, ai::ai_stop, ai::ai_decide, ai::ai_output,
             ai::ai_set_flash, ai::ai_allow_session, ai::ai_allow_always, ai::ai_trust_view, ai::ai_trust_scope,
-            ai::ai_trust_set_level, ai::ai_trust_add_rule, ai::ai_trust_remove_rule, ai::ai_end_allow_all,
+            ai::ai_trust_set_level, ai::ai_trust_add_rule, ai::ai_trust_remove_rule, ai::ai_end_allow_all, ai::ai_keep_policy,
             ssh_info_probe_section, ssh_systemctl_action, ssh_kill_process,
             ssh_iptables_chain, ssh_nft_chain, ssh_firewall_as_root,
             applog::app_log, applog::ui_heartbeat, applog::open_log_folder, diagnostics_report,

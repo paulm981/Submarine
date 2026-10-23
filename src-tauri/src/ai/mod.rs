@@ -1751,6 +1751,21 @@ pub async fn ai_allow_always(
     state.answer(id, Answer::Allow(BY_YOU.into()))
 }
 
+/// "Keep as it was" for a server whose policy a teammate's move loosened
+/// (trust::hold_loosened): it stays at "Ask every time" until you change it.
+#[tauri::command]
+pub async fn ai_keep_policy(state: tauri::State<'_, AiState>, db: tauri::State<'_, crate::DbState>, server_id: i64) -> Result<(), String> {
+    let what = with_vault(&db, |conn| {
+        trust::keep_as_it_was(conn, server_id)?;
+        Ok(format!("{}: kept as it was after a teammate's move ({})", trust::describe(conn, "server", server_id), LEVEL_NAMES[0]))
+    })?;
+    crate::save_vault_internal(&db)?;
+    state.log_setting(what);
+    state.end_allow_all(|x| x.server_id == Some(server_id), "kept as it was after a teammate's move");
+    state.changed();
+    Ok(())
+}
+
 /// Everything set, for Settings › AI tools.
 #[tauri::command]
 pub async fn ai_trust_view(db: tauri::State<'_, crate::DbState>) -> Result<trust::TrustView, String> {

@@ -621,6 +621,17 @@ function DesktopApp() {
     }
     await refreshServers();
   }, [addLog, refreshServers]);
+  // A teammate's move that let the AI do more on a server, kept as it was:
+  // the server stays at "Ask every time" here until it's changed (#115).
+  const keepAiPolicy = useCallback(async (serverId: number) => {
+    try {
+      await invoke("ai_keep_policy", { serverId });
+      addLog("The AI asks before every command on that server, as before.", "success");
+    } catch (e) {
+      addLog(`AI_KEEP_FAILED: ${e}`, "error");
+    }
+    await refreshServers();
+  }, [addLog, refreshServers]);
   const refreshCredentials = useCallback(async () => {
     try { setCredentials((await invoke("get_credentials")) as any[]); }
     catch (e) { addLog(`SYNC_CREDENTIALS: ${e}`, "error"); }
@@ -2730,6 +2741,7 @@ function DesktopApp() {
                 onQuickConnect={() => setIsQuickConnectOpen(true)}
                 onAllowHeld={allowHeld}
                 onKeepSsh={keepServerSsh}
+                onKeepAi={keepAiPolicy}
                 keyChange={shareKeyChange}
                 onAcceptKey={acceptShareKey}
                 heldDeletions={heldDeletions}
