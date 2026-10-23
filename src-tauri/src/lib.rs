@@ -17453,7 +17453,7 @@ fn root_probe_command(tool: &str, password: bool, args: &[String]) -> String {
     let mut env = root_tool_env(tool);
     env.push(("SUB_MODE", if password { "pw" } else { "n" }.to_string()));
     let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    remote_sh::sh_command_with("/bin/sh", &env, ROOT_PROBE_SCRIPT, args)
+    remote_sh::sh_command_encoded("/bin/sh", &env, ROOT_PROBE_SCRIPT, args)
 }
 
 /// Run a probe that may get the password: it goes only once the script has
@@ -17682,7 +17682,8 @@ exit $?"#
 );
 
 /// The command that runs `words` as root with `tool` (ROOT_EXEC_SCRIPT),
-/// under /bin/sh.
+/// under /bin/sh. The words go as octal (remote_sh::sh_command_encoded), so
+/// a command with `!` or a line break reaches it from a csh or tcsh login.
 fn root_exec_command(tool: &str, tag: &str, password: bool, pty: bool, stderr_to_stdout: bool, words: &[String]) -> String {
     let mut env = root_tool_env(tool);
     env.push(("SUB_TAG", tag.to_string()));
@@ -17696,7 +17697,7 @@ fn root_exec_command(tool: &str, tag: &str, password: bool, pty: bool, stderr_to
         env.push(("SUB_ERR", "1".into()));
     }
     let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    remote_sh::sh_command_with("/bin/sh", &env, ROOT_EXEC_SCRIPT, words)
+    remote_sh::sh_command_encoded("/bin/sh", &env, ROOT_EXEC_SCRIPT, words)
 }
 
 /// What root_feed gives a channel running ROOT_EXEC_SCRIPT.

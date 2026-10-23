@@ -1484,6 +1484,16 @@ mod root {
         assert!(r.s.kept_root("local-1", "sess-1").is_some_and(|k| k.0.password.is_some()));
     }
 
+    /// A command with `!`, quotes and a line break runs as root as written,
+    /// from a tcsh login (the labs' login shell where it's installed).
+    #[tokio::test]
+    async fn any_command_reaches_root_from_a_csh_login() {
+        let r = root_state(&[("none", "all nopasswd")], policy(3, &[], &[])).await;
+        r.s.share("local-1", "sess-1", "xyz").unwrap();
+        let a = ask(&r.s, "local-1", "xyz", "echo 'hi!' \"it's\"\necho two", true).await.unwrap();
+        assert!(a.text.ends_with("--- output ---\nhi! it's\ntwo\n"), "{}", a.text);
+    }
+
     /// The password is kept for one AI tab and one server: another AI tab
     /// on the same server, or the same AI tab on another server, is asked.
     #[tokio::test]
