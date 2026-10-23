@@ -379,7 +379,7 @@ static ROOT_RE: LazyLock<regex::Regex> =
 impl Parsed {
     pub(crate) fn new(command: &str) -> Parsed {
         let cut = |t: &str, read: &dyn Fn(&str) -> Vec<String>| -> Vec<Vec<String>> {
-            t.split(|c: char| matches!(c, ';' | '&' | '|' | '\n' | '\r' | '(' | ')' | '{' | '}' | '`')).map(read).filter(|w| !w.is_empty()).collect()
+            t.split([';', '&', '|', '\n', '\r', '(', ')', '{', '}', '`']).map(read).filter(|w| !w.is_empty()).collect()
         };
         let readings = collapsed(command);
         let mut words_ = vec![words(command)];
