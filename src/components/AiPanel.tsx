@@ -439,7 +439,7 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
                             title={`Everything is allowed on ${s.name} until ${t.label} closes. Click to end it.`}
                             className="text-[10px] text-amber-300 hover:text-red-300 hover:underline"
                           >
-                            (everything allowed: end)
+                            · end allow everything
                           </NoFocusButton>
                         )}
                         <NoFocusButton
