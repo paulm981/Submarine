@@ -25928,7 +25928,7 @@ pub fn run() {
             local_term::local_terminal_resize, local_term::local_terminal_close,
             ai::ai_settings, ai::ai_set_enabled, ai::ai_state, ai::ai_share, ai::ai_unshare, ai::ai_stop, ai::ai_decide, ai::ai_output,
             ai::ai_set_flash, ai::ai_allow_session, ai::ai_allow_always, ai::ai_trust_view, ai::ai_trust_scope,
-            ai::ai_trust_set_level, ai::ai_trust_add_rule, ai::ai_trust_remove_rule,
+            ai::ai_trust_set_level, ai::ai_trust_add_rule, ai::ai_trust_remove_rule, ai::ai_end_allow_all,
             ssh_info_probe_section, ssh_systemctl_action, ssh_kill_process,
             ssh_iptables_chain, ssh_nft_chain, ssh_firewall_as_root,
             applog::app_log, applog::ui_heartbeat, applog::open_log_folder, diagnostics_report,

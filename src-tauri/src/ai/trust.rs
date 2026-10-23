@@ -454,6 +454,7 @@ fn flags_match(want: &[String], command: &Parsed) -> bool {
 /// It doesn't catch a command that builds the name as it runs
 /// (`$(echo re)boot`, base64): the always-ask list is a safety net, not a
 /// wall.
+#[cfg(test)]
 pub(crate) fn ask_matches(rule: &str, command: &str) -> bool {
     ask_matches_parsed(rule, &Parsed::new(command))
 }
@@ -941,6 +942,16 @@ pub(crate) fn remove_rule(conn: &Connection, rule_id: i64) -> Result<Option<Rule
     let row = rules_where(conn, "WHERE id = ?1", &[&rule_id])?.into_iter().next();
     conn.execute("DELETE FROM ai_rules WHERE id = ?1", [rule_id]).map_err(db("AI_RULE_REMOVE"))?;
     Ok(row)
+}
+
+/// Whether a level set on `scope` `id` reaches `server_id`: its own, one of
+/// its folders', or the default.
+pub(crate) fn reaches(conn: &Connection, server_id: Option<i64>, scope: &str, id: i64) -> bool {
+    match scope {
+        "default" => true,
+        "server" => server_id == Some(id),
+        _ => chain(conn, server_id).map(|c| c.contains(&("folder", id))).unwrap_or(true),
+    }
 }
 
 /// What a scope is called, for the audit log.

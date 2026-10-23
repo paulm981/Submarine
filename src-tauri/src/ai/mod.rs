@@ -996,6 +996,51 @@ impl AiState {
         result
     }
 
+    /// "Allow everything here" ends for the shared servers `which` picks,
+    /// in every AI tab. Returns how many it was on for.
+    fn end_allow_all(&self, which: impl Fn(&SharedServer) -> bool, why: &str) -> usize {
+        self.end_allow_all_where(|_, x| which(x), Some(why))
+    }
+
+    /// The same, `which` given the AI tab's id too; `why` for the log.
+    fn end_allow_all_where(&self, which: impl Fn(&str, &SharedServer) -> bool, why: Option<&str>) -> usize {
+        let mut ended = Vec::new();
+        {
+            let mut s = self.lock();
+            for t in s.tabs.iter_mut() {
+                let tab_id = t.id.clone();
+                for x in t.servers.iter_mut().filter(|x| x.allow_all && which(&tab_id, x)) {
+                    x.allow_all = false;
+                    ended.push((t.label.clone(), x.name.clone()));
+                }
+            }
+        }
+        for (label, server) in &ended {
+            let mut e = audit::Entry::new("allow_everything_ended", label);
+            e.server = Some(server.clone());
+            e.by = Some(BY_YOU);
+            e.note = why.map(str::to_string);
+            self.audit(e);
+        }
+        if !ended.is_empty() {
+            self.changed();
+        }
+        ended.len()
+    }
+
+    /// End it for one server in one AI tab.
+    fn end_allow_all_in(&self, tab_id: &str, session_id: &str) -> usize {
+        self.end_allow_all_where(|t, x| t == tab_id && x.session_id == session_id, None)
+    }
+
+    /// The saved servers shared with any AI tab, by local id.
+    fn shared_server_ids(&self) -> Vec<Option<i64>> {
+        let mut ids: Vec<Option<i64>> = self.lock().tabs.iter().flat_map(|t| t.servers.iter().map(|x| x.server_id)).collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
     /// A line in the audit log for a change you made to the levels or
     /// rules.
     fn log_setting(&self, note: String) {
@@ -1624,6 +1669,16 @@ pub async fn ai_decide(state: tauri::State<'_, AiState>, id: u64, allow: bool, n
     }
 }
 
+/// End "Allow everything here" for a server shared with an AI tab.
+#[tauri::command]
+pub async fn ai_end_allow_all(state: tauri::State<'_, AiState>, tab_id: String, session_id: String) -> Result<(), String> {
+    let n = state.end_allow_all_in(&tab_id, &session_id);
+    if n == 0 {
+        return Err("Everything wasn't allowed there.".into());
+    }
+    Ok(())
+}
+
 /// "Allow everything here until this AI tab closes", from the card.
 #[tauri::command]
 pub async fn ai_allow_session(state: tauri::State<'_, AiState>, id: u64) -> Result<(), String> {
@@ -1715,12 +1770,16 @@ pub async fn ai_trust_set_level(
     id: i64,
     level: Option<u8>,
 ) -> Result<(), String> {
-    let what = with_vault(&db, |conn| {
+    let shared = state.shared_server_ids();
+    let (what, reached) = with_vault(&db, |conn| {
         trust::set_level(conn, &scope, id, level)?;
-        Ok(format!("{}: {}", trust::describe(conn, &scope, id), level_name(level)))
+        let reached: Vec<Option<i64>> = shared.into_iter().filter(|sid| trust::reaches(conn, *sid, &scope, id)).collect();
+        Ok((format!("{}: {}", trust::describe(conn, &scope, id), level_name(level)), reached))
     })?;
     crate::save_vault_internal(&db)?;
     state.log_setting(what);
+    // A level you set now holds, not "Allow everything here" from before.
+    state.end_allow_all(|x| reached.contains(&x.server_id), "its approval level was changed");
     state.changed();
     Ok(())
 }

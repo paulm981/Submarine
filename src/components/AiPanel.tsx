@@ -433,6 +433,15 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
                     {t.servers.map((s) => (
                       <span key={s.session_id} className="inline-flex items-center gap-0.5">
                         <NoFocusButton onPick={() => onGoToServer(s.session_id)} className="text-zinc-300 hover:text-white hover:underline">{s.name}</NoFocusButton>
+                        {s.allow_all && (
+                          <NoFocusButton
+                            onPick={() => run("ai_end_allow_all", { tabId: t.id, sessionId: s.session_id })}
+                            title={`Everything is allowed on ${s.name} until ${t.label} closes. Click to end it.`}
+                            className="text-[10px] text-amber-300 hover:text-red-300 hover:underline"
+                          >
+                            (everything allowed: end)
+                          </NoFocusButton>
+                        )}
                         <NoFocusButton
                           onPick={() => run("ai_unshare", { sessionId: s.session_id, tabId: t.id })}
                           title={`Stop sharing ${s.name} with ${t.label}`}

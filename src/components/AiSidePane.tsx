@@ -380,6 +380,16 @@ const ShareLine = ({ v, tab, shared, starting, onShare, onUnshare }: {
   return (
     <div className="shrink-0 px-3 py-1.5 flex items-center gap-2 border-b border-white/5 text-[11px] text-zinc-400">
       <span className="flex-1 min-w-0 leading-snug">{text}</span>
+      {here?.allow_all && (
+        <button
+          type="button"
+          onClick={() => { invoke("ai_end_allow_all", { tabId: tab.id, sessionId: here.session_id }).catch(() => {}); }}
+          title={`Stop allowing everything on this tab for ${tab.label}: its commands go back to this server's approval level`}
+          className="shrink-0 h-6 px-2 rounded border border-white/10 text-zinc-300 text-[10px] font-bold tracking-wide hover:border-red-400/50 hover:text-red-300"
+        >
+          End allow everything
+        </button>
+      )}
       {here && marker && (
         <button
           type="button"

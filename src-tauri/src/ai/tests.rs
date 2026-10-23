@@ -682,6 +682,33 @@ async fn unreadable_settings_ask_even_with_everything_allowed() {
     req.await.unwrap();
 }
 
+/// "Allow everything here" ends from its button, and when a level that
+/// reaches the server is set (end_allow_all, as ai_trust_set_level does).
+#[tokio::test]
+async fn allow_everything_can_be_ended() {
+    let (s, _, _) = state_with_policy(policy(1, &[], &[]));
+    s.share_as("local-1", "sess-2", "abc", None, Some(8)).unwrap();
+    for name in ["xyz", "abc"] {
+        let s2 = s.clone();
+        let req = tokio::spawn(async move {
+            let (_c, cancel) = watch::channel(false);
+            s2.run_command("local-1", name, "uptime", None, cancel).await
+        });
+        wait_for("the request", || !s.snapshot().pending.is_empty()).await;
+        s.allow_session(s.snapshot().pending[0].id).unwrap();
+        req.await.unwrap();
+    }
+    let on = |name: &str| s.snapshot().tabs[0].servers.iter().find(|x| x.name == name).unwrap().allow_all;
+    assert!(on("xyz") && on("abc"));
+    assert_eq!(s.end_allow_all_in("local-1", "sess-1"), 1);
+    assert!(!on("xyz") && on("abc"));
+    assert_eq!(s.end_allow_all(|x| x.server_id == Some(8), "its approval level was changed"), 1);
+    assert!(!on("abc"));
+    let (req, p) = ask_for(&s, "uptime").await;
+    s.decide(p.id, false).unwrap();
+    req.await.unwrap();
+}
+
 /// The marker's level, per shared server, follows the settings as they
 /// change.
 #[tokio::test]

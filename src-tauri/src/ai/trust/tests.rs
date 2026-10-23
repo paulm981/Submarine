@@ -627,3 +627,13 @@ fn new_defaults_are_there_for_a_new_vault() {
         assert!(ask.contains(&r.to_string()), "{r}");
     }
 }
+
+#[test]
+fn which_servers_a_level_reaches() {
+    let conn = vault();
+    assert!(reaches(&conn, Some(1), "folder", 10), "a folder above its own");
+    assert!(reaches(&conn, Some(1), "folder", 11));
+    assert!(!reaches(&conn, Some(2), "folder", 10));
+    assert!(reaches(&conn, Some(2), "server", 2) && !reaches(&conn, Some(1), "server", 2));
+    assert!(reaches(&conn, None, "default", 0));
+}
