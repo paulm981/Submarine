@@ -1434,7 +1434,7 @@ mod root {
         r.s.decide(p.id, true).unwrap();
         let b = req.await.unwrap();
         assert!(b.text.ends_with("second\n"), "{}", b.text);
-        assert_eq!(r.labs[0].attempts(), after_first + 1, "one sign-in with the kept password");
+        assert_eq!(r.labs[0].attempts(), after_first + 2, "the check and the tool's own question, no ticket");
         let log = audit_lines(&r.dir);
         let notes: Vec<&str> = log.iter().filter(|l| l["event"] == "root_password").map(|l| l["note"].as_str().unwrap()).collect();
         assert_eq!(notes, ["the server asked for a root password", "the root password was refused (one attempt)"]);
@@ -1680,8 +1680,8 @@ mod root {
         r.s.share("local-1", "sess-1", "xyz").unwrap();
         let req = ask(&r.s, "local-1", "xyz", "sleep 30", true);
         r.s.allow_with_password(card(&r.s, PasswordAsk::Needed).await.id, PW).unwrap();
-        // Signed in (the look, then the run's own check): it runs.
-        wait_for("it to run as root", || r.labs[0].attempts() >= 2 && !r.s.snapshot().running.is_empty()).await;
+        // Signed in (the look, the run's check, the tool's question): it runs.
+        wait_for("it to run as root", || r.labs[0].attempts() >= 3 && !r.s.snapshot().running.is_empty()).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
         let t = Instant::now();
         r.s.stop_tab("local-1");

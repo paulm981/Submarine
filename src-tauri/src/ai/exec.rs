@@ -169,6 +169,11 @@ async fn collect(channel: &mut russh::Channel<client::Msg>, out: &mut Exec, cap:
 // kept by mod.rs in the server's place in its list, never in SshState, so
 // the AI tab and the server's own tab never share a root password.
 //
+// It uses no sudo ticket and leaves none (RootAccess::without_tickets, `-k`
+// everywhere): a sign-in of yours never counts for the AI, even where
+// tickets are shared across terminals (`timestamp_type=global`), and the
+// AI's own check of the password leaves nothing behind.
+//
 // The limits are the same as for any command: no terminal, nothing on
 // stdin but the password, the time limit (counted from the start, the look
 // for root included), the output cap, and Stop.
@@ -287,17 +292,19 @@ pub(crate) async fn run_root<H: client::Handler + 'static>(
         RootHow::Kept(a) => (a, false),
         RootHow::Typed(pw) => {
             let (h, w, p) = (handle.clone(), words.clone(), pw.clone());
-            match detached(&mut stop, deadline, async move { crate::find_root_with_password(&h, &w, &p).await }).await {
+            match detached(&mut stop, deadline, async move { crate::find_root_with_password(&h, &w, &p, true).await }).await {
                 Look::Stopped => return stopped(false),
                 Look::TimedOut => return stopped(true),
-                Look::Done(Ok((tool, shell))) => (Arc::new(RootAccess::new(tool, Some(pw), shell, Some(std::time::Instant::now()))), true),
+                Look::Done(Ok((tool, shell))) => {
+                    (Arc::new(RootAccess::new(tool, Some(pw), shell, Some(std::time::Instant::now())).without_tickets()), true)
+                }
                 Look::Done(Err(e)) if e == crate::SUDO_WRONG_PASSWORD => return RootRun::WrongPassword(None),
                 Look::Done(Err(e)) => return failed(&e),
             }
         }
         RootHow::Find => {
             let (h, w) = (handle.clone(), words.clone());
-            match detached(&mut stop, deadline, async move { crate::find_root_without_password(&h, &w).await }).await {
+            match detached(&mut stop, deadline, async move { crate::find_root_without_password(&h, &w, true).await }).await {
                 Look::Stopped => return stopped(false),
                 Look::TimedOut => return stopped(true),
                 Look::Done(Ok(a)) => (Arc::new(a), true),
@@ -388,12 +395,20 @@ pub(crate) async fn run_root<H: client::Handler + 'static>(
             None if out.stopped || out.timed_out || out.cut => out.output.clear(),
             None => return failed(&crate::classify_tool_output(&text)),
         }
-    } else if access.password.is_none() && access.shell.is_none() && out.exit_status.is_some_and(|c| c != 0) {
+    } else if access.shell.is_none() && out.exit_status.is_some_and(|c| c != 0) {
         // `-l` says yes without a password where any of the login's rules
         // has NOPASSWD (sudo's `listpw`), even for a command that needs one;
         // running it says so, and nothing ran.
         if crate::tool_answer(&String::from_utf8_lossy(&out.output)).as_deref() == Some(crate::SUDO_NEED_PASSWORD) {
-            return RootRun::NeedPassword(Some(tool));
+            if access.password.is_none() {
+                return RootRun::NeedPassword(Some(tool));
+            }
+            // With a password: it ran with `-n -k`, as the rules said it
+            // needed none, and the password was never typed.
+            return RootRun::Failed {
+                you: format!("{tool} said this command needs no password, then asked for one to run it, so Submarine didn't type it."),
+                ai: format!("Couldn't run it as root: {tool} asked for a password Submarine doesn't type there."),
+            };
         }
     }
     RootRun::Ran(out, new_access())
