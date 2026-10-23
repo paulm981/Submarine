@@ -149,7 +149,7 @@ export const TrustEditor = ({ target }: { target: AiTrustTarget }) => {
       <RuleList kind="allow" rules={view.rules} target={target} inherited={view.inherited_allow} onChange={reload} />
       <RuleList kind="ask" rules={view.rules} target={target} inherited={view.inherited_ask} onChange={reload} />
       <p className="text-[11px] text-zinc-500 leading-snug">
-        Kept on this computer only, never synced, and only you can change it: the AI can't.
+        Kept on this computer only, never synced and not in profile files, and only you can change it: the AI can't.
       </p>
     </div>
   );

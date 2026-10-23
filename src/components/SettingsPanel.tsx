@@ -361,6 +361,7 @@ function AiToolsSettings() {
         <div className="text-sm font-semibold text-zinc-100">How much the AI may run without asking</div>
         <p className="text-[11.5px] text-zinc-500 leading-relaxed">
           Kept on this computer only: never synced, so a shared profile can't change it, and the AI can't either.
+          A profile file exported or copied to another computer arrives asking every time, with only its always-ask list.
           Whatever you choose, every command is in the AI panel and the audit log, and Stop ends it.
         </p>
         <AiTrustOverview />
