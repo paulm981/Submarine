@@ -17873,7 +17873,6 @@ async fn root_channel_open<H: russh::client::Handler>(
     pty: Option<(u32, u32)>,
     hook: Option<TurnHook<'_>>,
 ) -> Result<(russh::Channel<russh::client::Msg>, Option<&'static str>, Vec<u8>), String> {
-    let tool = if ELEVATION_TOOLS.contains(&access.tool) { access.tool } else { "sudo" };
     let mut channel = {
         let session = session_arc.lock().await;
         session.channel_open_session().await.map_err(|e| e.to_string())?
@@ -17884,11 +17883,36 @@ async fn root_channel_open<H: russh::client::Handler>(
             .await
             .map_err(|e| e.to_string())?;
     }
+    // From here a failure closes the channel: a dropped one stays open on the
+    // server, with whatever the tool started in it.
+    match root_channel_start(&mut channel, access, args, pty.is_some(), hook).await {
+        Ok((marker, early)) => Ok((channel, marker, early)),
+        Err(e) => {
+            let _ = channel.close().await;
+            Err(e)
+        }
+    }
+}
+
+/// Start `args` as root with `access` on `channel`, open and with nothing
+/// run on it yet (with a terminal when `pty`): ROOT_EXEC_SCRIPT, fed by
+/// root_feed. Returns, through a root shell without a terminal, the marker
+/// the command's output starts after (ROOT_STREAM_MARKER), and what the
+/// command already wrote as it started. On a failure the caller closes the
+/// channel. The AI's root commands start this way too (ai/exec.rs).
+async fn root_channel_start(
+    channel: &mut russh::Channel<russh::client::Msg>,
+    access: &ssh_manager::RootAccess,
+    args: &[String],
+    pty: bool,
+    hook: Option<TurnHook<'_>>,
+) -> Result<(Option<&'static str>, Vec<u8>), String> {
+    let tool = if ELEVATION_TOOLS.contains(&access.tool) { access.tool } else { "sudo" };
     let tag = new_root_tag();
     let password = access.password.as_ref().map(|p| p.as_str());
     let (words, line, marker) = match access.shell.filter(|s| ROOT_SHELL_FORMS.contains(s)) {
         Some(form) => {
-            let script = if pty.is_some() {
+            let script = if pty {
                 // In a terminal the line given to the root shell shows as it's
                 // typed; the screen is cleared before the command starts.
                 format!("printf '\\033[H\\033[2J\\033[3J'; exec {}", remote_sh::quote_words(args))
@@ -17896,24 +17920,17 @@ async fn root_channel_open<H: russh::client::Handler>(
                 format!("echo {}$(id -u); exec {} 2>&1", ROOT_STREAM_MARKER, remote_sh::quote_words(args))
             };
             let words: Vec<String> = form.split(' ').map(String::from).collect();
-            (words, root_shell_line(&script), pty.is_none().then_some(ROOT_STREAM_MARKER))
+            (words, root_shell_line(&script), (!pty).then_some(ROOT_STREAM_MARKER))
         }
         None => (args.to_vec(), String::new(), None),
     };
     // Without a terminal, what the tool says when it refuses comes on
     // stderr, which a stream doesn't read: it goes to stdout.
-    let command = root_exec_command(tool, &tag, password.is_some(), pty.is_some(), pty.is_none(), &words);
+    let command = root_exec_command(tool, &tag, password.is_some(), pty, !pty, &words);
     channel.exec(true, command.as_bytes()).await.map_err(|e| e.to_string())?;
-    // From here a failure closes the channel: a dropped one stays open on the
-    // server, with whatever the tool started in it.
-    let feed = RootFeed { tag: &tag, password, then: line.as_bytes(), end: pty.is_none(), pty: pty.is_some() };
-    match root_feed(&mut channel, feed, hook).await {
-        Ok(early) => Ok((channel, marker, early)),
-        Err(e) => {
-            let _ = channel.close().await;
-            Err(e)
-        }
-    }
+    let feed = RootFeed { tag: &tag, password, then: line.as_bytes(), end: !pty, pty };
+    let early = root_feed(channel, feed, hook).await?;
+    Ok((marker, early))
 }
 
 /// How long a kept password that worked is taken to work still: calls with
@@ -18042,7 +18059,6 @@ async fn root_access_for(
     password: Option<String>,
     use_known: bool,
 ) -> Result<ssh_manager::RootAccess, String> {
-    use ssh_manager::RootAccess;
     let password = password.map(zeroize::Zeroizing::new).filter(|p| !p.is_empty());
     if let Some(p) = &password {
         if p.contains(['\n', '\r', '\0']) {
@@ -18053,10 +18069,6 @@ async fn root_access_for(
     if let Some(pw) = password {
         return typed_root_access(state, session_id, session_arc, args, pw).await;
     }
-    let keep = |a: &RootAccess| {
-        let a = a.clone();
-        async move { state.root_access.lock().await.insert(session_id.to_string(), a) }
-    };
     if use_known {
         if let Some(a) = known_root_access(state, session_id).await {
             // A root shell runs anything, and root_run checks it's still root
@@ -18075,15 +18087,26 @@ async fn root_access_for(
             forget_root_access(state, session_id, &a).await;
         }
     }
-    let mut best: Option<String> = None;
+    let a = find_root_without_password(session_arc, args).await.map_err(|(e, _)| e)?;
+    state.root_access.lock().await.insert(session_id.to_string(), a.clone());
+    Ok(a)
+}
+
+/// The first tool (ELEVATION_TOOLS) whose rules let it run `args` as root
+/// without a password, else, as SFTP root mode does (probe_sudo_sftp), a
+/// root shell without one (find_root_shell). Signs in nowhere: the rules are
+/// asked with `-n -l`, which runs nothing. `Err`: the [SUDO] code worth
+/// showing, and the tool that gave it (None for NO_SUDO).
+async fn find_root_without_password<H: russh::client::Handler>(
+    session_arc: &HandleArc<H>,
+    args: &[String],
+) -> Result<ssh_manager::RootAccess, (String, Option<&'static str>)> {
+    use ssh_manager::RootAccess;
+    let mut best: Option<(String, &'static str)> = None;
     let mut refused: Vec<&'static str> = Vec::new();
     for &tool in ELEVATION_TOOLS {
         match root_probe(session_arc, tool, None, args).await {
-            Ok(()) => {
-                let a = RootAccess::new(tool, None, None, None);
-                keep(&a).await;
-                return Ok(a);
-            }
+            Ok(()) => return Ok(RootAccess::new(tool, None, None, None)),
             Err(e) => {
                 if e == SUDO_NOT_ALLOWED {
                     refused.push(tool);
@@ -18091,21 +18114,21 @@ async fn root_access_for(
                 if e != SUDO_NO_SUDO {
                     crate::applog::write_line("root", &format!("{} may not run {} itself ({})", tool, args.first().map(String::as_str).unwrap_or(""), e));
                 }
-                if best.as_deref().is_none_or(|b| elevation_error_rank(&e) > elevation_error_rank(b)) {
-                    best = Some(e);
+                if best.as_ref().is_none_or(|(b, _)| elevation_error_rank(&e) > elevation_error_rank(b)) {
+                    best = Some((e, tool));
                 }
             }
         }
     }
-    // As SFTP root mode: a root shell without a password before asking for
-    // one (probe_sudo_sftp).
     if let Some((tool, form)) = find_root_shell(session_arc, &refused).await {
         crate::applog::write_line("root", &format!("as root through `{} {}`, no password", tool, form));
-        let a = RootAccess::new(tool, None, Some(form), None);
-        keep(&a).await;
-        return Ok(a);
+        return Ok(RootAccess::new(tool, None, Some(form), None));
     }
-    Err(best.unwrap_or_else(|| SUDO_NO_SUDO.into()))
+    Err(match best {
+        Some((e, _)) if e == SUDO_NO_SUDO => (e, None),
+        Some((e, tool)) => (e, Some(tool)),
+        None => (SUDO_NO_SUDO.into(), None),
+    })
 }
 
 /// The tab's gate for passwords the user types (ssh_manager::RootGate).
@@ -18164,22 +18187,7 @@ async fn typed_root_access<H: russh::client::Handler>(
     if let Some(a) = kept.filter(|a| a.password.as_ref().is_some_and(|p| p.as_str() == pw.as_str())) {
         return Ok(a);
     }
-    let found = async {
-        let mut refused: Vec<&'static str> = Vec::new();
-        for tool in ELEVATION_TOOLS {
-            match root_probe(session_arc, tool, Some(pw.as_str()), args).await {
-                Ok(()) => return Ok((*tool, None)),
-                Err(e) if e == SUDO_NO_SUDO => continue,
-                Err(e) if e == SUDO_NOT_ALLOWED => refused.push(*tool),
-                Err(e) => return Err(e),
-            }
-        }
-        match find_root_shell_with_password(session_arc, &refused, &pw).await? {
-            Some((tool, form)) => Ok((tool, Some(form))),
-            None => Err(SUDO_NOT_ALLOWED.to_string()),
-        }
-    }
-    .await;
+    let found = find_root_with_password(session_arc, args, &pw).await;
     match found {
         Ok((tool, shell)) => {
             gate.rejected = None;
@@ -18194,6 +18202,32 @@ async fn typed_root_access<H: russh::client::Handler>(
             }
             Err(e)
         }
+    }
+}
+
+/// How `args` run as root with the user's typed `pw`: the first tool that
+/// takes it and allows them, else a root shell through one that takes it but
+/// allows only that (`dzdo su -`, find_root_shell_with_password). A tool that
+/// isn't there or doesn't allow the user hands over to the next, and any
+/// other answer (a wrong password above all) ends it: a mistyped password is
+/// one failed attempt. Returns the tool and the root shell's words, if any.
+async fn find_root_with_password<H: russh::client::Handler>(
+    session_arc: &HandleArc<H>,
+    args: &[String],
+    pw: &zeroize::Zeroizing<String>,
+) -> Result<(&'static str, Option<&'static str>), String> {
+    let mut refused: Vec<&'static str> = Vec::new();
+    for tool in ELEVATION_TOOLS {
+        match root_probe(session_arc, tool, Some(pw.as_str()), args).await {
+            Ok(()) => return Ok((*tool, None)),
+            Err(e) if e == SUDO_NO_SUDO => continue,
+            Err(e) if e == SUDO_NOT_ALLOWED => refused.push(*tool),
+            Err(e) => return Err(e),
+        }
+    }
+    match find_root_shell_with_password(session_arc, &refused, pw).await? {
+        Some((tool, form)) => Ok((tool, Some(form))),
+        None => Err(SUDO_NOT_ALLOWED.to_string()),
     }
 }
 
@@ -19199,9 +19233,10 @@ mod elevated_sftp_tests {
 /// Root over a real SSH connection to a server that runs commands with this
 /// machine's shell (tcsh as the login shell where it's installed), with
 /// stand-ins for sudo and dzdo: `dzdo su -` with a password (#96), what a
-/// wrong one costs, and a NOPASSWD rule never getting the password.
+/// wrong one costs, and a NOPASSWD rule never getting the password. The AI's
+/// root commands are tested on the same stand-ins (ai/tests.rs).
 #[cfg(all(test, unix))]
-mod root_over_ssh_tests {
+pub(crate) mod root_over_ssh_tests {
     use super::*;
     use crate::ssh_test_server::{connect, ShellOpts, TestClient, TestServer};
     use std::os::unix::fs::PermissionsExt;
@@ -19216,7 +19251,7 @@ mod root_over_ssh_tests {
     /// password). Each password read is a line in `attempts`. Like sudo
     /// without a terminal, a sign-in leaves a ticket for the caller's
     /// process (its parent), which `-n` and `-v` then use; `-k` ignores it.
-    const FAKE_TOOL: &str = r#"#!/bin/sh
+    pub(crate) const FAKE_TOOL: &str = r#"#!/bin/sh
 D=$(dirname "$0")
 T=$(basename "$0")
 n=; p=; l=; v=; k=
@@ -19265,13 +19300,17 @@ if [ "$1" = su ]; then PATH="$D/root:$PATH" exec sh; fi
 exec "$@"
 "#;
 
-    struct Lab {
-        dir: PathBuf,
-        handle: HandleArc<TestClient>,
+    pub(crate) struct Lab {
+        pub(crate) dir: PathBuf,
+        pub(crate) handle: HandleArc<TestClient>,
+        /// The server's count of commands still running.
+        pub(crate) running: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl Lab {
-        async fn new(name: &str, dzdo: &str, sudo: &str) -> Lab {
+        /// A server whose dzdo and sudo follow `dzdo` and `sudo` (FAKE_TOOL's
+        /// rules), with the password `s3cret pass`.
+        pub(crate) async fn new(name: &str, dzdo: &str, sudo: &str) -> Lab {
             let dir = std::env::temp_dir().join(format!("sub-root-{}-{}", name, std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
@@ -19295,15 +19334,18 @@ exec "$@"
                 login,
                 keep_running_on_close: false,
             };
-            let session = connect(TestServer::with_shell(opts), |_| {}, build_ssh_client_config()).await.expect("in-process SSH connection");
-            Lab { dir, handle: Arc::new(tokio::sync::Mutex::new(session)) }
+            let server = TestServer::with_shell(opts);
+            let running = server.running.clone();
+            let session = connect(server, |_| {}, build_ssh_client_config()).await.expect("in-process SSH connection");
+            Lab { dir, handle: Arc::new(tokio::sync::Mutex::new(session)), running }
         }
 
-        fn set(&self, file: &str, value: &str) {
+        pub(crate) fn set(&self, file: &str, value: &str) {
             std::fs::write(self.dir.join(file), value).unwrap();
         }
 
-        fn attempts(&self) -> usize {
+        /// The passwords the tools have read.
+        pub(crate) fn attempts(&self) -> usize {
             std::fs::read_to_string(self.dir.join("attempts")).map(|s| s.lines().count()).unwrap_or(0)
         }
     }
