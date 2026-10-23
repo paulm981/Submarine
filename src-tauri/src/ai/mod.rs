@@ -419,6 +419,7 @@ fn now() -> String {
 /// another name, a script that calls sudo), so nothing may be allowed because it says no. Anything
 /// that has to keep root out (step 3 of #32: running as another account)
 /// must decide on its own `as_root` and treat "can't tell" as root.
+#[cfg(test)]
 pub(crate) fn asks_for_root(command: &str) -> bool {
     trust::asks_for_root(command)
 }

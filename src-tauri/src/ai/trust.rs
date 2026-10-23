@@ -579,6 +579,7 @@ pub(crate) fn mentions_root(command: &str) -> bool {
 /// sudoedit, dzdo, su, doas, pkexec, run0, runuser, `machinectl shell`),
 /// read as the always-ask list reads words, anywhere in it, or a glob that
 /// could name one.
+#[cfg(test)]
 pub(crate) fn asks_for_root(command: &str) -> bool {
     Parsed::new(command).root
 }
