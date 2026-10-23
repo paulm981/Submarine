@@ -816,3 +816,101 @@ fn globs_in_command_position_still_ask() {
     assert!(asks_for_root("env s?do id"));
     assert!(!asks_for_root("ls s*"));
 }
+
+// -- Requests as root (#120) ----------------------------------------------------
+
+/// A request as root counts as root: at levels 1 and 2 it always asks, and
+/// no allow rule runs it, whatever the command. At level 3, or with the
+/// session's "allow everything", it runs (with only what the AI tab already
+/// has for root: mod.rs). The always-ask list and settings on hold still
+/// ask.
+#[test]
+fn a_request_as_root_asks_but_at_run_anything() {
+    let allow = rules(&["docker ps *", "uptime", "*"]);
+    let p = |level| Policy { level, allow: allow.clone(), ask: rules(&["reboot"]), windows: false, force_ask: None };
+    for level in [ASK_EVERY_TIME, ALLOWED_COMMANDS] {
+        for cmd in ["docker ps -a", "uptime"] {
+            assert_eq!(decide_as(&p(level), false, cmd, true), ask(), "level {level}: {cmd}");
+        }
+    }
+    // The same commands, not as root, run at level 2.
+    assert_eq!(decide_as(&p(ALLOWED_COMMANDS), false, "uptime", false), Decision::Rule("uptime".into()));
+    assert_eq!(decide_as(&p(RUN_ANYTHING), false, "docker ps -a", true), Decision::Anything);
+    assert_eq!(decide_as(&p(ASK_EVERY_TIME), true, "docker ps -a", true), Decision::Session);
+    // The always-ask list, at every level and with the session's too.
+    for (level, session) in [(ASK_EVERY_TIME, false), (ALLOWED_COMMANDS, false), (RUN_ANYTHING, false), (ASK_EVERY_TIME, true)] {
+        assert_eq!(decide_as(&p(level), session, "reboot", true), Decision::Ask { rule: Some("reboot".into()) });
+    }
+    let held = Policy { force_ask: Some(UNREADABLE.into()), ..p(RUN_ANYTHING) };
+    assert_eq!(decide_as(&held, true, "uptime", true), ask());
+}
+
+#[test]
+fn a_request_as_root_that_only_opens_a_shell_is_seen() {
+    for cmd in [
+        "sudo -i",
+        "sudo -s",
+        "dzdo -i",
+        "sudo -u root -i",
+        "su",
+        "su -",
+        "dzdo su -",
+        "sudo su - root",
+        "bash",
+        "bash -l",
+        "sudo bash",
+        "/bin/sh",
+        "sh -s",
+        "pkexec",
+        "run0",
+        "machinectl shell",
+        "uptime; sudo -i",
+        "LANG=C su",
+    ] {
+        assert!(Parsed::new(cmd).opens_shell(), "{cmd}");
+    }
+    for cmd in [
+        "docker ps -a",
+        "sudo docker ps -a",
+        "sudo -i docker ps",
+        "sudo -u postgres psql -c 'select 1'",
+        "su -c 'id' root",
+        "su - root -c id",
+        "bash -c 'id'",
+        "bash script.sh",
+        "sh -lc id",
+        "cat /etc/shadow",
+        "machinectl list",
+        "echo sudo -i",
+    ] {
+        assert!(!Parsed::new(cmd).opens_shell(), "{cmd}");
+    }
+}
+
+/// A plain simple command runs as root as its words (so a sudoers rule for
+/// that program allows it); anything a shell would read otherwise goes
+/// through `sh -c`.
+#[test]
+fn plain_commands_run_as_their_words() {
+    let w = |s: &str| plain_words(s).map(|v| v.join("|"));
+    assert_eq!(w("docker ps -a").as_deref(), Some("docker|ps|-a"));
+    assert_eq!(w("  systemctl status   nginx ").as_deref(), Some("systemctl|status|nginx"));
+    assert_eq!(w("journalctl -u nginx --since=today -n 50").as_deref(), Some("journalctl|-u|nginx|--since=today|-n|50"));
+    for cmd in [
+        "docker ps | head",
+        "echo 'a b'",
+        "ls *.log",
+        "cat ~/x",
+        "echo $HOME",
+        "ls # c",
+        "A=1 env",
+        "cd /var/log",
+        "echo a\\ b",
+        "ls\u{a0}-la",
+        "ls\t-la",
+        "uptime\nid",
+        "",
+    ] {
+        assert_eq!(plain_words(cmd), None, "{cmd:?}");
+    }
+}

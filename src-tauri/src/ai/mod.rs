@@ -1190,7 +1190,7 @@ impl AiState {
                 let parsed = (cmd.len() <= MAX_COMMAND && !cmd.contains('\0')).then(|| trust::Parsed::new(&cmd));
                 let policy = looked_up.map(|(id, _)| lookup(id));
                 let early = match (&policy, &parsed, looked_up) {
-                    (Some(p), Some(c), Some((_, allow_all))) => trust::decide_parsed(p, allow_all, c),
+                    (Some(p), Some(c), Some((_, allow_all))) => trust::decide_parsed(p, allow_all, c, false),
                     _ => trust::Decision::Ask { rule: None },
                 };
                 (parsed.is_some_and(|p| p.root), policy, early)

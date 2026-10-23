@@ -526,7 +526,97 @@ impl Parsed {
             });
         Parsed { command: command.to_string(), commands, root }
     }
+
+    /// It only opens a shell, which a request as root (#120) can't use: it
+    /// runs one command, with no terminal and nothing on stdin, so a shell
+    /// would end at once. `sudo -i`, `sudo -s`, `dzdo su -`, `su` without
+    /// `-c`, `machinectl shell`, or a shell with no command or script
+    /// (`bash`, `sudo bash -l`), as any of the simple commands in it. Read
+    /// plainly. Not a safety check: it only tells the AI to send the command
+    /// itself.
+    pub(crate) fn opens_shell(&self) -> bool {
+        self.commands.first().is_some_and(|cmds| cmds.iter().any(|c| opens_shell(c)))
+    }
 }
+
+/// The shells that start interactive with no command or script.
+const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ash", "ksh", "mksh", "csh", "tcsh", "fish"];
+
+/// sudo's, dzdo's and doas's options that take the next word.
+const ROOT_OPTIONS_WITH_A_VALUE: &[&str] = &["-u", "-g", "-p", "-c", "-h", "-r", "-t", "-d", "-a"];
+
+/// Whether one simple command (its words, read plainly) only opens a shell.
+fn opens_shell(words: &[Word]) -> bool {
+    let name = |w: &str| forms(w).last().map(|f| f.to_string()).unwrap_or_default();
+    let mut i = words.iter().position(|(w, _)| !is_assignment(w)).unwrap_or(words.len());
+    while let Some((w, _)) = words.get(i) {
+        let n = name(w);
+        match n.as_str() {
+            "sudo" | "dzdo" | "doas" | "run0" | "pkexec" => {
+                // Its options, then what it runs: nothing at all, after -i or
+                // -s, is a shell.
+                let mut shell = false;
+                i += 1;
+                while let Some((o, _)) = words.get(i) {
+                    if o == "--" {
+                        i += 1;
+                        break;
+                    }
+                    if !o.starts_with('-') {
+                        break;
+                    }
+                    if o == "--login" || o == "--shell" || (!o.starts_with("--") && o.contains(['i', 's'])) {
+                        shell = true;
+                    }
+                    i += if ROOT_OPTIONS_WITH_A_VALUE.contains(&o.as_str()) { 2 } else { 1 };
+                }
+                if i >= words.len() {
+                    return shell || n == "run0" || n == "pkexec";
+                }
+            }
+            // A shell unless it's given a command.
+            "su" | "runuser" => {
+                return !words[i + 1..].iter().any(|(o, _)| {
+                    o == "-c" || o.starts_with("--command") || o == "--session-command" || (o.starts_with('-') && !o.starts_with("--") && o.ends_with('c'))
+                });
+            }
+            "machinectl" => return words.get(i + 1).is_some_and(|(o, _)| o == "shell"),
+            s if SHELLS.contains(&s) => {
+                let rest = &words[i + 1..];
+                let command = rest.iter().any(|(o, _)| o.starts_with('-') && !o.starts_with("--") && o.contains('c'));
+                let script = rest.iter().any(|(o, _)| !o.starts_with('-') && !o.starts_with('+'));
+                return !command && !script;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// A command's words, when it's one simple command made only of plain
+/// words: printable ASCII, split at spaces, with nothing a shell
+/// would read otherwise (quotes, backslashes, globs, `~`, `#`, `!`, or a
+/// `NAME=value` first). Such a command runs as root as its words, with no
+/// shell between (`sudo docker ps -a`), so a sudoers rule for that one
+/// program allows it. Any other runs as `sh -c <command>`.
+pub(crate) fn plain_words(command: &str) -> Option<Vec<String>> {
+    if !is_simple(command) || !command.chars().all(|c| c == ' ' || c.is_ascii_graphic()) {
+        return None;
+    }
+    if command.contains(['\'', '"', '\\', '*', '?', '[', ']', '~', '#', '!']) {
+        return None;
+    }
+    let words: Vec<String> = command.split(' ').filter(|w| !w.is_empty()).map(str::to_string).collect();
+    let first = words.first()?;
+    (!first.contains('=') && !BUILTINS.contains(&first.as_str())).then_some(words)
+}
+
+/// What a shell does itself, with no program of that name to run.
+const BUILTINS: &[&str] = &[
+    ".", ":", "alias", "bg", "break", "cd", "command", "continue", "eval", "exec", "exit", "export", "fg", "getopts", "hash",
+    "jobs", "read", "readonly", "return", "set", "shift", "source", "times", "trap", "type", "ulimit", "umask", "unalias",
+    "unset", "wait",
+];
 
 /// The options a word gives: `-rf` is r and f, `--recursive` is recursive
 /// and r. None for a word that isn't an option (or `--`, after which none
@@ -692,12 +782,27 @@ impl Decision {
 ///   matches runs it.
 /// - Anything else asks.
 pub(crate) fn decide(policy: &Policy, session_allow: bool, command: &str) -> Decision {
-    decide_parsed(policy, session_allow, &Parsed::new(command))
+    decide_parsed(policy, session_allow, &Parsed::new(command), false)
 }
 
-/// The same, for a command read already. A policy that couldn't be read,
-/// or is on hold (`force_ask`), asks, whatever the level and the session.
-pub(crate) fn decide_parsed(policy: &Policy, session_allow: bool, command: &Parsed) -> Decision {
+/// The same for a request to run `command` as root (`as_root`, #120): it
+/// counts as asking for root, so at levels 1 and 2 it always asks, and no
+/// allow rule runs it.
+#[cfg(test)]
+pub(crate) fn decide_as(policy: &Policy, session_allow: bool, command: &str, as_root: bool) -> Decision {
+    decide_parsed(policy, session_allow, &Parsed::new(command), as_root)
+}
+
+/// The same, for a command read already; `as_root` for a request to run it
+/// as root. A policy that couldn't be read, or is on hold (`force_ask`),
+/// asks, whatever the level and the session.
+///
+/// At level 3 (or with the session's "allow everything") a request as root
+/// runs, but only with what this AI tab already has for root on the server:
+/// a password you typed for it here, or none where the server asks for
+/// none. Where the server wants a password this AI tab doesn't have, the
+/// card asks you for it (mod.rs): nothing here ever supplies one.
+pub(crate) fn decide_parsed(policy: &Policy, session_allow: bool, command: &Parsed, as_root: bool) -> Decision {
     if let Some(rule) = policy.ask.iter().find(|r| ask_matches_parsed(r, command)) {
         return Decision::Ask { rule: Some(rule.clone()) };
     }
@@ -707,7 +812,7 @@ pub(crate) fn decide_parsed(policy: &Policy, session_allow: bool, command: &Pars
     if session_allow || policy.level == RUN_ANYTHING {
         return if session_allow { Decision::Session } else { Decision::Anything };
     }
-    if policy.level == ALLOWED_COMMANDS && !command.root {
+    if policy.level == ALLOWED_COMMANDS && !command.root && !as_root {
         if let Some(rule) = policy.allow.iter().find(|r| allow_matches_on(r, &command.command, policy.windows)) {
             return Decision::Rule(rule.clone());
         }
