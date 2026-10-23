@@ -61,7 +61,9 @@ function describe(item: string, server: HeldServer): { what: string; detail?: st
     const where = move.into ? `into ${move.into}` : "to the top level";
     const may = move.level >= 3
       ? "the AI may run anything without asking"
-      : move.allow > 0
+      : move.change === "added"
+        ? "the AI may run your allowed commands without asking"
+        : move.allow > 0
         ? `the AI may run ${move.allow} more allowed command${move.allow === 1 ? "" : "s"} without asking`
         : "the AI may do more without asking";
     const lost = move.lost.length > 0 ? `, and ${move.lost.map((r) => `“${r}”`).join(", ")} no longer always ${move.lost.length === 1 ? "asks" : "ask"}` : "";

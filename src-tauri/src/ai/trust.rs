@@ -1056,10 +1056,11 @@ pub(crate) fn keep_as_it_was(conn: &Connection, server_id: i64) -> Result<(), St
     set_level(conn, "server", server_id, Some(ASK_EVERY_TIME))
 }
 
-/// Where a server connects to: its host, port, user, saved login and jump
-/// host.
+/// Where a server connects to: its host, port, user, saved login, jump
+/// host and proxy.
 type Target = Vec<rusqlite::types::Value>;
-const TARGET: &str = "host, port, username, credential_id, jump_host_id";
+const TARGET: &str = "host, port, username, credential_id, jump_host_id, proxy_type, proxy_host, proxy_port";
+const TARGET_COLUMNS: usize = 8;
 
 /// The tree as it was before a sync merged: each server's policy, its
 /// folder and where it connects to, and each folder's parent.
@@ -1078,7 +1079,7 @@ fn id_pairs(conn: &Connection, sql: &str) -> rusqlite::Result<Vec<(i64, Option<i
 fn targets(conn: &Connection) -> std::collections::HashMap<i64, Target> {
     let read = || -> rusqlite::Result<std::collections::HashMap<i64, Target>> {
         let mut stmt = conn.prepare(&format!("SELECT id, {TARGET} FROM servers"))?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, (1..=5).map(|i| r.get(i)).collect::<rusqlite::Result<Target>>()?)))?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, (1..=TARGET_COLUMNS).map(|i| r.get(i)).collect::<rusqlite::Result<Target>>()?)))?;
         rows.collect()
     };
     read().unwrap_or_default()
@@ -1129,11 +1130,10 @@ fn name_of(conn: &Connection, table: &str, id: Option<i64>) -> String {
 /// keep it as it was:
 ///
 /// - one whose policy it loosened, by moving it or a folder above it;
-/// - one new here (made, or deleted and made again) whose policy is looser
-///   than the default alone would give it, as in a folder set to run
-///   anything;
+/// - one new here (made, or deleted and made again) that the AI may run
+///   commands on without asking (its level above "Ask every time");
 /// - one the AI may run commands on without asking whose host, port,
-///   user, saved login or jump host it changed.
+///   user, saved login, jump host or proxy it changed.
 ///
 /// One held already is held again with what it is now.
 pub(crate) fn hold_loosened(conn: &Connection, before: TreeBefore) -> Result<(), String> {
@@ -1141,7 +1141,6 @@ pub(crate) fn hold_loosened(conn: &Connection, before: TreeBefore) -> Result<(),
     if !has_table(conn, "held_approvals").map_err(&fail)? {
         return Ok(());
     }
-    let default_only = try_policy(conn, None).unwrap_or_else(|_| Policy::unreadable());
     let mut now_targets = targets(conn);
     for (id, folder) in id_pairs(conn, "SELECT id, folder_id FROM servers").map_err(&fail)? {
         let Some(uuid) = uuid_of(conn, id).map_err(&fail)? else { continue };
@@ -1149,9 +1148,22 @@ pub(crate) fn hold_loosened(conn: &Connection, before: TreeBefore) -> Result<(),
         let target = now_targets.remove(&id);
         let server = name_of(conn, "servers", Some(id));
         let held = match before.servers.get(&id) {
+            // New here: held wherever the AI may run commands on it without
+            // asking, so a careful server deleted and made again under a
+            // loose default isn't let through.
             None => {
-                let Some((allow, lost)) = loosened(&default_only, &new) else { continue };
-                HeldPolicy { level: new.level, allow, lost, moved: server, moved_folder: false, into: name_of(conn, "folders", folder), change: "added".into() }
+                if new.level <= ASK_EVERY_TIME {
+                    continue;
+                }
+                HeldPolicy {
+                    level: new.level,
+                    allow: new.allow.len(),
+                    lost: Vec::new(),
+                    moved: server,
+                    moved_folder: false,
+                    into: name_of(conn, "folders", folder),
+                    change: "added".into(),
+                }
             }
             Some((old, old_folder, old_target)) => match loosened(old, &new) {
                 Some((allow, lost)) => {

@@ -3946,6 +3946,37 @@ mod sync_engine_tests {
         a.execute("UPDATE servers SET username='root' WHERE name='db-01'", []).unwrap();
         sync(&a, &b);
         assert_eq!(held_of(&b, "db-01").map(|h| h.change), Some("pointed".into()), "its user too");
+        approvals::allow(&b, &b.query_row("SELECT uuid FROM servers WHERE name='db-01'", [], |r| r.get::<_, String>(0)).unwrap(), &[]).unwrap();
+        a.execute("UPDATE servers SET proxy_type='socks5', proxy_host='proxy.example', proxy_port=1080 WHERE name='db-01'", []).unwrap();
+        sync(&a, &b);
+        assert_eq!(held_of(&b, "db-01").map(|h| h.change), Some("pointed".into()), "its proxy too");
+    }
+
+    // A careful server deleted and made again under a default that runs
+    // anything comes back as a new server: held, not let through.
+    #[test]
+    fn a_careful_server_made_again_under_a_loose_default_is_held() {
+        let (a, _ha) = device("A");
+        a.execute("INSERT INTO servers(name,host,port) VALUES('prod-db','db.example',22)", []).unwrap();
+        let (b, hb) = device("B");
+        approvals::create_schema(&b).unwrap();
+        ai::trust::create_schema(&b, "this-install-0000").unwrap();
+        b.execute("INSERT INTO sync_meta(key,value) VALUES('share_id','s1')", []).unwrap();
+        let sync = |a: &Connection, b: &Connection| apply_remote_records(b, &KEY, &collect_local_records(a, &KEY, "").unwrap(), &hb).unwrap();
+        sync(&a, &b);
+        let id: i64 = b.query_row("SELECT id FROM servers WHERE name='prod-db'", [], |r| r.get(0)).unwrap();
+        ai::trust::set_level(&b, "default", 0, Some(3)).unwrap();
+        ai::trust::set_level(&b, "server", id, Some(1)).unwrap();
+        a.execute("DELETE FROM servers WHERE name='prod-db'", []).unwrap();
+        a.execute("INSERT INTO servers(name,host,port) VALUES('prod-db','db.example',22)", []).unwrap();
+        sync(&a, &b);
+        let (id, uuid): (i64, String) = b.query_row("SELECT id, uuid FROM servers WHERE name='prod-db'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let items: Vec<String> = approvals::held_for(&b, &uuid).into_iter().collect();
+        assert_eq!(items.len(), 1, "{items:?}");
+        let h: ai::trust::HeldPolicy = serde_json::from_str(&items[0][ai::trust::HELD_ITEM.len()..]).unwrap();
+        assert_eq!((h.change.as_str(), h.level, h.into.as_str()), ("added", 3, ""));
+        let p = ai::trust::policy_for(&b, Some(id));
+        assert_eq!((p.level, p.force_ask.is_some()), (1, true));
     }
 
     // A move out of a folder set to "Ask every time", where every server
