@@ -327,8 +327,15 @@ fn glob_could_be(pat: &str, name: &str, prefix: bool) -> bool {
 /// `mk?s.ext4` for `mkfs*`). A glob of wildcards alone (`*`) counts for
 /// nothing: it would name everything.
 fn word_is(word: &str, name: &str, prefix: bool) -> bool {
+    word_is_at(word, name, prefix, true)
+}
+
+/// The same, where a glob is read as one only when `glob_ok`: a word in
+/// command position (`is_command`). Elsewhere it's an argument, such as
+/// `*.txt`, compared as it's written.
+fn word_is_at(word: &str, name: &str, prefix: bool, glob_ok: bool) -> bool {
     forms(word).into_iter().any(|f| {
-        if is_glob(f) {
+        if is_glob(f) && glob_ok {
             f.chars().any(|c| !matches!(c, '?' | '*' | '[' | ']' | '!' | '^' | '-')) && glob_could_be(f, name, prefix)
         } else if prefix {
             f.starts_with(name)
@@ -446,22 +453,54 @@ fn collapsed_words(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The ways a command is read into words for the always-ask list and the
-/// root check, each tried in turn: plainly (quotes and backslashes out),
-/// and collapsed.
-///
-/// The same readings are also cut into the simple commands they hold (at
-/// `;`, `&`, `|`, new lines, parentheses, braces and backticks), for
-/// options.
+/// A word of a simple command, and whether it's in command position: the
+/// first word (after any `VAR=value`), or any word after a command that
+/// runs others (RUNNERS) or gives root (ROOT_WORDS). Only there is a glob
+/// read as one that could name a program.
+type Word = (String, bool);
+
+/// `NAME=value`, as a word before the command sets it.
+fn is_assignment(w: &str) -> bool {
+    let Some((name, _)) = w.split_once('=') else { return false };
+    let mut c = name.chars();
+    c.next().is_some_and(|f| f.is_ascii_alphabetic() || f == '_') && c.all(|x| x.is_ascii_alphanumeric() || x == '_')
+}
+
+fn runs_others(w: &str, glob_ok: bool) -> bool {
+    RUNNERS.iter().any(|r| word_is_at(w, r, *r == "python", glob_ok))
+}
+
+fn gives_root(w: &str, glob_ok: bool) -> bool {
+    ROOT_WORDS.iter().any(|r| word_is_at(w, r, false, glob_ok))
+}
+
+/// Which words of a simple command are in command position.
+fn positions(words: Vec<String>) -> Vec<Word> {
+    let first = words.iter().position(|w| !is_assignment(w));
+    let mut after = false;
+    let mut out = Vec::with_capacity(words.len());
+    for (i, w) in words.into_iter().enumerate() {
+        let at = after || Some(i) == first;
+        if runs_others(&w, at) || gives_root(&w, at) {
+            after = true;
+        }
+        out.push((w, at));
+    }
+    out
+}
+
+/// The ways a command is read, for the always-ask list and the root check,
+/// each tried in turn: plainly (quotes and backslashes out), and
+/// collapsed. Each reading is cut into the simple commands it holds (at
+/// `;`, `&`, `|`, new lines, parentheses, braces and backticks), and each
+/// of those into its words.
 ///
 /// A command is read once (`Parsed::new`), and every rule matched against
 /// that.
 pub(crate) struct Parsed {
     command: String,
-    /// Each reading's words.
-    words: Vec<Vec<String>>,
     /// Each reading's simple commands, and their words.
-    commands: Vec<Vec<Vec<String>>>,
+    commands: Vec<Vec<Vec<Word>>>,
     /// It asks for root (asks_for_root).
     pub root: bool,
 }
@@ -473,19 +512,18 @@ static ROOT_RE: LazyLock<regex::Regex> =
 
 impl Parsed {
     pub(crate) fn new(command: &str) -> Parsed {
-        let cut = |t: &str, read: &dyn Fn(&str) -> Vec<String>| -> Vec<Vec<String>> {
-            t.split([';', '&', '|', '\n', '\r', '(', ')', '{', '}', '`']).map(read).filter(|w| !w.is_empty()).collect()
+        let cut = |t: &str, read: &dyn Fn(&str) -> Vec<String>| -> Vec<Vec<Word>> {
+            t.split([';', '&', '|', '\n', '\r', '(', ')', '{', '}', '`']).map(read).filter(|w| !w.is_empty()).map(positions).collect()
         };
-        let readings = collapsed(command);
-        let mut words_ = vec![words(command)];
-        words_.extend(readings.iter().map(|t| collapsed_words(t)));
         let mut commands = vec![cut(command, &words)];
-        commands.extend(readings.iter().map(|t| cut(t, &collapsed_words)));
+        commands.extend(collapsed(command).iter().map(|t| cut(t, &collapsed_words)));
         let root = ROOT_RE.is_match(command)
-            || words_.iter().flatten().any(|w| ROOT_WORDS.iter().any(|r| word_is(w, r, false)))
-            // `machinectl shell` opens a shell as root by default.
-            || words_.iter().any(|ws| ws.windows(2).any(|p| word_is(&p[0], "machinectl", false) && p[1] == "shell"));
-        Parsed { command: command.to_string(), words: words_, commands, root }
+            || commands.iter().flatten().any(|cmd| {
+                cmd.iter().any(|(w, at)| gives_root(w, *at))
+                    // `machinectl shell` opens a shell as root by default.
+                    || cmd.windows(2).any(|p| word_is_at(&p[0].0, "machinectl", false, p[0].1) && p[1].0 == "shell")
+            });
+        Parsed { command: command.to_string(), commands, root }
     }
 }
 
@@ -519,12 +557,12 @@ fn flags_match(want: &[String], command: &Parsed) -> bool {
         return false;
     }
     command.commands.iter().flatten().any(|cmd| {
-        cmd.iter().enumerate().any(|(i, w)| {
-            if !word_is(w, name, false) {
+        cmd.iter().enumerate().any(|(i, (w, at))| {
+            if !word_is_at(w, name, false, *at) {
                 return false;
             }
             let mut have: Vec<String> = Vec::new();
-            for a in &cmd[i + 1..] {
+            for (a, _) in &cmd[i + 1..] {
                 if a == "--" {
                     break;
                 }
@@ -540,8 +578,9 @@ fn flags_match(want: &[String], command: &Parsed) -> bool {
 /// after. So `reboot` is in `uptime; reboot`, `sudo reboot`,
 /// `/sbin/reboot now` and `shutdown.exe /r`, and `rm -rf *` in
 /// `cd /; rm -rf /tmp`. A command word counts as itself, as the name after
-/// its last `/` or `\` (without `.exe` and the like), or as a glob that
-/// could expand to the rule's word.
+/// its last `/` or `\` (without `.exe` and the like), or, in command
+/// position (`positions`), as a glob that could expand to the rule's word:
+/// `/sbin/reb?ot` asks, `ls *.txt` doesn't.
 ///
 /// It's read twice, and either reading counts: plainly, and collapsed
 /// (`collapsed`: `re$@boot`, `re{,}boot`, `shut^down`, `Restart-Comp`uter`
@@ -559,9 +598,9 @@ pub(crate) fn ask_matches(rule: &str, command: &str) -> bool {
 
 fn ask_matches_parsed(rule: &str, command: &Parsed) -> bool {
     let Some((want, prefix)) = ask_words(rule) else { return false };
-    command.words.iter().any(|have| {
-        have.windows(want.len())
-            .any(|win| win.iter().zip(&want).enumerate().all(|(i, (w, r))| word_is(w, r, prefix && i + 1 == want.len())))
+    command.commands.iter().flatten().any(|cmd| {
+        cmd.windows(want.len())
+            .any(|win| win.iter().zip(&want).enumerate().all(|(i, ((w, at), r))| word_is_at(w, r, prefix && i + 1 == want.len(), *at)))
     }) || (!prefix && flags_match(&want, command))
 }
 
@@ -572,7 +611,7 @@ const ROOT_WORDS: &[&str] = &["sudo", "sudoedit", "dzdo", "su", "doas", "pkexec"
 /// names a program that gives root, or is a glob that could (`sud?`).
 #[cfg(test)]
 pub(crate) fn mentions_root(command: &str) -> bool {
-    Parsed::new(command).words.iter().flatten().any(|w| ROOT_WORDS.iter().any(|r| word_is(w, r, false)))
+    Parsed::new(command).commands.iter().flatten().flatten().any(|(w, at)| gives_root(w, *at))
 }
 
 /// A command that asks for root: one of the tools that give it (sudo,

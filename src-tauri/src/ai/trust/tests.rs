@@ -775,3 +775,44 @@ fn more_ways_to_root_and_more_runners() {
         assert!(runner_warning(p).is_some(), "{p}");
     }
 }
+
+// -- Globs only in command position ------------------------------------------------------
+
+#[test]
+fn glob_arguments_dont_trip_prefix_rules() {
+    let p = Policy { level: 3, allow: vec![], ask: rules(DEFAULT_ASK), windows: false, force_ask: None };
+    for cmd in [
+        "ls *.txt",
+        "tail -n 50 /var/log/*.log",
+        "cat /etc/*release",
+        "wc -l src/*.rs",
+        "rm /tmp/*.tmp",
+        "ls /tmp/d*",
+        "LANG=C ls /tmp/d*",
+        "grep -l x /etc/s*",
+    ] {
+        assert_eq!(decide(&p, false, cmd), Decision::Anything, "{cmd}");
+        assert!(!asks_for_root(cmd), "{cmd}");
+    }
+}
+
+#[test]
+fn globs_in_command_position_still_ask() {
+    let p = Policy { level: 3, allow: vec![], ask: rules(DEFAULT_ASK), windows: false, force_ask: None };
+    for cmd in [
+        "/sbin/reb?ot",
+        "xargs /sbin/reb?ot",
+        "sudo /sbin/mk?s.ext4 /dev/sdb",
+        "uptime; /sbin/re{b,}oot",
+        "timeout 5 /sbin/reb?ot",
+        "LANG=C /sbin/reb?ot",
+        "echo x | sh -c /sbin/reb?ot",
+        "nohup /sbin/shut*",
+    ] {
+        assert!(matches!(decide(&p, false, cmd), Decision::Ask { rule: Some(_) }), "{cmd}");
+    }
+    // A glob that could name sudo, in command position, asks for root.
+    assert!(asks_for_root("sud? id"));
+    assert!(asks_for_root("env s?do id"));
+    assert!(!asks_for_root("ls s*"));
+}
