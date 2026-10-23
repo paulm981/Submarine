@@ -15297,11 +15297,14 @@ async fn rdp_builtin_open(
     // This server may be logged in to without NLA (the tab's per-server
     // option, off unless the user turned it on for the server).
     allow_no_nla: Option<bool>,
+    // The tab's speed and quality choices for this server (the standard ones if none).
+    graphics: Option<rdp_client::Graphics>,
     frames: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Result<(), String> {
     use std::sync::Arc;
     use tauri::Emitter;
 
+    let graphics = graphics.unwrap_or_default().checked()?;
     // A new attempt replaces the tab's last one.
     if let Some((_, old)) = rdp_clients.lock().await.remove(&session_id) {
         let _ = old.send(rdp_client::Cmd::Close);
@@ -15378,6 +15381,9 @@ async fn rdp_builtin_open(
         };
         let target = rdp::address(&host, port);
         log(&format!("Opening the RDP server {target} in this tab..."), "info");
+        if let Some(chosen) = graphics.describe() {
+            log(&chosen, "info");
+        }
 
         // The password: saved, else asked for here (it goes nowhere else).
         let password = if password.is_empty() {
@@ -15575,7 +15581,7 @@ async fn rdp_builtin_open(
         };
 
         let (login_user, domain) = rdp_client::split_domain(&user);
-        let login = rdp_client::Login { host: host.clone(), username: login_user, domain, password, width, height, allow_no_nla: allow_no_nla.unwrap_or(false) };
+        let login = rdp_client::Login { host: host.clone(), username: login_user, domain, password, width, height, allow_no_nla: allow_no_nla.unwrap_or(false), graphics };
         let connected = {
             let (app, attempt, sid, target) = (app.clone(), attempt.clone(), session_id.clone(), target.clone());
             move |w: u16, h: u16| {
@@ -16002,11 +16008,14 @@ async fn vnc_open(
     use_ssh_agent: Option<bool>,
     width: u16,
     height: u16,
+    // The tab's speed and quality choices for this server (the standard ones if none).
+    options: Option<vnc_client::Options>,
     frames: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Result<(), String> {
     use std::sync::Arc;
     use tauri::Emitter;
 
+    let options = options.unwrap_or_default().checked()?;
     // A new attempt replaces the tab's last one.
     if let Some((_, old)) = vnc_clients.lock().await.remove(&session_id) {
         let _ = old.send(vnc_client::Cmd::Close);
@@ -16088,6 +16097,9 @@ async fn vnc_open(
                 "A VNC server doesn't use saved logins: VNC sends its password with weak protection and doesn't check the server's identity. Type the VNC password when asked, or save it on the server.",
                 "warning",
             );
+        }
+        if let Some(chosen) = options.describe() {
+            log(&chosen, "info");
         }
 
         // The way there: straight, or a channel through the SSH server. The
@@ -16229,7 +16241,7 @@ async fn vnc_open(
         let flow = screens.start(&session_id, generation);
         let frame = screen_frame_sender(frames, Arc::clone(&flow));
         // A decoder that panics on a bad screen update ends this tab only.
-        let run = tauri::async_runtime::spawn(vnc_client::run(stream, password, connected, frame, flow, rx, wanted));
+        let run = tauri::async_runtime::spawn(vnc_client::run(stream, password, connected, frame, flow, rx, wanted, options));
         let outcome = match run.await {
             Ok(r) => r,
             Err(_) => Err("The VNC session stopped on bad data from the server".into()),
