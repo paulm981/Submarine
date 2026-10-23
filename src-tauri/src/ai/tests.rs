@@ -1633,19 +1633,43 @@ mod root {
         assert!(r.s.snapshot().pending.is_empty());
     }
 
-    /// Stop ends a command running as root on the server too.
+    /// Stop ends a command running as root, as far as Submarine can: its
+    /// channel is signalled and closed, and the AI is told at once. (The
+    /// command itself runs under sudo, as root, which a signal from the
+    /// login can't reach: on the server it ends when it next writes. The
+    /// test server, whose login shell here is tcsh, shows the same.)
     #[tokio::test]
     async fn stop_ends_a_root_command() {
         let r = root_state(&[("all", "none")], policy(3, &[], &[])).await;
         r.s.share("local-1", "sess-1", "xyz").unwrap();
         let req = ask(&r.s, "local-1", "xyz", "sleep 30", true);
         r.s.allow_with_password(card(&r.s, PasswordAsk::Needed).await.id, PW).unwrap();
-        wait_for("it to run as root", || r.labs[0].running.load(Ordering::SeqCst) == 1 && !r.s.snapshot().running.is_empty()).await;
+        // Signed in (the look, then the run's own check): it runs.
+        wait_for("it to run as root", || r.labs[0].attempts() >= 2 && !r.s.snapshot().running.is_empty()).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let t = Instant::now();
         r.s.stop_tab("local-1");
         let a = tokio::time::timeout(Duration::from_secs(10), req).await.expect("stopped").unwrap();
         assert!(a.text.starts_with("Stopped"), "{}", a.text);
-        wait_for("the command to end on the server", || r.labs[0].running.load(Ordering::SeqCst) == 0).await;
+        assert!(t.elapsed() < Duration::from_secs(8));
         assert!(r.s.kept_root("local-1", "sess-1").is_none());
+    }
+
+    /// Stopped while it looks for root, the look still ends cleanly on the
+    /// server (nothing left waiting for a password), and nothing runs.
+    #[tokio::test]
+    async fn stop_while_it_looks_for_root_leaves_nothing_behind() {
+        let r = root_state(&[("all", "none")], policy(1, &[], &[])).await;
+        r.labs[0].set("slowcheck", "2");
+        r.s.share("local-1", "sess-1", "xyz").unwrap();
+        let req = ask(&r.s, "local-1", "xyz", "echo ran > ran.txt", true);
+        r.s.allow_with_password(card(&r.s, PasswordAsk::Optional).await.id, PW).unwrap();
+        wait_for("the look", || r.labs[0].running.load(Ordering::SeqCst) == 1).await;
+        r.s.stop_tab("local-1");
+        let a = tokio::time::timeout(Duration::from_secs(10), req).await.expect("stopped").unwrap();
+        assert!(a.text.starts_with("Stopped"), "{}", a.text);
+        wait_for("the look to end on the server", || r.labs[0].running.load(Ordering::SeqCst) == 0).await;
+        assert!(!r.labs[0].dir.join("ran.txt").exists());
     }
 
     /// Through the helper, as Claude Code would: the tool says how to ask
@@ -1676,5 +1700,55 @@ mod root {
         let bad = h.call(4, "tools/call", json!({ "name": "run_command", "arguments": { "server": "xyz", "command": "id", "as_root": "yes" } })).await;
         assert_eq!(bad["result"]["isError"], true);
         nowhere(&r, &[]);
+    }
+}
+
+#[cfg(unix)]
+mod root_language {
+    use super::*;
+    use crate::root_over_ssh_tests::Lab;
+
+    /// A kept password that stopped working, on a sudo that answers in
+    /// German whatever the locale: the check failing counts as "didn't
+    /// work", whatever it said. It's forgotten after one attempt, and the
+    /// card asks again.
+    #[tokio::test]
+    async fn a_kept_password_turned_down_in_another_language_is_forgotten() {
+        let lab = Arc::new(Lab::new(&format!("ai-de-{}", channel::random_hex(4)), "all", "none").await);
+        let (h1, h2) = (lab.handle.clone(), lab.handle.clone());
+        let exec: Executor = Arc::new(move |_, cmd, limit, stop| {
+            let h = h1.clone();
+            Box::pin(async move { exec::run(&h, &cmd, limit, OUTPUT_CAP, stop).await })
+        });
+        let root_exec: RootExecutor = Arc::new(move |_, job: RootJob, limit, stop| {
+            let h = h2.clone();
+            Box::pin(async move { exec::run_root(&h, job.how, &job.command, limit, OUTPUT_CAP, stop, job.started).await })
+        });
+        let level3 = trust::Policy { level: trust::RUN_ANYTHING, ..Default::default() };
+        let s = AiState::with(exec, root_exec, Box::new(|| {}), None, Arc::new(move |_| level3.clone()), Box::new(|| {}));
+        s.turn_on().unwrap();
+        s.start_tab("local-1", "Claude").unwrap();
+        s.share("local-1", "sess-1", "xyz").unwrap();
+        let ask = |cmd: &'static str| {
+            let s = s.clone();
+            tokio::spawn(async move {
+                let (_c, cancel) = watch::channel(false);
+                s.run_command("local-1", "xyz", cmd, None, true, cancel).await
+            })
+        };
+        let req = ask("echo one");
+        wait_for("the card", || !s.snapshot().pending.is_empty()).await;
+        s.allow_with_password(s.snapshot().pending[0].id, "s3cret pass").unwrap();
+        assert!(req.await.unwrap().text.ends_with("one\n"));
+        assert!(s.kept_root("local-1", "sess-1").is_some());
+        let before = lab.attempts();
+        lab.set("password", "changed\n");
+        lab.set("germanalways", "");
+        let req = ask("echo two");
+        wait_for("the card again", || s.snapshot().pending.iter().any(|p| p.password == PasswordAsk::Wrong)).await;
+        assert_eq!(lab.attempts(), before + 1);
+        assert!(s.kept_root("local-1", "sess-1").is_none());
+        s.decide(s.snapshot().pending[0].id, false).unwrap();
+        assert_eq!(req.await.unwrap().text, "Denied by the user. The root password typed for it was refused.");
     }
 }

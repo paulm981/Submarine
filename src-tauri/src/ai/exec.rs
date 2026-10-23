@@ -252,10 +252,24 @@ async fn within<T>(stop: &mut watch::Receiver<bool>, deadline: tokio::time::Inst
     }
 }
 
+/// The look for root, as a task of its own: Stop or the time limit stop
+/// waiting for it, not the look itself, which ends by its own time limits.
+/// Dropped half-way, a probe's channel would stay open on the server, its
+/// tool waiting for a password that never comes.
+async fn detached<T: Send + 'static>(stop: &mut watch::Receiver<bool>, deadline: tokio::time::Instant, f: impl std::future::Future<Output = T> + Send + 'static) -> Look<T> {
+    let task = tokio::spawn(f);
+    match within(stop, deadline, task).await {
+        Look::Done(Ok(v)) => Look::Done(v),
+        Look::Done(Err(_)) => Look::Stopped,
+        Look::Stopped => Look::Stopped,
+        Look::TimedOut => Look::TimedOut,
+    }
+}
+
 /// Run `command` as root on the connection `handle`, getting root as `how`
 /// says, and collect its output as `run` does. `started` hears once the
 /// tool has taken the password (or needed none) and the command started.
-pub(crate) async fn run_root<H: client::Handler>(
+pub(crate) async fn run_root<H: client::Handler + 'static>(
     handle: &Arc<tokio::sync::Mutex<client::Handle<H>>>,
     how: RootHow,
     command: &str,
@@ -271,20 +285,26 @@ pub(crate) async fn run_root<H: client::Handler>(
     // sign-in: a wrong one ends it), or found without one.
     let (access, new) = match how {
         RootHow::Kept(a) => (a, false),
-        RootHow::Typed(pw) => match within(&mut stop, deadline, crate::find_root_with_password(handle, &words, &pw)).await {
-            Look::Stopped => return stopped(false),
-            Look::TimedOut => return stopped(true),
-            Look::Done(Ok((tool, shell))) => (Arc::new(RootAccess::new(tool, Some(pw), shell, Some(std::time::Instant::now()))), true),
-            Look::Done(Err(e)) if e == crate::SUDO_WRONG_PASSWORD => return RootRun::WrongPassword(None),
-            Look::Done(Err(e)) => return failed(&e),
-        },
-        RootHow::Find => match within(&mut stop, deadline, crate::find_root_without_password(handle, &words)).await {
-            Look::Stopped => return stopped(false),
-            Look::TimedOut => return stopped(true),
-            Look::Done(Ok(a)) => (Arc::new(a), true),
-            Look::Done(Err((e, tool))) if e == crate::SUDO_NEED_PASSWORD => return RootRun::NeedPassword(tool),
-            Look::Done(Err((e, _))) => return failed(&e),
-        },
+        RootHow::Typed(pw) => {
+            let (h, w, p) = (handle.clone(), words.clone(), pw.clone());
+            match detached(&mut stop, deadline, async move { crate::find_root_with_password(&h, &w, &p).await }).await {
+                Look::Stopped => return stopped(false),
+                Look::TimedOut => return stopped(true),
+                Look::Done(Ok((tool, shell))) => (Arc::new(RootAccess::new(tool, Some(pw), shell, Some(std::time::Instant::now()))), true),
+                Look::Done(Err(e)) if e == crate::SUDO_WRONG_PASSWORD => return RootRun::WrongPassword(None),
+                Look::Done(Err(e)) => return failed(&e),
+            }
+        }
+        RootHow::Find => {
+            let (h, w) = (handle.clone(), words.clone());
+            match detached(&mut stop, deadline, async move { crate::find_root_without_password(&h, &w).await }).await {
+                Look::Stopped => return stopped(false),
+                Look::TimedOut => return stopped(true),
+                Look::Done(Ok(a)) => (Arc::new(a), true),
+                Look::Done(Err((e, tool))) if e == crate::SUDO_NEED_PASSWORD => return RootRun::NeedPassword(tool),
+                Look::Done(Err((e, _))) => return failed(&e),
+            }
+        }
     };
     let tool = access.tool;
     let new_access = || new.then(|| access.clone());
@@ -304,13 +324,18 @@ pub(crate) async fn run_root<H: client::Handler>(
     for (k, v) in PAGER_ENV {
         let _ = channel.set_env(false, *k, *v).await;
     }
-    let start = crate::root_channel_start(&mut channel, &access, &words, false, None);
+    // Set when the tool's check of the password failed, whatever it said.
+    let turned_down = std::sync::atomic::AtomicBool::new(false);
+    let start = crate::root_channel_start(&mut channel, &access, &words, false, None, Some(&turned_down));
     let (end, marker) = match within(&mut stop, deadline, start).await {
         Look::Stopped => (End::Stopped, None),
         Look::TimedOut => (End::TimedOut, None),
         Look::Done(Err(e)) => {
             let _ = tokio::time::timeout(END_WAIT, channel.close()).await;
-            return if e == crate::SUDO_WRONG_PASSWORD {
+            // A password the tool didn't take, in any words (a sudo that isn't
+            // in English): it didn't work, and isn't tried again.
+            let refused = turned_down.load(std::sync::atomic::Ordering::SeqCst);
+            return if e == crate::SUDO_WRONG_PASSWORD || (access.password.is_some() && refused) {
                 RootRun::WrongPassword(Some(tool))
             } else if e == crate::SUDO_NEED_PASSWORD {
                 RootRun::NeedPassword(Some(tool))

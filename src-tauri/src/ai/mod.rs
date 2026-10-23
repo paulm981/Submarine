@@ -1721,7 +1721,14 @@ impl AiState {
                     }
                     break (approved_by, Ok(out), tool);
                 }
-                exec::RootRun::Failed { you, ai } => break (approved_by, Err((you, ai)), kept_tool),
+                exec::RootRun::Failed { you, ai } => {
+                    // A kept password is never left in place after a failure:
+                    // the next request asks for it again rather than risk it.
+                    if let Some(k) = kept.as_ref().filter(|k| k.0.password.is_some()) {
+                        self.forget_root(tab_id, &session_id, &k.0);
+                    }
+                    break (approved_by, Err((you, ai)), kept_tool);
+                }
                 exec::RootRun::NeedPassword(tool) => {
                     drop(turn);
                     refused = false;

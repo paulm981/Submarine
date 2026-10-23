@@ -17443,8 +17443,8 @@ const ROOT_PROBE_SCRIPT: &str = concat!(
 if [ "$SUB_MODE" = pw ]; then
 if safe; then :; else echo __SUB_SUDO:UNSAFE; exit 0; fi
 echo __SUB_SUDO:READ
-OUT=$("$X" -S -k -p "" -l "$@" 2>&1)
-else OUT=$("$X" -n -l "$@" 2>&1); fi
+OUT=$(LC_ALL=C LANG=C "$X" -S -k -p "" -l "$@" 2>&1)
+else OUT=$(LC_ALL=C LANG=C "$X" -n -l "$@" 2>&1); fi
 if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s "$OUT" | tr "\n" " ")"; fi"#
 );
 
@@ -17540,7 +17540,8 @@ async fn root_shell_probe<H: russh::client::Handler>(session_arc: &HandleArc<H>,
     let words: Vec<String> = form.split(' ').map(String::from).collect();
     root_probe(session_arc, tool, None, &words).await?;
     let line = root_shell_line("echo __SUB_SU_UID:$(id -u)");
-    let out = exec_with_stdin_capture(session_arc, &format!("{} -n {}", tool, form), Some(line.as_bytes()), 20).await?;
+    // In English (the C locale), so its refusals are understood.
+    let out = exec_with_stdin_capture(session_arc, &format!("env LC_ALL=C LANG=C {} -n {}", tool, form), Some(line.as_bytes()), 20).await?;
     if out.lines().any(|l| l.trim() == "__SUB_SU_UID:0") {
         Ok(())
     } else if out.contains("__SUB_SU_UID:") {
@@ -17668,7 +17669,7 @@ if [ -n "$SUB_TTY" ]; then stty -echo 2>/dev/null; fi
 echo "$T:READ"
 IFS= read -r p || exit 97
 if [ -n "$SUB_TTY" ]; then stty echo 2>/dev/null; fi
-printf '%s\n' "$p" | "$X" -S -p "" -v 2>&1
+printf '%s\n' "$p" | LC_ALL=C LANG=C "$X" -S -p "" -v 2>&1
 r=$?
 p=
 echo "$T:V:$r"
@@ -17708,6 +17709,10 @@ struct RootFeed<'a> {
     end: bool,
     /// A terminal: the tool asks on it (ROOT_EXEC_SCRIPT's third case).
     pty: bool,
+    /// Set when the tool's check of the password failed (`V:` not 0),
+    /// whatever it said: the AI forgets a kept password then, even when the
+    /// tool's words aren't English (ai/exec.rs).
+    turned_down: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 /// One call's turn with the tab's kept password, settled as soon as the
@@ -17787,6 +17792,9 @@ async fn root_feed(channel: &mut russh::Channel<russh::client::Msg>, feed: RootF
                     }
                     deadline = Instant::now() + Duration::from_secs(20);
                 } else {
+                    if let Some(t) = feed.turned_down {
+                        t.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     let answer = tool_answer(&String::from_utf8_lossy(&said));
                     let wrong = answer.as_deref() == Some(SUDO_WRONG_PASSWORD);
                     if let Some(h) = hook.take() {
@@ -17959,7 +17967,7 @@ async fn root_run<H: russh::client::Handler>(
         ));
         let words: Vec<String> = form.split(' ').map(String::from).collect();
         let cmd = root_exec_command(tool, &tag, password.is_some(), false, true, &words);
-        let feed = RootFeed { tag: &tag, password, then: line.as_bytes(), end: true, pty: false };
+        let feed = RootFeed { tag: &tag, password, then: line.as_bytes(), end: true, pty: false, turned_down: None };
         let (_, out) = exec_fed_capture(session_arc, &cmd, feed, hook, timeout_secs, ROOT_OUTPUT_MAX).await?;
         let Some(start) = out.find("__SUB_ROOT_OUT__:") else {
             return Err(classify_tool_output(&out));
@@ -17972,7 +17980,7 @@ async fn root_run<H: russh::client::Handler>(
         return Ok(parse_exit_marker(after));
     }
     let cmd = root_exec_command(tool, &tag, password.is_some(), false, true, args);
-    let feed = RootFeed { tag: &tag, password, then: b"", end: true, pty: false };
+    let feed = RootFeed { tag: &tag, password, then: b"", end: true, pty: false, turned_down: None };
     let (code, out) = exec_fed_capture(session_arc, &cmd, feed, hook, timeout_secs, ROOT_OUTPUT_MAX).await?;
     Ok((code, out.trim_end_matches('\n').to_string()))
 }
@@ -18030,7 +18038,7 @@ async fn root_channel_open<H: russh::client::Handler>(
     }
     // From here a failure closes the channel: a dropped one stays open on the
     // server, with whatever the tool started in it.
-    match root_channel_start(&mut channel, access, args, pty.is_some(), hook).await {
+    match root_channel_start(&mut channel, access, args, pty.is_some(), hook, None).await {
         Ok((marker, early)) => Ok((channel, marker, early)),
         Err(e) => {
             let _ = channel.close().await;
@@ -18045,12 +18053,14 @@ async fn root_channel_open<H: russh::client::Handler>(
 /// the command's output starts after (ROOT_STREAM_MARKER), and what the
 /// command already wrote as it started. On a failure the caller closes the
 /// channel. The AI's root commands start this way too (ai/exec.rs).
+/// `turned_down` is set when the tool's check of the password failed.
 async fn root_channel_start(
     channel: &mut russh::Channel<russh::client::Msg>,
     access: &ssh_manager::RootAccess,
     args: &[String],
     pty: bool,
     hook: Option<TurnHook<'_>>,
+    turned_down: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<(Option<&'static str>, Vec<u8>), String> {
     let tool = if ELEVATION_TOOLS.contains(&access.tool) { access.tool } else { "sudo" };
     let tag = new_root_tag();
@@ -18073,7 +18083,7 @@ async fn root_channel_start(
     // stderr, which a stream doesn't read: it goes to stdout.
     let command = root_exec_command(tool, &tag, password.is_some(), pty, !pty, &words);
     channel.exec(true, command.as_bytes()).await.map_err(|e| e.to_string())?;
-    let feed = RootFeed { tag: &tag, password, then: line.as_bytes(), end: !pty, pty };
+    let feed = RootFeed { tag: &tag, password, then: line.as_bytes(), end: !pty, pty, turned_down };
     let early = root_feed(channel, feed, hook).await?;
     Ok((marker, early))
 }
@@ -18697,8 +18707,8 @@ const SUDO_SFTP_PROBE: &str = concat!(
 if [ "$SUB_MODE" = pw ]; then
 if safe; then :; else echo __SUB_SUDO:UNSAFE; exit 0; fi
 echo __SUB_SUDO:READ
-OUT=$("$X" -S -k -p "" -l "$S" 2>&1)
-else OUT=$("$X" -n -l "$S" 2>&1); fi
+OUT=$(LC_ALL=C LANG=C "$X" -S -k -p "" -l "$S" 2>&1)
+else OUT=$(LC_ALL=C LANG=C "$X" -n -l "$S" 2>&1); fi
 if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s "$OUT" | tr "\n" " ")"; fi"#
 );
 
@@ -19195,7 +19205,7 @@ async fn open_elevated_sftp<H: russh::client::Handler>(
     };
     let cmd = root_exec_command(tool, &tag, password.is_some(), false, false, &words);
     channel.exec(true, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
-    let feed = RootFeed { tag: &tag, password, then: line.as_bytes(), end: false, pty: false };
+    let feed = RootFeed { tag: &tag, password, then: line.as_bytes(), end: false, pty: false, turned_down: None };
     if let Err(e) = root_feed(&mut channel, feed, None).await {
         let _ = channel.close().await;
         return Err(e);
@@ -19412,7 +19422,8 @@ pub(crate) mod root_over_ssh_tests {
     /// as with `timestamp_timeout=0`); `pamprompt` (PAM's own prompt shown
     /// instead of `-p`'s); `early` (a warning of its own first, then that
     /// many seconds before it asks); `slowcheck` (seconds to check a
-    /// password). Each password read is a line in `attempts`. Like sudo
+    /// password); `german` (its words in German, but in the C locale) or
+    /// `germanalways`. Each password read is a line in `attempts`. Like sudo
     /// without a terminal, a sign-in leaves a ticket for the caller's
     /// process (its parent), which `-n` and `-v` then use; `-k` ignores it.
     pub(crate) const FAKE_TOOL: &str = r#"#!/bin/sh
@@ -19425,6 +19436,9 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+de=
+if [ -f "$D/germanalways" ] || { [ -f "$D/german" ] && [ "$LC_ALL" != C ]; }; then de=1; fi
+say() { if [ -n "$de" ]; then echo "$2" >&2; else echo "$1" >&2; fi; }
 if [ -f "$D/early" ]; then echo "$T: unable to resolve host test: Name or service not known" >&2; sleep "$(cat "$D/early")"; fi
 rules=$(cat "$D/rules.$T")
 case $rules in
@@ -19434,19 +19448,19 @@ need=1
 case $rules in *nopasswd*) need=;; esac
 if [ -n "$need" ] && [ -z "$k" ] && [ -f "$D/ticket.$PPID" ]; then need=; fi
 if [ -n "$need" ]; then
-  if [ -n "$n" ]; then echo "$T: a password is required" >&2; exit 1; fi
+  if [ -n "$n" ]; then say "$T: a password is required" "$T: Ein Passwort ist notwendig"; exit 1; fi
   if [ -f "$D/pamprompt" ]; then p=$(cat "$D/pamprompt"); fi
   tries=0
   while :; do
     printf '%s' "$p" >&2
-    IFS= read -r pw || { echo >&2; echo "$T: no password was provided" >&2; exit 1; }
+    IFS= read -r pw || { echo >&2; say "$T: no password was provided" "$T: Es wurde kein Passwort angegeben"; exit 1; }
     echo >&2
     echo try >> "$D/attempts"
     if [ -f "$D/slowcheck" ]; then sleep "$(cat "$D/slowcheck")"; fi
     [ "$pw" = "$(cat "$D/password")" ] && break
-    echo "Sorry, try again." >&2
+    say "Sorry, try again." "Entschuldigung, versuchen Sie es noch einmal."
     tries=$((tries + 1))
-    if [ $tries -ge 3 ]; then echo "$T: 3 incorrect password attempts" >&2; exit 1; fi
+    if [ $tries -ge 3 ]; then say "$T: 3 incorrect password attempts" "$T: 3 Fehlversuche bei der Passwort-Eingabe"; exit 1; fi
   done
   if [ -z "$k" ] && [ ! -f "$D/notickets" ]; then touch "$D/ticket.$PPID"; fi
 fi
@@ -19659,6 +19673,19 @@ exec "$@"
         let (code, out) = root_run(&lab.handle, &su("s3cret pass"), &words("echo root"), 60, None).await.unwrap();
         assert_eq!((code, out.trim()), (0, "root"));
         assert_eq!(lab.attempts(), 1);
+    }
+
+    /// A sudo that speaks German is asked in English (the C locale), so a
+    /// wrong password is seen as one, once.
+    #[tokio::test]
+    async fn a_tool_in_another_language_is_asked_in_english() {
+        let lab = Lab::new("german", "all", "none").await;
+        lab.set("german", "");
+        assert_eq!(root_probe(&lab.handle, "dzdo", Some("not it"), &words("true")).await, Err(SUDO_WRONG_PASSWORD.to_string()));
+        assert_eq!(root_probe(&lab.handle, "dzdo", None, &words("true")).await, Err(SUDO_NEED_PASSWORD.to_string()));
+        let wrong = ssh_manager::RootAccess::new("dzdo", Some(pw("not it")), None, None);
+        assert_eq!(root_run(&lab.handle, &wrong, &words("echo root"), 30, None).await, Err(SUDO_WRONG_PASSWORD.to_string()));
+        assert_eq!(lab.attempts(), 2);
     }
 
     /// A slow answer to a wrong password (AD): still one attempt, and the
