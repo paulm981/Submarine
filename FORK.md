@@ -131,6 +131,8 @@ It works in three places:
 - **the Info panel**: start, stop and restart services, end processes, and read firewall rules as root;
 - **the Docker tab**: where only root may use Docker, containers, logs, live logs and container terminals work through root.
 
+The AI's root requests use it too, with a password of their own, kept for the AI tab only (see [AI help](#ai-help-without-sharing-keys)).
+
 ### Files
 
 - **Live Edit keeps your unsent changes.** If a copy on this computer has changes that never reached the server, it's kept in **Submarine unsent edits** in your Downloads folder when you open the file again, disconnect, lock the profile or quit. The window says so. On macOS and Linux, only you can read that folder.
