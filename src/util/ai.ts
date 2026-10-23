@@ -34,6 +34,9 @@ export interface AiPending {
   ask_rule: string | null;
   /// "Always allow this command here" is offered for it.
   can_allow_always: boolean;
+  /// Why it asks where the server's settings otherwise wouldn't: they
+  /// couldn't be read, or a change to them waits for your OK.
+  note: string | null;
 }
 export interface AiRunning {
   id: number; tab_label: string; session_id: string; server: string; command: string; started_at: string;

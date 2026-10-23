@@ -240,6 +240,9 @@ struct PendingView {
     /// (trust::is_simple), on a saved server, that doesn't ask for root and
     /// no always-ask rule caught.
     can_allow_always: bool,
+    /// Why it asks when the server's settings would otherwise not: they
+    /// couldn't be read, or a change to them waits for your OK.
+    note: Option<String>,
 }
 
 /// Your answer to a request.
@@ -414,13 +417,7 @@ fn now() -> String {
 /// that has to keep root out (step 3 of #32: running as another account)
 /// must decide on its own `as_root` and treat "can't tell" as root.
 pub(crate) fn asks_for_root(command: &str) -> bool {
-    use std::sync::LazyLock;
-    static RE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r#"(?:^|[\s;|&(){}`'"/!])(?:sudo|dzdo|su|doas|pkexec)(?:$|[\s;|&(){}`'"])"#).unwrap());
-    // And the same words as the always-ask list reads them (trust.rs):
-    // quotes and backslashes taken out, the name after a path, a glob that
-    // could name one (`sud?`), sudoedit and run0 too.
-    RE.is_match(command) || trust::mentions_root(command)
+    trust::asks_for_root(command)
 }
 
 /// A request runs as root: its server's tab logged in as root, or its
@@ -545,7 +542,7 @@ impl AiState {
         let policy: PolicyLookup = Arc::new(move |server_id| {
             let db = db_app.state::<crate::DbState>();
             let guard = db.conn.lock().unwrap_or_else(|e| e.into_inner());
-            guard.as_ref().map(|conn| trust::policy_for(conn, server_id)).unwrap_or_default()
+            guard.as_ref().map(|conn| trust::policy_for(conn, server_id)).unwrap_or_else(trust::Policy::unreadable)
         });
         let attention_app = app.clone();
         let attention = Box::new(move || {
@@ -1130,11 +1127,18 @@ impl AiState {
         // its own) and checked again under it.
         let looked_up = {
             let s = self.lock();
-            s.tabs.iter().find(|t| t.id == tab_id).and_then(|t| t.servers.iter().find(|x| x.name == server)).map(|x| x.server_id)
+            s.tabs.iter().find(|t| t.id == tab_id).and_then(|t| t.servers.iter().find(|x| x.name == server)).map(|x| (x.server_id, x.allow_all))
         };
-        let policy = looked_up.map(|id| (self.0.policy)(id));
-        // (A command too long to run is refused below, unread.)
-        let root_cmd = command.len() <= MAX_COMMAND && asks_for_root(command);
+        // The command read once, and the decision made, outside the lock. A
+        // command too long to run is refused below, unread.
+        let readable = command.len() <= MAX_COMMAND && !command.contains('\0');
+        let parsed = readable.then(|| trust::Parsed::new(command));
+        let root_cmd = parsed.as_ref().is_some_and(|p| p.root);
+        let policy = looked_up.map(|(id, _)| (self.0.policy)(id));
+        let early = match (&policy, &parsed, looked_up) {
+            (Some(p), Some(c), Some((_, allow_all))) => trust::decide_parsed(p, allow_all, c),
+            _ => trust::Decision::Ask { rule: None },
+        };
         // Checked before anything is shown to you or runs.
         let (label, session_id, server, user, id, epoch, rx, stop_tx, stop_rx, auto) = {
             let mut s = self.lock();
@@ -1198,12 +1202,9 @@ impl AiState {
             // Whether it waits for you (trust.rs). Settings read for another
             // server than this one (it was shared again meanwhile) count
             // for nothing: it asks.
-            let decision = match &policy {
-                Some(p) if looked_up == Some(found.server_id) => {
-                    trust::decide(p, found.allow_all, command)
-                }
-                _ => trust::Decision::Ask { rule: None },
-            };
+            // Made for this same share as it is now (not one shared again
+            // meanwhile, or whose "allow everything" changed): else it asks.
+            let decision = if looked_up == Some((found.server_id, found.allow_all)) { early } else { trust::Decision::Ask { rule: None } };
             let auto = decision.approved_by();
             if auto.is_none() && waiting >= MAX_WAITING {
                 drop(s);
@@ -1250,7 +1251,12 @@ impl AiState {
                             timeout_secs: timeout.unwrap_or(DEFAULT_TIMEOUT),
                             asked_at: now(),
                             server_id: found.server_id,
-                            can_allow_always: found.server_id.is_some() && ask_rule.is_none() && !root_cmd && trust::is_simple_on(command, policy.as_ref().is_some_and(|p| p.windows)),
+                            can_allow_always: found.server_id.is_some()
+                                && ask_rule.is_none()
+                                && !root_cmd
+                                && policy.as_ref().is_some_and(|p| p.force_ask.is_none())
+                                && trust::is_simple_on(command, policy.as_ref().is_some_and(|p| p.windows)),
+                            note: policy.as_ref().and_then(|p| p.force_ask.clone()).filter(|_| ask_rule.is_none()),
                             ask_rule,
                         },
                         decide: tx,

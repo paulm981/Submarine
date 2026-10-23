@@ -665,6 +665,23 @@ async fn deny_with_a_note_tells_the_ai_why() {
     assert_eq!(s.snapshot().history[0].outcome, "denied");
 }
 
+/// Settings that can't be read ask, even where you allowed everything, and
+/// the card says why.
+#[tokio::test]
+async fn unreadable_settings_ask_even_with_everything_allowed() {
+    let (s, shared, _) = state_with_policy(policy(1, &[], &[]));
+    let (req, p) = ask_for(&s, "uptime").await;
+    assert_eq!(p.note, None);
+    s.allow_session(p.id).unwrap();
+    req.await.unwrap();
+    *shared.lock().unwrap() = trust::Policy::unreadable();
+    let (req, p) = ask_for(&s, "uptime").await;
+    assert_eq!(p.note.as_deref(), Some(trust::UNREADABLE));
+    assert!(!p.can_allow_always);
+    s.decide(p.id, false).unwrap();
+    req.await.unwrap();
+}
+
 /// The marker's level, per shared server, follows the settings as they
 /// change.
 #[tokio::test]

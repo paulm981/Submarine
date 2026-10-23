@@ -354,21 +354,41 @@ fn collapsed_words(text: &str) -> Vec<String> {
 /// The ways a command is read into words for the always-ask list and the
 /// root check, each tried in turn: plainly (quotes and backslashes out),
 /// and collapsed.
-fn word_lists(command: &str) -> Vec<Vec<String>> {
-    let mut out = vec![words(command)];
-    out.extend(collapsed(command).iter().map(|t| collapsed_words(t)));
-    out
+///
+/// The same readings are also cut into the simple commands they hold (at
+/// `;`, `&`, `|`, new lines, parentheses, braces and backticks), for
+/// options.
+///
+/// A command is read once (`Parsed::new`), and every rule matched against
+/// that.
+pub(crate) struct Parsed {
+    command: String,
+    /// Each reading's words.
+    words: Vec<Vec<String>>,
+    /// Each reading's simple commands, and their words.
+    commands: Vec<Vec<Vec<String>>>,
+    /// It asks for root (asks_for_root).
+    pub root: bool,
 }
 
-/// The same readings, cut into the simple commands they hold (at `;`, `&`,
-/// `|`, new lines, parentheses, braces and backticks), for flags.
-fn command_lists(command: &str) -> Vec<Vec<Vec<String>>> {
-    let cut = |t: &str, read: &dyn Fn(&str) -> Vec<String>| -> Vec<Vec<String>> {
-        t.split(|c: char| matches!(c, ';' | '&' | '|' | '\n' | '\r' | '(' | ')' | '{' | '}' | '`')).map(read).filter(|w| !w.is_empty()).collect()
-    };
-    let mut out = vec![cut(command, &words)];
-    out.extend(collapsed(command).iter().map(|t| cut(t, &collapsed_words)));
-    out
+/// The tools that give root, as the old check had them: kept beside the
+/// words, as it also sees them inside a word (`(su -)`).
+static ROOT_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r#"(?:^|[\s;|&(){}`'"/!])(?:sudo|dzdo|su|doas|pkexec)(?:$|[\s;|&(){}`'"])"#).unwrap());
+
+impl Parsed {
+    pub(crate) fn new(command: &str) -> Parsed {
+        let cut = |t: &str, read: &dyn Fn(&str) -> Vec<String>| -> Vec<Vec<String>> {
+            t.split(|c: char| matches!(c, ';' | '&' | '|' | '\n' | '\r' | '(' | ')' | '{' | '}' | '`')).map(read).filter(|w| !w.is_empty()).collect()
+        };
+        let readings = collapsed(command);
+        let mut words_ = vec![words(command)];
+        words_.extend(readings.iter().map(|t| collapsed_words(t)));
+        let mut commands = vec![cut(command, &words)];
+        commands.extend(readings.iter().map(|t| cut(t, &collapsed_words)));
+        let root = ROOT_RE.is_match(command) || words_.iter().flatten().any(|w| ROOT_WORDS.iter().any(|r| word_is(w, r, false)));
+        Parsed { command: command.to_string(), words: words_, commands, root }
+    }
 }
 
 /// The options a word gives: `-rf` is r and f, `--recursive` is recursive
@@ -387,7 +407,7 @@ fn flags_of(word: &str) -> Option<Vec<String>> {
 /// A rule of a command and its options alone (`rm -rf *`) matches the
 /// command with those options in any order, split or long: `rm -fr`,
 /// `rm -r -f`, `rm --recursive --force`.
-fn flags_match(want: &[String], command: &str) -> bool {
+fn flags_match(want: &[String], command: &Parsed) -> bool {
     let Some((name, opts)) = want.split_first() else { return false };
     let mut need: Vec<String> = Vec::new();
     for o in opts {
@@ -400,7 +420,7 @@ fn flags_match(want: &[String], command: &str) -> bool {
     if need.is_empty() {
         return false;
     }
-    command_lists(command).iter().flatten().any(|cmd| {
+    command.commands.iter().flatten().any(|cmd| {
         cmd.iter().enumerate().any(|(i, w)| {
             if !word_is(w, name, false) {
                 return false;
@@ -435,8 +455,12 @@ fn flags_match(want: &[String], command: &str) -> bool {
 /// (`$(echo re)boot`, base64): the always-ask list is a safety net, not a
 /// wall.
 pub(crate) fn ask_matches(rule: &str, command: &str) -> bool {
+    ask_matches_parsed(rule, &Parsed::new(command))
+}
+
+fn ask_matches_parsed(rule: &str, command: &Parsed) -> bool {
     let Some((want, prefix)) = ask_words(rule) else { return false };
-    word_lists(command).iter().any(|have| {
+    command.words.iter().any(|have| {
         have.windows(want.len())
             .any(|win| win.iter().zip(&want).enumerate().all(|(i, (w, r))| word_is(w, r, prefix && i + 1 == want.len())))
     }) || (!prefix && flags_match(&want, command))
@@ -447,8 +471,16 @@ const ROOT_WORDS: &[&str] = &["sudo", "sudoedit", "dzdo", "su", "doas", "pkexec"
 
 /// Whether a word of `command`, read as the always-ask list reads them,
 /// names a program that gives root, or is a glob that could (`sud?`).
+#[cfg(test)]
 pub(crate) fn mentions_root(command: &str) -> bool {
-    word_lists(command).iter().flatten().any(|w| ROOT_WORDS.iter().any(|r| word_is(w, r, false)))
+    Parsed::new(command).words.iter().flatten().any(|w| ROOT_WORDS.iter().any(|r| word_is(w, r, false)))
+}
+
+/// A command that asks for root: one of the tools that give it (sudo,
+/// sudoedit, dzdo, su, doas, pkexec, run0), read as the always-ask list
+/// reads words, anywhere in it, or a glob that could name one.
+pub(crate) fn asks_for_root(command: &str) -> bool {
+    Parsed::new(command).root
 }
 
 /// The programs that run other commands they're given: an allow rule with a
@@ -511,19 +543,29 @@ impl Decision {
 /// - An always-ask rule that matches makes it ask, whatever the level.
 /// - "Allow everything here until this AI tab closes" (`session_allow`)
 ///   runs the rest, as level 3 does.
+/// - A policy that couldn't be read, or is on hold, asks.
 /// - At level 2, a command that asks for root (asks_for_root: sudo, dzdo,
 ///   su, doas, pkexec and the like) asks; otherwise an allow rule that
 ///   matches runs it.
 /// - Anything else asks.
 pub(crate) fn decide(policy: &Policy, session_allow: bool, command: &str) -> Decision {
-    if let Some(rule) = policy.ask.iter().find(|r| ask_matches(r, command)) {
+    decide_parsed(policy, session_allow, &Parsed::new(command))
+}
+
+/// The same, for a command read already. A policy that couldn't be read,
+/// or is on hold (`force_ask`), asks, whatever the level and the session.
+pub(crate) fn decide_parsed(policy: &Policy, session_allow: bool, command: &Parsed) -> Decision {
+    if let Some(rule) = policy.ask.iter().find(|r| ask_matches_parsed(r, command)) {
         return Decision::Ask { rule: Some(rule.clone()) };
+    }
+    if policy.force_ask.is_some() {
+        return Decision::Ask { rule: None };
     }
     if session_allow || policy.level == RUN_ANYTHING {
         return if session_allow { Decision::Session } else { Decision::Anything };
     }
-    if policy.level == ALLOWED_COMMANDS && !crate::ai::asks_for_root(command) {
-        if let Some(rule) = policy.allow.iter().find(|r| allow_matches_on(r, command, policy.windows)) {
+    if policy.level == ALLOWED_COMMANDS && !command.root {
+        if let Some(rule) = policy.allow.iter().find(|r| allow_matches_on(r, &command.command, policy.windows)) {
             return Decision::Rule(rule.clone());
         }
     }
@@ -629,12 +671,26 @@ pub(crate) struct Policy {
     /// The server's saved OS is Windows (server_os.rs): `%` and `^` are
     /// operators to its allow rules.
     pub windows: bool,
+    /// Every command asks, whatever the level and the session's allow: the
+    /// policy couldn't be read, or a change to it waits for your OK. Why,
+    /// in words for the request's card.
+    pub force_ask: Option<String>,
+}
+
+/// What the card says when the settings can't be read.
+pub(crate) const UNREADABLE: &str = "Submarine couldn't read this server's AI approval, so it asks.";
+
+impl Policy {
+    /// What holds when the settings can't be read: every command asks.
+    pub(crate) fn unreadable() -> Policy {
+        Policy { force_ask: Some(UNREADABLE.into()), ..Policy::default() }
+    }
 }
 
 impl Default for Policy {
     /// Ask every time: what holds when nothing can be read.
     fn default() -> Self {
-        Policy { level: ASK_EVERY_TIME, allow: Vec::new(), ask: Vec::new(), windows: false }
+        Policy { level: ASK_EVERY_TIME, allow: Vec::new(), ask: Vec::new(), windows: false, force_ask: None }
     }
 }
 
@@ -686,9 +742,10 @@ fn try_policy(conn: &Connection, server_id: Option<i64>) -> rusqlite::Result<Pol
     Ok(p)
 }
 
-/// What holds for `server_id`. Anything that can't be read asks every time.
+/// What holds for `server_id`. Anything that can't be read asks every time,
+/// even where you allowed everything (Policy::unreadable).
 pub(crate) fn policy_for(conn: &Connection, server_id: Option<i64>) -> Policy {
-    try_policy(conn, server_id).unwrap_or_default()
+    try_policy(conn, server_id).unwrap_or_else(|_| Policy::unreadable())
 }
 
 /// A level set on a server or folder (or the default), for Settings.

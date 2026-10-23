@@ -188,6 +188,12 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
           <span>It has hidden or control characters, shown below as ⟨U+…⟩.</span>
         </div>
       )}
+      {p.note && (
+        <div className="flex items-start gap-1.5 text-[11px] text-amber-300">
+          <ShieldAlert size={13} className="shrink-0 mt-px" />
+          <span>{p.note}</span>
+        </div>
+      )}
       {p.ask_rule && (
         <div className="flex items-start gap-1.5 text-[11px] text-amber-300">
           <ShieldAlert size={13} className="shrink-0 mt-px" />

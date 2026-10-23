@@ -238,7 +238,7 @@ fn every_default_rule_is_valid() {
 
 /// The decision at `level`, with `allow` and `ask` lists.
 fn dec(level: u8, session: bool, allow: &[String], ask: &[String], command: &str) -> Decision {
-    decide(&Policy { level, allow: allow.to_vec(), ask: ask.to_vec(), windows: false }, session, command)
+    decide(&Policy { level, allow: allow.to_vec(), ask: ask.to_vec(), windows: false, force_ask: None }, session, command)
 }
 
 fn ask() -> Decision {
@@ -432,7 +432,8 @@ fn a_loop_in_the_folder_tree_ends() {
 #[test]
 fn what_cannot_be_read_asks_every_time() {
     let conn = Connection::open_in_memory().unwrap();
-    assert_eq!(policy_for(&conn, Some(1)), Policy::default());
+    assert_eq!(policy_for(&conn, Some(1)), Policy::unreadable());
+    assert_eq!(decide(&Policy::unreadable(), true, "uptime"), Decision::Ask { rule: None }, "even with everything allowed");
 }
 
 #[test]
@@ -499,7 +500,7 @@ fn percent_and_caret_are_operators_on_windows() {
         assert!(allow_matches_on("dir *", cmd, false), "{cmd} is simple to a POSIX shell");
         assert!(!allow_matches_on("dir *", cmd, true), "{cmd}");
     }
-    let windows = Policy { level: 2, allow: rules(&["dir *"]), ask: vec![], windows: true };
+    let windows = Policy { level: 2, allow: rules(&["dir *"]), ask: vec![], windows: true, force_ask: None };
     assert_eq!(decide(&windows, false, "dir C:\\Users"), Decision::Rule("dir *".into()));
     assert_eq!(decide(&windows, false, "dir %USERPROFILE%"), ask());
 }
@@ -534,7 +535,7 @@ fn root_is_seen_however_it_is_written() {
     ] {
         assert!(mentions_root(cmd), "{cmd}");
         assert!(crate::ai::asks_for_root(cmd), "{cmd}: the card says so too");
-        let p = Policy { level: 2, allow: rules(&["* id", "sud? *", "s\\udo *", "'sudo' *", "SUDO *", "sudoedit *", "run0 *", "doas *", "su *"]), ask: vec![], windows: false };
+        let p = Policy { level: 2, allow: rules(&["* id", "sud? *", "s\\udo *", "'sudo' *", "SUDO *", "sudoedit *", "run0 *", "doas *", "su *"]), ask: vec![], windows: false, force_ask: None };
         assert_eq!(decide(&p, false, cmd), ask(), "{cmd}");
     }
     for cmd in ["cat sudoers.txt", "ls -su", "echo pseudo", "ls *", "id", "visudo-ish"] {
@@ -590,7 +591,7 @@ fn hidden_spellings_of_an_always_ask_rule_ask() {
     for (rule, commands) in cases {
         for cmd in *commands {
             assert!(ask_matches(rule, cmd), "{rule}: {cmd:?}");
-            let p = Policy { level: 3, allow: vec![], ask: rules(&[rule]), windows: false };
+            let p = Policy { level: 3, allow: vec![], ask: rules(&[rule]), windows: false, force_ask: None };
             assert_eq!(decide(&p, true, cmd), Decision::Ask { rule: Some(rule.to_string()) }, "{rule}: {cmd:?}");
         }
     }
