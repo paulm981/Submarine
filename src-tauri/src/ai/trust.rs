@@ -132,7 +132,9 @@ pub(crate) fn allow_matches_on(rule: &str, command: &str, windows: bool) -> bool
         // /etc/shadow).
         None => cmd.strip_prefix(body).is_some_and(|rest| {
             let last_word = cmd.rsplit(' ').next().unwrap_or(cmd);
-            !rest.chars().any(char::is_whitespace) && !last_word.split(['/', '\\']).any(|seg| seg == "..")
+            // No glob either: `.?` is `..` to bash before 5.2.
+            !rest.chars().any(|c| c.is_whitespace() || matches!(c, '?' | '*' | '['))
+                && !last_word.split(['/', '\\']).any(|seg| seg == "..")
         }),
     }
 }
@@ -182,59 +184,152 @@ fn is_glob(w: &str) -> bool {
     w.contains(['?', '*', '['])
 }
 
-/// Whether the shell glob `pat` (`?`, `*`, `[…]`) matches all of `text`.
-fn glob_match(pat: &[char], text: &[char]) -> bool {
-    match pat.first() {
-        None => text.is_empty(),
-        Some('*') => (0..=text.len()).any(|i| glob_match(&pat[1..], &text[i..])),
-        Some('?') => !text.is_empty() && glob_match(&pat[1..], &text[1..]),
-        Some('[') => {
-            let Some(close) = pat.iter().skip(2).position(|c| *c == ']').map(|p| p + 2) else {
-                return text.first() == Some(&'[') && glob_match(&pat[1..], &text[1..]);
-            };
-            let Some(c) = text.first() else { return false };
-            let set = &pat[1..close];
-            let (negate, set) = match set.first() {
-                Some('!' | '^') => (true, &set[1..]),
-                _ => (false, set),
-            };
-            let mut hit = false;
-            let mut i = 0;
-            while i < set.len() {
-                if i + 2 < set.len() && set[i + 1] == '-' {
-                    hit |= (set[i]..=set[i + 2]).contains(c);
-                    i += 3;
-                } else {
-                    hit |= set[i] == *c;
+/// A glob longer than this isn't matched: it's taken as one that could
+/// name anything, which only ever makes a request ask.
+const MAX_GLOB: usize = 256;
+
+/// One part of a glob.
+#[derive(Debug, Clone, PartialEq)]
+enum Glob {
+    Char(char),
+    /// `?`
+    One,
+    /// `*`, a run of them as one.
+    Any,
+    /// `[…]`: ranges and characters, and whether it's negated (`[!…]`).
+    Set(Vec<(char, char)>, bool),
+}
+
+fn parse_glob(pat: &[char]) -> Vec<Glob> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < pat.len() {
+        match pat[i] {
+            '*' => {
+                if out.last() != Some(&Glob::Any) {
+                    out.push(Glob::Any);
+                }
+                i += 1;
+            }
+            '?' => {
+                out.push(Glob::One);
+                i += 1;
+            }
+            '[' => match pat.iter().skip(i + 2).position(|c| *c == ']').map(|p| p + i + 2) {
+                Some(close) => {
+                    let mut set = &pat[i + 1..close];
+                    let negate = matches!(set.first(), Some('!' | '^'));
+                    if negate {
+                        set = &set[1..];
+                    }
+                    let mut ranges = Vec::new();
+                    let mut j = 0;
+                    while j < set.len() {
+                        if j + 2 < set.len() && set[j + 1] == '-' {
+                            ranges.push((set[j], set[j + 2]));
+                            j += 3;
+                        } else {
+                            ranges.push((set[j], set[j]));
+                            j += 1;
+                        }
+                    }
+                    out.push(Glob::Set(ranges, negate));
+                    i = close + 1;
+                }
+                None => {
+                    out.push(Glob::Char('['));
                     i += 1;
                 }
+            },
+            c => {
+                out.push(Glob::Char(c));
+                i += 1;
             }
-            hit != negate && glob_match(&pat[close + 1..], &text[1..])
         }
-        Some(p) => text.first() == Some(p) && glob_match(&pat[1..], &text[1..]),
+    }
+    out
+}
+
+/// Whether one part takes the character `c` (not `Any`).
+fn takes(g: &Glob, c: char) -> bool {
+    match g {
+        Glob::Char(x) => *x == c,
+        Glob::One => true,
+        Glob::Set(ranges, negate) => ranges.iter().any(|(a, b)| (*a..=*b).contains(&c)) != *negate,
+        Glob::Any => true,
+    }
+}
+
+/// The positions in `glob` reachable after reading `text`, as a set:
+/// every position at once, so the work is the text's length times the
+/// glob's, never more (no backtracking).
+fn glob_states(glob: &[Glob], text: &[char]) -> Vec<bool> {
+    // Where a `*` may also be skipped.
+    let close = |states: &mut Vec<bool>| {
+        for i in 0..glob.len() {
+            if states[i] && glob[i] == Glob::Any {
+                states[i + 1] = true;
+            }
+        }
+    };
+    let mut states = vec![false; glob.len() + 1];
+    states[0] = true;
+    close(&mut states);
+    for c in text {
+        let mut next = vec![false; glob.len() + 1];
+        for i in 0..glob.len() {
+            if !states[i] {
+                continue;
+            }
+            match &glob[i] {
+                Glob::Any => next[i] = true,
+                g if takes(g, *c) => next[i + 1] = true,
+                _ => {}
+            }
+        }
+        close(&mut next);
+        if !next.iter().any(|s| *s) {
+            return next;
+        }
+        states = next;
+    }
+    states
+}
+
+/// Whether the shell glob `pat` (`?`, `*`, `[…]`) matches all of `text`.
+#[cfg(test)]
+fn glob_match(pat: &[char], text: &[char]) -> bool {
+    pat.len() > MAX_GLOB || glob_states(&parse_glob(pat), text)[parse_glob(pat).len()]
+}
+
+/// Whether the glob `pat` could expand to `name`, or (`prefix`) to some
+/// word starting with `name`: once all of `name` is read, any part of the
+/// glob still reachable can be finished by some ending. A glob longer than
+/// MAX_GLOB counts as one that could.
+fn glob_could_be(pat: &str, name: &str, prefix: bool) -> bool {
+    let pat: Vec<char> = pat.chars().collect();
+    if pat.len() > MAX_GLOB {
+        return true;
+    }
+    let glob = parse_glob(&pat);
+    let name: Vec<char> = name.chars().collect();
+    let states = glob_states(&glob, &name);
+    if prefix {
+        states.iter().any(|s| *s)
+    } else {
+        states[glob.len()]
     }
 }
 
 /// A command word that names `name` (or, `prefix`, something starting with
 /// it): as itself, its name after the last `/` or `\`, without `.exe` and
-/// the like, or as a glob that could expand to it (`sud?`, `/sbin/reb?ot`).
-/// A glob of wildcards alone (`*`) counts for nothing: it would name
-/// everything.
+/// the like, or as a glob that could expand to it (`sud?`, `/sbin/reb?ot`,
+/// `mk?s.ext4` for `mkfs*`). A glob of wildcards alone (`*`) counts for
+/// nothing: it would name everything.
 fn word_is(word: &str, name: &str, prefix: bool) -> bool {
     forms(word).into_iter().any(|f| {
         if is_glob(f) {
-            if !f.chars().any(|c| !matches!(c, '?' | '*' | '[' | ']' | '!' | '^' | '-')) {
-                return false;
-            }
-            let pat: Vec<char> = f.chars().collect();
-            let name: Vec<char> = name.chars().collect();
-            glob_match(&pat, &name) || (prefix && (name.len()..name.len() + 24).any(|n| {
-                // Any longer name starting with it: tried with the glob's
-                // own letters as filler, which is enough for `?` and `*`.
-                let mut longer = name.clone();
-                longer.resize(n, 'x');
-                glob_match(&pat, &longer)
-            }))
+            f.chars().any(|c| !matches!(c, '?' | '*' | '[' | ']' | '!' | '^' | '-')) && glob_could_be(f, name, prefix)
         } else if prefix {
             f.starts_with(name)
         } else {
@@ -386,7 +481,10 @@ impl Parsed {
         words_.extend(readings.iter().map(|t| collapsed_words(t)));
         let mut commands = vec![cut(command, &words)];
         commands.extend(readings.iter().map(|t| cut(t, &collapsed_words)));
-        let root = ROOT_RE.is_match(command) || words_.iter().flatten().any(|w| ROOT_WORDS.iter().any(|r| word_is(w, r, false)));
+        let root = ROOT_RE.is_match(command)
+            || words_.iter().flatten().any(|w| ROOT_WORDS.iter().any(|r| word_is(w, r, false)))
+            // `machinectl shell` opens a shell as root by default.
+            || words_.iter().any(|ws| ws.windows(2).any(|p| word_is(&p[0], "machinectl", false) && p[1] == "shell"));
         Parsed { command: command.to_string(), words: words_, commands, root }
     }
 }
@@ -468,7 +566,7 @@ fn ask_matches_parsed(rule: &str, command: &Parsed) -> bool {
 }
 
 /// The programs that give root.
-const ROOT_WORDS: &[&str] = &["sudo", "sudoedit", "dzdo", "su", "doas", "pkexec", "run0"];
+const ROOT_WORDS: &[&str] = &["sudo", "sudoedit", "dzdo", "su", "doas", "pkexec", "run0", "runuser"];
 
 /// Whether a word of `command`, read as the always-ask list reads them,
 /// names a program that gives root, or is a glob that could (`sud?`).
@@ -478,8 +576,9 @@ pub(crate) fn mentions_root(command: &str) -> bool {
 }
 
 /// A command that asks for root: one of the tools that give it (sudo,
-/// sudoedit, dzdo, su, doas, pkexec, run0), read as the always-ask list
-/// reads words, anywhere in it, or a glob that could name one.
+/// sudoedit, dzdo, su, doas, pkexec, run0, runuser, `machinectl shell`),
+/// read as the always-ask list reads words, anywhere in it, or a glob that
+/// could name one.
 pub(crate) fn asks_for_root(command: &str) -> bool {
     Parsed::new(command).root
 }
@@ -491,6 +590,8 @@ const RUNNERS: &[&str] = &[
     "env", "xargs", "timeout", "nice", "ionice", "nohup", "exec", "command", "builtin", "busybox", "stdbuf", "setsid",
     "chroot", "watch", "sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish", "python", "perl", "ruby", "node", "php",
     "awk", "gawk", "mawk", "find", "git", "ssh", "rsync", "tar", "docker", "kubectl", "cmd", "powershell", "pwsh",
+    "sed", "time", "strace", "ltrace", "gdb", "nsenter", "unshare", "systemd-run", "flock", "parallel", "script", "sshpass",
+    "expect", "screen", "tmux", "at", "batch", "iex", "invoke-expression", "start-process", "wsl",
 ];
 
 /// The warning for an allow rule with a wildcard whose command runs other

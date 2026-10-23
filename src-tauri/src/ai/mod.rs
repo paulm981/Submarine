@@ -415,18 +415,12 @@ fn now() -> String {
 ///
 /// A warning for you on the request's card, and at "Run my allowed
 /// commands" a reason to ask (trust::decide), which only ever asks more. Not
-/// a wall: it's still easy to dodge (`$(echo sudo)`, `runuser`, a script
-/// that calls sudo), so nothing may be allowed because it says no. Anything
+/// a wall: it's still easy to dodge (`$(echo sudo)`, a copy of sudo under
+/// another name, a script that calls sudo), so nothing may be allowed because it says no. Anything
 /// that has to keep root out (step 3 of #32: running as another account)
 /// must decide on its own `as_root` and treat "can't tell" as root.
 pub(crate) fn asks_for_root(command: &str) -> bool {
     trust::asks_for_root(command)
-}
-
-/// A request runs as root: its server's tab logged in as root, or its
-/// command asks for root. A warning, as asks_for_root is.
-fn runs_as_root(user: Option<&str>, command: &str) -> bool {
-    user == Some("root") || asks_for_root(command)
 }
 
 /// Equal without saying where they differ.
@@ -1184,15 +1178,24 @@ impl AiState {
             let s = self.lock();
             s.tabs.iter().find(|t| t.id == tab_id).and_then(|t| t.servers.iter().find(|x| x.name == server)).map(|x| (x.server_id, x.allow_all))
         };
-        // The command read once, and the decision made, outside the lock. A
-        // command too long to run is refused below, unread.
-        let readable = command.len() <= MAX_COMMAND && !command.contains('\0');
-        let parsed = readable.then(|| trust::Parsed::new(command));
-        let root_cmd = parsed.as_ref().is_some_and(|p| p.root);
-        let policy = looked_up.map(|(id, _)| (self.0.policy)(id));
-        let early = match (&policy, &parsed, looked_up) {
-            (Some(p), Some(c), Some((_, allow_all))) => trust::decide_parsed(p, allow_all, c),
-            _ => trust::Decision::Ask { rule: None },
+        // The command read once, the settings read and the decision made,
+        // outside the lock and off the async workers (the vault has a lock
+        // of its own, and the AI writes the command). A command too long to
+        // run is refused below, unread. Should it fail, it asks, as root.
+        let (root_cmd, policy, early) = {
+            let lookup = self.0.policy.clone();
+            let cmd = command.to_string();
+            tokio::task::spawn_blocking(move || {
+                let parsed = (cmd.len() <= MAX_COMMAND && !cmd.contains('\0')).then(|| trust::Parsed::new(&cmd));
+                let policy = looked_up.map(|(id, _)| lookup(id));
+                let early = match (&policy, &parsed, looked_up) {
+                    (Some(p), Some(c), Some((_, allow_all))) => trust::decide_parsed(p, allow_all, c),
+                    _ => trust::Decision::Ask { rule: None },
+                };
+                (parsed.is_some_and(|p| p.root), policy, early)
+            })
+            .await
+            .unwrap_or_else(|_| (true, Some(trust::Policy::unreadable()), trust::Decision::Ask { rule: None }))
         };
         // Checked before anything is shown to you or runs.
         let (label, session_id, server, user, id, epoch, rx, stop_tx, stop_rx, auto) = {
@@ -1312,7 +1315,7 @@ impl AiState {
                             server: found.name.clone(),
                             user: found.user.clone(),
                             command: command.to_string(),
-                            root: runs_as_root(found.user.as_deref(), command),
+                            root: found.user.as_deref() == Some("root") || root_cmd,
                             timeout_secs: timeout.unwrap_or(DEFAULT_TIMEOUT),
                             asked_at: now(),
                             server_id: found.server_id,
@@ -1336,7 +1339,8 @@ impl AiState {
         if rx.is_some() && self.0.flash.load(Ordering::Relaxed) {
             (self.0.attention)();
         }
-        let root = runs_as_root(user.as_deref(), command);
+        // As root: the login, or the command (read above, not again).
+        let root = user.as_deref() == Some("root") || root_cmd;
         let limit = Duration::from_secs(timeout.unwrap_or(DEFAULT_TIMEOUT));
         let entry_for = |event: &'static str| {
             let mut e = audit::Entry::new(event, &label);

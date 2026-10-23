@@ -711,3 +711,59 @@ fn a_held_move_asks_and_keeps_what_it_lost() {
     let p = policy_for(&conn, Some(1));
     assert_eq!((p.level, p.force_ask), (2, None));
 }
+
+// -- Second review ---------------------------------------------------------------------
+
+/// Globs the AI writes can't make matching slow: every one of these used to
+/// take seconds to hours.
+#[test]
+fn pathological_globs_are_quick() {
+    let stars = |n: usize| "*".repeat(n);
+    let cases = [
+        format!("ls{}z", stars(10)),
+        format!("ls{}z", stars(15)),
+        format!("ls{}z", "*a".repeat(40)),
+        format!("sudoedit{}", stars(34)),
+        format!("s{}x", "?*".repeat(120)),
+        format!("[a]{}", "*[!b]".repeat(60)),
+        "x".repeat(300) + "*",
+    ];
+    for word in &cases {
+        let cmd = format!("{word} {word} {word}");
+        let t = std::time::Instant::now();
+        let p = Policy { level: 2, allow: rules(&["ls *"]), ask: rules(DEFAULT_ASK), windows: false, force_ask: None };
+        let _ = decide(&p, true, &cmd);
+        let _ = asks_for_root(&cmd);
+        assert!(t.elapsed() < std::time::Duration::from_millis(50), "{word}: {:?}", t.elapsed());
+    }
+    // A glob too long to read counts as one that could name anything.
+    assert!(word_is(&format!("{}x", "?".repeat(MAX_GLOB + 1)), "reboot", false));
+}
+
+#[test]
+fn prefix_always_ask_rules_catch_globs_with_text_after() {
+    for cmd in ["/sbin/mkf[s].xfs /dev/sdb", "/sbin/mk?s.ext4 /dev/sdb", "mkf*.vfat x", "mk[a-z]s"] {
+        assert!(ask_matches("mkfs*", cmd), "{cmd}");
+    }
+    assert!(!ask_matches("mkfs*", "/sbin/mk?x.ext4"));
+    assert!(!ask_matches("mkfs*", "mkf[!s]"));
+}
+
+#[test]
+fn a_prefix_rule_takes_no_glob_in_the_rest() {
+    assert!(allow_matches("cat /var/log/*", "cat /var/log/syslog.1"));
+    for cmd in ["cat /var/log/.?/.?/etc/shadow", "cat /var/log/*", "cat /var/log/sys?og", "cat /var/log/[s]yslog"] {
+        assert!(!allow_matches("cat /var/log/*", cmd), "{cmd}");
+    }
+}
+
+#[test]
+fn more_ways_to_root_and_more_runners() {
+    for cmd in ["runuser -u root id", "machinectl shell", "machinectl shell root@ /bin/sh", "/usr/bin/machinectl shell .host"] {
+        assert!(asks_for_root(cmd), "{cmd}");
+    }
+    assert!(!asks_for_root("machinectl list"));
+    for p in ["sed *", "time *", "strace *", "systemd-run *", "tmux *", "at *", "iex *", "Invoke-Expression *", "Start-Process *", "wsl *", "nsenter*"] {
+        assert!(runner_warning(p).is_some(), "{p}");
+    }
+}

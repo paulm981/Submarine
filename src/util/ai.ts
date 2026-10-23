@@ -162,6 +162,8 @@ const RUNNERS = [
   "env", "xargs", "timeout", "nice", "ionice", "nohup", "exec", "command", "builtin", "busybox", "stdbuf", "setsid",
   "chroot", "watch", "sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish", "python", "perl", "ruby", "node", "php",
   "awk", "gawk", "mawk", "find", "git", "ssh", "rsync", "tar", "docker", "kubectl", "cmd", "powershell", "pwsh",
+  "sed", "time", "strace", "ltrace", "gdb", "nsenter", "unshare", "systemd-run", "flock", "parallel", "script", "sshpass",
+  "expect", "screen", "tmux", "at", "batch", "iex", "invoke-expression", "start-process", "wsl",
 ];
 
 /// The warning for an allow rule like `timeout *`; null for any other.
