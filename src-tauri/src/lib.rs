@@ -17661,6 +17661,7 @@ const ROOT_EXEC_SCRIPT: &str = concat!(
     root_tool_find!(),
     "\n",
     r#"T=$SUB_TAG
+unset SUB_TAG
 if [ -n "$SUB_ERR" ]; then exec 2>&1; fi
 if [ -z "$X" ]; then echo "$T:NO_TOOL"; exit 95; fi
 if [ -z "$SUB_PW" ]; then echo "$T:RUN:n"; "$X" -n "$@"; exit $?; fi
@@ -17740,7 +17741,12 @@ const ROOT_CHECK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 async fn root_feed(channel: &mut russh::Channel<russh::client::Msg>, feed: RootFeed<'_>, hook: Option<TurnHook<'_>>) -> Result<Vec<u8>, String> {
     use russh::ChannelMsg;
     use std::time::{Duration, Instant};
-    let find = |seen: &[u8], what: &[u8]| seen.windows(what.len()).position(|w| w == what);
+    // Where `what` is in `seen` when it's the first thing there, blank space
+    // aside; None while it isn't (anything else first, and it never is).
+    let first = |seen: &[u8], what: &[u8]| {
+        let lead = seen.iter().take_while(|b| b.is_ascii_whitespace()).count();
+        seen[lead..].starts_with(what).then_some(lead)
+    };
     let read_tag = format!("{}:READ", feed.tag);
     let verdict_tag = format!("{}:V:", feed.tag);
     let run_tag = format!("{}:RUN:", feed.tag);
@@ -17814,21 +17820,24 @@ async fn root_feed(channel: &mut russh::Channel<russh::client::Msg>, feed: RootF
     };
     if how == "p" {
         // No ticket: the tool asks again, with the tag as its prompt, and
-        // only that prompt is answered. A prompt of PAM's own instead isn't
-        // answered: in a terminal with nothing else to send, the user sees
-        // it and types; otherwise it fails.
+        // only that prompt is answered, and only when it's the first thing
+        // after RUN:p: anything before it is something else talking (a
+        // command that runs without asking, printing what looks like the
+        // prompt), and the password isn't sent. A prompt of PAM's own instead
+        // isn't answered: in a terminal with nothing else to send, the user
+        // sees it and types; otherwise it fails.
         let pw = feed.password.ok_or_else(|| format!("{}: unexpected reply from the server", SUDO_FAILED))?;
         let prompt = format!("{}:PW:", feed.tag);
         let start = Instant::now();
         let mut quiet_by: Option<Instant> = None;
-        let mut asked = find(&rest, prompt.as_bytes());
+        let mut asked = first(&rest, prompt.as_bytes());
         while asked.is_none() {
             let until = quiet_by.unwrap_or(start + Duration::from_secs(20));
             let left = until.saturating_duration_since(Instant::now());
             match tokio::time::timeout(left, channel.wait()).await {
                 Ok(Some(ChannelMsg::Data { data })) | Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
                     rest.extend_from_slice(&data);
-                    asked = find(&rest, prompt.as_bytes());
+                    asked = first(&rest, prompt.as_bytes());
                     if !String::from_utf8_lossy(&rest).trim().is_empty() {
                         quiet_by = Some(Instant::now() + Duration::from_millis(500));
                     }
@@ -17857,7 +17866,10 @@ async fn root_feed(channel: &mut russh::Channel<russh::client::Msg>, feed: RootF
                     return Err(if text.trim().is_empty() {
                         format!("{}: the server didn't answer", SUDO_FAILED)
                     } else {
-                        format!("{}: sudo or dzdo asked for the password with a prompt of its own, which the app doesn't answer", SUDO_FAILED)
+                        format!(
+                            "{}: something came before sudo's or dzdo's own question for the password (a warning, or a prompt of its own), so the app didn't send it",
+                            SUDO_FAILED
+                        )
                     });
                 }
             }
@@ -19418,7 +19430,8 @@ pub(crate) mod root_over_ssh_tests {
 
     /// sudo or dzdo, as far as the app can tell. Files beside it set it up:
     /// `rules.<name>` (`all`, `shell` for `su -` only, `none`, plus
-    /// `nopasswd`), `password`; `notickets` (no ticket kept after a sign-in,
+    /// `nopasswd`, or `cmdnopw`: a password to sign in, none to run a
+    /// command), `password`; `notickets` (no ticket kept after a sign-in,
     /// as with `timestamp_timeout=0`); `pamprompt` (PAM's own prompt shown
     /// instead of `-p`'s); `early` (a warning of its own first, then that
     /// many seconds before it asks); `slowcheck` (seconds to check a
@@ -19446,6 +19459,7 @@ case $rules in
 esac
 need=1
 case $rules in *nopasswd*) need=;; esac
+case $rules in *cmdnopw*) [ -z "$v" ] && need=;; esac
 if [ -n "$need" ] && [ -z "$k" ] && [ -f "$D/ticket.$PPID" ]; then need=; fi
 if [ -n "$need" ]; then
   if [ -n "$n" ]; then say "$T: a password is required" "$T: Ein Passwort ist notwendig"; exit 1; fi
@@ -19651,6 +19665,24 @@ exec "$@"
             assert_eq!(lab.attempts(), 0, "{what}");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    /// A command that runs without asking, where no ticket is kept, and
+    /// prints something and then the app's prompt (read from the script's
+    /// environment): the prompt isn't answered, since it isn't the first
+    /// thing, and the command never gets the password.
+    #[tokio::test]
+    async fn output_before_the_prompt_never_gets_the_password() {
+        let lab = Lab::new("fakeprompt", "cmdnopw", "none").await;
+        lab.set("notickets", "");
+        let access = ssh_manager::RootAccess::new("dzdo", Some(pw("s3cret pass")), None, None);
+        let script = r#"printf 'hello\n'; tr '\0' '\n' < /proc/$PPID/environ | sed -n 's/^SUB_TAG=\(.*\)$/\1:PW:/p' | tr -d '\n'; IFS= read -r x; printf '[%s]' "$x" > got"#;
+        let got = root_run(&lab.handle, &access, &words(script), 30, None).await;
+        assert!(got.as_ref().is_err_and(|e| e.contains("didn't send it")), "{got:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let read = std::fs::read_to_string(lab.dir.join("got")).unwrap_or_default();
+        assert!(!read.contains("s3cret"), "{read}");
+        assert_eq!(lab.attempts(), 1, "only the check");
     }
 
     /// Where no ticket is kept, the tool asks again with the app's prompt,
