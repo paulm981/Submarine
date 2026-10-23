@@ -63,13 +63,31 @@ fn trimmed(command: &str) -> &str {
     command.trim_matches(|c| c == ' ' || c == '\t')
 }
 
+/// What cmd.exe also treats specially: `%VAR%` expansion and `^`, its
+/// escape (and line continuation).
+const WINDOWS_OPERATORS: &[char] = &['%', '^'];
+
+/// The half-width and full-width forms (U+FF00 to U+FFEF): look-alikes of
+/// the operators and letters, which no allowed command needs.
+fn full_width(c: char) -> bool {
+    ('\u{FF00}'..='\u{FFEF}').contains(&c)
+}
+
 /// One simple command, which an allow rule may match: no operator, no
 /// newline or CR, no backslash at the end (which would join a next line),
-/// and none of the hidden characters. Conservative on purpose:
-/// `echo "a;b"` isn't one, though the shell would run it as one.
+/// none of the hidden characters, and no full-width forms. Conservative on
+/// purpose: `echo "a;b"` isn't one, though the shell would run it as one.
 pub(crate) fn is_simple(command: &str) -> bool {
+    is_simple_on(command, false)
+}
+
+/// The same, for a server whose saved OS is Windows (`windows`): `%` and
+/// `^` count as operators there too.
+pub(crate) fn is_simple_on(command: &str, windows: bool) -> bool {
     let c = trimmed(command);
-    !c.is_empty() && !c.ends_with('\\') && !c.chars().any(|ch| OPERATORS.contains(&ch) || hidden(ch))
+    !c.is_empty()
+        && !c.ends_with('\\')
+        && !c.chars().any(|ch| OPERATORS.contains(&ch) || hidden(ch) || full_width(ch) || (windows && WINDOWS_OPERATORS.contains(&ch)))
 }
 
 /// Whether the allow rule `rule` matches `command`: `uptime` exactly that,
@@ -78,8 +96,13 @@ pub(crate) fn is_simple(command: &str) -> bool {
 /// (is_simple) matches, and a rule with `*` anywhere but at its end matches
 /// nothing.
 pub(crate) fn allow_matches(rule: &str, command: &str) -> bool {
+    allow_matches_on(rule, command, false)
+}
+
+/// The same, on a Windows server (`windows`, is_simple_on).
+pub(crate) fn allow_matches_on(rule: &str, command: &str, windows: bool) -> bool {
     let cmd = trimmed(command);
-    if !is_simple(cmd) {
+    if !is_simple_on(cmd, windows) {
         return false;
     }
     let rule = rule.trim();
@@ -184,23 +207,24 @@ impl Decision {
     }
 }
 
-/// The decision for `command` on a server at `level`.
+/// The decision for `command` on a server whose settings are `policy`.
 ///
 /// - An always-ask rule that matches makes it ask, whatever the level.
-/// - "Allow everything here until this AI tab closes" runs the rest, as
-///   level 3 does.
-/// - At level 2, a command that asks for root (`is_root_cmd`: sudo, dzdo,
-///   su, doas, pkexec) asks; otherwise an allow rule that matches runs it.
+/// - "Allow everything here until this AI tab closes" (`session_allow`)
+///   runs the rest, as level 3 does.
+/// - At level 2, a command that asks for root (asks_for_root: sudo, dzdo,
+///   su, doas, pkexec and the like) asks; otherwise an allow rule that
+///   matches runs it.
 /// - Anything else asks.
-pub(crate) fn decide(level: u8, session_allow: bool, allow: &[String], ask: &[String], command: &str, is_root_cmd: bool) -> Decision {
-    if let Some(rule) = ask.iter().find(|r| ask_matches(r, command)) {
+pub(crate) fn decide(policy: &Policy, session_allow: bool, command: &str) -> Decision {
+    if let Some(rule) = policy.ask.iter().find(|r| ask_matches(r, command)) {
         return Decision::Ask { rule: Some(rule.clone()) };
     }
-    if session_allow || level == RUN_ANYTHING {
+    if session_allow || policy.level == RUN_ANYTHING {
         return if session_allow { Decision::Session } else { Decision::Anything };
     }
-    if level == ALLOWED_COMMANDS && !is_root_cmd {
-        if let Some(rule) = allow.iter().find(|r| allow_matches(r, command)) {
+    if policy.level == ALLOWED_COMMANDS && !crate::ai::asks_for_root(command) {
+        if let Some(rule) = policy.allow.iter().find(|r| allow_matches_on(r, command, policy.windows)) {
             return Decision::Rule(rule.clone());
         }
     }
@@ -299,12 +323,15 @@ pub(crate) struct Policy {
     pub level: u8,
     pub allow: Vec<String>,
     pub ask: Vec<String>,
+    /// The server's saved OS is Windows (server_os.rs): `%` and `^` are
+    /// operators to its allow rules.
+    pub windows: bool,
 }
 
 impl Default for Policy {
     /// Ask every time: what holds when nothing can be read.
     fn default() -> Self {
-        Policy { level: ASK_EVERY_TIME, allow: Vec::new(), ask: Vec::new() }
+        Policy { level: ASK_EVERY_TIME, allow: Vec::new(), ask: Vec::new(), windows: false }
     }
 }
 
@@ -346,6 +373,13 @@ fn try_policy(conn: &Connection, server_id: Option<i64>) -> rusqlite::Result<Pol
         }
     }
     p.level = level.filter(|l| (1..=3).contains(l)).unwrap_or(ASK_EVERY_TIME);
+    // Read leniently: a vault without the column has no OS saved.
+    p.windows = server_id.is_some_and(|id| {
+        conn.query_row("SELECT os FROM servers WHERE id = ?1", [id], |r| r.get::<_, Option<String>>(0))
+            .ok()
+            .flatten()
+            .is_some_and(|os| os == "windows")
+    });
     Ok(p)
 }
 

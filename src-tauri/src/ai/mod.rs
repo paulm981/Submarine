@@ -977,7 +977,7 @@ impl AiState {
         // it was asked still holds it).
         for (other, command, server_id) in others {
             let p = (self.0.policy)(server_id);
-            let d = trust::decide(p.level, true, &p.allow, &p.ask, &command, asks_for_root(&command));
+            let d = trust::decide(&p, true, &command);
             if let Some(by) = d.approved_by() {
                 let _ = self.answer(other, Answer::Allow(by));
             }
@@ -1195,7 +1195,7 @@ impl AiState {
             // for nothing: it asks.
             let decision = match &policy {
                 Some(p) if looked_up == Some(found.server_id) => {
-                    trust::decide(p.level, found.allow_all, &p.allow, &p.ask, command, root_cmd)
+                    trust::decide(p, found.allow_all, command)
                 }
                 _ => trust::Decision::Ask { rule: None },
             };
@@ -1245,7 +1245,7 @@ impl AiState {
                             timeout_secs: timeout.unwrap_or(DEFAULT_TIMEOUT),
                             asked_at: now(),
                             server_id: found.server_id,
-                            can_allow_always: found.server_id.is_some() && ask_rule.is_none() && !root_cmd && trust::is_simple(command),
+                            can_allow_always: found.server_id.is_some() && ask_rule.is_none() && !root_cmd && trust::is_simple_on(command, policy.as_ref().is_some_and(|p| p.windows)),
                             ask_rule,
                         },
                         decide: tx,

@@ -594,7 +594,7 @@ fn state_with_policy(policy: trust::Policy) -> (AiState, Arc<Mutex<trust::Policy
 }
 
 fn policy(level: u8, allow: &[&str], ask: &[&str]) -> trust::Policy {
-    trust::Policy { level, allow: allow.iter().map(|s| s.to_string()).collect(), ask: ask.iter().map(|s| s.to_string()).collect() }
+    trust::Policy { level, allow: allow.iter().map(|s| s.to_string()).collect(), ask: ask.iter().map(|s| s.to_string()).collect(), ..Default::default() }
 }
 
 /// Ask for `command` on `xyz`, and wait until it's waiting for you.

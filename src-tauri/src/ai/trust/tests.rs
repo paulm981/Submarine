@@ -219,6 +219,11 @@ fn every_default_rule_is_valid() {
 
 // -- The decision --------------------------------------------------------------
 
+/// The decision at `level`, with `allow` and `ask` lists.
+fn dec(level: u8, session: bool, allow: &[String], ask: &[String], command: &str) -> Decision {
+    decide(&Policy { level, allow: allow.to_vec(), ask: ask.to_vec(), windows: false }, session, command)
+}
+
 fn ask() -> Decision {
     Decision::Ask { rule: None }
 }
@@ -226,22 +231,22 @@ fn ask() -> Decision {
 #[test]
 fn level_one_always_asks() {
     let allow = rules(&["uptime"]);
-    assert_eq!(decide(1, false, &allow, &[], "uptime", false), ask());
+    assert_eq!(dec(1, false, &allow, &[], "uptime"), ask());
     // Anything not 1, 2 or 3 asks every time too.
-    assert_eq!(decide(0, false, &allow, &[], "uptime", false), ask());
-    assert_eq!(decide(9, false, &allow, &[], "uptime", false), ask());
+    assert_eq!(dec(0, false, &allow, &[], "uptime"), ask());
+    assert_eq!(dec(9, false, &allow, &[], "uptime"), ask());
 }
 
 #[test]
 fn level_two_runs_allowed_commands_only() {
     let allow = rules(&["uptime", "systemctl status *"]);
-    assert_eq!(decide(2, false, &allow, &[], "uptime", false), Decision::Rule("uptime".into()));
-    assert_eq!(decide(2, false, &allow, &[], " systemctl status nginx ", false), Decision::Rule("systemctl status *".into()));
-    assert_eq!(decide(2, false, &allow, &[], "systemctl restart nginx", false), ask());
-    assert_eq!(decide(2, false, &allow, &[], "uptime; reboot", false), ask());
-    assert_eq!(decide(2, false, &allow, &[], "uptime && id", false), ask());
-    assert_eq!(decide(2, false, &allow, &[], "uptime\nid", false), ask());
-    assert_eq!(decide(2, false, &[], &[], "uptime", false), ask());
+    assert_eq!(dec(2, false, &allow, &[], "uptime"), Decision::Rule("uptime".into()));
+    assert_eq!(dec(2, false, &allow, &[], " systemctl status nginx "), Decision::Rule("systemctl status *".into()));
+    assert_eq!(dec(2, false, &allow, &[], "systemctl restart nginx"), ask());
+    assert_eq!(dec(2, false, &allow, &[], "uptime; reboot"), ask());
+    assert_eq!(dec(2, false, &allow, &[], "uptime && id"), ask());
+    assert_eq!(dec(2, false, &allow, &[], "uptime\nid"), ask());
+    assert_eq!(dec(2, false, &[], &[], "uptime"), ask());
 }
 
 #[test]
@@ -249,36 +254,36 @@ fn level_two_asks_for_sudo_even_with_a_rule() {
     let allow = rules(&["sudo *", "systemctl *"]);
     let cmd = "sudo systemctl restart nginx";
     assert!(crate::ai::asks_for_root(cmd));
-    assert_eq!(decide(2, false, &allow, &[], cmd, crate::ai::asks_for_root(cmd)), ask());
+    assert_eq!(dec(2, false, &allow, &[], cmd), ask());
     for cmd in ["su -c id", "doas id", "pkexec id", "dzdo id", "/usr/bin/sudo id"] {
         let allow = rules(&["* id", "su *", "doas *", "pkexec *", "dzdo *", "/usr/bin/sudo *"]);
-        assert_eq!(decide(2, false, &allow, &[], cmd, crate::ai::asks_for_root(cmd)), ask(), "{cmd}");
+        assert_eq!(dec(2, false, &allow, &[], cmd), ask(), "{cmd}");
     }
 }
 
 #[test]
 fn level_three_runs_anything_but_the_always_ask_list() {
     let ask_list = rules(&["reboot", "rm -rf *"]);
-    assert_eq!(decide(3, false, &[], &ask_list, "uptime; id | head", false), Decision::Anything);
-    assert_eq!(decide(3, false, &[], &ask_list, "sudo id", true), Decision::Anything, "sudo too, where it needs no password");
-    assert_eq!(decide(3, false, &[], &ask_list, "uptime && reboot", false), Decision::Ask { rule: Some("reboot".into()) });
-    assert_eq!(decide(3, false, &[], &ask_list, "cd /; rm -rf /tmp", false), Decision::Ask { rule: Some("rm -rf *".into()) });
+    assert_eq!(dec(3, false, &[], &ask_list, "uptime; id | head"), Decision::Anything);
+    assert_eq!(dec(3, false, &[], &ask_list, "sudo id"), Decision::Anything, "sudo too, where it needs no password");
+    assert_eq!(dec(3, false, &[], &ask_list, "uptime && reboot"), Decision::Ask { rule: Some("reboot".into()) });
+    assert_eq!(dec(3, false, &[], &ask_list, "cd /; rm -rf /tmp"), Decision::Ask { rule: Some("rm -rf *".into()) });
 }
 
 #[test]
 fn the_always_ask_list_beats_allow_rules() {
     let allow = rules(&["shutdown *"]);
     let ask_list = rules(&["shutdown"]);
-    assert_eq!(decide(2, false, &allow, &ask_list, "shutdown -h now", false), Decision::Ask { rule: Some("shutdown".into()) });
+    assert_eq!(dec(2, false, &allow, &ask_list, "shutdown -h now"), Decision::Ask { rule: Some("shutdown".into()) });
 }
 
 #[test]
 fn the_session_allow_runs_anything_but_the_always_ask_list() {
     let ask_list = rules(&["reboot"]);
-    assert_eq!(decide(1, true, &[], &ask_list, "uptime; id", false), Decision::Session);
-    assert_eq!(decide(2, true, &[], &ask_list, "sudo id", true), Decision::Session);
-    assert_eq!(decide(3, true, &[], &ask_list, "id", false), Decision::Session);
-    assert_eq!(decide(1, true, &[], &ask_list, "id; reboot", false), Decision::Ask { rule: Some("reboot".into()) });
+    assert_eq!(dec(1, true, &[], &ask_list, "uptime; id"), Decision::Session);
+    assert_eq!(dec(2, true, &[], &ask_list, "sudo id"), Decision::Session);
+    assert_eq!(dec(3, true, &[], &ask_list, "id"), Decision::Session);
+    assert_eq!(dec(1, true, &[], &ask_list, "id; reboot"), Decision::Ask { rule: Some("reboot".into()) });
 }
 
 #[test]
@@ -458,4 +463,35 @@ fn the_tables_are_not_synced() {
             .unwrap();
         assert!(!cols.iter().any(|c| c == "uuid" || c == "updated_at"), "{t}: {cols:?}");
     }
+}
+
+// -- Windows and full-width forms -----------------------------------------------
+
+#[test]
+fn full_width_forms_never_match() {
+    for c in ['\u{FF1B}', '\u{FF06}', '\u{FF5C}', '\u{FF04}', '\u{FF41}', '\u{FFE0}'] {
+        let cmd = format!("ls -la{c}x");
+        assert!(!is_simple(&cmd), "U+{:04X}", c as u32);
+        assert!(!allow_matches("ls *", &cmd), "U+{:04X}", c as u32);
+    }
+}
+
+#[test]
+fn percent_and_caret_are_operators_on_windows() {
+    for cmd in ["dir %COMSPEC%", "dir ^^x", "dir x^"] {
+        assert!(allow_matches_on("dir *", cmd, false), "{cmd} is simple to a POSIX shell");
+        assert!(!allow_matches_on("dir *", cmd, true), "{cmd}");
+    }
+    let windows = Policy { level: 2, allow: rules(&["dir *"]), ask: vec![], windows: true };
+    assert_eq!(decide(&windows, false, "dir C:\\Users"), Decision::Rule("dir *".into()));
+    assert_eq!(decide(&windows, false, "dir %USERPROFILE%"), ask());
+}
+
+#[test]
+fn a_windows_server_is_known_by_its_saved_os() {
+    let conn = vault();
+    conn.execute("ALTER TABLE servers ADD COLUMN os TEXT", []).unwrap();
+    conn.execute("UPDATE servers SET os = 'windows' WHERE id = 2", []).unwrap();
+    assert!(policy_for(&conn, Some(2)).windows);
+    assert!(!policy_for(&conn, Some(1)).windows);
 }
