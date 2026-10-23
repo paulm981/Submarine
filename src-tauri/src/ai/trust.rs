@@ -326,6 +326,7 @@ fn glob_could_be(pat: &str, name: &str, prefix: bool) -> bool {
 /// the like, or as a glob that could expand to it (`sud?`, `/sbin/reb?ot`,
 /// `mk?s.ext4` for `mkfs*`). A glob of wildcards alone (`*`) counts for
 /// nothing: it would name everything.
+#[cfg(test)]
 fn word_is(word: &str, name: &str, prefix: bool) -> bool {
     word_is_at(word, name, prefix, true)
 }
