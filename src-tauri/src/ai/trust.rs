@@ -785,9 +785,10 @@ fn seed_defaults(conn: &Connection) -> Result<(), String> {
 /// The levels and allow rules belong to the install that set them
 /// (`install`): a vault last opened by another one (exported and imported,
 /// or copied by hand) loses them, and keeps its always-ask list (the
-/// defaults again, if it has none). A vault that doesn't say yet (made
-/// before this) is taken as this install's. Returns whether it changed
-/// anything, so the vault is saved.
+/// defaults again, if it has none). So does one with the tables but no
+/// install named: only a vault whose tables are made now takes this
+/// install with nothing reset. Returns whether it changed anything, so the
+/// vault is saved.
 pub(crate) fn create_schema(conn: &Connection, install: &str) -> Result<bool, String> {
     let had: bool = conn
         .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ai_rules'", [], |_| Ok(()))
@@ -809,7 +810,9 @@ pub(crate) fn create_schema(conn: &Connection, install: &str) -> Result<bool, St
     if last.as_deref() == Some(install) {
         return Ok(changed);
     }
-    if last.is_some() {
+    // Tables there already, but another install's, or none named: reset.
+    // Only tables made just now take this install with nothing to reset.
+    if had {
         conn.execute_batch("DELETE FROM ai_levels; DELETE FROM ai_rules WHERE kind = 'allow';").map_err(db("AI_TRUST_RESET"))?;
         let asks: i64 = conn.query_row("SELECT COUNT(*) FROM ai_rules WHERE kind = 'ask'", [], |r| r.get(0)).map_err(db("AI_TRUST_RESET"))?;
         if asks == 0 {

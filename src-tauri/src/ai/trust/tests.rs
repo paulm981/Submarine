@@ -665,17 +665,25 @@ fn levels_and_allow_rules_dont_travel_in_a_copied_vault() {
     assert_eq!(policy_for(&conn, Some(1)).ask, rules(DEFAULT_ASK));
 }
 
-/// A vault that doesn't say which install opened it (from before this)
-/// keeps what it has, and is this install's from then on.
+/// A vault with the tables but no install named (from a build before this)
+/// is reset as another install's would be; only one whose tables are made
+/// now takes this install with nothing to reset.
 #[test]
-fn a_vault_without_an_install_keeps_its_levels() {
+fn a_vault_without_an_install_is_reset() {
     let conn = vault();
     set_level(&conn, "server", 1, Some(3)).unwrap();
+    add_rule(&conn, "server", 1, "allow", "uptime").unwrap();
     conn.execute("DELETE FROM sync_meta WHERE key = 'ai_trust_device'", []).unwrap();
     assert!(create_schema(&conn, "another-install-id-0000000000000").unwrap());
-    assert_eq!(policy_for(&conn, Some(1)).level, 3);
+    let p = policy_for(&conn, Some(1));
+    assert_eq!((p.level, p.allow.len()), (1, 0));
+    assert!(p.ask.contains(&"reboot".to_string()));
     let kept: String = conn.query_row("SELECT value FROM sync_meta WHERE key = 'ai_trust_device'", [], |r| r.get(0)).unwrap();
     assert_eq!(kept, "another-install-id-0000000000000");
+    // A fresh vault takes the install at once, and keeps what's set then.
+    let fresh = vault();
+    let kept: String = fresh.query_row("SELECT value FROM sync_meta WHERE key = 'ai_trust_device'", [], |r| r.get(0)).unwrap();
+    assert_eq!(kept, HERE);
 }
 
 #[test]
