@@ -292,7 +292,9 @@ function AiToolsSettings() {
             Let an AI tool started from Home ask Submarine to run commands on server tabs you share with it.
             It never gets a key or a password, and never connects to a server itself: Submarine runs each command
             on its own connection, after you click Allow in the AI panel, or at once where you've said it may (below).
-            Each AI tab only reaches the tabs shared with it, and closing it ends its access.
+            Each AI tab only reaches the tabs shared with it, and closing it ends its access. When it asks to run something
+            as root, Submarine runs it through the server's sudo or dzdo, and asks you for the root password on the request
+            if the server wants one. The AI never sees it.
           </p>
         </div>
         <button

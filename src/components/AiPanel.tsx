@@ -13,10 +13,10 @@ import { WILDCARD_WARNING } from "./AiTrust";
 //
 // A request never takes the keyboard: nothing here takes focus, the buttons
 // can't be reached with Tab, and only a click (never Enter or Space) allows
-// or denies, so typing in a terminal can't approve anything. The two fields
-// a card can show (a note with Deny, the rule for "Always allow") take the
-// keyboard only when clicked, and Enter in them does nothing: they never
-// approve anything by themselves.
+// or denies, so typing in a terminal can't approve anything. The fields a
+// card can show (a note with Deny, the rule for "Always allow", the root
+// password for a request as root) take the keyboard only when clicked, and
+// Enter in them does nothing: they never approve anything by themselves.
 
 /// A click with the mouse (or a tap), not a key: a keyboard "click" has no
 /// detail count.
@@ -89,8 +89,9 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
   p: AiPending;
   /// The server's approval level now (#115).
   level: number;
-  /// Allow, or Deny with an optional note for the AI.
-  decide: (allow: boolean, note?: string) => void;
+  /// Allow (with the root password typed on a card as root, if any), or
+  /// Deny with an optional note for the AI.
+  decide: (allow: boolean, note?: string, password?: string) => void;
   /// The card's other actions: "Always allow this command here" and "Allow
   /// everything here until this AI tab closes".
   act: (cmd: string, args: Record<string, unknown>) => void;
@@ -102,6 +103,17 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
   const [extra, setExtra] = useState<"rule" | "note" | null>(null);
   const [rule, setRule] = useState(p.command.trim());
   const [note, setNote] = useState("");
+  // The root password for a request as root (#120): typed here, sent only
+  // with Allow, to the app, which hands it to sudo's or dzdo's own prompt.
+  // Never shown, and cleared as it's sent or when the card asks again.
+  const [password, setPassword] = useState("");
+  useEffect(() => { setPassword(""); }, [p.password]);
+  const asksPassword = p.as_root && p.password !== "none";
+  const allow = () => {
+    const typed = asksPassword ? password : "";
+    setPassword("");
+    decide(true, undefined, typed);
+  };
   // The AI's own `*` (a glob in its command) would allow far more as a
   // rule: it has to be edited first.
   const globAsRule = rule.trim().endsWith("*") && rule.trim() === p.command.trim();
@@ -171,7 +183,9 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
       <div className="text-[11.5px] text-zinc-300">
         <span className="font-bold text-white">{p.tab_label}</span> wants to run on{" "}
         <NoFocusButton onPick={() => onGoToServer(p.session_id)} className="font-bold text-white hover:underline">{p.server}</NoFocusButton>
-        {p.user && <> as <span className={`font-bold ${loginIsRoot ? "text-amber-300" : "text-white"}`}>{p.user}</span></>}
+        {p.as_root ? (
+          <> as <span className="font-bold text-amber-300">root</span>{!loginIsRoot && <span className="text-zinc-400"> (via {p.root_via ?? "sudo or dzdo"})</span>}</>
+        ) : p.user && <> as <span className={`font-bold ${loginIsRoot ? "text-amber-300" : "text-white"}`}>{p.user}</span></>}
         {p.timeout_secs !== 60 && <span className="text-zinc-500"> · stops after {p.timeout_secs}s</span>}
       </div>
       {p.root && (
@@ -180,7 +194,9 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
           <span>
             {loginIsRoot
               ? "Runs as root: this server's tab is logged in as root."
-              : "Asks for root (sudo, dzdo, su, doas or pkexec). Where those need no password, it runs as root and nothing asks first."}
+              : p.as_root
+                ? "The AI asks to run this as root. Submarine runs it through the server's sudo or dzdo, and gives any password only to their own prompt. The AI never sees it."
+                : "Asks for root (sudo, dzdo, su, doas or pkexec). Where those need no password, it runs as root and nothing asks first."}
           </span>
         </div>
       )}
@@ -206,9 +222,36 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
       <pre className="whitespace-pre-wrap break-all rounded-lg bg-black/50 border border-white/10 p-2 font-mono text-[11.5px] text-zinc-100 select-text">
         {showPlainly(p.command)}
       </pre>
+      {asksPassword && (
+        <div className="space-y-1">
+          {p.password === "wrong" && (
+            <p className="text-[11px] text-red-300 leading-snug">That password didn't work, and counted as one try. Type it again, or deny.</p>
+          )}
+          {p.password === "needed" && (
+            <p className="text-[11px] text-amber-300 leading-snug">{p.server} asks for a root password{p.root_via ? ` (${p.root_via})` : ""}.</p>
+          )}
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={fieldKeys}
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            name={`ai-root-${p.id}`}
+            placeholder={p.password === "optional" ? "Root password (leave empty if the server doesn't ask)" : "Root password"}
+            aria-label={`The root password for ${p.server}`}
+            className={`${field} font-sans`}
+          />
+          <p className="text-[10px] text-zinc-500 leading-snug">
+            Kept for this AI tab and server until access ends. It goes only to sudo's or dzdo's own prompt, never to the AI or the logs.
+          </p>
+        </div>
+      )}
       <div className="flex gap-2">
         <NoFocusButton
-          onPick={() => decide(true)}
+          onPick={allow}
           onDown={down}
           accept={accept}
           className="flex-1 h-8 rounded-lg bg-primary/15 border border-primary/40 text-primary text-[11px] font-bold uppercase tracking-wider hover:bg-primary hover:text-zinc-950 flex items-center justify-center gap-1.5"
@@ -264,7 +307,11 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
           </div>
         )}
         <NoFocusButton
-          onPick={() => act("ai_allow_session", { id: p.id })}
+          onPick={() => {
+            const typed = asksPassword ? password : "";
+            setPassword("");
+            act("ai_allow_session", { id: p.id, password: typed || null });
+          }}
           onDown={down}
           accept={accept}
           title="Runs this, and what this AI tab asks for on this server from now on, without asking, but for your always-ask list. Ends when the AI tab closes, or the server stops being shared."
@@ -352,6 +399,7 @@ const DoneRow = ({ d }: { d: AiDone }) => {
           <span className="block font-mono text-[11px] text-zinc-200 truncate">{showPlainly(d.command)}</span>
           <span className={`block text-[10.5px] ${ok ? "text-emerald-400" : ran ? "text-amber-300" : "text-zinc-500"}`}>
             {outcomeLabel(d)}
+            {d.as_root && <span className="text-amber-300"> · as root{d.root_via && ` via ${d.root_via}`}</span>}
             {d.ran_without_asking && <> · {ranWithoutAsking(d.ran_without_asking)}</>}
             {d.hidden > 0 && <span className="text-sky-300"> · {d.hidden} hidden from the AI</span>}
             {d.cut && <span> · stopped at 1 MB</span>}
@@ -474,7 +522,7 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
             key={p.id}
             p={p}
             level={levelOf(snap, p.tab_id, p.session_id)}
-            decide={(allow, note) => run("ai_decide", { id: p.id, allow, note: note ?? null })}
+            decide={(allow, note, password) => run("ai_decide", { id: p.id, allow, note: note ?? null, password: password || null })}
             act={run}
             onGoToServer={onGoToServer}
           />
@@ -487,6 +535,7 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
             <span className="flex-1 min-w-0">
               <span className="block text-[10.5px] text-zinc-500">
                 <span className="font-semibold text-zinc-300">{r.tab_label}</span> {r.server} · running
+                {r.as_root && <span className="text-amber-300"> · as root{r.root_via && ` via ${r.root_via}`}</span>}
                 {r.ran_without_asking && <> · {ranWithoutAsking(r.ran_without_asking)}</>}
               </span>
               <span className="block font-mono text-[11px] text-zinc-200 truncate">{showPlainly(r.command)}</span>

@@ -15,6 +15,9 @@ export interface AiServer {
   allow_all: boolean;
   /// Its approval level now (1, 2 or 3).
   level: number;
+  /// What root goes through there for this AI tab, once a request as root
+  /// worked (#120): "sudo" or "dzdo".
+  root_via: string | null;
 }
 export interface AiTab {
   id: string; label: string; servers: AiServer[];
@@ -26,8 +29,18 @@ export interface AiPending {
   /// Who it runs as: the server tab's login user, if known.
   user: string | null;
   command: string;
-  /// It runs as root: the login user is root, or the command asks for root.
+  /// It runs as root: the login user is root, the command asks for root,
+  /// or the AI asked to run it as root.
   root: boolean;
+  /// The AI asked to run it as root (`as_root`, #120).
+  as_root: boolean;
+  /// What it goes through as root, once known: "sudo" or "dzdo".
+  root_via: string | null;
+  /// For a request as root: whether the card asks for the root password.
+  /// "optional" while nothing is known (left empty for a server that
+  /// doesn't ask), "needed" once the server asked, "wrong" when the one
+  /// typed didn't work.
+  password: "none" | "optional" | "needed" | "wrong";
   timeout_secs: number; asked_at: string;
   server_id: number | null;
   /// The always-ask rule that made it wait, if one did.
@@ -42,9 +55,13 @@ export interface AiRunning {
   id: number; tab_label: string; session_id: string; server: string; command: string; started_at: string;
   /// Why it runs without your Allow, if it does.
   ran_without_asking: string | null;
+  /// It runs as root at the AI's asking, and through what.
+  as_root: boolean; root_via: string | null;
 }
 export interface AiDone {
   id: number; tab_label: string; server: string; command: string; root: boolean;
+  /// It ran as root at the AI's asking, and through what.
+  as_root: boolean; root_via: string | null;
   outcome: "denied" | "cancelled" | "done" | "failed" | "stopped";
   exit_code: number | null; output_bytes: number; hidden: number;
   cut: boolean; timed_out: boolean; error: string | null; at: string;
@@ -118,12 +135,12 @@ export const AI_LEVELS: { level: number; title: string; text: string }[] = [
   {
     level: 2,
     title: "Run my allowed commands, ask for the rest",
-    text: "Commands on your allow list run straight away. Anything else waits for your Allow, and so does a command with sudo, su, doas, dzdo or pkexec.",
+    text: "Commands on your allow list run straight away. Anything else waits for your Allow, and so does a command with sudo, su, doas, dzdo or pkexec, and every request to run something as root.",
   },
   {
     level: 3,
     title: "Run anything, just log it",
-    text: "Every command runs without asking, including sudo where the server doesn't ask for a password. Your always-ask list still asks. Everything is in the AI panel and the audit log, and Stop still works.",
+    text: "Every command runs without asking, including sudo where the server doesn't ask for a password. A request to run something as root runs once you've typed the root password for that AI tab, or where the server needs none. Your always-ask list still asks. Everything is in the AI panel and the audit log, and Stop still works.",
   },
 ];
 

@@ -320,7 +320,7 @@ export const AiSidePane = ({ v, onHome, onGoToServer }: {
               key={p.id}
               p={p}
               level={levelOf(ai, p.tab_id, p.session_id)}
-              decide={(allow, note) => run("ai_decide", { id: p.id, allow, note: note ?? null })}
+              decide={(allow, note, password) => run("ai_decide", { id: p.id, allow, note: note ?? null, password: password || null })}
               act={run}
               onGoToServer={onGoToServer}
             />
