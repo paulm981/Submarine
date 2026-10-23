@@ -1458,6 +1458,32 @@ mod root {
         nowhere(&r, &[&a]);
     }
 
+    /// Root found without a password, for a command that then needs one:
+    /// the card that comes back keeps its password field (no loop of cards
+    /// with nothing to type), and the password typed takes that root's
+    /// place.
+    #[tokio::test]
+    async fn root_without_a_password_that_now_needs_one_asks_for_it() {
+        let r = root_state(&[("none", "all nopasswd")], policy(1, &[], &[])).await;
+        r.s.share("local-1", "sess-1", "xyz").unwrap();
+        let req = ask(&r.s, "local-1", "xyz", "echo free", true);
+        r.s.decide(card(&r.s, PasswordAsk::Optional).await.id, true).unwrap();
+        assert!(req.await.unwrap().text.ends_with("free\n"));
+        assert!(r.s.kept_root("local-1", "sess-1").is_some_and(|k| k.0.password.is_none()));
+        r.labs[0].set("rules.sudo", "all");
+        let req = ask(&r.s, "local-1", "xyz", "echo locked", true);
+        let p = card(&r.s, PasswordAsk::None).await;
+        r.s.decide(p.id, true).unwrap();
+        let p = card(&r.s, PasswordAsk::Needed).await;
+        assert_eq!(p.root_via, Some("sudo"));
+        // Still asking, a moment later.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(r.s.snapshot().pending[0].password, PasswordAsk::Needed);
+        r.s.allow_with_password(p.id, PW).unwrap();
+        assert!(req.await.unwrap().text.ends_with("locked\n"));
+        assert!(r.s.kept_root("local-1", "sess-1").is_some_and(|k| k.0.password.is_some()));
+    }
+
     /// The password is kept for one AI tab and one server: another AI tab
     /// on the same server, or the same AI tab on another server, is asked.
     #[tokio::test]

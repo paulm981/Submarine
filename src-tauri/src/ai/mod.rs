@@ -1178,9 +1178,12 @@ impl AiState {
                     intruder_at: t.intruder_at.clone(),
                 })
                 .collect(),
-            // A card as root asks for the password while this AI tab has
-            // nothing for root there: what another card's password, or a
-            // look, found since counts.
+            // A card as root asks for the password while this AI tab has no
+            // password for root there: what another card's password found
+            // since counts. Root found without a password hides the field
+            // only on a card that hasn't asked yet: one the server asked a
+            // password for (that root didn't do for this command) keeps it,
+            // and a password typed there takes that root's place.
             pending: s
                 .pending
                 .iter()
@@ -1188,10 +1191,11 @@ impl AiState {
                     let mut v = p.view.clone();
                     if v.as_root && v.user.as_deref() != Some("root") {
                         match kept_in(&s, &v.tab_id, &v.session_id) {
-                            Some(k) => {
+                            Some(k) if k.0.password.is_some() || matches!(v.password, PasswordAsk::None | PasswordAsk::Optional) => {
                                 v.password = PasswordAsk::None;
                                 v.root_via = Some(k.0.tool);
                             }
+                            Some(k) => v.root_via = v.root_via.or(Some(k.0.tool)),
                             None if v.password == PasswordAsk::None => v.password = PasswordAsk::Optional,
                             None => {}
                         }
