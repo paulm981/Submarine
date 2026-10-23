@@ -17433,6 +17433,11 @@ safe() { so "$X" && so "${X%/*}" || return 1; r=$(readlink -f "$X" 2>/dev/null);
 /// be given a password (root_tool_find).
 const SUDO_UNSAFE: &str = "[SUDO] FAILED: sudo/dzdo on this server isn't owned by root, so Submarine won't type your password into it.";
 
+/// What the call fails with where the server's sh has no printf of its own:
+/// the password would go through another program, on its command line,
+/// where any program running as the login could read it.
+const SUDO_NO_PRINTF: &str = "[SUDO] FAILED: this server's sh has no printf of its own, so Submarine won't pass your password through another program.";
+
 /// root_probe's script: `$X -l <command>` (`-l` runs nothing, so all it
 /// prints is the tool's own). With a password (`SUB_MODE=pw`), it says
 /// `READ` once the tool is safe, and the password goes after that.
@@ -17671,6 +17676,10 @@ fn password_line(password: &str) -> zeroize::Zeroizing<Vec<u8>> {
 ///
 /// The tool is found as root_tool_find says, and is given a password only
 /// once `safe` says it may (else `UNSAFE`); with no tool at all, `NO_TOOL`.
+/// The password goes from `read` to the tool through printf only where it's
+/// the shell's own (no other program, whose command line others could
+/// read, ever holds it; a here-document could write it to a file): else
+/// `NO_PRINTF`.
 ///
 /// With `SUB_NOTICKET` (the AI's root, #120) no sudo ticket is used or left
 /// behind: every call has `-k`, so a sign-in of yours (with a ticket shared
@@ -17689,6 +17698,7 @@ K=
 if [ -n "$SUB_NOTICKET" ]; then K=-k; fi
 if [ -z "$SUB_PW" ]; then echo "$T:RUN:n"; "$X" -n $K "$@"; exit $?; fi
 if safe; then :; else echo "$T:UNSAFE"; exit 96; fi
+case $(LC_ALL=C type printf 2>/dev/null) in *builtin*) ;; *) echo "$T:NO_PRINTF"; exit 96;; esac
 if [ -n "$SUB_TTY" ]; then stty -echo 2>/dev/null; fi
 echo "$T:READ"
 IFS= read -r p || exit 97
@@ -17779,6 +17789,7 @@ async fn root_feed(channel: &mut russh::Channel<russh::client::Msg>, feed: RootF
     let verdict_tag = format!("{}:V:", feed.tag);
     let run_tag = format!("{}:RUN:", feed.tag);
     let unsafe_tag = format!("{}:UNSAFE", feed.tag);
+    let no_printf_tag = format!("{}:NO_PRINTF", feed.tag);
     let no_tool_tag = format!("{}:NO_TOOL", feed.tag);
     let mut hook = hook;
     // The script's lines up to RUN; what the tool said since READ.
@@ -17813,6 +17824,8 @@ async fn root_feed(channel: &mut russh::Channel<russh::client::Msg>, feed: RootF
             };
             if line == unsafe_tag {
                 return Err(SUDO_UNSAFE.into());
+            } else if line == no_printf_tag {
+                return Err(SUDO_NO_PRINTF.into());
             } else if line == no_tool_tag {
                 return Err(SUDO_NO_SUDO.into());
             } else if line == read_tag {
