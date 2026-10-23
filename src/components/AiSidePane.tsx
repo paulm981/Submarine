@@ -317,7 +317,7 @@ export const AiSidePane = ({ v, onHome, onGoToServer }: {
         <div className="shrink-0 max-h-[45%] overflow-y-auto custom-scrollbar border-b border-white/5">
           {waiting.map((p) => (
             <PendingCard
-              key={p.id}
+              key={`${p.id}:${p.asked_at}`}
               p={p}
               level={levelOf(ai, p.tab_id, p.session_id)}
               decide={(allow, note, password) => run("ai_decide", { id: p.id, allow, note: note ?? null, password: password || null })}

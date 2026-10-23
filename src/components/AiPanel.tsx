@@ -82,7 +82,8 @@ const SETTLE_MS = 500;
 /// A request waiting for you. Its Allow and Deny only take a deliberate
 /// click: a single click (not a double-click's second), pressed and
 /// released on this card, and not within SETTLE_MS of the card appearing or
-/// moving. So when a card above it goes (the AI can withdraw one) and this
+/// moving. A card that comes back (a request as root asking for the
+/// password) is a new card: its key has the time it was asked again. So when a card above it goes (the AI can withdraw one) and this
 /// one slides up under the pointer, a click meant for the other can't
 /// decide it.
 export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
@@ -521,7 +522,7 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
         {/* Waiting for you. */}
         {snap.pending.map((p) => (
           <PendingCard
-            key={p.id}
+            key={`${p.id}:${p.asked_at}`}
             p={p}
             level={levelOf(snap, p.tab_id, p.session_id)}
             decide={(allow, note, password) => run("ai_decide", { id: p.id, allow, note: note ?? null, password: password || null })}
