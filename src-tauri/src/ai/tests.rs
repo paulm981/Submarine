@@ -225,7 +225,7 @@ async fn each_ai_tab_only_reaches_what_was_shared_with_it() {
     assert_eq!(label_b, "Claude 2");
     s.share("local-a", "sess-1", "xyz").unwrap();
     let (_, no_cancel) = watch::channel(false);
-    let r = s.run_command("local-b", "xyz", "uptime", None, no_cancel.clone()).await;
+    let r = s.run_command("local-b", "xyz", "uptime", None, false, no_cancel.clone()).await;
     assert!(r.is_error && r.text.contains("isn't shared with you"), "{}", r.text);
     assert!(s.snapshot().pending.is_empty(), "never shown to you");
     assert!(s.list_shared("local-b").text.contains("No servers"));
@@ -260,7 +260,7 @@ fn names_stay_unique_within_an_ai_tab() {
     let mut servers = Vec::new();
     for _ in 0..3 {
         let name = unique_name(&servers, "web");
-        servers.push(SharedServer { session_id: name.clone(), name, user: None, server_id: None, allow_all: false, level: 1 });
+        servers.push(SharedServer { session_id: name.clone(), name, user: None, server_id: None, allow_all: false, level: 1, root: None, root_via: None });
     }
     let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, ["web", "web (2)", "web (3)"]);
@@ -295,14 +295,14 @@ async fn requests_are_limited() {
     let mut waiting = Vec::new();
     for _ in 0..MAX_WAITING {
         let (s2, c) = (s.clone(), cancel.clone());
-        waiting.push(tokio::spawn(async move { s2.run_command("local-1", "xyz", "uptime", None, c).await }));
+        waiting.push(tokio::spawn(async move { s2.run_command("local-1", "xyz", "uptime", None, false, c).await }));
     }
     wait_for("the requests", || s.snapshot().pending.len() == MAX_WAITING).await;
-    let r = s.run_command("local-1", "xyz", "uptime", None, cancel.clone()).await;
+    let r = s.run_command("local-1", "xyz", "uptime", None, false, cancel.clone()).await;
     assert!(r.is_error && r.text.contains("already waiting"), "{}", r.text);
     // Bad arguments never reach you.
     for (cmd, t) in [("", None), ("x\0y", None), ("uptime", Some(0)), ("uptime", Some(MAX_TIMEOUT + 1))] {
-        let r = s.run_command("local-1", "xyz", cmd, t, cancel.clone()).await;
+        let r = s.run_command("local-1", "xyz", cmd, t, false, cancel.clone()).await;
         assert!(r.is_error, "{cmd:?} {t:?}");
     }
     assert_eq!(s.snapshot().pending.len(), MAX_WAITING);
@@ -323,7 +323,7 @@ async fn unsharing_cancels_what_waits() {
     s.share("local-1", "sess-1", "xyz").unwrap();
     let (_cancel_tx, cancel) = watch::channel(false);
     let s2 = s.clone();
-    let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "uptime", None, cancel).await });
+    let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "uptime", None, false, cancel).await });
     wait_for("the request", || s.snapshot().pending.len() == 1).await;
     // The server's tab reconnects: sharing stops.
     s.session_gone("sess-1", "reconnected");
@@ -341,7 +341,7 @@ async fn the_ai_withdrawing_a_request_cancels_it() {
     s.share("local-1", "sess-1", "xyz").unwrap();
     let (cancel_tx, cancel) = watch::channel(false);
     let s2 = s.clone();
-    let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "uptime", None, cancel).await });
+    let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "uptime", None, false, cancel).await });
     wait_for("the request", || s.snapshot().pending.len() == 1).await;
     let id = s.snapshot().pending[0].id;
     cancel_tx.send(true).unwrap();
@@ -367,7 +367,7 @@ fn state_printing(output: &'static str) -> AiState {
 async fn run_allowed(s: &AiState, command: &str) -> mcp::ToolResult {
     let (_c, cancel) = watch::channel(false);
     let (s2, cmd) = (s.clone(), command.to_string());
-    let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", &cmd, None, cancel).await });
+    let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", &cmd, None, false, cancel).await });
     wait_for("the request", || !s.snapshot().pending.is_empty()).await;
     s.decide(s.snapshot().pending[0].id, true).unwrap();
     req.await.unwrap()
@@ -387,7 +387,7 @@ async fn locking_or_turning_off_forgets_what_ran() {
         // One more, left waiting.
         let (_c, cancel) = watch::channel(false);
         let s2 = s.clone();
-        let waiting = tokio::spawn(async move { s2.run_command("local-1", "xyz", "uptime", None, cancel).await });
+        let waiting = tokio::spawn(async move { s2.run_command("local-1", "xyz", "uptime", None, false, cancel).await });
         wait_for("the request", || s.snapshot().pending.len() == 1).await;
         if off {
             s.turn_off().await;
@@ -433,7 +433,7 @@ async fn a_request_asked_while_access_ends_leaves_no_row() {
             let Some(tab) = s.lock().tabs.first().map(|t| t.id.clone()) else { return };
             let (s, cancel) = (s.clone(), cancel.clone());
             let server = if tab == "local-1" { "xyz" } else { "abc" };
-            let mut f: Asked = Box::pin(async move { s.run_command(&tab, server, "uptime", None, cancel).await });
+            let mut f: Asked = Box::pin(async move { s.run_command(&tab, server, "uptime", None, false, cancel).await });
             if let Some(r) = (&mut f).now_or_never() {
                 assert!(r.is_error, "refused at once: {}", r.text);
             }
@@ -473,10 +473,10 @@ async fn refusals_count_toward_the_limit_and_are_logged_cut_short() {
     let (_c, cancel) = watch::channel(false);
     let huge = "x".repeat(200 * 1024);
     for _ in 0..RATE_MAX + 30 {
-        let r = s.run_command("local-1", "nowhere", &huge, None, cancel.clone()).await;
+        let r = s.run_command("local-1", "nowhere", &huge, None, false, cancel.clone()).await;
         assert!(r.is_error);
     }
-    let r = s.run_command("local-1", "nowhere", "uptime", None, cancel.clone()).await;
+    let r = s.run_command("local-1", "nowhere", "uptime", None, false, cancel.clone()).await;
     assert!(r.text.contains("Too many requests"), "{}", r.text);
     let text = std::fs::read_to_string(dir.join(audit::FILE_NAME)).unwrap();
     let lines: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
@@ -506,7 +506,7 @@ async fn long_server_names_are_logged_cut_short() {
         if shared {
             s.share("local-1", "sess-1", "xyz").unwrap();
         }
-        let r = s.run_command("local-1", &huge, "uptime", None, cancel.clone()).await;
+        let r = s.run_command("local-1", &huge, "uptime", None, false, cancel.clone()).await;
         assert!(r.is_error && r.text.contains("isn't shared with you"), "{}", &r.text[..200.min(r.text.len())]);
         assert!(r.text.len() < 4 * 1024, "the AI's answer is cut too: {} bytes", r.text.len());
     }
@@ -551,7 +551,7 @@ async fn withdrawn_requests_are_logged_cut_short() {
     for deny in [false, true] {
         let (cancel_tx, cancel) = watch::channel(false);
         let (s2, cmd) = (s.clone(), long.clone());
-        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", &cmd, None, cancel).await });
+        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", &cmd, None, false, cancel).await });
         wait_for("the request", || s.snapshot().pending.len() == 1).await;
         if deny {
             s.decide(s.snapshot().pending[0].id, false).unwrap();
@@ -580,6 +580,7 @@ fn state_with_policy(policy: trust::Policy) -> (AiState, Arc<Mutex<trust::Policy
     let f = flashes.clone();
     let s = AiState::with(
         exec,
+        no_root(),
         Box::new(|| {}),
         None,
         Arc::new(move |_| p.lock().unwrap().clone()),
@@ -603,7 +604,7 @@ async fn ask_for(s: &AiState, command: &str) -> (tokio::task::JoinHandle<mcp::To
     let before: Vec<u64> = s.snapshot().pending.iter().map(|p| p.id).collect();
     let req = tokio::spawn(async move {
         let (_c, cancel) = watch::channel(false);
-        s2.run_command("local-1", "xyz", &cmd, None, cancel).await
+        s2.run_command("local-1", "xyz", &cmd, None, false, cancel).await
     });
     wait_for("the request", || s.snapshot().pending.iter().any(|p| !before.contains(&p.id))).await;
     let p = s.snapshot().pending.into_iter().find(|p| !before.contains(&p.id)).unwrap();
@@ -636,7 +637,7 @@ async fn the_card_says_what_can_be_allowed_always() {
     let s2 = s.clone();
     let req = tokio::spawn(async move {
         let (_c, cancel) = watch::channel(false);
-        s2.run_command("local-1", "quick", "uptime", None, cancel).await
+        s2.run_command("local-1", "quick", "uptime", None, false, cancel).await
     });
     wait_for("the request", || !s.snapshot().pending.is_empty()).await;
     let p = s.snapshot().pending[0].clone();
@@ -672,7 +673,7 @@ async fn unreadable_settings_ask_even_with_everything_allowed() {
     let (s, shared, _) = state_with_policy(policy(1, &[], &[]));
     let (req, p) = ask_for(&s, "uptime").await;
     assert_eq!(p.note, None);
-    s.allow_session(p.id).unwrap();
+    s.allow_session(p.id, None).unwrap();
     req.await.unwrap();
     *shared.lock().unwrap() = trust::Policy::unreadable();
     let (req, p) = ask_for(&s, "uptime").await;
@@ -692,10 +693,10 @@ async fn allow_everything_can_be_ended() {
         let s2 = s.clone();
         let req = tokio::spawn(async move {
             let (_c, cancel) = watch::channel(false);
-            s2.run_command("local-1", name, "uptime", None, cancel).await
+            s2.run_command("local-1", name, "uptime", None, false, cancel).await
         });
         wait_for("the request", || !s.snapshot().pending.is_empty()).await;
-        s.allow_session(s.snapshot().pending[0].id).unwrap();
+        s.allow_session(s.snapshot().pending[0].id, None).unwrap();
         req.await.unwrap();
     }
     let on = |name: &str| s.snapshot().tabs[0].servers.iter().find(|x| x.name == name).unwrap().allow_all;
@@ -827,7 +828,7 @@ mod ssh {
         let (_c, cancel) = watch::channel(false);
         let s2 = s.clone();
         let cmd = format!("touch '{}'", marker.display());
-        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", &cmd, None, cancel).await });
+        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", &cmd, None, false, cancel).await });
         let p = wait_pending(&s).await;
         s.decide(p.id, false).unwrap();
         let r = req.await.unwrap();
@@ -848,7 +849,7 @@ mod ssh {
         s.share("local-1", "sess-1", "xyz").unwrap();
         let (_c, cancel) = watch::channel(false);
         let s2 = s.clone();
-        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "echo begun; sleep 30", Some(1), cancel).await });
+        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "echo begun; sleep 30", Some(1), false, cancel).await });
         let p = wait_pending(&s).await;
         assert_eq!(p.timeout_secs, 1);
         s.decide(p.id, true).unwrap();
@@ -866,7 +867,7 @@ mod ssh {
         s.share("local-1", "sess-1", "xyz").unwrap();
         let (_c, cancel) = watch::channel(false);
         let s2 = s.clone();
-        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "sudo -n cat /etc/shadow", None, cancel).await });
+        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "sudo -n cat /etc/shadow", None, false, cancel).await });
         let p = wait_pending(&s).await;
         assert!(p.root);
         s.decide(p.id, false).unwrap();
@@ -884,7 +885,7 @@ mod ssh {
         s.share_as("local-1", "sess-1", "xyz", Some("root".into()), None).unwrap();
         let (_c, cancel) = watch::channel(false);
         let s2 = s.clone();
-        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "uptime", None, cancel).await });
+        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "uptime", None, false, cancel).await });
         let p = wait_pending(&s).await;
         assert_eq!((p.user.as_deref(), p.root), (Some("root"), true));
         s.decide(p.id, false).unwrap();
@@ -895,7 +896,7 @@ mod ssh {
         s.share_as("local-2", "sess-1", "xyz", Some("deploy".into()), None).unwrap();
         let (_c, cancel) = watch::channel(false);
         let s2 = s.clone();
-        let req = tokio::spawn(async move { s2.run_command("local-2", "xyz", "uptime", None, cancel).await });
+        let req = tokio::spawn(async move { s2.run_command("local-2", "xyz", "uptime", None, false, cancel).await });
         let p = wait_pending(&s).await;
         assert_eq!((p.user.as_deref(), p.root), (Some("deploy"), false));
         s.decide(p.id, false).unwrap();
@@ -911,7 +912,7 @@ mod ssh {
         s.share("local-1", "sess-1", "xyz").unwrap();
         let (_c, cancel) = watch::channel(false);
         let s2 = s.clone();
-        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "sleep 30", None, cancel).await });
+        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "sleep 30", None, false, cancel).await });
         let p = wait_pending(&s).await;
         s.decide(p.id, true).unwrap();
         wait_for("it to run", || !s.snapshot().running.is_empty()).await;
@@ -935,7 +936,7 @@ mod ssh {
             s.share("local-1", "sess-1", "xyz").unwrap();
             let (_c, cancel) = watch::channel(false);
             let s2 = s.clone();
-            let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "echo begun; exec sleep 30", None, cancel).await });
+            let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "echo begun; exec sleep 30", None, false, cancel).await });
             let p = wait_pending(&s).await;
             s.decide(p.id, true).unwrap();
             wait_for("it to run on the server", || running.load(Ordering::SeqCst) == 1).await;
@@ -962,7 +963,7 @@ mod ssh {
         s.share("local-1", "sess-1", "xyz").unwrap();
         let (_c, cancel) = watch::channel(false);
         let s2 = s.clone();
-        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "exec sleep 30", None, cancel).await });
+        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "exec sleep 30", None, false, cancel).await });
         let p = wait_pending(&s).await;
         s.decide(p.id, true).unwrap();
         wait_for("it to run on the server", || running.load(Ordering::SeqCst) == 1).await;
@@ -983,7 +984,7 @@ mod ssh {
         s.share("local-1", "sess-1", "xyz").unwrap();
         let (cancel_tx, cancel) = watch::channel(false);
         let s2 = s.clone();
-        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "exec sleep 30", None, cancel).await });
+        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "exec sleep 30", None, false, cancel).await });
         let p = wait_pending(&s).await;
         s.decide(p.id, true).unwrap();
         wait_for("it to run on the server", || running.load(Ordering::SeqCst) == 1).await;
@@ -1008,7 +1009,7 @@ mod ssh {
             let cmd = format!("touch '{}'; sleep 30", marker.display());
             let (_c, cancel) = watch::channel(false);
             let s2 = s.clone();
-            let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", &cmd, None, cancel).await });
+            let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", &cmd, None, false, cancel).await });
             let p = wait_pending(&s).await;
             // Both before the request's task wakes up: in the old code an
             // allowed request was then in neither list, and ran anyway.
@@ -1039,7 +1040,7 @@ mod ssh {
         s.share("local-1", "sess-1", "xyz").unwrap();
         let (cancel_tx, cancel) = watch::channel(false);
         let s2 = s.clone();
-        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "sleep 30", None, cancel).await });
+        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "sleep 30", None, false, cancel).await });
         let p = wait_pending(&s).await;
         s.decide(p.id, true).unwrap();
         cancel_tx.send(true).unwrap();
@@ -1065,7 +1066,7 @@ mod ssh {
         let dir = std::env::temp_dir().join(format!("submarine-ai-test-{}", channel::random_hex(6)));
         let shared = Arc::new(Mutex::new(policy));
         let p = shared.clone();
-        let s = AiState::with(exec, Box::new(|| {}), Some(dir.clone()), Arc::new(move |_| p.lock().unwrap().clone()), Box::new(|| {}));
+        let s = AiState::with(exec, no_root(), Box::new(|| {}), Some(dir.clone()), Arc::new(move |_| p.lock().unwrap().clone()), Box::new(|| {}));
         s.turn_on().unwrap();
         (s, dir, shared)
     }
@@ -1157,7 +1158,7 @@ mod ssh {
         let (a, pa) = ask_for(&s, "echo a").await;
         let (b, _) = ask_for(&s, "echo b").await;
         let (c, pc) = ask_for(&s, "echo c; reboot --help >/dev/null || true").await;
-        s.allow_session(pa.id).unwrap();
+        s.allow_session(pa.id, None).unwrap();
         assert!(a.await.unwrap().text.contains('a'));
         assert!(b.await.unwrap().text.contains('b'));
         let snap = s.snapshot();
@@ -1172,7 +1173,7 @@ mod ssh {
         c.await.unwrap();
         // What comes next runs at once.
         let (_c, cancel) = watch::channel(false);
-        let r = s.run_command("local-1", "xyz", "echo d && echo e", None, cancel.clone()).await;
+        let r = s.run_command("local-1", "xyz", "echo d && echo e", None, false, cancel.clone()).await;
         assert!(!r.is_error && r.text.contains('e'), "{}", r.text);
         // Unshared and shared again, it asks again.
         s.unshare("sess-1", Some("local-1"), "stopped sharing");
@@ -1194,7 +1195,7 @@ mod ssh {
             s.start_tab("local-1", "Claude").unwrap();
             s.share_as("local-1", "sess-1", "xyz", None, Some(1)).unwrap();
             let (a, pa) = ask_for(&s, "echo a").await;
-            s.allow_session(pa.id).unwrap();
+            s.allow_session(pa.id, None).unwrap();
             a.await.unwrap();
             match how {
                 "close" => s.end_tab("local-1"),
@@ -1233,12 +1234,12 @@ mod ssh {
             let s2 = s.clone();
             running.push(tokio::spawn(async move {
                 let (_c, cancel) = watch::channel(false);
-                s2.run_command("local-1", "xyz", "exec sleep 30", None, cancel).await
+                s2.run_command("local-1", "xyz", "exec sleep 30", None, false, cancel).await
             }));
         }
         wait_for("four to run", || s.snapshot().running.len() == MAX_RUNNING).await;
         let (_c, cancel) = watch::channel(false);
-        let r = s.run_command("local-1", "xyz", "uptime", None, cancel).await;
+        let r = s.run_command("local-1", "xyz", "uptime", None, false, cancel).await;
         assert!(r.is_error && r.text.contains("already running on xyz"), "{}", r.text);
         // The one that waits can't be allowed past it either.
         assert!(s.decide(p.id, true).unwrap_err().contains("already running"));
@@ -1259,12 +1260,421 @@ mod ssh {
         s.share_as("local-1", "sess-1", "xyz", None, Some(1)).unwrap();
         let (_c, cancel) = watch::channel(false);
         let s2 = s.clone();
-        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "echo begun; exec sleep 30", None, cancel).await });
+        let req = tokio::spawn(async move { s2.run_command("local-1", "xyz", "echo begun; exec sleep 30", None, false, cancel).await });
         wait_for("it to run", || !s.snapshot().running.is_empty()).await;
         assert_eq!(s.snapshot().running[0].ran_without_asking.as_deref(), Some("level: run anything"));
         s.stop_tab("local-1");
         let r = tokio::time::timeout(Duration::from_secs(10), req).await.expect("stopped").unwrap();
         assert!(r.is_error && r.text.starts_with("Stopped"), "{}", r.text);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// -- Root for the AI (#120), on the root tests' stand-ins for sudo and dzdo --
+
+#[cfg(unix)]
+mod root {
+    use super::*;
+    use crate::root_over_ssh_tests::Lab;
+
+    /// The root password on every lab: looked for wherever it must never be.
+    const PW: &str = "Sentinel-pw 91d2'x";
+
+    struct Root {
+        s: AiState,
+        dir: PathBuf,
+        policy: Arc<Mutex<trust::Policy>>,
+        labs: Vec<Arc<Lab>>,
+    }
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// An AiState whose sessions `sess-1`, `sess-2`, … are labs whose dzdo
+    /// and sudo follow `rules` (FAKE_TOOL's), each with the password PW,
+    /// and whose servers' level and rules are `policy`. One AI tab,
+    /// `local-1`, is open.
+    async fn root_state(rules: &[(&str, &str)], policy: trust::Policy) -> Root {
+        let mut labs = Vec::new();
+        for (dzdo, sudo) in rules {
+            let lab = Lab::new(&format!("ai-{}", channel::random_hex(6)), dzdo, sudo).await;
+            lab.set("password", &format!("{PW}\n"));
+            labs.push(Arc::new(lab));
+        }
+        let handles: Vec<_> = labs.iter().map(|l| l.handle.clone()).collect();
+        let pick = Arc::new(move |sid: &str| sid.strip_prefix("sess-").and_then(|n| n.parse::<usize>().ok()).and_then(|n| handles.get(n - 1).cloned()));
+        let p1 = pick.clone();
+        let exec: Executor = Arc::new(move |sid, cmd, limit, stop| {
+            let h = p1(&sid);
+            Box::pin(async move {
+                let h = h.ok_or("not connected")?;
+                exec::run(&h, &cmd, limit, OUTPUT_CAP, stop).await
+            })
+        });
+        let p2 = pick.clone();
+        let root_exec: RootExecutor = Arc::new(move |sid, job: RootJob, limit, stop| {
+            let h = p2(&sid);
+            Box::pin(async move {
+                match h {
+                    Some(h) => exec::run_root(&h, job.how, &job.command, limit, OUTPUT_CAP, stop, job.started).await,
+                    None => exec::RootRun::Failed { you: "not connected".into(), ai: "not connected".into() },
+                }
+            })
+        });
+        let dir = std::env::temp_dir().join(format!("submarine-ai-root-{}", channel::random_hex(6)));
+        let shared = Arc::new(Mutex::new(policy));
+        let p = shared.clone();
+        let s = AiState::with(exec, root_exec, Box::new(|| {}), Some(dir.clone()), Arc::new(move |_| p.lock().unwrap().clone()), Box::new(|| {}));
+        s.turn_on().unwrap();
+        s.start_tab("local-1", "Claude").unwrap();
+        Root { s, dir, policy: shared, labs }
+    }
+
+    /// Ask, as the AI tab `tab`, to run `cmd` on `server`.
+    fn ask(s: &AiState, tab: &str, server: &str, cmd: &str, as_root: bool) -> tokio::task::JoinHandle<mcp::ToolResult> {
+        let (s, tab, server, cmd) = (s.clone(), tab.to_string(), server.to_string(), cmd.to_string());
+        tokio::spawn(async move {
+            let (_c, cancel) = watch::channel(false);
+            s.run_command(&tab, &server, &cmd, None, as_root, cancel).await
+        })
+    }
+
+    /// The card waiting with `password`.
+    async fn card(s: &AiState, password: PasswordAsk) -> PendingView {
+        wait_for("the card", || s.snapshot().pending.iter().any(|p| p.password == password)).await;
+        s.snapshot().pending.into_iter().find(|p| p.password == password).unwrap()
+    }
+
+    fn audit_text(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(dir.join(audit::FILE_NAME)).unwrap_or_default()
+    }
+
+    fn audit_lines(dir: &std::path::Path) -> Vec<Value> {
+        audit_text(dir).lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    /// The password is nowhere but in the tools' own prompts: not in the
+    /// AI's answers, the audit log, the app log, the panel's state, its
+    /// history's outputs or any error.
+    fn nowhere(r: &Root, answers: &[&mcp::ToolResult]) {
+        for a in answers {
+            assert!(!a.text.contains(PW) && !a.text.contains("Sentinel"), "{}", a.text);
+        }
+        assert!(!audit_text(&r.dir).contains("Sentinel"));
+        assert!(!crate::applog::TEST_LINES.lock().unwrap().iter().any(|l| l.contains("Sentinel")));
+        assert!(!serde_json::to_string(&r.s.snapshot()).unwrap().contains("Sentinel"));
+        for d in r.s.lock().history.iter() {
+            assert!(!d.output.contains("Sentinel") && !d.ai_output.contains("Sentinel"));
+            assert!(!d.view.error.as_deref().unwrap_or("").contains("Sentinel"));
+        }
+    }
+
+    /// Where the server needs no password, there's no field: Allow runs it
+    /// through sudo, and the AI is told so. The next card knows.
+    #[tokio::test]
+    async fn as_root_without_a_password() {
+        let r = root_state(&[("none", "all nopasswd")], policy(1, &[], &[])).await;
+        r.s.share_as("local-1", "sess-1", "xyz", Some("deploy".into()), Some(1)).unwrap();
+        let req = ask(&r.s, "local-1", "xyz", "echo ran as root", true);
+        let p = card(&r.s, PasswordAsk::Optional).await;
+        assert!(p.root && p.as_root && !p.can_allow_always);
+        assert_eq!(p.root_via, None);
+        r.s.decide(p.id, true).unwrap();
+        let a = req.await.unwrap();
+        assert!(!a.is_error, "{}", a.text);
+        assert!(a.text.contains("Ran as root, through sudo.") && a.text.ends_with("ran as root\n"), "{}", a.text);
+        assert_eq!(r.labs[0].attempts(), 0);
+        let done = &r.s.snapshot().history[0];
+        assert_eq!((done.as_root, done.root_via), (true, Some("sudo")));
+        // Known now: no field, and it says which tool.
+        let req = ask(&r.s, "local-1", "xyz", "echo again; echo twice", true);
+        let p = card(&r.s, PasswordAsk::None).await;
+        assert_eq!(p.root_via, Some("sudo"));
+        r.s.decide(p.id, true).unwrap();
+        let a = req.await.unwrap();
+        assert!(a.text.ends_with("again\ntwice\n"), "{}", a.text);
+        let log = audit_lines(&r.dir);
+        let fin: Vec<&Value> = log.iter().filter(|l| l["event"] == "finished").collect();
+        assert_eq!(fin.len(), 2);
+        for f in fin {
+            assert_eq!((&f["as_root"], &f["root_tool"], &f["exit_code"]), (&json!(true), &json!("sudo"), &json!(0)));
+        }
+        assert!(log.iter().any(|l| l["event"] == "request" && l["decision"] == "allowed" && l["as_root"] == true && l["approved_by"] == "you"));
+    }
+
+    /// With a password: Allow without one, and the card comes back asking
+    /// for it; a wrong one costs one attempt and the card comes back saying
+    /// so; the right one runs it, and is kept for the next request.
+    #[tokio::test]
+    async fn as_root_with_a_password_right_and_wrong() {
+        let r = root_state(&[("all", "none")], policy(1, &[], &[])).await;
+        r.s.share_as("local-1", "sess-1", "xyz", None, Some(1)).unwrap();
+        let req = ask(&r.s, "local-1", "xyz", "echo password=hunter2; id -un >/dev/null; echo done", true);
+        let p = card(&r.s, PasswordAsk::Optional).await;
+        r.s.decide(p.id, true).unwrap();
+        let p = card(&r.s, PasswordAsk::Needed).await;
+        assert_eq!(p.root_via, Some("dzdo"));
+        assert_eq!(r.labs[0].attempts(), 0, "asking costs nothing");
+        r.s.allow_with_password(p.id, "not it").unwrap();
+        let p = card(&r.s, PasswordAsk::Wrong).await;
+        assert_eq!(r.labs[0].attempts(), 1, "one attempt, never tried again by itself");
+        r.s.allow_with_password(p.id, PW).unwrap();
+        let a = req.await.unwrap();
+        assert!(!a.is_error, "{}", a.text);
+        assert!(a.text.contains("Ran as root, through dzdo.") && a.text.contains("done"), "{}", a.text);
+        assert!(a.text.contains(&format!("password={}", filter::HIDDEN)) && !a.text.contains("hunter2"), "the filter as usual: {}", a.text);
+        let after_first = r.labs[0].attempts();
+        // Kept for this AI tab and server: no field, no question.
+        let req = ask(&r.s, "local-1", "xyz", "echo second", true);
+        let p = card(&r.s, PasswordAsk::None).await;
+        assert_eq!(p.root_via, Some("dzdo"));
+        r.s.decide(p.id, true).unwrap();
+        let b = req.await.unwrap();
+        assert!(b.text.ends_with("second\n"), "{}", b.text);
+        assert_eq!(r.labs[0].attempts(), after_first + 1, "one sign-in with the kept password");
+        let log = audit_lines(&r.dir);
+        let notes: Vec<&str> = log.iter().filter(|l| l["event"] == "root_password").map(|l| l["note"].as_str().unwrap()).collect();
+        assert_eq!(notes, ["the server asked for a root password", "the root password was refused (one attempt)"]);
+        nowhere(&r, &[&a, &b]);
+    }
+
+    /// Denied after a wrong password: the AI hears it was refused, and
+    /// nothing of the password.
+    #[tokio::test]
+    async fn denied_after_a_wrong_password() {
+        let r = root_state(&[("all", "none")], policy(1, &[], &[])).await;
+        r.s.share("local-1", "sess-1", "xyz").unwrap();
+        let req = ask(&r.s, "local-1", "xyz", "id", true);
+        let p = card(&r.s, PasswordAsk::Optional).await;
+        r.s.allow_with_password(p.id, "Sentinel wrong").unwrap();
+        let p = card(&r.s, PasswordAsk::Wrong).await;
+        r.s.decide(p.id, false).unwrap();
+        let a = req.await.unwrap();
+        assert_eq!(a.text, "Denied by the user. The root password typed for it was refused.");
+        assert_eq!(r.labs[0].attempts(), 1);
+        nowhere(&r, &[&a]);
+    }
+
+    /// The password is kept for one AI tab and one server: another AI tab
+    /// on the same server, or the same AI tab on another server, is asked.
+    #[tokio::test]
+    async fn the_password_is_kept_per_ai_tab_and_server() {
+        let r = root_state(&[("all", "none"), ("all", "none")], policy(1, &[], &[])).await;
+        r.s.start_tab("local-2", "Claude").unwrap();
+        r.s.share("local-1", "sess-1", "one").unwrap();
+        r.s.share("local-1", "sess-2", "two").unwrap();
+        r.s.share("local-2", "sess-1", "one").unwrap();
+        let req = ask(&r.s, "local-1", "one", "echo ok", true);
+        let p = card(&r.s, PasswordAsk::Optional).await;
+        r.s.allow_with_password(p.id, PW).unwrap();
+        assert!(!req.await.unwrap().is_error);
+        let kept = |tab: &str, sid: &str| r.s.kept_root(tab, sid).is_some();
+        assert!(kept("local-1", "sess-1"));
+        assert!(!kept("local-1", "sess-2") && !kept("local-2", "sess-1"));
+        for (tab, server) in [("local-2", "one"), ("local-1", "two")] {
+            let req = ask(&r.s, tab, server, "echo ok", true);
+            let p = card(&r.s, PasswordAsk::Optional).await;
+            assert_eq!(p.tab_id, tab);
+            r.s.decide(p.id, false).unwrap();
+            req.await.unwrap();
+        }
+        // The panel shows the tool for the server, never what's kept.
+        let snap = r.s.snapshot();
+        assert_eq!(snap.tabs[0].servers[0].root_via, Some("dzdo"));
+        assert!(snap.tabs[0].servers.iter().all(|x| x.root.is_none()));
+    }
+
+    /// Every way access ends forgets the password: unsharing, Stop, the
+    /// server's tab reconnecting or closing, the AI tab closing, the
+    /// profile locking, and AI tools turned off.
+    #[tokio::test]
+    async fn the_password_is_forgotten_when_access_ends() {
+        for how in ["unshare", "stop", "reconnect", "close", "lock", "off"] {
+            let r = root_state(&[("all", "none")], policy(1, &[], &[])).await;
+            r.s.share("local-1", "sess-1", "xyz").unwrap();
+            let req = ask(&r.s, "local-1", "xyz", "echo ok", true);
+            let p = card(&r.s, PasswordAsk::Optional).await;
+            r.s.allow_with_password(p.id, PW).unwrap();
+            assert!(!req.await.unwrap().is_error, "{how}");
+            assert!(r.s.kept_root("local-1", "sess-1").is_some());
+            match how {
+                "unshare" => r.s.unshare("sess-1", Some("local-1"), "stopped sharing"),
+                "stop" => r.s.stop_tab("local-1"),
+                "reconnect" => r.s.session_gone("sess-1", "reconnected"),
+                "close" => r.s.end_tab("local-1"),
+                "lock" => r.s.end_all_tabs(),
+                _ => r.s.turn_off().await,
+            }
+            if how == "off" {
+                r.s.turn_on().unwrap();
+            }
+            if r.s.snapshot().tabs.is_empty() {
+                r.s.start_tab("local-1", "Claude").unwrap();
+            }
+            r.s.share("local-1", "sess-1", "xyz").unwrap();
+            assert!(r.s.kept_root("local-1", "sess-1").is_none(), "{how}");
+            let req = ask(&r.s, "local-1", "xyz", "echo ok", true);
+            let p = card(&r.s, PasswordAsk::Optional).await;
+            r.s.decide(p.id, false).unwrap();
+            req.await.unwrap();
+        }
+    }
+
+    /// At "Run anything": a server that needs no password runs it without
+    /// a card; one that wants a password asks for it once, then runs
+    /// without a card. The always-ask list still asks.
+    #[tokio::test]
+    async fn run_anything_runs_as_root_only_with_what_it_has() {
+        let r = root_state(&[("none", "all nopasswd"), ("all", "none")], policy(3, &[], &["reboot"])).await;
+        r.s.share("local-1", "sess-1", "free").unwrap();
+        r.s.share("local-1", "sess-2", "locked").unwrap();
+        let a = ask(&r.s, "local-1", "free", "echo free", true).await.unwrap();
+        assert!(a.text.ends_with("free\n"), "{}", a.text);
+        assert_eq!(r.s.snapshot().history[0].ran_without_asking.as_deref(), Some("level: run anything"));
+        // The password: asked for (no empty field first), once.
+        let req = ask(&r.s, "local-1", "locked", "echo locked", true);
+        let p = card(&r.s, PasswordAsk::Needed).await;
+        assert_eq!(r.labs[1].attempts(), 0);
+        r.s.allow_with_password(p.id, PW).unwrap();
+        assert!(req.await.unwrap().text.ends_with("locked\n"));
+        let b = ask(&r.s, "local-1", "locked", "echo again", true).await.unwrap();
+        assert!(b.text.ends_with("again\n"), "{}", b.text);
+        assert!(r.s.snapshot().pending.is_empty());
+        // The always-ask list, with the password known.
+        let req = ask(&r.s, "local-1", "locked", "reboot", true);
+        let p = card(&r.s, PasswordAsk::None).await;
+        assert_eq!(p.ask_rule.as_deref(), Some("reboot"));
+        r.s.decide(p.id, false).unwrap();
+        req.await.unwrap();
+        nowhere(&r, &[&a, &b]);
+    }
+
+    /// At levels 1 and 2 a request as root always asks, even where an allow
+    /// rule matches the command and nothing needs a password.
+    #[tokio::test]
+    async fn levels_one_and_two_always_ask_for_root() {
+        let r = root_state(&[("none", "all nopasswd")], policy(2, &["echo *"], &[])).await;
+        r.s.share("local-1", "sess-1", "xyz").unwrap();
+        // Not as root, the rule runs it.
+        assert!(!ask(&r.s, "local-1", "xyz", "echo plain", false).await.unwrap().is_error);
+        for level in [2, 1] {
+            *r.policy.lock().unwrap() = policy(level, &["echo *"], &[]);
+            let req = ask(&r.s, "local-1", "xyz", "echo root", true);
+            wait_for("the card", || !r.s.snapshot().pending.is_empty()).await;
+            let p = r.s.snapshot().pending[0].clone();
+            assert!(p.as_root, "level {level}");
+            r.s.decide(p.id, true).unwrap();
+            assert!(req.await.unwrap().text.ends_with("root\n"));
+        }
+    }
+
+    /// dzdo before sudo, as SFTP root mode tries them; and `dzdo su -` with
+    /// the password where dzdo allows only that.
+    #[tokio::test]
+    async fn dzdo_or_sudo_as_the_server_has_them() {
+        let r = root_state(&[("all nopasswd", "all nopasswd"), ("shell", "none")], policy(1, &[], &[])).await;
+        r.s.share("local-1", "sess-1", "both").unwrap();
+        r.s.share("local-1", "sess-2", "su").unwrap();
+        let req = ask(&r.s, "local-1", "both", "echo hi", true);
+        r.s.decide(card(&r.s, PasswordAsk::Optional).await.id, true).unwrap();
+        assert!(req.await.unwrap().text.contains("through dzdo"));
+        let req = ask(&r.s, "local-1", "su", "id -u; echo via su", true);
+        let p = card(&r.s, PasswordAsk::Optional).await;
+        r.s.allow_with_password(p.id, PW).unwrap();
+        let a = req.await.unwrap();
+        assert!(a.text.contains("through dzdo") && a.text.ends_with("0\nvia su\n"), "only the command's output: {}", a.text);
+        nowhere(&r, &[&a]);
+    }
+
+    /// A kept password that stopped working (changed on the server): two
+    /// requests at once cost one failed attempt, and both ask again.
+    #[tokio::test]
+    async fn a_kept_password_that_stopped_working_is_tried_once() {
+        let r = root_state(&[("all", "none")], policy(3, &[], &[])).await;
+        r.s.share("local-1", "sess-1", "xyz").unwrap();
+        let req = ask(&r.s, "local-1", "xyz", "echo first", true);
+        r.s.allow_with_password(card(&r.s, PasswordAsk::Needed).await.id, PW).unwrap();
+        assert!(!req.await.unwrap().is_error);
+        let before = r.labs[0].attempts();
+        r.labs[0].set("password", "changed\n");
+        r.labs[0].set("slowcheck", "1");
+        let reqs = [ask(&r.s, "local-1", "xyz", "echo a", true), ask(&r.s, "local-1", "xyz", "echo b", true)];
+        wait_for("both cards", || r.s.snapshot().pending.len() == 2).await;
+        assert_eq!(r.labs[0].attempts(), before + 1);
+        assert!(r.s.kept_root("local-1", "sess-1").is_none());
+        for p in r.s.snapshot().pending {
+            assert!(matches!(p.password, PasswordAsk::Wrong | PasswordAsk::Needed), "{:?}", p.password);
+            r.s.decide(p.id, false).unwrap();
+        }
+        for q in reqs {
+            assert!(q.await.unwrap().text.starts_with("Denied"));
+        }
+    }
+
+    /// as_root runs one command: a request that would only open a shell is
+    /// refused before it's shown to you, and so is one on a Windows server.
+    #[tokio::test]
+    async fn a_root_shell_is_refused() {
+        let r = root_state(&[("all nopasswd", "none")], policy(3, &[], &[])).await;
+        r.s.share("local-1", "sess-1", "xyz").unwrap();
+        for cmd in ["sudo -i", "su -", "dzdo su -", "bash"] {
+            let a = ask(&r.s, "local-1", "xyz", cmd, true).await.unwrap();
+            assert!(a.is_error && a.text.contains("can't open a root shell"), "{cmd}: {}", a.text);
+        }
+        // A command with sudo in it runs as given.
+        let a = ask(&r.s, "local-1", "xyz", "echo sudo -i", true).await.unwrap();
+        assert!(a.text.ends_with("sudo -i\n"), "{}", a.text);
+        *r.policy.lock().unwrap() = trust::Policy { windows: true, ..policy(3, &[], &[]) };
+        let a = ask(&r.s, "local-1", "xyz", "dir", true).await.unwrap();
+        assert!(a.is_error && a.text.contains("Windows"), "{}", a.text);
+        assert!(r.s.snapshot().pending.is_empty());
+    }
+
+    /// Stop ends a command running as root on the server too.
+    #[tokio::test]
+    async fn stop_ends_a_root_command() {
+        let r = root_state(&[("all", "none")], policy(3, &[], &[])).await;
+        r.s.share("local-1", "sess-1", "xyz").unwrap();
+        let req = ask(&r.s, "local-1", "xyz", "sleep 30", true);
+        r.s.allow_with_password(card(&r.s, PasswordAsk::Needed).await.id, PW).unwrap();
+        wait_for("it to run as root", || r.labs[0].running.load(Ordering::SeqCst) == 1 && !r.s.snapshot().running.is_empty()).await;
+        r.s.stop_tab("local-1");
+        let a = tokio::time::timeout(Duration::from_secs(10), req).await.expect("stopped").unwrap();
+        assert!(a.text.starts_with("Stopped"), "{}", a.text);
+        wait_for("the command to end on the server", || r.labs[0].running.load(Ordering::SeqCst) == 0).await;
+        assert!(r.s.kept_root("local-1", "sess-1").is_none());
+    }
+
+    /// Through the helper, as Claude Code would: the tool says how to ask
+    /// for root, and the password never crosses the channel.
+    #[tokio::test]
+    async fn through_mcp_the_password_never_crosses() {
+        let r = root_state(&[("all", "none")], policy(1, &[], &[])).await;
+        let (_, env) = r.s.start_tab("local-9", "Claude").unwrap();
+        r.s.share("local-9", "sess-1", "xyz").unwrap();
+        let mut h = helper(var(&env, channel::ENV_ADDR), var(&env, channel::ENV_TOKEN));
+        h.call(1, "initialize", json!({ "protocolVersion": "2025-06-18" })).await;
+        let tools = h.call(2, "tools/list", json!({})).await;
+        let run = &tools["result"]["tools"][1];
+        assert_eq!(run["inputSchema"]["properties"]["as_root"]["type"], "boolean");
+        assert!(run["description"].as_str().unwrap().contains("as_root"));
+        h.send(json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "run_command", "arguments": { "server": "xyz", "command": "echo hello", "as_root": true }
+        }}))
+        .await;
+        let p = card(&r.s, PasswordAsk::Optional).await;
+        r.s.allow_with_password(p.id, "Sentinel nope").unwrap();
+        let p = card(&r.s, PasswordAsk::Wrong).await;
+        r.s.allow_with_password(p.id, PW).unwrap();
+        let reply = h.recv().await;
+        let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.ends_with("hello\n"), "{text}");
+        assert!(!reply.to_string().contains("Sentinel"));
+        let bad = h.call(4, "tools/call", json!({ "name": "run_command", "arguments": { "server": "xyz", "command": "id", "as_root": "yes" } })).await;
+        assert_eq!(bad["result"]["isError"], true);
+        nowhere(&r, &[]);
     }
 }

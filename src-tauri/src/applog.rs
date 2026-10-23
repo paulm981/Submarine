@@ -131,8 +131,19 @@ fn now() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
 }
 
+/// What tests wrote to the log, which tests never start: to check that
+/// something (a password) never reaches it.
+#[cfg(test)]
+pub(crate) static TEST_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 /// One line in the log, from `source` (app, ui, watchdog, crash).
 pub fn write_line(source: &str, text: &str) {
+    #[cfg(test)]
+    if let Ok(mut lines) = TEST_LINES.lock() {
+        if lines.len() < 100_000 {
+            lines.push(format!("[{source}] {text}"));
+        }
+    }
     let Some(sink) = SINK.get() else { return };
     let line = format_line(&now(), source, text);
     if let Ok(mut s) = sink.lock() {

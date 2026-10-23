@@ -781,6 +781,9 @@ impl Decision {
 ///   su, doas, pkexec and the like) asks; otherwise an allow rule that
 ///   matches runs it.
 /// - Anything else asks.
+///
+/// The app decides through decide_parsed, with the command read once.
+#[cfg(test)]
 pub(crate) fn decide(policy: &Policy, session_allow: bool, command: &str) -> Decision {
     decide_parsed(policy, session_allow, &Parsed::new(command), false)
 }

@@ -17,10 +17,13 @@
 //! russh `Channel` sends nothing to the server when it's dropped, so the
 //! command must never be left to a dropped task to end.
 
+use crate::ssh_manager::RootAccess;
 use russh::client;
 use russh::ChannelMsg;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
+use zeroize::Zeroizing;
 
 /// Asked for, best effort: most servers only accept LANG and LC_*.
 const PAGER_ENV: &[(&str, &str)] = &[("PAGER", "cat"), ("GIT_PAGER", "cat"), ("SYSTEMD_PAGER", "cat"), ("MANPAGER", "cat")];
@@ -151,6 +154,219 @@ async fn collect(channel: &mut russh::Channel<client::Msg>, out: &mut Exec, cap:
         }
     }
     End::Finished
+}
+
+// ---------------------------------------------------------------------------
+// As root (#120)
+// ---------------------------------------------------------------------------
+//
+// A request with `as_root` runs through sudo or dzdo, with the same code as
+// SFTP root mode, the Info panel and the Docker tab (lib.rs): the tool is
+// found as they find it (dzdo, then sudo, then a root shell such as
+// `dzdo su -`), and a password goes only to the tool's own prompt
+// (ROOT_EXEC_SCRIPT and root_feed: a random prompt, `-S -p "" -v`, one
+// attempt per password). What this AI tab has for root on the server is
+// kept by mod.rs in the server's place in its list, never in SshState, so
+// the AI tab and the server's own tab never share a root password.
+//
+// The limits are the same as for any command: no terminal, nothing on
+// stdin but the password, the time limit (counted from the start, the look
+// for root included), the output cap, and Stop.
+
+/// How a root command gets root.
+pub(crate) enum RootHow {
+    /// What this AI tab found, or was given, for the server before.
+    Kept(Arc<RootAccess>),
+    /// The password you typed on the card. Wiped when dropped.
+    Typed(Zeroizing<String>),
+    /// Nothing yet: look for root without a password.
+    Find,
+}
+
+/// How a root command went.
+pub(crate) enum RootRun {
+    /// It ran, or was stopped, cut or timed out (as `Exec` says). With the
+    /// root access it found or was given, when that's new (not `Kept`).
+    Ran(Exec, Option<Arc<RootAccess>>),
+    /// The server wants a password this request didn't have. Nothing ran.
+    /// The tool that asked, if known.
+    NeedPassword(Option<&'static str>),
+    /// sudo or dzdo turned the password down: one attempt. Nothing ran.
+    WrongPassword(Option<&'static str>),
+    /// Root couldn't be had, or the command couldn't start. Why, for you
+    /// (the panel and the audit log) and for the AI: words of Submarine's
+    /// own for the AI, never the server's.
+    Failed { you: String, ai: String },
+}
+
+/// What the AI's root command runs: its words, where it's a plain command
+/// (trust::plain_words: so a sudoers rule for that one program allows it),
+/// else `sh -c <command>`.
+pub(crate) fn root_words(command: &str) -> Vec<String> {
+    super::trust::plain_words(command).unwrap_or_else(|| vec!["sh".into(), "-c".into(), command.to_string()])
+}
+
+/// A [SUDO] code from lib.rs as RootRun::Failed's words.
+fn failed(code: &str) -> RootRun {
+    let (you, ai): (String, &str) = if code == crate::SUDO_NO_SUDO {
+        ("Neither sudo nor dzdo is on this server.".into(), "Couldn't run it as root: the server has neither sudo nor dzdo.")
+    } else if code == crate::SUDO_NOT_ALLOWED {
+        (
+            "sudo and dzdo don't let this login run that as root here.".into(),
+            "Couldn't run it as root: sudo and dzdo don't allow this login to run that on this server.",
+        )
+    } else if code == crate::SUDO_REQUIRETTY {
+        (
+            "sudo here only works in a terminal (requiretty), and the AI's commands run without one.".into(),
+            "Couldn't run it as root: sudo on this server only works in a terminal, and Submarine runs commands without one.",
+        )
+    } else if code == crate::SUDO_NEED_PASSWORD {
+        ("The server asked for a root password.".into(), "Couldn't run it as root: the server asked for a root password.")
+    } else {
+        let detail = code.strip_prefix(crate::SUDO_FAILED).map(|d| d.trim_start_matches(':').trim()).unwrap_or(code);
+        (format!("sudo or dzdo couldn't run it: {detail}"), "Couldn't run it as root: sudo or dzdo couldn't start it. The user can see why in Submarine.")
+    };
+    RootRun::Failed { you, ai: ai.to_string() }
+}
+
+/// The look for root, under the stop signal and the time limit.
+enum Look<T> {
+    Done(T),
+    Stopped,
+    TimedOut,
+}
+
+async fn within<T>(stop: &mut watch::Receiver<bool>, deadline: tokio::time::Instant, f: impl std::future::Future<Output = T>) -> Look<T> {
+    tokio::select! {
+        biased;
+        _ = stop_asked(stop) => Look::Stopped,
+        r = tokio::time::timeout_at(deadline, f) => match r {
+            Ok(v) => Look::Done(v),
+            Err(_) => Look::TimedOut,
+        },
+    }
+}
+
+/// Run `command` as root on the connection `handle`, getting root as `how`
+/// says, and collect its output as `run` does. `started` hears once the
+/// tool has taken the password (or needed none) and the command started.
+pub(crate) async fn run_root<H: client::Handler>(
+    handle: &Arc<tokio::sync::Mutex<client::Handle<H>>>,
+    how: RootHow,
+    command: &str,
+    limit: Duration,
+    cap: usize,
+    mut stop: watch::Receiver<bool>,
+    started: Option<tokio::sync::oneshot::Sender<()>>,
+) -> RootRun {
+    let deadline = tokio::time::Instant::now() + limit;
+    let words = root_words(command);
+    let stopped = |timed_out: bool| RootRun::Ran(Exec { stopped: !timed_out, timed_out, ..Exec::default() }, None);
+    // How root is had: kept, found with the password you typed (one
+    // sign-in: a wrong one ends it), or found without one.
+    let (access, new) = match how {
+        RootHow::Kept(a) => (a, false),
+        RootHow::Typed(pw) => match within(&mut stop, deadline, crate::find_root_with_password(handle, &words, &pw)).await {
+            Look::Stopped => return stopped(false),
+            Look::TimedOut => return stopped(true),
+            Look::Done(Ok((tool, shell))) => (Arc::new(RootAccess::new(tool, Some(pw), shell, Some(std::time::Instant::now()))), true),
+            Look::Done(Err(e)) if e == crate::SUDO_WRONG_PASSWORD => return RootRun::WrongPassword(None),
+            Look::Done(Err(e)) => return failed(&e),
+        },
+        RootHow::Find => match within(&mut stop, deadline, crate::find_root_without_password(handle, &words)).await {
+            Look::Stopped => return stopped(false),
+            Look::TimedOut => return stopped(true),
+            Look::Done(Ok(a)) => (Arc::new(a), true),
+            Look::Done(Err((e, tool))) if e == crate::SUDO_NEED_PASSWORD => return RootRun::NeedPassword(tool),
+            Look::Done(Err((e, _))) => return failed(&e),
+        },
+    };
+    let tool = access.tool;
+    let new_access = || new.then(|| access.clone());
+
+    let mut out = Exec::default();
+    let open = async {
+        let h = handle.lock().await;
+        h.channel_open_session().await.map_err(|e| format!("Couldn't open a channel to the server: {e}"))
+    };
+    let mut channel = match within(&mut stop, deadline, open).await {
+        Look::Stopped => return stopped(false),
+        Look::TimedOut => return stopped(true),
+        Look::Done(Err(e)) => return RootRun::Failed { you: e.clone(), ai: format!("Couldn't run it: {e}") },
+        Look::Done(Ok(c)) => c,
+    };
+    // From here on, every way out ends the channel below.
+    for (k, v) in PAGER_ENV {
+        let _ = channel.set_env(false, *k, *v).await;
+    }
+    let start = crate::root_channel_start(&mut channel, &access, &words, false, None);
+    let (end, marker) = match within(&mut stop, deadline, start).await {
+        Look::Stopped => (End::Stopped, None),
+        Look::TimedOut => (End::TimedOut, None),
+        Look::Done(Err(e)) => {
+            let _ = tokio::time::timeout(END_WAIT, channel.close()).await;
+            return if e == crate::SUDO_WRONG_PASSWORD {
+                RootRun::WrongPassword(Some(tool))
+            } else if e == crate::SUDO_NEED_PASSWORD {
+                RootRun::NeedPassword(Some(tool))
+            } else {
+                failed(&e)
+            };
+        }
+        Look::Done(Ok((marker, early))) => {
+            if let Some(s) = started {
+                let _ = s.send(());
+            }
+            let room = cap.min(early.len());
+            out.output.extend_from_slice(&early[..room]);
+            let end = if early.len() > cap {
+                End::Cut
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = stop_asked(&mut stop) => End::Stopped,
+                    r = tokio::time::timeout_at(deadline, collect(&mut channel, &mut out, cap)) => r.unwrap_or(End::TimedOut),
+                }
+            };
+            (end, marker)
+        }
+    };
+    if !matches!(end, End::Finished) {
+        let _ = tokio::time::timeout(END_WAIT, channel.signal(russh::Sig::KILL)).await;
+    }
+    let _ = tokio::time::timeout(END_WAIT, channel.close()).await;
+    match end {
+        End::Finished => {}
+        End::Cut => out.cut = true,
+        End::TimedOut => out.timed_out = true,
+        End::Stopped => out.stopped = true,
+        End::Failed(e) => return RootRun::Failed { you: e.clone(), ai: format!("Couldn't run it: {e}") },
+    }
+    // Through a root shell, the output starts after the marker line, which
+    // says who the shell is: the root shell's own start-up comes before it.
+    if let Some(marker) = marker {
+        let text = String::from_utf8_lossy(&out.output).into_owned();
+        match text.find(marker) {
+            Some(at) => {
+                let rest = &text[at + marker.len()..];
+                let (uid, after) = rest.split_once('\n').unwrap_or((rest, ""));
+                if uid.trim() != "0" {
+                    return failed(crate::SUDO_NOT_ALLOWED);
+                }
+                out.output = after.as_bytes().to_vec();
+            }
+            None if out.stopped || out.timed_out || out.cut => out.output.clear(),
+            None => return failed(&crate::classify_tool_output(&text)),
+        }
+    } else if access.password.is_none() && access.shell.is_none() && out.exit_status.is_some_and(|c| c != 0) {
+        // `-l` says yes without a password where any of the login's rules
+        // has NOPASSWD (sudo's `listpw`), even for a command that needs one;
+        // running it says so, and nothing ran.
+        if crate::tool_answer(&String::from_utf8_lossy(&out.output)).as_deref() == Some(crate::SUDO_NEED_PASSWORD) {
+            return RootRun::NeedPassword(Some(tool));
+        }
+    }
+    RootRun::Ran(out, new_access())
 }
 
 #[cfg(all(test, unix))]
