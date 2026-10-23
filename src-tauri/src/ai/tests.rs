@@ -1656,7 +1656,7 @@ mod root {
     async fn a_root_shell_is_refused() {
         let r = root_state(&[("all nopasswd", "none")], policy(3, &[], &[])).await;
         r.s.share("local-1", "sess-1", "xyz").unwrap();
-        for cmd in ["sudo -i", "su -", "dzdo su -", "bash"] {
+        for cmd in ["sudo -i", "su -", "dzdo su -", "bash", "-i", "-u root id"] {
             let a = ask(&r.s, "local-1", "xyz", cmd, true).await.unwrap();
             assert!(a.is_error && a.text.contains("can't open a root shell"), "{cmd}: {}", a.text);
         }

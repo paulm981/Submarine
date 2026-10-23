@@ -1400,8 +1400,8 @@ impl AiState {
                 };
                 if as_root && opens_shell {
                     return Err(refuse(
-                        "as_root runs one command, with no terminal and nothing on stdin, so it can't open a root shell. \
-                         Send the command itself (such as `docker ps -a`), and Submarine runs it as root."
+                        "as_root runs one command, with no terminal and nothing on stdin, so it can't open a root shell, \
+                         and takes no options for sudo or dzdo. Send the command itself (such as `docker ps -a`), and Submarine runs it as root."
                             .into(),
                     ));
                 }

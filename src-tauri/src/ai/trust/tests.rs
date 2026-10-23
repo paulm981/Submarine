@@ -866,6 +866,10 @@ fn a_request_as_root_that_only_opens_a_shell_is_seen() {
         "machinectl shell",
         "uptime; sudo -i",
         "LANG=C su",
+        "-i",
+        "-s",
+        "--login id",
+        "LANG=C -u root id",
     ] {
         assert!(Parsed::new(cmd).opens_shell(), "{cmd}");
     }
@@ -905,6 +909,8 @@ fn plain_commands_run_as_their_words() {
         "ls # c",
         "A=1 env",
         "cd /var/log",
+        "-i id",
+        "--version",
         "echo a\\ b",
         "ls\u{a0}-la",
         "ls\t-la",

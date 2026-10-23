@@ -531,9 +531,10 @@ impl Parsed {
     /// runs one command, with no terminal and nothing on stdin, so a shell
     /// would end at once. `sudo -i`, `sudo -s`, `dzdo su -`, `su` without
     /// `-c`, `machinectl shell`, or a shell with no command or script
-    /// (`bash`, `sudo bash -l`), as any of the simple commands in it. Read
-    /// plainly. Not a safety check: it only tells the AI to send the command
-    /// itself.
+    /// (`bash`, `sudo bash -l`), as any of the simple commands in it; or one
+    /// that starts with an option (`-i`, `-s`), which sudo or dzdo would read
+    /// as its own. Read plainly. Not a safety check: it only tells the AI to
+    /// send the command itself.
     pub(crate) fn opens_shell(&self) -> bool {
         self.commands.first().is_some_and(|cmds| cmds.iter().any(|c| opens_shell(c)))
     }
@@ -549,6 +550,9 @@ const ROOT_OPTIONS_WITH_A_VALUE: &[&str] = &["-u", "-g", "-p", "-c", "-h", "-r",
 fn opens_shell(words: &[Word]) -> bool {
     let name = |w: &str| forms(w).last().map(|f| f.to_string()).unwrap_or_default();
     let mut i = words.iter().position(|(w, _)| !is_assignment(w)).unwrap_or(words.len());
+    if words.get(i).is_some_and(|(w, _)| w.starts_with('-')) {
+        return true;
+    }
     while let Some((w, _)) = words.get(i) {
         let n = name(w);
         match n.as_str() {
@@ -598,7 +602,9 @@ fn opens_shell(words: &[Word]) -> bool {
 /// would read otherwise (quotes, backslashes, globs, `~`, `#`, `!`, or a
 /// `NAME=value` first). Such a command runs as root as its words, with no
 /// shell between (`sudo docker ps -a`), so a sudoers rule for that one
-/// program allows it. Any other runs as `sh -c <command>`.
+/// program allows it. Any other runs as `sh -c <command>`, and so does one
+/// whose first word starts with `-`, which the tool would take for an
+/// option of its own: the tool's first word is then `sh`.
 pub(crate) fn plain_words(command: &str) -> Option<Vec<String>> {
     if !is_simple(command) || !command.chars().all(|c| c == ' ' || c.is_ascii_graphic()) {
         return None;
@@ -608,7 +614,7 @@ pub(crate) fn plain_words(command: &str) -> Option<Vec<String>> {
     }
     let words: Vec<String> = command.split(' ').filter(|w| !w.is_empty()).map(str::to_string).collect();
     let first = words.first()?;
-    (!first.contains('=') && !BUILTINS.contains(&first.as_str())).then_some(words)
+    (!first.contains('=') && !first.starts_with('-') && !BUILTINS.contains(&first.as_str())).then_some(words)
 }
 
 /// What a shell does itself, with no program of that name to run.
