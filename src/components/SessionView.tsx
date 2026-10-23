@@ -36,15 +36,6 @@ type ShellSyncPushResult = { pushed: number; bytes: number; failed: { remote: st
 // Remembered per device like the panel's size; compact windows ignore it and
 // show the tool full screen.
 type ToolDock = "right" | "left" | "bottom" | "top";
-// A new terminal tab's number: the lowest one no open tab has (its own or,
-// renamed, its original), so closing tab 1 and opening another gives "1"
-// again rather than a second "2".
-const nextTabNumber = (terms: { title: string; baseTitle?: string }[]) => {
-  const used = new Set(terms.map(t => t.baseTitle ?? t.title));
-  let n = 1;
-  while (used.has(String(n))) n++;
-  return String(n);
-};
 
 // The start of a connect refused because the server's jump host was deleted
 // (src-tauri/src/jump_gone.rs, CODE).
@@ -285,6 +276,24 @@ const ToolTitleBar = ({ title, shortTitle, toggle, mirror, extra, onClose }: {
     </div>
   );
 };
+
+// The name of a new terminal tab: the lowest number no open terminal has
+// (issue #231). Closing "2" of 1, 2, 3 and opening another gives a new "2",
+// never a second "3". A renamed terminal keeps its number (`baseTitle`), and
+// the number it shows now is taken too (renaming "2" to "3" leaves no second
+// "3" to make); a container's terminal, named after the container, takes none.
+function nextTerminalNumber(terminals: { title: string; baseTitle?: string; container?: unknown }[]): string {
+  const used = new Set(
+    terminals
+      .filter((t) => !t.container)
+      .flatMap((t) => [t.title, t.baseTitle ?? t.title])
+      .filter((t) => /^\d+$/.test(t))
+      .map(Number),
+  );
+  let n = 1;
+  while (used.has(n)) n++;
+  return `${n}`;
+}
 
 // `displayName`: the session tab's name, which the user may have changed
 // from the server's (DesktopApp's tabNames). `profile`: the unlocked
@@ -918,7 +927,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // Another shell on this server, beside the one(s) on screen.
   const splitWithNew = () => {
     const newId = `${session.id}-term-${Date.now()}`;
-    setTerminals(prev => [...prev, { id: newId, title: nextTabNumber(prev) }]);
+    setTerminals(prev => [...prev, { id: newId, title: nextTerminalNumber(prev) }]);
     splitWith(newId);
     setActiveTab(newId);
   };
@@ -1823,7 +1832,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           <button
             onClick={() => {
               const newId = `${session.id}-term-${Date.now()}`;
-              setTerminals(prev => [...prev, { id: newId, title: nextTabNumber(prev) }]);
+              setTerminals(prev => [...prev, { id: newId, title: nextTerminalNumber(prev) }]);
               setActiveTab(newId);
             }}
             onContextMenu={(e) => {
