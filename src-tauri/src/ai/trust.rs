@@ -92,7 +92,8 @@ pub(crate) fn is_simple_on(command: &str, windows: bool) -> bool {
 
 /// Whether the allow rule `rule` matches `command`: `uptime` exactly that,
 /// `systemctl status *` that followed by a space and anything, or alone,
-/// `mkfs*` anything that starts with `mkfs`. Only a simple command
+/// `cat /var/log/*` that followed by the rest of the same word, with no
+/// space and no `..`. Only a simple command
 /// (is_simple) matches, and a rule with `*` anywhere but at its end matches
 /// nothing.
 pub(crate) fn allow_matches(rule: &str, command: &str) -> bool {
@@ -122,8 +123,24 @@ pub(crate) fn allow_matches_on(rule: &str, command: &str, windows: bool) -> bool
             let prefix = prefix.trim_end();
             cmd == prefix || cmd.strip_prefix(prefix).is_some_and(|rest| rest.starts_with(' '))
         }
-        None => cmd.starts_with(body),
+        // The rest of that one word only: no space, and no `..` to climb
+        // out of the folder written (`cat /var/log/*` never reaches
+        // /etc/shadow).
+        None => cmd.strip_prefix(body).is_some_and(|rest| {
+            let last_word = cmd.rsplit(' ').next().unwrap_or(cmd);
+            !rest.chars().any(char::is_whitespace) && !last_word.split(['/', '\\']).any(|seg| seg == "..")
+        }),
     }
+}
+
+/// What the card refuses to save as a rule: the AI's own command when it
+/// ends with `*`. As a rule, its `*` would allow much more than it does as
+/// a glob in this one command.
+pub(crate) const GLOB_AS_RULE: &str = "This command ends with *, which as a rule would allow more than this command. Edit it first.";
+
+pub(crate) fn glob_as_rule(pattern: &str, command: &str) -> bool {
+    let p = pattern.trim();
+    p.ends_with('*') && p == trimmed(command)
 }
 
 /// A word as an always-ask rule compares it: without quotes, backslashes or

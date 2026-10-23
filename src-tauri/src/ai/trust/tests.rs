@@ -36,10 +36,26 @@ fn a_space_before_the_star_is_a_word_boundary() {
 }
 
 #[test]
-fn a_star_without_a_space_is_any_ending() {
+fn a_star_without_a_space_is_the_rest_of_that_word() {
     assert!(allow_matches("ls*", "lsof"));
     assert!(allow_matches("ls*", "ls"));
     assert!(!allow_matches("ls*", "cat ls"));
+    assert!(!allow_matches("ls*", "lsof -i"), "no space after it");
+    assert!(allow_matches("cat /var/log/*", "cat /var/log/syslog"));
+    assert!(allow_matches("cat /var/log/*", "cat /var/log/nginx/error.log"));
+    assert!(!allow_matches("cat /var/log/*", "cat /var/log/syslog /etc/shadow"));
+    assert!(!allow_matches("cat /var/log/*", "cat /var/log/../../etc/shadow"));
+    assert!(!allow_matches("cat /var/log/*", "cat /var/log/.."));
+    assert!(allow_matches("cat /var/log/*", "cat /var/log/x..y"), "only a whole .. part");
+    assert!(!allow_matches("type C:\\logs\\*", "type C:\\logs\\..\\secrets.txt"));
+}
+
+#[test]
+fn the_ai_s_own_glob_isnt_saved_as_a_rule() {
+    assert!(glob_as_rule("cat /var/log/*", "cat /var/log/*"));
+    assert!(glob_as_rule(" ls * ", "ls *"));
+    assert!(!glob_as_rule("cat /var/log/syslog", "cat /var/log/syslog"));
+    assert!(!glob_as_rule("cat /var/log/*", "cat /var/log/syslog"));
 }
 
 #[test]

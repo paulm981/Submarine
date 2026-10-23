@@ -1632,6 +1632,9 @@ pub async fn ai_allow_always(
 ) -> Result<(), String> {
     let p = state.pending_view(id)?;
     let server_id = p.server_id.filter(|_| p.can_allow_always).ok_or("This command can't be allowed with a rule: it isn't one simple command on a saved server.")?;
+    if trust::glob_as_rule(&pattern, &p.command) {
+        return Err(trust::GLOB_AS_RULE.into());
+    }
     let pattern = trust::check_rule("allow", &pattern)?;
     if !trust::allow_matches(&pattern, &p.command) {
         return Err("That rule doesn't match this command.".into());

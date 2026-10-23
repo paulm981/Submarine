@@ -102,6 +102,9 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
   const [extra, setExtra] = useState<"rule" | "note" | null>(null);
   const [rule, setRule] = useState(p.command.trim());
   const [note, setNote] = useState("");
+  // The AI's own `*` (a glob in its command) would allow far more as a
+  // rule: it has to be edited first.
+  const globAsRule = rule.trim().endsWith("*") && rule.trim() === p.command.trim();
   const settledAt = useRef(0);
   const lastTop = useRef<number | null>(null);
   const downHere = useRef(false);
@@ -221,13 +224,17 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
               Exactly this command. End it with <code>&nbsp;*</code> to allow any arguments.
               {level < 2 && " This server asks every time now: saving also sets it to “Run my allowed commands, ask for the rest”."}
             </p>
-            {rule.trim().endsWith("*") && <p className="text-[10.5px] text-amber-300 leading-snug">{WILDCARD_WARNING}</p>}
+            {globAsRule ? (
+              <p className="text-[10.5px] text-red-300 leading-snug">
+                This command ends with *, which as a rule would allow more than this command. Edit it first.
+              </p>
+            ) : rule.trim().endsWith("*") && <p className="text-[10.5px] text-amber-300 leading-snug">{WILDCARD_WARNING}</p>}
             <div className="flex gap-2">
               <NoFocusButton
-                onPick={() => act("ai_allow_always", { id: p.id, pattern: rule })}
+                onPick={() => { if (!globAsRule) act("ai_allow_always", { id: p.id, pattern: rule }); }}
                 onDown={down}
                 accept={accept}
-                className="h-7 px-2.5 rounded-md bg-primary/15 border border-primary/40 text-primary text-[10.5px] font-bold uppercase tracking-wider hover:bg-primary hover:text-zinc-950"
+                className={`h-7 px-2.5 rounded-md bg-primary/15 border border-primary/40 text-primary text-[10.5px] font-bold uppercase tracking-wider hover:bg-primary hover:text-zinc-950 ${globAsRule ? "opacity-40 pointer-events-none" : ""}`}
               >
                 Save and allow
               </NoFocusButton>
