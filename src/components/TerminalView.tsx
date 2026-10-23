@@ -7,6 +7,7 @@ import { Unicode11Addon } from '@xterm/addon-unicode11';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { Channel, invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import '@xterm/xterm/css/xterm.css';
 import { KeyRound } from 'lucide-react';
 import { useIsNarrow } from '../hooks/useViewport';
@@ -25,6 +26,7 @@ import { withoutPasteControls } from '../util/pasteText';
 import { readUseLocalShell } from '../util/terminalShell';
 import { IS_ANDROID, IS_LINUX, IS_WINDOWS } from '../util/platform';
 import { readClipboardText } from '../util/clipboard';
+import { readUseSshAgent } from '../util/sshAgent';
 
 // Does the recent remote OUTPUT look like a no-echo password / passphrase
 // prompt? Used to skip command-history capture so typed secrets (sudo, su,
@@ -153,6 +155,8 @@ const TerminalView = ({
   local,
   onShellReady,
   telnet = false,
+  ownLogin = false,
+  quickAuth = null,
 }: {
   sessionId: string;
   terminalId: string;
@@ -216,6 +220,14 @@ const TerminalView = ({
   /// connect and every reconnect) and has printed what it prints on login,
   /// so typed-in commands land at its prompt (SessionView's run-on-connect).
   onShellReady?: () => void;
+  /// This terminal logs in on a connection of its own, as a new connection
+  /// to the server would, instead of opening a channel on its tab's (issue
+  /// #230): for servers that tie what a user may do to the login, such as
+  /// CA Access Control's `sesu`. When that login fails it uses the tab's
+  /// connection and says so.
+  ownLogin?: boolean;
+  /// A quick connect's login (it has no saved server), for `ownLogin`.
+  quickAuth?: unknown;
 }) => {
   const commands = local ? LOCAL_COMMANDS : SSH_COMMANDS;
 
@@ -256,6 +268,63 @@ const TerminalView = ({
       quiet: window.setTimeout(shellReady, SHELL_FIRST_OUTPUT_MS),
       cap: window.setTimeout(shellReady, SHELL_READY_CAP_MS),
     };
+  };
+
+  // The connection this terminal's shell runs on: its tab's, or its own
+  // (`ownLogin`), `<tab>::term-<terminal>`, which the backend takes as the
+  // tab's for what was typed there (a password asked for, a host key).
+  const ownConn = `${sessionId}::term-${terminalId}`;
+  const shellConnRef = useRef(sessionId);
+  // Ends the wait of this terminal's own login while it is in progress.
+  const cancelOwnRef = useRef<(() => void) | null>(null);
+  // Logs in on this terminal's own connection; resolves to the session to
+  // open the shell on: its own, or the tab's when that login failed. Null when
+  // it was cancelled (a newer login started, or the terminal or its tab went
+  // away): then there is nothing to open.
+  const connectOwn = async (term: Terminal): Promise<string | null> => {
+    // One login at a time: a newer one (a reconnect) replaces one still in
+    // progress, and the backend drops that one's connection when it starts.
+    cancelOwnRef.current?.();
+    let cancelled = false;
+    let settle: (r: true | string | null) => void = () => {};
+    const done = new Promise<true | string | null>((resolve) => { settle = resolve; });
+    const cancel = () => { cancelled = true; settle(null); };
+    cancelOwnRef.current = cancel;
+    const offs = await Promise.all([
+      listen(`connection-success-${ownConn}`, () => settle(true)),
+      listen(`connection-failed-${ownConn}`, (e: any) => settle(String(e.payload?.reason ?? 'the login failed'))),
+    ]);
+    const timer = setTimeout(() => settle('no answer within 60 seconds'), 60000);
+    if (!cancelled) {
+      invoke('initiate_connection', {
+        sessionId: ownConn,
+        serverId,
+        customPassword: null,
+        quickAuth: quickAuth ?? null,
+        sessionRole: 'terminal',
+        separateSessions: false,
+        useSshAgent: readUseSshAgent(),
+      }).catch((e) => settle(String(e)));
+    }
+    const result = await done;
+    clearTimeout(timer);
+    offs.forEach((off) => off());
+    if (cancelOwnRef.current === cancel) cancelOwnRef.current = null;
+    if (result === null) return null;
+    if (result === true) return ownConn;
+    term.writeln(`\x1b[33mThis terminal couldn't log in on its own (${result}); it uses the tab's connection.\x1b[0m`);
+    invoke('disconnect_session', { sessionId: ownConn }).catch(() => {});
+    return sessionId;
+  };
+  // Ends this terminal's own login: one in progress is cancelled (the backend
+  // drops its connection if it still comes up), one that's up is closed.
+  const closeOwn = () => {
+    const pending = cancelOwnRef.current;
+    cancelOwnRef.current = null;
+    pending?.();
+    if (!pending && shellConnRef.current === sessionId) return;
+    invoke('disconnect_session', { sessionId: ownConn }).catch(() => {});
+    shellConnRef.current = sessionId;
   };
   const terminalRef = useRef<HTMLDivElement>(null);
   // What a Wall moves into its tile (terminalDock): the div xterm draws
@@ -486,19 +555,45 @@ const TerminalView = ({
         term.writeln(`\x1b[31mReconnect into container failed: ${e instanceof Error ? e.message : e}\x1b[0m`);
       });
     } else {
-      invoke('open_terminal', {
-        sessionId,
-        terminalId,
-        cols: term.cols || 80,
-        rows: term.rows || 24,
-        useLocalShell: readUseLocalShell(),
-        onOutput: outputChannel(),
-      }).then(() => { syncSize(); opened(); watchForShellReady(); }, e => {
-        term.writeln(`\x1b[31mReconnect failed: ${e}\x1b[0m`);
-      });
+      // A terminal with a login of its own logs in again first.
+      (ownLogin ? connectOwn(term) : Promise.resolve(sessionId))
+        .then((sid) => {
+          if (sid === null) return false;
+          shellConnRef.current = sid;
+          return invoke('open_terminal', {
+            sessionId: sid,
+            terminalId,
+            cols: term.cols || 80,
+            rows: term.rows || 24,
+            useLocalShell: readUseLocalShell(),
+            onOutput: outputChannel(),
+          }).then(() => true);
+        })
+        .then((ok) => { if (ok) { syncSize(); opened(); watchForShellReady(); } }, e => {
+          term.writeln(`\x1b[31mReconnect failed: ${e}\x1b[0m`);
+        });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectionEpoch]);
+
+  // A terminal with a login of its own: the tab disconnected, so its own
+  // connection goes too (a reconnect logs it in again); and that connection
+  // dropping on its own is said in the terminal.
+  useEffect(() => {
+    if (disabled) closeOwn();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [disabled]);
+  useEffect(() => {
+    if (!ownLogin) return;
+    const off = listen(`session-disconnected-${ownConn}`, (e: any) => {
+      // This side closed it (the terminal, its tab, a failed login): no news.
+      if (e.payload?.user_initiated) return;
+      shellConnRef.current = sessionId;
+      xtermRef.current?.write("\r\n\x1b[33m── this terminal's own login closed; reconnect the tab to log in again ──\x1b[0m\r\n");
+    });
+    return () => { off.then((f) => f()); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ownConn, ownLogin]);
 
   // Move keyboard focus into this terminal's xterm. Shared by the
   // become-active effect and the parent-driven focus signal below, so the
@@ -958,14 +1053,19 @@ const TerminalView = ({
             term.writeln(`\x1b[31mFailed to attach to container: ${e instanceof Error ? e.message : e}\x1b[0m`);
           });
         } else {
-          invoke('open_terminal', {
-            sessionId,
-            terminalId,
-            cols: term.cols || 80,
-            rows: term.rows || 24,
-            useLocalShell: readUseLocalShell(),
-            onOutput: outputChannel(),
-          }).then(() => { syncSize(); opened(); watchForShellReady(); }, e => {
+          // A terminal with a login of its own logs in first.
+          (ownLogin ? connectOwn(term) : Promise.resolve(sessionId)).then((sid) => {
+            if (sid === null) return false;
+            shellConnRef.current = sid;
+            return invoke('open_terminal', {
+              sessionId: sid,
+              terminalId,
+              cols: term.cols || 80,
+              rows: term.rows || 24,
+              useLocalShell: readUseLocalShell(),
+              onOutput: outputChannel(),
+            }).then(() => true);
+          }).then((ok) => { if (ok) { syncSize(); opened(); watchForShellReady(); } }, e => {
             term.writeln(`\x1b[31mFailed to open terminal: ${e}\x1b[0m`);
           });
         }
@@ -1565,6 +1665,7 @@ const TerminalView = ({
       if (dockElRef.current === dock) dockElRef.current = null;
       setDockEl((cur) => (cur === dock ? null : cur));
       invoke(commands.close, { terminalId }).catch(console.error);
+      closeOwn();
     };
   }, [sessionId, terminalId]);
 

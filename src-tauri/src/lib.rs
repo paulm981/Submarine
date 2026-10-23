@@ -8807,10 +8807,14 @@ enum SecretSlot {
 /// shares its parent tab's prompted-secret cache, so the suffix is stripped to
 /// key the cache by the base session id. A plain primary id is returned as-is.
 fn base_session_id(session_id: &str) -> &str {
-    session_id
-        .strip_suffix("::sftp")
-        .or_else(|| session_id.strip_suffix("::fwd"))
-        .unwrap_or(session_id)
+    if let Some(base) = session_id.strip_suffix("::sftp").or_else(|| session_id.strip_suffix("::fwd")) {
+        return base;
+    }
+    // A terminal that logs in on its own (issue #230): `<tab>::term-<terminal>`.
+    match session_id.split_once("::term-") {
+        Some((base, terminal)) if !base.is_empty() && !terminal.is_empty() => base,
+        _ => session_id,
+    }
 }
 
 /// How many times in a row a server may start a keyboard-interactive round with
@@ -10739,6 +10743,10 @@ mod secret_prompt_tests {
         assert_eq!(base_session_id("tab-1"), "tab-1");
         assert_eq!(base_session_id("tab-1::sftp"), "tab-1");
         assert_eq!(base_session_id("tab-1::fwd"), "tab-1");
+        // A terminal with a login of its own is its tab's (issue #230).
+        assert_eq!(base_session_id("tab-1::term-tab-1-term-1729000000000"), "tab-1");
+        assert_eq!(base_session_id("::term-x"), "::term-x");
+        assert_eq!(base_session_id("tab-1::term-"), "tab-1::term-");
         // Anything else is left intact.
         assert_eq!(base_session_id("tab-1::other"), "tab-1::other");
     }
@@ -10887,10 +10895,14 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     // question once, and only that (see is_password_prompt).
     saved_password: Option<&str>,
     // `Some` on a connection that can't ask the user anything (a `::sftp` /
-    // `::fwd` one, whose prompts no tab listens to): the saved password still
-    // answers the server's password question, but any other question ends
-    // the login at once, as a failure, and sets this. `None` asks the user.
+    // `::fwd` one, whose prompts no tab listens to, or a terminal's own login,
+    // #230): the saved password still answers the server's password question,
+    // but any other question ends the login at once, as a failure, and sets
+    // this. `None` asks the user.
     unasked: Option<&std::sync::atomic::AtomicBool>,
+    // Set to the password the user typed for the server's password question,
+    // so that the caller can keep it for the tab once the login worked.
+    typed_password: &mut Option<Zeroizing<String>>,
 ) -> Option<Result<bool, russh::Error>> {
     use russh::client::KeyboardInteractiveAuthResponse;
     use tauri::Emitter;
@@ -10931,6 +10943,10 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
             KeyboardInteractiveAuthResponse::Success => return Some(Ok(true)),
             KeyboardInteractiveAuthResponse::Failure { .. } => {
                 if answered_with_saved {
+                    if unasked.is_some() {
+                        log("The saved password was rejected.", "error");
+                        return Some(Ok(false));
+                    }
                     // The saved password was turned down. Start over and ask
                     // the user, as without one.
                     answered_with_saved = false;
@@ -11058,6 +11074,9 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
                 // the SSH auth state machine.
                 let mut answers = answers;
                 answers.resize(prompts.len(), String::new());
+                if prompts.len() == 1 && is_password_prompt(&prompts[0].prompt, prompts[0].echo) && !answers[0].is_empty() {
+                    *typed_password = Some(Zeroizing::new(answers[0].clone()));
+                }
 
                 resp = match session
                     .authenticate_keyboard_interactive_respond(answers)
@@ -12477,6 +12496,7 @@ async fn login_hop(
                 ctx.attempt,
                 kbi_password.as_ref().map(|p| p.as_str()),
                 (!ctx.allow_prompt).then_some(&kbi_unasked),
+                &mut None,
             )
             .await
             {
@@ -12754,6 +12774,11 @@ async fn initiate_connection(
     // hang. Instead we let the secondary fail its auth and the frontend falls
     // back to routing SFTP / forwarding over the primary connection.
     let allow_kbi = !is_secondary;
+    // A terminal's own login (#230) can't ask either, but on a server that
+    // takes the password only through keyboard-interactive it answers the
+    // password question there: with the saved password, or the one typed for
+    // its tab.
+    let kbi_password_only = role == "terminal";
     // Which connection auto-starts this server's saved tunnels inline:
     //   - primary + shared mode    → yes (unchanged legacy behaviour)
     //   - primary + separate mode  → no  (the "forward" connection takes over)
@@ -13525,7 +13550,10 @@ async fn initiate_connection(
 
                 // For a server that asks for the password through keyboard-
                 // interactive instead of the password method (#145).
-                let kbi_password = custom_password.clone().or_else(|| password.clone()).map(Zeroizing::new);
+                let mut kbi_password = custom_password.clone().or_else(|| password.clone()).map(Zeroizing::new);
+                if kbi_password_only && kbi_password.is_none() {
+                    kbi_password = cache_get_secret(&prompted_secrets_clone, &base_id, SecretSlot::Password).await;
+                }
 
                 let mut auth_res = if login_cancelled {
                     // "Login as" was cancelled — nothing to try. The prompt set
@@ -13577,11 +13605,13 @@ async fn initiate_connection(
                 // stop here: the fallback would only ask again (the server's own
                 // "Password:" box on a typical PAM setup). Likewise after an
                 // ssh-agent signature failed: the session can't run anything else.
-                if allow_kbi
+                if (allow_kbi || kbi_password_only)
                     && !matches!(auth_res, Ok(true))
                     && !prompt_ctx.cancelled.load(std::sync::atomic::Ordering::Relaxed)
                     && !prompt_ctx.session_unusable.load(std::sync::atomic::Ordering::Relaxed)
                 {
+                    let mut typed_password = None;
+                    let kbi_unasked = std::sync::atomic::AtomicBool::new(false);
                     if let Some(kbi_res) = run_keyboard_interactive(
                         &mut session,
                         &effective_user,
@@ -13591,11 +13621,17 @@ async fn initiate_connection(
                         &kbi_txs_clone,
                         &attempt,
                         kbi_password.as_ref().map(|p| p.as_str()),
-                        None,
+                        (!allow_kbi).then_some(&kbi_unasked),
+                        &mut typed_password,
                     )
                     .await
                     {
                         auth_res = kbi_res;
+                    }
+                    // Kept for the tab once it worked, like a password typed
+                    // for the password method: a terminal's own login uses it.
+                    if let (Some(typed), Ok(true)) = (typed_password, &auth_res) {
+                        cache_store_secret(&prompted_secrets_clone, &base_id, SecretSlot::Password, typed).await;
                     }
                 }
                 release_agent(&prompt_ctx).await;
