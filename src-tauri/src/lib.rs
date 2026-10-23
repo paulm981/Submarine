@@ -17365,24 +17365,151 @@ fn parse_exit_marker(raw: &str) -> (i32, String) {
 // arguments are quoted words (remote_sh::quote_words), validated first by
 // every caller: unit names, PIDs, firewall identifiers.
 
-/// root_probe's script: `$SUB_TOOL -l <command>` (`-l` runs nothing, so all
-/// it prints is the tool's own).
-const ROOT_PROBE_SCRIPT: &str = r#"if command -v "$SUB_TOOL" >/dev/null 2>&1; then :; else echo __SUB_SUDO:NO_SUDO; exit 0; fi
-if [ "$SUB_MODE" = pw ]; then OUT=$("$SUB_TOOL" -S -k -p "" -l "$@" 2>&1); else OUT=$("$SUB_TOOL" -n -l "$@" 2>&1); fi
-if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s "$OUT" | tr "\n" " ")"; fi"#;
+// sudo or dzdo, for a script that may give it a password, is never the one
+// the login's PATH finds first: a program running as the login could put a
+// `sudo` of its own there and catch the password. The scripts below that
+// run the tool start with root_tool_find, run by /bin/sh:
+//
+// - PATH is set to ROOT_TOOL_PATH, and the tool (`$X`) is the first one
+//   found there, by its full path.
+// - Before a password goes anywhere, `safe` checks that the tool, the folder
+//   it's in, and (through a link) the file it points to and its folder, are
+//   owned by root and can't be changed by its group or by others. Otherwise
+//   the script says UNSAFE and reads nothing: no password is sent.
+//
+// That's as far as a script can go: the login's own start-up files run
+// before it (the login shell reads them), and could still catch what's
+// typed. The password is only as safe as the server account.
+
+/// Where the tool is looked for: never the login's own PATH.
+const ROOT_TOOL_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin";
+
+/// ROOT_TOOL_PATH, as the scripts get it (`SUB_PATH`). The tests' stand-ins
+/// for sudo and dzdo are in the test server's working folder (`.`), first.
+fn root_tool_path() -> String {
+    if cfg!(test) {
+        format!(".:{}", ROOT_TOOL_PATH)
+    } else {
+        ROOT_TOOL_PATH.to_string()
+    }
+}
+
+/// Who besides root may own the tool (`SUB_UID`): no one in the app (0 is
+/// root again); in the tests, whoever runs them, who owns the stand-ins.
+fn root_tool_owner() -> String {
+    #[cfg(all(test, unix))]
+    {
+        // SAFETY: geteuid can't fail.
+        unsafe { libc::geteuid() }.to_string()
+    }
+    #[cfg(not(all(test, unix)))]
+    {
+        "0".to_string()
+    }
+}
+
+/// The variables root_tool_find reads, for `tool`.
+fn root_tool_env(tool: &str) -> Vec<(&'static str, String)> {
+    vec![("SUB_TOOL", tool.to_string()), ("SUB_PATH", root_tool_path()), ("SUB_UID", root_tool_owner())]
+}
+
+/// The start of every script that runs sudo or dzdo (see above): `$X` is the
+/// tool's full path (empty when there's none), and `safe` says whether it
+/// may be given a password. POSIX sh. `unset -f` drops any function of
+/// those names a shell brought from its environment.
+macro_rules! root_tool_find {
+    () => {
+        r#"unset -f command ls readlink printf read echo pwd stty tr type 2>/dev/null
+PATH=$SUB_PATH; export PATH
+X=; o=$IFS; IFS=:
+for d in $PATH; do case $d in /*) ;; *) d=$(pwd)/$d;; esac; if [ -f "$d/$SUB_TOOL" ] && [ -x "$d/$SUB_TOOL" ]; then X=$d/$SUB_TOOL; break; fi; done
+IFS=$o
+so() { set -f; set -- $(ls -ldnL "$1" 2>/dev/null); set +f; [ "$3" = 0 ] || [ "$3" = "$SUB_UID" ] || return 1; case $1 in ?????w*|????????w*) return 1;; esac; }
+safe() { so "$X" && so "${X%/*}" || return 1; r=$(readlink -f "$X" 2>/dev/null); [ -z "$r" ] || { so "$r" && so "${r%/*}"; }; }"#
+    };
+}
+
+/// What the scripts say, and the tool calls fail with, when the tool may not
+/// be given a password (root_tool_find).
+const SUDO_UNSAFE: &str = "[SUDO] FAILED: sudo/dzdo on this server isn't owned by root, so Submarine won't type your password into it.";
+
+/// root_probe's script: `$X -l <command>` (`-l` runs nothing, so all it
+/// prints is the tool's own). With a password (`SUB_MODE=pw`), it says
+/// `READ` once the tool is safe, and the password goes after that.
+const ROOT_PROBE_SCRIPT: &str = concat!(
+    root_tool_find!(),
+    "\n",
+    r#"if [ -z "$X" ]; then echo __SUB_SUDO:NO_SUDO; exit 0; fi
+if [ "$SUB_MODE" = pw ]; then
+if safe; then :; else echo __SUB_SUDO:UNSAFE; exit 0; fi
+echo __SUB_SUDO:READ
+OUT=$("$X" -S -k -p "" -l "$@" 2>&1)
+else OUT=$("$X" -n -l "$@" 2>&1); fi
+if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s "$OUT" | tr "\n" " ")"; fi"#
+);
+
+/// The command that runs ROOT_PROBE_SCRIPT for `tool` and `args`.
+fn root_probe_command(tool: &str, password: bool, args: &[String]) -> String {
+    let mut env = root_tool_env(tool);
+    env.push(("SUB_MODE", if password { "pw" } else { "n" }.to_string()));
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    remote_sh::sh_command_with("/bin/sh", &env, ROOT_PROBE_SCRIPT, args)
+}
+
+/// Run a probe that may get the password: it goes only once the script has
+/// said `__SUB_SUDO:READ` (its checks passed), then stdin ends. Returns what
+/// it printed, up to 64 KB.
+async fn exec_probe_with_password<H: russh::client::Handler>(session_arc: &HandleArc<H>, cmd: &str, password: &str, timeout_secs: u64) -> Result<String, String> {
+    use russh::ChannelMsg;
+    let mut channel = {
+        let session = session_arc.lock().await;
+        session.channel_open_session().await.map_err(|e| e.to_string())?
+    };
+    channel.exec(true, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
+    let mut out: Vec<u8> = Vec::new();
+    let work = async {
+        let mut sent = false;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
+                    if out.len() < 64 * 1024 {
+                        out.extend_from_slice(data);
+                    }
+                    if !sent && String::from_utf8_lossy(&out).lines().any(|l| l.trim() == "__SUB_SUDO:READ") {
+                        sent = true;
+                        channel.data(&password_line(password)[..]).await.map_err(|e| e.to_string())?;
+                        channel.eof().await.map_err(|e| e.to_string())?;
+                    }
+                }
+                ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        Ok::<_, String>(())
+    };
+    let done = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), work).await;
+    let _ = channel.close().await;
+    match done {
+        Ok(r) => r?,
+        Err(_) => return Err(format!("exec timed out after {}s", timeout_secs)),
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
 
 /// Can `tool` run `args` as root on this server? `tool -l <command>` asks
 /// without running it, and also answers for sudoers rules scoped to one
 /// command. `Err` is a [SUDO] code (see classify_sudo_failure).
 async fn root_probe<H: russh::client::Handler>(session_arc: &HandleArc<H>, tool: &str, password: Option<&str>, args: &[String]) -> Result<(), String> {
-    let mode = if password.is_some() { "pw" } else { "n" };
-    let cmd = remote_sh::sh_command(&[("SUB_MODE", mode), ("SUB_TOOL", tool)], ROOT_PROBE_SCRIPT, args);
-    let stdin = password.map(password_line);
-    let out = exec_with_stdin_capture(session_arc, &cmd, stdin.as_ref().map(|s| &s[..]), 20).await?;
+    let cmd = root_probe_command(tool, password.is_some(), args);
+    let out = match password {
+        Some(pw) => exec_probe_with_password(session_arc, &cmd, pw, 20).await?,
+        None => exec_with_stdin_capture(session_arc, &cmd, None, 20).await?,
+    };
     for line in out.lines() {
         match line.trim().strip_prefix("__SUB_SUDO:") {
             Some("OK") => return Ok(()),
             Some("NO_SUDO") => return Err(SUDO_NO_SUDO.into()),
+            Some("UNSAFE") => return Err(SUDO_UNSAFE.into()),
             Some(rest) => {
                 if let Some(msg) = rest.strip_prefix("FAIL:") {
                     return Err(classify_sudo_failure(msg));
@@ -17526,36 +17653,48 @@ fn password_line(password: &str) -> zeroize::Zeroizing<Vec<u8>> {
 /// password is read. The command isn't exec'd: a ticket kept for the
 /// shell's children (no terminal: sudo's per-parent ticket) must still be
 /// its own.
-const ROOT_EXEC_SCRIPT: &str = r#"T=$SUB_TAG
+///
+/// The tool is found as root_tool_find says, and is given a password only
+/// once `safe` says it may (else `UNSAFE`); with no tool at all, `NO_TOOL`.
+const ROOT_EXEC_SCRIPT: &str = concat!(
+    root_tool_find!(),
+    "\n",
+    r#"T=$SUB_TAG
 if [ -n "$SUB_ERR" ]; then exec 2>&1; fi
-if [ -z "$SUB_PW" ]; then echo "$T:RUN:n"; "$SUB_TOOL" -n "$@"; exit $?; fi
+if [ -z "$X" ]; then echo "$T:NO_TOOL"; exit 95; fi
+if [ -z "$SUB_PW" ]; then echo "$T:RUN:n"; "$X" -n "$@"; exit $?; fi
+if safe; then :; else echo "$T:UNSAFE"; exit 96; fi
 if [ -n "$SUB_TTY" ]; then stty -echo 2>/dev/null; fi
 echo "$T:READ"
 IFS= read -r p || exit 97
 if [ -n "$SUB_TTY" ]; then stty echo 2>/dev/null; fi
-printf '%s\n' "$p" | "$SUB_TOOL" -S -p "" -v 2>&1
+printf '%s\n' "$p" | "$X" -S -p "" -v 2>&1
 r=$?
 p=
 echo "$T:V:$r"
 if [ "$r" != 0 ]; then exit 98; fi
-if "$SUB_TOOL" -n -v >/dev/null 2>&1; then echo "$T:RUN:t"; "$SUB_TOOL" -n "$@"; exit $?; fi
+if "$X" -n -v >/dev/null 2>&1; then echo "$T:RUN:t"; "$X" -n "$@"; exit $?; fi
 echo "$T:RUN:p"
-if [ -n "$SUB_TTY" ]; then "$SUB_TOOL" -p "$T:PW:" "$@"; else "$SUB_TOOL" -S -p "$T:PW:" "$@"; fi
-exit $?"#;
+if [ -n "$SUB_TTY" ]; then "$X" -p "$T:PW:" "$@"; else "$X" -S -p "$T:PW:" "$@"; fi
+exit $?"#
+);
 
-/// The command that runs `words` as root with `tool` (ROOT_EXEC_SCRIPT).
+/// The command that runs `words` as root with `tool` (ROOT_EXEC_SCRIPT),
+/// under /bin/sh.
 fn root_exec_command(tool: &str, tag: &str, password: bool, pty: bool, stderr_to_stdout: bool, words: &[String]) -> String {
-    let mut env = vec![("SUB_TOOL", tool), ("SUB_TAG", tag)];
+    let mut env = root_tool_env(tool);
+    env.push(("SUB_TAG", tag.to_string()));
     if password {
-        env.push(("SUB_PW", "1"));
+        env.push(("SUB_PW", "1".into()));
     }
     if pty {
-        env.push(("SUB_TTY", "1"));
+        env.push(("SUB_TTY", "1".into()));
     }
     if stderr_to_stdout {
-        env.push(("SUB_ERR", "1"));
+        env.push(("SUB_ERR", "1".into()));
     }
-    remote_sh::sh_command(&env, ROOT_EXEC_SCRIPT, words)
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    remote_sh::sh_command_with("/bin/sh", &env, ROOT_EXEC_SCRIPT, words)
 }
 
 /// What root_feed gives a channel running ROOT_EXEC_SCRIPT.
@@ -17600,6 +17739,8 @@ async fn root_feed(channel: &mut russh::Channel<russh::client::Msg>, feed: RootF
     let read_tag = format!("{}:READ", feed.tag);
     let verdict_tag = format!("{}:V:", feed.tag);
     let run_tag = format!("{}:RUN:", feed.tag);
+    let unsafe_tag = format!("{}:UNSAFE", feed.tag);
+    let no_tool_tag = format!("{}:NO_TOOL", feed.tag);
     let mut hook = hook;
     // The script's lines up to RUN; what the tool said since READ.
     let mut pending: Vec<u8> = Vec::new();
@@ -17631,7 +17772,11 @@ async fn root_feed(channel: &mut russh::Channel<russh::client::Msg>, feed: RootF
                 }
                 None => text.trim(),
             };
-            if line == read_tag {
+            if line == unsafe_tag {
+                return Err(SUDO_UNSAFE.into());
+            } else if line == no_tool_tag {
+                return Err(SUDO_NO_SUDO.into());
+            } else if line == read_tag {
                 let Some(pw) = feed.password else { return Err(format!("{}: unexpected reply from the server", SUDO_FAILED)) };
                 channel.data(&password_line(pw)[..]).await.map_err(|e| e.to_string())?;
                 deadline = Instant::now() + ROOT_CHECK_WAIT;
@@ -18541,13 +18686,29 @@ echo "__SUB_SUDO:PATH:$S""#
 }
 /// Finds the server's sftp-server, for a root shell to start (find_sftp_server).
 const SFTP_SERVER_FIND: &str = sftp_server_find!();
+/// Finds sftp-server and asks the tool about it, as ROOT_PROBE_SCRIPT does
+/// (root_tool_find; with a password, `READ` once the tool is safe).
 const SUDO_SFTP_PROBE: &str = concat!(
+    root_tool_find!(),
+    "\n",
     sftp_server_find!(),
     "\n",
-    r#"if command -v "$SUB_TOOL" >/dev/null 2>&1; then :; else echo __SUB_SUDO:NO_SUDO; exit 0; fi
-if [ "$SUB_MODE" = pw ]; then OUT=$("$SUB_TOOL" -S -k -p "" -l "$S" 2>&1); else OUT=$("$SUB_TOOL" -n -l "$S" 2>&1); fi
+    r#"if [ -z "$X" ]; then echo __SUB_SUDO:NO_SUDO; exit 0; fi
+if [ "$SUB_MODE" = pw ]; then
+if safe; then :; else echo __SUB_SUDO:UNSAFE; exit 0; fi
+echo __SUB_SUDO:READ
+OUT=$("$X" -S -k -p "" -l "$S" 2>&1)
+else OUT=$("$X" -n -l "$S" 2>&1); fi
 if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s "$OUT" | tr "\n" " ")"; fi"#
 );
+
+/// The command that runs SUDO_SFTP_PROBE for `tool`.
+fn sftp_probe_command(tool: &str, password: bool) -> String {
+    let mut env = root_tool_env(tool);
+    env.push(("SUB_MODE", if password { "pw" } else { "n" }.to_string()));
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    remote_sh::sh_command_with("/bin/sh", &env, SUDO_SFTP_PROBE, &[])
+}
 
 /// Programs that can run sftp-server as root, in the order they're tried.
 /// `dzdo` first: a host that has it is managed through it, and sudo there is
@@ -18752,10 +18913,11 @@ async fn find_sftp_server<H: russh::client::Handler>(session_arc: &HandleArc<H>)
 }
 
 async fn probe_sudo_sftp_with<H: russh::client::Handler>(session_arc: &HandleArc<H>, password: Option<&str>, tool: &str) -> Result<String, String> {
-    let mode = if password.is_some() { "pw" } else { "n" };
-    let cmd = remote_sh::sh_command(&[("SUB_MODE", mode), ("SUB_TOOL", tool)], SUDO_SFTP_PROBE, &[]);
-    let stdin = password.map(password_line);
-    let out = exec_with_stdin_capture(session_arc, &cmd, stdin.as_ref().map(|s| &s[..]), 25).await?;
+    let cmd = sftp_probe_command(tool, password.is_some());
+    let out = match password {
+        Some(pw) => exec_probe_with_password(session_arc, &cmd, pw, 25).await?,
+        None => exec_with_stdin_capture(session_arc, &cmd, None, 25).await?,
+    };
     let mut path: Option<String> = None;
     for line in out.lines() {
         let Some(rest) = line.trim().strip_prefix("__SUB_SUDO:") else { continue };
@@ -18769,6 +18931,7 @@ async fn probe_sudo_sftp_with<H: russh::client::Handler>(session_arc: &HandleArc
         match rest {
             "NO_SFTP_SERVER" => return Err(SUDO_NO_SFTP_SERVER.into()),
             "NO_SUDO" => return Err(SUDO_NO_SUDO.into()),
+            "UNSAFE" => return Err(SUDO_UNSAFE.into()),
             "OK" => {
                 let p = path.ok_or_else(|| format!("{}: sftp-server path missing", SUDO_FAILED))?;
                 if !is_safe_remote_exec_path(&p) {
@@ -19205,12 +19368,13 @@ mod elevated_sftp_tests {
     fn root_scripts_run_under_any_login_shell() {
         let args = vec!["systemctl".to_string(), "restart".to_string(), "it's".to_string()];
         let cases: Vec<(String, &str)> = vec![
-            (remote_sh::sh_command(&[("SUB_MODE", "n"), ("SUB_TOOL", "true")], ROOT_PROBE_SCRIPT, &args), "__SUB_SUDO:OK"),
-            (remote_sh::sh_command(&[("SUB_MODE", "pw"), ("SUB_TOOL", "false")], ROOT_PROBE_SCRIPT, &args), "__SUB_SUDO:FAIL:"),
-            (remote_sh::sh_command(&[("SUB_MODE", "n"), ("SUB_TOOL", "no-such-tool")], ROOT_PROBE_SCRIPT, &args), "__SUB_SUDO:NO_SUDO"),
+            (root_probe_command("true", false, &args), "__SUB_SUDO:OK"),
+            (root_probe_command("false", true, &args), "__SUB_SUDO:FAIL:"),
+            (root_probe_command("no-such-tool", false, &args), "__SUB_SUDO:NO_SUDO"),
             (root_exec_command("true", "TAG", false, false, true, &args), "TAG:RUN:n"),
             (root_exec_command("true", "TAG", true, false, true, &args), "TAG:READ"),
-            (remote_sh::sh_command(&[("SUB_MODE", "n"), ("SUB_TOOL", "true")], SUDO_SFTP_PROBE, &[]), "__SUB_SUDO:"),
+            (root_exec_command("no-such-tool", "TAG", true, false, true, &args), "TAG:NO_TOOL"),
+            (sftp_probe_command("true", false), "__SUB_SUDO:"),
             (remote_sh::sh_command(&[], SFTP_SERVER_FIND, &[]), "__SUB_SUDO:"),
             (remote_sh::sh_command(&[("SUB_MODE", "n")], SUDO_SHELL_PROBE, &[]), "__SUB_SUDO:"),
         ];
@@ -19311,6 +19475,11 @@ exec "$@"
         /// A server whose dzdo and sudo follow `dzdo` and `sudo` (FAKE_TOOL's
         /// rules), with the password `s3cret pass`.
         pub(crate) async fn new(name: &str, dzdo: &str, sudo: &str) -> Lab {
+            Lab::new_with_path(name, dzdo, sudo, None).await
+        }
+
+        /// The same, with `first` first on the login's PATH.
+        pub(crate) async fn new_with_path(name: &str, dzdo: &str, sudo: &str, first: Option<&std::path::Path>) -> Lab {
             let dir = std::env::temp_dir().join(format!("sub-root-{}-{}", name, std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
@@ -19329,7 +19498,12 @@ exec "$@"
             let tcsh = std::process::Command::new("tcsh").arg("-c").arg("true").output().is_ok_and(|o| o.status.success());
             let login = if tcsh { vec!["tcsh".to_string(), "-c".to_string()] } else { Vec::new() };
             let opts = ShellOpts {
-                path: Some(format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default())),
+                path: Some(format!(
+                    "{}{}:{}",
+                    first.map(|f| format!("{}:", f.display())).unwrap_or_default(),
+                    dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                )),
                 cwd: Some(dir.clone()),
                 login,
                 keep_running_on_close: false,
@@ -19428,6 +19602,41 @@ exec "$@"
         let got = root_run(&lab.handle, &su("s3cret pass"), &words("echo root"), 60, None).await;
         assert!(got.as_ref().is_err_and(|e| e.contains("prompt of its own")), "{got:?}");
         assert_eq!(lab.attempts(), 3);
+    }
+
+    /// A `dzdo` of the login's own, first on its PATH (a program running as
+    /// the login put it there), never gets the password: the tool is found
+    /// on a fixed PATH.
+    #[tokio::test]
+    async fn a_tool_planted_on_the_logins_path_is_never_used() {
+        let planted = std::env::temp_dir().join(format!("sub-root-planted-{}", std::process::id()));
+        std::fs::create_dir_all(&planted).unwrap();
+        let caught = planted.join("caught");
+        std::fs::write(planted.join("dzdo"), format!("#!/bin/sh\ncat > '{}'\n", caught.display())).unwrap();
+        std::fs::set_permissions(planted.join("dzdo"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let lab = Lab::new_with_path("planted", "shell", "none", Some(&planted)).await;
+        let (code, out) = root_run(&lab.handle, &su("s3cret pass"), &words("echo root"), 30, None).await.unwrap();
+        assert_eq!((code, out.trim()), (0, "root"));
+        assert!(!caught.exists(), "the planted dzdo ran");
+        let _ = std::fs::remove_dir_all(&planted);
+    }
+
+    /// A tool its group or anyone else can change, or in a folder they can
+    /// change, is never given a password: nothing is read, and the call
+    /// says why.
+    #[tokio::test]
+    async fn a_tool_others_can_change_never_gets_the_password() {
+        for what in ["file", "folder"] {
+            let lab = Lab::new(&format!("unsafe-{what}"), "all", "none").await;
+            let path = if what == "file" { lab.dir.join("dzdo") } else { lab.dir.clone() };
+            let mode = if what == "file" { 0o775 } else { 0o777 };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let access = ssh_manager::RootAccess::new("dzdo", Some(pw("s3cret pass")), None, None);
+            assert_eq!(root_run(&lab.handle, &access, &words("echo root"), 30, None).await, Err(SUDO_UNSAFE.to_string()), "{what}");
+            assert_eq!(root_probe(&lab.handle, "dzdo", Some("s3cret pass"), &words("true")).await, Err(SUDO_UNSAFE.to_string()), "{what}");
+            assert_eq!(lab.attempts(), 0, "{what}");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     /// Where no ticket is kept, the tool asks again with the app's prompt,

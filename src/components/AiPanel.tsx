@@ -246,6 +246,8 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
           />
           <p className="text-[10px] text-zinc-500 leading-snug">
             Kept for this AI tab and server until access ends. It goes only to sudo's or dzdo's own prompt, never to the AI or the logs.
+            It's only as safe as the server account, though: a program running as that account could catch it. A sudoers rule that
+            needs no password for the commands you want is safer.
           </p>
         </div>
       )}

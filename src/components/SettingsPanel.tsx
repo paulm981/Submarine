@@ -294,7 +294,9 @@ function AiToolsSettings() {
             on its own connection, after you click Allow in the AI panel, or at once where you've said it may (below).
             Each AI tab only reaches the tabs shared with it, and closing it ends its access. When it asks to run something
             as root, Submarine runs it through the server's sudo or dzdo, and asks you for the root password on the request
-            if the server wants one. The AI never sees it.
+            if the server wants one. The AI never sees it. The password is only as safe as the server account, though: a
+            program running as that account could catch it. A sudoers rule that needs no password for the commands you want
+            is safer.
           </p>
         </div>
         <button

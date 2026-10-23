@@ -220,6 +220,11 @@ fn failed(code: &str) -> RootRun {
             "sudo here only works in a terminal (requiretty), and the AI's commands run without one.".into(),
             "Couldn't run it as root: sudo on this server only works in a terminal, and Submarine runs commands without one.",
         )
+    } else if code == crate::SUDO_UNSAFE {
+        (
+            "sudo/dzdo on this server isn't owned by root, so Submarine won't type your password into it.".into(),
+            "Couldn't run it as root: sudo or dzdo on this server isn't owned by root, so Submarine won't give it the password.",
+        )
     } else if code == crate::SUDO_NEED_PASSWORD {
         ("The server asked for a root password.".into(), "Couldn't run it as root: the server asked for a root password.")
     } else {
