@@ -1,7 +1,7 @@
 import { ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Bot, Check, ChevronDown, ChevronRight, Loader2, ShieldAlert, Square, X, Zap } from "lucide-react";
-import { AiDone, AiPending, AiSnapshot } from "../util/ai";
+import { AiDone, AiPending, AiSnapshot, runnerWarning } from "../util/ai";
 import { HIDDEN_CONTROLS } from "../util/fileName";
 import { WILDCARD_WARNING } from "./AiTrust";
 
@@ -105,6 +105,10 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
   // The AI's own `*` (a glob in its command) would allow far more as a
   // rule: it has to be edited first.
   const globAsRule = rule.trim().endsWith("*") && rule.trim() === p.command.trim();
+  // A wildcard rule for a command that runs other commands takes one more
+  // click, for the rule as it is when that click comes.
+  const runner = runnerWarning(rule);
+  const [confirmed, setConfirmed] = useState<string | null>(null);
   const settledAt = useRef(0);
   const lastTop = useRef<number | null>(null);
   const downHere = useRef(false);
@@ -228,15 +232,21 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
               <p className="text-[10.5px] text-red-300 leading-snug">
                 This command ends with *, which as a rule would allow more than this command. Edit it first.
               </p>
+            ) : runner ? (
+              <p className="text-[10.5px] text-red-300 font-semibold leading-snug">{runner}</p>
             ) : rule.trim().endsWith("*") && <p className="text-[10.5px] text-amber-300 leading-snug">{WILDCARD_WARNING}</p>}
             <div className="flex gap-2">
               <NoFocusButton
-                onPick={() => { if (!globAsRule) act("ai_allow_always", { id: p.id, pattern: rule }); }}
+                onPick={() => {
+                  if (globAsRule) return;
+                  if (runner && confirmed !== rule) { setConfirmed(rule); return; }
+                  act("ai_allow_always", { id: p.id, pattern: rule, confirmRunner: !!runner });
+                }}
                 onDown={down}
                 accept={accept}
                 className={`h-7 px-2.5 rounded-md bg-primary/15 border border-primary/40 text-primary text-[10.5px] font-bold uppercase tracking-wider hover:bg-primary hover:text-zinc-950 ${globAsRule ? "opacity-40 pointer-events-none" : ""}`}
               >
-                Save and allow
+                {runner && confirmed === rule ? "Yes, allow any command this way" : "Save and allow"}
               </NoFocusButton>
               <NoFocusButton onPick={() => setExtra(null)} className="h-7 px-2.5 rounded-md border border-white/10 text-zinc-400 text-[10.5px] font-bold uppercase tracking-wider hover:text-white">
                 Cancel

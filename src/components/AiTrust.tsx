@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ShieldAlert, ShieldCheck, Trash2, X } from "lucide-react";
-import { AI_LEVELS, AiTrustTarget, closeAiTrust, levelTitle, useAiTrustTarget } from "../util/ai";
+import { AI_LEVELS, AiTrustTarget, closeAiTrust, levelTitle, runnerWarning, useAiTrustTarget } from "../util/ai";
 
 // How much the AI may run without asking (#115, src-tauri/src/ai/trust.rs):
 // the level and the two lists of a server, a folder or every server. Kept on
@@ -48,11 +48,16 @@ const RuleList = ({ kind, rules, target, inherited, onChange }: {
 }) => {
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // A wildcard rule for a command that runs other commands takes a second
+  // click on Add, for the rule as it is then.
+  const runner = kind === "allow" ? runnerWarning(draft) : null;
+  const [confirmed, setConfirmed] = useState<string | null>(null);
   const add = () => {
     if (!draft.trim()) return;
+    if (runner && confirmed !== draft) { setConfirmed(draft); return; }
     setError(null);
-    invoke("ai_trust_add_rule", { scope: target.scope, id: target.id, kind, pattern: draft })
-      .then(() => { setDraft(""); onChange(); }, (e) => setError(errText(e)));
+    invoke("ai_trust_add_rule", { scope: target.scope, id: target.id, kind, pattern: draft, confirmRunner: !!runner })
+      .then(() => { setDraft(""); setConfirmed(null); onChange(); }, (e) => setError(errText(e)));
   };
   const remove = (id: number) => {
     setError(null);
@@ -97,10 +102,12 @@ const RuleList = ({ kind, rules, target, inherited, onChange }: {
           className="flex-1 min-w-0 h-8 px-2.5 bg-zinc-900/60 border border-white/10 rounded-lg font-mono text-[11.5px] text-zinc-50 outline-none focus:border-primary/50 placeholder:text-zinc-600"
         />
         <button onClick={add} disabled={!draft.trim()} className="shrink-0 h-8 px-3 rounded-lg bg-zinc-900 border border-white/10 text-[11px] font-bold uppercase tracking-wider text-zinc-300 hover:bg-white/5 disabled:opacity-40">
-          Add
+          {runner && confirmed === draft ? "Yes, add it" : "Add"}
         </button>
       </div>
-      {kind === "allow" && draft.trim().endsWith("*") && <p className="text-[11px] text-amber-300 leading-snug">{WILDCARD_WARNING}</p>}
+      {runner ? (
+        <p className="text-[11px] text-red-300 font-semibold leading-snug">{runner}{confirmed === draft ? " Click again to add it anyway." : ""}</p>
+      ) : kind === "allow" && draft.trim().endsWith("*") && <p className="text-[11px] text-amber-300 leading-snug">{WILDCARD_WARNING}</p>}
       {error && <p className="text-[11px] text-red-400 break-words">{error}</p>}
     </div>
   );

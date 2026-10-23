@@ -511,3 +511,58 @@ fn a_windows_server_is_known_by_its_saved_os() {
     assert!(policy_for(&conn, Some(2)).windows);
     assert!(!policy_for(&conn, Some(1)).windows);
 }
+
+// -- Root, read as the always-ask list reads words ----------------------------------
+
+#[test]
+fn root_is_seen_however_it_is_written() {
+    for cmd in [
+        "sudo id",
+        "'sudo' id",
+        "s\\udo id",
+        "\"s\"udo id",
+        "SUDO id",
+        "/usr/bin/sudo id",
+        "sudo.exe id",
+        "sudoedit /etc/hosts",
+        "run0 id",
+        "sud? id",
+        "/usr/bin/s[u]do id",
+        "su -",
+        "doas id",
+    ] {
+        assert!(mentions_root(cmd), "{cmd}");
+        assert!(crate::ai::asks_for_root(cmd), "{cmd}: the card says so too");
+        let p = Policy { level: 2, allow: rules(&["* id", "sud? *", "s\\udo *", "'sudo' *", "SUDO *", "sudoedit *", "run0 *", "doas *", "su *"]), ask: vec![], windows: false };
+        assert_eq!(decide(&p, false, cmd), ask(), "{cmd}");
+    }
+    for cmd in ["cat sudoers.txt", "ls -su", "echo pseudo", "ls *", "id", "visudo-ish"] {
+        assert!(!mentions_root(cmd), "{cmd}");
+    }
+}
+
+#[test]
+fn rules_for_commands_that_run_commands_are_warned_about() {
+    for p in ["timeout *", "env *", "xargs*", "bash *", "python3 *", "python3.12 *", "/usr/bin/find *", "git *", "pwsh.exe *", "awk *", "C:\\Windows\\System32\\cmd.exe *", "'bash' *"] {
+        assert!(runner_warning(p).is_some(), "{p}");
+    }
+    assert_eq!(
+        runner_warning("timeout *").as_deref(),
+        Some("`timeout *` lets the AI run any command, as root too where sudo needs no password.")
+    );
+    for p in ["timeout 5 uptime", "ls *", "systemctl status *", "gitk", "uptime"] {
+        assert!(runner_warning(p).is_none(), "{p}");
+    }
+}
+
+#[test]
+fn globs_are_matched() {
+    let g = |p: &str, t: &str| glob_match(&p.chars().collect::<Vec<_>>(), &t.chars().collect::<Vec<_>>());
+    assert!(g("reb?ot", "reboot"));
+    assert!(g("r*t", "reboot"));
+    assert!(g("re[a-c]oot", "reboot"));
+    assert!(!g("re[!b]oot", "reboot"));
+    assert!(!g("reb?ot", "rebot"));
+    assert!(g("[", "["));
+}
+

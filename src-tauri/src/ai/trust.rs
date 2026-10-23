@@ -54,6 +54,10 @@ static HIDDEN: LazyLock<regex::Regex> = LazyLock::new(|| {
 });
 
 fn hidden(c: char) -> bool {
+    // Printable ASCII never is: most of every command, without the regex.
+    if (' '..='~').contains(&c) {
+        return false;
+    }
     let mut buf = [0u8; 4];
     HIDDEN.is_match(c.encode_utf8(&mut buf))
 }
@@ -159,6 +163,86 @@ fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// What Windows runs a name with, dropped from it: `shutdown.exe` is
+/// `shutdown`.
+const RUNNABLE_EXTENSIONS: &[&str] = &[".exe", ".com", ".bat", ".cmd"];
+
+/// The ways a command word may name a program: as written, the name after
+/// its last `/` or `\`, and that without a Windows extension.
+fn forms(word: &str) -> Vec<&str> {
+    let base = word.rsplit(['/', '\\']).next().unwrap_or(word);
+    let mut out = vec![word, base];
+    if let Some(stem) = RUNNABLE_EXTENSIONS.iter().find_map(|e| base.strip_suffix(e)) {
+        out.push(stem);
+    }
+    out
+}
+
+fn is_glob(w: &str) -> bool {
+    w.contains(['?', '*', '['])
+}
+
+/// Whether the shell glob `pat` (`?`, `*`, `[…]`) matches all of `text`.
+fn glob_match(pat: &[char], text: &[char]) -> bool {
+    match pat.first() {
+        None => text.is_empty(),
+        Some('*') => (0..=text.len()).any(|i| glob_match(&pat[1..], &text[i..])),
+        Some('?') => !text.is_empty() && glob_match(&pat[1..], &text[1..]),
+        Some('[') => {
+            let Some(close) = pat.iter().skip(2).position(|c| *c == ']').map(|p| p + 2) else {
+                return text.first() == Some(&'[') && glob_match(&pat[1..], &text[1..]);
+            };
+            let Some(c) = text.first() else { return false };
+            let set = &pat[1..close];
+            let (negate, set) = match set.first() {
+                Some('!' | '^') => (true, &set[1..]),
+                _ => (false, set),
+            };
+            let mut hit = false;
+            let mut i = 0;
+            while i < set.len() {
+                if i + 2 < set.len() && set[i + 1] == '-' {
+                    hit |= (set[i]..=set[i + 2]).contains(c);
+                    i += 3;
+                } else {
+                    hit |= set[i] == *c;
+                    i += 1;
+                }
+            }
+            hit != negate && glob_match(&pat[close + 1..], &text[1..])
+        }
+        Some(p) => text.first() == Some(p) && glob_match(&pat[1..], &text[1..]),
+    }
+}
+
+/// A command word that names `name` (or, `prefix`, something starting with
+/// it): as itself, its name after the last `/` or `\`, without `.exe` and
+/// the like, or as a glob that could expand to it (`sud?`, `/sbin/reb?ot`).
+/// A glob of wildcards alone (`*`) counts for nothing: it would name
+/// everything.
+fn word_is(word: &str, name: &str, prefix: bool) -> bool {
+    forms(word).into_iter().any(|f| {
+        if is_glob(f) {
+            if !f.chars().any(|c| !matches!(c, '?' | '*' | '[' | ']' | '!' | '^' | '-')) {
+                return false;
+            }
+            let pat: Vec<char> = f.chars().collect();
+            let name: Vec<char> = name.chars().collect();
+            glob_match(&pat, &name) || (prefix && (name.len()..name.len() + 24).any(|n| {
+                // Any longer name starting with it: tried with the glob's
+                // own letters as filler, which is enough for `?` and `*`.
+                let mut longer = name.clone();
+                longer.resize(n, 'x');
+                glob_match(&pat, &longer)
+            }))
+        } else if prefix {
+            f.starts_with(name)
+        } else {
+            f == name
+        }
+    })
+}
+
 /// An always-ask rule's words, and whether its last is a prefix (`mkfs*`).
 /// A trailing ` *` adds nothing: the words may be followed by anything.
 fn ask_words(rule: &str) -> Option<(Vec<String>, bool)> {
@@ -174,27 +258,66 @@ fn ask_words(rule: &str) -> Option<(Vec<String>, bool)> {
     (!w.is_empty()).then_some((w, prefix))
 }
 
+/// The ways a command is read into words for the always-ask list and the
+/// root check, each tried in turn.
+fn word_lists(command: &str) -> Vec<Vec<String>> {
+    vec![words(command)]
+}
+
 /// Whether the always-ask rule `rule` is in `command`: its words, in order
 /// and side by side, as words anywhere in it, whatever comes before or
-/// after. So `reboot` is in `uptime; reboot`, `sudo reboot` and
-/// `/sbin/reboot now`, and `rm -rf *` in `cd /; rm -rf /tmp`. A command
-/// word counts as itself or as the name after its last `/`.
+/// after. So `reboot` is in `uptime; reboot`, `sudo reboot`,
+/// `/sbin/reboot now` and `shutdown.exe /r`, and `rm -rf *` in
+/// `cd /; rm -rf /tmp`. A command word counts as itself, as the name after
+/// its last `/` or `\` (without `.exe` and the like), or as a glob that
+/// could expand to the rule's word.
 ///
 /// It catches a rule written plainly, quoted or with backslashes, not a
 /// command that builds the name as it runs (`$(echo re)boot`, base64): the
 /// always-ask list is a safety net, not a wall.
 pub(crate) fn ask_matches(rule: &str, command: &str) -> bool {
     let Some((want, prefix)) = ask_words(rule) else { return false };
-    let have = words(command);
-    let same = |w: &str, r: &str, last: bool| {
-        let base = w.rsplit('/').next().unwrap_or(w);
-        if last && prefix {
-            w.starts_with(r) || base.starts_with(r)
-        } else {
-            w == r || base == r
-        }
-    };
-    have.windows(want.len()).any(|win| win.iter().zip(&want).enumerate().all(|(i, (w, r))| same(w, r, i + 1 == want.len())))
+    word_lists(command).iter().any(|have| {
+        have.windows(want.len())
+            .any(|win| win.iter().zip(&want).enumerate().all(|(i, (w, r))| word_is(w, r, prefix && i + 1 == want.len())))
+    })
+}
+
+/// The programs that give root.
+const ROOT_WORDS: &[&str] = &["sudo", "sudoedit", "dzdo", "su", "doas", "pkexec", "run0"];
+
+/// Whether a word of `command`, read as the always-ask list reads them,
+/// names a program that gives root, or is a glob that could (`sud?`).
+pub(crate) fn mentions_root(command: &str) -> bool {
+    word_lists(command).iter().flatten().any(|w| ROOT_WORDS.iter().any(|r| word_is(w, r, false)))
+}
+
+/// The programs that run other commands they're given: an allow rule with a
+/// wildcard that starts with one of them allows any command at all.
+/// `python` stands for every name that starts with it (`python3.12`).
+const RUNNERS: &[&str] = &[
+    "env", "xargs", "timeout", "nice", "ionice", "nohup", "exec", "command", "builtin", "busybox", "stdbuf", "setsid",
+    "chroot", "watch", "sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish", "python", "perl", "ruby", "node", "php",
+    "awk", "gawk", "mawk", "find", "git", "ssh", "rsync", "tar", "docker", "kubectl", "cmd", "powershell", "pwsh",
+];
+
+/// The warning for an allow rule with a wildcard whose command runs other
+/// commands (`timeout *`); None for any other rule. Saving one takes an
+/// extra click.
+pub(crate) fn runner_warning(pattern: &str) -> Option<String> {
+    let p = pattern.trim();
+    if !p.ends_with('*') {
+        return None;
+    }
+    // Its first word, quotes out but backslashes kept, for a Windows path.
+    let first = p
+        .trim_end_matches('*')
+        .split(|c: char| c.is_whitespace() || OPERATORS.contains(&c))
+        .find(|w| !w.is_empty())?
+        .replace(['\'', '"'], "")
+        .to_lowercase();
+    let runs = forms(&first).into_iter().any(|f| RUNNERS.iter().any(|r| f == *r || (*r == "python" && f.starts_with(r))));
+    runs.then(|| format!("`{p}` lets the AI run any command, as root too where sudo needs no password."))
 }
 
 /// What happens to a request.

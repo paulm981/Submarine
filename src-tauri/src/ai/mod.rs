@@ -407,16 +407,20 @@ fn now() -> String {
 /// sudo or dzdo needs no password, that's root with no question asked, and
 /// Submarine can't always tell.
 ///
-/// A warning for you on the request's card, NOT a gate: it's easy to dodge
-/// (`s\udo`, `$(echo sudo)`, `runuser`, a script that calls sudo), so
-/// nothing may be allowed or refused because of it. Anything that has to
-/// keep root out (step 3 of #32: running as another account) must decide on
-/// its own `as_root` and treat "can't tell" as root.
+/// A warning for you on the request's card, and at "Run my allowed
+/// commands" a reason to ask (trust::decide), which only ever asks more. Not
+/// a wall: it's still easy to dodge (`$(echo sudo)`, `runuser`, a script
+/// that calls sudo), so nothing may be allowed because it says no. Anything
+/// that has to keep root out (step 3 of #32: running as another account)
+/// must decide on its own `as_root` and treat "can't tell" as root.
 pub(crate) fn asks_for_root(command: &str) -> bool {
     use std::sync::LazyLock;
     static RE: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r#"(?:^|[\s;|&(){}`'"/!])(?:sudo|dzdo|su|doas|pkexec)(?:$|[\s;|&(){}`'"])"#).unwrap());
-    RE.is_match(command)
+    // And the same words as the always-ask list reads them (trust.rs):
+    // quotes and backslashes taken out, the name after a path, a glob that
+    // could name one (`sud?`), sudoedit and run0 too.
+    RE.is_match(command) || trust::mentions_root(command)
 }
 
 /// A request runs as root: its server's tab logged in as root, or its
@@ -1129,7 +1133,8 @@ impl AiState {
             s.tabs.iter().find(|t| t.id == tab_id).and_then(|t| t.servers.iter().find(|x| x.name == server)).map(|x| x.server_id)
         };
         let policy = looked_up.map(|id| (self.0.policy)(id));
-        let root_cmd = asks_for_root(command);
+        // (A command too long to run is refused below, unread.)
+        let root_cmd = command.len() <= MAX_COMMAND && asks_for_root(command);
         // Checked before anything is shown to you or runs.
         let (label, session_id, server, user, id, epoch, rx, stop_tx, stop_rx, auto) = {
             let mut s = self.lock();
@@ -1619,6 +1624,15 @@ fn level_name(level: Option<u8>) -> &'static str {
     }
 }
 
+/// An allow rule with a wildcard for a command that runs other commands
+/// (`timeout *`) is saved only with the extra click that confirms it.
+fn check_runner(pattern: &str, confirmed: Option<bool>) -> Result<(), String> {
+    match trust::runner_warning(pattern) {
+        Some(warning) if confirmed != Some(true) => Err(format!("{warning} Confirm it to save it.")),
+        _ => Ok(()),
+    }
+}
+
 /// "Always allow this command here", from the card: `pattern` (the command,
 /// or it with ` *` for any arguments) goes on the server's allow list, and
 /// this request is allowed. A server still at "Ask every time" goes to "Run
@@ -1629,8 +1643,10 @@ pub async fn ai_allow_always(
     db: tauri::State<'_, crate::DbState>,
     id: u64,
     pattern: String,
+    confirm_runner: Option<bool>,
 ) -> Result<(), String> {
     let p = state.pending_view(id)?;
+    check_runner(&pattern, confirm_runner)?;
     let server_id = p.server_id.filter(|_| p.can_allow_always).ok_or("This command can't be allowed with a rule: it isn't one simple command on a saved server.")?;
     if trust::glob_as_rule(&pattern, &p.command) {
         return Err(trust::GLOB_AS_RULE.into());
@@ -1692,7 +1708,11 @@ pub async fn ai_trust_add_rule(
     id: i64,
     kind: String,
     pattern: String,
+    confirm_runner: Option<bool>,
 ) -> Result<String, String> {
+    if kind == "allow" {
+        check_runner(&pattern, confirm_runner)?;
+    }
     let (pattern, what) = with_vault(&db, |conn| {
         let pattern = trust::add_rule(conn, &scope, id, &kind, &pattern)?;
         let what = format!("{}: {} `{pattern}`", trust::describe(conn, &scope, id), if kind == "allow" { "always allow" } else { "always ask" });

@@ -151,3 +151,25 @@ export const useAiTrustTarget = (): AiTrustTarget | null =>
 /// default for one that isn't saved.
 export const trustTargetFor = (s: AiServer): AiTrustTarget =>
   s.server_id !== null ? { scope: "server", id: s.server_id, name: s.name } : { scope: "default", id: 0, name: "every server" };
+
+// The commands that run other commands they're given (trust.rs's RUNNERS,
+// kept the same): an allow rule with a wildcard that starts with one allows
+// any command. The backend refuses to save one without the extra click.
+const RUNNERS = [
+  "env", "xargs", "timeout", "nice", "ionice", "nohup", "exec", "command", "builtin", "busybox", "stdbuf", "setsid",
+  "chroot", "watch", "sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish", "python", "perl", "ruby", "node", "php",
+  "awk", "gawk", "mawk", "find", "git", "ssh", "rsync", "tar", "docker", "kubectl", "cmd", "powershell", "pwsh",
+];
+
+/// The warning for an allow rule like `timeout *`; null for any other.
+export const runnerWarning = (pattern: string): string | null => {
+  const p = pattern.trim();
+  if (!p.endsWith("*")) return null;
+  const first = p.replace(/\*+$/, "").split(/[\s;&|`$><(){}]+/).find((w) => w !== "");
+  if (!first) return null;
+  const word = first.replace(/['"\\]/g, (c) => (c === "\\" ? "\\" : "")).toLowerCase();
+  const base = word.split(/[/\\]/).pop() ?? word;
+  const stem = base.replace(/\.(exe|com|bat|cmd)$/, "");
+  const runs = [word, base, stem].some((f) => RUNNERS.some((r) => f === r || (r === "python" && f.startsWith(r))));
+  return runs ? `\`${p}\` lets the AI run any command, as root too where sudo needs no password.` : null;
+};
