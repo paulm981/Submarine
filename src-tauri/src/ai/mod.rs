@@ -134,6 +134,9 @@ const AI_TAIL: usize = 32 * 1024;
 const RATE_MAX: usize = 20;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_WAITING: usize = 3;
+/// Commands one AI tab may have running at once on one server, those that
+/// ran without asking included.
+const MAX_RUNNING: usize = 4;
 /// What the log keeps at most of a request's command (as written in its
 /// JSON), and of a server name: the AI may send anything there, up to MCP's
 /// 1 MB, and may ask, withdraw and ask again without you allowing anything.
@@ -894,6 +897,13 @@ impl AiState {
         let result = {
             let mut s = self.lock();
             let at = s.pending.iter().position(|p| p.view.id == id).ok_or("That request isn't waiting any more.")?;
+            if matches!(answer, Answer::Allow(_)) {
+                let v = &s.pending[at].view;
+                let running_there = s.running.iter().filter(|r| r.tab_id == v.tab_id && r.session_id == v.session_id).count();
+                if running_there >= MAX_RUNNING {
+                    return Err(format!("{MAX_RUNNING} commands from this AI tab are already running on {}. Allow this one once one of them ends.", v.server));
+                }
+            }
             let p = s.pending.remove(at);
             let still_shared = s.tabs.iter().any(|t| t.id == p.view.tab_id && t.servers.iter().any(|x| x.session_id == p.view.session_id));
             match answer {
@@ -1206,6 +1216,16 @@ impl AiState {
             // meanwhile, or whose "allow everything" changed): else it asks.
             let decision = if looked_up == Some((found.server_id, found.allow_all)) { early } else { trust::Decision::Ask { rule: None } };
             let auto = decision.approved_by();
+            let running_there = s.running.iter().filter(|r| r.tab_id == tab_id && r.session_id == found.session_id).count();
+            if running_there >= MAX_RUNNING {
+                drop(s);
+                return self.refuse(
+                    &label,
+                    server,
+                    command,
+                    format!("{MAX_RUNNING} of your commands are already running on {}. Wait for one to finish.", found.name),
+                );
+            }
             if auto.is_none() && waiting >= MAX_WAITING {
                 drop(s);
                 return self.refuse(&label, server, command, format!("{MAX_WAITING} requests are already waiting for the user. Wait for them first."));

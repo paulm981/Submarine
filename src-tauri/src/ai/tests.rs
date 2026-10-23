@@ -1190,6 +1190,39 @@ mod ssh {
         }
     }
 
+    /// At most four commands run at once for one AI tab on one server,
+    /// those that run without asking included; a fifth is refused, and
+    /// Allow on one that waits says why.
+    #[tokio::test]
+    async fn at_most_four_run_at_once_on_a_server() {
+        let (s, dir, shared) = state_with(policy(1, &[], &[])).await;
+        s.start_tab("local-1", "Claude").unwrap();
+        s.share_as("local-1", "sess-1", "xyz", None, Some(1)).unwrap();
+        // One left waiting, then four that run without asking.
+        let (req, p) = ask_for(&s, "uptime").await;
+        *shared.lock().unwrap() = policy(3, &[], &[]);
+        let mut running = Vec::new();
+        for _ in 0..MAX_RUNNING {
+            let s2 = s.clone();
+            running.push(tokio::spawn(async move {
+                let (_c, cancel) = watch::channel(false);
+                s2.run_command("local-1", "xyz", "exec sleep 30", None, cancel).await
+            }));
+        }
+        wait_for("four to run", || s.snapshot().running.len() == MAX_RUNNING).await;
+        let (_c, cancel) = watch::channel(false);
+        let r = s.run_command("local-1", "xyz", "uptime", None, cancel).await;
+        assert!(r.is_error && r.text.contains("already running on xyz"), "{}", r.text);
+        // The one that waits can't be allowed past it either.
+        assert!(s.decide(p.id, true).unwrap_err().contains("already running"));
+        s.stop_tab("local-1");
+        assert!(req.await.unwrap().is_error);
+        for r in running {
+            r.await.unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A command that runs without asking still stops when access ends, on
     /// the server too.
     #[tokio::test]

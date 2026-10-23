@@ -326,7 +326,12 @@ mod tests {
     #[tokio::test]
     async fn at_most_eight_calls_at_once() {
         let (s, mut w, mut r, _t) = connection(1 << 20);
-        let call = |id: u64| json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": "run_command", "arguments": { "server": "xyz", "command": "sleep 1" } } });
+        // On two servers: at most four run at once on one (MAX_RUNNING).
+        s.share("local-1", "sess-2", "abc").unwrap();
+        let call = |id: u64| {
+            let server = if id % 2 == 1 { "xyz" } else { "abc" };
+            json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": "run_command", "arguments": { "server": server, "command": "sleep 1" } } })
+        };
         // Eight in flight: six allowed and running, two waiting for you.
         let mut sent = 0;
         while sent < MAX_CALLS as u64 {
