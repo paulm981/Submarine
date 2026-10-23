@@ -109,6 +109,8 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
   // click, for the rule as it is when that click comes.
   const runner = runnerWarning(rule);
   const [confirmed, setConfirmed] = useState<string | null>(null);
+  // When it was asked for: the confirming click waits SETTLE_MS after it.
+  const confirmedAt = useRef(0);
   const settledAt = useRef(0);
   const lastTop = useRef<number | null>(null);
   const downHere = useRef(false);
@@ -245,7 +247,8 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
               <NoFocusButton
                 onPick={() => {
                   if (globAsRule) return;
-                  if (runner && confirmed !== rule) { setConfirmed(rule); return; }
+                  if (runner && confirmed !== rule) { setConfirmed(rule); confirmedAt.current = performance.now(); return; }
+                  if (runner && performance.now() - confirmedAt.current < SETTLE_MS) return;
                   act("ai_allow_always", { id: p.id, pattern: rule, confirmRunner: !!runner });
                 }}
                 onDown={down}

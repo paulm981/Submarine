@@ -36,6 +36,9 @@ const useLoaded = <T,>(load: () => Promise<T>): [T | null, string | null, () => 
   return [data, error, reload];
 };
 
+/// How long "Yes, add it" ignores clicks after it appears.
+const CONFIRM_SETTLE_MS = 500;
+
 export const WILDCARD_WARNING =
   "A * allows any arguments, and some arguments can run other commands, such as find -exec or awk. Use an exact command where it will do.";
 
@@ -49,12 +52,18 @@ const RuleList = ({ kind, rules, target, inherited, onChange }: {
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
   // A wildcard rule for a command that runs other commands takes a second
-  // click on Add, for the rule as it is then.
+  // click on Add, for the rule as it is then: a single click of its own,
+  // not a double-click's second, not Enter, and not within CONFIRM_SETTLE_MS
+  // of the first.
   const runner = kind === "allow" ? runnerWarning(draft) : null;
-  const [confirmed, setConfirmed] = useState<string | null>(null);
-  const add = () => {
+  const [confirmed, setConfirmed] = useState<{ draft: string; at: number } | null>(null);
+  const confirming = !!runner && confirmed?.draft === draft;
+  const add = (click?: React.MouseEvent) => {
     if (!draft.trim()) return;
-    if (runner && confirmed !== draft) { setConfirmed(draft); return; }
+    if (runner) {
+      if (!confirming) { setConfirmed({ draft, at: performance.now() }); return; }
+      if (!click || click.detail !== 1 || performance.now() - confirmed!.at < CONFIRM_SETTLE_MS) return;
+    }
     setError(null);
     invoke("ai_trust_add_rule", { scope: target.scope, id: target.id, kind, pattern: draft, confirmRunner: !!runner })
       .then(() => { setDraft(""); setConfirmed(null); onChange(); }, (e) => setError(errText(e)));
@@ -101,12 +110,12 @@ const RuleList = ({ kind, rules, target, inherited, onChange }: {
           spellCheck={false}
           className="flex-1 min-w-0 h-8 px-2.5 bg-zinc-900/60 border border-white/10 rounded-lg font-mono text-[11.5px] text-zinc-50 outline-none focus:border-primary/50 placeholder:text-zinc-600"
         />
-        <button onClick={add} disabled={!draft.trim()} className="shrink-0 h-8 px-3 rounded-lg bg-zinc-900 border border-white/10 text-[11px] font-bold uppercase tracking-wider text-zinc-300 hover:bg-white/5 disabled:opacity-40">
-          {runner && confirmed === draft ? "Yes, add it" : "Add"}
+        <button onClick={(e) => add(e)} onKeyDown={(e) => { if (confirming && (e.key === "Enter" || e.key === " ")) e.preventDefault(); }} disabled={!draft.trim()} className="shrink-0 h-8 px-3 rounded-lg bg-zinc-900 border border-white/10 text-[11px] font-bold uppercase tracking-wider text-zinc-300 hover:bg-white/5 disabled:opacity-40">
+          {confirming ? "Yes, add it" : "Add"}
         </button>
       </div>
       {runner ? (
-        <p className="text-[11px] text-red-300 font-semibold leading-snug">{runner}{confirmed === draft ? " Click again to add it anyway." : ""}</p>
+        <p className="text-[11px] text-red-300 font-semibold leading-snug">{runner}{confirming ? " Click “Yes, add it” to add it anyway." : ""}</p>
       ) : kind === "allow" && draft.trim().endsWith("*") && <p className="text-[11px] text-amber-300 leading-snug">{WILDCARD_WARNING}</p>}
       {error && <p className="text-[11px] text-red-400 break-words">{error}</p>}
     </div>
