@@ -6292,8 +6292,11 @@ async fn setup_master_db_with(
     // Saved walls (multiexec.rs): device-local too, added the same way.
     conn.execute(multiexec::SCHEMA, []).map_err(|e| format!("[DATABASE] WALLS_TABLE_FAILED: {}", e))?;
     // The AI's approval levels and rules (ai/trust.rs, #115): device-local
-    // too, so a shared profile never changes how much the AI may do here.
-    ai::trust::create_schema(&conn)?;
+    // too, so a shared profile never changes how much the AI may do here,
+    // and tied to this install, so a copy of the vault doesn't carry them.
+    if ai::trust::create_schema(&conn, &ai::trust::install_id(&app_handle))? {
+        needs_resave = true;
+    }
     // The OS each server last reported (server_os.rs), for its badge.
     // Device-local, not a synced column. Added here for both vault paths too;
     // on a vault that has it already this answers "duplicate column".

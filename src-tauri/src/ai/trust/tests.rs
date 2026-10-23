@@ -333,6 +333,9 @@ fn rules_are_checked() {
 
 // -- The tables ------------------------------------------------------------------
 
+/// This install, in the tests.
+const HERE: &str = "0123456789abcdef0123456789abcdef";
+
 /// A vault with servers 1 and 2: 1 in folder 11, inside 10; 2 at the top.
 fn vault() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
@@ -343,7 +346,7 @@ fn vault() -> Connection {
          INSERT INTO servers VALUES (1, 'web-01', 11), (2, 'db-01', NULL);",
     )
     .unwrap();
-    create_schema(&conn).unwrap();
+    create_schema(&conn, HERE).unwrap();
     conn
 }
 
@@ -356,7 +359,7 @@ fn a_new_vault_starts_with_the_default_always_ask_list_once() {
     // Removed, it doesn't come back at the next open.
     let reboot = view(&conn).unwrap().rules.into_iter().find(|r| r.pattern == "reboot").unwrap();
     remove_rule(&conn, reboot.id).unwrap();
-    create_schema(&conn).unwrap();
+    create_schema(&conn, HERE).unwrap();
     assert!(!policy_for(&conn, Some(2)).ask.contains(&"reboot".to_string()));
 }
 
@@ -636,4 +639,41 @@ fn which_servers_a_level_reaches() {
     assert!(!reaches(&conn, Some(2), "folder", 10));
     assert!(reaches(&conn, Some(2), "server", 2) && !reaches(&conn, Some(1), "server", 2));
     assert!(reaches(&conn, None, "default", 0));
+}
+
+/// The levels and allow rules belong to the install that set them: a vault
+/// opened by another loses them, and keeps its always-ask list.
+#[test]
+fn levels_and_allow_rules_dont_travel_in_a_copied_vault() {
+    let conn = vault();
+    set_level(&conn, "server", 1, Some(3)).unwrap();
+    set_level(&conn, "default", 0, Some(2)).unwrap();
+    add_rule(&conn, "server", 1, "allow", "uptime").unwrap();
+    add_rule(&conn, "folder", 10, "ask", "systemctl stop *").unwrap();
+    // Opened again here: nothing changes.
+    assert!(!create_schema(&conn, HERE).unwrap());
+    assert_eq!(policy_for(&conn, Some(1)).level, 3);
+    // Opened by another install.
+    assert!(create_schema(&conn, "another-install-id-0000000000000").unwrap());
+    let p = policy_for(&conn, Some(1));
+    assert_eq!(p.level, 1);
+    assert!(p.allow.is_empty());
+    assert!(p.ask.contains(&"systemctl stop *".to_string()) && p.ask.contains(&"reboot".to_string()), "{:?}", p.ask);
+    // With no always-ask rule left, the defaults come back.
+    conn.execute("DELETE FROM ai_rules", []).unwrap();
+    create_schema(&conn, HERE).unwrap();
+    assert_eq!(policy_for(&conn, Some(1)).ask, rules(DEFAULT_ASK));
+}
+
+/// A vault that doesn't say which install opened it (from before this)
+/// keeps what it has, and is this install's from then on.
+#[test]
+fn a_vault_without_an_install_keeps_its_levels() {
+    let conn = vault();
+    set_level(&conn, "server", 1, Some(3)).unwrap();
+    conn.execute("DELETE FROM sync_meta WHERE key = 'ai_trust_device'", []).unwrap();
+    assert!(create_schema(&conn, "another-install-id-0000000000000").unwrap());
+    assert_eq!(policy_for(&conn, Some(1)).level, 3);
+    let kept: String = conn.query_row("SELECT value FROM sync_meta WHERE key = 'ai_trust_device'", [], |r| r.get(0)).unwrap();
+    assert_eq!(kept, "another-install-id-0000000000000");
 }

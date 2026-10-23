@@ -645,22 +645,82 @@ fn db(code: &'static str) -> impl Fn(rusqlite::Error) -> String {
     move |e| format!("[DATABASE] {code}: {e}")
 }
 
+/// This install's id, outside every vault (beside ai_tools.json): made
+/// the first time. The levels and allow rules a vault holds count only on
+/// the install that last opened it (create_schema).
+pub(crate) fn install_id(app: &tauri::AppHandle) -> String {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Install {
+        id: String,
+    }
+    const FILE: &str = "ai_install.json";
+    if let Some(i) = crate::local_open::read_setting::<Install>(app, FILE).filter(|i| i.id.len() >= 16) {
+        return i.id;
+    }
+    let id = super::channel::random_hex(16);
+    // Not kept, the next open gets another, and the vault's levels and
+    // allow rules are reset: the safe way to fail.
+    if let Err(e) = crate::local_open::write_setting(app, FILE, &Install { id: id.clone() }, "this install's id") {
+        crate::applog::write_line("ai", &format!("{e}: AI approval levels will be reset at the next open."));
+    }
+    id
+}
+
+/// The vault's key holding the install that last opened it. In sync_meta,
+/// which never syncs.
+const DEVICE_KEY: &str = "ai_trust_device";
+
+fn seed_defaults(conn: &Connection) -> Result<(), String> {
+    for p in DEFAULT_ASK {
+        conn.execute("INSERT OR IGNORE INTO ai_rules (scope, scope_id, kind, pattern) VALUES ('default', 0, 'ask', ?1)", [p])
+            .map_err(db("AI_TRUST_DEFAULTS"))?;
+    }
+    Ok(())
+}
+
 /// Make the tables, and the first time, the default always-ask list. Every
 /// vault open runs it, on `servers` and `folders` as they are by then.
-pub(crate) fn create_schema(conn: &Connection) -> Result<(), String> {
+///
+/// The levels and allow rules belong to the install that set them
+/// (`install`): a vault last opened by another one (exported and imported,
+/// or copied by hand) loses them, and keeps its always-ask list (the
+/// defaults again, if it has none). A vault that doesn't say yet (made
+/// before this) is taken as this install's. Returns whether it changed
+/// anything, so the vault is saved.
+pub(crate) fn create_schema(conn: &Connection, install: &str) -> Result<bool, String> {
     let had: bool = conn
         .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ai_rules'", [], |_| Ok(()))
         .optional()
         .map_err(db("AI_TRUST_SCHEMA"))?
         .is_some();
     conn.execute_batch(SCHEMA).map_err(db("AI_TRUST_SCHEMA"))?;
+    let mut changed = false;
     if !had {
-        for p in DEFAULT_ASK {
-            conn.execute("INSERT OR IGNORE INTO ai_rules (scope, scope_id, kind, pattern) VALUES ('default', 0, 'ask', ?1)", [p])
-                .map_err(db("AI_TRUST_DEFAULTS"))?;
+        seed_defaults(conn)?;
+        changed = true;
+    }
+    conn.execute("CREATE TABLE IF NOT EXISTS sync_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)", [])
+        .map_err(db("AI_TRUST_DEVICE"))?;
+    let last: Option<String> = conn
+        .query_row("SELECT value FROM sync_meta WHERE key = ?1", [DEVICE_KEY], |r| r.get(0))
+        .optional()
+        .map_err(db("AI_TRUST_DEVICE"))?;
+    if last.as_deref() == Some(install) {
+        return Ok(changed);
+    }
+    if last.is_some() {
+        conn.execute_batch("DELETE FROM ai_levels; DELETE FROM ai_rules WHERE kind = 'allow';").map_err(db("AI_TRUST_RESET"))?;
+        let asks: i64 = conn.query_row("SELECT COUNT(*) FROM ai_rules WHERE kind = 'ask'", [], |r| r.get(0)).map_err(db("AI_TRUST_RESET"))?;
+        if asks == 0 {
+            seed_defaults(conn)?;
         }
     }
-    Ok(())
+    conn.execute(
+        "INSERT INTO sync_meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        params![DEVICE_KEY, install],
+    )
+    .map_err(db("AI_TRUST_DEVICE"))?;
+    Ok(true)
 }
 
 /// What holds for one server: its level and every rule on the way up.
