@@ -3893,6 +3893,61 @@ mod sync_engine_tests {
         assert!(approvals::held_by_server(&c).is_empty());
     }
 
+    // A server new here that lands where the AI may do more than by default
+    // is held; one somewhere plain isn't. A server the AI may run commands
+    // on without asking is held when someone points it elsewhere.
+    #[test]
+    fn a_shared_profile_holds_new_and_re_pointed_servers() {
+        let (a, _ha) = device("A");
+        a.execute_batch(
+            "INSERT INTO folders(name) VALUES('Lab'), ('Quiet');
+             INSERT INTO servers(name,host,port,username) VALUES('db-01','db.example',22,'deploy'), ('web-01','web.example',22,'deploy');",
+        )
+        .unwrap();
+        let (b, hb) = device("B");
+        approvals::create_schema(&b).unwrap();
+        ai::trust::create_schema(&b, "this-install-0000").unwrap();
+        b.execute("INSERT INTO sync_meta(key,value) VALUES('share_id','s1')", []).unwrap();
+        let sync = |a: &Connection, b: &Connection| apply_remote_records(b, &KEY, &collect_local_records(a, &KEY, "").unwrap(), &hb).unwrap();
+        sync(&a, &b);
+        let id_of = |c: &Connection, t: &str, n: &str| -> i64 { c.query_row(&format!("SELECT id FROM {t} WHERE name=?1"), [n], |r| r.get(0)).unwrap() };
+        let held_of = |b: &Connection, name: &str| -> Option<ai::trust::HeldPolicy> {
+            let uuid: String = b.query_row("SELECT uuid FROM servers WHERE name=?1", [name], |r| r.get(0)).unwrap();
+            approvals::held_for(b, &uuid).into_iter().next().map(|i| serde_json::from_str(&i[ai::trust::HELD_ITEM.len()..]).unwrap())
+        };
+        ai::trust::set_level(&b, "folder", id_of(&b, "folders", "Lab"), Some(3)).unwrap();
+        ai::trust::set_level(&b, "server", id_of(&b, "servers", "db-01"), Some(2)).unwrap();
+
+        // New in Lab: held. New in Quiet: not.
+        a.execute_batch(
+            "INSERT INTO servers(name,host,port,folder_id) VALUES('lab-01','lab.example',22,(SELECT id FROM folders WHERE name='Lab'));
+             INSERT INTO servers(name,host,port,folder_id) VALUES('q-01','q.example',22,(SELECT id FROM folders WHERE name='Quiet'));",
+        )
+        .unwrap();
+        sync(&a, &b);
+        let h = held_of(&b, "lab-01").expect("held");
+        assert_eq!((h.change.as_str(), h.level, h.moved.as_str(), h.into.as_str()), ("added", 3, "lab-01", "Lab"));
+        assert_eq!(ai::trust::policy_for(&b, Some(id_of(&b, "servers", "lab-01"))).level, 1);
+        assert!(held_of(&b, "q-01").is_none());
+
+        // db-01 runs allowed commands here: pointed elsewhere, it's held.
+        // web-01 asks every time: pointed elsewhere, it isn't. A change to
+        // anything else isn't either.
+        a.execute("UPDATE servers SET notes='x' WHERE name='db-01'", []).unwrap();
+        sync(&a, &b);
+        assert!(held_of(&b, "db-01").is_none());
+        a.execute("UPDATE servers SET host='evil.example' WHERE name IN ('db-01','web-01')", []).unwrap();
+        sync(&a, &b);
+        let h = held_of(&b, "db-01").expect("held");
+        assert_eq!((h.change.as_str(), h.level), ("pointed", 2));
+        assert!(ai::trust::policy_for(&b, Some(id_of(&b, "servers", "db-01"))).force_ask.is_some());
+        assert!(held_of(&b, "web-01").is_none());
+        approvals::allow(&b, &b.query_row("SELECT uuid FROM servers WHERE name='db-01'", [], |r| r.get::<_, String>(0)).unwrap(), &[]).unwrap();
+        a.execute("UPDATE servers SET username='root' WHERE name='db-01'", []).unwrap();
+        sync(&a, &b);
+        assert_eq!(held_of(&b, "db-01").map(|h| h.change), Some("pointed".into()), "its user too");
+    }
+
     // A move out of a folder set to "Ask every time", where every server
     // runs anything, is held too.
     #[test]

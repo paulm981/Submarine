@@ -940,7 +940,7 @@ pub(crate) const HELD_ITEM: &str = "ai_policy:";
 
 /// What the card says while a server is held.
 pub(crate) const HELD_NOTE: &str =
-    "Someone you share this profile with moved this server, or a folder it's in, and the AI may now do more here. Until you look at it in Waiting for your OK, every command asks.";
+    "Someone you share this profile with moved this server, added it, or changed where it connects to, and the AI may now do more here. Until you look at it in Waiting for your OK, every command asks.";
 
 /// What a move did to a server's policy, for "Waiting for your OK".
 #[derive(Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -956,6 +956,16 @@ pub(crate) struct HeldPolicy {
     pub moved: String,
     pub moved_folder: bool,
     pub into: String,
+    /// What the change was: `moved` (the server or a folder above it),
+    /// `added` (a server new here, where it may do more than by default),
+    /// or `pointed` (where it connects to, while the AI may run commands
+    /// there without asking).
+    #[serde(default = "moved")]
+    pub change: String,
+}
+
+fn moved() -> String {
+    "moved".into()
 }
 
 fn has_table(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
@@ -984,6 +994,7 @@ fn held_policy(conn: &Connection, server_id: i64) -> rusqlite::Result<Option<Hel
             moved: String::new(),
             moved_folder: false,
             into: String::new(),
+            change: moved(),
         })
     }))
 }
@@ -1005,10 +1016,15 @@ pub(crate) fn keep_as_it_was(conn: &Connection, server_id: i64) -> Result<(), St
     set_level(conn, "server", server_id, Some(ASK_EVERY_TIME))
 }
 
+/// Where a server connects to: its host, port, user, saved login and jump
+/// host.
+type Target = Vec<rusqlite::types::Value>;
+const TARGET: &str = "host, port, username, credential_id, jump_host_id";
+
 /// The tree as it was before a sync merged: each server's policy, its
-/// folder, and each folder's parent.
+/// folder and where it connects to, and each folder's parent.
 pub(crate) struct TreeBefore {
-    servers: std::collections::HashMap<i64, (Policy, Option<i64>)>,
+    servers: std::collections::HashMap<i64, (Policy, Option<i64>, Option<Target>)>,
     parents: std::collections::HashMap<i64, Option<i64>>,
 }
 
@@ -1018,14 +1034,25 @@ fn id_pairs(conn: &Connection, sql: &str) -> rusqlite::Result<Vec<(i64, Option<i
     rows.collect()
 }
 
+/// Where each server connects to; None where that can't be read.
+fn targets(conn: &Connection) -> std::collections::HashMap<i64, Target> {
+    let read = || -> rusqlite::Result<std::collections::HashMap<i64, Target>> {
+        let mut stmt = conn.prepare(&format!("SELECT id, {TARGET} FROM servers"))?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, (1..=5).map(|i| r.get(i)).collect::<rusqlite::Result<Target>>()?)))?;
+        rows.collect()
+    };
+    read().unwrap_or_default()
+}
+
 /// Just before a shared profile's sync merges: what each server's policy
-/// is. None when no move could change one: no level or rule is set on a
-/// folder (a server's own go with it, and the default is the same
-/// everywhere), so a profile that doesn't use levels pays nothing.
+/// is, and where it connects to. None when no sync could let the AI do
+/// more: no level or rule is set on a folder (a server's own go with it,
+/// and the default is the same everywhere) and no server runs anything
+/// without asking, so a profile that doesn't use levels pays nothing.
 pub(crate) fn before_sync(conn: &Connection) -> Option<TreeBefore> {
     let used: bool = conn
         .query_row(
-            "SELECT EXISTS (SELECT 1 FROM ai_levels WHERE scope = 'folder') OR EXISTS (SELECT 1 FROM ai_rules WHERE scope = 'folder')",
+            "SELECT EXISTS (SELECT 1 FROM ai_levels WHERE scope = 'folder' OR level > 1) OR EXISTS (SELECT 1 FROM ai_rules WHERE scope = 'folder')",
             [],
             |r| r.get(0),
         )
@@ -1033,9 +1060,10 @@ pub(crate) fn before_sync(conn: &Connection) -> Option<TreeBefore> {
     if !used {
         return None;
     }
+    let mut targets = targets(conn);
     let mut servers = std::collections::HashMap::new();
     for (id, folder) in id_pairs(conn, "SELECT id, folder_id FROM servers").ok()? {
-        servers.insert(id, (try_policy(conn, Some(id)).ok()?, folder));
+        servers.insert(id, (try_policy(conn, Some(id)).ok()?, folder, targets.remove(&id)));
     }
     let parents = id_pairs(conn, "SELECT id, parent_id FROM folders").ok()?.into_iter().collect();
     Some(TreeBefore { servers, parents })
@@ -1056,40 +1084,70 @@ fn name_of(conn: &Connection, table: &str, id: Option<i64>) -> String {
 }
 
 /// Just after a shared profile's sync merged (every record, deletion and
-/// link in place): each server whose policy the sync loosened is held
+/// link in place), each server the sync let the AI do more on is held
 /// (approvals.rs's `held_approvals`, item HELD_ITEM), until you allow it or
-/// keep it as it was. A new server isn't held, as approvals.rs doesn't
-/// hold one either: you see where it is before you open it. One held
-/// already is held again with what it is now.
+/// keep it as it was:
+///
+/// - one whose policy it loosened, by moving it or a folder above it;
+/// - one new here (made, or deleted and made again) whose policy is looser
+///   than the default alone would give it, as in a folder set to run
+///   anything;
+/// - one the AI may run commands on without asking whose host, port,
+///   user, saved login or jump host it changed.
+///
+/// One held already is held again with what it is now.
 pub(crate) fn hold_loosened(conn: &Connection, before: TreeBefore) -> Result<(), String> {
     let fail = db("AI_POLICY_HOLD");
     if !has_table(conn, "held_approvals").map_err(&fail)? {
         return Ok(());
     }
+    let default_only = try_policy(conn, None).unwrap_or_else(|_| Policy::unreadable());
+    let mut now_targets = targets(conn);
     for (id, folder) in id_pairs(conn, "SELECT id, folder_id FROM servers").map_err(&fail)? {
-        let Some((old, old_folder)) = before.servers.get(&id) else { continue };
         let Some(uuid) = uuid_of(conn, id).map_err(&fail)? else { continue };
         let new = try_policy(conn, Some(id)).unwrap_or_else(|_| Policy::unreadable());
-        let Some((allow, lost)) = loosened(old, &new) else { continue };
-        // What moved: the server, or the nearest folder above it whose
-        // parent changed.
-        let (moved, moved_folder, into) = if folder != *old_folder {
-            (name_of(conn, "servers", Some(id)), false, name_of(conn, "folders", folder))
-        } else {
-            let mut at = folder;
-            let mut found = None;
-            for _ in 0..MAX_DEPTH {
-                let Some(f) = at else { break };
-                let parent: Option<i64> = conn.query_row("SELECT parent_id FROM folders WHERE id = ?1", [f], |r| r.get(0)).optional().map_err(&fail)?.flatten();
-                if before.parents.get(&f) != Some(&parent) {
-                    found = Some((name_of(conn, "folders", Some(f)), true, name_of(conn, "folders", parent)));
-                    break;
-                }
-                at = parent;
+        let target = now_targets.remove(&id);
+        let server = name_of(conn, "servers", Some(id));
+        let held = match before.servers.get(&id) {
+            None => {
+                let Some((allow, lost)) = loosened(&default_only, &new) else { continue };
+                HeldPolicy { level: new.level, allow, lost, moved: server, moved_folder: false, into: name_of(conn, "folders", folder), change: "added".into() }
             }
-            found.unwrap_or_else(|| (name_of(conn, "servers", Some(id)), false, name_of(conn, "folders", folder)))
+            Some((old, old_folder, old_target)) => match loosened(old, &new) {
+                Some((allow, lost)) => {
+                    // What moved: the server, or the nearest folder above
+                    // it whose parent changed.
+                    let (moved, moved_folder, into) = if folder != *old_folder {
+                        (server, false, name_of(conn, "folders", folder))
+                    } else {
+                        let mut at = folder;
+                        let mut found = None;
+                        for _ in 0..MAX_DEPTH {
+                            let Some(f) = at else { break };
+                            let parent: Option<i64> =
+                                conn.query_row("SELECT parent_id FROM folders WHERE id = ?1", [f], |r| r.get(0)).optional().map_err(&fail)?.flatten();
+                            if before.parents.get(&f) != Some(&parent) {
+                                found = Some((name_of(conn, "folders", Some(f)), true, name_of(conn, "folders", parent)));
+                                break;
+                            }
+                            at = parent;
+                        }
+                        found.unwrap_or_else(|| (server, false, name_of(conn, "folders", folder)))
+                    };
+                    HeldPolicy { level: new.level, allow, lost, moved, moved_folder, into, change: "moved".into() }
+                }
+                None if new.level > ASK_EVERY_TIME && old_target.is_some() && *old_target != target => HeldPolicy {
+                    level: new.level,
+                    allow: 0,
+                    lost: Vec::new(),
+                    moved: server,
+                    moved_folder: false,
+                    into: String::new(),
+                    change: "pointed".into(),
+                },
+                None => continue,
+            },
         };
-        let held = HeldPolicy { level: new.level, allow, lost, moved, moved_folder, into };
         let item = format!("{HELD_ITEM}{}", serde_json::to_string(&held).map_err(|e| e.to_string())?);
         conn.execute("DELETE FROM held_approvals WHERE uuid = ?1 AND item LIKE 'ai_policy:%'", [&uuid]).map_err(&fail)?;
         conn.execute("INSERT OR IGNORE INTO held_approvals (uuid, item, since) VALUES (?1, ?2, strftime('%s','now'))", params![uuid, item])

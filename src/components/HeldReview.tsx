@@ -34,7 +34,11 @@ function switchOf(item: string): { protocol: string; label: string; port: string
 /** A move that lets the AI do more on the server here (src-tauri/src/ai/trust.rs,
  *  HeldPolicy): `ai_policy:` and its JSON. */
 const AI_ITEM = "ai_policy:";
-type HeldPolicy = { level: number; allow: number; lost: string[]; moved: string; moved_folder: boolean; into: string };
+type HeldPolicy = {
+  level: number; allow: number; lost: string[]; moved: string; moved_folder: boolean; into: string;
+  /** "moved", "added" (new here), or "pointed" (where it connects to changed). */
+  change?: string;
+};
 function aiMoveOf(item: string): HeldPolicy | null {
   if (!item.startsWith(AI_ITEM)) return null;
   try { return JSON.parse(item.slice(AI_ITEM.length)) as HeldPolicy; } catch { return { level: 3, allow: 0, lost: [], moved: "", moved_folder: false, into: "" }; }
@@ -61,8 +65,16 @@ function describe(item: string, server: HeldServer): { what: string; detail?: st
         ? `the AI may run ${move.allow} more allowed command${move.allow === 1 ? "" : "s"} without asking`
         : "the AI may do more without asking";
     const lost = move.lost.length > 0 ? `, and ${move.lost.map((r) => `“${r}”`).join(", ")} no longer always ${move.lost.length === 1 ? "asks" : "ask"}` : "";
+    if (move.change === "pointed") {
+      return {
+        what: `Someone changed where ${server.name} connects to; the AI may run commands there without asking.`,
+        detail: `Until you choose, the AI asks before every command on ${server.name} here. Allow lets it run commands there without asking again. Keep as it was keeps ${server.name} at “Ask every time” on this computer until you change it.`,
+      };
+    }
     return {
-      what: `Someone moved ${what} ${where}; there ${may}${lost}.`,
+      what: move.change === "added"
+        ? `Someone added ${server.name} ${move.into ? `to ${move.into}` : "at the top level"}; there ${may}${lost}.`
+        : `Someone moved ${what} ${where}; there ${may}${lost}.`,
       detail: `Until you choose, the AI asks before every command on ${server.name} here. Allow lets the new setting apply. Keep as it was keeps ${server.name} at “Ask every time” on this computer until you change it.`,
     };
   }

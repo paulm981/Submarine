@@ -708,7 +708,7 @@ fn a_held_move_asks_and_keeps_what_it_lost() {
     .unwrap();
     set_level(&conn, "folder", 11, Some(3)).unwrap();
     add_rule(&conn, "folder", 11, "allow", "uptime").unwrap();
-    let held = HeldPolicy { level: 3, allow: 1, lost: rules(&["systemctl stop *"]), moved: "web-01".into(), moved_folder: false, into: "Web".into() };
+    let held = HeldPolicy { level: 3, allow: 1, lost: rules(&["systemctl stop *"]), moved: "web-01".into(), moved_folder: false, into: "Web".into(), change: "moved".into() };
     conn.execute("INSERT INTO held_approvals VALUES ('u1', ?1, 0)", [format!("{HELD_ITEM}{}", serde_json::to_string(&held).unwrap())]).unwrap();
     let p = policy_for(&conn, Some(1));
     assert_eq!((p.level, p.allow.len(), p.force_ask.as_deref()), (1, 0, Some(HELD_NOTE)));
