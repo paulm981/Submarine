@@ -200,8 +200,9 @@ fn an_always_ask_rule_of_several_words() {
     assert!(ask_matches("rm -rf *", "rm -rf"));
     assert!(ask_matches("rm -rf *", "sudo rm -rf --no-preserve-root /"));
     assert!(ask_matches("rm -rf *", "true&&rm -rf x"));
-    assert!(!ask_matches("rm -rf *", "rm -r -f /"), "only the spelling written");
-    assert!(!ask_matches("rm -rf *", "rm x -rf"));
+    assert!(ask_matches("rm -rf *", "rm -r -f /"), "options in any order, split or long");
+    assert!(ask_matches("rm -rf *", "rm x -rf"), "options after the files, as GNU rm takes them");
+    assert!(!ask_matches("rm -rf *", "rm -r x"));
     assert!(ask_matches("init 0", "init 0"));
     assert!(ask_matches("init 0", "sudo /sbin/init 0"));
     assert!(!ask_matches("init 0", "init 6"));
@@ -566,3 +567,62 @@ fn globs_are_matched() {
     assert!(g("[", "["));
 }
 
+
+// -- The collapsed reading -----------------------------------------------------------
+
+#[test]
+fn hidden_spellings_of_an_always_ask_rule_ask() {
+    let cases: &[(&str, &[&str])] = &[
+        // Expansions and quoting.
+        ("reboot", &["re$@boot", "re${x}boot", "re``boot", "re$()boot", "$'\\x72eboot'", "re{,}boot", "re$1boot", "re${HOME:0:0}boot", "re$*boot"]),
+        // Globs.
+        ("reboot", &["/sbin/re{b,}oot", "/sbin/reb?ot", "/sbin/re[b]oot", "sudo /sbin/r*boot"]),
+        // A line continuation.
+        ("reboot", &["re\\\nboot", "re\\\r\nboot now"]),
+        // Windows cmd.
+        ("shutdown", &["shutdown.exe /r", "C:\\Windows\\System32\\shutdown.exe /r", "shut^down /r", "shut%PATH:~0,0%down /r", "SHUTDOWN /r /t 0"]),
+        // PowerShell.
+        ("shutdown", &["shut`down /r"]),
+        ("Restart-Computer", &["Restart-Comp`uter -Force", "restart-computer"]),
+        // Options in any order, split or long.
+        ("rm -rf *", &["rm -fr /", "rm -r -f /", "rm --recursive --force /", "rm -Rf /", "cd /tmp && rm -f -r x", "/bin/rm -rfv x"]),
+    ];
+    for (rule, commands) in cases {
+        for cmd in *commands {
+            assert!(ask_matches(rule, cmd), "{rule}: {cmd:?}");
+            let p = Policy { level: 3, allow: vec![], ask: rules(&[rule]), windows: false };
+            assert_eq!(decide(&p, true, cmd), Decision::Ask { rule: Some(rule.to_string()) }, "{rule}: {cmd:?}");
+        }
+    }
+}
+
+#[test]
+fn the_collapsed_reading_doesnt_ask_for_everything() {
+    for cmd in ["uptime", "ls *", "ls -la /var/log/*", "echo $HOME", "cat /etc/os-release", "df -h", "rm -r x", "rm -f x", "rm x -- -rf"] {
+        for rule in DEFAULT_ASK {
+            if *rule == "rm -rf *" || *rule == "rm -fr *" {
+                assert!(!ask_matches(rule, cmd), "{rule}: {cmd}");
+                continue;
+            }
+            assert!(!ask_matches(rule, cmd), "{rule}: {cmd}");
+        }
+    }
+    assert!(!ask_matches("rm -rf *", "rm -r x; ls -f"), "options of another command");
+}
+
+#[test]
+fn bash_ansi_c_quoting_is_read() {
+    assert_eq!(ansi_c("\\x72eboot"), "reboot");
+    assert_eq!(ansi_c("\\162eboot"), "reboot");
+    assert_eq!(ansi_c("\\u0072eboot"), "reboot");
+    assert_eq!(ansi_c("a\\nb"), "a\nb");
+}
+
+#[test]
+fn new_defaults_are_there_for_a_new_vault() {
+    let conn = vault();
+    let ask = policy_for(&conn, Some(2)).ask;
+    for r in ["rm -fr *", "telinit", "Restart-Computer", "Stop-Computer", "format", "diskpart"] {
+        assert!(ask.contains(&r.to_string()), "{r}");
+    }
+}

@@ -258,10 +258,163 @@ fn ask_words(rule: &str) -> Option<(Vec<String>, bool)> {
     (!w.is_empty()).then_some((w, prefix))
 }
 
+/// Most brace alternatives tried, and brace groups read, in one command.
+const MAX_BRACE_ALTS: usize = 8;
+
+/// Expansions that may expand to nothing, for the collapsed reading: `$@`,
+/// `$*`, `$1`, `$NAME`, `${…}`, an empty `$()`, an empty pair of
+/// backticks, and cmd.exe's `%…%`.
+static EMPTYABLE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\$(?:[@*#?!$0-9-]|[A-Za-z_][A-Za-z0-9_]*|\{[^}]*\}|\(\s*\))|``|%[^%\s]*%").unwrap()
+});
+/// A brace group with alternatives: `{b,}`, `{,}`.
+static BRACES: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\{([^{}]*,[^{}]*)\}").unwrap());
+/// Bash's `$'…'`, which reads escapes such as `\x72`.
+static ANSI_C: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\$'((?:[^'\\]|\\.)*)'").unwrap());
+
+/// What bash makes of the inside of a `$'…'`.
+fn ansi_c(body: &str) -> String {
+    let mut out = String::new();
+    let mut it = body.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(e) = it.next() else { break };
+        let mut number = |radix: u32, max: usize, first: Option<char>| {
+            let mut digits: String = first.into_iter().collect();
+            while digits.len() < max && it.peek().is_some_and(|d| d.is_digit(radix)) {
+                digits.push(it.next().unwrap_or_default());
+            }
+            u32::from_str_radix(&digits, radix).ok().and_then(char::from_u32)
+        };
+        let decoded = match e {
+            'x' => number(16, 2, None),
+            'u' => number(16, 4, None),
+            'U' => number(16, 8, None),
+            '0'..='7' => number(8, 3, Some(e)),
+            'n' => Some('\n'),
+            't' => Some('\t'),
+            'r' => Some('\r'),
+            other => Some(other),
+        };
+        out.extend(decoded);
+    }
+    out
+}
+
+/// The collapsed readings of a command: what's left once the ways to hide
+/// a word in it are taken out. Line continuations (`\` or cmd.exe's `^`
+/// before a new line) go; `$'…'` is read as bash reads it; expansions that
+/// may be empty go; each brace group is taken out, and in turn read as its
+/// first, second, … alternative; then quotes, `^` and PowerShell's
+/// backticks go. Backslashes stay, as Windows paths need them (the plain
+/// reading takes them out).
+fn collapsed(command: &str) -> Vec<String> {
+    let mut text = command.replace("\\\r\n", "").replace("\\\n", "").replace("^\r\n", "").replace("^\n", "");
+    text = ANSI_C.replace_all(&text, |c: &regex::Captures| ansi_c(&c[1])).into_owned();
+    text = text.replace("$\"", "\"");
+    text = EMPTYABLE.replace_all(&text, "").into_owned();
+    let groups: Vec<Vec<String>> = BRACES
+        .captures_iter(&text)
+        .take(MAX_BRACE_ALTS)
+        .map(|c| c[1].split(',').map(str::to_string).collect())
+        .collect();
+    let most = groups.iter().map(Vec::len).max().unwrap_or(0).min(MAX_BRACE_ALTS);
+    // None: every group taken out; Some(k): each read as its k-th
+    // alternative (its last, where it has fewer).
+    let picks = std::iter::once(None).chain((0..most).map(Some));
+    let strip = |t: String| t.chars().filter(|c| !matches!(c, '\'' | '"' | '^' | '`')).collect::<String>();
+    picks
+        .map(|pick| {
+            let mut n = 0;
+            let t = BRACES.replace_all(&text, |_: &regex::Captures| {
+                let g = groups.get(n);
+                n += 1;
+                match (pick, g) {
+                    (Some(k), Some(alts)) => alts.get(k).or(alts.last()).cloned().unwrap_or_default(),
+                    _ => String::new(),
+                }
+            });
+            strip(t.into_owned())
+        })
+        .collect()
+}
+
+/// Words split as the collapsed reading has them: lower case, hidden
+/// characters out, backslashes kept.
+fn collapsed_words(text: &str) -> Vec<String> {
+    text.split(|c: char| c.is_whitespace() || c.is_control() || OPERATORS.contains(&c))
+        .map(|w| w.chars().filter(|c| !hidden(*c)).collect::<String>().to_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
 /// The ways a command is read into words for the always-ask list and the
-/// root check, each tried in turn.
+/// root check, each tried in turn: plainly (quotes and backslashes out),
+/// and collapsed.
 fn word_lists(command: &str) -> Vec<Vec<String>> {
-    vec![words(command)]
+    let mut out = vec![words(command)];
+    out.extend(collapsed(command).iter().map(|t| collapsed_words(t)));
+    out
+}
+
+/// The same readings, cut into the simple commands they hold (at `;`, `&`,
+/// `|`, new lines, parentheses, braces and backticks), for flags.
+fn command_lists(command: &str) -> Vec<Vec<Vec<String>>> {
+    let cut = |t: &str, read: &dyn Fn(&str) -> Vec<String>| -> Vec<Vec<String>> {
+        t.split(|c: char| matches!(c, ';' | '&' | '|' | '\n' | '\r' | '(' | ')' | '{' | '}' | '`')).map(read).filter(|w| !w.is_empty()).collect()
+    };
+    let mut out = vec![cut(command, &words)];
+    out.extend(collapsed(command).iter().map(|t| cut(t, &collapsed_words)));
+    out
+}
+
+/// The options a word gives: `-rf` is r and f, `--recursive` is recursive
+/// and r. None for a word that isn't an option (or `--`, after which none
+/// are).
+fn flags_of(word: &str) -> Option<Vec<String>> {
+    if let Some(long) = word.strip_prefix("--") {
+        let long = long.split('=').next().unwrap_or(long);
+        let first = long.chars().next()?;
+        return Some(vec![long.to_string(), first.to_string()]);
+    }
+    let short = word.strip_prefix('-')?;
+    (!short.is_empty()).then(|| short.chars().map(|c| c.to_string()).collect())
+}
+
+/// A rule of a command and its options alone (`rm -rf *`) matches the
+/// command with those options in any order, split or long: `rm -fr`,
+/// `rm -r -f`, `rm --recursive --force`.
+fn flags_match(want: &[String], command: &str) -> bool {
+    let Some((name, opts)) = want.split_first() else { return false };
+    let mut need: Vec<String> = Vec::new();
+    for o in opts {
+        match flags_of(o) {
+            Some(f) if !o.starts_with("--") => need.extend(f),
+            Some(f) => need.push(f[0].clone()),
+            None => return false,
+        }
+    }
+    if need.is_empty() {
+        return false;
+    }
+    command_lists(command).iter().flatten().any(|cmd| {
+        cmd.iter().enumerate().any(|(i, w)| {
+            if !word_is(w, name, false) {
+                return false;
+            }
+            let mut have: Vec<String> = Vec::new();
+            for a in &cmd[i + 1..] {
+                if a == "--" {
+                    break;
+                }
+                have.extend(flags_of(a).unwrap_or_default());
+            }
+            need.iter().all(|n| have.contains(n))
+        })
+    })
 }
 
 /// Whether the always-ask rule `rule` is in `command`: its words, in order
@@ -272,15 +425,21 @@ fn word_lists(command: &str) -> Vec<Vec<String>> {
 /// its last `/` or `\` (without `.exe` and the like), or as a glob that
 /// could expand to the rule's word.
 ///
-/// It catches a rule written plainly, quoted or with backslashes, not a
-/// command that builds the name as it runs (`$(echo re)boot`, base64): the
-/// always-ask list is a safety net, not a wall.
+/// It's read twice, and either reading counts: plainly, and collapsed
+/// (`collapsed`: `re$@boot`, `re{,}boot`, `shut^down`, `Restart-Comp`uter`
+/// are all caught). A rule of a command and options (`rm -rf *`) also
+/// catches those options in any order, split or long (`rm -r -f`,
+/// `rm --recursive --force`).
+///
+/// It doesn't catch a command that builds the name as it runs
+/// (`$(echo re)boot`, base64): the always-ask list is a safety net, not a
+/// wall.
 pub(crate) fn ask_matches(rule: &str, command: &str) -> bool {
     let Some((want, prefix)) = ask_words(rule) else { return false };
     word_lists(command).iter().any(|have| {
         have.windows(want.len())
             .any(|win| win.iter().zip(&want).enumerate().all(|(i, (w, r))| word_is(w, r, prefix && i + 1 == want.len())))
-    })
+    }) || (!prefix && flags_match(&want, command))
 }
 
 /// The programs that give root.
@@ -432,8 +591,12 @@ END;";
 
 /// The always-ask list a vault starts with, for every server. You can
 /// remove any of them in Settings › AI tools.
-pub(crate) const DEFAULT_ASK: &[&str] =
-    &["reboot", "shutdown", "poweroff", "halt", "init 0", "init 6", "rm -rf *", "mkfs*", "dd *", ":(){"];
+/// Only a vault that has no list yet gets them, so a rule you removed never
+/// comes back.
+pub(crate) const DEFAULT_ASK: &[&str] = &[
+    "reboot", "shutdown", "poweroff", "halt", "init 0", "init 6", "telinit", "rm -rf *", "rm -fr *", "mkfs*", "dd *", ":(){",
+    "Restart-Computer", "Stop-Computer", "format", "diskpart",
+];
 
 fn db(code: &'static str) -> impl Fn(rusqlite::Error) -> String {
     move |e| format!("[DATABASE] {code}: {e}")

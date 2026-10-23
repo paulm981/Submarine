@@ -73,7 +73,7 @@ const RuleList = ({ kind, rules, target, inherited, onChange }: {
       <p className="text-[11px] text-zinc-500 leading-snug">
         {kind === "allow"
           ? <>Runs without asking at “Run my allowed commands”. <code>uptime</code> allows exactly that; <code>systemctl status *</code> allows it with any arguments. Only one simple command matches: one with ; &amp; | $ ` &gt; &lt; or a new line always asks.</>
-          : <>Always waits for your Allow, at every level. Found anywhere in a command, as whole words: <code>reboot</code> also catches <code>sudo reboot</code> and <code>uptime; reboot</code>. Write each spelling you want caught: <code>rm -rf *</code> doesn't catch <code>rm -fr</code>.</>}
+          : <>Always waits for your Allow, at every level. Found anywhere in a command, as whole words, also when quotes, <code>$@</code> or <code>^</code> hide them: <code>reboot</code> also catches <code>sudo reboot</code> and <code>uptime; re''boot</code>. A command with options, such as <code>rm -rf *</code>, catches them in any order, split or long. A command that builds the name as it runs can still get past it.</>}
       </p>
       {own.length > 0 && (
         <ul className="rounded-lg border border-white/5 divide-y divide-white/5">
