@@ -9,18 +9,21 @@
 //! soon as it's made.
 //!
 //! A server behind a saved jump host is checked from the jump host, over a
-//! connection Submarine already has to it (a tab open on the jump host, or
-//! one on another server behind it), with a `direct-tcpip` channel that's
-//! closed at once. Without one, the check says so instead of logging in
+//! connection Submarine already has to it (the route of a tab on another
+//! server behind it, or a tab open on the jump host itself), with a
+//! `direct-tcpip` channel that's closed as soon as it opens, even when the
+//! jump host answers after the page has stopped waiting. One such check per
+//! server is in flight at a time, and none holds a lock other tabs need. Without one, the check says so instead of logging in
 //! anywhere. A server reached through a proxy or a ProxyCommand isn't checked
 //! from here either: a connect from here wouldn't go the way its logins do.
 
 use crate::diagnose::Reach;
-use crate::ssh_manager::SshState;
+use crate::ssh_manager::{ClientHandler, SshState};
 use crate::{ConfigTarget, ConnectRoute, DbState};
 use russh::client::Handle;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// How long one check waits for an answer.
@@ -75,9 +78,7 @@ struct Server {
     proxy_host: Option<String>,
     proxy_port: Option<i32>,
     jump_id: Option<i32>,
-    /// The jump host's name, None when it's gone.
     jump_name: Option<String>,
-    jump_exists: bool,
     /// Why it mustn't be connected now: its jump host was deleted
     /// (jump_gone.rs).
     refused: Option<String>,
@@ -86,98 +87,173 @@ struct Server {
 fn read_server(db: &DbState, server_id: i32) -> Result<Server, String> {
     let guard = db.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
     let conn = guard.as_ref().ok_or("Database is not open")?;
-    let mut s = conn.query_row(
-        "SELECT s.name, s.host, s.port,
-                CASE WHEN COALESCE(s.auth_type, 'vault') = 'vault' THEN c.username ELSE s.username END,
-                s.protocol, s.proxy_type, s.proxy_host, s.proxy_port, s.jump_host_id, j.name, j.id
-         FROM servers s LEFT JOIN credentials c ON c.id = s.credential_id
-         LEFT JOIN servers j ON j.id = s.jump_host_id
-         WHERE s.id = ?1",
-        [server_id],
-        |r| {
-            Ok(Server {
-                name: r.get(0)?,
-                host: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                port: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                user: r.get(3)?,
-                protocol: r.get(4)?,
-                proxy_type: r.get::<_, Option<String>>(5)?.unwrap_or_else(|| "none".into()),
-                proxy_host: r.get(6)?,
-                proxy_port: r.get(7)?,
-                jump_id: r.get(8)?,
-                jump_name: r.get(9)?,
-                jump_exists: r.get::<_, Option<i32>>(10)?.is_some(),
-                refused: None,
-            })
-        },
-    )
-    .map_err(|_| "Server not found".to_string())?;
+    let mut s = conn
+        .query_row(
+            "SELECT s.name, s.host, s.port,
+                    CASE WHEN COALESCE(s.auth_type, 'vault') = 'vault' THEN c.username ELSE s.username END,
+                    s.protocol, s.proxy_type, s.proxy_host, s.proxy_port, s.jump_host_id, j.name
+             FROM servers s LEFT JOIN credentials c ON c.id = s.credential_id
+             LEFT JOIN servers j ON j.id = s.jump_host_id
+             WHERE s.id = ?1",
+            [server_id],
+            |r| {
+                Ok(Server {
+                    name: r.get(0)?,
+                    host: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    port: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    user: r.get(3)?,
+                    protocol: r.get(4)?,
+                    proxy_type: r.get::<_, Option<String>>(5)?.unwrap_or_else(|| "none".into()),
+                    proxy_host: r.get(6)?,
+                    proxy_port: r.get(7)?,
+                    jump_id: r.get(8)?,
+                    jump_name: r.get(9)?,
+                    refused: None,
+                })
+            },
+        )
+        .map_err(|_| "Server not found".to_string())?;
     s.refused = crate::jump_gone::reason(conn, i64::from(server_id));
     Ok(s)
 }
 
-/// The servers saved with jump host `jump_id`.
-fn servers_behind(db: &DbState, jump_id: i32) -> HashSet<i32> {
-    let Ok(guard) = db.conn.lock() else { return HashSet::new() };
-    let Some(conn) = guard.as_ref() else { return HashSet::new() };
-    let Ok(mut stmt) = conn.prepare("SELECT id FROM servers WHERE jump_host_id = ?1") else { return HashSet::new() };
-    stmt.query_map([jump_id], |r| r.get::<_, i32>(0))
-        .map(|rows| rows.flatten().collect())
-        .unwrap_or_default()
+/// After the page has been answered, how long a channel open through a jump
+/// host is still waited for, so one that opens late is closed rather than
+/// left open on the jump host. One that takes longer is let go.
+const LATE_OPEN_LIMIT: Duration = Duration::from_secs(30);
+/// A tab's own connection to the jump host is shared with the tab, so a
+/// check through it isn't waited for past CHECK_TIMEOUT. After one that ran
+/// out, that way isn't tried again for this server for a while: an open the
+/// jump host answers late can't be closed from here.
+const TAB_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Servers with a check through a jump host still waiting for its channel:
+/// one at a time each, so they can't pile up while a server reboots.
+fn pending() -> &'static std::sync::Mutex<HashSet<i32>> {
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<HashSet<i32>>> = std::sync::OnceLock::new();
+    PENDING.get_or_init(Default::default)
 }
 
-/// A `direct-tcpip` channel through `via` to `host:port`, closed at once.
-async fn open_through<H: russh::client::Handler>(via: &Handle<H>, host: &str, port: u16, limit: Duration) -> Result<u64, String> {
+fn tab_cooldowns() -> &'static std::sync::Mutex<HashMap<i32, Instant>> {
+    static COOLDOWNS: std::sync::OnceLock<std::sync::Mutex<HashMap<i32, Instant>>> = std::sync::OnceLock::new();
+    COOLDOWNS.get_or_init(Default::default)
+}
+
+/// What a check through a jump host came to.
+#[derive(Debug, PartialEq)]
+enum Through {
+    /// The channel opened, in ms.
+    Answers(u64),
+    /// The jump host couldn't open it (its words, when it said any).
+    NoAnswer(Option<String>),
+    /// Nothing yet: it's still being waited for (or an earlier one is).
+    NotYet,
+}
+
+/// A `direct-tcpip` channel through `via` to `host:port`, closed as soon as
+/// it opens. The page is answered within `limit`; the open itself goes on in
+/// its own task (holding its own reference to the connection, no lock) for
+/// up to LATE_OPEN_LIMIT, so a late one is closed too. One at a time per
+/// server: while one is waited for, another check answers NotYet.
+async fn open_shared<H: russh::client::Handler + 'static>(
+    server_id: i32,
+    via: Arc<Handle<H>>,
+    host: &str,
+    port: u16,
+    limit: Duration,
+) -> Through {
+    if !pending().lock().map(|mut p| p.insert(server_id)).unwrap_or(false) {
+        return Through::NotYet;
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let host = host.to_string();
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let open = via.channel_open_direct_tcpip(host, u32::from(port), "127.0.0.1", 0);
+        let result = match tokio::time::timeout(LATE_OPEN_LIMIT, open).await {
+            Ok(Ok(channel)) => {
+                let ms = started.elapsed().as_millis() as u64;
+                let _ = channel.close().await;
+                Through::Answers(ms)
+            }
+            Ok(Err(e)) => Through::NoAnswer(Some(e.to_string())),
+            Err(_) => Through::NoAnswer(None),
+        };
+        drop(via);
+        if let Ok(mut p) = pending().lock() {
+            p.remove(&server_id);
+        }
+        let _ = tx.send(result);
+    });
+    match tokio::time::timeout(limit, rx).await {
+        Ok(Ok(result)) => result,
+        _ => Through::NotYet,
+    }
+}
+
+/// Through a tab's own connection to the jump host, which the tab uses too:
+/// only when it's free right now, and for no longer than `limit`.
+async fn open_on_tab(
+    server_id: i32,
+    tab: &tokio::sync::Mutex<Handle<ClientHandler>>,
+    host: &str,
+    port: u16,
+    limit: Duration,
+) -> Option<Through> {
+    if tab_cooldowns().lock().ok()?.get(&server_id).is_some_and(|until| Instant::now() < *until) {
+        return Some(Through::NotYet);
+    }
+    let h = tab.try_lock().ok()?;
+    if h.is_closed() {
+        return None;
+    }
     let started = Instant::now();
-    let open = via.channel_open_direct_tcpip(host.to_string(), u32::from(port), "127.0.0.1", 0);
-    match tokio::time::timeout(limit, open).await {
+    let open = h.channel_open_direct_tcpip(host.to_string(), u32::from(port), "127.0.0.1", 0);
+    Some(match tokio::time::timeout(limit, open).await {
         Ok(Ok(channel)) => {
             let ms = started.elapsed().as_millis() as u64;
             let _ = channel.close().await;
-            Ok(ms)
+            Through::Answers(ms)
         }
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => Err(String::new()),
-    }
+        Ok(Err(e)) => Through::NoAnswer(Some(e.to_string())),
+        Err(_) => {
+            if let Ok(mut c) = tab_cooldowns().lock() {
+                c.insert(server_id, Instant::now() + TAB_COOLDOWN);
+            }
+            Through::NotYet
+        }
+    })
 }
 
 /// Check `host:port` from jump host `jump_id`, over a connection Submarine
-/// already has to it: None when there's none.
-async fn check_through_jump(
-    ssh: &SshState,
-    db: &DbState,
-    jump_id: i32,
-    host: &str,
-    port: u16,
-) -> Option<Result<u64, String>> {
-    let deadline = Instant::now() + CHECK_TIMEOUT;
-    let left = || deadline.saturating_duration_since(Instant::now());
-    let sessions: Vec<(String, i32)> = ssh.session_servers.lock().await.iter().map(|(s, id)| (s.clone(), *id)).collect();
-
-    // A tab open on the jump host itself.
-    let own: Vec<_> = {
-        let conns = ssh.connections.lock().await;
-        sessions.iter().filter(|(_, id)| *id == jump_id).filter_map(|(s, _)| conns.get(s).cloned()).collect()
+/// already has to it: None when there's none. A route a tab behind it opened
+/// is used first (only one that went through this jump host), then a tab on
+/// the jump host itself. No lock is held while the channel opens.
+async fn check_through_jump(ssh: &SshState, server_id: i32, jump_id: i32, host: &str, port: u16) -> Option<Through> {
+    let route = {
+        let routes = ssh.jump_connections.lock().await;
+        routes
+            .values()
+            .filter(|r| r.jump_id == Some(jump_id))
+            .filter_map(|r| r.handles.last())
+            .find(|h| !h.is_closed())
+            .cloned()
     };
-    for handle in own {
-        let Ok(h) = tokio::time::timeout(left(), handle.lock()).await else { break };
-        if !h.is_closed() {
-            return Some(open_through(&h, host, port, left()).await);
+    if let Some(via) = route {
+        return Some(open_shared(server_id, via, host, port, CHECK_TIMEOUT).await);
+    }
+    let sessions: Vec<String> =
+        ssh.session_servers.lock().await.iter().filter(|(_, id)| **id == jump_id).map(|(s, _)| s.clone()).collect();
+    let tabs: Vec<_> = {
+        let conns = ssh.connections.lock().await;
+        sessions.iter().filter_map(|s| conns.get(s).cloned()).collect()
+    };
+    for tab in tabs {
+        if let Some(through) = open_on_tab(server_id, &tab, host, port, CHECK_TIMEOUT).await {
+            return Some(through);
         }
     }
-
-    // A tab on another server behind it: its route ends at the jump host.
-    let behind = servers_behind(db, jump_id);
-    let routes: Vec<String> = sessions.iter().filter(|(_, id)| behind.contains(id)).map(|(s, _)| s.clone()).collect();
-    if routes.is_empty() {
-        return None;
-    }
-    let Ok(jumps) = tokio::time::timeout(left(), ssh.jump_connections.lock()).await else { return None };
-    let via = routes
-        .iter()
-        .filter_map(|s| jumps.get(s).and_then(|route| route.last()))
-        .find(|h| !h.is_closed())?;
-    Some(open_through(via, host, port, left()).await)
+    None
 }
 
 /// Check `server_id` once: does its port take a connection, and how fast.
@@ -210,13 +286,11 @@ pub async fn ping_server(
     Ok(match route {
         ConnectRoute::Direct => from_reach(port, crate::diagnose::reach(&target.host, port, CHECK_TIMEOUT).await),
         ConnectRoute::Jump(jump_id) => {
-            if !s.jump_exists {
-                return Ok(PingReply::NotChecked { why: "Its jump host is gone: edit the server to pick another.".into() });
-            }
             let through = s.jump_name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "its jump host".into());
-            match check_through_jump(&ssh, &db, jump_id, &target.host, port).await {
-                Some(Ok(ms)) => PingReply::Answers { port, ms, through: Some(through) },
-                Some(Err(e)) => PingReply::NoAnswer { port, why: Some(e).filter(|e| !e.is_empty()), through: Some(through) },
+            match check_through_jump(&ssh, server_id, jump_id, &target.host, port).await {
+                Some(Through::Answers(ms)) => PingReply::Answers { port, ms, through: Some(through) },
+                Some(Through::NoAnswer(why)) => PingReply::NoAnswer { port, why, through: Some(through) },
+                Some(Through::NotYet) => PingReply::NoAnswer { port, why: Some("no answer yet".into()), through: Some(through) },
                 None => PingReply::NotChecked {
                     why: format!("Behind a jump host ({through}): open a terminal to it, or to a server behind it, to check."),
                 },
@@ -294,13 +368,25 @@ mod tests {
     #[tokio::test]
     async fn through_a_jump_host_the_channel_is_the_answer() {
         use crate::ssh_test_server::{connect, TestServer};
-        let jump = connect(TestServer::default(), |_| {}, russh::client::Config::default()).await.unwrap();
-        assert!(open_through(&jump, "target", 22, CHECK_TIMEOUT).await.is_ok());
-        // A jump host that never answers: no answer, within the limit.
-        let stalled = connect(TestServer::stalling_direct_tcpip(), |_| {}, russh::client::Config::default()).await.unwrap();
+        let jump = Arc::new(connect(TestServer::default(), |_| {}, russh::client::Config::default()).await.unwrap());
+        assert!(matches!(open_shared(-1, Arc::clone(&jump), "target", 22, CHECK_TIMEOUT).await, Through::Answers(_)));
+        assert!(!pending().lock().unwrap().contains(&-1), "nothing left waiting");
+    }
+
+    #[tokio::test]
+    async fn a_late_channel_is_waited_for_once_and_not_piled_up() {
+        use crate::ssh_test_server::{connect, TestServer};
+        // A jump host that never answers the open.
+        let stalled = Arc::new(connect(TestServer::stalling_direct_tcpip(), |_| {}, russh::client::Config::default()).await.unwrap());
         let started = Instant::now();
-        assert_eq!(open_through(&stalled, "target", 22, Duration::from_millis(200)).await, Err(String::new()));
+        let first = open_shared(-2, Arc::clone(&stalled), "target", 22, Duration::from_millis(200)).await;
+        assert_eq!(first, Through::NotYet, "the page hears in time");
         assert!(started.elapsed() < Duration::from_secs(2));
+        // Still waited for in its task: a second check doesn't send another.
+        assert!(pending().lock().unwrap().contains(&-2));
+        assert_eq!(open_shared(-2, Arc::clone(&stalled), "target", 22, Duration::from_millis(50)).await, Through::NotYet);
+        // The task holds its own reference to the connection, not a lock.
+        assert!(Arc::strong_count(&stalled) >= 2);
     }
 
     #[tokio::test]

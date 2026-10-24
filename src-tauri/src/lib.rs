@@ -13259,6 +13259,11 @@ async fn initiate_connection(
         // `ssh -J` does. Their Handles stay in `jump_handles` through the
         // target handshake; on success they move into `state_jump_connections`
         // for the session's life.
+        // The saved jump host the route goes through, kept with its Handles.
+        let route_jump_id = match &route {
+            ConnectRoute::Jump(jid) => Some(*jid),
+            _ => None,
+        };
         let chain: Option<Result<Vec<russh::client::Handle<ssh_manager::ClientHandler>>, String>> = match &route {
             ConnectRoute::Jump(jid) => {
                 emit_log(&format!("ProxyJump: routing through jump host (server id {})...", jid), "info");
@@ -13624,7 +13629,11 @@ async fn initiate_connection(
                                 // and a later reconnect / disconnect / close
                                 // drops them together.
                                 if !jump_handles.is_empty() {
-                                    state_jump_connections.lock().await.insert(session_id_clone.clone(), std::mem::take(&mut jump_handles));
+                                    let handles = std::mem::take(&mut jump_handles).into_iter().map(Arc::new).collect();
+                                    state_jump_connections
+                                        .lock()
+                                        .await
+                                        .insert(session_id_clone.clone(), ssh_manager::JumpRoute { jump_id: route_jump_id, handles });
                                 }
                                 true
                             } else {
