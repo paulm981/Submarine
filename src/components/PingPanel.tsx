@@ -7,10 +7,14 @@ import { playBackSound, stopAllPings, stopPing, usePinged, type PingTarget } fro
 // Ping (#33): a small panel, bottom right, with a card for each server being
 // pinged. Each card asks the backend for one check (ping_server: a plain TCP
 // connect to the server's port, or a channel through its jump host) every
-// CHECK_EVERY_MS, and says when the server stopped answering and when it
-// came back. Closing a card stops its checks; nothing keeps running after.
+// CHECK_EVERY_MS while its port doesn't answer, and every CHECK_READY_MS once
+// it does: each check opens and closes a connection, which a server or jump
+// host that bans repeated ones (fail2ban, sshguard) could take for an attack.
+// It says when the server stopped answering and when it came back. Closing a
+// card stops its checks; nothing keeps running after.
 
 const CHECK_EVERY_MS = 2000;
+const CHECK_READY_MS = 30000;
 const REPLIES_SHOWN = 8;
 const EVENTS_SHOWN = 4;
 
@@ -106,7 +110,8 @@ const PingCard = ({ target }: { target: PingTarget }) => {
         last = now;
         setLevel(now);
       }
-      timer = window.setTimeout(check, Math.max(0, CHECK_EVERY_MS - (Date.now() - started)));
+      const every = last === "ready" ? CHECK_READY_MS : CHECK_EVERY_MS;
+      timer = window.setTimeout(check, Math.max(0, every - (Date.now() - started)));
     };
     void check();
     return () => { alive = false; window.clearTimeout(timer); };
@@ -137,6 +142,11 @@ const PingCard = ({ target }: { target: PingTarget }) => {
       </div>
       <div className="px-3 pb-2.5 space-y-1.5">
         {headline && <div className={`text-[12px] font-semibold ${level ? TONE_TEXT[LEVEL_TONE[level]] : "text-zinc-400"}`}>{headline}</div>}
+        {level && !note && (
+          <div className="text-[10.5px] text-zinc-500">
+            {level === "ready" ? "Checked every 30 seconds while it answers." : "Checked every 2 seconds until it answers."}
+          </div>
+        )}
         {note && <div className="text-[11.5px] text-zinc-400 leading-snug">{note}</div>}
         {events.length > 0 && (
           <ul className="space-y-0.5">

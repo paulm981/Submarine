@@ -71,6 +71,8 @@ const OPEN_MANY = 10;
 // A wall is one tab however many it holds; past this many it still asks,
 // as each one connects.
 const WALL_MANY = 30;
+// More servers than this pinged at once asks first (pingMany).
+const PING_MANY = 10;
 // How far the pointer travels before a press becomes a drag, how long a drag
 // hovers on a closed folder before it opens, and the band at the list's top
 // and bottom edges that scrolls it.
@@ -351,6 +353,17 @@ export const SessionTree = ({
     onOpenAsWall(list, name);
   };
   const openSelectedAsWall = () => openAsWall(pickedWall, `${pickedWall.length} servers`);
+  // Many at once is asked about first, as a big Wall is: each check is a
+  // connection, and a server or jump host that bans repeated ones could ban
+  // you, or the jump host.
+  const pingMany = async (list: any[]) => {
+    if (list.length > PING_MANY && !(await confirm({
+      title: `Ping ${list.length} servers?`,
+      message: "Each one is checked every 2 seconds until it answers, then every 30 seconds. A server or jump host that blocks addresses making many connections (fail2ban, sshguard) could block yours.",
+      okLabel: `Ping ${list.length}`,
+    }))) return;
+    pingServers(list);
+  };
 
   // The rows a move or a delete is about: the selection when `r` is in it
   // (or there is no `r`), else just `r`.
@@ -969,7 +982,7 @@ export const SessionTree = ({
                   // Several selected: each server among them.
                   const list = pickedCount > 1 && selected.has(r.key) ? picked.list : [r.server];
                   return list.length > 0 && (
-                    <button className={menuItem} onClick={run(() => pingServers(list))}>
+                    <button className={menuItem} onClick={run(() => void pingMany(list))}>
                       <Activity size={13} className={menuIcon} /> {list.length > 1 ? `Ping ${list.length} servers` : "Ping"}
                     </button>
                   );
