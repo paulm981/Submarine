@@ -855,6 +855,18 @@ function DesktopApp() {
     bumpTimer.current = setTimeout(() => { quietSync(); }, 6000);
   }, [appSettings.autoSync, quietSync]);
 
+  // A password typed into a connect prompt with "Save password" ticked was
+  // saved once its login worked: the servers changed, and the change syncs.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let gone = false;
+    listen("server-password-saved", () => {
+      refreshServers();
+      bumpSync();
+    }).then((fn) => { if (gone) fn(); else unlisten = fn; });
+    return () => { gone = true; if (unlisten) unlisten(); };
+  }, [refreshServers, bumpSync]);
+
   // Turning auto-sync off has to cancel a push that's already armed. The check
   // above only runs when the timer is SCHEDULED, so editing something and then
   // switching auto-sync off within the six-second window still fired the sync —
