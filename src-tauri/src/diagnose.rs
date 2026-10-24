@@ -35,7 +35,7 @@ pub enum Route {
 
 /// What the TCP connect to one address came to.
 #[derive(Debug, PartialEq)]
-enum Reach {
+pub(crate) enum Reach {
     Answers(u128),
     Refused,
     TimedOut,
@@ -59,10 +59,21 @@ struct Probe {
 /// share another. The first address that answers wins; otherwise the last
 /// failure is reported.
 async fn probe(host: &str, port: u16) -> Probe {
+    probe_within(host, port, STEP_TIMEOUT).await
+}
+
+/// A plain TCP connect to `host:port`, as `probe` makes it, with `limit` for
+/// the lookup and another for the connects. `Err` is why the name didn't
+/// resolve. Used by Ping (ping.rs).
+pub(crate) async fn reach(host: &str, port: u16, limit: Duration) -> Result<Reach, String> {
+    probe_within(host, port, limit).await.outcome
+}
+
+async fn probe_within(host: &str, port: u16, limit: Duration) -> Probe {
     let literal = host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>().ok();
     let addresses: Vec<IpAddr> = match literal {
         Some(ip) => vec![ip],
-        None => match tokio::time::timeout(STEP_TIMEOUT, tokio::net::lookup_host((host, port))).await {
+        None => match tokio::time::timeout(limit, tokio::net::lookup_host((host, port))).await {
             Ok(Ok(found)) => {
                 let mut list: Vec<IpAddr> = Vec::new();
                 for a in found {
@@ -85,7 +96,7 @@ async fn probe(host: &str, port: u16) -> Probe {
     let started = Instant::now();
     let mut last = Reach::TimedOut;
     for ip in &addresses {
-        let Some(left) = STEP_TIMEOUT.checked_sub(started.elapsed()) else { break };
+        let Some(left) = limit.checked_sub(started.elapsed()) else { break };
         let tried = Instant::now();
         last = match tokio::time::timeout(left, tokio::net::TcpStream::connect(SocketAddr::new(*ip, port))).await {
             Ok(Ok(_)) => Reach::Answers(tried.elapsed().as_millis()),

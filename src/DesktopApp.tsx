@@ -60,6 +60,8 @@ import RdpSessionView from "./components/RdpSessionView";
 import TelnetSessionView from "./components/TelnetSessionView";
 import VncSessionView from "./components/VncSessionView";
 import MonitoringPanel from "./components/MonitoringPanel";
+import PingPanel from "./components/PingPanel";
+import { PING_SOUND_KEY, readPingSound } from "./ui/ping";
 import { ErrorBoundary } from "./ui/ErrorBoundary";
 import { parseObjectList } from "./util/serverJson";
 
@@ -464,6 +466,9 @@ function DesktopApp() {
     // Ask before closing a tab whose session is connected (Settings ›
     // Servers, or "Don't ask again" in the prompt). Defaults ON.
     confirmCloseSession: localStorage.getItem('submarine-confirm-close') !== 'off',
+    // A short sound when a server being pinged answers again (Settings ›
+    // Servers). Per-device; defaults ON. See ui/ping.
+    pingSound: readPingSound(),
     // Flat tabs that touch, instead of pills (title bar and each server's
     // terminal tabs). Per-device; defaults OFF.
     compactTabs: localStorage.getItem('submarine-compact-tabs') === 'on',
@@ -499,6 +504,7 @@ function DesktopApp() {
     localStorage.setItem('submarine-detect-os', appSettings.detectOs ? 'on' : 'off');
     localStorage.setItem('submarine-watch-upstream', appSettings.watchUpstream ? 'on' : 'off');
     localStorage.setItem('submarine-confirm-close', appSettings.confirmCloseSession ? 'on' : 'off');
+    localStorage.setItem(PING_SOUND_KEY, appSettings.pingSound ? 'on' : 'off');
     localStorage.setItem('submarine-compact-tabs', appSettings.compactTabs ? 'on' : 'off');
     writeWallCloseTaken(appSettings.wallCloseTaken);
     // Tell already-mounted terminals to re-fit with the new font size / face.
@@ -3435,6 +3441,7 @@ function DesktopApp() {
             />
           )}
           {!isMobile && treeOpen && treeSide === "right" && sessionTree}
+          <PingPanel />
           {aiOpen && ai.enabled && (
             <AiPanel
               snap={ai}

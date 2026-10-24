@@ -40,6 +40,7 @@ Closing a Wall that took your tabs asks whether to put them back or close them. 
 - **A session tree** beside the terminal, with search. It holds folders, servers and Remote Desktop links, and you manage it with drag and drop, rename, move and delete. **Show only open** (the eye button) narrows it to the servers you have open.
 - **Remote Desktop links** are saved with your servers and open in Remote Desktop Connection on Windows.
 - **OS badges** on servers, and a look of their own for Remote Desktop links.
+- **Ping** a server from its right-click menu in the tree or the grid, while it reboots, say. A small panel shows each answer and its time, when the server stopped answering and came back, and whether its SSH port answers yet. A quiet sound plays when you can log in again. It's a plain connection to the port, so it works where ping is blocked; behind a jump host it checks from the jump host, over a connection you already have open.
 
 ### Bring your sessions with you
 

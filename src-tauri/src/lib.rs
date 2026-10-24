@@ -49,6 +49,7 @@ mod applog;
 mod term_output;
 mod proxy_command;
 mod diagnose;
+mod ping;
 mod hop_policy;
 mod ai;
 mod open_policy;
@@ -26505,6 +26506,7 @@ pub fn run() {
             local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
             local_term::local_terminal_open, local_term::local_terminal_write, local_term::local_windows_build,
             local_term::local_terminal_resize, local_term::local_terminal_close,
+            ping::ping_server,
             ai::ai_settings, ai::ai_set_enabled, ai::ai_state, ai::ai_share, ai::ai_unshare, ai::ai_stop, ai::ai_decide, ai::ai_output,
             ai::ai_set_flash, ai::ai_allow_session, ai::ai_allow_always, ai::ai_trust_view, ai::ai_trust_scope,
             ai::ai_trust_set_level, ai::ai_trust_add_rule, ai::ai_trust_remove_rule, ai::ai_end_allow_all, ai::ai_keep_policy,

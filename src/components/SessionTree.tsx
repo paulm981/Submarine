@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
-  ArrowLeftRight, Bot, ChevronRight, ChevronsDownUp, Copy, CopyPlus, Folder, FolderInput, FolderOpen, FolderPlus,
+  Activity, ArrowLeftRight, Bot, ChevronRight, ChevronsDownUp, Copy, CopyPlus, Folder, FolderInput, FolderOpen, FolderPlus,
   Eye, LayoutGrid, Monitor, MonitorSmartphone, Pencil, Play, Plus, Search, ShieldAlert, TerminalSquare, Trash2, X,
 } from "lucide-react";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
@@ -11,6 +11,7 @@ import RdpLinkModal, { type RdpLink } from "./RdpLinkModal";
 import MoveToFolderModal from "./MoveToFolderModal";
 import { OsBadge, osName } from "./OsBadge";
 import { openAiTrust, useAi } from "../util/ai";
+import { pingServers } from "../ui/ping";
 
 // The session tree beside the main view, in the spirit of MobaXterm's
 // Sessions sidebar: every folder, server and Remote Desktop link as one
@@ -885,7 +886,7 @@ export const SessionTree = ({
         />
         <div
           className="fixed z-[9999] w-[250px] py-1 bg-[#15151a] border border-white/10 rounded-lg shadow-2xl text-[11.5px]"
-          style={{ left: Math.min(menu.x, window.innerWidth - 270), top: Math.min(menu.y, window.innerHeight - 330) }}
+          style={{ left: Math.min(menu.x, window.innerWidth - 270), top: Math.min(menu.y, window.innerHeight - 360) }}
         >
           {menu.row === null ? (
             newItems(null)
@@ -960,6 +961,15 @@ export const SessionTree = ({
                     <CopyPlus size={13} className={menuIcon} /> Duplicate
                   </button>
                 )}
+                {r.kind === "server" && (() => {
+                  // Several selected: each server among them.
+                  const list = pickedCount > 1 && selected.has(r.key) ? picked.list : [r.server];
+                  return list.length > 0 && (
+                    <button className={menuItem} onClick={run(() => pingServers(list))}>
+                      <Activity size={13} className={menuIcon} /> {list.length > 1 ? `Ping ${list.length} servers` : "Ping"}
+                    </button>
+                  );
+                })()}
                 {!many && (
                   <button className={menuItem} onClick={run(() => { navigator.clipboard?.writeText(String(host)).catch(() => {}); })}>
                     <Copy size={13} className={menuIcon} /> Copy host name

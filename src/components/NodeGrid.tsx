@@ -1,4 +1,4 @@
-import { Search, Plus, Server, Globe, Folder, FolderPlus, ChevronLeft, ChevronRight, Trash2, Edit2, Zap, Check, X, Copy, GripVertical, MonitorSmartphone, ShieldAlert, KeyRound } from "lucide-react";
+import { Activity, Play, Search, Plus, Server, Globe, Folder, FolderPlus, ChevronLeft, ChevronRight, Trash2, Edit2, Zap, Check, X, Copy, GripVertical, MonitorSmartphone, ShieldAlert, KeyRound } from "lucide-react";
 import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { useConfirm } from "../ui/confirm";
@@ -8,6 +8,7 @@ import { IS_ANDROID } from "../util/platform";
 import { OsBadge } from "./OsBadge";
 import { HeldReview } from "./HeldReview";
 import { HeldDeletions } from "./HeldDeletions";
+import { pingServers } from "../ui/ping";
 
 export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFolderIdProp, onActiveFolderChange, onOpenServer, onEditServer, onAddClick, onQuickConnect, onRemoveServer, onRemoveFolder, onRenameFolder, onCreateFolder, onCloneServer, onReorderServers, onOpenRdp, onSaveRdp, onRemoveRdp, onAllowHeld, onKeepSsh, onKeepAi, keyChange, onAcceptKey, heldDeletions, onResolveDeletions, isMobile }: any) => {
   const [search, setSearch] = useState("");
@@ -126,6 +127,8 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
 
   // Add / edit dialog for a Remote Desktop link; null while closed.
   const [rdpDraft, setRdpDraft] = useState<RdpLink | null>(null);
+  // A server card's right-click menu.
+  const [cardMenu, setCardMenu] = useState<{ x: number; y: number; server: any } | null>(null);
   const [rdpError, setRdpError] = useState<string | null>(null);
   const newRdp = () => setRdpDraft({ name: "", host: "", port: 3389, username: "", folder_id: activeFolderId, notes: "" });
 
@@ -346,6 +349,11 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
         key={`server-${s.id}`}
         data-sid={s.id}
         onClick={() => { if (draggedRef.current) return; onOpenServer(s); }}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          if (draggedRef.current) return;
+          setCardMenu({ x: e.clientX, y: e.clientY, server: s });
+        }}
         className="group relative flex items-center gap-3 h-16 pl-3.5 pr-2 rounded-xl bg-gradient-to-br from-[#17171c] to-[#121216] border border-white/5 hover:border-primary/40 hover:bg-white/[0.015] transition-colors duration-150 cursor-pointer overflow-hidden"
       >
         {/* Per-server colour accent: a crisp left bar. */}
@@ -837,6 +845,37 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
 
       {rdpDraft && createPortal(
         <RdpLinkModal link={rdpDraft} folders={allFolders} onSave={onSaveRdp} onClose={() => setRdpDraft(null)} />,
+        document.body
+      )}
+
+      {/* A server card's menu. The layer under it takes the click that
+          closes it, so that click doesn't also open the card beneath. */}
+      {cardMenu && createPortal(
+        <>
+          <div
+            className="fixed inset-0 z-[9998]"
+            onClick={() => setCardMenu(null)}
+            onContextMenu={(e) => { e.preventDefault(); setCardMenu(null); }}
+          />
+          <div
+            className="fixed z-[9999] w-[200px] py-1 bg-[#15151a] border border-white/10 rounded-lg shadow-2xl text-[11.5px]"
+            style={{ left: Math.min(cardMenu.x, window.innerWidth - 220), top: Math.min(cardMenu.y, window.innerHeight - 120) }}
+          >
+            {([
+              { icon: Play, label: "Open", act: () => onOpenServer(cardMenu.server) },
+              { icon: Activity, label: "Ping", act: () => pingServers([cardMenu.server]) },
+              { icon: Edit2, label: "Edit…", act: () => onEditServer(cardMenu.server) },
+            ] as const).map(({ icon: Icon, label, act }) => (
+              <button
+                key={label}
+                onClick={() => { setCardMenu(null); act(); }}
+                className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left"
+              >
+                <Icon size={13} className="text-zinc-500" /> {label}
+              </button>
+            ))}
+          </div>
+        </>,
         document.body
       )}
 

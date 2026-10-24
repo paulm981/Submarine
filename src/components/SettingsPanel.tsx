@@ -1088,6 +1088,24 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
                 <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${settings.confirmCloseSession !== false ? 'left-[22px]' : 'left-0.5'}`} />
               </button>
             </div>
+            <div className="flex items-center justify-between gap-4">
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-zinc-100">Play a sound when a pinged server answers again</div>
+                <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
+                  A short, quiet tone when a server you're pinging (right-click it, then Ping) can be logged in to
+                  again, after a reboot, say.
+                </p>
+              </div>
+              <button
+                role="switch"
+                aria-checked={settings.pingSound !== false}
+                aria-label="Play a sound when a pinged server answers again"
+                onClick={() => setSettings((s: any) => ({ ...s, pingSound: !(s.pingSound !== false) }))}
+                className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${settings.pingSound !== false ? 'bg-primary' : 'bg-zinc-700'}`}
+              >
+                <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${settings.pingSound !== false ? 'left-[22px]' : 'left-0.5'}`} />
+              </button>
+            </div>
             <JumpLoginLimit />
           </div>
         </section>
