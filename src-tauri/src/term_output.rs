@@ -12,7 +12,9 @@
 //! terminal): batches over a few KB travel as raw bytes, fetched by the page
 //! rather than evaluated. And the page acknowledges what xterm has processed
 //! (`terminal_output_ack`), so no more than IN_FLIGHT_MAX is ever waiting on
-//! the page. The rest waits here. The SSH channel keeps being read meanwhile
+//! the page. The rest waits here. An ack names the channel the output came
+//! over, so after a reconnect (a new channel for the same terminal) what the
+//! page was still drawing from the old one doesn't count for the new one. The SSH channel keeps being read meanwhile
 //! (it must: a reader that stops stalls the whole connection, see
 //! ssh_manager::pty_pump), so when the stream stays faster than the window
 //! for long, the oldest waiting output past PENDING_MAX is dropped, with a
@@ -32,6 +34,9 @@ const SEND_MAX: usize = 256 * 1024;
 /// Waiting here for the page; past this the oldest goes, down to PENDING_KEEP.
 const PENDING_MAX: usize = 8 * 1024 * 1024;
 const PENDING_KEEP: usize = 4 * 1024 * 1024;
+/// Room kept for what waits once a backlog has gone: past this, it's given
+/// back (a backlog leaves the buffer at up to twice PENDING_MAX).
+const PENDING_SPARE: usize = 512 * 1024;
 
 struct State {
     pending: Vec<u8>,
@@ -160,6 +165,13 @@ fn trim_pending(pending: &mut Vec<u8>) -> Option<usize> {
     Some(cut)
 }
 
+/// Once `pending` has drained, the room a backlog left it with goes back.
+fn release_spare(pending: &mut Vec<u8>) {
+    if pending.is_empty() && pending.capacity() > PENDING_SPARE {
+        pending.shrink_to(PENDING_SPARE);
+    }
+}
+
 fn human(n: usize) -> String {
     if n >= 1024 * 1024 {
         format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
@@ -183,6 +195,7 @@ async fn send_loop(inner: Arc<Inner>) {
             if !s.pending.is_empty() && (s.closed || s.in_flight < IN_FLIGHT_MAX) {
                 let n = s.pending.len().min(SEND_MAX);
                 let chunk: Vec<u8> = s.pending.drain(..n).collect();
+                release_spare(&mut s.pending);
                 s.in_flight += chunk.len();
                 Next::Send(chunk)
             } else if s.closed && s.pending.is_empty() {
@@ -214,11 +227,14 @@ async fn send_loop(inner: Arc<Inner>) {
     }
 }
 
-/// The page's terminal has processed `bytes` of `terminal_id`'s output.
+/// The page's terminal has processed `bytes` of `terminal_id`'s output, sent
+/// over the channel `channel` (its id). An ack for an earlier channel of the
+/// same terminal, from before a reconnect, is let go: that output was never
+/// counted against this one.
 #[tauri::command]
-pub fn terminal_output_ack(terminal_id: String, bytes: usize) {
+pub fn terminal_output_ack(terminal_id: String, channel: u32, bytes: usize) {
     let inner = sinks().lock().ok().and_then(|m| m.get(&terminal_id).cloned());
-    if let Some(inner) = inner {
+    if let Some(inner) = inner.filter(|i| i.channel.id() == channel) {
         if let Ok(mut s) = inner.state.lock() {
             s.in_flight = s.in_flight.saturating_sub(bytes);
         }
@@ -229,6 +245,55 @@ pub fn terminal_output_ack(terminal_id: String, bytes: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn in_flight(id: &str) -> usize {
+        let inner = sinks().lock().unwrap().get(id).cloned().unwrap();
+        let n = inner.state.lock().unwrap().in_flight;
+        n
+    }
+
+    fn wait_for(what: impl Fn() -> bool) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while !what() {
+            assert!(Instant::now() < until, "timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn an_ack_from_before_a_reconnect_doesnt_count() {
+        let id = "ack-generation-test";
+        let old = OutputSink::open(id, Channel::new(|_| Ok(())));
+        let old_channel = old.0.channel.id();
+        let new = OutputSink::open(id, Channel::new(|_| Ok(())));
+        assert_ne!(old_channel, new.0.channel.id());
+        new.push(&mut vec![b'x'; IN_FLIGHT_MAX * 2]);
+        wait_for(|| in_flight(id) >= IN_FLIGHT_MAX);
+        // The page acks what it drew from the old channel: the new one
+        // still waits for its own.
+        terminal_output_ack(id.to_string(), old_channel, IN_FLIGHT_MAX);
+        assert_eq!(in_flight(id), IN_FLIGHT_MAX);
+        terminal_output_ack(id.to_string(), new.0.channel.id(), IN_FLIGHT_MAX);
+        wait_for(|| new.0.state.lock().unwrap().pending.is_empty());
+        drop(old);
+        drop(new);
+    }
+
+    #[test]
+    fn a_drained_backlog_gives_its_room_back() {
+        let mut p: Vec<u8> = Vec::with_capacity(PENDING_MAX * 2);
+        p.extend_from_slice(&[b'x'; 1024]);
+        // Not while anything still waits.
+        release_spare(&mut p);
+        assert!(p.capacity() >= PENDING_MAX * 2);
+        p.clear();
+        release_spare(&mut p);
+        assert!(p.capacity() <= PENDING_SPARE, "{}", p.capacity());
+        // A small buffer is left as it is.
+        let mut small: Vec<u8> = Vec::with_capacity(4096);
+        release_spare(&mut small);
+        assert_eq!(small.capacity(), 4096);
+    }
 
     #[test]
     fn a_short_backlog_is_kept_whole() {

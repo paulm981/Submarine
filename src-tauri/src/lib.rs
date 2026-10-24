@@ -26503,7 +26503,7 @@ pub fn run() {
             multiexec::write_terminals_data,
             local_term::list_local_shells, local_term::local_shell_set_default,
             local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
-            local_term::local_terminal_open, local_term::local_terminal_write,
+            local_term::local_terminal_open, local_term::local_terminal_write, local_term::local_windows_build,
             local_term::local_terminal_resize, local_term::local_terminal_close,
             ai::ai_settings, ai::ai_set_enabled, ai::ai_state, ai::ai_share, ai::ai_unshare, ai::ai_stop, ai::ai_decide, ai::ai_output,
             ai::ai_set_flash, ai::ai_allow_session, ai::ai_allow_always, ai::ai_trust_view, ai::ai_trust_scope,

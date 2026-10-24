@@ -23,7 +23,7 @@ import { HighlightStream, matcherForServer, type Matcher } from '../ui/highlight
 import { readScrollback } from '../util/terminalScrollback';
 import { withoutPasteControls } from '../util/pasteText';
 import { readUseLocalShell } from '../util/terminalShell';
-import { IS_ANDROID, IS_LINUX } from '../util/platform';
+import { IS_ANDROID, IS_LINUX, IS_WINDOWS } from '../util/platform';
 import { readClipboardText } from '../util/clipboard';
 
 // Does the recent remote OUTPUT look like a no-echo password / passphrase
@@ -128,6 +128,13 @@ const cycleMod = (s: "off" | "armed" | "locked"): "off" | "armed" | "locked" =>
 const PTY_SIZE_SETTLE_MS = 150;
 
 // A container's terminal that needed root, and the password wasn't given.
+// A Home terminal on Windows runs in a pseudo-console (ConPTY), which wraps
+// and redraws lines itself on a resize; xterm matches it when told so, and
+// better for knowing which Windows build it is. Asked for once.
+let windowsBuild: Promise<number | null> | null = null;
+const readWindowsBuild = () =>
+  (windowsBuild ??= invoke<number | null>('local_windows_build').catch(() => null));
+
 const ROOT_CANCELLED = '\x1b[33mThis container\'s terminal needs root on the server. Close this tab and open it again to enter the password.\x1b[0m';
 
 const TerminalView = ({
@@ -215,10 +222,16 @@ const TerminalView = ({
   // What draws this terminal's output (set up with its xterm, below). Each
   // open — the first and every reconnect — passes a fresh channel to the
   // backend that hands its messages to it.
-  const outputRef = useRef<((data: Uint8Array) => void) | null>(null);
+  // It's told which channel each batch came over (its id), which is what the
+  // batch is acknowledged under: after a reconnect, what's still being drawn
+  // from the old channel isn't counted for the new one.
+  const outputRef = useRef<((data: Uint8Array, channel: number) => void) | null>(null);
   // Syntax highlighting of the output (src/ui/highlight.ts).
   const highlightRef = useRef<HighlightStream | null>(null);
-  const outputChannel = () => new Channel<ArrayBuffer>((buf) => outputRef.current?.(new Uint8Array(buf)));
+  const outputChannel = () => {
+    const ch: Channel<ArrayBuffer> = new Channel<ArrayBuffer>((buf) => outputRef.current?.(new Uint8Array(buf), ch.id));
+    return ch;
+  };
 
   // The wait for a freshly opened shell to be ready (SHELL_QUIET_MS): armed
   // when open_terminal returns, pushed back by each output batch. Refs only,
@@ -761,8 +774,15 @@ const TerminalView = ({
       // (openLink). xterm already ignores other schemes while
       // allowNonHttpProtocols is off.
       linkHandler: { allowNonHttpProtocols: false, activate: (_event, uri) => openLink(uri) },
+      ...(local && IS_WINDOWS ? { windowsPty: { backend: 'conpty' as const } } : {}),
       allowProposedApi: true
     });
+    let ptyDisposed = false;
+    if (local && IS_WINDOWS) {
+      void readWindowsBuild().then((buildNumber) => {
+        if (buildNumber && !ptyDisposed) term.options.windowsPty = { backend: 'conpty', buildNumber };
+      });
+    }
 
     const fitAddon = new FitAddon();
     fitAddonRef.current = fitAddon;
@@ -917,6 +937,8 @@ const TerminalView = ({
             local.onOpened?.(label);
           }, e => {
             term.writeln(`\x1b[31mCouldn't start the shell: ${e}\x1b[0m`);
+            // Nothing to type into: keys stop here (the tab marks it ended).
+            disabledRef.current = true;
             local.onFailed?.();
           });
         } else if (containerExec) {
@@ -1291,21 +1313,24 @@ const TerminalView = ({
     // xterm has processed a batch it's acknowledged, which is what lets the
     // backend send more (src-tauri/src/term_output.rs): a stream faster than
     // this window can draw waits there instead of piling up here. Acks are
-    // grouped, at most one per ACK_EVERY bytes or 30ms.
+    // grouped, at most one per ACK_EVERY bytes or 30ms, and each names the
+    // channel its output came over.
     const ACK_EVERY = 128 * 1024;
     let unacked = 0;
+    let ackChannel = 0;
     let ackTimer = 0;
     const sendAck = () => {
       if (ackTimer) window.clearTimeout(ackTimer);
       ackTimer = 0;
       const bytes = unacked;
       unacked = 0;
-      if (bytes > 0) invoke('terminal_output_ack', { terminalId, bytes }).catch(() => {});
+      if (bytes > 0) invoke('terminal_output_ack', { terminalId, channel: ackChannel, bytes }).catch(() => {});
     };
-    const processed = (bytes: number) => {
+    const processed = (channel: number, bytes: number) => {
       lineBudget = LINE_BUDGET;
       charBudget = CHAR_BUDGET;
       noteTerminalParsed(terminalId, bytes);
+      if (channel !== ackChannel) { sendAck(); ackChannel = channel; }
       unacked += bytes;
       if (unacked >= ACK_EVERY) sendAck();
       else if (!ackTimer) ackTimer = window.setTimeout(sendAck, 30);
@@ -1316,15 +1341,15 @@ const TerminalView = ({
     highlightRef.current = highlighter;
     let matcher: Matcher | null = matcherForServer(serverId);
     highlighter.setMatcher(matcher, false);
-    outputRef.current = (data: Uint8Array) => {
+    outputRef.current = (data: Uint8Array, channel: number) => {
       const w = readyWatchRef.current;
       if (w) { window.clearTimeout(w.quiet); w.quiet = window.setTimeout(shellReady, SHELL_QUIET_MS); }
       // Counted for the freeze watchdog: received, and still to be drawn.
       // xterm buffers a multibyte sequence split across batches.
       noteTerminalOutput(terminalId, data.length);
       if (!local) noteOutput(terminalId, data);
-      if (highlighter.active) term.write(highlighter.push(data), () => processed(data.length));
-      else term.write(data, () => processed(data.length));
+      if (highlighter.active) term.write(highlighter.push(data), () => processed(channel, data.length));
+      else term.write(data, () => processed(channel, data.length));
       // Keep a short tail of decoded output so command-history capture can
       // recognize a no-echo password prompt and skip the typed secret.
       try {
@@ -1513,6 +1538,7 @@ const TerminalView = ({
       window.clearTimeout(openTimer);
       stopReadyWatch();
       fontDisposed = true;
+      ptyDisposed = true;
       window.removeEventListener('submarine-settings-changed', handleSettingsChange);
       resizeObserver.disconnect();
       onDataDisposable.dispose();
