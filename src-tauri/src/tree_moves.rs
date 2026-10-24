@@ -145,7 +145,27 @@ pub(crate) fn delete_scope(conn: &Connection, servers: &[i64], links: &[i64], fo
     Ok((all_servers, all_links, all_folders))
 }
 
+/// Before servers are deleted, every server that went through one of them as
+/// its jump host is let go of it, as when the deletion comes from another
+/// device (lib.rs, apply_tombstone), rather than left pointing at nothing.
+/// A local repair, not an edit to push: each device does it when the
+/// deletion reaches it.
+pub(crate) fn unlink_jump_hosts(conn: &Connection, servers: &[i64]) -> Result<(), String> {
+    if servers.is_empty() {
+        return Ok(());
+    }
+    crate::with_merge_flag(conn, |c| {
+        let mut stmt =
+            c.prepare("UPDATE servers SET jump_host_id = NULL WHERE jump_host_id = ?1").map_err(db("JUMP_UNLINK_FAILED"))?;
+        for id in servers {
+            stmt.execute(params![id]).map_err(db("JUMP_UNLINK_FAILED"))?;
+        }
+        Ok(())
+    })
+}
+
 fn delete_in(conn: &Connection, servers: &[i64], links: &[i64], folders: &[i64]) -> Result<(), String> {
+    unlink_jump_hosts(conn, servers)?;
     for id in servers {
         conn.execute("DELETE FROM servers WHERE id = ?1", params![id]).map_err(db("SERVER_DELETE_FAILED"))?;
     }
@@ -221,9 +241,10 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE folders(id INTEGER PRIMARY KEY, name TEXT, parent_id INTEGER);
-             CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, folder_id INTEGER, position INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, folder_id INTEGER, position INTEGER NOT NULL DEFAULT 0, jump_host_id INTEGER);
+             CREATE TABLE sync_flags(key TEXT PRIMARY KEY, val INTEGER NOT NULL);
              INSERT INTO folders VALUES (1, 'Prod', NULL), (2, 'East', 1), (3, 'Lab', NULL);
-             INSERT INTO servers VALUES (10, 'web1', 1, 0), (11, 'web2', 1, 1), (12, 'db1', 2, 0), (13, 'tool', NULL, 0);",
+             INSERT INTO servers VALUES (10, 'web1', 1, 0, NULL), (11, 'web2', 1, 1, NULL), (12, 'db1', 2, 0, NULL), (13, 'tool', NULL, 0, NULL);",
         )
         .unwrap();
         conn.execute_batch(crate::rdp_links::SCHEMA).unwrap();
@@ -285,6 +306,29 @@ mod tests {
         delete_in(&conn, &servers, &links, &folders).unwrap();
         let left: i64 = conn.query_row("SELECT COUNT(*) FROM servers", [], |r| r.get(0)).unwrap();
         assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn deleting_a_jump_host_lets_go_of_the_servers_behind_it() {
+        let conn = vault();
+        // web1 and web2 go through tool; db1 through web1.
+        conn.execute_batch(
+            "UPDATE servers SET jump_host_id = 13 WHERE id IN (10, 11); UPDATE servers SET jump_host_id = 10 WHERE id = 12;
+             CREATE TABLE stamped(id INTEGER);
+             CREATE TRIGGER stamp AFTER UPDATE ON servers WHEN COALESCE((SELECT val FROM sync_flags WHERE key='merge'),0)=0
+               BEGIN INSERT INTO stamped VALUES (NEW.id); END;",
+        )
+        .unwrap();
+        delete_in(&conn, &[13], &[], &[]).unwrap();
+        let jump = |id: i64| -> Option<i64> { conn.query_row("SELECT jump_host_id FROM servers WHERE id=?1", [id], |r| r.get(0)).unwrap() };
+        assert_eq!((jump(10), jump(11)), (None, None), "unlinked, not left pointing at nothing");
+        assert_eq!(jump(12), Some(10), "another jump host is left alone");
+        let stamped: i64 = conn.query_row("SELECT COUNT(*) FROM stamped", [], |r| r.get(0)).unwrap();
+        assert_eq!(stamped, 0, "a local repair, not edits for sync to push");
+        // Deleting one behind it as well as it, in one go.
+        delete_in(&conn, &[10, 12], &[], &[]).unwrap();
+        let left: i64 = conn.query_row("SELECT COUNT(*) FROM servers", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 1);
     }
 
     #[test]

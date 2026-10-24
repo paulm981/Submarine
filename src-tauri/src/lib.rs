@@ -7787,8 +7787,12 @@ async fn delete_server(
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
 
-    conn.execute("DELETE FROM servers WHERE id=?1", rusqlite::params![id])
+    // The servers that went through it as their jump host let go of it.
+    let tx = conn.unchecked_transaction().map_err(|e| format!("[DATABASE] TX_BEGIN: {}", e))?;
+    tree_moves::unlink_jump_hosts(&tx, &[i64::from(id)])?;
+    tx.execute("DELETE FROM servers WHERE id=?1", rusqlite::params![id])
         .map_err(|e| format!("[DATABASE] SERVER_DELETE_FAILED: {}", e))?;
+    tx.commit().map_err(|e| format!("[DATABASE] TX_COMMIT: {}", e))?;
 
     drop(conn_guard);
     save_vault_internal(&state)?;
@@ -8148,6 +8152,12 @@ async fn delete_folder(
 fn delete_folder_tree(conn: &rusqlite::Connection, folder_ids: &[i64]) -> Result<(), String> {
     let tx = conn.unchecked_transaction().map_err(|e| format!("[DATABASE] TX_BEGIN: {}", e))?;
     for fid in folder_ids {
+        // The servers that went through one of these as their jump host let go of it.
+        let doomed: Vec<i64> = tx
+            .prepare("SELECT id FROM servers WHERE folder_id=?1")
+            .and_then(|mut stmt| stmt.query_map(rusqlite::params![fid], |r| r.get(0))?.collect())
+            .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_QUERY_FAILED: {}", e))?;
+        tree_moves::unlink_jump_hosts(&tx, &doomed)?;
         tx.execute("DELETE FROM servers WHERE folder_id=?1", rusqlite::params![fid])
             .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_DELETE_FAILED: {}", e))?;
         tx.execute("DELETE FROM rdp_links WHERE folder_id=?1", rusqlite::params![fid])
@@ -8272,10 +8282,11 @@ mod folder_subtree_tests {
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
              CREATE TABLE folders(id INTEGER PRIMARY KEY, name TEXT, parent_id INTEGER);
-             CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, folder_id INTEGER, FOREIGN KEY(folder_id) REFERENCES folders(id));
+             CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, folder_id INTEGER, jump_host_id INTEGER, FOREIGN KEY(folder_id) REFERENCES folders(id));
              CREATE TABLE rdp_links(id INTEGER PRIMARY KEY, name TEXT, folder_id INTEGER, FOREIGN KEY(folder_id) REFERENCES folders(id));
+             CREATE TABLE sync_flags(key TEXT PRIMARY KEY, val INTEGER NOT NULL);
              INSERT INTO folders VALUES (1,'a',NULL),(2,'b',1),(3,'c',2),(4,'d',NULL);
-             INSERT INTO servers VALUES (10,'s10',1),(11,'s11',3),(12,'s12',4),(13,'s13',NULL);
+             INSERT INTO servers VALUES (10,'s10',1,NULL),(11,'s11',3,NULL),(12,'s12',4,11),(13,'s13',NULL,10);
              INSERT INTO rdp_links VALUES (20,'r20',2),(21,'r21',4);",
         )
         .unwrap();
@@ -8287,6 +8298,8 @@ mod folder_subtree_tests {
         assert_eq!(col("SELECT id FROM folders ORDER BY id"), vec![4]);
         assert_eq!(col("SELECT id FROM servers ORDER BY id"), vec![12, 13]);
         assert_eq!(col("SELECT id FROM rdp_links ORDER BY id"), vec![21]);
+        // Their jump hosts went with the folder: not left pointing at nothing.
+        assert_eq!(col("SELECT COUNT(*) FROM servers WHERE jump_host_id IS NOT NULL"), vec![0]);
     }
 }
 
@@ -25655,13 +25668,25 @@ fn resolve_node_auth_for_monitor(
 ) -> Result<monitor::NodeAuth, String> {
     let (mut auth, jump_host_id) = resolve_node_auth_row(conn, node_id)?;
     if let Some(jid) = jump_host_id.filter(|j| *j != node_id) {
+        if conn.query_row("SELECT 1 FROM servers WHERE id = ?1", [jid], |_| Ok(())).is_err() {
+            return Err("its jump host is gone".into());
+        }
         let (mut jump, _) = resolve_node_auth_row(conn, jid)
-            .map_err(|e| format!("jump host: {}", e))?;
+            .map_err(|e| format!("its jump host: {}", e))?;
         // Reached directly, as connect_jump_host does.
         jump.proxy_type = "none".into();
         auth.jump = Some(Box::new(jump));
     }
     Ok(auth)
+}
+
+/// The app log's line for a server "Resume all" couldn't start, which it
+/// skips to go on with the rest: "db-01's jump host is gone; skipped".
+fn resume_skipped_line(name: &str, why: &str) -> String {
+    match why.strip_prefix("its ") {
+        Some(rest) => format!("{name}'s {rest}; skipped"),
+        None => format!("{name}: {why}; skipped"),
+    }
 }
 
 fn resolve_node_auth_row(
@@ -25751,6 +25776,39 @@ fn resolve_node_auth_row(
         },
         jump_host_id,
     ))
+}
+
+#[cfg(test)]
+mod monitor_resume_tests {
+    use super::*;
+
+    fn vault() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT,
+                credential_id INTEGER, key_id INTEGER, auth_type TEXT, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER,
+                jump_host_id INTEGER, protocol TEXT);
+             CREATE TABLE credentials(id INTEGER PRIMARY KEY, username TEXT, password TEXT, key_id INTEGER, auth_type TEXT);
+             INSERT INTO servers(id, name, host, port, username, auth_type) VALUES (1, 'bastion', 'b.example', 22, 'ops', 'custom');
+             INSERT INTO servers(id, name, host, port, username, auth_type, jump_host_id) VALUES (2, 'web-01', 'w.example', 22, 'ops', 'custom', 1);
+             INSERT INTO servers(id, name, host, port, username, auth_type, jump_host_id) VALUES (3, 'db-01', 'd.example', 22, 'ops', 'custom', 99);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn a_server_whose_jump_host_is_gone_is_skipped_and_said_so() {
+        let conn = vault();
+        let web = resolve_node_auth_for_monitor(&conn, 2).unwrap();
+        assert_eq!(web.jump.as_deref().map(|j| j.host.as_str()), Some("b.example"));
+        let why = match resolve_node_auth_for_monitor(&conn, 3) {
+            Ok(_) => panic!("db-01's jump host is gone"),
+            Err(e) => e,
+        };
+        assert_eq!(resume_skipped_line("db-01", &why), "db-01's jump host is gone; skipped");
+        assert_eq!(resume_skipped_line("rdp-01", "RDP server can't be monitored"), "rdp-01: RDP server can't be monitored; skipped");
+    }
 }
 
 fn default_metrics() -> Vec<String> {
@@ -26142,7 +26200,7 @@ async fn monitor_resume_all(
                 match resolve_node_auth_for_monitor(conn, node_id) {
                     Ok(auth) => (auth, metrics, customs, name),
                     Err(e) => {
-                        crate::applog::write_line("monitor", &format!("node {}: not started ({})", node_id, e));
+                        crate::applog::write_line("monitor", &resume_skipped_line(&name, &e));
                         skipped.push((node_id, name));
                         continue;
                     }

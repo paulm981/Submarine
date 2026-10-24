@@ -423,7 +423,10 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
           <button
             onClick={async (e) => {
               e.stopPropagation();
-              if (await confirm({ title: 'Delete server?', message: `“${s.name}” will be removed from this profile.`, destructive: true })) {
+              // Servers that go through it lose their jump host (tree_moves::unlink_jump_hosts).
+              const behind = (servers || []).filter((x: any) => x.jump_host_id === s.id && x.id !== s.id).length;
+              const note = behind ? ` ${behind === 1 ? "1 other server uses" : `${behind} other servers use`} it as a jump host, and will have none after this.` : "";
+              if (await confirm({ title: 'Delete server?', message: `“${s.name}” will be removed from this profile.${note}`, destructive: true })) {
                 onRemoveServer(s.id);
               }
             }}

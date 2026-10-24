@@ -469,7 +469,11 @@ export const SessionTree = ({
     const it = itemsFor(r);
     if (itemCount(it) === 0) return;
     const folderIds = new Set(it.folders.flatMap((f) => subtreeIds(index, f)));
-    const nServers = new Set([...it.servers, ...(servers || []).filter((x) => folderIds.has(known(x.folder_id) as number)).map((x) => x.id)]).size;
+    const goneServers = new Set<number>([...it.servers, ...(servers || []).filter((x) => folderIds.has(known(x.folder_id) as number)).map((x) => x.id)]);
+    const nServers = goneServers.size;
+    // Servers staying that go through one of these as their jump host: they
+    // lose it (tree_moves::unlink_jump_hosts).
+    const behind = (servers || []).filter((x) => !goneServers.has(x.id) && x.jump_host_id != null && goneServers.has(x.jump_host_id)).length;
     const nLinks = new Set([...it.links, ...(rdpLinks || []).filter((x) => folderIds.has(known(x.folder_id) as number)).map((x) => x.id)]).size;
     const parts = [
       folderIds.size && plural(folderIds.size, "folder"),
@@ -479,7 +483,9 @@ export const SessionTree = ({
     const list = parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}` : parts[0];
     const ok = await confirm({
       title: itemCount(it) === 1 ? `Delete ${describe(it)}?` : `Delete ${plural(itemCount(it), "item")}?`,
-      message: `${list} will be removed from Submarine. Nothing changes on the servers themselves, and tabs already open stay connected until you close them.`,
+      message: `${list} will be removed from Submarine. Nothing changes on the servers themselves, and tabs already open stay connected until you close them.${
+        behind ? ` ${plural(behind, "other server")} ${behind === 1 ? "uses" : "use"} ${nServers === 1 ? "it" : "one of them"} as a jump host, and will have none after this.` : ""
+      }`,
       okLabel: "Delete",
       destructive: true,
     });
