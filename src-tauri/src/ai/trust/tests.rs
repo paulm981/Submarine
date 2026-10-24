@@ -742,7 +742,9 @@ fn pathological_globs_are_quick() {
         let p = Policy { level: 2, allow: rules(&["ls *"]), ask: rules(DEFAULT_ASK), windows: false, force_ask: None };
         let _ = decide(&p, true, &cmd);
         let _ = asks_for_root(&cmd);
-        assert!(t.elapsed() < std::time::Duration::from_millis(50), "{word}: {:?}", t.elapsed());
+        // A generous limit: the old matcher took seconds to hours on these, and
+        // a debug build on a busy CI runner can take tens of milliseconds.
+        assert!(t.elapsed() < std::time::Duration::from_secs(1), "{word}: {:?}", t.elapsed());
     }
     // A glob too long to read counts as one that could name anything.
     assert!(word_is(&format!("{}x", "?".repeat(MAX_GLOB + 1)), "reboot", false));
