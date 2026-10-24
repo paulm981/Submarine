@@ -3544,23 +3544,24 @@ function DesktopApp() {
             // An RDP (issue #3), telnet (#179) or VNC server has a host,
             // port, login (its own or a saved one) and maybe an SSH server to
             // go through; nothing that runs over SSH (forwards, mirrors,
-            // autostart, a proxy, a key). An RDP server's saved password isn't
-            // touched: the RDP app asks. A telnet server's is kept, for the
-            // terminal's password button; a VNC server's, for its login. A
-            // VNC server never has a saved login: VNC sends its password with
-            // weak protection and doesn't check the server's identity, so a
-            // shared login's password would be open to anyone on the path.
+            // autostart, a proxy, a key). Its saved password is kept: an RDP
+            // server's for the built-in client and Remote Desktop Connection
+            // (which never gets a saved login's: secret_policy.rs), a telnet
+            // server's for the terminal's password button, a VNC server's for
+            // its login. A VNC server never has a saved login: VNC sends its
+            // password with weak protection and doesn't check the server's
+            // identity, so a shared login's password would be open to anyone
+            // on the path.
             const isRdp = newNode.protocol === "rdp";
             const isTelnet = newNode.protocol === "telnet";
             const isVnc = newNode.protocol === "vnc";
-            const keepsPassword = isTelnet || isVnc;
             const savedLogin = newNode.authType === "vault" && !isVnc;
             const payload = isRdp || isTelnet || isVnc ? {
               name: newNode.name,
               host: newNode.host,
               port: newNode.port,
               username: isInline && !isVnc ? (newNode.username?.trim() || null) : null,
-              password: keepsPassword && !savedLogin ? (newNode.password || null) : null,
+              password: !savedLogin ? (newNode.password || null) : null,
               credentialId: (savedLogin && newNode.credentialId) ? parseInt(newNode.credentialId) : null,
               folderId: newNode.folderId ? parseInt(newNode.folderId) : null,
               proxyType: "none",
@@ -3572,7 +3573,7 @@ function DesktopApp() {
               autostart: false,
               mirrors: [],
               color: newNode.color ?? null,
-              preservePassword: keepsPassword ? !!newNode.id && !newNode.password_dirty : true,
+              preservePassword: !!newNode.id && !newNode.password_dirty,
             } : {
               name: newNode.name,
               host: newNode.host,

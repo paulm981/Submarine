@@ -204,14 +204,19 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Securit
 # the TPM where there is one) that signs only after the user's PIN, face or
 # finger. Already in the build through Tauri (same version, nothing new to
 # download); these are its parts used here. Also the list of this computer's
-# drives, one of which may be shared with an RDP server (rdp_share.rs).
+# drives, one of which may be shared with an RDP server (rdp_share.rs), and
+# DPAPI and WaitForInputIdle: Remote Desktop Connection gets the saved
+# password in its .rdp file, encrypted for this Windows user, and the file
+# goes once it has read it (rdp.rs, launch_rdp_app).
 windows = { version = "0.62", features = [
     "Foundation",
     "Security_Credentials",
     "Security_Cryptography",
     "Storage_Streams",
     "Win32_Foundation",
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
     "Win32_System_TpmBaseServices",
     "Win32_UI_WindowsAndMessaging",
 ] }
