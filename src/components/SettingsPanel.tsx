@@ -20,6 +20,7 @@ import LicensesDialog from "./LicensesDialog";
 import { DEFAULT_SCHEME } from "../ui/terminalThemes";
 import { windowSummary } from "../util/diagnostics";
 import { MAX_SCROLLBACK, MIN_SCROLLBACK, clampScrollback } from "../util/terminalScrollback";
+import { DEFAULT_INFO_FONT_SIZE, MAX_INFO_FONT_SIZE, MIN_INFO_FONT_SIZE, clampInfoFontSize } from "../util/infoFont";
 import type { WallCloseTaken } from "../util/wallClose";
 import { AiTrustOverview } from "./AiTrust";
 
@@ -377,6 +378,58 @@ function AiToolsSettings() {
 
 // Slider covers the everyday range; the number field takes anything 1–99.
 const SLIDER_MAX = 40;
+
+// The Info panel's text size (util/infoFont), with the − / + buttons the
+// terminal's font size has. Per-device, like the rest of this card.
+function InfoFontSizeSetting({ settings, setSettings }: any) {
+  const size = clampInfoFontSize(settings.infoFontSize);
+  const setSize = (n: number) => setSettings((s: any) => ({ ...s, infoFontSize: clampInfoFontSize(n) }));
+  return (
+    <div className="space-y-3 pt-6 border-t border-white/5">
+      <div className="flex justify-between items-center gap-3">
+        <label htmlFor="info-font-size" className="text-[11px] font-black text-zinc-500 uppercase tracking-wider">Info Panel Text Size (px)</label>
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            aria-label="Smaller Info panel text"
+            onClick={() => setSize(size - 1)}
+            disabled={size <= MIN_INFO_FONT_SIZE}
+            className="w-8 h-8 flex items-center justify-center bg-black border border-white/10 rounded-lg text-zinc-300 hover:text-white hover:border-primary/40 disabled:opacity-30 transition-colors"
+          >
+            <Minus size={14} />
+          </button>
+          <output
+            id="info-font-size"
+            aria-live="polite"
+            className="w-14 h-8 flex items-center justify-center bg-black border border-white/10 rounded-lg text-[12px] font-bold text-white"
+          >
+            {size}
+          </output>
+          <button
+            type="button"
+            aria-label="Larger Info panel text"
+            onClick={() => setSize(size + 1)}
+            disabled={size >= MAX_INFO_FONT_SIZE}
+            className="w-8 h-8 flex items-center justify-center bg-black border border-white/10 rounded-lg text-zinc-300 hover:text-white hover:border-primary/40 disabled:opacity-30 transition-colors"
+          >
+            <Plus size={14} />
+          </button>
+        </div>
+      </div>
+      <p className="text-[11.5px] text-zinc-500 leading-relaxed">
+        The text in a server's Info panel, from {MIN_INFO_FONT_SIZE} to {MAX_INFO_FONT_SIZE}. Its smaller labels and icons grow with it.
+        {size !== DEFAULT_INFO_FONT_SIZE && (
+          <>
+            {" "}
+            <button type="button" onClick={() => setSize(DEFAULT_INFO_FONT_SIZE)} className="font-semibold text-zinc-400 hover:text-white">
+              Back to {DEFAULT_INFO_FONT_SIZE}
+            </button>
+          </>
+        )}
+      </p>
+    </div>
+  );
+}
 
 // "Use my default shell" (open_terminal in lib.rs): offered only where this
 // computer has a shell of its own to start, which the backend knows
@@ -1006,6 +1059,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
                 ))}
               </div>
             </div>
+            <InfoFontSizeSetting settings={settings} setSettings={setSettings} />
             <div className="flex items-center justify-between gap-4 pt-6 border-t border-white/5">
               <div className="min-w-0">
                 <div className="text-sm font-semibold text-zinc-100">Compact tabs</div>

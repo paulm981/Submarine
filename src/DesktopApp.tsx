@@ -62,6 +62,7 @@ import VncSessionView from "./components/VncSessionView";
 import MonitoringPanel from "./components/MonitoringPanel";
 import PingPanel from "./components/PingPanel";
 import { PING_SOUND_KEY, readPingSound } from "./ui/ping";
+import { INFO_FONT_SIZE_KEY, readInfoFontSize } from "./util/infoFont";
 import { ErrorBoundary } from "./ui/ErrorBoundary";
 import { parseObjectList } from "./util/serverJson";
 
@@ -469,6 +470,9 @@ function DesktopApp() {
     // A short sound when a server being pinged answers again (Settings ›
     // Servers). Per-device; defaults ON. See ui/ping.
     pingSound: readPingSound(),
+    // The Info panel's text size (Settings › UI Customization). Per-device.
+    // See util/infoFont.
+    infoFontSize: readInfoFontSize(),
     // Flat tabs that touch, instead of pills (title bar and each server's
     // terminal tabs). Per-device; defaults OFF.
     compactTabs: localStorage.getItem('submarine-compact-tabs') === 'on',
@@ -506,6 +510,7 @@ function DesktopApp() {
     localStorage.setItem('submarine-confirm-close', appSettings.confirmCloseSession ? 'on' : 'off');
     localStorage.setItem(PING_SOUND_KEY, appSettings.pingSound ? 'on' : 'off');
     localStorage.setItem('submarine-compact-tabs', appSettings.compactTabs ? 'on' : 'off');
+    localStorage.setItem(INFO_FONT_SIZE_KEY, String(appSettings.infoFontSize));
     writeWallCloseTaken(appSettings.wallCloseTaken);
     // Tell already-mounted terminals to re-fit with the new font size / face.
     // Without this dispatch the listener in TerminalView is dead code and
