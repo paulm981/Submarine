@@ -46,6 +46,9 @@ const nextTabNumber = (terms: { title: string; baseTitle?: string }[]) => {
   return String(n);
 };
 
+// The start of a connect refused because the server's jump host was deleted
+// (src-tauri/src/jump_gone.rs, CODE).
+const JUMP_GONE = "[JUMP_GONE]";
 const TOOL_DOCK_KEY = "submarine-tool-dock";
 const DOCK_OPTIONS: { id: ToolDock; label: string; Icon: typeof PanelRight }[] = [
   { id: "right", label: "Right of the terminal", Icon: PanelRight },
@@ -299,6 +302,13 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
     }
   }, [status, session?.id, onStatusChange]);
   const [disconnectReason, setDisconnectReason] = useState<string>("");
+  // Refused before connecting because the server's jump host was deleted
+  // (src-tauri/src/jump_gone.rs): what to say, and the two choices.
+  const [jumpGone, setJumpGone] = useState<string | null>(null);
+  const noteRefusal = (e: unknown) => {
+    const text = String(e);
+    if (text.startsWith(JUMP_GONE)) setJumpGone(text.slice(JUMP_GONE.length).trim());
+  };
   const [logs, setLogs] = useState<{ msg: string, type: string, time?: string }[]>([]);
   // Cap to keep a chatty session (monitors, mirrors, MOTD spam) from
   // ballooning React state — each render copies the whole array, so an
@@ -1275,6 +1285,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
       invoke("initiate_connection", { sessionId: session.id, serverId: session.serverId, customPassword: customPasswordRef.current || null, quickAuth: session.quickAuth || null, sessionRole: "primary", separateSessions: separateFwdRef.current, useSshAgent: readUseSshAgent() })
     ).catch(e => {
       pushLog({ msg: `Failed to initiate: ${e}`, type: 'error' });
+      noteRefusal(e);
       setStatus('failed');
     });
 
@@ -1338,6 +1349,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
         // Refused before any connecting (the server was deleted, say): no
         // failure event follows, so don't sit on "Connecting…".
         pushLog({ msg: `Failed to initiate: ${e}`, type: 'error' });
+        noteRefusal(e);
         setStatus('failed');
         cancelReconnect();
       });
@@ -1363,6 +1375,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
     setKbiPrompt(null);
     setKbiValues([]);
     setDisconnectReason("");
+    setJumpGone(null);
     resetSecondaryStatus();
     primarySeparateRef.current = separateFwdRef.current;
     invoke("initiate_connection", {
@@ -1373,8 +1386,46 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
       sessionRole: "primary",
       separateSessions: separateFwdRef.current,
       useSshAgent: readUseSshAgent(),
-    }).catch(console.error);
+    }).catch((e) => {
+      // Refused before any connecting: no failure event follows.
+      pushLog({ msg: `Failed to initiate: ${e}`, type: 'error' });
+      noteRefusal(e);
+      setStatus('failed');
+      cancelReconnect();
+    });
   };
+
+  // The choices for a server whose jump host was deleted. Connect directly
+  // takes this click: it clears the note (and a link to nothing) and
+  // connects; the host key is checked as always. Pick a jump host opens the
+  // server's form at Jump via (DesktopApp).
+  const connectDirectly = () => {
+    invoke("jump_host_connect_directly", { serverId: session.serverId })
+      .then(() => reconnect())
+      .catch((e) => pushLog({ msg: `Couldn't change it: ${e}`, type: 'error' }));
+  };
+  const pickJumpHost = () => {
+    window.dispatchEvent(new CustomEvent("submarine-pick-jump-host", { detail: { serverId: session.serverId } }));
+  };
+  const jumpGoneChoices = jumpGone && (
+    <div role="alert" className="mb-3 sm:mb-4 px-3 py-2.5 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-200 text-[12px] leading-relaxed">
+      <p>{jumpGone}</p>
+      <div className="mt-2 flex flex-wrap gap-2">
+        <button
+          onClick={connectDirectly}
+          className="h-7 px-3 rounded-lg bg-amber-500/15 border border-amber-500/40 text-amber-100 hover:bg-amber-500/25 text-[11px] font-semibold"
+        >
+          Connect directly
+        </button>
+        <button
+          onClick={pickJumpHost}
+          className="h-7 px-3 rounded-lg bg-white/5 border border-white/10 text-zinc-200 hover:bg-white/10 hover:text-white text-[11px] font-semibold"
+        >
+          Pick a jump host
+        </button>
+      </div>
+    </div>
+  );
 
   // Tab-strip right-click "Reconnect" fires a DOM CustomEvent rather than
   // round-tripping through React props — keeps DesktopApp's tab UI decoupled
@@ -1621,6 +1672,8 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               }}
             />
           )}
+
+          {status === 'failed' && jumpGoneChoices}
 
           {/* Log Window. `min-h-0` is what makes it actually scroll: a flex
               child defaults to min-height:auto (its content height), so without
@@ -2178,6 +2231,8 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           );
         })()
       )}
+
+      {status === 'failed' && jumpGone && <div className="shrink-0 px-3 sm:px-4 pt-2">{jumpGoneChoices}</div>}
 
       {/* Tab Content Split Pane. Side-by-side on roomy desktop; on narrow
           (`isCompact`) viewports the tool pane takes over the full width

@@ -10,6 +10,7 @@ import {
 import { ScrollableTabs } from "./ScrollableTabs";
 import { useConfirm } from "../ui/confirm";
 import { useRootInvoke } from "../ui/rootInvoke";
+import { DEFAULT_INFO_FONT_SIZE, useInfoFontSize } from "../util/infoFont";
 
 interface DockerTabProps {
   sessionId: string;
@@ -1473,12 +1474,19 @@ const Empty = ({ children }: { children: React.ReactNode }) => (
   <div className="text-[11px] text-zinc-500 italic">{children}</div>
 );
 
-const ModalShell = ({ title, onClose, actions, children }: { title: string; onClose: () => void; actions?: React.ReactNode; children: React.ReactNode }) => (
+const ModalShell = ({ title, onClose, actions, children }: { title: string; onClose: () => void; actions?: React.ReactNode; children: React.ReactNode }) => {
+  // The Info panel around it is zoomed to its text size (#56, util/infoFont):
+  // undone here, so a dialog is drawn at its own size and never outgrows the
+  // window. It stays inside the panel (not a portal), so it's hidden with
+  // its tab.
+  const infoSize = useInfoFontSize();
+  const unzoom = infoSize === DEFAULT_INFO_FONT_SIZE ? undefined : { zoom: DEFAULT_INFO_FONT_SIZE / infoSize };
+  return (
   // On phones we go full-bleed: no outer padding, no rounded corners, no
   // border — the modal IS the screen. From sm: up we revert to a centered
   // card with the soft-edge look. Saves the ~24 px of viewport that a
   // floating card eats on a 360 px screen.
-  <div className="fixed inset-0 z-[9999] bg-black/60 backdrop-blur-sm flex sm:items-center sm:justify-center sm:p-3 animate-in fade-in" onClick={onClose}>
+  <div style={unzoom} className="fixed inset-0 z-[9999] bg-black/60 backdrop-blur-sm flex sm:items-center sm:justify-center sm:p-3 animate-in fade-in" onClick={onClose}>
     <div onClick={(e) => e.stopPropagation()} className="bg-[#0c0c0e] sm:border sm:border-white/10 sm:rounded-xl w-full sm:max-w-3xl h-full sm:h-[80vh] flex flex-col overflow-hidden shadow-2xl">
       <div className="shrink-0 h-11 sm:h-10 px-3 flex items-center justify-between border-b border-white/5 bg-white/[0.02]">
         <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-300 truncate select-text">{title}</span>
@@ -1495,6 +1503,7 @@ const ModalShell = ({ title, onClose, actions, children }: { title: string; onCl
       {children}
     </div>
   </div>
-);
+  );
+};
 
 export default DockerTab;

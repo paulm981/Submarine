@@ -60,6 +60,9 @@ import RdpSessionView from "./components/RdpSessionView";
 import TelnetSessionView from "./components/TelnetSessionView";
 import VncSessionView from "./components/VncSessionView";
 import MonitoringPanel from "./components/MonitoringPanel";
+import PingPanel from "./components/PingPanel";
+import { PING_SOUND_KEY, readPingSound } from "./ui/ping";
+import { INFO_FONT_SIZE_KEY, readInfoFontSize } from "./util/infoFont";
 import { ErrorBoundary } from "./ui/ErrorBoundary";
 import { parseObjectList } from "./util/serverJson";
 
@@ -312,6 +315,8 @@ function DesktopApp() {
   // for the whole profile session.
   const [activeFolderId, setActiveFolderId] = useState<number | null>(null);
   const [isPanelOpen, setIsPanelOpen] = useState(false);
+  // The form opened at Jump via ("Pick a jump host", see below).
+  const [focusJumpVia, setFocusJumpVia] = useState(false);
   const [isQuickConnectOpen, setIsQuickConnectOpen] = useState(false);
   const [servers, setServers] = useState<any[]>([]);
   const [credentials, setCredentials] = useState<any[]>([]);
@@ -464,6 +469,12 @@ function DesktopApp() {
     // Ask before closing a tab whose session is connected (Settings ›
     // Servers, or "Don't ask again" in the prompt). Defaults ON.
     confirmCloseSession: localStorage.getItem('submarine-confirm-close') !== 'off',
+    // A short sound when a server being pinged answers again (Settings ›
+    // Servers). Per-device; defaults ON. See ui/ping.
+    pingSound: readPingSound(),
+    // The Info panel's text size (Settings › UI Customization). Per-device.
+    // See util/infoFont.
+    infoFontSize: readInfoFontSize(),
     // Flat tabs that touch, instead of pills (title bar and each server's
     // terminal tabs). Per-device; defaults OFF.
     compactTabs: localStorage.getItem('submarine-compact-tabs') === 'on',
@@ -499,7 +510,9 @@ function DesktopApp() {
     localStorage.setItem('submarine-detect-os', appSettings.detectOs ? 'on' : 'off');
     localStorage.setItem('submarine-watch-upstream', appSettings.watchUpstream ? 'on' : 'off');
     localStorage.setItem('submarine-confirm-close', appSettings.confirmCloseSession ? 'on' : 'off');
+    localStorage.setItem(PING_SOUND_KEY, appSettings.pingSound ? 'on' : 'off');
     localStorage.setItem('submarine-compact-tabs', appSettings.compactTabs ? 'on' : 'off');
+    localStorage.setItem(INFO_FONT_SIZE_KEY, String(appSettings.infoFontSize));
     writeWallCloseTaken(appSettings.wallCloseTaken);
     // Tell already-mounted terminals to re-fit with the new font size / face.
     // Without this dispatch the listener in TerminalView is dead code and
@@ -1715,7 +1728,8 @@ function DesktopApp() {
       .catch((e) => addLog(`QUICK_NODE_SAVE_FAILED: ${e}`, "error"));
   };
 
-  const handleEditNode = async (server: any) => {
+  const handleEditNode = async (server: any, opts?: { focusJump?: boolean }) => {
+    setFocusJumpVia(!!opts?.focusJump);
     // Servers come back from get_servers with `has_password` (boolean) but
     // no plaintext. Reveal the secret only when the user opens the edit
     // sheet — that way the password never sits in renderer memory during
@@ -1766,6 +1780,19 @@ function DesktopApp() {
     setFormError("");
     setIsPanelOpen(true);
   };
+
+  // "Pick a jump host", from a tab whose server's jump host was deleted
+  // (SessionView): its form, at Jump via.
+  useEffect(() => {
+    const onPick = (e: Event) => {
+      const id = (e as CustomEvent<{ serverId: number }>).detail?.serverId;
+      const server = (servers || []).find((x: any) => x.id === id);
+      if (server) void handleEditNode(server, { focusJump: true });
+    };
+    window.addEventListener("submarine-pick-jump-host", onPick);
+    return () => window.removeEventListener("submarine-pick-jump-host", onPick);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [servers]);
 
   // Render helper, NOT a component — it is invoked as `{TitleBar()}` below,
   // never as `<TitleBar />`. Rendering it as a JSX element would give it a
@@ -3435,6 +3462,7 @@ function DesktopApp() {
             />
           )}
           {!isMobile && treeOpen && treeSide === "right" && sessionTree}
+          <PingPanel />
           {aiOpen && ai.enabled && (
             <AiPanel
               snap={ai}
@@ -3451,7 +3479,8 @@ function DesktopApp() {
       <AiTrustModal />
 
       <AddNodePanel
-        isOpen={isPanelOpen} onClose={() => { setIsPanelOpen(false); setFormError(""); }}
+        isOpen={isPanelOpen} onClose={() => { setIsPanelOpen(false); setFormError(""); setFocusJumpVia(false); }}
+        focusJump={focusJumpVia}
         newNode={newNode} setNewNode={setNewNode}
         isEditMode={!!newNode.id}
         onSave={async () => {

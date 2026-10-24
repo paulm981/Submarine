@@ -192,9 +192,28 @@ fn wsl_default_distro() -> Option<String> {
 /// A string value under HKEY_CURRENT_USER.
 #[cfg(windows)]
 fn user_registry_string(key: &str, value: &str) -> Option<String> {
-    use std::ffi::c_void;
     // (HKEY)(ULONG_PTR)(LONG)0x80000001, sign-extended as Windows does.
     const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as i32 as isize;
+    registry_string(HKEY_CURRENT_USER, key, value)
+}
+
+/// Windows' build number (e.g. 22631), as it records it. xterm uses it to
+/// match how this Windows' pseudo-console wraps and redraws lines on a
+/// resize.
+#[cfg(windows)]
+fn windows_build() -> Option<u32> {
+    // (HKEY)(ULONG_PTR)(LONG)0x80000002, as above.
+    const HKEY_LOCAL_MACHINE: isize = 0x8000_0002u32 as i32 as isize;
+    registry_string(HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "CurrentBuildNumber")?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// A string value under `root`.
+#[cfg(windows)]
+fn registry_string(root: isize, key: &str, value: &str) -> Option<String> {
+    use std::ffi::c_void;
     const RRF_RT_REG_SZ: u32 = 0x0000_0002;
     #[link(name = "advapi32")]
     extern "system" {
@@ -214,7 +233,7 @@ fn user_registry_string(key: &str, value: &str) -> Option<String> {
     let mut bytes = (buf.len() * 2) as u32;
     let rc = unsafe {
         RegGetValueW(
-            HKEY_CURRENT_USER,
+            root,
             key.as_ptr(),
             value.as_ptr(),
             RRF_RT_REG_SZ,
@@ -533,7 +552,7 @@ mod pty {
     use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
     use std::collections::{HashMap, HashSet};
     use std::io::{Read, Write};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
     use tauri::{Emitter, Manager};
@@ -678,10 +697,15 @@ mod pty {
         // thread takes keystrokes.
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let output_over = Arc::new(AtomicBool::new(false));
+        let batches = Arc::new(AtomicUsize::new(0));
         std::thread::spawn(move || pump_reader(reader, tx));
-        let over = output_over.clone();
+        let (over, sent) = (output_over.clone(), batches.clone());
+        let mut flush = flush;
         std::thread::spawn(move || {
-            send_batches(rx, flush);
+            send_batches(rx, |batch: &mut Vec<u8>| {
+                flush(batch);
+                sent.fetch_add(1, Ordering::SeqCst);
+            });
             over.store(true, Ordering::SeqCst);
             end_once();
         });
@@ -690,17 +714,49 @@ mod pty {
         // When the shell exits, let go of the terminal: on Windows the
         // output pipe only ends once the pseudo-console is closed, and on
         // Unix a job left in the background can keep it open. The pause
-        // first lets the reader take what the shell wrote last.
+        // first lets the reader take what the shell wrote last. Closing a
+        // pseudo-console can hand over a last batch of output, so that's
+        // waited for too, briefly, before the end is said.
         let (terms2, id2) = (terms.clone(), id.to_string());
         std::thread::spawn(move || {
             let _ = child.wait();
             std::thread::sleep(Duration::from_millis(200));
             drop(terms2.take(&id2));
-            if !output_over.load(Ordering::SeqCst) {
+            if !wait_for_last_output(&output_over, &batches, END_QUIET, END_WAIT_MAX) {
                 end_on_exit();
             }
         });
         Ok(())
+    }
+
+    /// After the shell has exited, how long its output must have been quiet
+    /// for it to be over, and the longest that's waited for.
+    const END_QUIET: Duration = Duration::from_millis(100);
+    const END_WAIT_MAX: Duration = Duration::from_millis(1000);
+
+    /// Wait until the output is over (true), or has sent no batch for
+    /// `quiet` (false), but no longer than `max` (false).
+    pub(super) fn wait_for_last_output(over: &AtomicBool, batches: &AtomicUsize, quiet: Duration, max: Duration) -> bool {
+        let until = Instant::now() + max;
+        let mut seen = batches.load(Ordering::SeqCst);
+        let mut quiet_since = Instant::now();
+        loop {
+            if over.load(Ordering::SeqCst) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= until {
+                return false;
+            }
+            let n = batches.load(Ordering::SeqCst);
+            if n != seen {
+                seen = n;
+                quiet_since = now;
+            } else if now.duration_since(quiet_since) >= quiet {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     type Started = ((Term, mpsc::Receiver<Vec<u8>>), Box<dyn portable_pty::Child + Send + Sync>, Box<dyn Read + Send>, Box<dyn Write + Send>);
@@ -919,6 +975,20 @@ fn ai_shell(tool: &str, launch: crate::ai::HomeLaunch) -> Shell {
     s
 }
 
+/// The Windows build number for a Home terminal's xterm (`windowsPty`);
+/// None elsewhere, or when it can't be read.
+#[tauri::command]
+pub fn local_windows_build() -> Option<u32> {
+    #[cfg(windows)]
+    {
+        windows_build()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 #[tauri::command]
 pub async fn local_terminal_write(terms: tauri::State<'_, LocalTerms>, terminal_id: String, data: Vec<u8>) -> Result<(), String> {
     #[cfg(target_os = "android")]
@@ -993,6 +1063,50 @@ mod tests {
     fn etc_shells_leaves_out_the_ones_that_refuse_logins() {
         let listed = "# /etc/shells: valid login shells\n/bin/sh\n/usr/bin/bash\n/usr/sbin/nologin\n/bin/false\n/usr/bin/git-shell\n  /usr/bin/zsh  \nnot-a-path\n";
         assert_eq!(etc_shells(listed), vec![PathBuf::from("/bin/sh"), PathBuf::from("/usr/bin/bash"), PathBuf::from("/usr/bin/zsh")]);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn the_end_waits_for_the_last_output() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let (quiet, max) = (Duration::from_millis(100), Duration::from_millis(1000));
+        // Output already over: its own end is said, not this one.
+        let over = AtomicBool::new(true);
+        assert!(pty::wait_for_last_output(&over, &AtomicUsize::new(0), quiet, max));
+        // Nothing more comes: a short wait.
+        let over = AtomicBool::new(false);
+        let t = Instant::now();
+        assert!(!pty::wait_for_last_output(&over, &AtomicUsize::new(0), quiet, max));
+        assert!(t.elapsed() < Duration::from_millis(500), "{:?}", t.elapsed());
+        // A last batch arrives: waited for, then the output ends.
+        let (over, batches) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+        let (o, b) = (over.clone(), batches.clone());
+        let late = std::thread::spawn(move || {
+            for _ in 0..5 {
+                std::thread::sleep(Duration::from_millis(40));
+                b.fetch_add(1, Ordering::SeqCst);
+            }
+            o.store(true, Ordering::SeqCst);
+        });
+        assert!(pty::wait_for_last_output(&over, &batches, quiet, max));
+        late.join().unwrap();
+        // Output that never stops (a job left running): not past the cap.
+        let (over, batches) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)));
+        let (stop, b) = (Arc::new(AtomicBool::new(false)), batches.clone());
+        let s = stop.clone();
+        let busy = std::thread::spawn(move || {
+            while !s.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(20));
+                b.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let t = Instant::now();
+        assert!(!pty::wait_for_last_output(&over, &batches, quiet, max));
+        assert!(t.elapsed() >= max && t.elapsed() < max * 3, "{:?}", t.elapsed());
+        stop.store(true, Ordering::SeqCst);
+        busy.join().unwrap();
     }
 
     #[test]

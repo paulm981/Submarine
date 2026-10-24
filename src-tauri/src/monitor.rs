@@ -413,10 +413,13 @@ async fn run_poller(
     db: Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
     settings: SharedSettings,
     node_name: String,
-    auth: NodeAuth,
+    mut auth: NodeAuth,
     mut stop_rx: oneshot::Receiver<()>,
 ) {
     let node_id = entry.node_id;
+    // Its jump host was deleted while it ran: what it was started with is
+    // read again once the user has chosen.
+    let mut auth_stale = false;
     let mut last: Option<RawSnapshot> = None;
     let mut handle: Option<MonitorSession> = None;
     let mut backoff = Duration::from_secs(2);
@@ -540,6 +543,40 @@ async fn run_poller(
         // a slow or hung handshake tears the poller down at once, instead of
         // waiting out the connect/handshake budget (up to connect_timeout * 2).
         if handle.as_ref().map(|h| h.is_closed()).unwrap_or(true) {
+            // Its jump host was deleted: not checked, rather than directly or
+            // through the one it was started with (jump_gone.rs). Looked at
+            // again each interval; once the user chooses, it starts over
+            // with the server as it's saved now.
+            let refused = db.lock().ok().and_then(|g| g.as_ref().and_then(|c| crate::jump_gone::reason(c, i64::from(node_id))));
+            if let Some(why) = refused {
+                auth_stale = true;
+                mark_disconnected(&app, &entry, Some(why)).await;
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    _ = tokio::time::sleep(interval) => {}
+                }
+                continue;
+            }
+            if auth_stale {
+                let fresh = db.lock().map_err(|_| "lock".to_string()).and_then(|g| match g.as_ref() {
+                    Some(c) => crate::resolve_node_auth_for_monitor(c, node_id),
+                    None => Err("db not ready".into()),
+                });
+                match fresh {
+                    Ok(a) => {
+                        auth = a;
+                        auth_stale = false;
+                    }
+                    Err(why) => {
+                        mark_disconnected(&app, &entry, Some(why)).await;
+                        tokio::select! {
+                            _ = &mut stop_rx => break,
+                            _ = tokio::time::sleep(interval) => {}
+                        }
+                        continue;
+                    }
+                }
+            }
             let target = match with_ssh_config(&db, &auth, &node_name).await {
                 Ok(t) => t,
                 Err(why) => {

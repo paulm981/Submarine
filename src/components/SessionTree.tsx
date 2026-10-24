@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
-  ArrowLeftRight, Bot, ChevronRight, ChevronsDownUp, Copy, CopyPlus, Folder, FolderInput, FolderOpen, FolderPlus,
+  Activity, ArrowLeftRight, Bot, ChevronRight, ChevronsDownUp, Copy, CopyPlus, Folder, FolderInput, FolderOpen, FolderPlus,
   Eye, LayoutGrid, Monitor, MonitorSmartphone, Pencil, Play, Plus, Search, ShieldAlert, TerminalSquare, Trash2, X,
 } from "lucide-react";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
@@ -11,6 +11,8 @@ import RdpLinkModal, { type RdpLink } from "./RdpLinkModal";
 import MoveToFolderModal from "./MoveToFolderModal";
 import { OsBadge, osName } from "./OsBadge";
 import { openAiTrust, useAi } from "../util/ai";
+import { pingServers } from "../ui/ping";
+import { jumpHostNote } from "../util/jumpHostNote";
 
 // The session tree beside the main view, in the spirit of MobaXterm's
 // Sessions sidebar: every folder, server and Remote Desktop link as one
@@ -69,6 +71,8 @@ const OPEN_MANY = 10;
 // A wall is one tab however many it holds; past this many it still asks,
 // as each one connects.
 const WALL_MANY = 30;
+// More servers than this pinged at once asks first (pingMany).
+const PING_MANY = 10;
 // How far the pointer travels before a press becomes a drag, how long a drag
 // hovers on a closed folder before it opens, and the band at the list's top
 // and bottom edges that scrolls it.
@@ -349,6 +353,17 @@ export const SessionTree = ({
     onOpenAsWall(list, name);
   };
   const openSelectedAsWall = () => openAsWall(pickedWall, `${pickedWall.length} servers`);
+  // Many at once is asked about first, as a big Wall is: each check is a
+  // connection, and a server or jump host that bans repeated ones could ban
+  // you, or the jump host.
+  const pingMany = async (list: any[]) => {
+    if (list.length > PING_MANY && !(await confirm({
+      title: `Ping ${list.length} servers?`,
+      message: "Each one is checked every 2 seconds until it answers, then every 30 seconds. A server or jump host that blocks addresses making many connections (fail2ban, sshguard) could block yours.",
+      okLabel: `Ping ${list.length}`,
+    }))) return;
+    pingServers(list);
+  };
 
   // The rows a move or a delete is about: the selection when `r` is in it
   // (or there is no `r`), else just `r`.
@@ -468,7 +483,10 @@ export const SessionTree = ({
     const it = itemsFor(r);
     if (itemCount(it) === 0) return;
     const folderIds = new Set(it.folders.flatMap((f) => subtreeIds(index, f)));
-    const nServers = new Set([...it.servers, ...(servers || []).filter((x) => folderIds.has(known(x.folder_id) as number)).map((x) => x.id)]).size;
+    const goneServers = new Set<number>([...it.servers, ...(servers || []).filter((x) => folderIds.has(known(x.folder_id) as number)).map((x) => x.id)]);
+    const nServers = goneServers.size;
+    // Servers staying that go through one of these as their jump host.
+    const jumpNote = jumpHostNote(servers, goneServers);
     const nLinks = new Set([...it.links, ...(rdpLinks || []).filter((x) => folderIds.has(known(x.folder_id) as number)).map((x) => x.id)]).size;
     const parts = [
       folderIds.size && plural(folderIds.size, "folder"),
@@ -478,7 +496,7 @@ export const SessionTree = ({
     const list = parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}` : parts[0];
     const ok = await confirm({
       title: itemCount(it) === 1 ? `Delete ${describe(it)}?` : `Delete ${plural(itemCount(it), "item")}?`,
-      message: `${list} will be removed from Submarine. Nothing changes on the servers themselves, and tabs already open stay connected until you close them.`,
+      message: `${list} will be removed from Submarine. Nothing changes on the servers themselves, and tabs already open stay connected until you close them.${jumpNote}`,
       okLabel: "Delete",
       destructive: true,
     });
@@ -885,7 +903,7 @@ export const SessionTree = ({
         />
         <div
           className="fixed z-[9999] w-[250px] py-1 bg-[#15151a] border border-white/10 rounded-lg shadow-2xl text-[11.5px]"
-          style={{ left: Math.min(menu.x, window.innerWidth - 270), top: Math.min(menu.y, window.innerHeight - 330) }}
+          style={{ left: Math.min(menu.x, window.innerWidth - 270), top: Math.min(menu.y, window.innerHeight - 360) }}
         >
           {menu.row === null ? (
             newItems(null)
@@ -960,6 +978,15 @@ export const SessionTree = ({
                     <CopyPlus size={13} className={menuIcon} /> Duplicate
                   </button>
                 )}
+                {r.kind === "server" && (() => {
+                  // Several selected: each server among them.
+                  const list = pickedCount > 1 && selected.has(r.key) ? picked.list : [r.server];
+                  return list.length > 0 && (
+                    <button className={menuItem} onClick={run(() => void pingMany(list))}>
+                      <Activity size={13} className={menuIcon} /> {list.length > 1 ? `Ping ${list.length} servers` : "Ping"}
+                    </button>
+                  );
+                })()}
                 {!many && (
                   <button className={menuItem} onClick={run(() => { navigator.clipboard?.writeText(String(host)).catch(() => {}); })}>
                     <Copy size={13} className={menuIcon} /> Copy host name

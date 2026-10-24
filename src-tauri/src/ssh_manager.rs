@@ -391,6 +391,16 @@ async fn pty_pump<F>(
     writer.abort();
 }
 
+/// A session's route through its jump hosts (`SshState::jump_connections`):
+/// their Handles, the last jump host last, each shared so a check through it
+/// (ping.rs) takes its own reference instead of holding the map; the
+/// connections close once the last reference goes. `jump_id`: the saved
+/// jump host it went through, None for a ProxyJump from ~/.ssh/config.
+pub struct JumpRoute {
+    pub jump_id: Option<i32>,
+    pub handles: Vec<Arc<client::Handle<ClientHandler>>>,
+}
+
 pub struct SshState {
     pub fp_txs: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     /// Pending keyboard-interactive (2FA / OTP) prompt responses, keyed by the
@@ -408,7 +418,7 @@ pub struct SshState {
     /// here purely to keep it (and thus the direct-tcpip channel carrying the
     /// target's transport) alive for the session's lifetime. Removed — and so
     /// dropped/closed — on reconnect teardown, disconnect, and profile close.
-    pub jump_connections: Arc<Mutex<HashMap<String, Vec<client::Handle<ClientHandler>>>>>,
+    pub jump_connections: Arc<Mutex<HashMap<String, JumpRoute>>>,
     pub terminal_txs: Arc<Mutex<HashMap<String, mpsc::Sender<TerminalCommand>>>>,
     /// Per-terminal "last requested PTY size" watch. The PTY task selects
     /// on this in parallel with `terminal_txs` and forwards `window_change`

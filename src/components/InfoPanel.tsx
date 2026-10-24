@@ -11,6 +11,7 @@ import { ScrollableTabs } from "./ScrollableTabs";
 import { useConfirm } from "../ui/confirm";
 import { useRootInvoke } from "../ui/rootInvoke";
 import CopyValue from "./CopyValue";
+import { DEFAULT_INFO_FONT_SIZE, useInfoFontSize } from "../util/infoFont";
 
 interface InfoPanelProps {
   sessionId: string;
@@ -826,6 +827,8 @@ const subTabActive = "bg-primary/10 text-primary border border-primary/20 shadow
 
 const InfoPanel = ({ sessionId, disabled, visible = true, onOpenContainerTerminal }: InfoPanelProps) => {
   const [tab, setTab] = useState<SubTab>("overview");
+  // Settings › UI Customization: its text is 11px, scaled to this.
+  const fontSize = useInfoFontSize();
 
   const [overview, setOverview] = useState<TabState<OverviewData>>(freshTab);
   const [network, setNetwork] = useState<TabState<NetworkData>>(freshTab);
@@ -963,7 +966,7 @@ const InfoPanel = ({ sessionId, disabled, visible = true, onOpenContainerTermina
     : activeState.loading ? "Probing…" : activeState.loaded ? "" : "Pending";
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden">
+    <div className="flex-1 flex flex-col overflow-hidden" style={fontSize === DEFAULT_INFO_FONT_SIZE ? undefined : { zoom: fontSize / DEFAULT_INFO_FONT_SIZE }}>
       <div className="shrink-0 h-9 px-3 flex items-center justify-between border-b border-white/5 bg-white/[0.02] gap-2">
         <span className="text-[10px] text-zinc-500 truncate select-text">{fmtMeta}</span>
         {tab !== "docker" && tab !== "processes" && (

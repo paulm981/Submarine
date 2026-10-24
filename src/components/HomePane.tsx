@@ -244,9 +244,11 @@ export const HomePane = ({ visible, onLiveShells }: { visible: boolean; onLiveSh
                   onAiStarted.current.delete(t.id);
                   started?.(t.id);
                 },
-                // Couldn't start (the error is in the tab): the AI side
-                // pane stops waiting for it.
+                // Couldn't start (the error is in the tab): it's ended, so
+                // it takes no typing and isn't counted as a running shell
+                // when closing, and the AI side pane stops waiting for it.
                 onFailed: () => {
+                  setTabs((prev) => prev.map((x) => (x.id === t.id ? { ...x, ended: true } : x)));
                   onAiStarted.current.delete(t.id);
                   aiStartEnded(t.id);
                 },
