@@ -397,6 +397,15 @@ mod tests {
         assert!(matches!(reply, PingReply::Answers { .. }), "{reply:?}");
         drop(listener);
         let reply = from_reach(port, crate::diagnose::reach("127.0.0.1", port, CHECK_TIMEOUT).await);
-        assert_eq!(reply, PingReply::Refused { port });
+        if cfg!(windows) {
+            // Windows retries a refused connect for about 2 s, longer than a
+            // check waits, so a closed port there reads as no answer.
+            assert!(
+                matches!(reply, PingReply::Refused { .. } | PingReply::NoAnswer { why: None, .. }),
+                "{reply:?}"
+            );
+        } else {
+            assert_eq!(reply, PingReply::Refused { port });
+        }
     }
 }
