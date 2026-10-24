@@ -1,8 +1,9 @@
 import { ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Bot, Check, ChevronDown, ChevronRight, Loader2, ShieldAlert, Square, X } from "lucide-react";
-import { AiDone, AiPending, AiSnapshot } from "../util/ai";
+import { Bot, Check, ChevronDown, ChevronRight, Loader2, ShieldAlert, Square, X, Zap } from "lucide-react";
+import { AiDone, AiPending, AiSnapshot, runnerWarning } from "../util/ai";
 import { HIDDEN_CONTROLS } from "../util/fileName";
+import { WILDCARD_WARNING } from "./AiTrust";
 
 // The AI panel (#32): one for the whole app, docked on the right and opened
 // from the title bar's AI button. It holds what every AI tab does, on every
@@ -12,7 +13,10 @@ import { HIDDEN_CONTROLS } from "../util/fileName";
 //
 // A request never takes the keyboard: nothing here takes focus, the buttons
 // can't be reached with Tab, and only a click (never Enter or Space) allows
-// or denies, so typing in a terminal can't approve anything.
+// or denies, so typing in a terminal can't approve anything. The fields a
+// card can show (a note with Deny, the rule for "Always allow", the root
+// password for a request as root) take the keyboard only when clicked, and
+// Enter in them does nothing: they never approve anything by themselves.
 
 /// A click with the mouse (or a tap), not a key: a keyboard "click" has no
 /// detail count.
@@ -78,11 +82,48 @@ const SETTLE_MS = 500;
 /// A request waiting for you. Its Allow and Deny only take a deliberate
 /// click: a single click (not a double-click's second), pressed and
 /// released on this card, and not within SETTLE_MS of the card appearing or
-/// moving. So when a card above it goes (the AI can withdraw one) and this
+/// moving. A card that comes back (a request as root asking for the
+/// password) is a new card: its key has the time it was asked again. So when a card above it goes (the AI can withdraw one) and this
 /// one slides up under the pointer, a click meant for the other can't
 /// decide it.
-export const PendingCard = ({ p, decide, onGoToServer }: { p: AiPending; decide: (allow: boolean) => void; onGoToServer: (sessionId: string) => void }) => {
+export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
+  p: AiPending;
+  /// The server's approval level now (#115).
+  level: number;
+  /// Allow (with the root password typed on a card as root, if any), or
+  /// Deny with an optional note for the AI.
+  decide: (allow: boolean, note?: string, password?: string) => void;
+  /// The card's other actions: "Always allow this command here" and "Allow
+  /// everything here until this AI tab closes".
+  act: (cmd: string, args: Record<string, unknown>) => void;
+  onGoToServer: (sessionId: string) => void;
+}) => {
   const ref = useRef<HTMLDivElement>(null);
+  // Which of the card's extra parts is open: the rule to save, or the note
+  // to deny with.
+  const [extra, setExtra] = useState<"rule" | "note" | null>(null);
+  const [rule, setRule] = useState(p.command.trim());
+  const [note, setNote] = useState("");
+  // The root password for a request as root (#120): typed here, sent only
+  // with Allow, to the app, which hands it to sudo's or dzdo's own prompt.
+  // Never shown, and cleared as it's sent or when the card asks again.
+  const [password, setPassword] = useState("");
+  useEffect(() => { setPassword(""); }, [p.password]);
+  const asksPassword = p.as_root && p.password !== "none";
+  const allow = () => {
+    const typed = asksPassword ? password : "";
+    setPassword("");
+    decide(true, undefined, typed);
+  };
+  // The AI's own `*` (a glob in its command) would allow far more as a
+  // rule: it has to be edited first.
+  const globAsRule = rule.trim().endsWith("*") && rule.trim() === p.command.trim();
+  // A wildcard rule for a command that runs other commands takes one more
+  // click, for the rule as it is when that click comes.
+  const runner = runnerWarning(rule);
+  const [confirmed, setConfirmed] = useState<string | null>(null);
+  // When it was asked for: the confirming click waits SETTLE_MS after it.
+  const confirmedAt = useRef(0);
   const settledAt = useRef(0);
   const lastTop = useRef<number | null>(null);
   const downHere = useRef(false);
@@ -131,12 +172,21 @@ export const PendingCard = ({ p, decide, onGoToServer }: { p: AiPending; decide:
   };
   const down = () => { downHere.current = !moved() && performance.now() >= settledAt.current; };
   const loginIsRoot = p.user === "root";
+  // The fields: Enter does nothing, and no key in them reaches the app.
+  const fieldKeys = (e: React.KeyboardEvent) => {
+    e.stopPropagation();
+    if (e.key === "Enter") e.preventDefault();
+  };
+  const link = "text-[10.5px] text-zinc-400 hover:text-white underline-offset-2 hover:underline text-left";
+  const field = "w-full h-7 px-2 bg-black/40 border border-white/10 rounded-md font-mono text-[11px] text-zinc-100 outline-none focus:border-primary/50 placeholder:text-zinc-600";
   return (
     <div ref={ref} className="m-2 rounded-xl border border-primary/30 bg-primary/[0.06] p-3 space-y-2">
       <div className="text-[11.5px] text-zinc-300">
         <span className="font-bold text-white">{p.tab_label}</span> wants to run on{" "}
         <NoFocusButton onPick={() => onGoToServer(p.session_id)} className="font-bold text-white hover:underline">{p.server}</NoFocusButton>
-        {p.user && <> as <span className={`font-bold ${loginIsRoot ? "text-amber-300" : "text-white"}`}>{p.user}</span></>}
+        {p.as_root ? (
+          <> as <span className="font-bold text-amber-300">root</span>{!loginIsRoot && <span className="text-zinc-400"> (via {p.root_via ?? "sudo or dzdo"})</span>}</>
+        ) : p.user && <> as <span className={`font-bold ${loginIsRoot ? "text-amber-300" : "text-white"}`}>{p.user}</span></>}
         {p.timeout_secs !== 60 && <span className="text-zinc-500"> · stops after {p.timeout_secs}s</span>}
       </div>
       {p.root && (
@@ -145,7 +195,9 @@ export const PendingCard = ({ p, decide, onGoToServer }: { p: AiPending; decide:
           <span>
             {loginIsRoot
               ? "Runs as root: this server's tab is logged in as root."
-              : "Asks for root (sudo, dzdo, su, doas or pkexec). Where those need no password, it runs as root and nothing asks first."}
+              : p.as_root
+                ? "The AI asks to run this as root. Submarine runs it through the server's sudo or dzdo, and gives any password only to their own prompt. The AI never sees it."
+                : "Asks for root (sudo, dzdo, su, doas or pkexec). Where those need no password, it runs as root and nothing asks first."}
           </span>
         </div>
       )}
@@ -155,13 +207,54 @@ export const PendingCard = ({ p, decide, onGoToServer }: { p: AiPending; decide:
           <span>It has hidden or control characters, shown below as ⟨U+…⟩.</span>
         </div>
       )}
+      {p.note && (
+        <div className="flex items-start gap-1.5 text-[11px] text-amber-300">
+          <ShieldAlert size={13} className="shrink-0 mt-px" />
+          <span>{p.note}</span>
+        </div>
+      )}
+      {p.ask_rule && (
+        <div className="flex items-start gap-1.5 text-[11px] text-amber-300">
+          <ShieldAlert size={13} className="shrink-0 mt-px" />
+          <span>Asks because of your always-ask rule <code className="text-amber-200">{p.ask_rule}</code>.</span>
+        </div>
+      )}
       {/* The whole command, never cut off. */}
       <pre className="whitespace-pre-wrap break-all rounded-lg bg-black/50 border border-white/10 p-2 font-mono text-[11.5px] text-zinc-100 select-text">
         {showPlainly(p.command)}
       </pre>
+      {asksPassword && (
+        <div className="space-y-1">
+          {p.password === "wrong" && (
+            <p className="text-[11px] text-red-300 leading-snug">That password didn't work, and counted as one try. Type it again, or deny.</p>
+          )}
+          {p.password === "needed" && (
+            <p className="text-[11px] text-amber-300 leading-snug">{p.server} asks for a root password{p.root_via ? ` (${p.root_via})` : ""}.</p>
+          )}
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={fieldKeys}
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            name={`ai-root-${p.id}`}
+            placeholder={p.password === "optional" ? "Root password (leave empty if the server doesn't ask)" : "Root password"}
+            aria-label={`The root password for ${p.server}`}
+            className={`${field} font-sans`}
+          />
+          <p className="text-[10px] text-zinc-500 leading-snug">
+            Kept for this AI tab and server until access ends. It goes only to sudo's or dzdo's own prompt, never to the AI or the logs.
+            It's only as safe as the server account, though: a program running as that account could catch it. A sudoers rule that
+            needs no password for the commands you want is safer.
+          </p>
+        </div>
+      )}
       <div className="flex gap-2">
         <NoFocusButton
-          onPick={() => decide(true)}
+          onPick={allow}
           onDown={down}
           accept={accept}
           className="flex-1 h-8 rounded-lg bg-primary/15 border border-primary/40 text-primary text-[11px] font-bold uppercase tracking-wider hover:bg-primary hover:text-zinc-950 flex items-center justify-center gap-1.5"
@@ -177,9 +270,97 @@ export const PendingCard = ({ p, decide, onGoToServer }: { p: AiPending; decide:
           <X size={13} /> Deny
         </NoFocusButton>
       </div>
+      <div className="flex flex-col items-start gap-1">
+        {p.can_allow_always && extra !== "rule" && (
+          <NoFocusButton onPick={() => setExtra("rule")} className={link}>Always allow this command here…</NoFocusButton>
+        )}
+        {extra === "rule" && (
+          <div className="w-full space-y-1.5 rounded-lg border border-white/10 bg-black/20 p-2">
+            <div className="text-[10.5px] text-zinc-400">Always allow on {p.server}:</div>
+            <input value={rule} onChange={(e) => setRule(e.target.value)} onKeyDown={fieldKeys} spellCheck={false} aria-label="The command to always allow" className={field} />
+            <p className="text-[10.5px] text-zinc-500 leading-snug">
+              Exactly this command. End it with <code>&nbsp;*</code> to allow any arguments.
+              {level < 2 && " This server asks every time now: saving also sets it to “Run my allowed commands, ask for the rest”."}
+            </p>
+            {globAsRule ? (
+              <p className="text-[10.5px] text-red-300 leading-snug">
+                This command ends with *, which as a rule would allow more than this command. Edit it first.
+              </p>
+            ) : runner ? (
+              <p className="text-[10.5px] text-red-300 font-semibold leading-snug">{runner}</p>
+            ) : rule.trim().endsWith("*") && <p className="text-[10.5px] text-amber-300 leading-snug">{WILDCARD_WARNING}</p>}
+            <div className="flex gap-2">
+              <NoFocusButton
+                onPick={() => {
+                  if (globAsRule) return;
+                  if (runner && confirmed !== rule) { setConfirmed(rule); confirmedAt.current = performance.now(); return; }
+                  if (runner && performance.now() - confirmedAt.current < SETTLE_MS) return;
+                  act("ai_allow_always", { id: p.id, pattern: rule, confirmRunner: !!runner });
+                }}
+                onDown={down}
+                accept={accept}
+                className={`h-7 px-2.5 rounded-md bg-primary/15 border border-primary/40 text-primary text-[10.5px] font-bold uppercase tracking-wider hover:bg-primary hover:text-zinc-950 ${globAsRule ? "opacity-40 pointer-events-none" : ""}`}
+              >
+                {runner && confirmed === rule ? "Yes, allow any command this way" : "Save and allow"}
+              </NoFocusButton>
+              <NoFocusButton onPick={() => setExtra(null)} className="h-7 px-2.5 rounded-md border border-white/10 text-zinc-400 text-[10.5px] font-bold uppercase tracking-wider hover:text-white">
+                Cancel
+              </NoFocusButton>
+            </div>
+          </div>
+        )}
+        <NoFocusButton
+          onPick={() => {
+            const typed = asksPassword ? password : "";
+            setPassword("");
+            act("ai_allow_session", { id: p.id, password: typed || null });
+          }}
+          onDown={down}
+          accept={accept}
+          title="Runs this, and what this AI tab asks for on this server from now on, without asking, but for your always-ask list. Ends when the AI tab closes, or the server stops being shared."
+          className={`${link} flex items-center gap-1`}
+        >
+          <Zap size={11} className="shrink-0" /> Allow everything here until this AI tab closes
+        </NoFocusButton>
+        {extra !== "note" && (
+          <NoFocusButton onPick={() => setExtra("note")} className={link}>Deny with a note…</NoFocusButton>
+        )}
+        {extra === "note" && (
+          <div className="w-full space-y-1.5 rounded-lg border border-white/10 bg-black/20 p-2">
+            <input
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              onKeyDown={fieldKeys}
+              maxLength={500}
+              placeholder="Why, so the AI can try another way"
+              aria-label="A note for the AI"
+              className={`${field} font-sans`}
+            />
+            <div className="flex gap-2">
+              <NoFocusButton
+                onPick={() => decide(false, note)}
+                onDown={down}
+                accept={accept}
+                className="h-7 px-2.5 rounded-md bg-zinc-900 border border-white/10 text-zinc-300 text-[10.5px] font-bold uppercase tracking-wider hover:border-red-400/50 hover:text-red-300"
+              >
+                Deny with this note
+              </NoFocusButton>
+              <NoFocusButton onPick={() => setExtra(null)} className="h-7 px-2.5 rounded-md border border-white/10 text-zinc-400 text-[10.5px] font-bold uppercase tracking-wider hover:text-white">
+                Cancel
+              </NoFocusButton>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 };
+
+/// A shared server's level, for its requests' cards.
+export const levelOf = (snap: AiSnapshot, tabId: string, sessionId: string): number =>
+  snap.tabs.find((t) => t.id === tabId)?.servers.find((s) => s.session_id === sessionId)?.level ?? 1;
+
+const ranWithoutAsking = (why: string) => <span className="text-amber-300/90">ran without asking: {why}</span>;
 
 const outcomeLabel = (d: AiDone) => {
   switch (d.outcome) {
@@ -221,6 +402,8 @@ const DoneRow = ({ d }: { d: AiDone }) => {
           <span className="block font-mono text-[11px] text-zinc-200 truncate">{showPlainly(d.command)}</span>
           <span className={`block text-[10.5px] ${ok ? "text-emerald-400" : ran ? "text-amber-300" : "text-zinc-500"}`}>
             {outcomeLabel(d)}
+            {d.as_root && <span className="text-amber-300"> · as root{d.root_via && ` via ${d.root_via}`}</span>}
+            {d.ran_without_asking && <> · {ranWithoutAsking(d.ran_without_asking)}</>}
             {d.hidden > 0 && <span className="text-sky-300"> · {d.hidden} hidden from the AI</span>}
             {d.cut && <span> · stopped at 1 MB</span>}
           </span>
@@ -304,6 +487,15 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
                     {t.servers.map((s) => (
                       <span key={s.session_id} className="inline-flex items-center gap-0.5">
                         <NoFocusButton onPick={() => onGoToServer(s.session_id)} className="text-zinc-300 hover:text-white hover:underline">{s.name}</NoFocusButton>
+                        {s.allow_all && (
+                          <NoFocusButton
+                            onPick={() => run("ai_end_allow_all", { tabId: t.id, sessionId: s.session_id })}
+                            title={`Everything is allowed on ${s.name} until ${t.label} closes. Click to end it.`}
+                            className="text-[10px] text-amber-300 hover:text-red-300 hover:underline"
+                          >
+                            · end allow everything
+                          </NoFocusButton>
+                        )}
                         <NoFocusButton
                           onPick={() => run("ai_unshare", { sessionId: s.session_id, tabId: t.id })}
                           title={`Stop sharing ${s.name} with ${t.label}`}
@@ -329,7 +521,14 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
 
         {/* Waiting for you. */}
         {snap.pending.map((p) => (
-          <PendingCard key={p.id} p={p} decide={(allow) => run("ai_decide", { id: p.id, allow })} onGoToServer={onGoToServer} />
+          <PendingCard
+            key={`${p.id}:${p.asked_at}`}
+            p={p}
+            level={levelOf(snap, p.tab_id, p.session_id)}
+            decide={(allow, note, password) => run("ai_decide", { id: p.id, allow, note: note ?? null, password: password || null })}
+            act={run}
+            onGoToServer={onGoToServer}
+          />
         ))}
 
         {/* Running now. */}
@@ -337,7 +536,11 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
           <div key={r.id} className="px-3 py-2 border-t border-white/5 flex items-start gap-2">
             <Loader2 size={12} className="mt-0.5 shrink-0 animate-spin text-primary" />
             <span className="flex-1 min-w-0">
-              <span className="block text-[10.5px] text-zinc-500"><span className="font-semibold text-zinc-300">{r.tab_label}</span> {r.server} · running</span>
+              <span className="block text-[10.5px] text-zinc-500">
+                <span className="font-semibold text-zinc-300">{r.tab_label}</span> {r.server} · running
+                {r.as_root && <span className="text-amber-300"> · as root{r.root_via && ` via ${r.root_via}`}</span>}
+                {r.ran_without_asking && <> · {ranWithoutAsking(r.ran_without_asking)}</>}
+              </span>
               <span className="block font-mono text-[11px] text-zinc-200 truncate">{showPlainly(r.command)}</span>
             </span>
           </div>

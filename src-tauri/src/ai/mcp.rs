@@ -20,8 +20,11 @@ const VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-0
 const MAX_MESSAGE: usize = 1024 * 1024;
 
 const INSTRUCTIONS: &str = "Submarine runs commands on servers the user has shared with you, over the SSH connections it already holds. \
-You never get credentials. Every command waits until the user clicks Allow in Submarine's AI panel, and may be denied. \
-Call list_shared to see the servers you can use. Output you get back is filtered: secrets it recognises are replaced with [hidden by Submarine].";
+You never get credentials. Depending on the approval level the user chose for each server, a command runs at once or waits until \
+the user clicks Allow in Submarine, and may be denied, sometimes with a note saying why. \
+Call list_shared to see the servers you can use. Output you get back is filtered: secrets it recognises are replaced with [hidden by Submarine]. \
+To run a command as root, set as_root on run_command rather than typing sudo, su or dzdo yourself: Submarine asks the user, \
+and supplies any password itself. You never see or need it.";
 
 /// The tools, with MCP's standard hints (ToolAnnotations, from 2025-03-26):
 /// `list_shared` changes nothing; `run_command` may change anything, on
@@ -36,16 +39,21 @@ pub(crate) fn tools() -> Value {
         },
         {
             "name": "run_command",
-            "description": "Run a shell command on a shared server, as the user's SSH login, once the user allows it in Submarine. \
+            "description": "Run a shell command on a shared server, as the user's SSH login, once the user allows it in Submarine \
+(or at once, where the user's settings for that server say so). \
 No terminal is attached and nothing is on stdin, so interactive programs and pagers won't work; use non-interactive forms \
 (e.g. `journalctl -n 50 --no-pager`, `top -bn1`). The command is stopped at its timeout or past 1 MB of output. \
+To run it as root, set as_root to true and give the plain command (e.g. `docker ps -a`), instead of typing sudo, su or dzdo \
+yourself: Submarine asks the user, runs it through the server's sudo or dzdo, and supplies any password itself. You never see \
+or need the password, and you can't ask for it. as_root runs one command: it can't open a root shell (no `sudo -i` or `su -`). \
 Returns the exit code and the output (stdout and stderr together), with secrets replaced by [hidden by Submarine].",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "server": { "type": "string", "description": "The server's name, as list_shared gives it." },
                     "command": { "type": "string", "description": "The command line, run by the account's login shell on the server." },
-                    "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": super::MAX_TIMEOUT, "description": "Stop it after this many seconds (default 60)." }
+                    "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": super::MAX_TIMEOUT, "description": "Stop it after this many seconds (default 60)." },
+                    "as_root": { "type": "boolean", "description": "Run it as root, through the server's sudo or dzdo. The user is asked, and types any password in Submarine; you never get it. Give the plain command, without sudo." }
                 },
                 "required": ["server", "command"],
                 "additionalProperties": false
@@ -324,7 +332,12 @@ mod tests {
     #[tokio::test]
     async fn at_most_eight_calls_at_once() {
         let (s, mut w, mut r, _t) = connection(1 << 20);
-        let call = |id: u64| json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": "run_command", "arguments": { "server": "xyz", "command": "sleep 1" } } });
+        // On two servers: at most four run at once on one (MAX_RUNNING).
+        s.share("local-1", "sess-2", "abc").unwrap();
+        let call = |id: u64| {
+            let server = if id % 2 == 1 { "xyz" } else { "abc" };
+            json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": "run_command", "arguments": { "server": server, "command": "sleep 1" } } })
+        };
         // Eight in flight: six allowed and running, two waiting for you.
         let mut sent = 0;
         while sent < MAX_CALLS as u64 {

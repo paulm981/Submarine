@@ -39,7 +39,8 @@ import HomePane from "./components/HomePane";
 import AiPanel from "./components/AiPanel";
 import AiSidePane, { AiPaneButton, type AiPaneView } from "./components/AiSidePane";
 import { useAiPane } from "./ui/aiPane";
-import { useAi, sharedWith } from "./util/ai";
+import { useAi, sharedWith, aiMarker, openAiTrust, trustTargetFor } from "./util/ai";
+import { AiTrustModal } from "./components/AiTrust";
 import { IS_ANDROID } from "./util/platform";
 import type { RdpLink } from "./components/RdpLinkModal";
 import { folderTree } from "./util/folderTree";
@@ -617,6 +618,17 @@ function DesktopApp() {
       if (await invoke<boolean>("keep_server_ssh", { serverId })) addLog("Kept the server as it was.", "success");
     } catch (e) {
       addLog(`KEEP_SSH_FAILED: ${e}`, "error");
+    }
+    await refreshServers();
+  }, [addLog, refreshServers]);
+  // A teammate's move that let the AI do more on a server, kept as it was:
+  // the server stays at "Ask every time" here until it's changed (#115).
+  const keepAiPolicy = useCallback(async (serverId: number) => {
+    try {
+      await invoke("ai_keep_policy", { serverId });
+      addLog("The AI asks before every command on that server, as before.", "success");
+    } catch (e) {
+      addLog(`AI_KEEP_FAILED: ${e}`, "error");
     }
     await refreshServers();
   }, [addLog, refreshServers]);
@@ -2140,11 +2152,31 @@ function DesktopApp() {
               {isMergedTab && (
                 <Columns size={9} className="text-primary/70 mr-1 shrink-0" />
               )}
-              {/* Shared with an AI tab; lit while one is doing something here. */}
+              {/* Shared with an AI tab; lit while one is doing something here.
+                  Amber, with a click to change it, where the AI may run
+                  commands here without asking (#115). */}
               {(() => {
                 const with_ = sharedWith(ai, s.id);
                 if (with_.length === 0) return null;
                 const busy = ai.running.some(r => r.session_id === s.id) || ai.pending.some(p => p.session_id === s.id);
+                const entries = with_.flatMap(t => t.servers.filter(x => x.session_id === s.id));
+                const loosest = entries.find(x => x.allow_all || x.level >= 3) ?? entries.find(x => x.level === 2);
+                const marker = loosest ? aiMarker(loosest) : null;
+                if (loosest && marker) {
+                  return (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); openAiTrust(trustTargetFor(loosest)); }}
+                      title={`Shared with ${with_.map(t => t.label).join(", ")}. ${marker}. Click to change it.`}
+                      aria-label={marker}
+                      className={`mr-1 shrink-0 flex items-center gap-0.5 rounded px-0.5 text-amber-300 hover:bg-amber-400/15 ${busy ? "animate-pulse" : ""}`}
+                    >
+                      <Bot size={10} />
+                      {/* The marker's words, the Bot icon standing for "AI:". */}
+                      <span className="text-[9.5px] font-semibold whitespace-nowrap">{marker.replace(/^AI: /, "")}</span>
+                    </button>
+                  );
+                }
                 return (
                   <span title={`Shared with ${with_.map(t => t.label).join(", ")}`} aria-label="Shared with AI" className={`mr-1 shrink-0 flex ${busy ? "text-primary animate-pulse" : "text-zinc-400"}`}>
                     <Bot size={10} />
@@ -2709,6 +2741,7 @@ function DesktopApp() {
                 onQuickConnect={() => setIsQuickConnectOpen(true)}
                 onAllowHeld={allowHeld}
                 onKeepSsh={keepServerSsh}
+                onKeepAi={keepAiPolicy}
                 keyChange={shareKeyChange}
                 onAcceptKey={acceptShareKey}
                 heldDeletions={heldDeletions}
@@ -3411,6 +3444,11 @@ function DesktopApp() {
           )}
         </div>
       )}
+
+      {/* How much the AI may run without asking, for a server, a folder or
+          every server (#115): opened from a tab's AI marker, the AI pane or
+          the session tree's menus. */}
+      <AiTrustModal />
 
       <AddNodePanel
         isOpen={isPanelOpen} onClose={() => { setIsPanelOpen(false); setFormError(""); }}

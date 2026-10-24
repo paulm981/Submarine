@@ -2,7 +2,8 @@
 //! from Home's menu reaches Submarine over a local channel (channel.rs,
 //! through `submarine --mcp`, helper.rs) and asks it to run commands on the
 //! servers you've shared with that AI tab. Submarine shows each request in
-//! the AI panel, runs it only once you click Allow, on its own SSH channel
+//! the AI panel and runs it once you click Allow, or at once where your
+//! approval level and rules say so (trust.rs, #115), on its own SSH channel
 //! (exec.rs), and gives back the output with known secrets hidden
 //! (filter.rs). Every request and decision goes in the audit log (audit.rs).
 //!
@@ -25,7 +26,20 @@
 //! - **Access ends** when the AI tab closes, when the server's tab closes or
 //!   reconnects, when you stop sharing, or when Submarine quits; anything
 //!   still waiting for approval is cancelled and anything running stopped,
-//!   on the server too.
+//!   on the server too. "Allow everything here until this AI tab closes"
+//!   (SharedServer::allow_all) ends with it: it's kept on the server's place
+//!   in the AI tab's list, which every end of access takes away.
+//! - **The AI can't change how much it may do.** Levels and rules are read
+//!   here, as each request comes (`policy`), and changed only by the Tauri
+//!   commands the app's own pages call. No MCP tool reaches them.
+//! - **Root without the password (#120).** `run_command` with `as_root` runs
+//!   the command through sudo or dzdo (exec::run_root, with the same code as
+//!   SFTP root mode). Where the server wants a password, the card asks you
+//!   for it; it goes only to the tool's own prompt, one attempt each time.
+//!   What worked is kept in the server's place in the AI tab's list
+//!   (SharedServer::root), so every end of access forgets it, and is never
+//!   shared with the server tab's own root access, either way. It's never in
+//!   the output, the AI's answer, the audit log, the app log or an error.
 
 mod audit;
 mod channel;
@@ -34,12 +48,14 @@ mod exec;
 mod filter;
 pub mod helper;
 mod mcp;
+pub(crate) mod trust;
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch};
@@ -126,6 +142,9 @@ const AI_TAIL: usize = 32 * 1024;
 const RATE_MAX: usize = 20;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_WAITING: usize = 3;
+/// Commands one AI tab may have running at once on one server, those that
+/// ran without asking included.
+const MAX_RUNNING: usize = 4;
 /// What the log keeps at most of a request's command (as written in its
 /// JSON), and of a server name: the AI may send anything there, up to MCP's
 /// 1 MB, and may ask, withdraw and ask again without you allowing anything.
@@ -135,6 +154,8 @@ const MAX_LOGGED_NAME: usize = 256;
 const MAX_LOGGED_NOTE: usize = 2 * 1024;
 /// Finished requests the panel keeps.
 const HISTORY: usize = 20;
+/// A note you give with Deny, at most, in characters.
+const MAX_DENY_NOTE: usize = 500;
 /// How long a second connection for an AI tab waits for the first to end
 /// before it's refused: Claude Code reconnecting (`/mcp`) ends its old
 /// helper and starts a new one, which may connect a moment before the app
@@ -143,16 +164,74 @@ const RECONNECT_GRACE: Duration = Duration::from_secs(5);
 /// The panel's event.
 const CHANGED: &str = "ai-changed";
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 struct Settings {
     #[serde(default)]
     enabled: bool,
+    /// Flash the taskbar when a request waits for you and Submarine isn't
+    /// in front. On unless turned off.
+    #[serde(default = "on")]
+    flash: bool,
+}
+
+fn on() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { enabled: false, flash: true }
+    }
 }
 
 type ExecFuture = Pin<Box<dyn Future<Output = Result<exec::Exec, String>> + Send>>;
 /// Runs a command on a session's connection: the real one over SshState, or
 /// a test server's. `(session_id, command, timeout, stop)`; see exec::run.
 type Executor = Arc<dyn Fn(String, String, Duration, watch::Receiver<bool>) -> ExecFuture + Send + Sync>;
+type RootFuture = Pin<Box<dyn Future<Output = exec::RootRun> + Send>>;
+/// Runs a command as root (#120) on a session's connection, as Executor
+/// does: `(session_id, job, timeout, stop)`; see exec::run_root.
+type RootExecutor = Arc<dyn Fn(String, RootJob, Duration, watch::Receiver<bool>) -> RootFuture + Send + Sync>;
+
+/// A command to run as root, and how root is had.
+pub(crate) struct RootJob {
+    command: String,
+    how: exec::RootHow,
+    /// Told once the tool has taken the password (or needed none) and the
+    /// command started.
+    started: Option<oneshot::Sender<()>>,
+}
+
+/// What an AI tab has for root on a shared server (#120): the tool, a root
+/// shell's words, and the password you typed for it there, if the server
+/// asked for one (zeroised when the last copy goes). Never shown, logged or
+/// sent.
+#[derive(Clone)]
+struct KeptRoot(Arc<crate::ssh_manager::RootAccess>);
+
+impl std::fmt::Debug for KeptRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KeptRoot({})", self.0.tool)
+    }
+}
+
+/// For a request as root, whether its card asks for the root password.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+enum PasswordAsk {
+    /// No field: not as root, or this AI tab has what it needs there.
+    None,
+    /// Nothing is known yet: a field you may leave empty, for a server that
+    /// doesn't ask.
+    Optional,
+    /// The server asked for one.
+    Needed,
+    /// The one typed was turned down.
+    Wrong,
+}
+/// What holds for a saved server (its local id; None for one not saved):
+/// read from the vault in the app, set by hand in tests. Read only.
+type PolicyLookup = Arc<dyn Fn(Option<i64>) -> trust::Policy + Send + Sync>;
 
 /// A server shared with an AI tab.
 #[derive(Serialize, Clone, Debug)]
@@ -162,6 +241,22 @@ struct SharedServer {
     name: String,
     /// Who its tab logged in as, which commands run as; None if not known.
     user: Option<String>,
+    /// The saved server its tab was opened for (its local id), whose level
+    /// and rules hold; None for one not saved.
+    server_id: Option<i64>,
+    /// "Allow everything here until this AI tab closes": as level 3, for
+    /// this AI tab only. In memory only, and gone when this goes.
+    allow_all: bool,
+    /// Its level now, for the tab's marker: filled in by `snapshot`.
+    level: u8,
+    /// What this AI tab has for root there (#120), once a request as root
+    /// worked: in memory only, gone when this goes (every end of access).
+    /// Never in a snapshot.
+    #[serde(skip)]
+    root: Option<KeptRoot>,
+    /// The tool root goes through there, once known (sudo or dzdo): filled
+    /// in by `snapshot`.
+    root_via: Option<&'static str>,
 }
 
 struct Tab {
@@ -192,16 +287,44 @@ struct PendingView {
     /// Who it runs as: the server tab's login user, if known.
     user: Option<String>,
     command: String,
-    /// It runs as root: the login user is root, or the command asks for
-    /// root (asks_for_root).
+    /// It runs as root: the login user is root, the command asks for root
+    /// (asks_for_root), or the AI asked to run it as root.
     root: bool,
+    /// The AI asked to run it as root (`as_root`, #120).
+    as_root: bool,
+    /// What it goes through as root, once known: sudo or dzdo.
+    root_via: Option<&'static str>,
+    /// For a request as root, whether the card asks for the password.
+    password: PasswordAsk,
     timeout_secs: u64,
     asked_at: String,
+    /// The saved server it's for, whose lists "Always allow" adds to.
+    server_id: Option<i64>,
+    /// The always-ask rule that made it wait, if one did.
+    ask_rule: Option<String>,
+    /// "Always allow this command here" is offered: it's one simple command
+    /// (trust::is_simple), on a saved server, that doesn't ask for root and
+    /// no always-ask rule caught.
+    can_allow_always: bool,
+    /// Why it asks when the server's settings would otherwise not: they
+    /// couldn't be read, or a change to them waits for your OK.
+    note: Option<String>,
 }
+
+/// Your answer to a request.
+enum Answer {
+    /// Allowed; how (Decision::approved_by, or "you"), and for a request as
+    /// root, the password you typed on its card, if you did.
+    Allow { by: String, password: Option<Zeroizing<String>> },
+    /// Denied, with your note, if you gave one.
+    Deny(Option<String>),
+}
+
+const BY_YOU: &str = "you";
 
 struct Pending {
     view: PendingView,
-    decide: oneshot::Sender<bool>,
+    decide: oneshot::Sender<Answer>,
     /// Its stop signal, moved to `Running` when you allow it.
     stop: watch::Sender<bool>,
 }
@@ -214,6 +337,12 @@ struct RunningView {
     server: String,
     command: String,
     started_at: String,
+    /// Why it runs without your Allow, if it does.
+    ran_without_asking: Option<String>,
+    /// It runs as root at the AI's asking (#120), and through what, once
+    /// known.
+    as_root: bool,
+    root_via: Option<&'static str>,
 }
 
 struct Running {
@@ -234,6 +363,9 @@ struct DoneView {
     server: String,
     command: String,
     root: bool,
+    /// It ran as root at the AI's asking (#120), and through what.
+    as_root: bool,
+    root_via: Option<&'static str>,
     /// denied, cancelled, done, failed, stopped.
     outcome: &'static str,
     exit_code: Option<i64>,
@@ -243,6 +375,9 @@ struct DoneView {
     timed_out: bool,
     error: Option<String>,
     at: String,
+    /// It ran without asking you, and why: `rule: <pattern>`, `level: run
+    /// anything` or `session: allow everything`.
+    ran_without_asking: Option<String>,
 }
 
 /// A finished request: its row, everything you see, and what the AI was
@@ -295,8 +430,14 @@ struct Inner {
     shared: Mutex<Shared>,
     listener: Mutex<Option<channel::Listener>>,
     exec: Executor,
+    root_exec: RootExecutor,
     changed: Box<dyn Fn() + Send + Sync>,
     audit: audit::AuditLog,
+    policy: PolicyLookup,
+    /// Draws your eye to Submarine when a request waits for you (the
+    /// taskbar flashing), if `flash` is on.
+    attention: Box<dyn Fn() + Send + Sync>,
+    flash: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -343,22 +484,15 @@ fn now() -> String {
 /// sudo or dzdo needs no password, that's root with no question asked, and
 /// Submarine can't always tell.
 ///
-/// A warning for you on the request's card, NOT a gate: it's easy to dodge
-/// (`s\udo`, `$(echo sudo)`, `runuser`, a script that calls sudo), so
-/// nothing may be allowed or refused because of it. Anything that has to
-/// keep root out (step 3 of #32: running as another account) must decide on
-/// its own `as_root` and treat "can't tell" as root.
+/// A warning for you on the request's card, and at "Run my allowed
+/// commands" a reason to ask (trust::decide), which only ever asks more. Not
+/// a wall: it's still easy to dodge (`$(echo sudo)`, a copy of sudo under
+/// another name, a script that calls sudo), so nothing may be allowed because it says no. Anything
+/// that has to keep root out (step 3 of #32: running as another account)
+/// must decide on its own `as_root` and treat "can't tell" as root.
+#[cfg(test)]
 pub(crate) fn asks_for_root(command: &str) -> bool {
-    use std::sync::LazyLock;
-    static RE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r#"(?:^|[\s;|&(){}`'"/!])(?:sudo|dzdo|su|doas|pkexec)(?:$|[\s;|&(){}`'"])"#).unwrap());
-    RE.is_match(command)
-}
-
-/// A request runs as root: its server's tab logged in as root, or its
-/// command asks for root. A warning, as asks_for_root is.
-fn runs_as_root(user: Option<&str>, command: &str) -> bool {
-    user == Some("root") || asks_for_root(command)
+    trust::asks_for_root(command)
 }
 
 /// Equal without saying where they differ.
@@ -428,13 +562,31 @@ fn unique_name(servers: &[SharedServer], wanted: &str) -> String {
 }
 
 impl AiState {
+    /// Every server asks every time, nothing flashes, and nothing runs as
+    /// root.
+    #[cfg(test)]
     fn new(exec: Executor, changed: Box<dyn Fn() + Send + Sync>, audit_dir: Option<PathBuf>) -> AiState {
+        AiState::with(exec, no_root(), changed, audit_dir, Arc::new(|_| trust::Policy::default()), Box::new(|| {}))
+    }
+
+    fn with(
+        exec: Executor,
+        root_exec: RootExecutor,
+        changed: Box<dyn Fn() + Send + Sync>,
+        audit_dir: Option<PathBuf>,
+        policy: PolicyLookup,
+        attention: Box<dyn Fn() + Send + Sync>,
+    ) -> AiState {
         AiState(Arc::new(Inner {
             shared: Mutex::new(Shared::default()),
             listener: Mutex::new(None),
             exec,
+            root_exec,
             changed,
             audit: audit::AuditLog::new(audit_dir),
+            policy,
+            attention,
+            flash: AtomicBool::new(true),
         }))
     }
 
@@ -452,12 +604,51 @@ impl AiState {
                 exec::run(&handle, &command, limit, OUTPUT_CAP, stop).await
             })
         });
+        // As root: on the same connection, with only what the AI tab has
+        // for root there (RootJob), never the tab's own root access.
+        let root_app = app.clone();
+        let root_exec: RootExecutor = Arc::new(move |session_id, job: RootJob, limit, stop| {
+            let app = root_app.clone();
+            Box::pin(async move {
+                let state = app.state::<crate::ssh_manager::SshState>();
+                let handle = state.connections.lock().await.get(&session_id).cloned();
+                let Some(handle) = handle else {
+                    let why = "That server's tab isn't connected right now.".to_string();
+                    return exec::RootRun::Failed { you: why.clone(), ai: format!("Couldn't run it: {why}") };
+                };
+                exec::run_root(&handle, job.how, &job.command, limit, OUTPUT_CAP, stop, job.started).await
+            })
+        });
         let emit_app = app.clone();
         let changed = Box::new(move || {
             let _ = emit_app.emit(CHANGED, ());
         });
-        let state = AiState::new(exec, changed, app.path().app_log_dir().ok());
+        // The open profile's levels and rules, read as each request comes.
+        // No profile open (or the vault busy failing): ask every time.
+        let db_app = app.clone();
+        let policy: PolicyLookup = Arc::new(move |server_id| {
+            let db = db_app.state::<crate::DbState>();
+            let guard = db.conn.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().map(|conn| trust::policy_for(conn, server_id)).unwrap_or_else(trust::Policy::unreadable)
+        });
+        let attention_app = app.clone();
+        let attention = Box::new(move || {
+            #[cfg(not(target_os = "android"))]
+            {
+                let windows = attention_app.webview_windows();
+                let window = windows.get("main").or_else(|| windows.values().next());
+                if let Some(w) = window.filter(|w| !w.is_focused().unwrap_or(false)) {
+                    // The taskbar button flashes until Submarine is in front
+                    // (Windows), or is marked urgent (Linux).
+                    let _ = w.request_user_attention(Some(tauri::UserAttentionType::Informational));
+                }
+            }
+            #[cfg(target_os = "android")]
+            let _ = &attention_app;
+        });
+        let state = AiState::with(exec, root_exec, changed, app.path().app_log_dir().ok(), policy, attention);
         let settings: Settings = crate::local_open::read_setting(app, SETTINGS_FILE).unwrap_or_default();
+        state.0.flash.store(settings.flash, Ordering::Relaxed);
         if settings.enabled {
             let s = state.clone();
             tauri::async_runtime::spawn(async move {
@@ -683,18 +874,28 @@ impl AiState {
 
     #[cfg(test)]
     fn share(&self, tab_id: &str, session_id: &str, name: &str) -> Result<(), String> {
-        self.share_as(tab_id, session_id, name, None)
+        self.share_as(tab_id, session_id, name, None, None)
     }
 
-    /// Share `session_id`, whose tab logged in as `user`, with `tab_id`.
-    fn share_as(&self, tab_id: &str, session_id: &str, name: &str, user: Option<String>) -> Result<(), String> {
+    /// Share `session_id`, whose tab logged in as `user` and was opened for
+    /// the saved server `server_id`, with `tab_id`.
+    fn share_as(&self, tab_id: &str, session_id: &str, name: &str, user: Option<String>, server_id: Option<i64>) -> Result<(), String> {
         let mut s = self.lock();
         let tab = s.tabs.iter_mut().find(|t| t.id == tab_id).ok_or("That AI tab isn't open any more.")?;
         if tab.servers.iter().any(|x| x.session_id == session_id) {
             return Ok(());
         }
         let name = unique_name(&tab.servers, name);
-        tab.servers.push(SharedServer { session_id: session_id.to_string(), name: name.clone(), user });
+        tab.servers.push(SharedServer {
+            session_id: session_id.to_string(),
+            name: name.clone(),
+            user,
+            server_id,
+            allow_all: false,
+            level: trust::ASK_EVERY_TIME,
+            root: None,
+            root_via: None,
+        });
         let label = tab.label.clone();
         drop(s);
         let mut e = audit::Entry::new("shared", &label);
@@ -767,59 +968,241 @@ impl AiState {
         });
     }
 
-    /// Your Allow or Deny. Allowed, the request moves from waiting to
-    /// running in the same step, with its stop signal, and only while its
-    /// AI tab still has the server shared: so unsharing, Stop or a
-    /// reconnect at the same moment either comes first (and it never runs)
-    /// or finds it running (and stops it).
+    /// Your Allow or Deny, as a click on the card.
+    #[cfg(test)]
     fn decide(&self, id: u64, allow: bool) -> Result<(), String> {
+        self.answer(id, if allow { Answer::Allow { by: BY_YOU.into(), password: None } } else { Answer::Deny(None) })
+    }
+
+    /// Allow, with the root password typed on the card.
+    #[cfg(test)]
+    fn allow_with_password(&self, id: u64, password: &str) -> Result<(), String> {
+        let password = typed_password(Some(password.to_string()))?;
+        self.answer(id, Answer::Allow { by: BY_YOU.into(), password })
+    }
+
+    /// Your answer to a request. Allowed, it moves from waiting to running
+    /// in the same step, with its stop signal, and only while its AI tab
+    /// still has the server shared: so unsharing, Stop or a reconnect at the
+    /// same moment either comes first (and it never runs) or finds it
+    /// running (and stops it).
+    fn answer(&self, id: u64, answer: Answer) -> Result<(), String> {
         let result = {
             let mut s = self.lock();
             let at = s.pending.iter().position(|p| p.view.id == id).ok_or("That request isn't waiting any more.")?;
+            if matches!(answer, Answer::Allow { .. }) {
+                let v = &s.pending[at].view;
+                let running_there = s.running.iter().filter(|r| r.tab_id == v.tab_id && r.session_id == v.session_id).count();
+                if running_there >= MAX_RUNNING {
+                    return Err(format!("{MAX_RUNNING} commands from this AI tab are already running on {}. Allow this one once one of them ends.", v.server));
+                }
+            }
             let p = s.pending.remove(at);
             let still_shared = s.tabs.iter().any(|t| t.id == p.view.tab_id && t.servers.iter().any(|x| x.session_id == p.view.session_id));
-            if !allow {
-                let _ = p.decide.send(false);
-                Ok(())
-            } else if !still_shared {
-                // Dropped: cancelled, as access has ended.
-                Err("That server isn't shared with the AI any more.".to_string())
-            } else {
-                let v = &p.view;
-                s.running.push(Running {
-                    view: RunningView {
-                        id: v.id,
-                        tab_label: v.tab_label.clone(),
-                        session_id: v.session_id.clone(),
-                        server: v.server.clone(),
-                        command: v.command.clone(),
-                        started_at: now(),
-                    },
-                    tab_id: v.tab_id.clone(),
-                    session_id: v.session_id.clone(),
-                    stop: p.stop.clone(),
-                });
-                if p.decide.send(true).is_err() {
-                    // Nobody is waiting for the answer any more.
-                    s.running.pop();
+            match answer {
+                Answer::Deny(note) => {
+                    let _ = p.decide.send(Answer::Deny(note));
+                    Ok(())
                 }
-                Ok(())
+                // Dropped: cancelled, as access has ended.
+                Answer::Allow { .. } if !still_shared => Err("That server isn't shared with the AI any more.".to_string()),
+                Answer::Allow { by, password } => {
+                    // A password only ever goes with a request as root.
+                    let password = password.filter(|_| p.view.as_root);
+                    let v = &p.view;
+                    s.running.push(Running {
+                        view: RunningView {
+                            id: v.id,
+                            tab_label: v.tab_label.clone(),
+                            session_id: v.session_id.clone(),
+                            server: v.server.clone(),
+                            command: v.command.clone(),
+                            started_at: now(),
+                            ran_without_asking: Some(by.clone()).filter(|b| b != BY_YOU),
+                            as_root: v.as_root,
+                            root_via: v.root_via,
+                        },
+                        tab_id: v.tab_id.clone(),
+                        session_id: v.session_id.clone(),
+                        stop: p.stop.clone(),
+                    });
+                    if p.decide.send(Answer::Allow { by, password }).is_err() {
+                        // Nobody is waiting for the answer any more.
+                        s.running.pop();
+                    }
+                    Ok(())
+                }
             }
         };
         self.changed();
         result
     }
 
+    /// Deny, with a note the AI gets, so it can try another way. The note is
+    /// only words for the AI: it can't allow anything.
+    fn deny(&self, id: u64, note: Option<String>) -> Result<(), String> {
+        let note = note
+            .map(|n| n.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|n| !n.is_empty())
+            .map(|n| if n.chars().count() > MAX_DENY_NOTE { n.chars().take(MAX_DENY_NOTE).collect() } else { n });
+        self.answer(id, Answer::Deny(note))
+    }
+
+    /// A waiting request's card, as it is now.
+    fn pending_view(&self, id: u64) -> Result<PendingView, String> {
+        self.lock().pending.iter().find(|p| p.view.id == id).map(|p| p.view.clone()).ok_or_else(|| "That request isn't waiting any more.".to_string())
+    }
+
+    /// "Allow everything here until this AI tab closes": this request is
+    /// allowed, and from now on, as long as the server stays shared with
+    /// this AI tab, its requests there run without asking, but for what the
+    /// always-ask list catches. What else is waiting there now runs too,
+    /// unless an always-ask rule made it wait.
+    fn allow_session(&self, id: u64, password: Option<Zeroizing<String>>) -> Result<(), String> {
+        let (others, label, server) = {
+            let mut s = self.lock();
+            let p = s.pending.iter().find(|p| p.view.id == id).ok_or("That request isn't waiting any more.")?;
+            let (tab_id, session_id) = (p.view.tab_id.clone(), p.view.session_id.clone());
+            let others: Vec<(u64, String, Option<i64>, bool)> = s
+                .pending
+                .iter()
+                .filter(|o| o.view.id != id && o.view.tab_id == tab_id && o.view.session_id == session_id && o.view.ask_rule.is_none())
+                .map(|o| (o.view.id, o.view.command.clone(), o.view.server_id, o.view.as_root))
+                .collect();
+            let tab = s.tabs.iter_mut().find(|t| t.id == tab_id).ok_or("That AI tab isn't open any more.")?;
+            let label = tab.label.clone();
+            let shared = tab.servers.iter_mut().find(|x| x.session_id == session_id).ok_or("That server isn't shared with the AI any more.")?;
+            shared.allow_all = true;
+            (others, label, shared.name.clone())
+        };
+        let mut e = audit::Entry::new("allow_everything", &label);
+        e.server = Some(server);
+        e.by = Some(BY_YOU);
+        e.note = Some("allow everything here until this AI tab closes".into());
+        self.audit(e);
+        let result = self.answer(id, Answer::Allow { by: BY_YOU.into(), password });
+        // Each as it would be decided now (an always-ask rule added since
+        // it was asked still holds it). One as root runs with what this AI
+        // tab has for root there, or asks for the password again.
+        for (other, command, server_id, as_root) in others {
+            let p = (self.0.policy)(server_id);
+            let d = trust::decide_parsed(&p, true, &trust::Parsed::new(&command), as_root);
+            if let Some(by) = d.approved_by() {
+                let _ = self.answer(other, Answer::Allow { by, password: None });
+            }
+        }
+        result
+    }
+
+    /// "Allow everything here" ends for the shared servers `which` picks,
+    /// in every AI tab. Returns how many it was on for.
+    fn end_allow_all(&self, which: impl Fn(&SharedServer) -> bool, why: &str) -> usize {
+        self.end_allow_all_where(|_, x| which(x), Some(why))
+    }
+
+    /// The same, `which` given the AI tab's id too; `why` for the log.
+    fn end_allow_all_where(&self, which: impl Fn(&str, &SharedServer) -> bool, why: Option<&str>) -> usize {
+        let mut ended = Vec::new();
+        {
+            let mut s = self.lock();
+            for t in s.tabs.iter_mut() {
+                let tab_id = t.id.clone();
+                for x in t.servers.iter_mut().filter(|x| x.allow_all && which(&tab_id, x)) {
+                    x.allow_all = false;
+                    ended.push((t.label.clone(), x.name.clone()));
+                }
+            }
+        }
+        for (label, server) in &ended {
+            let mut e = audit::Entry::new("allow_everything_ended", label);
+            e.server = Some(server.clone());
+            e.by = Some(BY_YOU);
+            e.note = why.map(str::to_string);
+            self.audit(e);
+        }
+        if !ended.is_empty() {
+            self.changed();
+        }
+        ended.len()
+    }
+
+    /// End it for one server in one AI tab.
+    fn end_allow_all_in(&self, tab_id: &str, session_id: &str) -> usize {
+        self.end_allow_all_where(|t, x| t == tab_id && x.session_id == session_id, None)
+    }
+
+    /// The saved servers shared with any AI tab, by local id.
+    fn shared_server_ids(&self) -> Vec<Option<i64>> {
+        let mut ids: Vec<Option<i64>> = self.lock().tabs.iter().flat_map(|t| t.servers.iter().map(|x| x.server_id)).collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// A line in the audit log for a change you made to the levels or
+    /// rules.
+    fn log_setting(&self, note: String) {
+        let mut e = audit::Entry::new("approval_setting", "");
+        e.by = Some(BY_YOU);
+        e.note = Some(note);
+        self.audit(e);
+    }
+
     pub(crate) fn snapshot(&self) -> Snapshot {
+        // Each shared server's level, for its marker: read before the lock,
+        // as the vault has its own.
+        let mut ids: Vec<Option<i64>> = self.lock().tabs.iter().flat_map(|t| t.servers.iter().map(|x| x.server_id)).collect();
+        ids.sort();
+        ids.dedup();
+        let levels: Vec<(Option<i64>, u8)> = ids.into_iter().map(|id| (id, (self.0.policy)(id).level)).collect();
+        let level_of = |id: Option<i64>| levels.iter().find(|(i, _)| *i == id).map(|(_, l)| *l).unwrap_or(trust::ASK_EVERY_TIME);
         let s = self.lock();
         Snapshot {
             enabled: s.enabled,
             tabs: s
                 .tabs
                 .iter()
-                .map(|t| TabView { id: t.id.clone(), label: t.label.clone(), servers: t.servers.clone(), intruder_at: t.intruder_at.clone() })
+                .map(|t| TabView {
+                    id: t.id.clone(),
+                    label: t.label.clone(),
+                    servers: t
+                        .servers
+                        .iter()
+                        .map(|x| SharedServer {
+                            level: level_of(x.server_id),
+                            root_via: x.root.as_ref().map(|k| k.0.tool),
+                            root: None,
+                            ..x.clone()
+                        })
+                        .collect(),
+                    intruder_at: t.intruder_at.clone(),
+                })
                 .collect(),
-            pending: s.pending.iter().map(|p| p.view.clone()).collect(),
+            // A card as root asks for the password while this AI tab has no
+            // password for root there: what another card's password found
+            // since counts. Root found without a password hides the field
+            // only on a card that hasn't asked yet: one the server asked a
+            // password for (that root didn't do for this command) keeps it,
+            // and a password typed there takes that root's place.
+            pending: s
+                .pending
+                .iter()
+                .map(|p| {
+                    let mut v = p.view.clone();
+                    if v.as_root && v.user.as_deref() != Some("root") {
+                        match kept_in(&s, &v.tab_id, &v.session_id) {
+                            Some(k) if k.0.password.is_some() || matches!(v.password, PasswordAsk::None | PasswordAsk::Optional) => {
+                                v.password = PasswordAsk::None;
+                                v.root_via = Some(k.0.tool);
+                            }
+                            Some(k) => v.root_via = v.root_via.or(Some(k.0.tool)),
+                            None if v.password == PasswordAsk::None => v.password = PasswordAsk::Optional,
+                            None => {}
+                        }
+                    }
+                    v
+                })
+                .collect(),
             running: s.running.iter().map(|r| r.view.clone()).collect(),
             history: s.history.iter().rev().map(|d| d.view.clone()).collect(),
             audit_log: self.0.audit.path().map(|p| p.to_string_lossy().into_owned()),
@@ -892,7 +1275,12 @@ impl AiState {
                 let server = args.get("server").and_then(|v| v.as_str()).unwrap_or("");
                 let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
                 let timeout = args.get("timeout_seconds").and_then(|v| v.as_u64());
-                self.run_command(tab_id, server, command, timeout, cancel).await
+                let as_root = match args.get("as_root") {
+                    None | Some(serde_json::Value::Null) => false,
+                    Some(serde_json::Value::Bool(b)) => *b,
+                    Some(_) => return ToolResult::err("as_root must be true or false."),
+                };
+                self.run_command(tab_id, server, command, timeout, as_root, cancel).await
             }
             _ => ToolResult::err(format!("Submarine has no tool called {name}.")),
         }
@@ -925,9 +1313,42 @@ impl AiState {
         ToolResult::err(why)
     }
 
-    async fn run_command(&self, tab_id: &str, server: &str, command: &str, timeout: Option<u64>, mut cancel: watch::Receiver<bool>) -> ToolResult {
-        // Checked before anything is shown to you.
-        let (label, session_id, server, user, id, epoch, mut rx, stop_tx, stop_rx) = {
+    async fn run_command(
+        &self,
+        tab_id: &str,
+        server: &str,
+        command: &str,
+        timeout: Option<u64>,
+        as_root: bool,
+        mut cancel: watch::Receiver<bool>,
+    ) -> ToolResult {
+        // The named server's settings, read before the lock (the vault has
+        // its own) and checked again under it.
+        let looked_up = {
+            let s = self.lock();
+            s.tabs.iter().find(|t| t.id == tab_id).and_then(|t| t.servers.iter().find(|x| x.name == server)).map(|x| (x.server_id, x.allow_all))
+        };
+        // The command read once, the settings read and the decision made,
+        // outside the lock and off the async workers (the vault has a lock
+        // of its own, and the AI writes the command). A command too long to
+        // run is refused below, unread. Should it fail, it asks, as root.
+        let (root_cmd, opens_shell, policy, early) = {
+            let lookup = self.0.policy.clone();
+            let cmd = command.to_string();
+            tokio::task::spawn_blocking(move || {
+                let parsed = (cmd.len() <= MAX_COMMAND && !cmd.contains('\0')).then(|| trust::Parsed::new(&cmd));
+                let policy = looked_up.map(|(id, _)| lookup(id));
+                let early = match (&policy, &parsed, looked_up) {
+                    (Some(p), Some(c), Some((_, allow_all))) => trust::decide_parsed(p, allow_all, c, as_root),
+                    _ => trust::Decision::Ask { rule: None },
+                };
+                (parsed.as_ref().is_some_and(|p| p.root), parsed.as_ref().is_some_and(|p| p.opens_shell()), policy, early)
+            })
+            .await
+            .unwrap_or_else(|_| (true, false, Some(trust::Policy::unreadable()), trust::Decision::Ask { rule: None }))
+        };
+        // Checked before anything is shown to you or runs.
+        let (label, session_id, server, user, id, epoch, rx, stop_tx, stop_rx, auto, card) = {
             let mut s = self.lock();
             let next_id = s.next_id + 1;
             let epoch = s.epoch;
@@ -977,11 +1398,17 @@ impl AiState {
                         format!("{asked} isn't shared with you. Shared: {}. Ask the user to click Share with AI on its tab.", names.join(", "))
                     }));
                 };
-                let found = found.clone();
-                if waiting >= MAX_WAITING {
-                    return Err(refuse(format!("{MAX_WAITING} requests are already waiting for the user. Wait for them first.")));
+                if as_root && opens_shell {
+                    return Err(refuse(
+                        "as_root runs one command, with no terminal and nothing on stdin, so it can't open a root shell, \
+                         and takes no options for sudo or dzdo. Send the command itself (such as `docker ps -a`), and Submarine runs it as root."
+                            .into(),
+                    ));
                 }
-                Ok(found)
+                if as_root && policy.as_ref().is_some_and(|p| p.windows) {
+                    return Err(refuse(format!("{} is a Windows server: as_root works with sudo or dzdo, on Linux and other Unix servers.", found.name)));
+                }
+                Ok(found.clone())
             })();
             let found = match checked {
                 Ok(f) => f,
@@ -990,29 +1417,97 @@ impl AiState {
                     return self.refuse(&label, server, command, why);
                 }
             };
+            // Whether it waits for you (trust.rs), decided for this same
+            // share as it is now (not one shared again meanwhile, or whose
+            // "allow everything" changed): else it asks.
+            let decision = if looked_up == Some((found.server_id, found.allow_all)) { early } else { trust::Decision::Ask { rule: None } };
+            let auto = decision.approved_by();
+            let running_there = s.running.iter().filter(|r| r.tab_id == tab_id && r.session_id == found.session_id).count();
+            if running_there >= MAX_RUNNING {
+                drop(s);
+                return self.refuse(
+                    &label,
+                    server,
+                    command,
+                    format!("{MAX_RUNNING} of your commands are already running on {}. Wait for one to finish.", found.name),
+                );
+            }
+            if auto.is_none() && waiting >= MAX_WAITING {
+                drop(s);
+                return self.refuse(&label, server, command, format!("{MAX_WAITING} requests are already waiting for the user. Wait for them first."));
+            }
             s.next_id = next_id;
-            let (tx, rx) = oneshot::channel();
             let (stop_tx, stop_rx) = watch::channel(false);
-            s.pending.push(Pending {
-                view: PendingView {
-                    id: next_id,
-                    tab_id: tab_id.to_string(),
-                    tab_label: label.clone(),
-                    session_id: found.session_id.clone(),
-                    server: found.name.clone(),
-                    user: found.user.clone(),
-                    command: command.to_string(),
-                    root: runs_as_root(found.user.as_deref(), command),
-                    timeout_secs: timeout.unwrap_or(DEFAULT_TIMEOUT),
-                    asked_at: now(),
-                },
-                decide: tx,
-                stop: stop_tx.clone(),
-            });
-            (label, found.session_id, found.name, found.user, next_id, epoch, rx, stop_tx, stop_rx)
+            let login_root = found.user.as_deref() == Some("root");
+            let ask_rule = match &decision {
+                trust::Decision::Ask { rule } => rule.clone(),
+                _ => None,
+            };
+            // Its card, as it's shown now or if it comes back to ask for the
+            // root password.
+            let card = PendingView {
+                id: next_id,
+                tab_id: tab_id.to_string(),
+                tab_label: label.clone(),
+                session_id: found.session_id.clone(),
+                server: found.name.clone(),
+                user: found.user.clone(),
+                command: command.to_string(),
+                root: login_root || root_cmd || as_root,
+                as_root,
+                root_via: found.root.as_ref().map(|k| k.0.tool),
+                // A tab logged in as root runs it as it is: nothing to ask.
+                password: if as_root && !login_root && found.root.is_none() { PasswordAsk::Optional } else { PasswordAsk::None },
+                timeout_secs: timeout.unwrap_or(DEFAULT_TIMEOUT),
+                asked_at: now(),
+                server_id: found.server_id,
+                can_allow_always: found.server_id.is_some()
+                    && ask_rule.is_none()
+                    && !root_cmd
+                    && !as_root
+                    && policy.as_ref().is_some_and(|p| p.force_ask.is_none())
+                    && trust::is_simple_on(command, policy.as_ref().is_some_and(|p| p.windows)),
+                note: policy.as_ref().and_then(|p| p.force_ask.clone()).filter(|_| ask_rule.is_none()),
+                ask_rule,
+            };
+            let rx = match &auto {
+                // Runs now: in the running list with its stop signal, in
+                // this same step, so any end of access stops it.
+                Some(by) => {
+                    s.running.push(Running {
+                        view: RunningView {
+                            id: next_id,
+                            tab_label: label.clone(),
+                            session_id: found.session_id.clone(),
+                            server: found.name.clone(),
+                            command: command.to_string(),
+                            started_at: now(),
+                            ran_without_asking: Some(by.clone()),
+                            as_root,
+                            root_via: card.root_via,
+                        },
+                        tab_id: tab_id.to_string(),
+                        session_id: found.session_id.clone(),
+                        stop: stop_tx.clone(),
+                    });
+                    None
+                }
+                None => {
+                    let (tx, rx) = oneshot::channel();
+                    s.pending.push(Pending { view: card.clone(), decide: tx, stop: stop_tx.clone() });
+                    Some(rx)
+                }
+            };
+            (label, found.session_id, found.name, found.user, next_id, epoch, rx, stop_tx, stop_rx, auto, card)
         };
         self.changed();
-        let root = runs_as_root(user.as_deref(), command);
+        if rx.is_some() && self.0.flash.load(Ordering::Relaxed) {
+            (self.0.attention)();
+        }
+        // As root: the login, the command (read above, not again), or the
+        // AI's asking. Through sudo or dzdo only where the login isn't root.
+        let root = card.root;
+        let via_tool = as_root && user.as_deref() != Some("root");
         let limit = Duration::from_secs(timeout.unwrap_or(DEFAULT_TIMEOUT));
         let entry_for = |event: &'static str| {
             let mut e = audit::Entry::new(event, &label);
@@ -1022,6 +1517,7 @@ impl AiState {
             e.user = user.clone();
             e.command = Some(for_log(command, MAX_LOGGED_COMMAND));
             e.root = root;
+            e.as_root = as_root;
             e
         };
         let entry = || entry_for("request");
@@ -1032,6 +1528,8 @@ impl AiState {
                 server: server.clone(),
                 command: command.to_string(),
                 root,
+                as_root,
+                root_via: None,
                 outcome,
                 exit_code: None,
                 output_bytes: 0,
@@ -1040,87 +1538,239 @@ impl AiState {
                 timed_out: false,
                 error: None,
                 at: now(),
+                ran_without_asking: None,
             },
             output: Zeroizing::default(),
             ai_output: Zeroizing::default(),
         };
-
-        // Waiting for you. The answer: Some(allowed), or None when access
-        // ended first (the request dropped by cancel_where or decide).
-        let decision: Result<Option<bool>, ()> = tokio::select! {
-            biased;
-            d = &mut rx => Ok(d.ok()),
-            _ = withdrawal(&mut cancel) => Err(()),
-        };
-        let decision = match decision {
-            Ok(d) => d,
-            // The AI withdrew it: unless you or an end of access got to it
-            // first, it's taken off the waiting list here.
-            Err(()) => {
-                let was_waiting = {
-                    let mut s = self.lock();
-                    let before = s.pending.len();
-                    s.pending.retain(|p| p.view.id != id);
-                    before != s.pending.len()
-                };
-                if was_waiting {
-                    let mut e = entry();
-                    e.decision = Some("cancelled");
-                    e.note = Some("cancelled by the AI tool".into());
-                    self.audit(e);
-                    self.remember(epoch, done("cancelled"));
-                    self.changed();
-                    return ToolResult::err("Cancelled before the user decided: the request was withdrawn.");
-                }
-                // Taken off under the same lock as the answer was given, so
-                // it's there now (or the request was dropped).
-                rx.try_recv().ok()
-            }
-        };
-        let Some(allowed) = decision else {
-            let mut e = entry();
-            e.decision = Some("cancelled");
-            e.note = Some("access ended".into());
-            self.audit(e);
-            self.remember(epoch, done("cancelled"));
-            self.changed();
-            return ToolResult::err("Cancelled before the user decided: the server isn't shared any more.");
-        };
-        if !allowed {
-            let mut e = entry();
-            e.decision = Some("denied");
-            e.by = Some("you");
-            self.audit(e);
-            self.remember(epoch, done("denied"));
-            self.changed();
-            return ToolResult::err("Denied by the user.");
-        }
-
-        // Logged now, as you allowed it: a long command, or one that hangs,
-        // is in the log while it runs, not only once it ends. Its "finished"
-        // line follows, with the same id.
-        let mut e = entry();
-        e.decision = Some("allowed");
-        e.by = Some("you");
-        self.audit(e);
-
-        // Allowed: decide() has put it in the running list with its stop
-        // signal, which an end of access sets. The AI withdrawing it sets it
-        // too. Either way exec::run ends it on the server before returning;
-        // it runs as a task of its own, so it does even if this is dropped.
         let withdrawn = |c: &watch::Receiver<bool>| *c.borrow();
-        if withdrawn(&cancel) {
-            let _ = stop_tx.send(true);
-        }
-        let mut task = tokio::spawn((self.0.exec)(session_id.clone(), command.to_string(), limit, stop_rx));
-        let joined = tokio::select! {
-            r = &mut task => r,
-            _ = withdrawal(&mut cancel) => {
+
+        // Allowed (at once, `auto`, or by your answer), then run. A request
+        // as root whose server wants a password it didn't have, or turned
+        // down the one you typed, comes back to you with its card asking for
+        // it, and is allowed again: so this goes round until it runs, or you
+        // deny it, or access ends.
+        let mut auto = auto;
+        let mut rx = rx;
+        // The last password typed for it was turned down.
+        let mut refused = false;
+        let mut round = 0u32;
+        let (approved_by, result, via) = loop {
+            round += 1;
+            let (approved_by, typed) = match (auto.take(), rx.take()) {
+                (Some(by), _) => (by, None),
+                (None, None) => unreachable!("a request either runs now or waits"),
+                (None, Some(mut rx)) => {
+                    // Waiting for you. The answer: Some, or None when access
+                    // ended first (the request dropped by cancel_where or answer).
+                    let decision: Result<Option<Answer>, ()> = tokio::select! {
+                        biased;
+                        d = &mut rx => Ok(d.ok()),
+                        _ = withdrawal(&mut cancel) => Err(()),
+                    };
+                    let decision = match decision {
+                        Ok(d) => d,
+                        // The AI withdrew it: unless you or an end of access got
+                        // to it first, it's taken off the waiting list here.
+                        Err(()) => {
+                            let was_waiting = {
+                                let mut s = self.lock();
+                                let before = s.pending.len();
+                                s.pending.retain(|p| p.view.id != id);
+                                before != s.pending.len()
+                            };
+                            if was_waiting {
+                                let mut e = entry();
+                                e.decision = Some("cancelled");
+                                e.note = Some("cancelled by the AI tool".into());
+                                self.audit(e);
+                                self.remember(epoch, done("cancelled"));
+                                self.changed();
+                                return ToolResult::err("Cancelled before the user decided: the request was withdrawn.");
+                            }
+                            // Taken off under the same lock as the answer was
+                            // given, so it's there now (or the request was
+                            // dropped).
+                            rx.try_recv().ok()
+                        }
+                    };
+                    match decision {
+                        None => {
+                            let mut e = entry();
+                            e.decision = Some("cancelled");
+                            e.note = Some("access ended".into());
+                            self.audit(e);
+                            self.remember(epoch, done("cancelled"));
+                            self.changed();
+                            return ToolResult::err("Cancelled before the user decided: the server isn't shared any more.");
+                        }
+                        Some(Answer::Deny(note)) => {
+                            let mut e = entry();
+                            e.decision = Some("denied");
+                            e.by = Some(BY_YOU);
+                            e.note = note.as_ref().map(|n| format!("note: {n}"));
+                            self.audit(e);
+                            self.remember(epoch, done("denied"));
+                            self.changed();
+                            let after = if refused { " The root password typed for it was refused." } else { "" };
+                            return ToolResult::err(match note {
+                                Some(n) => format!("Denied by the user: {n}{after}"),
+                                None => format!("Denied by the user.{after}"),
+                            });
+                        }
+                        Some(Answer::Allow { by, password }) => (by, password),
+                    }
+                }
+            };
+            let ran_without_asking = Some(approved_by.clone()).filter(|b| b != BY_YOU);
+
+            // Logged now, as it's allowed: a long command, or one that hangs,
+            // is in the log while it runs, not only once it ends. Its "finished"
+            // line follows, with the same id.
+            let mut e = entry();
+            e.decision = Some("allowed");
+            e.by = Some(if ran_without_asking.is_some() { "your settings" } else { BY_YOU });
+            e.approved_by = Some(approved_by.clone());
+            if round > 1 {
+                e.note = Some("allowed again, after the server asked for the root password".into());
+            }
+            self.audit(e);
+
+            // Allowed: answer() (or the step above, when it runs without asking)
+            // has put it in the running list with its stop signal, which an end
+            // of access sets. The AI withdrawing it sets it
+            // too. Either way exec::run ends it on the server before returning;
+            // it runs as a task of its own, so it does even if this is dropped.
+            if withdrawn(&cancel) {
                 let _ = stop_tx.send(true);
-                task.await
+            }
+            if !via_tool {
+                let mut task = tokio::spawn((self.0.exec)(session_id.clone(), command.to_string(), limit, stop_rx.clone()));
+                let joined = tokio::select! {
+                    r = &mut task => r,
+                    _ = withdrawal(&mut cancel) => {
+                        let _ = stop_tx.send(true);
+                        task.await
+                    }
+                };
+                let result = joined.unwrap_or_else(|e| Err(format!("It stopped unexpectedly: {e}")));
+                break (approved_by, result.map_err(|e| (e.clone(), format!("Couldn't run it: {e}"))), None);
+            }
+
+            // As root (#120): with the password you just typed, else with
+            // what this AI tab has for root there, else looking for root
+            // that needs no password.
+            let kept = self.kept_root(tab_id, &session_id).filter(|_| typed.is_none());
+            let how = match (typed, &kept) {
+                (Some(pw), _) => exec::RootHow::Typed(pw),
+                (None, Some(k)) => exec::RootHow::Kept(k.0.clone()),
+                (None, None) => exec::RootHow::Find,
+            };
+            // A kept password is tried by one request at a time until the
+            // tool has taken it, so one that stopped working (changed on the
+            // server) costs one failed attempt, not one per request. A
+            // request that waited finds it forgotten, and asks you.
+            let mut turn = None;
+            let mut gone = false;
+            if let Some(k) = kept.as_ref().filter(|k| k.0.password.is_some()) {
+                let mut stop_wait = stop_rx.clone();
+                turn = tokio::select! {
+                    g = k.0.checked.clone().lock_owned() => Some(g),
+                    _ = stop_wait.wait_for(|s| *s) => None,
+                    _ = withdrawal(&mut cancel) => {
+                        let _ = stop_tx.send(true);
+                        None
+                    }
+                };
+                gone = turn.is_some() && !self.kept_root(tab_id, &session_id).is_some_and(|x| Arc::ptr_eq(&x.0, &k.0));
+            }
+            let run = if kept.as_ref().is_some_and(|k| k.0.password.is_some()) && turn.is_none() {
+                exec::RootRun::Ran(exec::Exec { stopped: true, ..exec::Exec::default() }, None)
+            } else if gone {
+                exec::RootRun::NeedPassword(kept.as_ref().map(|k| k.0.tool))
+            } else {
+                let (started_tx, mut started_rx) = oneshot::channel();
+                let job = RootJob { command: command.to_string(), how, started: Some(started_tx) };
+                let mut task = tokio::spawn((self.0.root_exec)(session_id.clone(), job, limit, stop_rx.clone()));
+                let mut watching = turn.is_some();
+                let mut withdrawn_seen = false;
+                let joined = loop {
+                    tokio::select! {
+                        biased;
+                        r = &mut task => break r,
+                        s = &mut started_rx, if watching => {
+                            watching = false;
+                            // The tool took it: the next request may go.
+                            if s.is_ok() {
+                                turn = None;
+                            }
+                        }
+                        _ = withdrawal(&mut cancel), if !withdrawn_seen => {
+                            withdrawn_seen = true;
+                            let _ = stop_tx.send(true);
+                        }
+                    }
+                };
+                joined.unwrap_or_else(|e| {
+                    let why = format!("It stopped unexpectedly: {e}");
+                    exec::RootRun::Failed { you: why.clone(), ai: format!("Couldn't run it: {why}") }
+                })
+            };
+            let kept_tool = kept.as_ref().map(|k| k.0.tool);
+            match run {
+                exec::RootRun::Ran(out, new) => {
+                    let tool = new.as_ref().map(|a| a.tool).or(kept_tool);
+                    if let Some(a) = new {
+                        self.keep_root(id, tab_id, &session_id, a);
+                    }
+                    break (approved_by, Ok(out), tool);
+                }
+                exec::RootRun::Failed { you, ai } => {
+                    // A kept password is never left in place after a failure:
+                    // the next request asks for it again rather than risk it.
+                    if let Some(k) = kept.as_ref().filter(|k| k.0.password.is_some()) {
+                        self.forget_root(tab_id, &session_id, &k.0);
+                    }
+                    break (approved_by, Err((you, ai)), kept_tool);
+                }
+                exec::RootRun::NeedPassword(tool) => {
+                    drop(turn);
+                    refused = false;
+                    let mut e = entry_for("root_password");
+                    e.root_tool = tool.or(kept_tool);
+                    e.note = Some("the server asked for a root password".into());
+                    self.audit(e);
+                    match self.ask_again(&card, PasswordAsk::Needed, tool.or(kept_tool), &stop_tx) {
+                        Some(again) => rx = Some(again),
+                        None => break (approved_by, Ok(exec::Exec { stopped: true, ..exec::Exec::default() }), tool),
+                    }
+                }
+                exec::RootRun::WrongPassword(tool) => {
+                    // A kept one turned down is forgotten at once: no other
+                    // request tries it.
+                    if let Some(k) = &kept {
+                        self.forget_root(tab_id, &session_id, &k.0);
+                    }
+                    drop(turn);
+                    refused = true;
+                    let mut e = entry_for("root_password");
+                    e.root_tool = tool.or(kept_tool);
+                    e.note = Some("the root password was refused (one attempt)".into());
+                    self.audit(e);
+                    match self.ask_again(&card, PasswordAsk::Wrong, tool.or(kept_tool), &stop_tx) {
+                        Some(again) => rx = Some(again),
+                        None => break (approved_by, Ok(exec::Exec { stopped: true, ..exec::Exec::default() }), tool),
+                    }
+                }
+            }
+            self.changed();
+            if self.0.flash.load(Ordering::Relaxed) {
+                (self.0.attention)();
             }
         };
-        let result: Result<exec::Exec, String> = joined.unwrap_or_else(|e| Err(format!("It stopped unexpectedly: {e}")));
+        let ran_without_asking = Some(approved_by).filter(|b| b != BY_YOU);
+        drop(stop_rx);
+
         // Still listed: nothing ended its access while it ran.
         let still_listed = {
             let mut s = self.lock();
@@ -1131,7 +1781,10 @@ impl AiState {
         let stopped_by_ai = still_listed && withdrawn(&cancel);
 
         let mut e = entry_for("finished");
+        e.root_tool = via;
         let mut d = done("done");
+        d.view.ran_without_asking = ran_without_asking;
+        d.view.root_via = via;
         let answer = match result {
             Ok(out) if out.stopped => {
                 e.note = Some(if stopped_by_ai { "stopped: withdrawn by the AI tool" } else { "stopped: access ended" }.into());
@@ -1171,6 +1824,9 @@ impl AiState {
                     (None, Some(sig)) => format!("Ended by signal {sig}\n"),
                     (None, None) => "Exit code: unknown\n".to_string(),
                 };
+                if let Some(tool) = via {
+                    head.push_str(&format!("Ran as root, through {tool}.\n"));
+                }
                 if out.timed_out {
                     head.push_str(&format!("Stopped by Submarine after {} seconds.\n", limit.as_secs()));
                 }
@@ -1203,11 +1859,11 @@ impl AiState {
                 d.view.timed_out = out.timed_out;
                 ToolResult::ok(answer)
             }
-            Err(err) => {
+            Err((err, for_ai)) => {
                 e.note = Some(err.clone());
                 d.view.outcome = "failed";
-                d.view.error = Some(err.clone());
-                ToolResult::err(format!("Couldn't run it: {err}"))
+                d.view.error = Some(err);
+                ToolResult::err(for_ai)
             }
         };
         self.audit(e);
@@ -1215,6 +1871,86 @@ impl AiState {
         self.changed();
         answer
     }
+
+    // -- Root for the AI (#120) -------------------------------------------
+
+    /// What `tab_id` has for root on `session_id`, if anything.
+    fn kept_root(&self, tab_id: &str, session_id: &str) -> Option<KeptRoot> {
+        kept_in(&self.lock(), tab_id, session_id)
+    }
+
+    /// Keep `access` for root on `session_id` in `tab_id`'s list: only while
+    /// the request `id` is still running there, so not in a share that
+    /// ended (and maybe started again) meanwhile.
+    fn keep_root(&self, id: u64, tab_id: &str, session_id: &str, access: Arc<crate::ssh_manager::RootAccess>) {
+        let mut s = self.lock();
+        if !s.running.iter().any(|r| r.view.id == id) {
+            return;
+        }
+        if let Some(x) = s.tabs.iter_mut().find(|t| t.id == tab_id).and_then(|t| t.servers.iter_mut().find(|x| x.session_id == session_id)) {
+            x.root = Some(KeptRoot(access));
+        }
+    }
+
+    /// Forget `access`, a password the tool turned down, if it's still the
+    /// one kept.
+    fn forget_root(&self, tab_id: &str, session_id: &str, access: &Arc<crate::ssh_manager::RootAccess>) {
+        let mut s = self.lock();
+        if let Some(x) = s.tabs.iter_mut().find(|t| t.id == tab_id).and_then(|t| t.servers.iter_mut().find(|x| x.session_id == session_id)) {
+            if x.root.as_ref().is_some_and(|k| Arc::ptr_eq(&k.0, access)) {
+                x.root = None;
+            }
+        }
+    }
+
+    /// A request as root that you (or the server's level) allowed, whose
+    /// server wants a password it didn't have, or turned down the one
+    /// given: back on the waiting list, its card asking for the password
+    /// (`password`), in the same step as it leaves the running list. None
+    /// when it's been stopped (withdrawn, or access ended) meanwhile.
+    fn ask_again(&self, card: &PendingView, password: PasswordAsk, via: Option<&'static str>, stop: &watch::Sender<bool>) -> Option<oneshot::Receiver<Answer>> {
+        let mut s = self.lock();
+        if *stop.borrow() {
+            return None;
+        }
+        let at = s.running.iter().position(|r| r.view.id == card.id)?;
+        let shared = s.tabs.iter().any(|t| t.id == card.tab_id && t.servers.iter().any(|x| x.session_id == card.session_id));
+        if !shared {
+            return None;
+        }
+        s.running.remove(at);
+        let (tx, rx) = oneshot::channel();
+        let mut view = card.clone();
+        view.password = password;
+        view.root_via = via.or(view.root_via);
+        view.asked_at = now();
+        s.pending.push(Pending { view, decide: tx, stop: stop.clone() });
+        Some(rx)
+    }
+}
+
+/// What `tab_id` has for root on `session_id`, in `s`.
+fn kept_in(s: &Shared, tab_id: &str, session_id: &str) -> Option<KeptRoot> {
+    s.tabs.iter().find(|t| t.id == tab_id)?.servers.iter().find(|x| x.session_id == session_id)?.root.clone()
+}
+
+/// A root password typed on a card, as it's kept: wiped when dropped, None
+/// when empty. One with a line break (or a NUL) is refused: it would end
+/// the line the tool reads.
+fn typed_password(password: Option<String>) -> Result<Option<Zeroizing<String>>, String> {
+    let password = password.map(Zeroizing::new).filter(|p| !p.is_empty());
+    if password.as_ref().is_some_and(|p| p.contains(['\n', '\r', '\0'])) {
+        return Err("A password can't have a line break.".into());
+    }
+    Ok(password)
+}
+
+/// A root executor for tests that run nothing as root.
+#[cfg(test)]
+fn no_root() -> RootExecutor {
+    Arc::new(|_, _, _, _| {
+        Box::pin(async { exec::RootRun::Failed { you: "no root in this test".into(), ai: "Couldn't run it: no root in this test".into() } })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1224,6 +1960,8 @@ impl AiState {
 #[derive(Serialize)]
 pub struct AiSettings {
     enabled: bool,
+    /// Flash the taskbar when the AI needs you.
+    flash: bool,
     /// Where Claude Code is, when it's installed.
     claude: Option<String>,
     available: bool,
@@ -1232,6 +1970,7 @@ pub struct AiSettings {
 fn settings_view(state: &AiState) -> AiSettings {
     AiSettings {
         enabled: state.enabled(),
+        flash: state.0.flash.load(Ordering::Relaxed),
         claude: claude::find().map(|p| p.to_string_lossy().into_owned()),
         available: cfg!(not(target_os = "android")),
     }
@@ -1247,12 +1986,22 @@ pub async fn ai_set_enabled(app: tauri::AppHandle, state: tauri::State<'_, AiSta
     if cfg!(target_os = "android") {
         return Err("AI tools aren't available on Android.".into());
     }
-    crate::local_open::write_setting(&app, SETTINGS_FILE, &Settings { enabled }, "the AI tools setting")?;
+    let flash = state.0.flash.load(Ordering::Relaxed);
+    crate::local_open::write_setting(&app, SETTINGS_FILE, &Settings { enabled, flash }, "the AI tools setting")?;
     if enabled {
         state.turn_on()?;
     } else {
         state.turn_off().await;
     }
+    Ok(settings_view(&state))
+}
+
+/// "Flash the taskbar when the AI needs you", on this device.
+#[tauri::command]
+pub async fn ai_set_flash(app: tauri::AppHandle, state: tauri::State<'_, AiState>, flash: bool) -> Result<AiSettings, String> {
+    let enabled = state.enabled();
+    crate::local_open::write_setting(&app, SETTINGS_FILE, &Settings { enabled, flash }, "the AI tools setting")?;
+    state.0.flash.store(flash, Ordering::Relaxed);
     Ok(settings_view(&state))
 }
 
@@ -1269,7 +2018,10 @@ pub async fn ai_share(state: tauri::State<'_, AiState>, ssh: tauri::State<'_, cr
         return Err("That server's tab isn't connected.".into());
     }
     let user = ssh.session_users.lock().await.get(&session_id).cloned();
-    state.share_as(&tab_id, &session_id, &name, user)
+    // A quick connect is server 0: no saved server, so no settings of its
+    // own and no "Always allow" for it.
+    let server_id = ssh.session_servers.lock().await.get(&session_id).map(|&id| i64::from(id)).filter(|&id| id > 0);
+    state.share_as(&tab_id, &session_id, &name, user, server_id)
 }
 
 /// Stop sharing a server: with one AI tab, or (no `tab_id`) with any.
@@ -1300,9 +2052,191 @@ pub async fn ai_output(state: tauri::State<'_, AiState>, id: u64) -> Result<Done
     Ok(DoneOutput { output: d.output.to_string(), ai_output: d.ai_output.to_string() })
 }
 
+/// Allow or Deny, from the card. `note`, with Deny: what the AI is told,
+/// so it can try another way. `password`, with Allow on a card as root
+/// (#120): the root password you typed there, which goes only to sudo's or
+/// dzdo's own prompt, and is kept for this AI tab and server only.
 #[tauri::command]
-pub async fn ai_decide(state: tauri::State<'_, AiState>, id: u64, allow: bool) -> Result<(), String> {
-    state.decide(id, allow)
+pub async fn ai_decide(state: tauri::State<'_, AiState>, id: u64, allow: bool, note: Option<String>, password: Option<String>) -> Result<(), String> {
+    if allow {
+        let password = typed_password(password)?;
+        state.answer(id, Answer::Allow { by: BY_YOU.into(), password })
+    } else {
+        state.deny(id, note)
+    }
+}
+
+/// End "Allow everything here" for a server shared with an AI tab.
+#[tauri::command]
+pub async fn ai_end_allow_all(state: tauri::State<'_, AiState>, tab_id: String, session_id: String) -> Result<(), String> {
+    let n = state.end_allow_all_in(&tab_id, &session_id);
+    if n == 0 {
+        return Err("Everything wasn't allowed there.".into());
+    }
+    Ok(())
+}
+
+/// "Allow everything here until this AI tab closes", from the card, with
+/// the root password typed on it, if it's a card as root that asks for one.
+#[tauri::command]
+pub async fn ai_allow_session(state: tauri::State<'_, AiState>, id: u64, password: Option<String>) -> Result<(), String> {
+    let password = typed_password(password)?;
+    state.allow_session(id, password)
+}
+
+// ---------------------------------------------------------------------------
+// Approval levels and rules (trust.rs): changed only from here, by you
+// ---------------------------------------------------------------------------
+
+/// Run `f` on the open profile's vault.
+fn with_vault<T>(db: &crate::DbState, f: impl FnOnce(&rusqlite::Connection) -> Result<T, String>) -> Result<T, String> {
+    let guard = db.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+    let conn = guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+    f(conn)
+}
+
+const LEVEL_NAMES: [&str; 3] = ["ask every time", "run my allowed commands, ask for the rest", "run anything, just log it"];
+
+fn level_name(level: Option<u8>) -> &'static str {
+    match level {
+        Some(l @ 1..=3) => LEVEL_NAMES[l as usize - 1],
+        _ => "follows its folder or the default",
+    }
+}
+
+/// An allow rule with a wildcard for a command that runs other commands
+/// (`timeout *`) is saved only with the extra click that confirms it.
+fn check_runner(pattern: &str, confirmed: Option<bool>) -> Result<(), String> {
+    match trust::runner_warning(pattern) {
+        Some(warning) if confirmed != Some(true) => Err(format!("{warning} Confirm it to save it.")),
+        _ => Ok(()),
+    }
+}
+
+/// "Always allow this command here", from the card: `pattern` (the command,
+/// or it with ` *` for any arguments) goes on the server's allow list, and
+/// this request is allowed. A server still at "Ask every time" goes to "Run
+/// my allowed commands", or the rule would do nothing; the card says so.
+#[tauri::command]
+pub async fn ai_allow_always(
+    state: tauri::State<'_, AiState>,
+    db: tauri::State<'_, crate::DbState>,
+    id: u64,
+    pattern: String,
+    confirm_runner: Option<bool>,
+) -> Result<(), String> {
+    let p = state.pending_view(id)?;
+    check_runner(&pattern, confirm_runner)?;
+    let server_id = p.server_id.filter(|_| p.can_allow_always).ok_or("This command can't be allowed with a rule: it isn't one simple command on a saved server.")?;
+    if trust::glob_as_rule(&pattern, &p.command) {
+        return Err(trust::GLOB_AS_RULE.into());
+    }
+    let pattern = trust::check_rule("allow", &pattern)?;
+    if !trust::allow_matches(&pattern, &p.command) {
+        return Err("That rule doesn't match this command.".into());
+    }
+    let (raised, what) = with_vault(&db, |conn| {
+        let pattern = trust::add_rule(conn, "server", server_id, "allow", &pattern)?;
+        let raised = trust::policy_for(conn, Some(server_id)).level == trust::ASK_EVERY_TIME;
+        if raised {
+            trust::set_level(conn, "server", server_id, Some(trust::ALLOWED_COMMANDS))?;
+        }
+        Ok((raised, format!("{}: always allow `{pattern}`", trust::describe(conn, "server", server_id))))
+    })?;
+    crate::save_vault_internal(&db)?;
+    state.log_setting(if raised { format!("{what}; level set to {}", LEVEL_NAMES[1]) } else { what });
+    state.answer(id, Answer::Allow { by: BY_YOU.into(), password: None })
+}
+
+/// "Keep as it was" for a server whose policy a teammate's move loosened
+/// (trust::hold_loosened): it stays at "Ask every time" until you change it.
+#[tauri::command]
+pub async fn ai_keep_policy(state: tauri::State<'_, AiState>, db: tauri::State<'_, crate::DbState>, server_id: i64) -> Result<(), String> {
+    let what = with_vault(&db, |conn| {
+        trust::keep_as_it_was(conn, server_id)?;
+        Ok(format!("{}: kept as it was after a teammate's move ({})", trust::describe(conn, "server", server_id), LEVEL_NAMES[0]))
+    })?;
+    crate::save_vault_internal(&db)?;
+    state.log_setting(what);
+    state.end_allow_all(|x| x.server_id == Some(server_id), "kept as it was after a teammate's move");
+    state.changed();
+    Ok(())
+}
+
+/// Everything set, for Settings › AI tools.
+#[tauri::command]
+pub async fn ai_trust_view(db: tauri::State<'_, crate::DbState>) -> Result<trust::TrustView, String> {
+    with_vault(&db, trust::view)
+}
+
+/// One server's or folder's settings (or the default's), for its editor.
+#[tauri::command]
+pub async fn ai_trust_scope(db: tauri::State<'_, crate::DbState>, scope: String, id: i64) -> Result<trust::ScopeView, String> {
+    with_vault(&db, |conn| trust::scope_view(conn, &scope, id))
+}
+
+/// Set the level of a server, a folder or the default; None takes it off.
+#[tauri::command]
+pub async fn ai_trust_set_level(
+    state: tauri::State<'_, AiState>,
+    db: tauri::State<'_, crate::DbState>,
+    scope: String,
+    id: i64,
+    level: Option<u8>,
+) -> Result<(), String> {
+    let shared = state.shared_server_ids();
+    let (what, reached) = with_vault(&db, |conn| {
+        trust::set_level(conn, &scope, id, level)?;
+        let reached: Vec<Option<i64>> = shared.into_iter().filter(|sid| trust::reaches(conn, *sid, &scope, id)).collect();
+        Ok((format!("{}: {}", trust::describe(conn, &scope, id), level_name(level)), reached))
+    })?;
+    crate::save_vault_internal(&db)?;
+    state.log_setting(what);
+    // A level you set now holds, not "Allow everything here" from before.
+    state.end_allow_all(|x| reached.contains(&x.server_id), "its approval level was changed");
+    state.changed();
+    Ok(())
+}
+
+/// Add an allow (`kind` "allow") or always-ask ("ask") rule.
+#[tauri::command]
+pub async fn ai_trust_add_rule(
+    state: tauri::State<'_, AiState>,
+    db: tauri::State<'_, crate::DbState>,
+    scope: String,
+    id: i64,
+    kind: String,
+    pattern: String,
+    confirm_runner: Option<bool>,
+) -> Result<String, String> {
+    if kind == "allow" {
+        check_runner(&pattern, confirm_runner)?;
+    }
+    let (pattern, what) = with_vault(&db, |conn| {
+        let pattern = trust::add_rule(conn, &scope, id, &kind, &pattern)?;
+        let what = format!("{}: {} `{pattern}`", trust::describe(conn, &scope, id), if kind == "allow" { "always allow" } else { "always ask" });
+        Ok((pattern, what))
+    })?;
+    crate::save_vault_internal(&db)?;
+    state.log_setting(what);
+    state.changed();
+    Ok(pattern)
+}
+
+#[tauri::command]
+pub async fn ai_trust_remove_rule(state: tauri::State<'_, AiState>, db: tauri::State<'_, crate::DbState>, id: i64) -> Result<(), String> {
+    let what = with_vault(&db, |conn| {
+        Ok(trust::remove_rule(conn, id)?.map(|r| {
+            let list = if r.kind == "allow" { "always allow" } else { "always ask" };
+            format!("{}: removed {list} `{}`", trust::describe(conn, &r.scope, r.scope_id), r.pattern)
+        }))
+    })?;
+    crate::save_vault_internal(&db)?;
+    if let Some(what) = what {
+        state.log_setting(what);
+    }
+    state.changed();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

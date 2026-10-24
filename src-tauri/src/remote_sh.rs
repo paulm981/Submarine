@@ -76,6 +76,20 @@ pub(crate) fn sh_command_with(sh: &str, env: &[(&str, &str)], script: &str, args
     cmd
 }
 
+/// Turns each argument of sh_command_encoded back from its octal, in
+/// order, as `"$@"`. `printf x` keeps a line break at an argument's end.
+const ARGS_DECODE: &str = r#"n=$#; while [ "$n" -gt 0 ]; do a=$(printf "$1"; printf x); a=${a%x}; shift; set -- "$@" "$a"; n=$((n - 1)); done"#;
+
+/// sh_command_with for arguments that may hold anything (a command the AI
+/// wrote, with `!` or line breaks, which csh and tcsh won't take inside
+/// quotes): each goes as octal too, and the script gets them back as
+/// `"$@"`. Four times as long as a quoted word.
+pub(crate) fn sh_command_encoded(sh: &str, env: &[(&str, &str)], script: &str, args: &[String]) -> String {
+    let script = format!("{ARGS_DECODE}\n{script}");
+    let args: Vec<String> = args.iter().map(|a| octal(a)).collect();
+    sh_command_with(sh, env, &script, &args)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +150,25 @@ mod tests {
             } else {
                 assert_eq!(String::from_utf8_lossy(&out.stdout), EXPECTED, "{shell}: {}", String::from_utf8_lossy(&out.stderr));
             }
+            ran += 1;
+        }
+        assert!(ran >= 1);
+    }
+
+    /// Arguments of any kind (`!`, line breaks, quotes, one ending with a
+    /// line break, an empty one) reach the script as written, through sh,
+    /// tcsh and csh alike.
+    #[cfg(unix)]
+    #[test]
+    fn encoded_arguments_reach_the_script_under_any_login_shell() {
+        let args: Vec<String> = ["hi!", "line\nbreak", "it's \"q\" $x `y`", "end\n", "", "100%"].map(String::from).to_vec();
+        let cmd = sh_command_encoded("/bin/sh", &[], "for w; do printf '[%s]' \"$w\"; done", &args);
+        assert!(!cmd.contains(['\n', '!']), "{cmd}");
+        let want: String = args.iter().map(|a| format!("[{a}]")).collect();
+        let mut ran = 0;
+        for shell in ["sh", "tcsh", "csh"] {
+            let Ok(out) = std::process::Command::new(shell).arg("-c").arg(&cmd).output() else { continue };
+            assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{shell}: {}", String::from_utf8_lossy(&out.stderr));
             ran += 1;
         }
         assert!(ran >= 1);

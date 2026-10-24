@@ -539,6 +539,10 @@ pub struct RootAccess {
     /// instead of each signing in with a password that may have stopped
     /// working (lib.rs, password_turn).
     pub checked: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
+    /// Sudo's cached sign-ins (tickets) are neither used nor left behind
+    /// (`-k`): the AI's root (#120), which must never ride on a sign-in of
+    /// yours, or leave one for anything else.
+    pub no_tickets: bool,
 }
 
 /// A tab's gate for passwords the user types (SshState::root_gates).
@@ -556,7 +560,13 @@ impl RootAccess {
         shell: Option<&'static str>,
         checked: Option<std::time::Instant>,
     ) -> Self {
-        RootAccess { tool, password, shell, checked: Arc::new(tokio::sync::Mutex::new(checked)) }
+        RootAccess { tool, password, shell, checked: Arc::new(tokio::sync::Mutex::new(checked)), no_tickets: false }
+    }
+
+    /// The same, using and leaving no sudo tickets (`no_tickets`).
+    pub fn without_tickets(mut self) -> Self {
+        self.no_tickets = true;
+        self
     }
 }
 

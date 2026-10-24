@@ -1,14 +1,14 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Bot, Home, Loader2, PanelRightClose, PanelRightOpen, X } from "lucide-react";
-import { AiTab, sharedWith, useAi } from "../util/ai";
+import { AiTab, aiMarker, openAiTrust, sharedWith, trustTargetFor, useAi } from "../util/ai";
 import {
   PANE_MIN_WIDTH, aiStarted, aiPaneState, choosePaneAi, closePaneHere, leftView, resetAiPane, setPaneFolded, setPaneHere,
   setPaneWidth, showHomeTab, useAiPane,
 } from "../ui/aiPane";
 import { appHotkey, claimTerminal, dockedTerminal, setAiPaneKeyLive, useDockVersion } from "../ui/terminalDock";
 import { IS_ANDROID } from "../util/platform";
-import { PendingCard } from "./AiPanel";
+import { PendingCard, levelOf } from "./AiPanel";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The AI side pane (#100): an AI tab beside the server tab you're working in,
@@ -316,7 +316,14 @@ export const AiSidePane = ({ v, onHome, onGoToServer }: {
       {waiting.length > 0 && (
         <div className="shrink-0 max-h-[45%] overflow-y-auto custom-scrollbar border-b border-white/5">
           {waiting.map((p) => (
-            <PendingCard key={p.id} p={p} decide={(allow) => run("ai_decide", { id: p.id, allow })} onGoToServer={onGoToServer} />
+            <PendingCard
+              key={`${p.id}:${p.asked_at}`}
+              p={p}
+              level={levelOf(ai, p.tab_id, p.session_id)}
+              decide={(allow, note, password) => run("ai_decide", { id: p.id, allow, note: note ?? null, password: password || null })}
+              act={run}
+              onGoToServer={onGoToServer}
+            />
           ))}
         </div>
       )}
@@ -334,6 +341,10 @@ const ShareLine = ({ v, tab, shared, starting, onShare, onUnshare }: {
   const btn = "shrink-0 h-6 px-2 rounded border text-[10px] font-bold uppercase tracking-wider disabled:opacity-40 disabled:pointer-events-none";
   let text: string;
   let action: React.ReactNode = null;
+  // How much it may run here without asking (#115): said, with a click to
+  // change it, whenever it's more than "Ask every time".
+  const here = v.session ? tab.servers.find((s) => s.session_id === v.session!.id) : undefined;
+  const marker = here ? aiMarker(here) : null;
   if (v.session && !v.session.ssh) {
     text = "Remote Desktop, VNC and telnet tabs can't be shared with AI.";
   } else if (v.session) {
@@ -353,7 +364,7 @@ const ShareLine = ({ v, tab, shared, starting, onShare, onUnshare }: {
           ? `Once ${tab.label} has started`
           : !v.session.connected
             ? "Once this tab is connected"
-            : `Let ${tab.label} ask to run commands on this tab, each one only after you allow it`}
+            : `Let ${tab.label} ask to run commands on this tab: each one waits for your Allow, unless you have set this server to run commands without asking`}
         className={`${btn} bg-primary/15 border-primary/40 text-primary hover:bg-primary hover:text-zinc-950`}
       >
         Share
@@ -369,6 +380,26 @@ const ShareLine = ({ v, tab, shared, starting, onShare, onUnshare }: {
   return (
     <div className="shrink-0 px-3 py-1.5 flex items-center gap-2 border-b border-white/5 text-[11px] text-zinc-400">
       <span className="flex-1 min-w-0 leading-snug">{text}</span>
+      {here?.allow_all && (
+        <button
+          type="button"
+          onClick={() => { invoke("ai_end_allow_all", { tabId: tab.id, sessionId: here.session_id }).catch(() => {}); }}
+          title={`Stop allowing everything on this tab for ${tab.label}: its commands go back to this server's approval level`}
+          className="shrink-0 h-6 px-2 rounded border border-white/10 text-zinc-300 text-[10px] font-bold tracking-wide hover:border-red-400/50 hover:text-red-300"
+        >
+          End allow everything
+        </button>
+      )}
+      {here && marker && (
+        <button
+          type="button"
+          onClick={() => openAiTrust(trustTargetFor(here))}
+          title={`${marker}${here.allow_all ? " (allowed until this AI tab closes)" : ""}. Click to change how much the AI may run here without asking.`}
+          className="shrink-0 h-6 px-2 rounded border border-amber-400/30 bg-amber-400/10 text-amber-300 text-[10px] font-bold tracking-wide hover:bg-amber-400/20"
+        >
+          {marker}
+        </button>
+      )}
       {action}
     </div>
   );

@@ -6,9 +6,10 @@
 //! before are kept too, as `ai-audit.old.2.log` and `ai-audit.old.3.log`.
 //!
 //! It holds what was asked and decided, never a command's output, and never a
-//! token or a password. What the AI side can make it write is limited
-//! (mod.rs): every request counts toward the rate limit, refused or not, and
-//! every request's command is cut to 4 KB (with a hash of all of it).
+//! token or a password (a root password typed for the AI included). What
+//! the AI side can make it write is limited (mod.rs): every request counts
+//! toward the rate limit, refused or not, and every request's command is cut
+//! to 4 KB (with a hash of all of it).
 
 use serde::Serialize;
 use std::fs::{File, OpenOptions};
@@ -62,12 +63,25 @@ pub(crate) struct Entry {
     pub command: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub root: bool,
+    /// The AI asked to run it as root (`as_root`, #120): through sudo or
+    /// dzdo, with a password typed in Submarine if one was needed. The
+    /// password is never in the log.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub as_root: bool,
+    /// What it went through as root: `sudo` or `dzdo`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_tool: Option<&'static str>,
     /// allowed, denied, cancelled, refused.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<&'static str>,
-    /// Who decided: "you", or "Submarine" for one refused before it was shown.
+    /// Who decided: "you", "your settings" for one that ran without asking
+    /// (#115), or "Submarine" for one refused before it was shown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub by: Option<&'static str>,
+    /// How one that runs was allowed: `you`, `rule: <pattern>`, `level: run
+    /// anything` or `session: allow everything`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approved_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
