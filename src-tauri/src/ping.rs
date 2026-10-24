@@ -78,12 +78,15 @@ struct Server {
     /// The jump host's name, None when it's gone.
     jump_name: Option<String>,
     jump_exists: bool,
+    /// Why it mustn't be connected now: its jump host was deleted
+    /// (jump_gone.rs).
+    refused: Option<String>,
 }
 
 fn read_server(db: &DbState, server_id: i32) -> Result<Server, String> {
     let guard = db.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
     let conn = guard.as_ref().ok_or("Database is not open")?;
-    conn.query_row(
+    let mut s = conn.query_row(
         "SELECT s.name, s.host, s.port,
                 CASE WHEN COALESCE(s.auth_type, 'vault') = 'vault' THEN c.username ELSE s.username END,
                 s.protocol, s.proxy_type, s.proxy_host, s.proxy_port, s.jump_host_id, j.name, j.id
@@ -104,10 +107,13 @@ fn read_server(db: &DbState, server_id: i32) -> Result<Server, String> {
                 jump_id: r.get(8)?,
                 jump_name: r.get(9)?,
                 jump_exists: r.get::<_, Option<i32>>(10)?.is_some(),
+                refused: None,
             })
         },
     )
-    .map_err(|_| "Server not found".to_string())
+    .map_err(|_| "Server not found".to_string())?;
+    s.refused = crate::jump_gone::reason(conn, i64::from(server_id));
+    Ok(s)
 }
 
 /// The servers saved with jump host `jump_id`.
@@ -182,6 +188,11 @@ pub async fn ping_server(
     server_id: i32,
 ) -> Result<PingReply, String> {
     let s = read_server(&db, server_id)?;
+    // Its jump host was deleted: the same words a terminal gets, and no
+    // connection anywhere.
+    if let Some(why) = s.refused {
+        return Ok(PingReply::NotChecked { why });
+    }
     let host = s.host.trim().to_string();
     if host.is_empty() {
         return Ok(PingReply::NotChecked { why: "It has no address saved.".into() });
@@ -223,6 +234,37 @@ pub async fn ping_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_server_whose_jump_host_was_deleted_isnt_pinged() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, host TEXT, port INTEGER, username TEXT, credential_id INTEGER,
+                auth_type TEXT, protocol TEXT, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER, jump_host_id INTEGER, uuid TEXT);
+             CREATE TABLE credentials(id INTEGER PRIMARY KEY, username TEXT);
+             CREATE TABLE sync_flags(key TEXT PRIMARY KEY, val INTEGER NOT NULL);
+             INSERT INTO servers(id, name, host, port, jump_host_id) VALUES (1, 'web-gw', 'g.example', 22, NULL), (2, 'db-01', 'd.example', 22, 1);",
+        )
+        .unwrap();
+        crate::tree_moves::unlink_jump_hosts(&conn, &[1]).unwrap();
+        conn.execute("DELETE FROM servers WHERE id = 1", []).unwrap();
+        let db = crate::DbState {
+            conn: std::sync::Arc::new(std::sync::Mutex::new(Some(conn))),
+            master_key: Default::default(),
+            salt: Default::default(),
+            db_path: Default::default(),
+            active_profile: Default::default(),
+            hlc: Default::default(),
+            generation: Default::default(),
+            sync_cursor: Default::default(),
+            profile_lock: Default::default(),
+        };
+        let s = read_server(&db, 2).unwrap();
+        assert_eq!(
+            s.refused.as_deref(),
+            Some("db-01's jump host (web-gw) was deleted, so Submarine won't connect it directly without asking.")
+        );
+    }
 
     #[test]
     fn replies_say_what_the_connect_came_to() {

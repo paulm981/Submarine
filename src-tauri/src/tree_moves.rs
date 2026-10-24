@@ -146,13 +146,17 @@ pub(crate) fn delete_scope(conn: &Connection, servers: &[i64], links: &[i64], fo
 }
 
 /// Before servers are deleted, every server that went through one of them as
-/// its jump host is let go of it, as when the deletion comes from another
-/// device (lib.rs, apply_tombstone), rather than left pointing at nothing.
-/// A local repair, not an edit to push: each device does it when the
-/// deletion reaches it.
+/// its jump host is noted on this device (jump_gone.rs), so it's never
+/// connected directly without asking, and its link is cleared rather than
+/// left pointing at nothing, as when the deletion comes from another device
+/// (lib.rs, apply_tombstone). Clearing it is a local repair, not an edit to
+/// push: each device does it when the deletion reaches it.
 pub(crate) fn unlink_jump_hosts(conn: &Connection, servers: &[i64]) -> Result<(), String> {
     if servers.is_empty() {
         return Ok(());
+    }
+    for id in servers {
+        crate::jump_gone::note_behind(conn, *id)?;
     }
     crate::with_merge_flag(conn, |c| {
         let mut stmt =
@@ -309,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_jump_host_lets_go_of_the_servers_behind_it() {
+    fn deleting_a_jump_host_leaves_the_servers_behind_it_refusing_to_go_direct() {
         let conn = vault();
         // web1 and web2 go through tool; db1 through web1.
         conn.execute_batch(
@@ -323,6 +327,11 @@ mod tests {
         let jump = |id: i64| -> Option<i64> { conn.query_row("SELECT jump_host_id FROM servers WHERE id=?1", [id], |r| r.get(0)).unwrap() };
         assert_eq!((jump(10), jump(11)), (None, None), "unlinked, not left pointing at nothing");
         assert_eq!(jump(12), Some(10), "another jump host is left alone");
+        // ...but noted, so neither connects directly without asking.
+        let refused = crate::jump_gone::refuse(&conn, 10).unwrap_err();
+        assert!(refused.starts_with("[JUMP_GONE] web1's jump host (tool) was deleted"), "{refused}");
+        assert!(crate::jump_gone::refuse(&conn, 11).is_err());
+        assert!(crate::jump_gone::refuse(&conn, 12).is_ok());
         let stamped: i64 = conn.query_row("SELECT COUNT(*) FROM stamped", [], |r| r.get(0)).unwrap();
         assert_eq!(stamped, 0, "a local repair, not edits for sync to push");
         // Deleting one behind it as well as it, in one go.

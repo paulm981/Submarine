@@ -315,6 +315,8 @@ function DesktopApp() {
   // for the whole profile session.
   const [activeFolderId, setActiveFolderId] = useState<number | null>(null);
   const [isPanelOpen, setIsPanelOpen] = useState(false);
+  // The form opened at Jump via ("Pick a jump host", see below).
+  const [focusJumpVia, setFocusJumpVia] = useState(false);
   const [isQuickConnectOpen, setIsQuickConnectOpen] = useState(false);
   const [servers, setServers] = useState<any[]>([]);
   const [credentials, setCredentials] = useState<any[]>([]);
@@ -1726,7 +1728,8 @@ function DesktopApp() {
       .catch((e) => addLog(`QUICK_NODE_SAVE_FAILED: ${e}`, "error"));
   };
 
-  const handleEditNode = async (server: any) => {
+  const handleEditNode = async (server: any, opts?: { focusJump?: boolean }) => {
+    setFocusJumpVia(!!opts?.focusJump);
     // Servers come back from get_servers with `has_password` (boolean) but
     // no plaintext. Reveal the secret only when the user opens the edit
     // sheet — that way the password never sits in renderer memory during
@@ -1777,6 +1780,19 @@ function DesktopApp() {
     setFormError("");
     setIsPanelOpen(true);
   };
+
+  // "Pick a jump host", from a tab whose server's jump host was deleted
+  // (SessionView): its form, at Jump via.
+  useEffect(() => {
+    const onPick = (e: Event) => {
+      const id = (e as CustomEvent<{ serverId: number }>).detail?.serverId;
+      const server = (servers || []).find((x: any) => x.id === id);
+      if (server) void handleEditNode(server, { focusJump: true });
+    };
+    window.addEventListener("submarine-pick-jump-host", onPick);
+    return () => window.removeEventListener("submarine-pick-jump-host", onPick);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [servers]);
 
   // Render helper, NOT a component — it is invoked as `{TitleBar()}` below,
   // never as `<TitleBar />`. Rendering it as a JSX element would give it a
@@ -3463,7 +3479,8 @@ function DesktopApp() {
       <AiTrustModal />
 
       <AddNodePanel
-        isOpen={isPanelOpen} onClose={() => { setIsPanelOpen(false); setFormError(""); }}
+        isOpen={isPanelOpen} onClose={() => { setIsPanelOpen(false); setFormError(""); setFocusJumpVia(false); }}
+        focusJump={focusJumpVia}
         newNode={newNode} setNewNode={setNewNode}
         isEditMode={!!newNode.id}
         onSave={async () => {

@@ -49,6 +49,7 @@ mod applog;
 mod term_output;
 mod proxy_command;
 mod diagnose;
+mod jump_gone;
 mod ping;
 mod hop_policy;
 mod ai;
@@ -1295,6 +1296,9 @@ fn apply_remote_inner(
     // more on a server here is held too (ai/trust.rs): each server's AI
     // policy as it is before the merge, to compare with after it.
     let ai_before = if shared { ai::trust::before_sync(&tx) } else { None };
+    // Each server's jump host before the merge: one the merge deletes leaves
+    // the servers behind it refusing to go direct (jump_gone.rs).
+    let jumps_before = jump_gone::links_before(&tx);
     for spec in ENTITIES {
         let watch = shared && approvals::watches(spec.table);
         for rec in records.iter().filter(|r| !r.deleted && r.entity_type == spec.table) {
@@ -1351,8 +1355,15 @@ fn apply_remote_inner(
             rusqlite::params![id, f.uuid],
         ) {
             eprintln!("[SYNC] fk fixup skipped {}.{} uuid={}: {}", f.table, f.fk_col, f.uuid, e);
+        } else if id.is_none() && f.table == "servers" && f.fk_col == "jump_host_id" {
+            // It came with a jump host this device doesn't have: it isn't
+            // connected directly without asking (jump_gone.rs).
+            if let Err(e) = jump_gone::note_unresolved(&tx, &f.uuid) {
+                eprintln!("[SYNC] jump host note skipped uuid={}: {}", f.uuid, e);
+            }
         }
     }
+    jump_gone::note_lost(&tx, &jumps_before).map_err(|e| format!("[SYNC] JUMP_GONE: {e}"))?;
     // A Remote Desktop link's folder has no foreign key (rdp_links.rs), so a folder
     // this batch deleted can leave a link pointing at nothing: one this device
     // made in it since it last synced. It goes to the top level, not nowhere.
@@ -1568,7 +1579,9 @@ fn apply_tombstone(conn: &Connection, rec: &SyncRecord) -> Result<(), String> {
             // Unlink what points at it first: those links would block the
             // delete (a folder that still holds a server on this device) or
             // be left dangling. A local repair, like the fixup pass: the merge
-            // guard keeps the triggers from stamping it as an edit.
+            // guard keeps the triggers from stamping it as an edit. (A server
+            // that went through it as its jump host is noted once the batch
+            // is in: jump_gone::note_lost.)
             for s in ENTITIES {
                 for fk in s.fks.iter().filter(|fk| fk.ref_table == spec.table && !fk.required) {
                     conn.execute(&format!("UPDATE {} SET {}=NULL WHERE {}=?1", s.table, fk.col, fk.col), [id])
@@ -4468,6 +4481,19 @@ mod sync_engine_tests {
             .query_row("SELECT jump_host_id FROM servers WHERE name='app'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(dangling, None, "the link must be cleared, not left dangling");
+        // ...and C won't connect it directly without asking (jump_gone.rs).
+        let app_id: i64 = c.query_row("SELECT id FROM servers WHERE name='app'", [], |r| r.get(0)).unwrap();
+        let refused = crate::jump_gone::refuse(&c, app_id).unwrap_err();
+        assert!(refused.starts_with("[JUMP_GONE] app's jump host (bastion) was deleted"), "{refused}");
+        // A device that never had the bastion gets 'app' with a jump host it
+        // can't find: refused too, without the name.
+        let (d, hd) = device("D");
+        let app_uuid: String = a.query_row("SELECT uuid FROM servers WHERE name='app'", [], |r| r.get(0)).unwrap();
+        let app_only: Vec<SyncRecord> = seed.iter().filter(|r| r.uuid == app_uuid).cloned().collect();
+        assert_eq!(app_only.len(), 1);
+        apply_remote_records(&d, &KEY, &app_only, &hd).unwrap();
+        let d_app: i64 = d.query_row("SELECT id FROM servers WHERE name='app'", [], |r| r.get(0)).unwrap();
+        assert!(crate::jump_gone::refuse(&d, d_app).is_err(), "no jump host it can find: refused");
     }
 
     #[test]
@@ -7665,6 +7691,9 @@ async fn set_server_jump_host(state: tauri::State<'_, DbState>, id: i32, value: 
         "UPDATE servers SET jump_host_id=?1 WHERE id=?2",
         rusqlite::params![value, id],
     ).map_err(|e| format!("[DATABASE] SERVER_JUMP_HOST_FAILED: {}", e))?;
+    // Saved from its form, which shows its jump host or "Direct": what the
+    // user chose, so a deleted jump host's note goes (jump_gone.rs).
+    jump_gone::clear(conn, i64::from(id))?;
     drop(conn_guard);
     save_vault_internal(&state)?;
     Ok(())
@@ -12952,6 +12981,8 @@ async fn initiate_connection(
                 Some("vnc") => return Err("This is a VNC server: it opens as a screen, not a terminal".into()),
                 _ => {}
             }
+            // Its jump host was deleted: never directly without asking.
+            jump_gone::refuse(conn, i64::from(server_id))?;
 
             // Single source of truth per auth_type — no field mixing.
             // - vault: identity comes ENTIRELY from the credential row. Any
@@ -15033,6 +15064,8 @@ async fn initiate_rdp(
     let (name, host, port, user, node_key, protocol, jump_id, jump_name) = {
         let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        // Its jump host was deleted: never directly without asking (jump_gone.rs).
+        jump_gone::refuse(conn, i64::from(server_id))?;
         conn.query_row(
             "SELECT s.name, s.host, s.port,
                     CASE WHEN COALESCE(s.auth_type, 'vault') = 'vault' THEN c.username ELSE s.username END,
@@ -15265,6 +15298,8 @@ async fn rdp_builtin_open(
     let (name, host, port, user, password, protocol, jump_id, jump_name) = {
         let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        // Its jump host was deleted: never directly without asking (jump_gone.rs).
+        jump_gone::refuse(conn, i64::from(server_id))?;
         conn.query_row(
             "SELECT s.name, s.host, s.port,
                     CASE WHEN COALESCE(s.auth_type, 'vault') = 'vault' THEN c.username ELSE s.username END,
@@ -15783,6 +15818,8 @@ async fn telnet_connect(
     let (name, host, port, protocol, jump_id, jump_name) = {
         let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        // Its jump host was deleted: never directly without asking (jump_gone.rs).
+        jump_gone::refuse(conn, i64::from(server_id))?;
         conn.query_row(
             "SELECT s.name, s.host, s.port, s.protocol, s.jump_host_id, j.name
              FROM servers s
@@ -15969,6 +16006,8 @@ async fn vnc_open(
     let (name, host, port, password, protocol, jump_id, jump_name, uses_saved_login) = {
         let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        // Its jump host was deleted: never directly without asking (jump_gone.rs).
+        jump_gone::refuse(conn, i64::from(server_id))?;
         conn.query_row(
             "SELECT s.name, s.host, s.port,
                     CASE WHEN COALESCE(s.auth_type, 'vault') = 'vault' THEN NULL ELSE s.password END,
@@ -25666,11 +25705,10 @@ fn resolve_node_auth_for_monitor(
     conn: &rusqlite::Connection,
     node_id: i32,
 ) -> Result<monitor::NodeAuth, String> {
+    // Its jump host was deleted: never directly without asking.
+    jump_gone::refuse(conn, i64::from(node_id))?;
     let (mut auth, jump_host_id) = resolve_node_auth_row(conn, node_id)?;
     if let Some(jid) = jump_host_id.filter(|j| *j != node_id) {
-        if conn.query_row("SELECT 1 FROM servers WHERE id = ?1", [jid], |_| Ok(())).is_err() {
-            return Err("its jump host is gone".into());
-        }
         let (mut jump, _) = resolve_node_auth_row(conn, jid)
             .map_err(|e| format!("its jump host: {}", e))?;
         // Reached directly, as connect_jump_host does.
@@ -25681,11 +25719,12 @@ fn resolve_node_auth_for_monitor(
 }
 
 /// The app log's line for a server "Resume all" couldn't start, which it
-/// skips to go on with the rest: "db-01's jump host is gone; skipped".
+/// skips to go on with the rest: "db-01's jump host (web-gw) was deleted, so
+/// Submarine won't connect it directly without asking. Skipped."
 fn resume_skipped_line(name: &str, why: &str) -> String {
-    match why.strip_prefix("its ") {
-        Some(rest) => format!("{name}'s {rest}; skipped"),
-        None => format!("{name}: {why}; skipped"),
+    match why.strip_prefix(jump_gone::CODE) {
+        Some(said) => format!("{} Skipped.", said.trim()),
+        None => format!("{name}: {why}. Skipped."),
     }
 }
 
@@ -25789,9 +25828,12 @@ mod monitor_resume_tests {
                 credential_id INTEGER, key_id INTEGER, auth_type TEXT, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER,
                 jump_host_id INTEGER, protocol TEXT);
              CREATE TABLE credentials(id INTEGER PRIMARY KEY, username TEXT, password TEXT, key_id INTEGER, auth_type TEXT);
+             CREATE TABLE sync_flags(key TEXT PRIMARY KEY, val INTEGER NOT NULL);
              INSERT INTO servers(id, name, host, port, username, auth_type) VALUES (1, 'bastion', 'b.example', 22, 'ops', 'custom');
              INSERT INTO servers(id, name, host, port, username, auth_type, jump_host_id) VALUES (2, 'web-01', 'w.example', 22, 'ops', 'custom', 1);
-             INSERT INTO servers(id, name, host, port, username, auth_type, jump_host_id) VALUES (3, 'db-01', 'd.example', 22, 'ops', 'custom', 99);",
+             INSERT INTO servers(id, name, host, port, username, auth_type, jump_host_id) VALUES (3, 'db-01', 'd.example', 22, 'ops', 'custom', 99);
+             INSERT INTO servers(id, name, host, port, username, auth_type, jump_host_id) VALUES (4, 'db-02', 'e.example', 22, 'ops', 'custom', 5);
+             INSERT INTO servers(id, name, host, port, username, auth_type) VALUES (5, 'web-gw', 'g.example', 22, 'ops', 'custom');",
         )
         .unwrap();
         conn
@@ -25806,8 +25848,22 @@ mod monitor_resume_tests {
             Ok(_) => panic!("db-01's jump host is gone"),
             Err(e) => e,
         };
-        assert_eq!(resume_skipped_line("db-01", &why), "db-01's jump host is gone; skipped");
-        assert_eq!(resume_skipped_line("rdp-01", "RDP server can't be monitored"), "rdp-01: RDP server can't be monitored; skipped");
+        assert_eq!(
+            resume_skipped_line("db-01", &why),
+            "db-01's jump host was deleted, so Submarine won't connect it directly without asking. Skipped."
+        );
+        // Deleted here: noted with its name, the link cleared, and still skipped.
+        crate::tree_moves::unlink_jump_hosts(&conn, &[5]).unwrap();
+        conn.execute("DELETE FROM servers WHERE id = 5", []).unwrap();
+        let why = match resolve_node_auth_for_monitor(&conn, 4) {
+            Ok(_) => panic!("db-02's jump host was deleted"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            resume_skipped_line("db-02", &why),
+            "db-02's jump host (web-gw) was deleted, so Submarine won't connect it directly without asking. Skipped."
+        );
+        assert_eq!(resume_skipped_line("rdp-01", "an RDP server can't be monitored"), "rdp-01: an RDP server can't be monitored. Skipped.");
     }
 }
 
@@ -26564,7 +26620,7 @@ pub fn run() {
             local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
             local_term::local_terminal_open, local_term::local_terminal_write, local_term::local_windows_build,
             local_term::local_terminal_resize, local_term::local_terminal_close,
-            ping::ping_server,
+            ping::ping_server, jump_gone::jump_host_connect_directly,
             ai::ai_settings, ai::ai_set_enabled, ai::ai_state, ai::ai_share, ai::ai_unshare, ai::ai_stop, ai::ai_decide, ai::ai_output,
             ai::ai_set_flash, ai::ai_allow_session, ai::ai_allow_always, ai::ai_trust_view, ai::ai_trust_scope,
             ai::ai_trust_set_level, ai::ai_trust_add_rule, ai::ai_trust_remove_rule, ai::ai_end_allow_all, ai::ai_keep_policy,

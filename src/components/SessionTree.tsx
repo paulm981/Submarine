@@ -12,6 +12,7 @@ import MoveToFolderModal from "./MoveToFolderModal";
 import { OsBadge, osName } from "./OsBadge";
 import { openAiTrust, useAi } from "../util/ai";
 import { pingServers } from "../ui/ping";
+import { jumpHostNote } from "../util/jumpHostNote";
 
 // The session tree beside the main view, in the spirit of MobaXterm's
 // Sessions sidebar: every folder, server and Remote Desktop link as one
@@ -471,9 +472,8 @@ export const SessionTree = ({
     const folderIds = new Set(it.folders.flatMap((f) => subtreeIds(index, f)));
     const goneServers = new Set<number>([...it.servers, ...(servers || []).filter((x) => folderIds.has(known(x.folder_id) as number)).map((x) => x.id)]);
     const nServers = goneServers.size;
-    // Servers staying that go through one of these as their jump host: they
-    // lose it (tree_moves::unlink_jump_hosts).
-    const behind = (servers || []).filter((x) => !goneServers.has(x.id) && x.jump_host_id != null && goneServers.has(x.jump_host_id)).length;
+    // Servers staying that go through one of these as their jump host.
+    const jumpNote = jumpHostNote(servers, goneServers);
     const nLinks = new Set([...it.links, ...(rdpLinks || []).filter((x) => folderIds.has(known(x.folder_id) as number)).map((x) => x.id)]).size;
     const parts = [
       folderIds.size && plural(folderIds.size, "folder"),
@@ -483,9 +483,7 @@ export const SessionTree = ({
     const list = parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}` : parts[0];
     const ok = await confirm({
       title: itemCount(it) === 1 ? `Delete ${describe(it)}?` : `Delete ${plural(itemCount(it), "item")}?`,
-      message: `${list} will be removed from Submarine. Nothing changes on the servers themselves, and tabs already open stay connected until you close them.${
-        behind ? ` ${plural(behind, "other server")} ${behind === 1 ? "uses" : "use"} ${nServers === 1 ? "it" : "one of them"} as a jump host, and will have none after this.` : ""
-      }`,
+      message: `${list} will be removed from Submarine. Nothing changes on the servers themselves, and tabs already open stay connected until you close them.${jumpNote}`,
       okLabel: "Delete",
       destructive: true,
     });

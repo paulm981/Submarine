@@ -2,13 +2,14 @@ import { Activity, Play, Search, Plus, Server, Globe, Folder, FolderPlus, Chevro
 import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { useConfirm } from "../ui/confirm";
-import { FolderRow, childFolders, folderPath, indexFolders, subtreeCounts } from "../util/folderPath";
+import { FolderRow, childFolders, folderPath, indexFolders, subtreeCounts, subtreeIds } from "../util/folderPath";
 import RdpLinkModal, { RdpLink } from "./RdpLinkModal";
 import { IS_ANDROID } from "../util/platform";
 import { OsBadge } from "./OsBadge";
 import { HeldReview } from "./HeldReview";
 import { HeldDeletions } from "./HeldDeletions";
 import { pingServers } from "../ui/ping";
+import { jumpHostNote } from "../util/jumpHostNote";
 
 export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFolderIdProp, onActiveFolderChange, onOpenServer, onEditServer, onAddClick, onQuickConnect, onRemoveServer, onRemoveFolder, onRenameFolder, onCreateFolder, onCloneServer, onReorderServers, onOpenRdp, onSaveRdp, onRemoveRdp, onAllowHeld, onKeepSsh, onKeepAi, keyChange, onAcceptKey, heldDeletions, onResolveDeletions, isMobile }: any) => {
   const [search, setSearch] = useState("");
@@ -423,9 +424,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
           <button
             onClick={async (e) => {
               e.stopPropagation();
-              // Servers that go through it lose their jump host (tree_moves::unlink_jump_hosts).
-              const behind = (servers || []).filter((x: any) => x.jump_host_id === s.id && x.id !== s.id).length;
-              const note = behind ? ` ${behind === 1 ? "1 other server uses" : `${behind} other servers use`} it as a jump host, and will have none after this.` : "";
+              const note = jumpHostNote(servers, new Set([s.id]));
               if (await confirm({ title: 'Delete server?', message: `“${s.name}” will be removed from this profile.${note}`, destructive: true })) {
                 onRemoveServer(s.id);
               }
@@ -576,7 +575,11 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
               <button
                 onClick={async (e) => {
                   e.stopPropagation();
-                  if (await confirm({ title: 'Delete folder?', message: `“${f.name}” and every folder, server and Remote Desktop link inside it will be removed.`, destructive: true })) {
+                  // Servers elsewhere that go through one inside it as their jump host.
+                  const inside = new Set(subtreeIds(folderIndex, f.id));
+                  const gone = new Set<number>((servers || []).filter((x: any) => x.folder_id != null && inside.has(x.folder_id)).map((x: any) => x.id));
+                  const note = jumpHostNote(servers, gone);
+                  if (await confirm({ title: 'Delete folder?', message: `“${f.name}” and every folder, server and Remote Desktop link inside it will be removed.${note}`, destructive: true })) {
                     onRemoveFolder(f.id);
                   }
                 }}

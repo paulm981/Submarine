@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { folderOptions } from "../util/folderPath";
@@ -89,7 +89,19 @@ type ImportedSshKey = {
   encrypted: boolean;
 };
 
-const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credentials, refreshCredentials, refreshRdpLinks, sshKeys, refreshSshKeys, folders, refreshFolders, refreshServers, servers, isEditMode, formError, isMobile, onImported }: any) => {
+const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credentials, refreshCredentials, refreshRdpLinks, sshKeys, refreshSshKeys, folders, refreshFolders, refreshServers, servers, isEditMode, formError, isMobile, onImported, focusJump }: any) => {
+  // Opened from "Pick a jump host" (a server whose jump host was deleted,
+  // see SessionView): Jump via is brought into view and focused.
+  const jumpRowRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!isOpen || !focusJump) return;
+    const t = window.setTimeout(() => {
+      const row = jumpRowRef.current;
+      row?.scrollIntoView({ block: "center" });
+      row?.querySelector<HTMLElement>("input, button")?.focus();
+    }, 150);
+    return () => window.clearTimeout(t);
+  }, [isOpen, focusJump]);
   const [isCreatingFolder, setIsCreatingFolder] = useState(false);
   // An RDP (issue #3), telnet (#179) or VNC server has a host, port, login
   // and maybe an SSH server to go through; the SSH-only parts of the form
@@ -831,7 +843,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 proxy above: that's a plain TCP proxy, this is a full SSH hop
                 that opens a direct-tcpip channel to the target. Self is filtered
                 out so a node can't jump through itself. */}
-            <div className="flex justify-between items-center gap-3">
+            <div ref={jumpRowRef} className="flex justify-between items-center gap-3">
               <label className="text-[11px] font-bold text-zinc-400 shrink-0">{isSsh ? "Jump via" : "Through SSH server"}</label>
               <JumpHostPicker
                 label={isSsh ? "Jump via" : "Through SSH server"}
