@@ -12,7 +12,7 @@ import { SCHEMES, readSchemeId, schemeById } from "../ui/terminalThemes";
 import { HIGHLIGHT_SETS, highlightSetById, readHighlightId } from "../ui/highlight";
 import { SchemeSwatch } from "./TerminalSchemes";
 import { DEFAULT_RDP_OPTIONS, RDP_BUILTIN_EXPERIMENTAL, RDP_WINDOW_SIZES, type RdpOptions } from "../util/rdpOptions";
-import { ChoiceRow } from "./FormRows";
+import { ChoiceRow, SwitchRow } from "./FormRows";
 import { RdpShareFields, RdpSpeedFields } from "./RdpOptionFields";
 import {
   DEFAULT_VNC_OPTIONS, VNC_COLOR_CHOICES, VNC_ENCODING_CHOICES, VNC_FPS_CHOICES, normalizeVncOptions,
@@ -1017,6 +1017,12 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               const set = (patch: Partial<VncOptions>) => setNewNode({ ...newNode, vncOptions: normalizeVncOptions({ ...o, ...patch }) });
               return (
                 <div className="space-y-2.5 pt-1">
+                  <SwitchRow
+                    label="Share the clipboard"
+                    hint="Text you copy on the server comes to this device; this device's goes to the server when you paste it there (a paste key in the tab, or its Paste button). Plain ASCII text only, such as links and commands: a VNC clipboard can't carry other characters."
+                    checked={o.clipboard}
+                    onChange={(clipboard) => set({ clipboard })}
+                  />
                   <div className="text-[11px] font-bold text-zinc-300">Speed and quality</div>
                   <ChoiceRow
                     label="Encoding"
