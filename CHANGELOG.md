@@ -9,6 +9,12 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+### From the original project
+
+- **Locking your profile calls off logins still in progress.** A connection that was still logging in, waiting on the server or on a question, no longer comes up after the profile is locked. (Their [#237](https://github.com/SinaXhpm/submarine/pull/237); [#121](https://github.com/paulm981/Submarine/issues/121))
+
+## v0.4.0-fork.11
+
 - **Home terminals end more tidily.** "The shell has ended" now comes after the shell's last output, not before it. A terminal that couldn't start is marked ended, so closing Submarine doesn't count it as a running shell. On Windows, lines wrap and redraw as Windows' own console does when you resize the window. Fast output after a reconnect is paced correctly, and a burst of output no longer leaves its memory in use afterwards. ([#52](https://github.com/paulm981/Submarine/issues/52))
 - **Ping a server from the session list.** Right-click a server in the tree or the grid, then **Ping**. A small panel shows each answer and how long it took, when the server stopped answering and when it came back, and whether its SSH port answers yet, so you know when you can log in. A short, quiet sound plays when it does; you can turn it off in **Settings › Servers**. It checks every 2 seconds until the server answers, then every 30 seconds. You can ping several servers at once (more than 10 asks first), and closing a server's card stops its pings. The check is a plain connection to the SSH port, so it works where ping is blocked and logs in nowhere. A server behind a jump host is checked from the jump host, over a connection already open to it; without one, the panel says to open a terminal first. ([#33](https://github.com/paulm981/Submarine/issues/33))
 - **Choose the Info panel's text size.** It's in **Settings › UI Customization**, from 10 to 16 px; it was always 11 px. The panel's smaller labels and icons grow with it. The setting stays on this computer. ([#56](https://github.com/paulm981/Submarine/issues/56))
