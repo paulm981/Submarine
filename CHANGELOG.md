@@ -9,10 +9,6 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
-- **vim no longer freezes the terminal.** Opening a file in vim used to stop that terminal for good: nothing more showed up and typing did nothing, so you had to close it and log in again. nano and less were fine. It came from how the app was built: vim asks the terminal whether the cursor blinks, and the built copy of the terminal code failed on that question. The app is now built so that code works, and every build checks for this kind of fault before it can ship. ([#129](https://github.com/paulm981/Submarine/issues/129))
-
-## v0.4.0-fork.12
-
 ### From the original project
 
 - **Speed and quality for Remote Desktop (built-in client) and VNC.** A server's form has **Speed and quality**. For RDP you can choose the colours, desktop effects, the network type and whether to offer RemoteFX. For VNC you can choose the encoding, the colours and the most updates per second. The choices are kept on this computer only. A server you don't change connects exactly as before. (Their [#233](https://github.com/SinaXhpm/submarine/pull/233); [#121](https://github.com/paulm981/Submarine/issues/121))
