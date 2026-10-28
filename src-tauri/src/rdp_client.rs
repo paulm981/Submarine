@@ -19,9 +19,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD_NO_PAD as B64, Engine as _};
+use ironrdp::cliprdr::backend::CliprdrBackend;
+use ironrdp::cliprdr::pdu::{
+    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest, FileContentsResponse, FormatDataRequest,
+    FormatDataResponse, LockDataId,
+};
+use ironrdp::cliprdr::CliprdrClient;
 use ironrdp::connector::connection_activation::ConnectionActivationState;
-use ironrdp::connector::{self, ClientConnector, ClientConnectorState, Credentials, DesktopSize};
-use ironrdp::core::WriteBuf;
+use ironrdp::connector::{self, BitmapConfig, ClientConnector, ClientConnectorState, Credentials, DesktopSize};
+use ironrdp::core::{IntoOwned as _, WriteBuf};
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
@@ -29,7 +35,7 @@ use ironrdp::input::{Database, MouseButton, MousePosition, Operation, Scancode, 
 use ironrdp::pdu::gcc::{ConnectionType, KeyboardType};
 use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::pdu::nego::SecurityProtocol;
-use ironrdp::pdu::rdp::capability_sets::{MajorPlatformType, RailSupportLevel};
+use ironrdp::pdu::rdp::capability_sets::{client_codecs_capabilities, BitmapCodecs, MajorPlatformType, RailSupportLevel};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
@@ -70,7 +76,221 @@ fn desktop_fits(width: u16, height: u16) -> Result<(), String> {
 pub enum Cmd {
     Input(Vec<InputEvent>),
     Resize(u16, u16),
+    /// Text from this computer's clipboard for the server's, then (when the
+    /// user pressed a paste key in the tab) that key, once the server has it.
+    Paste(Zeroizing<String>, PasteKeys),
     Close,
+}
+
+/// The paste key the page held back while the text went to the server's
+/// clipboard; the server is sent it once the text is there (see `paste_keys`).
+#[derive(serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PasteKeys {
+    /// Only put the text on the server's clipboard (the tab's button).
+    None,
+    /// Ctrl+V.
+    Ctrlv,
+    /// Shift+Insert.
+    Shiftinsert,
+    /// Cmd+V on a Mac, which is Win+V to the server: the Windows key is let
+    /// go and Ctrl+V sent instead.
+    Cmdv,
+}
+
+/// How long a held-back paste key waits for the server to take the text.
+const PASTE_WAIT: Duration = Duration::from_millis(1500);
+/// How often what the shared files' backend finished later is sent on.
+const DRIVE_POLL: Duration = Duration::from_millis(100);
+/// The most characters a copy on the server brings to this computer.
+const MAX_CLIP_CHARS: usize = 1_000_000;
+/// The most bytes such a copy can take (4 a character at most, and an end):
+/// a longer answer isn't copied out of the channel at all.
+const MAX_CLIP_BYTES: usize = MAX_CLIP_CHARS * 4 + 4;
+
+/// The keys that do the paste on the server, as operations on the session's
+/// keyboard (`Database`; `held` says what is down there now). The modifier
+/// goes with them, so a modifier the user already let go of doesn't turn the
+/// paste into typing; one the user still holds stays down (pressed again, it
+/// would be let go first, and the next key would come without it).
+fn paste_keys(keys: PasteKeys, held: impl Fn(Scancode) -> bool) -> Vec<Operation> {
+    let sc = |extended, code| Scancode::from_u8(extended, code);
+    let (ctrl, shift, v, insert) = (sc(false, 0x1d), sc(false, 0x2a), sc(false, 0x2f), sc(true, 0x52));
+    let press = |modifier, key| {
+        if held(modifier) {
+            vec![Operation::KeyPressed(key), Operation::KeyReleased(key)]
+        } else {
+            vec![Operation::KeyPressed(modifier), Operation::KeyPressed(key), Operation::KeyReleased(key), Operation::KeyReleased(modifier)]
+        }
+    };
+    match keys {
+        PasteKeys::None => Vec::new(),
+        PasteKeys::Ctrlv => press(ctrl, v),
+        PasteKeys::Shiftinsert => press(shift, insert),
+        PasteKeys::Cmdv => {
+            // Ctrl goes down before the Windows keys are let go: a Windows key
+            // let go on its own opens the Start menu (GNOME's Activities).
+            let ctrl_down = !held(ctrl);
+            let mut ops = Vec::new();
+            if ctrl_down {
+                ops.push(Operation::KeyPressed(ctrl));
+            }
+            ops.extend([sc(true, 0x5b), sc(true, 0x5c)].into_iter().filter(|win| held(*win)).map(Operation::KeyReleased));
+            ops.extend([Operation::KeyPressed(v), Operation::KeyReleased(v)]);
+            if ctrl_down {
+                ops.push(Operation::KeyReleased(ctrl));
+            }
+            ops
+        }
+    }
+}
+
+/// What the clipboard channel tells the session loop (`ClipBridge`).
+#[derive(Debug)]
+enum ClipEvent {
+    /// The channel is up: this side says what it has to offer (nothing, until the user pastes).
+    FormatListWanted,
+    /// The server answered what this side offered.
+    Offered(bool),
+    /// The user copied something on the server; whether it has text.
+    RemoteCopy(Option<ClipboardFormatId>),
+    /// The server wants this side's text, in this format.
+    Wanted(ClipboardFormatId),
+    /// The text the server copied, as asked for (none: it was gone).
+    RemoteText(Option<Vec<u8>>),
+    /// The server's answer was longer than MAX_CLIP_BYTES (this many bytes).
+    RemoteTooLong(usize),
+}
+
+/// The clipboard channel's backend: it passes what the server does on to the
+/// session loop, which answers through the channel. Text only: no file list
+/// is ever offered, so the server never asks for file contents.
+#[derive(Debug)]
+struct ClipBridge(mpsc::UnboundedSender<ClipEvent>);
+
+ironrdp::core::impl_as_any!(ClipBridge);
+
+impl CliprdrBackend for ClipBridge {
+    fn temporary_directory(&self) -> &str {
+        ""
+    }
+
+    fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
+        ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
+    }
+
+    fn on_ready(&mut self) {}
+
+    fn on_request_format_list(&mut self) {
+        let _ = self.0.send(ClipEvent::FormatListWanted);
+    }
+
+    fn on_format_list_response(&mut self, ok: bool) {
+        let _ = self.0.send(ClipEvent::Offered(ok));
+    }
+
+    fn on_process_negotiated_capabilities(&mut self, _capabilities: ClipboardGeneralCapabilityFlags) {}
+
+    fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
+        let _ = self.0.send(ClipEvent::RemoteCopy(text_format(available_formats)));
+    }
+
+    fn on_format_data_request(&mut self, request: FormatDataRequest) {
+        let _ = self.0.send(ClipEvent::Wanted(request.format));
+    }
+
+    fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
+        let event = if response.is_error() {
+            ClipEvent::RemoteText(None)
+        } else if response.data().len() > MAX_CLIP_BYTES {
+            ClipEvent::RemoteTooLong(response.data().len())
+        } else {
+            ClipEvent::RemoteText(Some(response.data().to_vec()))
+        };
+        let _ = self.0.send(event);
+    }
+
+    fn on_file_contents_request(&mut self, _request: FileContentsRequest) {}
+
+    fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
+
+    fn on_lock(&mut self, _data_id: LockDataId) {}
+
+    fn on_unlock(&mut self, _data_id: LockDataId) {}
+}
+
+/// The text format to ask for from what the server offers: Unicode, else ANSI.
+fn text_format(formats: &[ClipboardFormat]) -> Option<ClipboardFormatId> {
+    [ClipboardFormatId::CF_UNICODETEXT, ClipboardFormatId::CF_TEXT]
+        .into_iter()
+        .find(|id| formats.iter().any(|f| f.id == *id))
+}
+
+/// The server's text in `format`, up to its first NUL; none when it is too
+/// long to bring over.
+fn decode_clip_text(format: ClipboardFormatId, data: &[u8]) -> Result<String, String> {
+    let text = if format == ClipboardFormatId::CF_UNICODETEXT {
+        let units: Vec<u16> = data.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|u| *u != 0).collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        let end = data.iter().position(|b| *b == 0).unwrap_or(data.len());
+        String::from_utf8_lossy(&data[..end]).into_owned()
+    };
+    let n = text.chars().count();
+    if n > MAX_CLIP_CHARS {
+        return Err(format!("The server's copy is too long to bring over ({n} characters; the most is {MAX_CLIP_CHARS})."));
+    }
+    Ok(text)
+}
+
+/// A clipboard step's frames, ready to send; a failure ends nothing but the
+/// step (the session goes on without it).
+fn clip_step(
+    stage: &mut ActiveStage,
+    step: impl FnOnce(&mut CliprdrClient) -> ironrdp::pdu::PduResult<ironrdp::cliprdr::CliprdrSvcMessages<ironrdp::cliprdr::Client>>,
+) -> Result<Vec<ActiveStageOutput>, String> {
+    let Some(channel) = stage.get_svc_processor_mut::<CliprdrClient>() else {
+        return Ok(Vec::new());
+    };
+    let messages = step(channel).map_err(|e| format!("The shared clipboard: {e}"))?;
+    let frame = stage.process_svc_processor_messages(messages).map_err(|e| format!("The shared clipboard: {e}"))?;
+    Ok(if frame.is_empty() { Vec::new() } else { vec![ActiveStageOutput::ResponseFrame(frame)] })
+}
+
+/// What the shared files' backend finished since the last look, ready to send.
+fn drive_deferred(stage: &mut ActiveStage) -> Result<Vec<ActiveStageOutput>, String> {
+    let Some(channel) = stage.get_svc_processor_mut::<ironrdp::rdpdr::Rdpdr>() else {
+        return Ok(Vec::new());
+    };
+    let messages = channel.poll_deferred_messages().map_err(|e| format!("The shared files: {e}"))?;
+    if messages.is_empty() {
+        return Ok(Vec::new());
+    }
+    let frame = stage
+        .process_svc_messages_by_name(&ironrdp::rdpdr::Rdpdr::NAME, messages)
+        .map_err(|e| format!("The shared files: {e}"))?;
+    Ok(vec![ActiveStageOutput::ResponseFrame(frame)])
+}
+
+/// Tells the server what this side's clipboard has: text, or nothing.
+fn offer_text(stage: &mut ActiveStage, has_text: bool) -> Result<Vec<ActiveStageOutput>, String> {
+    let formats: &[ClipboardFormat] = if has_text { &[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)] } else { &[] };
+    clip_step(stage, |c| c.initiate_copy(formats))
+}
+
+/// The clipboard channel's next event; never, without the channel.
+async fn next_clip_event(events: &mut Option<mpsc::UnboundedReceiver<ClipEvent>>) -> Option<ClipEvent> {
+    match events {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn sleep_until_due(due: Option<tokio::time::Instant>) {
+    match due {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Mouse and keyboard from the page (TerminalView's RDP sibling, RdpCanvas).
@@ -108,6 +328,124 @@ fn nla_gate(selected: SecurityProtocol, allow_without_nla: bool) -> Result<(), S
     ))
 }
 
+/// Which of the server's desktop effects may be drawn (and sent over the link):
+/// the "experience" choices of Remote Desktop Connection. Only a Windows server
+/// acts on them; others (xrdp) draw what they draw.
+#[derive(serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Effects {
+    /// What this client always asked for: the wallpaper and visual styles,
+    /// smooth fonts, no animations and no windows dragged with their contents.
+    #[default]
+    Standard,
+    /// None of them but the picture itself: the least to send on a slow link.
+    Minimal,
+    /// All of them, for a fast link.
+    Full,
+}
+
+/// How fast the link is said to be. The server may send less detail on a slower one.
+#[derive(serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Network {
+    #[default]
+    Lan,
+    Broadband,
+    Slow,
+}
+
+/// What the page asks of the picture for one server (the "Speed and quality"
+/// choices of the tab, `rdpOptions.ts`). The default is what this client asked
+/// for before they existed, byte for byte (`connector_config` is tested for it).
+#[derive(serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Graphics {
+    /// Bits a pixel: 32, 24 or 16. Less is less to send, and gradients band.
+    pub colors: u8,
+    pub effects: Effects,
+    pub network: Network,
+    /// Offer RemoteFX, a picture codec of Windows servers; it is used only if the server has it.
+    pub remote_fx: bool,
+}
+
+impl Default for Graphics {
+    fn default() -> Self {
+        Self { colors: 32, effects: Effects::Standard, network: Network::Lan, remote_fx: false }
+    }
+}
+
+impl Graphics {
+    /// The choices as the page sent them, or why they can't be used.
+    pub fn checked(self) -> Result<Self, String> {
+        if matches!(self.colors, 16 | 24 | 32) {
+            Ok(self)
+        } else {
+            Err(format!("{}-bit colour isn't one of 16, 24 and 32", self.colors))
+        }
+    }
+
+    /// A one-line account for the tab's log, where the choices are not the standard ones.
+    pub fn describe(&self) -> Option<String> {
+        if *self == Self::default() {
+            return None;
+        }
+        let effects = match self.effects {
+            Effects::Standard => "standard desktop effects",
+            Effects::Minimal => "minimal desktop effects",
+            Effects::Full => "all desktop effects",
+        };
+        let network = match self.network {
+            Network::Lan => "a fast network",
+            Network::Broadband => "broadband",
+            Network::Slow => "a slow network",
+        };
+        let mut parts = vec![format!("{}-bit colour", self.colors), effects.to_string(), network.to_string()];
+        if self.remote_fx {
+            parts.push("RemoteFX offered".to_string());
+        }
+        Some(format!("Speed and quality: {}.", parts.join(", ")))
+    }
+
+    fn connection_type(&self) -> ConnectionType {
+        match self.network {
+            Network::Lan => ConnectionType::Lan,
+            Network::Broadband => ConnectionType::BroadbandHigh,
+            Network::Slow => ConnectionType::BroadbandLow,
+        }
+    }
+
+    fn performance_flags(&self) -> PerformanceFlags {
+        match self.effects {
+            Effects::Standard => PerformanceFlags::default(),
+            Effects::Minimal => {
+                PerformanceFlags::DISABLE_WALLPAPER
+                    | PerformanceFlags::DISABLE_FULLWINDOWDRAG
+                    | PerformanceFlags::DISABLE_MENUANIMATIONS
+                    | PerformanceFlags::DISABLE_THEMING
+                    | PerformanceFlags::DISABLE_CURSOR_SHADOW
+                    | PerformanceFlags::DISABLE_CURSORSETTINGS
+            }
+            Effects::Full => PerformanceFlags::ENABLE_FONT_SMOOTHING | PerformanceFlags::ENABLE_DESKTOP_COMPOSITION,
+        }
+    }
+
+    /// The picture settings of the connection; none (the connector's own
+    /// defaults: 32 bits, no codecs, lossless) where nothing was asked for.
+    fn bitmap(&self) -> Option<BitmapConfig> {
+        // On a link that isn't fast, the server may lower the picture's detail.
+        let lossy = self.network != Network::Lan;
+        if self.colors == 32 && !lossy && !self.remote_fx {
+            return None;
+        }
+        let codecs = if self.remote_fx {
+            client_codecs_capabilities(&[]).unwrap_or(BitmapCodecs(Vec::new()))
+        } else {
+            BitmapCodecs(Vec::new())
+        };
+        Some(BitmapConfig { lossy_compression: lossy, color_depth: u32::from(self.colors), codecs })
+    }
+}
+
 /// Who to log in as, and the first size of the desktop.
 pub struct Login {
     /// The server's name as the user gave it (TLS name and CredSSP target).
@@ -119,6 +457,11 @@ pub struct Login {
     pub height: u16,
     /// This server may be logged in to without NLA (see `nla_gate`).
     pub allow_no_nla: bool,
+    pub graphics: Graphics,
+    /// Share the clipboard with the server (text, both ways).
+    pub clipboard: bool,
+    /// Files shared with the server: their channel (rdp_share.rs).
+    pub drive: Option<ironrdp::rdpdr::Rdpdr>,
 }
 
 /// "DOMAIN\user" or "user@domain" as the login name and domain NLA wants.
@@ -220,12 +563,12 @@ fn connector_config(login: &Login) -> connector::Config {
         keyboard_subtype: 0,
         keyboard_layout: 0,
         keyboard_functional_keys_count: 12,
-        connection_type: ConnectionType::Lan,
+        connection_type: login.graphics.connection_type(),
         ime_file_name: String::new(),
         dig_product_id: String::new(),
         desktop_size: DesktopSize { width: login.width, height: login.height },
         monitor_layout: None,
-        bitmap: None,
+        bitmap: login.graphics.bitmap(),
         client_build: 0,
         client_name: "Submarine".to_owned(),
         client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
@@ -251,7 +594,7 @@ fn connector_config(login: &Login) -> connector::Config {
         compression_type: None,
         multitransport_flags: None,
         support_dyn_vc_gfx_protocol: false,
-        performance_flags: PerformanceFlags::default(),
+        performance_flags: login.graphics.performance_flags(),
         desktop_scale_factor: 0,
         hardware_id: None,
         license_cache: None,
@@ -364,16 +707,18 @@ fn operations(events: Vec<InputEvent>) -> Vec<Operation> {
 /// `verify_cert` gets the server's certificate (DER) before any password is
 /// sent and says whether to go on. `connected` runs once the desktop is
 /// there; `frame` sends one frame to the page and says whether the page is
-/// still listening. Returns why the session ended.
+/// still listening; `remote_copy` gets the text the user copied on the server
+/// (with the clipboard shared). Returns why the session ended.
 #[allow(clippy::too_many_arguments)]
 pub async fn run<S, V, VF>(
     stream: S,
     client_addr: SocketAddr,
-    login: Login,
+    mut login: Login,
     verify_cert: V,
     connected: impl FnOnce(u16, u16),
     notice: impl Fn(&str),
     frame: impl Fn(Vec<u8>) -> bool,
+    remote_copy: impl Fn(String),
     flow: Arc<crate::screen_flow::Flow>,
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
 ) -> Result<String, String>
@@ -386,6 +731,18 @@ where
     let mut framed = TokioFramed::new(stream);
     let drdynvc = DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
     let mut connector = ClientConnector::new(connector_config(&login), client_addr).with_static_channel(drdynvc);
+    // The shared clipboard is a channel of its own, only there when it's wanted.
+    let mut clip_events = None;
+    if login.clipboard {
+        let (tx, rx) = mpsc::unbounded_channel();
+        connector = connector.with_static_channel(CliprdrClient::new(Box::new(ClipBridge(tx))));
+        clip_events = Some(rx);
+    }
+    // Files shared with the server: a channel of its own too.
+    let sharing = login.drive.is_some();
+    if let Some(rdpdr) = login.drive.take() {
+        connector = connector.with_static_channel(rdpdr);
+    }
     let allow_no_nla = login.allow_no_nla;
     drop(login);
 
@@ -484,9 +841,93 @@ where
     let mut dirty: Vec<InclusiveRectangle> = Vec::new();
     let mut tick = tokio::time::interval(FRAME_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut drive_tick = tokio::time::interval(DRIVE_POLL);
+    drive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The shared clipboard: this side's text (offered to the server only once
+    // the user pastes it there), the formats the server's copies were asked
+    // for in (one answer comes for each, in order), and a paste key held back
+    // until the server has the text.
+    let mut local_text: Option<Zeroizing<String>> = None;
+    let mut asked_formats: std::collections::VecDeque<ClipboardFormatId> = std::collections::VecDeque::new();
+    let mut held_paste: Option<(PasteKeys, tokio::time::Instant)> = None;
 
     loop {
+        let paste_due = held_paste.map(|(_, at)| at);
         let outputs = tokio::select! {
+            Some(event) = next_clip_event(&mut clip_events) => match event {
+                ClipEvent::FormatListWanted => offer_text(&mut stage, local_text.is_some()).unwrap_or_else(|e| {
+                    notice(&e);
+                    Vec::new()
+                }),
+                // The server has the text: the held-back paste key goes now.
+                // Refused, it would paste what the server had before: it doesn't.
+                ClipEvent::Offered(taken) => match held_paste.take() {
+                    Some((keys, _)) if taken => {
+                        let ops = paste_keys(keys, |k| db.is_key_pressed(k));
+                        let fast = db.apply(ops).into_vec();
+                        stage.process_fastpath_input(&mut image, &fast).map_err(|e| format!("RDP: {e}"))?
+                    }
+                    Some(_) => {
+                        notice("The server didn't take this device's text, so nothing was pasted.");
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                },
+                ClipEvent::RemoteCopy(Some(format)) => match clip_step(&mut stage, |c| c.initiate_paste(format)) {
+                    Ok(outputs) => {
+                        asked_formats.push_back(format);
+                        outputs
+                    }
+                    Err(e) => {
+                        notice(&e);
+                        Vec::new()
+                    }
+                },
+                ClipEvent::RemoteCopy(None) => Vec::new(),
+                ClipEvent::RemoteText(None) => {
+                    asked_formats.pop_front();
+                    Vec::new()
+                }
+                ClipEvent::RemoteTooLong(bytes) => {
+                    asked_formats.pop_front();
+                    notice(&format!("The server's copy is too long to bring over ({bytes} bytes; the most is {MAX_CLIP_CHARS} characters)."));
+                    Vec::new()
+                }
+                ClipEvent::Wanted(format) => {
+                    let response = match local_text.as_deref() {
+                        Some(text) if format == ClipboardFormatId::CF_UNICODETEXT => FormatDataResponse::new_unicode_string(text),
+                        Some(text) if format == ClipboardFormatId::CF_TEXT => FormatDataResponse::new_string(text),
+                        _ => FormatDataResponse::new_error(),
+                    }
+                    .into_owned();
+                    clip_step(&mut stage, |c| c.submit_format_data(response)).unwrap_or_else(|e| {
+                        notice(&e);
+                        Vec::new()
+                    })
+                }
+                ClipEvent::RemoteText(Some(data)) => {
+                    let format = asked_formats.pop_front().unwrap_or(ClipboardFormatId::CF_UNICODETEXT);
+                    match decode_clip_text(format, &data) {
+                        Ok(text) if !text.is_empty() => remote_copy(text),
+                        Ok(_) => {}
+                        Err(e) => notice(&e),
+                    }
+                    Vec::new()
+                }
+            },
+            // What the shared files' backend finished later: a lock granted,
+            // a change in a folder the server watches.
+            _ = drive_tick.tick(), if sharing => drive_deferred(&mut stage).unwrap_or_else(|e| {
+                notice(&e);
+                Vec::new()
+            }),
+            // The server didn't say it has the text in time: the key goes anyway.
+            _ = sleep_until_due(paste_due), if paste_due.is_some() => {
+                let keys = held_paste.take().map_or(PasteKeys::None, |(keys, _)| keys);
+                let ops = paste_keys(keys, |k| db.is_key_pressed(k));
+                let fast = db.apply(ops).into_vec();
+                stage.process_fastpath_input(&mut image, &fast).map_err(|e| format!("RDP: {e}"))?
+            }
             pdu = reader.read_pdu() => {
                 let (action, payload) = pdu.map_err(|e| format!("The connection to the RDP server ended: {e}"))?;
                 stage.process(&mut image, action, &payload).map_err(|e| format!("RDP: {e}"))?
@@ -518,6 +959,16 @@ where
                     }
                     fast.extend(db.apply(operations(part)).into_vec());
                     stage.process_fastpath_input(&mut image, &fast).map_err(|e| format!("RDP: {e}"))?
+                }
+                Some(Cmd::Paste(text, keys)) => {
+                    local_text = Some(text);
+                    if keys != PasteKeys::None {
+                        held_paste = Some((keys, tokio::time::Instant::now() + PASTE_WAIT));
+                    }
+                    offer_text(&mut stage, true).unwrap_or_else(|e| {
+                        notice(&e);
+                        Vec::new()
+                    })
                 }
                 Some(Cmd::Resize(w, h)) => {
                     let (w, h) = clamp_size(w, h);
@@ -625,6 +1076,7 @@ fn login_error(e: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironrdp::pdu::rdp::capability_sets::CodecProperty;
 
     #[test]
     fn domain_forms() {
@@ -648,6 +1100,212 @@ mod tests {
         }
         // Nothing selected is no NLA either.
         assert!(nla_gate(SecurityProtocol::empty(), false).is_err());
+    }
+
+    fn login_with(graphics: Graphics) -> Login {
+        Login {
+            host: "server".into(),
+            username: "user".into(),
+            domain: None,
+            password: Zeroizing::new("secret".into()),
+            width: 1280,
+            height: 720,
+            allow_no_nla: false,
+            graphics,
+            clipboard: false,
+            drive: None,
+        }
+    }
+
+    #[test]
+    fn a_paste_key_brings_its_modifier_and_cmd_v_becomes_ctrl_v() {
+        let codes_holding = |keys, held: &[(bool, u8)]| {
+            paste_keys(keys, |s: Scancode| held.contains(&s.as_u8()))
+                .into_iter()
+                .map(|op| match op {
+                    Operation::KeyPressed(s) => (true, s.as_u8()),
+                    Operation::KeyReleased(s) => (false, s.as_u8()),
+                    _ => panic!("only keys"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let codes = |keys| codes_holding(keys, &[]);
+        assert!(codes(PasteKeys::None).is_empty());
+        // Ctrl down, V down, V up, Ctrl up.
+        assert_eq!(codes(PasteKeys::Ctrlv), [(true, (false, 0x1d)), (true, (false, 0x2f)), (false, (false, 0x2f)), (false, (false, 0x1d))]);
+        assert_eq!(codes(PasteKeys::Shiftinsert), [(true, (false, 0x2a)), (true, (true, 0x52)), (false, (true, 0x52)), (false, (false, 0x2a))]);
+        // A modifier the user still holds stays down: only the key goes.
+        assert_eq!(codes_holding(PasteKeys::Ctrlv, &[(false, 0x1d)]), [(true, (false, 0x2f)), (false, (false, 0x2f))]);
+        assert_eq!(codes_holding(PasteKeys::Shiftinsert, &[(false, 0x2a)]), [(true, (true, 0x52)), (false, (true, 0x52))]);
+        // A Mac's Cmd is the server's Windows key: Ctrl goes down first, then
+        // the Windows key that is down is let go (never on its own), then V.
+        assert_eq!(
+            codes_holding(PasteKeys::Cmdv, &[(true, 0x5b)]),
+            [(true, (false, 0x1d)), (false, (true, 0x5b)), (true, (false, 0x2f)), (false, (false, 0x2f)), (false, (false, 0x1d))]
+        );
+        assert_eq!(codes(PasteKeys::Cmdv), codes(PasteKeys::Ctrlv), "no Windows key down: just Ctrl+V");
+        // What the page sends.
+        for (word, keys) in [("none", PasteKeys::None), ("ctrlv", PasteKeys::Ctrlv), ("shiftinsert", PasteKeys::Shiftinsert), ("cmdv", PasteKeys::Cmdv)] {
+            assert_eq!(serde_json::from_str::<PasteKeys>(&format!("\"{word}\"")).unwrap(), keys);
+        }
+        let ts = include_str!("../../src/util/rdpClipboard.ts");
+        for word in ["\"ctrlv\"", "\"shiftinsert\"", "\"cmdv\"", "\"none\""] {
+            assert!(ts.contains(word), "src/util/rdpClipboard.ts must name {word}, as rdp_client::PasteKeys does");
+        }
+    }
+
+    #[test]
+    fn the_text_of_a_copy_on_the_server() {
+        let unicode = |s: &str| s.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+        // UTF-16, up to the NUL the server ends it with.
+        let mut data = unicode("héllo ✓ 世界");
+        data.extend([0, 0, b'x', 0]);
+        assert_eq!(decode_clip_text(ClipboardFormatId::CF_UNICODETEXT, &data).unwrap(), "héllo ✓ 世界");
+        // An odd byte at the end is left out, not a panic.
+        let mut odd = unicode("ab");
+        odd.push(0x41);
+        assert_eq!(decode_clip_text(ClipboardFormatId::CF_UNICODETEXT, &odd).unwrap(), "ab");
+        assert_eq!(decode_clip_text(ClipboardFormatId::CF_TEXT, b"plain\0rest").unwrap(), "plain");
+        assert_eq!(decode_clip_text(ClipboardFormatId::CF_TEXT, b"").unwrap(), "");
+        // Too long to bring over: said so, not copied.
+        let long = unicode(&"x".repeat(MAX_CLIP_CHARS + 1));
+        assert!(decode_clip_text(ClipboardFormatId::CF_UNICODETEXT, &long).unwrap_err().contains("too long"));
+        assert!(decode_clip_text(ClipboardFormatId::CF_UNICODETEXT, &unicode(&"x".repeat(MAX_CLIP_CHARS))).is_ok());
+    }
+
+    #[test]
+    fn what_the_server_does_on_its_clipboard_reaches_the_session_loop() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut bridge = ClipBridge(tx);
+        // A copy with Unicode text is asked for as Unicode; ANSI only as ANSI; no text: nothing to ask for.
+        let f = |id| ClipboardFormat::new(id);
+        bridge.on_remote_copy(&[f(ClipboardFormatId::new(49_161)), f(ClipboardFormatId::CF_TEXT), f(ClipboardFormatId::CF_UNICODETEXT)]);
+        bridge.on_remote_copy(&[f(ClipboardFormatId::CF_TEXT)]);
+        bridge.on_remote_copy(&[f(ClipboardFormatId::new(8))]);
+        bridge.on_request_format_list();
+        bridge.on_format_list_response(true);
+        bridge.on_format_data_request(FormatDataRequest { format: ClipboardFormatId::CF_UNICODETEXT });
+        bridge.on_format_data_response(FormatDataResponse::new_unicode_string("hi"));
+        bridge.on_format_data_response(FormatDataResponse::new_error());
+        let mut got = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            got.push(format!("{e:?}"));
+        }
+        assert_eq!(got.len(), 8, "{got:?}");
+        assert!(got[0].contains("RemoteCopy(Some") && got[0].contains("13"), "{}", got[0]);
+        assert!(got[1].contains("RemoteCopy(Some") && got[1].contains("(1)"), "{}", got[1]);
+        assert_eq!(got[2], "RemoteCopy(None)");
+        assert_eq!(got[3], "FormatListWanted");
+        assert_eq!(got[4], "Offered(true)");
+        assert!(got[5].starts_with("Wanted("), "{}", got[5]);
+        assert!(got[6].starts_with("RemoteText(Some("), "{}", got[6]);
+        assert_eq!(got[7], "RemoteText(None)");
+        // Files are never offered, so this side never stores any.
+        assert_eq!(bridge.temporary_directory(), "");
+        assert!(!bridge.client_capabilities().contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED));
+    }
+
+    // A server nobody changed the speed and quality of must be asked exactly
+    // what it was asked before they existed.
+    #[test]
+    fn untouched_speed_and_quality_ask_what_the_client_always_asked() {
+        let c = connector_config(&login_with(Graphics::default()));
+        assert!(c.bitmap.is_none(), "no picture settings of its own");
+        assert_eq!(c.performance_flags, PerformanceFlags::default());
+        assert_eq!(c.connection_type, ConnectionType::Lan);
+        assert_eq!(Graphics::default().describe(), None, "nothing to say about the standard ones");
+        // What the page keeps for a server that never had them is the default too.
+        assert_eq!(serde_json::from_str::<Graphics>("{}").unwrap(), Graphics::default());
+        assert!(Graphics::default().checked().is_ok());
+    }
+
+    #[test]
+    fn fewer_colours_and_a_slower_link_change_the_picture_settings() {
+        let b = connector_config(&login_with(Graphics { colors: 16, ..Graphics::default() })).bitmap.expect("16 bits is a setting");
+        assert_eq!((b.color_depth, b.lossy_compression, b.codecs.0.len()), (16, false, 0));
+        let b = connector_config(&login_with(Graphics { colors: 24, ..Graphics::default() })).bitmap.unwrap();
+        assert_eq!(b.color_depth, 24);
+        // A link that isn't fast: the server may lower the detail, and is told how fast it is.
+        for (network, kind) in [(Network::Broadband, ConnectionType::BroadbandHigh), (Network::Slow, ConnectionType::BroadbandLow)] {
+            let c = connector_config(&login_with(Graphics { network, ..Graphics::default() }));
+            assert_eq!(c.connection_type, kind);
+            let b = c.bitmap.expect("a slower link is a setting");
+            assert_eq!((b.color_depth, b.lossy_compression, b.codecs.0.len()), (32, true, 0));
+        }
+        assert_eq!(connector_config(&login_with(Graphics::default())).connection_type, ConnectionType::Lan);
+    }
+
+    #[test]
+    fn remotefx_is_offered_only_when_asked_for() {
+        let b = connector_config(&login_with(Graphics { remote_fx: true, ..Graphics::default() })).bitmap.expect("RemoteFX is a setting");
+        assert_eq!((b.color_depth, b.lossy_compression), (32, false));
+        assert!(!b.codecs.0.is_empty() && b.codecs.0.iter().all(|c| matches!(c.property, CodecProperty::RemoteFx(_))));
+        // With the other choices it stays one codec (RemoteFX), nothing else is offered.
+        let b = connector_config(&login_with(Graphics { colors: 16, network: Network::Slow, remote_fx: true, ..Graphics::default() })).bitmap.unwrap();
+        assert_eq!((b.color_depth, b.lossy_compression, b.codecs.0.len()), (16, true, 1));
+    }
+
+    #[test]
+    fn desktop_effects_map_to_the_servers_flags() {
+        let flags = |effects| connector_config(&login_with(Graphics { effects, ..Graphics::default() })).performance_flags;
+        assert_eq!(flags(Effects::Standard), PerformanceFlags::default());
+        let minimal = flags(Effects::Minimal);
+        for f in [
+            PerformanceFlags::DISABLE_WALLPAPER,
+            PerformanceFlags::DISABLE_THEMING,
+            PerformanceFlags::DISABLE_MENUANIMATIONS,
+            PerformanceFlags::DISABLE_FULLWINDOWDRAG,
+        ] {
+            assert!(minimal.contains(f), "{f:?}");
+        }
+        assert!(!minimal.intersects(PerformanceFlags::ENABLE_FONT_SMOOTHING | PerformanceFlags::ENABLE_DESKTOP_COMPOSITION));
+        let full = flags(Effects::Full);
+        assert!(full.contains(PerformanceFlags::ENABLE_FONT_SMOOTHING | PerformanceFlags::ENABLE_DESKTOP_COMPOSITION));
+        assert!(!full.intersects(
+            PerformanceFlags::DISABLE_WALLPAPER
+                | PerformanceFlags::DISABLE_THEMING
+                | PerformanceFlags::DISABLE_MENUANIMATIONS
+                | PerformanceFlags::DISABLE_FULLWINDOWDRAG
+        ));
+    }
+
+    #[test]
+    fn the_page_sends_camel_case_and_a_depth_that_isnt_offered_is_refused() {
+        let g: Graphics = serde_json::from_str(r#"{"colors":16,"effects":"minimal","network":"broadband","remoteFx":true}"#).unwrap();
+        assert_eq!(g, Graphics { colors: 16, effects: Effects::Minimal, network: Network::Broadband, remote_fx: true });
+        // A part left out is the standard one.
+        assert_eq!(serde_json::from_str::<Graphics>(r#"{"colors":16}"#).unwrap(), Graphics { colors: 16, ..Graphics::default() });
+        for colors in [0u8, 8, 15, 33, 255] {
+            assert!(Graphics { colors, ..Graphics::default() }.checked().is_err(), "{colors}");
+        }
+        for colors in [16u8, 24, 32] {
+            assert!(Graphics { colors, ..Graphics::default() }.checked().is_ok(), "{colors}");
+        }
+        // A word this client doesn't know is an error, not the standard.
+        assert!(serde_json::from_str::<Graphics>(r#"{"effects":"wild"}"#).is_err());
+        assert!(serde_json::from_str::<Graphics>(r#"{"network":"dialup"}"#).is_err());
+        assert!(serde_json::from_str::<Graphics>(r#"{"colors":"16"}"#).is_err());
+    }
+
+    #[test]
+    fn the_log_line_says_what_was_chosen() {
+        let g = Graphics { colors: 16, effects: Effects::Minimal, network: Network::Slow, remote_fx: true };
+        assert_eq!(
+            g.describe().as_deref(),
+            Some("Speed and quality: 16-bit colour, minimal desktop effects, a slow network, RemoteFX offered.")
+        );
+        assert_eq!(
+            Graphics { effects: Effects::Full, ..Graphics::default() }.describe().as_deref(),
+            Some("Speed and quality: 32-bit colour, all desktop effects, a fast network.")
+        );
+    }
+
+    #[test]
+    fn the_tab_and_the_backend_use_the_same_words() {
+        let ts = include_str!("../../src/util/rdpOptions.ts");
+        for word in ["\"minimal\"", "\"full\"", "\"standard\"", "\"broadband\"", "\"slow\"", "\"lan\"", "remoteFx"] {
+            assert!(ts.contains(word), "src/util/rdpOptions.ts must use {word}, as rdp_client::Graphics does");
+        }
     }
 
     #[test]

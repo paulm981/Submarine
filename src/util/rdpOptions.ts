@@ -13,18 +13,93 @@ export interface RdpOptions {
   /** The window's size when not full screen. */
   width: number;
   height: number;
+  /** Share the clipboard. In the built-in client: text, this device's only
+   *  when pasted into the server (see rdpClipboard.ts). */
   clipboard: boolean;
   /** This computer's drives (with Remmina: the home folder). */
   drives: boolean;
   /** The built-in client may log in to this server without NLA. Off: a server
    *  that doesn't do NLA is refused before anything is sent (audit 2, #4). */
   allowNoNla: boolean;
+  /** The built-in client's speed and quality (the next four): the defaults are
+   *  what it always asked for. Kept equal to `rdp_client::Graphics`. */
+  colors: RdpColors;
+  /** Which of the server's desktop effects may be drawn (Windows servers act on it). */
+  effects: RdpEffects;
+  /** How fast the link is said to be; the server may send less detail on a slower one. */
+  network: RdpNetwork;
+  /** Offer RemoteFX; it is used only if the server has it. */
+  remoteFx: boolean;
+  /** Files the built-in client shares with the server: nothing, one folder,
+   *  or a whole drive (`sharePath`: the folder, or the drive's `D:\`), read
+   *  only or not. Kept equal to `rdp_share::Share`. */
+  share: RdpShareKind;
+  sharePath: string;
+  shareReadOnly: boolean;
+  /** The server's address (`rdpAddress`) when the share was chosen: files go
+   *  there only, so that a changed address (by someone else, in a shared
+   *  profile) doesn't take them along. */
+  shareFor: string;
 }
+
+export type RdpShareKind = "off" | "folder" | "drive";
+
+export type RdpColors = 32 | 24 | 16;
+export type RdpEffects = "standard" | "minimal" | "full";
+export type RdpNetwork = "lan" | "broadband" | "slow";
 
 export const RDP_OPTIONS_KEY = "submarine-rdp-options";
 
 // What Remote Desktop Connection does on its own, files kept private.
-export const DEFAULT_RDP_OPTIONS: RdpOptions = { app: "system", fullScreen: true, width: 1600, height: 900, clipboard: true, drives: false, allowNoNla: false };
+export const DEFAULT_RDP_OPTIONS: RdpOptions = {
+  app: "system", fullScreen: true, width: 1600, height: 900, clipboard: true, drives: false, allowNoNla: false,
+  colors: 32, effects: "standard", network: "lan", remoteFx: false,
+  share: "off", sharePath: "", shareReadOnly: false, shareFor: "",
+};
+
+/** A server's address as a share is kept for (`shareFor`), and as the
+ *  backend checks it (rdp_share::Share::chosen_for). */
+export const rdpAddress = (host: string, port: number): string => `${host.trim().toLowerCase()}:${port}`;
+
+/** The choices of what the built-in client shares, as the form lists them; a
+ *  drive is a drive letter on Windows (elsewhere a drive is the folder it is
+ *  mounted on). */
+export function rdpShareChoices(windows: boolean): { value: RdpShareKind; label: string }[] {
+  return [
+    { value: "off", label: "Nothing" },
+    { value: "folder", label: "A folder" },
+    ...(windows ? [{ value: "drive" as const, label: "A whole drive" }] : []),
+  ];
+}
+
+/** What the built-in client is told to share (`rdp_share::Share`), or nothing. */
+export function rdpShare(o: RdpOptions): { kind: "folder" | "drive"; path: string; readOnly: boolean; address: string } | null {
+  return o.share !== "off" && o.sharePath.trim()
+    ? { kind: o.share, path: o.sharePath.trim(), readOnly: o.shareReadOnly, address: o.shareFor }
+    : null;
+}
+
+/** The choices of the built-in client's speed and quality, as the form lists them. */
+export const RDP_COLOR_CHOICES: { value: RdpColors; label: string }[] = [
+  { value: 32, label: "True colour (32-bit)" },
+  { value: 24, label: "24-bit" },
+  { value: 16, label: "High colour (16-bit)" },
+];
+export const RDP_EFFECT_CHOICES: { value: RdpEffects; label: string }[] = [
+  { value: "standard", label: "Standard" },
+  { value: "minimal", label: "Minimal (fastest)" },
+  { value: "full", label: "Full (all effects)" },
+];
+export const RDP_NETWORK_CHOICES: { value: RdpNetwork; label: string }[] = [
+  { value: "lan", label: "Fast (local network)" },
+  { value: "broadband", label: "Broadband" },
+  { value: "slow", label: "Slow (mobile, or far away)" },
+];
+
+/** What the built-in client is told about the picture: only the speed and quality. */
+export function rdpGraphics(o: RdpOptions): Pick<RdpOptions, "colors" | "effects" | "network" | "remoteFx"> {
+  return { colors: o.colors, effects: o.effects, network: o.network, remoteFx: o.remoteFx };
+}
 
 /** How the built-in client's refusal of a server without NLA starts: the tab
  *  offers the one-click opt-in for it. Kept equal to `rdp_client::NO_NLA`
@@ -65,6 +140,14 @@ export function readRdpOptions(uuid?: string | null): RdpOptions {
     if (typeof kept.clipboard === "boolean") o.clipboard = kept.clipboard;
     if (typeof kept.drives === "boolean") o.drives = kept.drives;
     if (typeof kept.allowNoNla === "boolean") o.allowNoNla = kept.allowNoNla;
+    if (RDP_COLOR_CHOICES.some((c) => c.value === kept.colors)) o.colors = kept.colors as RdpColors;
+    if (RDP_EFFECT_CHOICES.some((c) => c.value === kept.effects)) o.effects = kept.effects as RdpEffects;
+    if (RDP_NETWORK_CHOICES.some((c) => c.value === kept.network)) o.network = kept.network as RdpNetwork;
+    if (typeof kept.remoteFx === "boolean") o.remoteFx = kept.remoteFx;
+    if (kept.share === "off" || kept.share === "folder" || kept.share === "drive") o.share = kept.share;
+    if (typeof kept.sharePath === "string") o.sharePath = kept.sharePath;
+    if (typeof kept.shareReadOnly === "boolean") o.shareReadOnly = kept.shareReadOnly;
+    if (typeof kept.shareFor === "string") o.shareFor = kept.shareFor;
   }
   return o;
 }

@@ -58,6 +58,7 @@ mod rdp;
 mod quick_unlock;
 mod busy;
 mod rdp_client;
+mod rdp_share;
 mod term_filter;
 mod vault_backup;
 mod known_hosts;
@@ -8806,10 +8807,14 @@ enum SecretSlot {
 /// shares its parent tab's prompted-secret cache, so the suffix is stripped to
 /// key the cache by the base session id. A plain primary id is returned as-is.
 fn base_session_id(session_id: &str) -> &str {
-    session_id
-        .strip_suffix("::sftp")
-        .or_else(|| session_id.strip_suffix("::fwd"))
-        .unwrap_or(session_id)
+    if let Some(base) = session_id.strip_suffix("::sftp").or_else(|| session_id.strip_suffix("::fwd")) {
+        return base;
+    }
+    // A terminal that logs in on its own (issue #230): `<tab>::term-<terminal>`.
+    match session_id.split_once("::term-") {
+        Some((base, terminal)) if !base.is_empty() && !terminal.is_empty() => base,
+        _ => session_id,
+    }
 }
 
 /// How many times in a row a server may start a keyboard-interactive round with
@@ -10738,6 +10743,10 @@ mod secret_prompt_tests {
         assert_eq!(base_session_id("tab-1"), "tab-1");
         assert_eq!(base_session_id("tab-1::sftp"), "tab-1");
         assert_eq!(base_session_id("tab-1::fwd"), "tab-1");
+        // A terminal with a login of its own is its tab's (issue #230).
+        assert_eq!(base_session_id("tab-1::term-tab-1-term-1729000000000"), "tab-1");
+        assert_eq!(base_session_id("::term-x"), "::term-x");
+        assert_eq!(base_session_id("tab-1::term-"), "tab-1::term-");
         // Anything else is left intact.
         assert_eq!(base_session_id("tab-1::other"), "tab-1::other");
     }
@@ -10886,10 +10895,14 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     // question once, and only that (see is_password_prompt).
     saved_password: Option<&str>,
     // `Some` on a connection that can't ask the user anything (a `::sftp` /
-    // `::fwd` one, whose prompts no tab listens to): the saved password still
-    // answers the server's password question, but any other question ends
-    // the login at once, as a failure, and sets this. `None` asks the user.
+    // `::fwd` one, whose prompts no tab listens to, or a terminal's own login,
+    // #230): the saved password still answers the server's password question,
+    // but any other question ends the login at once, as a failure, and sets
+    // this. `None` asks the user.
     unasked: Option<&std::sync::atomic::AtomicBool>,
+    // Set to the password the user typed for the server's password question,
+    // so that the caller can keep it for the tab once the login worked.
+    typed_password: &mut Option<Zeroizing<String>>,
 ) -> Option<Result<bool, russh::Error>> {
     use russh::client::KeyboardInteractiveAuthResponse;
     use tauri::Emitter;
@@ -10930,6 +10943,10 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
             KeyboardInteractiveAuthResponse::Success => return Some(Ok(true)),
             KeyboardInteractiveAuthResponse::Failure { .. } => {
                 if answered_with_saved {
+                    if unasked.is_some() {
+                        log("The saved password was rejected.", "error");
+                        return Some(Ok(false));
+                    }
                     // The saved password was turned down. Start over and ask
                     // the user, as without one.
                     answered_with_saved = false;
@@ -11057,6 +11074,9 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
                 // the SSH auth state machine.
                 let mut answers = answers;
                 answers.resize(prompts.len(), String::new());
+                if prompts.len() == 1 && is_password_prompt(&prompts[0].prompt, prompts[0].echo) && !answers[0].is_empty() {
+                    *typed_password = Some(Zeroizing::new(answers[0].clone()));
+                }
 
                 resp = match session
                     .authenticate_keyboard_interactive_respond(answers)
@@ -12476,6 +12496,7 @@ async fn login_hop(
                 ctx.attempt,
                 kbi_password.as_ref().map(|p| p.as_str()),
                 (!ctx.allow_prompt).then_some(&kbi_unasked),
+                &mut None,
             )
             .await
             {
@@ -12753,6 +12774,11 @@ async fn initiate_connection(
     // hang. Instead we let the secondary fail its auth and the frontend falls
     // back to routing SFTP / forwarding over the primary connection.
     let allow_kbi = !is_secondary;
+    // A terminal's own login (#230) can't ask either, but on a server that
+    // takes the password only through keyboard-interactive it answers the
+    // password question there: with the saved password, or the one typed for
+    // its tab.
+    let kbi_password_only = role == "terminal";
     // Which connection auto-starts this server's saved tunnels inline:
     //   - primary + shared mode    → yes (unchanged legacy behaviour)
     //   - primary + separate mode  → no  (the "forward" connection takes over)
@@ -13524,7 +13550,10 @@ async fn initiate_connection(
 
                 // For a server that asks for the password through keyboard-
                 // interactive instead of the password method (#145).
-                let kbi_password = custom_password.clone().or_else(|| password.clone()).map(Zeroizing::new);
+                let mut kbi_password = custom_password.clone().or_else(|| password.clone()).map(Zeroizing::new);
+                if kbi_password_only && kbi_password.is_none() {
+                    kbi_password = cache_get_secret(&prompted_secrets_clone, &base_id, SecretSlot::Password).await;
+                }
 
                 let mut auth_res = if login_cancelled {
                     // "Login as" was cancelled — nothing to try. The prompt set
@@ -13576,11 +13605,13 @@ async fn initiate_connection(
                 // stop here: the fallback would only ask again (the server's own
                 // "Password:" box on a typical PAM setup). Likewise after an
                 // ssh-agent signature failed: the session can't run anything else.
-                if allow_kbi
+                if (allow_kbi || kbi_password_only)
                     && !matches!(auth_res, Ok(true))
                     && !prompt_ctx.cancelled.load(std::sync::atomic::Ordering::Relaxed)
                     && !prompt_ctx.session_unusable.load(std::sync::atomic::Ordering::Relaxed)
                 {
+                    let mut typed_password = None;
+                    let kbi_unasked = std::sync::atomic::AtomicBool::new(false);
                     if let Some(kbi_res) = run_keyboard_interactive(
                         &mut session,
                         &effective_user,
@@ -13590,11 +13621,17 @@ async fn initiate_connection(
                         &kbi_txs_clone,
                         &attempt,
                         kbi_password.as_ref().map(|p| p.as_str()),
-                        None,
+                        (!allow_kbi).then_some(&kbi_unasked),
+                        &mut typed_password,
                     )
                     .await
                     {
                         auth_res = kbi_res;
+                    }
+                    // Kept for the tab once it worked, like a password typed
+                    // for the password method: a terminal's own login uses it.
+                    if let (Some(typed), Ok(true)) = (typed_password, &auth_res) {
+                        cache_store_secret(&prompted_secrets_clone, &base_id, SecretSlot::Password, typed).await;
                     }
                 }
                 release_agent(&prompt_ctx).await;
@@ -15228,6 +15265,13 @@ async fn initiate_rdp(
     Ok(())
 }
 
+/// The drives this computer has (`X:\`), for sharing one with an RDP server
+/// from the built-in client; none but on Windows.
+#[tauri::command]
+fn rdp_share_drives() -> Vec<String> {
+    rdp_share::drives()
+}
+
 /// The built-in RDP sessions (rdp_client.rs) by tab: what the page sends them.
 type RdpClients = std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, (u64, tokio::sync::mpsc::UnboundedSender<rdp_client::Cmd>)>>>;
 
@@ -15297,11 +15341,19 @@ async fn rdp_builtin_open(
     // This server may be logged in to without NLA (the tab's per-server
     // option, off unless the user turned it on for the server).
     allow_no_nla: Option<bool>,
+    // The tab's speed and quality choices for this server (the standard ones if none).
+    graphics: Option<rdp_client::Graphics>,
+    // Share the clipboard with the server (the tab's per-server option).
+    clipboard: Option<bool>,
+    // Files shared with the server: a folder or a drive (the tab's per-server
+    // option, off unless the user turned it on for the server).
+    share: Option<rdp_share::Share>,
     frames: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Result<(), String> {
     use std::sync::Arc;
     use tauri::Emitter;
 
+    let graphics = graphics.unwrap_or_default().checked()?;
     // A new attempt replaces the tab's last one.
     if let Some((_, old)) = rdp_clients.lock().await.remove(&session_id) {
         let _ = old.send(rdp_client::Cmd::Close);
@@ -15378,6 +15430,9 @@ async fn rdp_builtin_open(
         };
         let target = rdp::address(&host, port);
         log(&format!("Opening the RDP server {target} in this tab..."), "info");
+        if let Some(chosen) = graphics.describe() {
+            log(&chosen, "info");
+        }
 
         // The password: saved, else asked for here (it goes nowhere else).
         let password = if password.is_empty() {
@@ -15574,8 +15629,39 @@ async fn rdp_builtin_open(
             }
         };
 
+        // Files shared with the server; one that isn't there is said and left out.
+        // Only to the address they were chosen for (rdp_share::Share::address).
+        let share = share.filter(|share| {
+            let ok = share.chosen_for(&host, port);
+            if !ok {
+                log("Files aren't shared: this server's address has changed since you chose to share them. Open its form, check what it shares, and save.", "warning");
+            }
+            ok
+        });
+        let drive = share.and_then(|share| match rdp_share::channel(&share) {
+            Ok(channel) => {
+                let how = if share.read_only { ", read only" } else { "" };
+                log(&format!("Sharing {} with the server{how}.", share.path.trim()), "info");
+                Some(channel)
+            }
+            Err(e) => {
+                log(&format!("Files aren't shared: {e}."), "error");
+                None
+            }
+        });
         let (login_user, domain) = rdp_client::split_domain(&user);
-        let login = rdp_client::Login { host: host.clone(), username: login_user, domain, password, width, height, allow_no_nla: allow_no_nla.unwrap_or(false) };
+        let login = rdp_client::Login {
+            host: host.clone(),
+            username: login_user,
+            domain,
+            password,
+            width,
+            height,
+            allow_no_nla: allow_no_nla.unwrap_or(false),
+            graphics,
+            clipboard: clipboard.unwrap_or(false),
+            drive,
+        };
         let connected = {
             let (app, attempt, sid, target) = (app.clone(), attempt.clone(), session_id.clone(), target.clone());
             move |w: u16, h: u16| {
@@ -15605,7 +15691,16 @@ async fn rdp_builtin_open(
                 }
             }
         };
-        let run = tauri::async_runtime::spawn(rdp_client::run(stream, client_addr, login, verify, connected, notice, frame, flow, rx));
+        // What the user copied on the server, for the tab to put on this computer's clipboard.
+        let remote_copy = {
+            let (app, attempt, sid) = (app.clone(), attempt.clone(), session_id.clone());
+            move |text: String| {
+                if attempt.is_current_now() {
+                    let _ = app.emit(&format!("rdp-clipboard-{sid}"), serde_json::json!({"text": text}));
+                }
+            }
+        };
+        let run = tauri::async_runtime::spawn(rdp_client::run(stream, client_addr, login, verify, connected, notice, frame, remote_copy, flow, rx));
         let outcome = match run.await {
             Ok(r) => r,
             Err(_) => Err("The RDP session stopped on bad data from the server".into()),
@@ -15647,6 +15742,20 @@ async fn rdp_builtin_input(rdp_clients: tauri::State<'_, RdpClients>, session_id
     }
     if let Some((_, tx)) = rdp_clients.lock().await.get(&session_id) {
         let _ = tx.send(rdp_client::Cmd::Input(events));
+    }
+    Ok(())
+}
+
+/// Text from this computer's clipboard for the server's (the tab read it when
+/// the user pasted, or pressed its button), and the paste key it held back.
+#[tauri::command]
+async fn rdp_builtin_paste(rdp_clients: tauri::State<'_, RdpClients>, session_id: String, text: String, keys: rdp_client::PasteKeys) -> Result<(), String> {
+    let text = zeroize::Zeroizing::new(text);
+    if text.chars().count() > 1_000_000 {
+        return Err("The clipboard holds too much text to send (the most is 1,000,000 characters).".into());
+    }
+    if let Some((_, tx)) = rdp_clients.lock().await.get(&session_id) {
+        let _ = tx.send(rdp_client::Cmd::Paste(text, keys));
     }
     Ok(())
 }
@@ -16002,11 +16111,14 @@ async fn vnc_open(
     use_ssh_agent: Option<bool>,
     width: u16,
     height: u16,
+    // The tab's speed and quality choices for this server (the standard ones if none).
+    options: Option<vnc_client::Options>,
     frames: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Result<(), String> {
     use std::sync::Arc;
     use tauri::Emitter;
 
+    let options = options.unwrap_or_default().checked()?;
     // A new attempt replaces the tab's last one.
     if let Some((_, old)) = vnc_clients.lock().await.remove(&session_id) {
         let _ = old.send(vnc_client::Cmd::Close);
@@ -16088,6 +16200,9 @@ async fn vnc_open(
                 "A VNC server doesn't use saved logins: VNC sends its password with weak protection and doesn't check the server's identity. Type the VNC password when asked, or save it on the server.",
                 "warning",
             );
+        }
+        if let Some(chosen) = options.describe() {
+            log(&chosen, "info");
         }
 
         // The way there: straight, or a channel through the SSH server. The
@@ -16229,7 +16344,7 @@ async fn vnc_open(
         let flow = screens.start(&session_id, generation);
         let frame = screen_frame_sender(frames, Arc::clone(&flow));
         // A decoder that panics on a bad screen update ends this tab only.
-        let run = tauri::async_runtime::spawn(vnc_client::run(stream, password, connected, frame, flow, rx, wanted));
+        let run = tauri::async_runtime::spawn(vnc_client::run(stream, password, connected, frame, flow, rx, wanted, options));
         let outcome = match run.await {
             Ok(r) => r,
             Err(_) => Err("The VNC session stopped on bad data from the server".into()),
@@ -26629,7 +26744,7 @@ pub fn run() {
             add_ssh_key, edit_ssh_key, delete_ssh_key,
             pick_ssh_key_file, read_ssh_key_file, import_ssh_key_file,
             initiate_connection, verify_fingerprint_response, submit_kbi_response, disconnect_session, set_use_ssh_config,
-            initiate_rdp, rdp_open_again, rdp_builtin_open, rdp_builtin_input, rdp_builtin_resize, rdp_builtin_close,
+            initiate_rdp, rdp_open_again, rdp_builtin_open, rdp_builtin_input, rdp_builtin_paste, rdp_builtin_resize, rdp_builtin_close, rdp_share_drives,
             telnet_connect, telnet_open_terminal, vnc_open, vnc_input, vnc_resize, screen_ack,
             start_tunnel, stop_tunnel, list_tunnels, restart_session_tunnels, persist_session_tunnels,
             list_tunnel_rules, remove_tunnel_rule, rename_tunnel_rule,
