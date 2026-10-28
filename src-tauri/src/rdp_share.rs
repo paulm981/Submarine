@@ -483,7 +483,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sub-share-root-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let ok = root(&share(ShareKind::Folder, &dir.to_string_lossy())).unwrap();
-        assert_eq!(ok, std::fs::canonicalize(&dir).unwrap());
+        let real = std::fs::canonicalize(&dir).unwrap();
+        // On Windows without the `\\?\` resolving gives (see `root`).
+        #[cfg(windows)]
+        let real = PathBuf::from(real.to_string_lossy().strip_prefix(r"\\?\").unwrap().to_string());
+        assert_eq!(ok, real);
         assert!(root(&share(ShareKind::Folder, "")).is_err());
         assert!(root(&share(ShareKind::Folder, "relative/folder")).is_err());
         assert!(root(&share(ShareKind::Folder, &dir.join("not-there").to_string_lossy())).is_err());
