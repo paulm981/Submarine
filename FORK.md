@@ -11,7 +11,7 @@ This page covers:
 
 What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
-The fork is based on the original project's **0.4.0**, with every change up to [#229](https://github.com/SinaXhpm/submarine/pull/229) brought in.
+The fork is based on the original project's **0.4.0**, with every change up to [#229](https://github.com/SinaXhpm/submarine/pull/229), and [#233](https://github.com/SinaXhpm/submarine/pull/233)–[#237](https://github.com/SinaXhpm/submarine/pull/237), brought in.
 
 ## What this fork adds
 
@@ -254,14 +254,13 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 
 ## Changes in the original project not taken yet
 
-Every change up to [#229](https://github.com/SinaXhpm/submarine/pull/229) is taken, and so is [#237](https://github.com/SinaXhpm/submarine/pull/237) (locking calls off logins in progress). Where the fork takes one differently, the table above says so.
+Every change up to [#229](https://github.com/SinaXhpm/submarine/pull/229) is taken, and so are [#233](https://github.com/SinaXhpm/submarine/pull/233)–[#237](https://github.com/SinaXhpm/submarine/pull/237). Where the fork takes one differently, the table above says so.
 
 Being brought in, in steps ([#121](https://github.com/paulm981/Submarine/issues/121)):
 
 | The original project's change | Step |
 |---|---|
-| [#233](https://github.com/SinaXhpm/submarine/pull/233)–[#236](https://github.com/SinaXhpm/submarine/pull/236): RDP and VNC speed and quality, RDP clipboard and files, terminal numbers, a terminal with its own login | Next |
-| [#241](https://github.com/SinaXhpm/submarine/pull/241), [#242](https://github.com/SinaXhpm/submarine/pull/242): "Save password" on prompts, the RDP app gets the saved password | With fork rules: a saved login shared with other servers never goes to the RDP app or into a VNC password, and in a shared profile the tick starts off |
+| [#241](https://github.com/SinaXhpm/submarine/pull/241), [#242](https://github.com/SinaXhpm/submarine/pull/242): "Save password" on prompts, the RDP app gets the saved password | Next, with fork rules: a saved login shared with other servers never goes to the RDP app or into a VNC password, and in a shared profile the tick starts off |
 | [#238](https://github.com/SinaXhpm/submarine/pull/238)–[#249](https://github.com/SinaXhpm/submarine/pull/249): search and history keys, RDP and VNC tab tools, VNC clipboard | Last |
 
 ## Keeping up with the original project

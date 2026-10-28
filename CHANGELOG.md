@@ -9,6 +9,19 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+### From the original project
+
+- **Speed and quality for Remote Desktop (built-in client) and VNC.** A server's form has **Speed and quality**. For RDP you can choose the colours, desktop effects, the network type and whether to offer RemoteFX. For VNC you can choose the encoding, the colours and the most updates per second. The choices are kept on this computer only. A server you don't change connects exactly as before. (Their [#233](https://github.com/SinaXhpm/submarine/pull/233); [#121](https://github.com/paulm981/Submarine/issues/121))
+- **The built-in Remote Desktop client can share the clipboard and files.** Both are off until you turn them on in the server's form.
+  - **Clipboard:** text copied on the server comes to this computer. Your text goes to the server only when you paste it there. Only text is shared, never files.
+  - **Files:** you can share one folder, or a whole drive on Windows, and you can make it read only. Every path the server asks for is checked so it can't reach outside what you shared.
+  - These settings stay on this computer: they never sync with a shared profile, and phones don't have them.
+  - (Their [#234](https://github.com/SinaXhpm/submarine/pull/234); [#121](https://github.com/paulm981/Submarine/issues/121))
+- **A new terminal takes the lowest free number.** Close terminal 2 of 1, 2 and 3, open another, and it's called 2 again, not a second 3. (Their [#235](https://github.com/SinaXhpm/submarine/pull/235); [#121](https://github.com/paulm981/Submarine/issues/121))
+- **A terminal can log in on its own.** Right-click the **+** button for **New terminal with its own login**, or **Always for this server**. That terminal logs in to the server again instead of sharing its tab's connection. This helps with software that ties rights to the login, such as CA Access Control's `sesu`. It uses the password you typed for the tab and the host key you accepted there, and asks nothing new. If that login fails, the terminal uses the tab's connection and says so. (Their [#236](https://github.com/SinaXhpm/submarine/pull/236); [#121](https://github.com/paulm981/Submarine/issues/121))
+
+## v0.4.0-fork.13
+
 - **vim no longer freezes the terminal.** Opening a file in vim used to stop that terminal for good: nothing more showed up and typing did nothing, so you had to close it and log in again. nano and less were fine. It came from how the app was built: vim asks the terminal whether the cursor blinks, and the built copy of the terminal code failed on that question. The app is now built so that code works, and every build checks for this kind of fault before it can ship. ([#129](https://github.com/paulm981/Submarine/issues/129))
 
 ## v0.4.0-fork.12
