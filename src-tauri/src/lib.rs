@@ -15630,6 +15630,14 @@ async fn rdp_builtin_open(
         };
 
         // Files shared with the server; one that isn't there is said and left out.
+        // Only to the address they were chosen for (rdp_share::Share::address).
+        let share = share.filter(|share| {
+            let ok = share.chosen_for(&host, port);
+            if !ok {
+                log("Files aren't shared: this server's address has changed since you chose to share them. Open its form, check what it shares, and save.", "warning");
+            }
+            ok
+        });
         let drive = share.and_then(|share| match rdp_share::channel(&share) {
             Ok(channel) => {
                 let how = if share.read_only { ", read only" } else { "" };

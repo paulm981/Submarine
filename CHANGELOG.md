@@ -12,11 +12,16 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 ### From the original project
 
 - **Speed and quality for Remote Desktop (built-in client) and VNC.** A server's form has **Speed and quality**. For RDP you can choose the colours, desktop effects, the network type and whether to offer RemoteFX. For VNC you can choose the encoding, the colours and the most updates per second. The choices are kept on this computer only. A server you don't change connects exactly as before. (Their [#233](https://github.com/SinaXhpm/submarine/pull/233); [#121](https://github.com/paulm981/Submarine/issues/121))
-- **The built-in Remote Desktop client can share the clipboard and files.** Both are off until you turn them on in the server's form.
-  - **Clipboard:** text copied on the server comes to this computer. Your text goes to the server only when you paste it there. Only text is shared, never files.
-  - **Files:** you can share one folder, or a whole drive on Windows, and you can make it read only. Every path the server asks for is checked so it can't reach outside what you shared.
+- **The built-in Remote Desktop client can share the clipboard and files.**
+  - **Clipboard:** shared unless you turn off **Share the clipboard** in the server's form. Text copied on the server comes to your clipboard only while you're looking at its tab. If you're elsewhere, it waits in a note in that tab for you to copy. This stops a server from swapping what you're about to paste into a terminal. Your text goes to the server only when you paste it there. Only text is shared, never files.
+  - **Files:** off until you choose one folder, or a whole drive on Windows, in the server's form. You can make it read only.
+  - **Where files are kept safe:**
+    - Every path the server asks for is checked so it can't reach outside what you shared.
+    - Even with all of `/` shared on Linux, the system's own files that hold running programs' memory and settings stay out of reach.
+    - A server can have at most 1,024 files open at once.
+    - Files go only to the server address you chose them for: if someone in a shared profile changes the address, nothing is shared until you save the form again.
   - These settings stay on this computer: they never sync with a shared profile, and phones don't have them.
-  - (Their [#234](https://github.com/SinaXhpm/submarine/pull/234); [#121](https://github.com/paulm981/Submarine/issues/121))
+  - (Their [#234](https://github.com/SinaXhpm/submarine/pull/234), with the fork's checks from [#131](https://github.com/paulm981/Submarine/issues/131); [#121](https://github.com/paulm981/Submarine/issues/121))
 - **A new terminal takes the lowest free number.** Close terminal 2 of 1, 2 and 3, open another, and it's called 2 again, not a second 3. (Their [#235](https://github.com/SinaXhpm/submarine/pull/235); [#121](https://github.com/paulm981/Submarine/issues/121))
 - **A terminal can log in on its own.** Right-click the **+** button for **New terminal with its own login**, or **Always for this server**. That terminal logs in to the server again instead of sharing its tab's connection. This helps with software that ties rights to the login, such as CA Access Control's `sesu`. It uses the password you typed for the tab and the host key you accepted there, and asks nothing new. If that login fails, the terminal uses the tab's connection and says so. (Their [#236](https://github.com/SinaXhpm/submarine/pull/236); [#121](https://github.com/paulm981/Submarine/issues/121))
 

@@ -31,7 +31,7 @@ import { SCROLLBACK_KEY, readScrollback } from "./util/terminalScrollback";
 import { USE_LOCAL_SHELL_KEY, readUseLocalShell } from "./util/terminalShell";
 import { USE_SSH_AGENT_KEY, readUseSshAgent } from "./util/sshAgent";
 import { USE_SSH_CONFIG_KEY, readUseSshConfig } from "./util/sshConfig";
-import { DEFAULT_RDP_OPTIONS, readRdpOptions, writeRdpOptions } from "./util/rdpOptions";
+import { DEFAULT_RDP_OPTIONS, rdpAddress, readRdpOptions, writeRdpOptions } from "./util/rdpOptions";
 import { DEFAULT_VNC_OPTIONS, readVncOptions, writeVncOptions } from "./util/vncOptions";
 import { Sidebar } from "./components/Sidebar";
 import { NodeGrid } from "./components/NodeGrid";
@@ -3626,7 +3626,9 @@ function DesktopApp() {
             if (isRdp) {
               try {
                 const uuid = (await invoke<any[]>("get_servers")).find((s) => s.id === savedId)?.uuid;
-                if (uuid) writeRdpOptions(uuid, newNode.rdpOptions || DEFAULT_RDP_OPTIONS);
+                // Files shared go to this address only (rdpOptions' shareFor).
+                const o = newNode.rdpOptions || DEFAULT_RDP_OPTIONS;
+                if (uuid) writeRdpOptions(uuid, { ...o, shareFor: o.share !== "off" ? rdpAddress(newNode.host, newNode.port) : "" });
               } catch (e) {
                 addLog(`SAVE_RDP_OPTIONS_FAILED: ${e}`, "error");
               }

@@ -2921,7 +2921,7 @@ dependencies = [
  "ironrdp-pdu",
  "ironrdp-rdpdr",
  "ironrdp-svc",
- "nix",
+ "nix 0.31.3",
  "tracing",
  "windows 0.62.2",
 ]

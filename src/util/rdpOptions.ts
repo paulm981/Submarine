@@ -36,6 +36,10 @@ export interface RdpOptions {
   share: RdpShareKind;
   sharePath: string;
   shareReadOnly: boolean;
+  /** The server's address (`rdpAddress`) when the share was chosen: files go
+   *  there only, so that a changed address (by someone else, in a shared
+   *  profile) doesn't take them along. */
+  shareFor: string;
 }
 
 export type RdpShareKind = "off" | "folder" | "drive";
@@ -50,8 +54,12 @@ export const RDP_OPTIONS_KEY = "submarine-rdp-options";
 export const DEFAULT_RDP_OPTIONS: RdpOptions = {
   app: "system", fullScreen: true, width: 1600, height: 900, clipboard: true, drives: false, allowNoNla: false,
   colors: 32, effects: "standard", network: "lan", remoteFx: false,
-  share: "off", sharePath: "", shareReadOnly: false,
+  share: "off", sharePath: "", shareReadOnly: false, shareFor: "",
 };
+
+/** A server's address as a share is kept for (`shareFor`), and as the
+ *  backend checks it (rdp_share::Share::chosen_for). */
+export const rdpAddress = (host: string, port: number): string => `${host.trim().toLowerCase()}:${port}`;
 
 /** The choices of what the built-in client shares, as the form lists them; a
  *  drive is a drive letter on Windows (elsewhere a drive is the folder it is
@@ -65,8 +73,10 @@ export function rdpShareChoices(windows: boolean): { value: RdpShareKind; label:
 }
 
 /** What the built-in client is told to share (`rdp_share::Share`), or nothing. */
-export function rdpShare(o: RdpOptions): { kind: "folder" | "drive"; path: string; readOnly: boolean } | null {
-  return o.share !== "off" && o.sharePath.trim() ? { kind: o.share, path: o.sharePath.trim(), readOnly: o.shareReadOnly } : null;
+export function rdpShare(o: RdpOptions): { kind: "folder" | "drive"; path: string; readOnly: boolean; address: string } | null {
+  return o.share !== "off" && o.sharePath.trim()
+    ? { kind: o.share, path: o.sharePath.trim(), readOnly: o.shareReadOnly, address: o.shareFor }
+    : null;
 }
 
 /** The choices of the built-in client's speed and quality, as the form lists them. */
@@ -137,6 +147,7 @@ export function readRdpOptions(uuid?: string | null): RdpOptions {
     if (kept.share === "off" || kept.share === "folder" || kept.share === "drive") o.share = kept.share;
     if (typeof kept.sharePath === "string") o.sharePath = kept.sharePath;
     if (typeof kept.shareReadOnly === "boolean") o.shareReadOnly = kept.shareReadOnly;
+    if (typeof kept.shareFor === "string") o.shareFor = kept.shareFor;
   }
   return o;
 }

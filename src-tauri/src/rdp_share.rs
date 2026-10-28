@@ -35,6 +35,18 @@ pub struct Share {
     pub path: String,
     #[serde(default)]
     pub read_only: bool,
+    /// The server's address (`host:port`) when the share was chosen: files go
+    /// to that address only. Someone else in a shared profile may change the
+    /// server's address, and the share mustn't follow it there.
+    #[serde(default)]
+    pub address: String,
+}
+
+impl Share {
+    /// Whether the share was chosen for the server at `host`:`port`.
+    pub fn chosen_for(&self, host: &str, port: u16) -> bool {
+        self.address == format!("{}:{port}", host.trim().to_lowercase())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -116,8 +128,9 @@ pub fn root(share: &Share) -> Result<PathBuf, String> {
 /// joined to the folder as text: without one, `\x` after `/s/Share` would
 /// be `/s/Sharex`), then names between backslashes: none empty, `.` or
 /// `..`, none with `/` or NUL, and no symbolic link anywhere on the way (a
-/// link may point anywhere). With `listing` the last name may end in `*`,
-/// which isn't part of the name: the backend lists that folder.
+/// link may point anywhere). With `listing` the last name may end in one
+/// `*`, which isn't part of the name: the backend lists that folder (it takes
+/// off one `*` only, so only one is taken off here).
 #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub fn inside(base: &Path, path: &str, listing: bool) -> Option<PathBuf> {
     let mut out = base.to_path_buf();
@@ -132,7 +145,7 @@ pub fn inside(base: &Path, path: &str, listing: bool) -> Option<PathBuf> {
     let count = parts.len();
     for (i, part) in parts.into_iter().enumerate() {
         let last = i + 1 == count;
-        let name = if last && listing { part.trim_end_matches('*') } else { part };
+        let name = if last && listing { part.strip_suffix('*').unwrap_or(part) } else { part };
         if last && listing && name.is_empty() {
             break;
         }
@@ -299,6 +312,32 @@ mod confined {
     /// The most one read gives (as the Windows backend's limit).
     const MAX_READ: u32 = 1024 * 1024;
 
+    /// Whether `place` is on one of the kernel's own file systems, whose
+    /// "files" are this computer's processes and settings rather than files:
+    /// `/proc/<pid>/mem` would give the server this app's memory, unlocked
+    /// passwords and all. Refused even when the shared folder is `/`.
+    #[cfg(target_os = "linux")]
+    fn kernel_fs(place: &std::path::Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        // proc, sysfs, debugfs, securityfs, tracefs, cgroup, cgroup2, bpf,
+        // devpts, configfs, efivarfs, pstore (linux/magic.h).
+        const KERNEL: [u32; 12] = [
+            0x9fa0, 0x6265_6572, 0x6462_6720, 0x7363_6673, 0x7472_6163, 0x0027_e0eb, 0x6367_7270, 0xcafe_4a11, 0x1cd1, 0x6265_6570,
+            0xde5e_81e4, 0x6165_676c,
+        ];
+        let Ok(c) = std::ffi::CString::new(place.as_os_str().as_bytes()) else { return true };
+        let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+        // Not there (yet): nothing of the kernel's to reach.
+        if unsafe { libc::statfs(c.as_ptr(), &mut fs) } != 0 {
+            return false;
+        }
+        KERNEL.contains(&(fs.f_type as u32))
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn kernel_fs(_place: &std::path::Path) -> bool {
+        false
+    }
+
     #[derive(Debug)]
     pub struct Confined {
         inner: NixRdpdrBackend,
@@ -317,14 +356,17 @@ mod confined {
         /// The answer to a request that mustn't reach the backend: a path that
         /// leads out of the folder, something there that is neither a file
         /// nor a folder (opening a FIFO waits for a writer, and would hold up
-        /// the whole session), or a change to a read-only share.
+        /// the whole session) or is the kernel's (`kernel_fs`), a listing of
+        /// anything but a folder, or a change to a read-only share.
         fn refused(&self, req: &ServerDriveIoRequest) -> Option<Vec<SvcMessage>> {
             let answer = |pdu: RdpdrPdu| Some(vec![SvcMessage::from(pdu)]);
             match req {
                 ServerDriveIoRequest::ServerCreateDriveRequest(r) => {
                     let changes = r.create_disposition != CreateDisposition::FILE_OPEN || r.create_options.contains(CreateOptions::FILE_DELETE_ON_CLOSE);
                     let place = inside(&self.base, &r.path, false);
-                    let odd = place.as_deref().and_then(|p| std::fs::symlink_metadata(p).ok()).is_some_and(|m| !m.is_file() && !m.is_dir());
+                    let odd = place.as_deref().is_some_and(|p| {
+                        std::fs::symlink_metadata(p).is_ok_and(|m| !m.is_file() && !m.is_dir()) || kernel_fs(p)
+                    });
                     if place.is_none() || odd || (self.read_only && changes) {
                         return answer(RdpdrPdu::DeviceCreateResponse(DeviceCreateResponse {
                             device_io_reply: DeviceIoResponse::new(r.device_io_request.clone(), NtStatus::ACCESS_DENIED),
@@ -333,7 +375,11 @@ mod confined {
                         }));
                     }
                 }
-                ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(r) if r.initial_query != 0 && inside(&self.base, &r.path, true).is_none() => {
+                ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(r)
+                    if r.initial_query != 0
+                        && !inside(&self.base, &r.path, true)
+                            .is_some_and(|p| std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir()) && !kernel_fs(&p)) =>
+                {
                     return answer(RdpdrPdu::ClientDriveQueryDirectoryResponse(ClientDriveQueryDirectoryResponse {
                         device_io_reply: DeviceIoResponse::new(r.device_io_request.clone(), NtStatus::NO_MORE_FILES),
                         buffer: None,
@@ -403,7 +449,7 @@ mod tests {
     use super::*;
 
     fn share(kind: ShareKind, path: &str) -> Share {
-        Share { kind, path: path.into(), read_only: false }
+        Share { kind, path: path.into(), read_only: false, address: String::new() }
     }
 
     #[test]
@@ -419,8 +465,14 @@ mod tests {
 
     #[test]
     fn the_options_from_the_tab() {
-        let s: Share = serde_json::from_str(r#"{"kind":"folder","path":"/tmp/x","readOnly":true}"#).unwrap();
-        assert_eq!(s, Share { kind: ShareKind::Folder, path: "/tmp/x".into(), read_only: true });
+        let s: Share = serde_json::from_str(r#"{"kind":"folder","path":"/tmp/x","readOnly":true,"address":"rdp.example:3389"}"#).unwrap();
+        assert_eq!(s, Share { kind: ShareKind::Folder, path: "/tmp/x".into(), read_only: true, address: "rdp.example:3389".into() });
+        // Files go only to the address they were chosen for.
+        assert!(s.chosen_for("RDP.example ", 3389));
+        assert!(!s.chosen_for("rdp.example", 3390));
+        assert!(!s.chosen_for("evil.example", 3389));
+        let old: Share = serde_json::from_str(r#"{"kind":"folder","path":"/tmp/x"}"#).unwrap();
+        assert!(!old.chosen_for("rdp.example", 3389), "chosen for no address: for none");
         let d: Share = serde_json::from_str(r#"{"kind":"drive","path":"D:\\"}"#).unwrap();
         assert!(d.kind == ShareKind::Drive && !d.read_only, "writable unless said");
         assert!(serde_json::from_str::<Share>(r#"{"kind":"everything","path":"/"}"#).is_err());
@@ -457,6 +509,7 @@ mod tests {
         assert_eq!(inside(&base, r"\*", true), Some(base.clone()));
         assert_eq!(inside(&base, r"\docs\*", true), Some(base.join("docs")));
         assert_eq!(inside(&base, r"\..*", true), None, "the folder above, listed");
+        assert_eq!(inside(&base, r"\docs**", true), Some(base.join("docs*")), "one `*` off, as the backend takes");
         assert_eq!(inside(&base, r"\docs\*", false), Some(base.join("docs").join("*")), "a `*` is a name's own elsewhere");
         #[cfg(unix)]
         {
@@ -482,9 +535,9 @@ mod tests {
         let base = std::fs::canonicalize(&dir).unwrap();
         let mut backend = confined::Confined::new(base, false);
         // A request as a server sends it (device 1), and the answer's bytes.
-        let mut send = |file_id: u32, major: u32, payload: Vec<u8>| -> Vec<u8> {
+        let mut send = |file_id: u32, major: u32, minor: u32, payload: Vec<u8>| -> Vec<u8> {
             let mut bytes = Vec::new();
-            for x in [1u32, file_id, 7, major, 0] {
+            for x in [1u32, file_id, 7, major, minor] {
                 bytes.extend(x.to_le_bytes());
             }
             bytes.extend(payload);
@@ -505,18 +558,55 @@ mod tests {
         };
         let status = |r: &[u8]| u32::from_le_bytes(r[12..16].try_into().unwrap());
         // A FIFO: refused at once, not opened (that would wait for a writer).
-        assert_eq!(status(&send(0, 0, open(r"\pipe"))), 0xC000_0022, "access denied");
+        assert_eq!(status(&send(0, 0, 0, open(r"\pipe"))), 0xC000_0022, "access denied");
+        // Nor listed as if it were a folder (that would wait the same way).
+        let list = |path: &str| {
+            let units: Vec<u16> = path.encode_utf16().chain([0]).collect();
+            let mut bytes = Vec::new();
+            bytes.extend(3u32.to_le_bytes()); // FileBothDirectoryInformation
+            bytes.push(1); // the first query
+            bytes.extend(((units.len() * 2) as u32).to_le_bytes());
+            bytes.extend([0u8; 23]);
+            bytes.extend(units.iter().flat_map(|u| u.to_le_bytes()));
+            bytes
+        };
+        assert_eq!(status(&send(0, 0x0c, 1, list(r"\pipe*"))), 0x8000_0006, "no more files");
+        assert_eq!(status(&send(0, 0x0c, 1, list(r"\small.txt*"))), 0x8000_0006, "a file isn't listed either");
         // A read asking for 4 GB gets what there is, without room made for 4 GB.
-        let r = send(0, 0, open(r"\small.txt"));
+        let r = send(0, 0, 0, open(r"\small.txt"));
         assert_eq!(status(&r), 0);
         let file_id = u32::from_le_bytes(r[16..20].try_into().unwrap());
         let mut read = u32::MAX.to_le_bytes().to_vec();
         read.extend(0u64.to_le_bytes());
         read.extend([0u8; 20]);
-        let r = send(file_id, 3, read);
+        let r = send(file_id, 3, 0, read);
         assert_eq!(status(&r), 0);
         assert_eq!(&r[20..], b"hello");
         let _ = std::fs::remove_dir_all(&dir);
+
+        // The kernel's own files, with all of `/` shared: this app's memory and
+        // the rest of /proc stay out of reach, as do their listings.
+        #[cfg(target_os = "linux")]
+        {
+            let mut backend = confined::Confined::new(PathBuf::from("/"), true);
+            let mut send = |major: u32, minor: u32, payload: Vec<u8>| -> u32 {
+                let mut bytes = Vec::new();
+                for x in [1u32, 0, 7, major, minor] {
+                    bytes.extend(x.to_le_bytes());
+                }
+                bytes.extend(payload);
+                let mut src = ReadCursor::new(&bytes);
+                let io = DeviceIoRequest::decode(&mut src).unwrap();
+                let req = ServerDriveIoRequest::decode(io, &mut src).unwrap();
+                status(&backend.handle_drive_io_request(req).unwrap()[0].encode_unframed_pdu().unwrap())
+            };
+            let me = std::process::id();
+            assert_eq!(send(0, 0, open(&format!(r"\proc\{me}\mem"))), 0xC000_0022);
+            assert_eq!(send(0, 0, open(&format!(r"\proc\{me}\environ"))), 0xC000_0022);
+            assert_eq!(send(0, 0, open(r"\proc")), 0xC000_0022);
+            assert_eq!(send(0x0c, 1, list(r"\proc\*")), 0x8000_0006);
+            assert_eq!(send(0x0c, 1, list(&format!(r"\proc\{me}\*"))), 0x8000_0006);
+        }
     }
 
     #[cfg(any(windows, target_os = "macos", target_os = "linux"))]

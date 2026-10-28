@@ -18,6 +18,9 @@ use tracing::{debug, warn};
 
 use super::printer::{PrintTarget, PrinterSpooler, unsupported_response, write_response};
 
+/// Submarine: the most files and folders a server may have open at once.
+const MAX_OPEN: usize = 1_024;
+
 #[derive(Debug, Default)]
 pub struct NixRdpdrBackend {
     file_id: u32,
@@ -706,7 +709,9 @@ pub(crate) fn make_query_dir_resp(
                 0
             };
             let file_name = &file_full_path[file_last_slash..];
-            match std::fs::metadata(&file_full_path) {
+            // Submarine: a link's own details, not those of what it points to,
+            // which may be outside the shared folder.
+            match std::fs::symlink_metadata(&file_full_path) {
                 Ok(meta) => {
                     let file_attribute = get_file_attributes(&meta, file_name);
                     if file_class == FileInformationClassLevel::FILE_BOTH_DIRECTORY_INFORMATION {
@@ -856,6 +861,19 @@ pub(crate) fn create_drive(
 ) -> PduResult<Vec<SvcMessage>> {
     let file_id = backend.file_id;
     backend.file_id += 1;
+    // Submarine: at most MAX_OPEN files and folders open at once, as the Windows
+    // backend's limit, so that a server can't use up this process's file
+    // descriptors (and with them every other connection's).
+    if backend.file_map.len() + backend.file_dir_map.len() >= MAX_OPEN {
+        warn!("Too many files open on this share");
+        let io_response = DeviceIoResponse::new(req_inner.device_io_request, NtStatus::UNSUCCESSFUL);
+        let res = RdpdrPdu::DeviceCreateResponse(DeviceCreateResponse {
+            device_io_reply: io_response,
+            file_id,
+            information: Information::empty(),
+        });
+        return Ok(vec![SvcMessage::from(res)]);
+    }
     let mut path = String::from(backend.file_base.as_str());
     path.push_str(&req_inner.path.replace('\\', "/"));
     // first process directory

@@ -49,6 +49,10 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
   // Text the user copied on the server that couldn't go on this computer's
   // clipboard by itself (a webview that wants a click for that): one click does.
   const [serverCopy, setServerCopy] = useState<string | null>(null);
+  // Whether you're looking at this tab: the server's text goes to this
+  // computer's clipboard on its own only then (see rdp-clipboard below).
+  const inFrontRef = useRef(isActiveView);
+  inFrontRef.current = isActiveView;
   // Hidden while the desktop shows; open again on request.
   const [showLog, setShowLog] = useState(false);
 
@@ -163,8 +167,16 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
         setAppFailed(Array.isArray(e.payload?.said) ? e.payload.said : []);
       }),
       // Text the user copied on the server, for this computer's clipboard.
+      // Only while this tab is in front and the window has the focus: a server
+      // that copies while you work elsewhere (in a terminal, say) could
+      // otherwise swap what you're about to paste there. Then its text waits
+      // in the note above the desktop, for you to copy.
       listen(`rdp-clipboard-${id}`, (e: any) => {
         const text = String(e.payload?.text ?? "");
+        if (!inFrontRef.current || !document.hasFocus()) {
+          setServerCopy(text);
+          return;
+        }
         navigator.clipboard.writeText(text).then(
           () => setServerCopy(null),
           () => setServerCopy(text),
