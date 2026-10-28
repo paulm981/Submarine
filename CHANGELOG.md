@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **vim no longer freezes the terminal.** Opening a file in vim used to stop that terminal for good: nothing more showed up and typing did nothing, so you had to close it and log in again. nano and less were fine. It came from how the app was built: vim asks the terminal whether the cursor blinks, and the built copy of the terminal code failed on that question. The app is now built so that code works, and every build checks for this kind of fault before it can ship. ([#129](https://github.com/paulm981/Submarine/issues/129))
+
+## v0.4.0-fork.12
+
 ### From the original project
 
 - **Locking your profile calls off logins still in progress.** A connection that was still logging in, waiting on the server or on a question, no longer comes up after the profile is locked. (Their [#237](https://github.com/SinaXhpm/submarine/pull/237); [#121](https://github.com/paulm981/Submarine/issues/121))

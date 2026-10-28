@@ -29,6 +29,17 @@ const fontsourceWoff2Only = {
 export default defineConfig(async () => ({
   plugins: [react(), fontsourceWoff2Only],
 
+  // What the page is built for: the web views the app runs in (WebView2 and
+  // Android's are Chromium, WebKitGTK and WKWebView are Safari's engine), at
+  // ES2021. Vite's default is ES2020, which made esbuild rewrite xterm.js's
+  // `x ||= {}`, and its minifier then dropped the `let x` the rewrite still
+  // needed: xterm threw "r is not defined" on every mode query (`ESC[?12$p`,
+  // which vim sends) and drew nothing more in that terminal.
+  // scripts/check-bundle.mjs fails the build on any such undeclared name.
+  build: {
+    target: ["es2021", "chrome87", "edge88", "safari14"],
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors
