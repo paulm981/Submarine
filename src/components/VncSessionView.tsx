@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { AlertTriangle, Loader2, MonitorSmartphone, RotateCw, ShieldAlert, X } from "lucide-react";
+import { AlertTriangle, ClipboardPaste, Loader2, MonitorSmartphone, RotateCw, ShieldAlert, SlidersHorizontal, X } from "lucide-react";
 import { AuthPrompts } from "./AuthPrompts";
 import RemoteScreen, { type RemoteScreenHandle } from "./RemoteScreen";
+import { LinkMark, LinkPanel, ToolPanel, VncSettingsPanel, usePageShown, usePauseWhileHidden } from "./ScreenTabTools";
 import { readUseSshAgent } from "../util/sshAgent";
-import { readVncOptions } from "../util/vncOptions";
+import type { LinkStats } from "../util/screenLink";
+import { VNC_PRESETS, readVncOptions, vncNeedsReconnect, writeVncOptions, type VncOptions } from "../util/vncOptions";
+import { type PasteKeys, pasteKeysOf, readLocalClipboard } from "../util/rdpClipboard";
+import { scancodeFor } from "../util/scancodes";
 
 // A VNC server's tab: the server's screen in the tab itself (vnc_client.rs),
 // straight to it or through the node's SSH server, whose host-key and login
@@ -20,7 +24,8 @@ const PASSWORD_REFUSED = /refused the password|said: Authentication failed/i;
 
 const NOT_ENCRYPTED = "VNC isn't encrypted: the screen and what is typed cross the network as they are. Through an SSH server, it's private up to that server.";
 
-export default function VncSessionView({ session, displayName, onClose, onStatusChange, isActiveView = false, onPromptChange }: any) {
+// `shown`: the tab is on screen (alone, or in a split), not behind another view.
+export default function VncSessionView({ session, displayName, onClose, onStatusChange, isActiveView = false, shown = true, onPromptChange }: any) {
   const [status, setStatus] = useState<Status>("connecting");
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [reason, setReason] = useState("");
@@ -33,6 +38,24 @@ export default function VncSessionView({ session, displayName, onClose, onStatus
   const passwordRetries = useRef(0);
   // Hidden while the screen shows; open again on request.
   const [showLog, setShowLog] = useState(false);
+  // The clipboard shared with the server (this server's option, read when the
+  // tab connects); text copied on the server that couldn't go on this device's
+  // clipboard by itself (a webview that wants a click for that); and why a
+  // paste didn't go to the server.
+  const [shareClipboard, setShareClipboard] = useState(false);
+  const [serverCopy, setServerCopy] = useState<string | null>(null);
+  // Whether you're looking at this tab: the server's text goes to this
+  // computer's clipboard on its own only then (see vnc-clipboard below).
+  const inFrontRef = useRef(isActiveView);
+  inFrontRef.current = isActiveView;
+  const [pasteNote, setPasteNote] = useState<string | null>(null);
+  // The tab's tools: this server's options on this device as the settings
+  // panel changes them, the ones the session now open was opened with, and
+  // how its link is doing.
+  const [opts, setOpts] = useState<VncOptions>(() => readVncOptions(session.serverUuid));
+  const [usedOpts, setUsedOpts] = useState<VncOptions | null>(null);
+  const [link, setLink] = useState<LinkStats | null>(null);
+  const [panel, setPanel] = useState<"link" | "settings" | null>(null);
 
   const [fingerprintPrompt, setFingerprintPrompt] = useState<any>(null);
   const [kbiPrompt, setKbiPrompt] = useState<any>(null);
@@ -66,17 +89,26 @@ export default function VncSessionView({ session, displayName, onClose, onStatus
     };
     const screen = screenRef.current;
     if (!screen) return failed("The tab isn't ready yet. Try again.");
-    const { width, height } = screen.wantedSize();
+    const options = readVncOptions(session.serverUuid);
+    // The panels show what this session has, and the resolution is sized for at once.
+    setOpts(options);
+    setUsedOpts(options);
+    setLink(null);
+    const { width, height } = screen.wantedSize(options.resolution);
     invoke("vnc_open", {
       sessionId: session.id,
       serverId: session.serverId,
       useSshAgent: readUseSshAgent(),
       width,
       height,
-      options: readVncOptions(session.serverUuid),
+      options,
+      clipboard: options.clipboard,
       askPassword: askPassword.current,
       frames: screen.newChannel(),
     }).catch(failed);
+    setShareClipboard(options.clipboard);
+    setServerCopy(null);
+    setPasteNote(null);
   }, [session.id, session.serverId, session.serverUuid, pushLog]);
 
   // Listen first, then connect: a result that comes back at once must find
@@ -131,6 +163,28 @@ export default function VncSessionView({ session, displayName, onClose, onStatus
         setReason(String(e.payload?.reason ?? "The connection closed."));
         setStatus("disconnected");
       }),
+      listen(`vnc-link-${id}`, (e: any) => setLink(e.payload as LinkStats)),
+      // Text the user copied on the server, for this device's clipboard.
+      // Only while this tab is in front and the window has the focus, as in
+      // the RDP tab: a server that copies while you work elsewhere (in a
+      // terminal, say) could otherwise swap what you're about to paste there.
+      // Then its text waits in the note above the desktop, for you to copy.
+      listen(`vnc-clipboard-${id}`, (e: any) => {
+        const text = String(e.payload?.text ?? "");
+        if (!inFrontRef.current || !document.hasFocus()) {
+          setServerCopy(text);
+        } else {
+          navigator.clipboard.writeText(text).then(
+            () => setServerCopy(null),
+            () => setServerCopy(text),
+          );
+        }
+        // The server sends its clipboard as Latin-1; the VNC library reads it as
+        // UTF-8, so a character beyond ASCII arrives as a replacement mark.
+        if (text.includes("\uFFFD")) {
+          pushLog({ msg: "Some characters of the server's copy didn't come through: a VNC clipboard carries plain ASCII text only.", type: "warning" });
+        }
+      }),
     ]);
     subs.then(() => { if (!cancelled) connect(); });
     // The tab menu's Reconnect.
@@ -158,14 +212,94 @@ export default function VncSessionView({ session, displayName, onClose, onStatus
     if (nonce) await invoke("submit_kbi_response", { nonce, responses }).catch(console.error);
   };
 
+  // This device's clipboard to the server's, then the paste key (the Paste
+  // button only sets the server's clipboard). Text the server's clipboard
+  // can't carry isn't sent, and the tab says why; a held-back key press still
+  // goes on its own (its modifier is down on the server already), and the
+  // server pastes what it has.
+  const pasteToServer = async (keys: PasteKeys, fromKey: boolean) => {
+    const key = (code: string, k: string, down: boolean) => ({ t: "key", code: scancodeFor(code) ?? 0, key: k, down });
+    const sendKey = () => {
+      if (!fromKey) return;
+      const events =
+        keys === "shiftinsert" ? [key("Insert", "Insert", true), key("Insert", "Insert", false)]
+        // Cmd+V on a Mac is Super+V to the server: Ctrl+V instead.
+        : keys === "cmdv" ? [key("ControlLeft", "Control", true), key("MetaLeft", "Meta", false), key("KeyV", "v", true), key("KeyV", "v", false), key("ControlLeft", "Control", false)]
+        : [key("KeyV", "v", true), key("KeyV", "v", false)];
+      invoke("vnc_input", { sessionId: session.id, events }).catch(() => {});
+    };
+    let text: string;
+    try {
+      text = await readLocalClipboard();
+    } catch (e) {
+      pushLog({ msg: `This device's clipboard couldn't be read: ${e}`, type: "warning" });
+      sendKey();
+      return;
+    }
+    try {
+      await invoke("vnc_paste", { sessionId: session.id, text });
+      setPasteNote(null);
+    } catch (e) {
+      setPasteNote(String(e));
+      pushLog({ msg: String(e), type: "warning" });
+    }
+    sendKey();
+  };
+  // A paste key in the tab: held back from the screen until the text is on the
+  // server (capture phase, ahead of the screen's own key handler). Its repeats
+  // while held go nowhere: the screen would type them.
+  const onPasteKey = (e: React.KeyboardEvent) => {
+    if (!shareClipboard || status !== "connected" || e.nativeEvent.isComposing) return;
+    const keys = pasteKeysOf(e);
+    if (!keys) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.repeat) return;
+    void pasteToServer(keys, true);
+  };
+
+  // A choice made in the settings panel: kept for the server on this device
+  // at once, over what the server form may have changed meanwhile.
+  const setOpt = (patch: Partial<VncOptions>) => {
+    const next = { ...(session.serverUuid ? readVncOptions(session.serverUuid) : opts), ...patch };
+    setOpts(next);
+    if (session.serverUuid) writeVncOptions(session.serverUuid, next);
+  };
+  const togglePanel = (which: "link" | "settings") => {
+    if (panel === which) return setPanel(null);
+    if (session.serverUuid) setOpts(readVncOptions(session.serverUuid));
+    setPanel(which);
+  };
+  const lessData = () => {
+    const light = VNC_PRESETS.find((p) => p.value === "light");
+    if (light) setOpt(light.set);
+    setPanel("settings");
+  };
+
+  // No updates are asked for while the tab is hidden (behind another tab or
+  // view, or the window minimised), if the user lets it: a few seconds on, and
+  // they start again as soon as the tab is back.
+  const pageShown = usePageShown();
+  usePauseWhileHidden(status === "connected" && !(shown && pageShown) && opts.pauseHidden, "vnc_shown", session.id);
+  // No link to show without a connection.
+  useEffect(() => {
+    if (status !== "connected") setPanel((p) => (p === "link" ? null : p));
+  }, [status]);
+
   const name = displayName || session.serverName;
   const working = status === "connecting";
   const broken = status === "failed" || status === "disconnected";
   const connected = status === "connected";
+  // A change the session now open hasn't got: the settings panel offers to connect again.
+  const reconnectForOpts = connected && usedOpts && vncNeedsReconnect(usedOpts, opts)
+    ? () => { setPanel(null); connect(); }
+    : null;
 
   return (
     <div data-vnc-status={status} className="relative flex-1 flex flex-col bg-[#0a0a0c] text-white overflow-hidden">
-      <div className="shrink-0 h-9 px-2 sm:px-3 flex items-center gap-2 border-b border-white/5 bg-[#0e0e10]">
+      {/* The labels show by the bar's own width, not the window's: in a split
+          view the tab is a part of the window. */}
+      <div className="shrink-0 h-9 px-2 sm:px-3 flex items-center gap-2 border-b border-white/5 bg-[#0e0e10] [container-type:inline-size]">
         <span className={`shrink-0 ${broken ? "text-red-400" : "text-primary"}`} aria-hidden="true">
           {working ? <Loader2 size={14} className="animate-spin" /> : broken ? <AlertTriangle size={14} /> : <MonitorSmartphone size={14} />}
         </span>
@@ -176,13 +310,33 @@ export default function VncSessionView({ session, displayName, onClose, onStatus
             title={NOT_ENCRYPTED}
           >
             <ShieldAlert size={10} aria-hidden="true" />
-            <span className="hidden sm:inline">Not encrypted</span>
+            <span className="hidden [@container(min-width:560px)]:inline">Not encrypted</span>
           </span>
         )}
         <span className={`min-w-0 truncate text-[11px] ${broken ? "text-red-400/90" : "text-zinc-500"}`}>
           {working ? "Connecting…" : status === "failed" ? "Connection failed" : status === "disconnected" ? "Disconnected" : via ? `VNC · through ${via}` : "VNC"}
         </span>
         <div className="ml-auto shrink-0 flex items-center gap-1.5">
+          {connected && shareClipboard && (
+            <button
+              onClick={() => void pasteToServer("ctrlv", false)}
+              title="Paste this device's clipboard into the server"
+              aria-label="Paste this device's clipboard into the server"
+              className="h-7 px-2 flex items-center gap-1.5 rounded-md bg-white/5 text-zinc-300 hover:text-zinc-100 text-[11px] font-semibold transition-colors"
+            >
+              <ClipboardPaste size={12} aria-hidden="true" /><span className="hidden [@container(min-width:560px)]:inline">Paste</span>
+            </button>
+          )}
+          {connected && <LinkMark link={link} open={panel === "link"} onClick={() => togglePanel("link")} />}
+          <button
+            onClick={() => togglePanel("settings")}
+            aria-expanded={panel === "settings"}
+            title="Speed and quality"
+            aria-label="Speed and quality"
+            className={`h-7 px-2 flex items-center gap-1.5 rounded-md text-[11px] font-semibold transition-colors ${panel === "settings" ? "bg-primary/15 text-primary" : "bg-white/5 text-zinc-400 hover:text-zinc-200"}`}
+          >
+            <SlidersHorizontal size={12} aria-hidden="true" /><span className="hidden [@container(min-width:700px)]:inline">Settings</span>
+          </button>
           {connected && (
             <button
               onClick={() => setShowLog((v) => !v)}
@@ -200,7 +354,7 @@ export default function VncSessionView({ session, displayName, onClose, onStatus
               aria-label="Reconnect"
               className="h-7 px-2 flex items-center gap-1.5 rounded-md bg-primary/10 text-primary hover:bg-primary/20 text-[11px] font-semibold transition-colors"
             >
-              <RotateCw size={12} /><span className="hidden sm:inline">Reconnect</span>
+              <RotateCw size={12} /><span className="hidden [@container(min-width:560px)]:inline">Reconnect</span>
             </button>
           )}
           <button
@@ -209,19 +363,42 @@ export default function VncSessionView({ session, displayName, onClose, onStatus
             aria-label="Close session"
             className="h-7 px-2 flex items-center gap-1.5 rounded-md bg-white/5 text-zinc-300 hover:bg-red-500/15 hover:text-red-300 text-[11px] font-semibold transition-colors"
           >
-            <X size={12} /><span className="hidden sm:inline">Close</span>
+            <X size={12} /><span className="hidden [@container(min-width:560px)]:inline">Close</span>
           </button>
         </div>
       </div>
 
-      <div className="relative flex-1 min-h-0 flex flex-col">
+      {connected && serverCopy !== null && (
+        <div role="status" className="shrink-0 px-3 py-1.5 flex items-center gap-2 border-b border-white/5 bg-primary/10 text-[11.5px] text-zinc-200">
+          <span className="min-w-0 truncate">Text was copied on the server ({serverCopy.length} characters).</span>
+          <button
+            onClick={() => navigator.clipboard.writeText(serverCopy).then(() => setServerCopy(null), () => {})}
+            className="shrink-0 h-6 px-2 rounded-md bg-primary/20 text-primary hover:bg-primary/30 font-semibold"
+          >
+            Copy it here
+          </button>
+          <button onClick={() => setServerCopy(null)} aria-label="Dismiss" className="ml-auto shrink-0 text-zinc-500 hover:text-zinc-300">
+            <X size={12} />
+          </button>
+        </div>
+      )}
+      {connected && pasteNote !== null && (
+        <div role="status" className="shrink-0 px-3 py-1.5 flex items-center gap-2 border-b border-white/5 bg-amber-500/10 text-[11.5px] text-amber-200">
+          <span className="min-w-0">{pasteNote}</span>
+          <button onClick={() => setPasteNote(null)} aria-label="Dismiss" className="ml-auto shrink-0 text-zinc-500 hover:text-zinc-300">
+            <X size={12} />
+          </button>
+        </div>
+      )}
+      <div className="relative flex-1 min-h-0 flex flex-col" onKeyDownCapture={onPasteKey}>
         <RemoteScreen
           ref={screenRef}
           sessionId={session.id}
-          active={isActiveView && !promptWaiting}
+          active={isActiveView && !promptWaiting && !panel}
           connected={connected}
           inputCommand="vnc_input"
           resizeCommand="vnc_resize"
+          scale={opts.resolution}
         />
         {(!connected || showLog) && (
           <div className="absolute inset-0 z-10 flex flex-col p-4 sm:p-8 bg-[#0a0a0c]/90">
@@ -245,6 +422,18 @@ export default function VncSessionView({ session, displayName, onClose, onStatus
           </div>
         )}
       </div>
+
+      {/* Outside the screen: a paste key in a panel isn't the server's. */}
+      {panel === "link" && (
+        <ToolPanel title="Connection" onClose={() => setPanel(null)}>
+          <LinkPanel link={link} onLessData={lessData} />
+        </ToolPanel>
+      )}
+      {panel === "settings" && (
+        <ToolPanel title="Speed and quality" onClose={() => setPanel(null)}>
+          <VncSettingsPanel o={opts} set={setOpt} reconnect={reconnectForOpts} />
+        </ToolPanel>
+      )}
 
       {promptWaiting && (
         <div

@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { AlertTriangle, ClipboardPaste, ExternalLink, FlaskConical, Loader2, MonitorSmartphone, RotateCw, X } from "lucide-react";
+import { AlertTriangle, ClipboardPaste, ExternalLink, FlaskConical, FolderSymlink, Loader2, MonitorSmartphone, RotateCw, SlidersHorizontal, X } from "lucide-react";
 import { AuthPrompts } from "./AuthPrompts";
 import RemoteScreen, { type RemoteScreenHandle } from "./RemoteScreen";
+import { FilesPanel, LinkMark, LinkPanel, RdpSettingsPanel, ToolPanel, usePageShown, usePauseWhileHidden, type SharedNow } from "./ScreenTabTools";
 import { readUseSshAgent } from "../util/sshAgent";
-import { IS_ANDROID } from "../util/platform";
-import { RDP_BUILTIN_EXPERIMENTAL, RDP_NO_NLA_PREFIX, describeRdpOptions, rdpGraphics, rdpShare, readRdpOptions, writeRdpOptions } from "../util/rdpOptions";
+import { IS_ANDROID, IS_WINDOWS } from "../util/platform";
+import type { LinkStats } from "../util/screenLink";
+import {
+  RDP_BUILTIN_EXPERIMENTAL, RDP_NO_NLA_PREFIX, RDP_PRESETS, describeRdpOptions, rdpGraphics, rdpNeedsReconnect, rdpAddress, rdpShare, readRdpOptions, writeRdpOptions,
+  type RdpOptions,
+} from "../util/rdpOptions";
 import { type PasteKeys, pasteKeysOf, readLocalClipboard } from "../util/rdpClipboard";
 import { scancodeFor } from "../util/scancodes";
 
@@ -29,7 +34,8 @@ type Opened = { app: string; address: string; via: string | null; tracked: boole
 const PASSWORD_REFUSED = /didn't accept the user name or password/;
 type LogLine = { msg: string; type: string; time: string };
 
-export default function RdpSessionView({ session, displayName, onClose, onStatusChange, isActiveView = false, onPromptChange }: any) {
+// `shown`: the tab is on screen (alone, or in a split), not behind another view.
+export default function RdpSessionView({ session, displayName, onClose, onStatusChange, isActiveView = false, shown = true, onPromptChange }: any) {
   // Read once: a tab keeps the way it opened with until it's closed (a phone
   // can switch to the built-in client from the tab).
   const [builtin, setBuiltin] = useState(() => readRdpOptions(session.serverUuid).app === "builtin");
@@ -65,6 +71,15 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
   const passwordRetries = useRef(0);
   // Hidden while the desktop shows; open again on request.
   const [showLog, setShowLog] = useState(false);
+  // The built-in client's tools: this server's options on this device as its
+  // panels change them, the ones the session now open was opened with, what it
+  // shares, and how its link is doing.
+  const [opts, setOpts] = useState<RdpOptions>(() => readRdpOptions(session.serverUuid));
+  const [usedOpts, setUsedOpts] = useState<RdpOptions | null>(null);
+  const [shared, setShared] = useState<SharedNow | null>(null);
+  const [link, setLink] = useState<LinkStats | null>(null);
+  const [panel, setPanel] = useState<"link" | "files" | "settings" | null>(null);
+  const [drives, setDrives] = useState<string[]>([]);
 
   const [fingerprintPrompt, setFingerprintPrompt] = useState<any>(null);
   const [kbiPrompt, setKbiPrompt] = useState<any>(null);
@@ -102,8 +117,13 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
       const canvas = canvasRef.current;
       if (!canvas) return failed("The tab isn't ready yet. Try again.");
       pushLog({ msg: RDP_BUILTIN_EXPERIMENTAL, type: "warning" });
-      const { width, height } = canvas.wantedSize();
       const options = readRdpOptions(session.serverUuid);
+      // The panels show what this session has, and the resolution is sized for at once.
+      setOpts(options);
+      setUsedOpts(options);
+      setShared(null);
+      setLink(null);
+      const { width, height } = canvas.wantedSize(options.resolution);
       invoke("rdp_builtin_open", {
         sessionId: session.id,
         serverId: session.serverId,
@@ -163,8 +183,11 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
         askPassword.current = false;
         passwordRetries.current = 0;
         setOpened(e.payload as Opened);
+        setShared((e.payload?.shared as SharedNow | null) ?? null);
         setStatus("connected");
       }),
+      // How the built-in client's link is doing, every 2 seconds.
+      listen(`rdp-link-${id}`, (e: any) => setLink(e.payload as LinkStats)),
       listen(`connection-failed-${id}`, (e: any) => {
         const why = String(e.payload?.reason ?? "The connection failed.");
         askPassword.current = false;
@@ -301,6 +324,40 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
     void pasteToServer(keys, true);
   };
 
+  // A choice made in a panel: kept for the server on this device at once,
+  // over what the server form may have changed meanwhile.
+  const setOpt = (patch: Partial<RdpOptions>) => {
+    const next = { ...(session.serverUuid ? readRdpOptions(session.serverUuid) : opts), ...patch };
+    // Files chosen here go to this tab's server address only, as from the
+    // server form (rdpOptions' shareFor): a changed address shares nothing.
+    if ("share" in patch || "sharePath" in patch || "shareReadOnly" in patch) {
+      next.shareFor = next.share !== "off" && session.host ? rdpAddress(session.host, session.port ?? 3389) : "";
+    }
+    setOpts(next);
+    if (session.serverUuid) writeRdpOptions(session.serverUuid, next);
+  };
+  const togglePanel = (which: "link" | "files" | "settings") => {
+    if (panel === which) return setPanel(null);
+    if (session.serverUuid) setOpts(readRdpOptions(session.serverUuid));
+    if (which === "files" && IS_WINDOWS) invoke<string[]>("rdp_share_drives").then(setDrives, () => setDrives([]));
+    setPanel(which);
+  };
+  const lessData = () => {
+    const light = RDP_PRESETS.find((p) => p.value === "light");
+    if (light) setOpt(light.set);
+    setPanel("settings");
+  };
+
+  // The picture pauses while the tab is hidden (behind another tab or view,
+  // or the window minimised), if the server can and the user lets it: a few
+  // seconds on, and it comes back as soon as the tab does.
+  const pageShown = usePageShown();
+  usePauseWhileHidden(builtin && status === "connected" && !(shown && pageShown) && opts.pauseHidden, "rdp_builtin_shown", session.id);
+  // No link to show without a connection.
+  useEffect(() => {
+    if (status !== "connected") setPanel((p) => (p === "link" ? null : p));
+  }, [status]);
+
   const name = displayName || session.serverName;
   const working = status === "connecting";
   const broken = status === "failed" || status === "disconnected";
@@ -360,7 +417,7 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
       className="shrink-0 inline-flex items-center gap-1 h-5 px-1.5 rounded border border-amber-500/30 bg-amber-500/10 text-amber-300 text-[10px] font-bold uppercase tracking-wider"
     >
       <FlaskConical size={10} aria-hidden="true" />
-      <span className="hidden sm:inline">Experimental</span>
+      <span className="hidden [@container(min-width:560px)]:inline">Experimental</span>
     </span>
   );
 
@@ -411,9 +468,15 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
 
   if (builtin) {
     const connected = status === "connected";
+    // A change the session now open hasn't got: the panels offer to connect again.
+    const reconnectForOpts = connected && usedOpts && rdpNeedsReconnect(usedOpts, opts)
+      ? () => { setPanel(null); connect(); }
+      : null;
     return (
       <div data-rdp-status={status} className="relative flex-1 flex flex-col bg-[#0a0a0c] text-white overflow-hidden">
-        <div className="shrink-0 h-9 px-2 sm:px-3 flex items-center gap-2 border-b border-white/5 bg-[#0e0e10]">
+        {/* The labels show by the bar's own width, not the window's: in a split
+            view the tab is a part of the window. */}
+        <div className="shrink-0 h-9 px-2 sm:px-3 flex items-center gap-2 border-b border-white/5 bg-[#0e0e10] [container-type:inline-size]">
           <span className={`shrink-0 ${broken ? "text-red-400" : "text-primary"}`} aria-hidden="true">
             {working ? <Loader2 size={14} className="animate-spin" /> : broken ? <AlertTriangle size={14} /> : <MonitorSmartphone size={14} />}
           </span>
@@ -430,9 +493,31 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
                 aria-label="Paste this device's clipboard into the server"
                 className="h-7 px-2 flex items-center gap-1.5 rounded-md bg-white/5 text-zinc-300 hover:text-zinc-100 text-[11px] font-semibold transition-colors"
               >
-                <ClipboardPaste size={12} aria-hidden="true" /><span className="hidden sm:inline">Paste</span>
+                <ClipboardPaste size={12} aria-hidden="true" /><span className="hidden [@container(min-width:560px)]:inline">Paste</span>
               </button>
             )}
+            {connected && <LinkMark link={link} open={panel === "link"} onClick={() => togglePanel("link")} />}
+            {/* A phone shares no files: its backend has no drive to give. */}
+            {!IS_ANDROID && (
+              <button
+                onClick={() => togglePanel("files")}
+                aria-expanded={panel === "files"}
+                title="Shared files"
+                aria-label="Shared files"
+                className={`h-7 px-2 flex items-center gap-1.5 rounded-md text-[11px] font-semibold transition-colors ${panel === "files" ? "bg-primary/15 text-primary" : "bg-white/5 text-zinc-400 hover:text-zinc-200"}`}
+              >
+                <FolderSymlink size={12} aria-hidden="true" /><span className="hidden [@container(min-width:700px)]:inline">Files</span>
+              </button>
+            )}
+            <button
+              onClick={() => togglePanel("settings")}
+              aria-expanded={panel === "settings"}
+              title="Speed and quality"
+              aria-label="Speed and quality"
+              className={`h-7 px-2 flex items-center gap-1.5 rounded-md text-[11px] font-semibold transition-colors ${panel === "settings" ? "bg-primary/15 text-primary" : "bg-white/5 text-zinc-400 hover:text-zinc-200"}`}
+            >
+              <SlidersHorizontal size={12} aria-hidden="true" /><span className="hidden [@container(min-width:700px)]:inline">Settings</span>
+            </button>
             {connected && (
               <button
                 onClick={() => setShowLog((v) => !v)}
@@ -459,7 +544,7 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
                 aria-label="Reconnect"
                 className="h-7 px-2 flex items-center gap-1.5 rounded-md bg-primary/10 text-primary hover:bg-primary/20 text-[11px] font-semibold transition-colors"
               >
-                <RotateCw size={12} /><span className="hidden sm:inline">Reconnect</span>
+                <RotateCw size={12} /><span className="hidden [@container(min-width:560px)]:inline">Reconnect</span>
               </button>
             )}
             <button
@@ -468,7 +553,7 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
               aria-label="Close session"
               className="h-7 px-2 flex items-center gap-1.5 rounded-md bg-white/5 text-zinc-300 hover:bg-red-500/15 hover:text-red-300 text-[11px] font-semibold transition-colors"
             >
-              <X size={12} /><span className="hidden sm:inline">Close</span>
+              <X size={12} /><span className="hidden [@container(min-width:560px)]:inline">Close</span>
             </button>
           </div>
         </div>
@@ -491,10 +576,11 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
           <RemoteScreen
             ref={canvasRef}
             sessionId={session.id}
-            active={isActiveView && !promptWaiting}
+            active={isActiveView && !promptWaiting && !panel}
             connected={connected}
             inputCommand="rdp_builtin_input"
             resizeCommand="rdp_builtin_resize"
+            scale={opts.resolution}
           />
           {(!connected || showLog) && (
             <div className="absolute inset-0 z-10 flex flex-col p-4 sm:p-8 bg-[#0a0a0c]/90">
@@ -505,6 +591,23 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
             </div>
           )}
         </div>
+
+        {/* Outside the screen: a paste key in a panel isn't the server's. */}
+        {panel === "link" && (
+          <ToolPanel title="Connection" onClose={() => setPanel(null)}>
+            <LinkPanel link={link} onLessData={lessData} />
+          </ToolPanel>
+        )}
+        {panel === "files" && (
+          <ToolPanel title="Shared files" onClose={() => setPanel(null)}>
+            <FilesPanel shared={connected ? shared : undefined} o={opts} set={setOpt} drives={drives} reconnect={reconnectForOpts} />
+          </ToolPanel>
+        )}
+        {panel === "settings" && (
+          <ToolPanel title="Speed and quality" onClose={() => setPanel(null)}>
+            <RdpSettingsPanel o={opts} set={setOpt} reconnect={reconnectForOpts} />
+          </ToolPanel>
+        )}
 
         {prompts}
       </div>

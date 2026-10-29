@@ -18,6 +18,7 @@ mod tunnel;
 mod telnet;
 mod vnc_client;
 mod screen_flow;
+mod screen_link;
 mod monitor;
 mod cloud;
 mod cloud_config;
@@ -16159,7 +16160,9 @@ async fn rdp_builtin_open(
             }
         };
 
-        // Files shared with the server; one that isn't there is said and left out.
+        // Files shared with the server; one that isn't there is said and left
+        // out. What is shared goes to the tab with the connection.
+        let mut shared = serde_json::Value::Null;
         // Only to the address they were chosen for (rdp_share::Share::address).
         let share = share.filter(|share| {
             let ok = share.chosen_for(&host, port);
@@ -16171,7 +16174,9 @@ async fn rdp_builtin_open(
         let drive = share.and_then(|share| match rdp_share::channel(&share) {
             Ok(channel) => {
                 let how = if share.read_only { ", read only" } else { "" };
-                log(&format!("Sharing {} with the server{how}.", share.path.trim()), "info");
+                let name = rdp_share::share_name(&share);
+                log(&format!("Sharing {} with the server{how}, as \\\\tsclient\\{name}.", share.path.trim()), "info");
+                shared = serde_json::json!({ "name": name, "path": share.path.trim(), "readOnly": share.read_only });
                 Some(channel)
             }
             Err(e) => {
@@ -16197,7 +16202,10 @@ async fn rdp_builtin_open(
             move |w: u16, h: u16| {
                 if attempt.is_current_now() {
                     let _ = app.emit(&format!("session-log-{sid}"), serde_json::json!({"msg": format!("Connected to {target} ({w}×{h})."), "type": "success"}));
-                    let _ = app.emit(&format!("connection-success-{sid}"), serde_json::json!({"builtin": true, "address": target, "width": w, "height": h}));
+                    let _ = app.emit(
+                        &format!("connection-success-{sid}"),
+                        serde_json::json!({"builtin": true, "address": target, "width": w, "height": h, "shared": shared}),
+                    );
                 }
             }
         };
@@ -16247,7 +16255,16 @@ async fn rdp_builtin_open(
                 }
             }
         };
-        let run = tauri::async_runtime::spawn(rdp_client::run(stream, client_addr, login, verify, connected, notice, frame, remote_copy, flow, rx));
+        // How the link is doing, for the tab's connection mark.
+        let link = {
+            let (app, attempt, sid) = (app.clone(), attempt.clone(), session_id.clone());
+            move |stats: screen_link::LinkStats| {
+                if attempt.is_current_now() {
+                    let _ = app.emit(&format!("rdp-link-{sid}"), stats);
+                }
+            }
+        };
+        let run = tauri::async_runtime::spawn(rdp_client::run(stream, client_addr, login, verify, connected, notice, frame, remote_copy, link, flow, rx));
         let outcome = match run.await {
             Ok(r) => r,
             Err(_) => Err("The RDP session stopped on bad data from the server".into()),
@@ -16311,6 +16328,15 @@ async fn rdp_builtin_paste(rdp_clients: tauri::State<'_, RdpClients>, session_id
 async fn rdp_builtin_resize(rdp_clients: tauri::State<'_, RdpClients>, session_id: String, width: u16, height: u16) -> Result<(), String> {
     if let Some((_, tx)) = rdp_clients.lock().await.get(&session_id) {
         let _ = tx.send(rdp_client::Cmd::Resize(width, height));
+    }
+    Ok(())
+}
+
+/// The tab was hidden (the server may stop sending the picture meanwhile) or shown again.
+#[tauri::command]
+async fn rdp_builtin_shown(rdp_clients: tauri::State<'_, RdpClients>, session_id: String, shown: bool) -> Result<(), String> {
+    if let Some((_, tx)) = rdp_clients.lock().await.get(&session_id) {
+        let _ = tx.send(rdp_client::Cmd::Shown(shown));
     }
     Ok(())
 }
@@ -16713,6 +16739,8 @@ async fn vnc_open(
     height: u16,
     // The tab's speed and quality choices for this server (the standard ones if none).
     options: Option<vnc_client::Options>,
+    // Share the clipboard with the server (the tab's per-server option).
+    clipboard: Option<bool>,
     // Ask for the password even when one is saved: the tab's last try with the
     // saved one was refused.
     ask_password: Option<bool>,
@@ -16722,6 +16750,7 @@ async fn vnc_open(
     use tauri::Emitter;
 
     let options = options.unwrap_or_default().checked()?;
+    let clipboard = clipboard.unwrap_or(false);
     // A new attempt replaces the tab's last one.
     if let Some((_, old)) = vnc_clients.lock().await.remove(&session_id) {
         let _ = old.send(vnc_client::Cmd::Close);
@@ -16975,8 +17004,26 @@ async fn vnc_open(
         };
         let flow = screens.start(&session_id, generation);
         let frame = screen_frame_sender(frames, Arc::clone(&flow));
+        // What the user copied on the server, for the tab to put on this device's clipboard.
+        let remote_copy = {
+            let (app, attempt, sid) = (app.clone(), attempt.clone(), session_id.clone());
+            move |text: String| {
+                if attempt.is_current_now() {
+                    let _ = app.emit(&format!("vnc-clipboard-{sid}"), serde_json::json!({"text": text}));
+                }
+            }
+        };
+        // How the link is doing, for the tab's connection mark.
+        let link = {
+            let (app, attempt, sid) = (app.clone(), attempt.clone(), session_id.clone());
+            move |stats: screen_link::LinkStats| {
+                if attempt.is_current_now() {
+                    let _ = app.emit(&format!("vnc-link-{sid}"), stats);
+                }
+            }
+        };
         // A decoder that panics on a bad screen update ends this tab only.
-        let run = tauri::async_runtime::spawn(vnc_client::run(stream, password, connected, frame, flow, rx, wanted, options));
+        let run = tauri::async_runtime::spawn(vnc_client::run(stream, password, connected, frame, flow, rx, wanted, options, clipboard, remote_copy, link));
         let outcome = match run.await {
             Ok(r) => r,
             Err(_) => Err("The VNC session stopped on bad data from the server".into()),
@@ -17024,6 +17071,30 @@ async fn vnc_input(vnc_clients: tauri::State<'_, vnc_client::VncClients>, sessio
 async fn vnc_resize(vnc_clients: tauri::State<'_, vnc_client::VncClients>, session_id: String, width: u16, height: u16) -> Result<(), String> {
     if let Some((_, tx)) = vnc_clients.lock().await.get(&session_id) {
         let _ = tx.send(vnc_client::Cmd::Resize(width, height));
+    }
+    Ok(())
+}
+
+/// Text from this device's clipboard for the VNC server's (the tab read it
+/// when the user pasted, or pressed its button); the paste key comes after it
+/// as input. Text the server's clipboard can't carry is refused, and why.
+#[tauri::command]
+async fn vnc_paste(vnc_clients: tauri::State<'_, vnc_client::VncClients>, session_id: String, text: String) -> Result<(), String> {
+    let text = zeroize::Zeroizing::new(text);
+    if let Some(why) = vnc_client::paste_refusal(&text) {
+        return Err(why);
+    }
+    if let Some((_, tx)) = vnc_clients.lock().await.get(&session_id) {
+        let _ = tx.send(vnc_client::Cmd::Paste(text));
+    }
+    Ok(())
+}
+
+/// The VNC tab was hidden (no updates are asked for meanwhile) or shown again.
+#[tauri::command]
+async fn vnc_shown(vnc_clients: tauri::State<'_, vnc_client::VncClients>, session_id: String, shown: bool) -> Result<(), String> {
+    if let Some((_, tx)) = vnc_clients.lock().await.get(&session_id) {
+        let _ = tx.send(vnc_client::Cmd::Shown(shown));
     }
     Ok(())
 }
@@ -27376,8 +27447,8 @@ pub fn run() {
             add_ssh_key, edit_ssh_key, delete_ssh_key,
             pick_ssh_key_file, read_ssh_key_file, import_ssh_key_file,
             initiate_connection, verify_fingerprint_response, submit_kbi_response, kbi_save_choice, disconnect_session, set_use_ssh_config,
-            initiate_rdp, rdp_open_again, rdp_builtin_open, rdp_builtin_input, rdp_builtin_paste, rdp_builtin_resize, rdp_builtin_close, rdp_share_drives,
-            telnet_connect, telnet_open_terminal, vnc_open, vnc_input, vnc_resize, screen_ack,
+            initiate_rdp, rdp_open_again, rdp_builtin_open, rdp_builtin_input, rdp_builtin_paste, rdp_builtin_resize, rdp_builtin_shown, rdp_builtin_close, rdp_share_drives,
+            telnet_connect, telnet_open_terminal, vnc_open, vnc_input, vnc_resize, vnc_paste, vnc_shown, screen_ack,
             start_tunnel, stop_tunnel, list_tunnels, restart_session_tunnels, persist_session_tunnels,
             list_tunnel_rules, remove_tunnel_rule, rename_tunnel_rule,
             open_terminal, local_shell, write_terminal_data, type_saved_password, resize_terminal, close_terminal,
@@ -27447,6 +27518,14 @@ pub fn run() {
         .build(context)
         .expect("error while building tauri application")
         .run(|_app, event| {
+            // A phone's app went to the background or came back (Android's
+            // onPause and onResume): its WebView still says it is visible, so
+            // the page is told here (an RDP tab pauses its picture meanwhile).
+            #[cfg(mobile)]
+            if let tauri::RunEvent::WindowEvent { event: window_event @ (tauri::WindowEvent::Suspended | tauri::WindowEvent::Resumed), .. } = &event {
+                use tauri::Emitter;
+                let _ = _app.emit("app-shown", matches!(window_event, tauri::WindowEvent::Resumed));
+            }
             if let tauri::RunEvent::Exit = event {
                 // The decrypted copies this run staged go with it.
                 sweep_app_temp(true);
