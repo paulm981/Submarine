@@ -631,6 +631,16 @@ const TerminalView = ({
     term.focus();
   };
 
+  // Fits xterm to its box, unless the box isn't laid out: a terminal behind
+  // another tab is left out of the layout (#127), and xterm would measure it
+  // as a few cells and tell the server's shell so. It keeps its size (80×24
+  // if it opened hidden) and fits once it's shown.
+  const fitTerminal = () => {
+    const el = xtermRef.current?.element;
+    if (!el || el.getClientRects().length === 0) return;
+    fitAddonRef.current?.fit();
+  };
+
   // Repaint when this terminal becomes the active one. The parent uses
   // opacity (within a session) or display:none (across sessions/tabs) to
   // swap visible terminals — neither triggers xterm's internal redraw, so
@@ -642,7 +652,7 @@ const TerminalView = ({
     if (!isActive) return;
     const id = requestAnimationFrame(() => {
       try {
-        fitAddonRef.current?.fit();
+        fitTerminal();
         const t = xtermRef.current;
         if (t) t.refresh(0, Math.max(0, t.rows - 1));
       } catch { /* terminal not ready yet — next tick will catch it */ }
@@ -659,7 +669,7 @@ const TerminalView = ({
     if (!visible || isActive) return;
     const id = requestAnimationFrame(() => {
       try {
-        fitAddonRef.current?.fit();
+        fitTerminal();
         const t = xtermRef.current;
         if (t) t.refresh(0, Math.max(0, t.rows - 1));
       } catch { /* not laid out yet — the ResizeObserver refits */ }
@@ -993,7 +1003,7 @@ const TerminalView = ({
     // Cleared on unmount: a terminal closed within these 50ms must not open
     // its PTY after the close was sent.
     const openTimer = window.setTimeout(() => {
-      fitAddon.fit();
+      fitTerminal();
       
       // Start PTY Session with correct dimensions only ONCE.
       if (!openedRef.current) {
@@ -1413,9 +1423,12 @@ const TerminalView = ({
     // xterm has processed a batch it's acknowledged, which is what lets the
     // backend send more (src-tauri/src/term_output.rs): a stream faster than
     // this window can draw waits there instead of piling up here. Acks are
-    // grouped, at most one per ACK_EVERY bytes or 30ms, and each names the
-    // channel its output came over.
+    // grouped, at most one per ACK_EVERY bytes or ACK_IDLE_MS, and each names
+    // the channel its output came over. ACK_EVERY is well under the backend's
+    // 1 MiB window, so the slower idle ack never holds output back; it spares
+    // a call per terminal per key in a Wall of many (#127).
     const ACK_EVERY = 128 * 1024;
+    const ACK_IDLE_MS = 1000;
     let unacked = 0;
     let ackChannel = 0;
     let ackTimer = 0;
@@ -1433,7 +1446,7 @@ const TerminalView = ({
       if (channel !== ackChannel) { sendAck(); ackChannel = channel; }
       unacked += bytes;
       if (unacked >= ACK_EVERY) sendAck();
-      else if (!ackTimer) ackTimer = window.setTimeout(sendAck, 30);
+      else if (!ackTimer) ackTimer = window.setTimeout(sendAck, ACK_IDLE_MS);
     };
     // Highlighting: the server's own set, or this device's (applyLook
     // follows changes to either). Off, output goes to xterm as it came.
@@ -1484,7 +1497,7 @@ const TerminalView = ({
         if (!xtermRef.current) return;
         if (!onScreen()) return;
         try {
-          fitAddon.fit();
+          fitTerminal();
           const t = xtermRef.current;
           t.refresh(0, Math.max(0, t.rows - 1));
         } catch { /* swallow — xterm tolerates transient 0×0 sizes */ }
@@ -1534,7 +1547,7 @@ const TerminalView = ({
         term.options.fontSize = size;
         term.options.fontFamily = family;
         try {
-          fitAddon.fit();
+          fitTerminal();
           term.refresh(0, Math.max(0, term.rows - 1));
         } catch { /* hidden tab (0×0) — the ResizeObserver refits on show */ }
       };
@@ -1566,7 +1579,7 @@ const TerminalView = ({
     // only virtual-keyboard / pinch-zoom.
     const scrollPromptIntoView = () => {
       requestAnimationFrame(() => {
-        try { fitAddon.fit(); } catch { /* terminal not ready */ }
+        try { fitTerminal(); } catch { /* terminal not ready */ }
         term.scrollToBottom();
       });
     };
@@ -1619,7 +1632,7 @@ const TerminalView = ({
         }
         requestAnimationFrame(() => {
           try {
-            fitAddon.fit();
+            fitTerminal();
             term.refresh(0, Math.max(0, term.rows - 1));
           } catch { /* not laid out yet — the ResizeObserver refits */ }
         });

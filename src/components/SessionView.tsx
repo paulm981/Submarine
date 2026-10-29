@@ -320,7 +320,9 @@ function writeOwnLogin(uuid: string, on: boolean) {
 // `displayName`: the session tab's name, which the user may have changed
 // from the server's (DesktopApp's tabNames). `profile`: the unlocked
 // profile's name, for what is kept per server on this device.
-const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onStatusChange, chromeless = false, onTerminalsChange, isActiveView = false, onPromptChange, compactTabs = false }: any) => {
+// `onScreen`: this session is on screen at all. DesktopApp takes one that
+// isn't out of the layout, so its terminals can't be measured and mustn't fit.
+const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onStatusChange, chromeless = false, onTerminalsChange, isActiveView = false, onScreen: sessionOnScreen = true, onPromptChange, compactTabs = false }: any) => {
   const [status, setStatus] = useState<'connecting' | 'connected' | 'failed' | 'disconnected'>('connecting');
 
   // Bubble every status change up to the parent so the session-tab strip
@@ -2348,7 +2350,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
             const inSplit = slot >= 0;
             const shown = inSplit || (!splitOn && activeTab === t.id);
             const isFocused = activeTab === t.id;
-            const onScreen = shown && !(activeTool && toolAlone);
+            const onScreen = sessionOnScreen && shown && !(activeTool && toolAlone);
             return (
               <div
                 key={t.id}
@@ -2357,7 +2359,9 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                 onMouseDown={inSplit ? () => setActiveTab(t.id) : undefined}
                 onTouchStart={inSplit ? () => setActiveTab(t.id) : undefined}
                 className={`group/pane absolute ${inSplit ? 'min-w-0 min-h-0 border' : 'inset-0'} ${
-                  shown ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'
+                  // A terminal behind another tab is left out of the layout,
+                  // so xterm stops drawing it (#127); it keeps its buffer.
+                  shown ? 'opacity-100 z-10' : 'hidden'
                 } ${inSplit ? (isFocused
                   ? 'border-primary/40 shadow-[inset_0_0_0_1px_rgba(var(--primary),0.15)]'
                   : 'border-white/[0.03]') : ''}`}
