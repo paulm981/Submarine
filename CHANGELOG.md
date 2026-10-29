@@ -11,6 +11,26 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ### From the original project
 
+- **Search and history on Ctrl+Shift+F and Ctrl+Shift+R.** In a terminal, the search now opens on **Ctrl+Shift+F** and the command history on **Ctrl+Shift+R** (Cmd+Shift on a Mac). Plain Ctrl+F and Ctrl+R go to the shell again: Ctrl+R is its own history search, and Ctrl+F pages forward in less and vim. The keys work on any keyboard layout. F5 and Ctrl+Shift+R no longer reload the app and drop your sessions. (Their [#238](https://github.com/SinaXhpm/submarine/pull/238); [#121](https://github.com/paulm981/Submarine/issues/121))
+- **The built-in Remote Desktop tab gets its own tools.**
+  - A connection mark (Good, Fair, Weak or Not answering, with the delay) opens a panel with the figures.
+  - **Settings** has the speed and quality choices, quick sets of them, a resolution, and a pause of the picture while the tab is hidden.
+  - **Files** chooses what of this computer the server gets. A share chosen there goes only to the server's address at the time, as from the server's form.
+  - Choices made in the tab are kept for that server on this computer.
+  - The tab's bar fits a narrow split pane.
+  - (Their [#244](https://github.com/SinaXhpm/submarine/pull/244) and [#246](https://github.com/SinaXhpm/submarine/pull/246); [#121](https://github.com/paulm981/Submarine/issues/121))
+- **The VNC tab shares the clipboard, and gets the same tools.**
+  - Text copied on the server comes to this computer while you're looking at its tab. Otherwise it waits in a note in the tab for you to copy.
+  - A paste key in the tab puts your text on the server's clipboard.
+  - Only plain text (ASCII) is shared; the tab says why when text can't go. The clipboard is on by default; you can turn it off per server.
+  - Like the Remote Desktop tab, VNC gets a connection mark, a **Settings** panel and a pause while the tab is hidden, which is on by default.
+  - A busy screen no longer falls seconds behind, and resizing the window works more reliably.
+  - (Their [#247](https://github.com/SinaXhpm/submarine/pull/247) and [#249](https://github.com/SinaXhpm/submarine/pull/249); [#121](https://github.com/paulm981/Submarine/issues/121))
+
+## v0.4.0-fork.16
+
+### From the original project
+
 - **"Save password" when you type a password.** When a server has no saved password, or its saved one is wrong, the password prompt has a **Save password** tick. Ticked, the password is saved once the login with it works: to the server, to its saved login if it uses one, or to the jump host it was asked for. This covers SSH, jump hosts, the built-in Remote Desktop client and VNC.
   - The tick starts off when the login also tried keys, or when the profile is shared. In a shared profile, a line under the tick says everyone in it gets the password.
   - When the saved login is used by other servers too, a line under the tick names them.

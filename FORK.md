@@ -11,7 +11,7 @@ This page covers:
 
 What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
-The fork is based on the original project's **0.4.0**, with every change up to [#229](https://github.com/SinaXhpm/submarine/pull/229), [#233](https://github.com/SinaXhpm/submarine/pull/233)–[#237](https://github.com/SinaXhpm/submarine/pull/237), [#241](https://github.com/SinaXhpm/submarine/pull/241) and [#242](https://github.com/SinaXhpm/submarine/pull/242) brought in.
+The fork is based on the original project's **0.4.0**, with every change up to [#249](https://github.com/SinaXhpm/submarine/pull/249) brought in.
 
 ## What this fork adds
 
@@ -256,17 +256,18 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | A VNC password typed at its prompt ([#241](https://github.com/SinaXhpm/submarine/pull/241)) | Saved to the server's saved login when it has one | Saved only into the server itself: no tick when it has a saved login, which VNC's weak protection mustn't carry ([#121](https://github.com/paulm981/Submarine/issues/121)) |
 | What "Save password" saves ([#241](https://github.com/SinaXhpm/submarine/pull/241)) | The last password the server asked for, wherever the server's record points when the login ends | Only the first password a server asks for, only for the server's saved login name, and nothing if the server was changed while you logged in ([#121](https://github.com/paulm981/Submarine/issues/121)) |
 | The password Remote Desktop Connection gets ([#242](https://github.com/SinaXhpm/submarine/pull/242)) | The server's saved password, or its saved login's | The server's own saved password only, never a saved login's: other servers use that login too ([#121](https://github.com/paulm981/Submarine/issues/121)) |
+| VNC clipboard ([#247](https://github.com/SinaXhpm/submarine/pull/247)) | Text copied on the server goes to this computer's clipboard at once | Only while its tab is in front and the window has the focus, as for Remote Desktop ([#121](https://github.com/paulm981/Submarine/issues/121)) |
 | Website ([#229](https://github.com/SinaXhpm/submarine/pull/229)) | `website/` is published at `submarine.sinaxhpm.com` | The folder comes along with merges, unchanged, but the fork doesn't publish it: no workflow builds or deploys it |
 
 ## Changes in the original project not taken yet
 
-Every change up to [#229](https://github.com/SinaXhpm/submarine/pull/229) is taken, and so are [#233](https://github.com/SinaXhpm/submarine/pull/233)–[#237](https://github.com/SinaXhpm/submarine/pull/237), [#241](https://github.com/SinaXhpm/submarine/pull/241) and [#242](https://github.com/SinaXhpm/submarine/pull/242). Where the fork takes one differently, the table above says so.
+Every change up to [#249](https://github.com/SinaXhpm/submarine/pull/249) is taken. Where the fork takes one differently, the table above says so.
 
-Being brought in, in steps ([#121](https://github.com/paulm981/Submarine/issues/121)):
+Not taken yet, for the next sync:
 
-| The original project's change | Step |
+| The original project's change | Why not yet |
 |---|---|
-| [#238](https://github.com/SinaXhpm/submarine/pull/238)–[#249](https://github.com/SinaXhpm/submarine/pull/249): search and history keys, RDP and VNC tab tools, VNC clipboard | Next |
+| [#252](https://github.com/SinaXhpm/submarine/pull/252)–[#265](https://github.com/SinaXhpm/submarine/pull/265): selected text visible again, an arrow beside "+", SFTP Follow, an Android fix, refused RDP logins explained, faster mirrors, SSH channels and SFTP folders, an app that does less when idle, terminal floods held in the app, a phone's keyboard in RDP and VNC, on-connect commands in each new terminal | Merged after this round of syncing started. Several touch the terminal's output path, which the fork changed for lag ([#127](https://github.com/paulm981/Submarine/issues/127)), so they get their own review |
 
 ## Keeping up with the original project
 
