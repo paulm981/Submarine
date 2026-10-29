@@ -15,6 +15,9 @@ Submarine's VNC tab uses (`src/vnc_client.rs`). MIT OR Apache-2.0 (`LICENSE-MIT`
    it now counts the server's late answer to that request (reason "this client", nothing pending) as
    knowing it. Before, the session could never resize again. Tested in `resize.rs`
    (`the_late_answer_to_a_timed_out_resize_lets_the_next_one_go`).
+3. At most 64 chunks of a server's data wait for the decoder (`NETWORK_CHANNEL_SIZE` in
+   `src/client/connection.rs`), about 4 MiB, not 4096 (about 256 MiB per connection). The network task
+   reads on while the decoder is held up, and a server can hold it up cheaply (Submarine's review for #121).
 
 Not copied: the crate's `tests/` folder and examples (its `[[test]]` and dev-dependencies are left out of
 `Cargo.toml`, which is written out by hand from the published one). The unit tests inside `src/` are kept.

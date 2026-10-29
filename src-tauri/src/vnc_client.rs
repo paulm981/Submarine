@@ -743,6 +743,21 @@ pub fn explain(e: &VncError) -> String {
 /// Ok("closed") when the page closed it, Ok(reason) when the server ended it,
 /// Err when it failed.
 #[allow(clippy::too_many_arguments)]
+/// How long a send to the server may wait. A server that stops reading fills
+/// its socket and then the library's queue, and the send would wait for
+/// good: the session would hear no Close, and the tab would close with the
+/// connection still open.
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Sends `ev` to the server: Ok(true) once sent, Ok(false) when the
+/// connection is gone, Err when the server stopped reading (SEND_TIMEOUT).
+async fn send(client: &::vnc::VncClient, ev: X11Event) -> Result<bool, String> {
+    match tokio::time::timeout(SEND_TIMEOUT, client.input(ev)).await {
+        Ok(sent) => Ok(sent.is_ok()),
+        Err(_) => Err("The VNC server stopped taking what this side sends.".into()),
+    }
+}
+
 pub async fn run<S, P, C, F, R, L>(
     stream: S,
     password: P,
@@ -816,7 +831,7 @@ where
             cmd = rx.recv() => match cmd {
                 Some(Cmd::Input(events)) => {
                     for ev in pointer.events(events) {
-                        if client.input(ev).await.is_err() {
+                        if !send(&client, ev).await? {
                             break;
                         }
                     }
@@ -831,7 +846,7 @@ where
                 // two in order.
                 Some(Cmd::Paste(text)) => {
                     if clipboard && paste_refusal(&text).is_none() {
-                        let _ = client.input(X11Event::CopyText(text.to_string())).await;
+                        send(&client, X11Event::CopyText(text.to_string())).await?;
                     }
                 }
                 // Hidden: the probe out goes unanswered. Shown again: the first
@@ -849,7 +864,9 @@ where
                 }
                 Some(Cmd::Close) | None => {
                     for ev in pointer.release_all() {
-                        let _ = client.input(ev).await;
+                        if send(&client, ev).await.is_err() {
+                            break;
+                        }
                     }
                     break Ok("closed".to_string());
                 }
@@ -866,7 +883,7 @@ where
                     // bytes may come before the send returns.
                     let asked = tokio::time::Instant::now();
                     let corner = Rect { x: 0, y: 0, width: PROBE_SIDE, height: PROBE_SIDE };
-                    if client.input(X11Event::RefreshRect(corner)).await.is_err() {
+                    if !send(&client, X11Event::RefreshRect(corner)).await? {
                         break Ok("The VNC server closed the connection.".to_string());
                     }
                     probe.out = Some(asked);
@@ -988,10 +1005,8 @@ where
                 // The next incremental update: right after one came, else a
                 // few times a second, and not oftener than the page chose;
                 // none while the tab is hidden.
-                if pacer.tick(Instant::now(), changed, held || paused) {
-                    if client.input(X11Event::Refresh).await.is_err() {
-                        break Ok("The VNC server closed the connection.".to_string());
-                    }
+                if pacer.tick(Instant::now(), changed, held || paused) && !send(&client, X11Event::Refresh).await? {
+                    break Ok("The VNC server closed the connection.".to_string());
                 }
             }
         }

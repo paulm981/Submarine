@@ -19,7 +19,9 @@ use tokio_util::compat::*;
 use tracing::*;
 
 use crate::{codec, PixelFormat, Rect, VncEncoding, VncError, VncEvent, X11Event};
-const NETWORK_CHANNEL_SIZE: usize = 4096;
+// Submarine: 64 chunks of up to 64 KiB (about 4 MiB) of a server's data wait
+// for the decoder, not 4096 (about 256 MiB per connection).
+const NETWORK_CHANNEL_SIZE: usize = 64;
 const INPUT_CHANNEL_SIZE: usize = 4096;
 const OUTPUT_CHANNEL_SIZE: usize = 2;
 
