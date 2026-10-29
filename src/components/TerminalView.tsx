@@ -20,6 +20,7 @@ import { useRootInvoke } from '../ui/rootInvoke';
 import HistorySearchOverlay from './HistorySearchOverlay';
 import { DEFAULT_FONT_STACK, fontFamilyCss, readFontFamily, readFontSize } from '../util/terminalFont';
 import { MIN_CONTRAST_RATIO, readBoldBright, readGpu, readMinContrast, schemeForServer } from '../ui/terminalThemes';
+import { claimGpu, gpuChanged, releaseGpu, type GpuHolder } from '../ui/gpuSlots';
 import { HighlightStream, matcherForServer, type Matcher } from '../ui/highlight';
 import { readScrollback } from '../util/terminalScrollback';
 import { withoutPasteControls } from '../util/pasteText';
@@ -356,8 +357,12 @@ const TerminalView = ({
     isActiveRef.current = isActive;
   }, [isActive]);
   const visibleRef = useRef(visible ?? isActive);
+  // Takes or gives up a GPU context as the terminal comes on screen or goes
+  // (set with its xterm, below).
+  const gpuUpdateRef = useRef<() => void>(() => {});
   useEffect(() => {
     visibleRef.current = visible ?? isActive;
+    gpuUpdateRef.current();
   }, [visible, isActive]);
   // While a Wall shows this terminal (src/ui/terminalDock.ts) its xterm sits
   // in the Wall's tile, on screen whatever this tab is doing — so it refits
@@ -967,29 +972,45 @@ const TerminalView = ({
     term.open(host);
 
     // Draw with the GPU (xterm's WebGL renderer) unless Settings turned it
-    // off. If WebGL isn't there, or the context is lost — a webview keeps
-    // only so many, so the oldest terminals lose theirs when many are open —
-    // xterm goes back to drawing with the DOM, which always works.
+    // off, while there's a context for it (src/ui/gpuSlots.ts: terminals on
+    // screen first). If WebGL isn't there, or the context is lost, xterm goes
+    // back to drawing with the DOM, which always works.
     let webgl: WebglAddon | null = null;
     // Lost its context once: stays on the DOM renderer until GPU drawing is
     // turned off and on again, rather than taking a context back on the next
     // settings change and so pushing another terminal's out.
     let gpuLost = false;
-    const setGpu = (on: boolean) => {
+    const dropGpu = () => {
+      webgl?.dispose();
+      webgl = null;
+      noteTerminalRenderer(terminalId, "dom");
+    };
+    const gpuSlot: GpuHolder = {
+      onScreen: () => isActiveRef.current || visibleRef.current || dockedRef.current,
+      evict: dropGpu,
+      retry: () => updateGpu(),
+    };
+    const updateGpu = () => {
+      const on = readGpu();
       if (!on) gpuLost = false;
-      if (on === !!webgl || (on && gpuLost)) return;
-      if (!on) {
-        webgl?.dispose();
-        webgl = null;
-        noteTerminalRenderer(terminalId, "dom");
+      if (!on || gpuLost) {
+        if (webgl) dropGpu();
+        releaseGpu(gpuSlot);
         return;
       }
+      if (!gpuSlot.onScreen()) {
+        // Kept until a terminal on screen needs it; one may be waiting now.
+        if (webgl) gpuChanged();
+        return;
+      }
+      if (webgl || !claimGpu(gpuSlot)) return;
       try {
         const addon = new WebglAddon();
         addon.onContextLoss(() => {
           addon.dispose();
           if (webgl === addon) webgl = null;
           gpuLost = true;
+          releaseGpu(gpuSlot);
           noteTerminalRenderer(terminalId, "dom");
           console.warn(`[terminal] ${terminalId} lost its GPU context; drawing without the GPU`);
         });
@@ -1000,10 +1021,12 @@ const TerminalView = ({
         // No WebGL here: don't try again on every settings change.
         webgl = null;
         gpuLost = true;
+        releaseGpu(gpuSlot);
         noteTerminalRenderer(terminalId, "dom");
       }
     };
-    setGpu(readGpu());
+    gpuUpdateRef.current = updateGpu;
+    updateGpu();
     
     // Cleared on unmount: a terminal closed within these 50ms must not open
     // its PTY after the close was sent.
@@ -1524,7 +1547,7 @@ const TerminalView = ({
       if (term.options.minimumContrastRatio !== ratio) term.options.minimumContrastRatio = ratio;
       const boldBright = readBoldBright();
       if (term.options.drawBoldTextInBrightColors !== boldBright) term.options.drawBoldTextInBrightColors = boldBright;
-      setGpu(readGpu());
+      updateGpu();
       const next = matcherForServer(serverId);
       if (next !== matcher) {
         matcher = next;
@@ -1627,6 +1650,7 @@ const TerminalView = ({
       },
       moved: (docked) => {
         dockedRef.current = docked;
+        updateGpu();
         setLooking(terminalId, lookingNow());
         // Moving the element can take the keyboard from it without a blur
         // event, so xterm would go on drawing the cursor of a terminal being
@@ -1677,6 +1701,8 @@ const TerminalView = ({
       searchAddon.dispose();
       searchAddonRef.current = null;
       webgl?.dispose();
+      releaseGpu(gpuSlot);
+      gpuUpdateRef.current = () => {};
       forgetTerminal(terminalId);
       term.dispose();
       dock.remove();

@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { readGpu, readMinContrast } from "../ui/terminalThemes";
 import { readFontFamily, readFontSize } from "./terminalFont";
+import { MAX_GPU, gpuSlotsInUse } from "../ui/gpuSlots";
 
 // Troubleshooting, the window's half (the log itself is src-tauri/src/applog.rs).
 //
@@ -197,7 +198,7 @@ export const windowSummary = (): string => {
     {} as Record<string, number>,
   );
   return [
-    `GPU drawing ${readGpu() ? "on" : "off"}`,
+    `GPU drawing ${readGpu() ? "on" : "off"} (${gpuSlotsInUse().holding} of ${MAX_GPU} contexts in use, ${gpuSlotsInUse().waiting} terminal(s) on screen waiting)`,
     `keep text readable ${readMinContrast() ? "on" : "off"}`,
     `font ${readFontFamily() || "default"} ${readFontSize()} px`,
     `${terms.size} terminal(s) open (${Object.entries(renderers).map(([r, n]) => `${n} ${r}`).join(", ") || "none"})`,
