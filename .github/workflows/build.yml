@@ -671,9 +671,12 @@ jobs:
     if: >-
       !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'
       && needs.version.result == 'success'
-    # Only this job writes: it publishes the release.
+    # Only this job writes: it publishes the release, and signs where its
+    # files came from (an OIDC token for Sigstore, and the attestation store).
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -749,7 +752,18 @@ jobs:
               (IFS='|'; echo "${linux[*]}" | sed 's/|/ · /g')
             fi
             echo
+            echo "**Check a download** came from this repository's build: \`gh attestation verify <file> --repo $REPO\` ([GitHub CLI](https://cli.github.com/))."
+            echo
           } > notes.md
+
+      # Signs where each file came from, through GitHub and Sigstore: the
+      # repository, the workflow and the commit it was built from. Anyone can
+      # check a download with `gh attestation verify <file> --repo <this repo>`
+      # (#48). Before publishing, so a release never goes out unsigned.
+      - name: Attest where the files came from
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release-files/*
 
       # Published straight away: the app's update check only sees published
       # releases. GitHub's list of merged pull requests goes after the notes.

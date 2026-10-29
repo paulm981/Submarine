@@ -1012,12 +1012,20 @@ struct Open {
     /// The DEK sealed under the vault's password, and the salt it's under.
     escrow: Option<(String, String)>,
     key_salt: Option<String>,
+    /// Which opening of the profile this is (`DbState::generation`).
+    generation: u64,
 }
 
-fn open_profile(db: &DbState) -> Result<Option<Open>, String> {
+/// The open profile, when it syncs to a store. `at`: only if it's still the
+/// one open at that generation.
+fn open_profile(db: &DbState, at: Option<u64>) -> Result<Option<Open>, String> {
     let profile = db.active_profile.lock().map_err(|_| "[STATE] LOCK_PROFILE")?.clone().ok_or("[SYNC] NO_PROFILE_OPEN")?;
     let conn_g = db.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
     let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
+    if let Some(generation) = at {
+        db.still_open(generation)?;
+    }
+    let generation = db.generation_now();
     let Some(linked) = linked(conn)? else { return Ok(None) };
     let hlc = db.hlc.lock().map_err(|_| "[STATE] LOCK_HLC")?.as_ref().ok_or("[SYNC] NO_HLC")?.clone();
     let (dek, _) = crate::get_or_create_dek(conn)?;
@@ -1030,7 +1038,7 @@ fn open_profile(db: &DbState) -> Result<Option<Open>, String> {
         }
         _ => None,
     };
-    Ok(Some(Open { linked, key: Zeroizing::new(dek), hlc, profile, escrow, key_salt: meta_get(conn, META_KEY_SALT) }))
+    Ok(Some(Open { linked, key: Zeroizing::new(dek), hlc, profile, escrow, key_salt: meta_get(conn, META_KEY_SALT), generation }))
 }
 
 /// The profile a sync started on is the one open now. Profiles can be
@@ -1038,7 +1046,10 @@ fn open_profile(db: &DbState) -> Result<Option<Open>, String> {
 /// items must never be merged into another's vault.
 fn still_open(db: &DbState, conn: &Connection, open: &Open) -> Result<(), String> {
     let name = db.active_profile.lock().map_err(|_| "[STATE] LOCK_PROFILE")?.clone();
-    if name.as_deref() != Some(open.profile.as_str()) || meta_get(conn, META_PROFILE).as_deref() != Some(open.linked.profile_id.as_str()) {
+    if db.generation_now() != open.generation
+        || name.as_deref() != Some(open.profile.as_str())
+        || meta_get(conn, META_PROFILE).as_deref() != Some(open.linked.profile_id.as_str())
+    {
         return Err("[STORE] The profile was closed during the sync.".into());
     }
     Ok(())
@@ -1110,11 +1121,18 @@ async fn exchange(app: &tauri::AppHandle, db: &DbState, dir: PathBuf, open: &Ope
 
 /// Sync the open profile with its store. Runs under `STORE_LOCK`.
 async fn sync_open(app: &tauri::AppHandle, db: &DbState, open: &Open) -> Result<SyncReport, String> {
-    let id = &open.linked.profile_id;
     match open.linked.store.kind {
         Kind::Folder => {
-            let root = folder_root(&open.linked.store.location)?;
-            let ex = exchange(app, db, data_dir(&root).join(id), open).await?;
+            let data = data_dir(&folder_root(&open.linked.store.location)?);
+            let moved = match folder_to_join_now(app, &data, open).await? {
+                Some(id) => {
+                    leave_folder_now(app, &data, open).await?;
+                    Some(relink(db, open, id).await?)
+                }
+                None => None,
+            };
+            let open = moved.as_ref().unwrap_or(open);
+            let ex = exchange(app, db, data.join(&open.linked.profile_id), open).await?;
             if let Some(salt) = &ex.key_salt {
                 record_key_salt(db, open, salt).await?;
             }
@@ -1122,13 +1140,26 @@ async fn sync_open(app: &tauri::AppHandle, db: &DbState, open: &Open) -> Result<
         }
         Kind::Git => {
             let repo = Repo::for_store(app, &open.linked.store)?;
+            let data = data_dir(&repo.dir);
+            let mut moved: Option<Open> = None;
             let mut pulled = 0;
             let (mut removed, mut backup) = (0, None);
             // A push refused because another computer pushed first starts
             // over from its commit, which this merge then includes.
             for _ in 0..4 {
                 let base = repo.pull().await?;
-                let ex = exchange(app, db, data_dir(&repo.dir).join(id), open).await?;
+                let open = moved.as_ref().unwrap_or(open);
+                if let Some(id) = folder_to_join_now(app, &data, open).await? {
+                    // Out of its own folder first, in a commit of its own:
+                    // linked to the other one only once that's pushed.
+                    leave_folder_now(app, &data, open).await?;
+                    if let Pushed::Unchanged | Pushed::Sent = repo.push(base.as_deref()).await? {
+                        moved = Some(relink(db, open, id).await?);
+                    }
+                    continue;
+                }
+                let id = &open.linked.profile_id;
+                let ex = exchange(app, db, data.join(id), open).await?;
                 pulled += ex.pulled;
                 removed += ex.removed;
                 backup = ex.backup.or(backup);
@@ -1151,7 +1182,7 @@ async fn sync_open(app: &tauri::AppHandle, db: &DbState, open: &Open) -> Result<
 /// for one that doesn't.
 pub(crate) async fn sync_if_linked(app: &tauri::AppHandle, db: &DbState) -> Result<Option<SyncReport>, String> {
     let _turn = store_turn(app).await?;
-    let Some(open) = open_profile(db)? else { return Ok(None) };
+    let Some(open) = open_profile(db, None)? else { return Ok(None) };
     sync_open(app, db, &open).await.map(Some)
 }
 
@@ -1177,7 +1208,7 @@ pub(crate) struct Peek {
 
 pub(crate) async fn peek(app: &tauri::AppHandle, db: &DbState) -> Result<Option<Peek>, String> {
     let _turn = store_turn(app).await?;
-    let Some(open) = open_profile(db)? else { return Ok(None) };
+    let Some(open) = open_profile(db, None)? else { return Ok(None) };
     let root = reach(app, &open.linked.store).await?;
     let dir = data_dir(&root).join(&open.linked.profile_id);
     let node = crate::sync_device_node_id(app);
@@ -1192,11 +1223,15 @@ pub(crate) fn is_linked(conn: &Connection) -> bool {
     meta_get(conn, META_PROFILE).is_some()
 }
 
-/// The profile folders in a store that hold this key's files: a copy of the
-/// open profile set up from another computer (the same vault, exported or
-/// restored), to join rather than start beside.
-fn find_same_profile(data: &Path, key: &[u8; 32]) -> Option<String> {
+/// The first profile folder in a store (by name) that holds this key's files:
+/// a copy of the open profile set up from another computer (the same vault,
+/// exported or restored), to join rather than start beside. `before`: only
+/// a folder named before that one.
+fn find_same_profile(data: &Path, key: &[u8; 32], before: Option<&str>) -> Option<String> {
     for (id, dir) in profile_dirs(data) {
+        if before.is_some_and(|b| id.as_str() >= b) {
+            break;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -1206,6 +1241,78 @@ fn find_same_profile(data: &Path, key: &[u8; 32]) -> Option<String> {
         }
     }
     None
+}
+
+/// Two computers holding the same profile that set it up before the folder
+/// had brought either one's file to the other each found nothing to join,
+/// and started a folder of their own: each would sync only with itself, for
+/// good. So while this computer is the only one in its folder, it looks
+/// again, and joins the first folder (by name) holding this profile's files.
+/// They all pick the same one, and the one already in it stays. None when
+/// it stays where it is.
+fn folder_to_join(data: &Path, key: &[u8; 32], id: &str, node: &str) -> Result<Option<String>, String> {
+    let seen = read_profile(&data.join(id), key, node)?;
+    if seen.devices.iter().any(|d| !d.this_one) || !seen.copies.is_empty() {
+        return Ok(None);
+    }
+    Ok(find_same_profile(data, key, Some(id)))
+}
+
+async fn folder_to_join_now(app: &tauri::AppHandle, data: &Path, open: &Open) -> Result<Option<String>, String> {
+    let (data, key, id, node) = (data.to_path_buf(), *open.key, open.linked.profile_id.clone(), crate::sync_device_node_id(app));
+    tokio::task::spawn_blocking(move || folder_to_join(&data, &key, &id, &node)).await.map_err(|e| format!("[STORE] JOIN: {e}"))?
+}
+
+/// Take this computer's file out of the profile folder it's leaving, and the
+/// folder itself, with its `profile.key`, when no other computer's file is in
+/// it: a stale file there would hold the next computer to set up apart.
+fn leave_folder(dir: &Path, node: &str) -> Result<(), String> {
+    refuse_links(dir)?;
+    let own = dir.join(format!("{node}{DEVICE_EXT}"));
+    match std::fs::remove_file(&own) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("[STORE] Couldn't remove {}: {e}", own.display()));
+        }
+        _ => {}
+    }
+    let others = match std::fs::read_dir(dir) {
+        Ok(rd) => rd.flatten().any(|e| e.file_name().to_string_lossy().ends_with(DEVICE_EXT)),
+        Err(_) => true,
+    };
+    if !others {
+        let _ = std::fs::remove_file(dir.join(KEY_FILE));
+        let _ = std::fs::remove_dir(dir);
+    }
+    Ok(())
+}
+
+async fn leave_folder_now(app: &tauri::AppHandle, data: &Path, open: &Open) -> Result<(), String> {
+    let (dir, node) = (data.join(&open.linked.profile_id), crate::sync_device_node_id(app));
+    tokio::task::spawn_blocking(move || leave_folder(&dir, &node)).await.map_err(|e| format!("[STORE] JOIN: {e}"))?
+}
+
+/// Link the open profile to another folder in its store (`folder_to_join`),
+/// and the `Open` that syncs with it.
+async fn relink(db: &DbState, open: &Open, profile_id: String) -> Result<Open, String> {
+    let linked = Linked { store: open.linked.store.clone(), profile_id };
+    {
+        let conn_g = db.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
+        let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
+        still_open(db, conn, open)?;
+        link(conn, &linked)?;
+    }
+    crate::save_vault_async(db).await?;
+    crate::applog::write_line("sync", "joined the folder another computer started for this profile");
+    Ok(Open {
+        linked,
+        key: open.key.clone(),
+        hlc: open.hlc.clone(),
+        profile: open.profile.clone(),
+        escrow: open.escrow.clone(),
+        // `link` forgot it: the new folder's `profile.key` is another's.
+        key_salt: None,
+        generation: open.generation,
+    })
 }
 
 fn profile_dirs(data: &Path) -> Vec<(String, PathBuf)> {
@@ -1270,6 +1377,33 @@ pub async fn store_status(db_state: tauri::State<'_, DbState>) -> Result<Option<
     Ok(linked(conn)?.map(|l| StoreInfo { kind: l.store.kind_str(), location: shown_location(&l.store), branch: l.store.branch }))
 }
 
+/// Link the profile open at `generation` to `l`, unless another one (or this
+/// one again) was opened since; what it was linked to before, for
+/// `undo_setup`.
+fn link_setup(db: &DbState, generation: u64, l: &Linked) -> Result<Option<Linked>, String> {
+    let conn_g = db.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
+    let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
+    db.still_open(generation)?;
+    let previous = linked(conn).ok().flatten();
+    link(conn, l)?;
+    Ok(previous)
+}
+
+/// Back to how it was after a setup that failed: a store that can't be
+/// synced with isn't set up. Only in the profile the setup was for; another
+/// one open now keeps its own store.
+fn undo_setup(db: &DbState, generation: u64, previous: Option<&Linked>) {
+    let Ok(g) = db.conn.lock() else { return };
+    let Some(conn) = g.as_ref() else { return };
+    if db.still_open(generation).is_err() {
+        return;
+    }
+    let _ = match previous {
+        Some(p) => link(conn, p),
+        None => unlink(conn),
+    };
+}
+
 /// Start syncing the open profile through a folder or a git repository, and
 /// sync it once. A copy of this profile already there (the same vault from
 /// another computer) is joined; otherwise it gets a folder of its own.
@@ -1283,41 +1417,30 @@ pub async fn store_setup(
 ) -> Result<SyncReport, String> {
     let _turn = store_turn(&app).await?;
     let store = Store::new(&kind, &location, branch.as_deref())?;
-    let key = {
+    // `generation` pins the profile this is for: reaching the store (git may
+    // wait on a sign-in) and the first sync take a while, and a profile
+    // opened meanwhile must be neither linked nor unlinked.
+    let (key, generation) = {
         let conn_g = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
         let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
         if meta_get(conn, "share_id").is_some() {
             return Err("[STORE] This profile is shared through the cloud, so it can't sync to your own storage too.".into());
         }
-        Zeroizing::new(crate::get_or_create_dek(conn)?.0)
+        (Zeroizing::new(crate::get_or_create_dek(conn)?.0), db_state.generation_now())
     };
     let root = reach(&app, &store).await?;
     let data = data_dir(&root);
     let k = *key;
-    let found = tokio::task::spawn_blocking(move || find_same_profile(&data, &k)).await.map_err(|e| format!("[STORE] JOIN: {e}"))?;
+    let found = tokio::task::spawn_blocking(move || find_same_profile(&data, &k, None)).await.map_err(|e| format!("[STORE] JOIN: {e}"))?;
     let l = Linked { store, profile_id: found.unwrap_or_else(crate::new_entity_uuid) };
-    let previous = {
-        let conn_g = db_state.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
-        let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
-        let previous = linked(conn).ok().flatten();
-        link(conn, &l)?;
-        previous
-    };
+    let previous = link_setup(&db_state, generation, &l)?;
     let res = async {
-        let open = open_profile(&db_state)?.ok_or("[STORE] LINK_LOST")?;
+        let open = open_profile(&db_state, Some(generation))?.ok_or("[STORE] LINK_LOST")?;
         sync_open(&app, &db_state, &open).await
     }
     .await;
     if res.is_err() {
-        // Back to how it was: a store that can't be synced with isn't set up.
-        if let Ok(g) = db_state.conn.lock() {
-            if let Some(conn) = g.as_ref() {
-                let _ = match &previous {
-                    Some(p) => link(conn, p),
-                    None => unlink(conn),
-                };
-            }
-        }
+        undo_setup(&db_state, generation, previous.as_ref());
     }
     crate::save_vault_async(&db_state).await?;
     res
@@ -1429,7 +1552,7 @@ pub async fn store_restore_profile(
             meta_set(conn, "dek", &hex::encode(*key))?;
             link(conn, &Linked { store, profile_id })?;
         }
-        let open = open_profile(&db_state)?.ok_or("[STORE] LINK_LOST")?;
+        let open = open_profile(&db_state, Some(opened))?.ok_or("[STORE] LINK_LOST")?;
         let report = sync_open(&app, &db_state, &open).await?;
         crate::save_vault_async(&db_state).await?;
         Ok::<_, String>(report)
@@ -1466,6 +1589,132 @@ mod tests {
     fn names(conn: &Connection, table: &str) -> Vec<String> {
         let mut st = conn.prepare(&format!("SELECT name FROM {table} ORDER BY name")).unwrap();
         st.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+    }
+
+    /// The app's state with `conn` open as the profile `name`.
+    fn state(conn: Connection, hlc: std::sync::Arc<crate::hlc::Hlc>, name: &str) -> DbState {
+        use std::sync::{atomic::AtomicU64, Arc, Mutex};
+        DbState {
+            conn: Arc::new(Mutex::new(Some(conn))),
+            master_key: Mutex::new(None),
+            salt: Mutex::new(None),
+            db_path: Mutex::new(None),
+            active_profile: Mutex::new(Some(name.into())),
+            hlc: Mutex::new(Some(hlc)),
+            generation: Arc::new(AtomicU64::new(1)),
+            sync_cursor: Mutex::new(None),
+            profile_lock: Mutex::new(None),
+        }
+    }
+
+    /// Open the profile `name` (`conn`) in place of the one open, as opening
+    /// one does.
+    fn open_another(db: &DbState, conn: Connection, hlc: std::sync::Arc<crate::hlc::Hlc>, name: &str) {
+        let mut g = db.conn.lock().unwrap();
+        *g = Some(conn);
+        *db.active_profile.lock().unwrap() = Some(name.into());
+        *db.hlc.lock().unwrap() = Some(hlc);
+        db.bump_generation();
+    }
+
+    fn linked_now(db: &DbState) -> Option<Linked> {
+        linked(db.conn.lock().unwrap().as_ref().unwrap()).unwrap()
+    }
+
+    // Setup reaches the store and syncs once before it's done; a profile
+    // opened meanwhile is neither linked to the store nor, when the setup
+    // gives up, unlinked from its own.
+    #[test]
+    fn setup_links_only_the_profile_it_was_started_in() {
+        let folder = |n: &str| Store::new("folder", &tmp(n).to_string_lossy(), None).unwrap();
+        let (a, ha) = device("A");
+        let db = state(a, ha, "work");
+        let generation = db.generation_now();
+        let work = Linked { store: folder("work-store"), profile_id: "a".repeat(32) };
+
+        // Nothing changed: linked, and put back when the setup fails.
+        assert!(link_setup(&db, generation, &work).unwrap().is_none());
+        assert_eq!(linked_now(&db).unwrap().profile_id, work.profile_id);
+        assert!(open_profile(&db, Some(generation)).unwrap().is_some());
+        undo_setup(&db, generation, None);
+        assert!(linked_now(&db).is_none());
+
+        // "home", which syncs to a store of its own, is opened while the
+        // setup of "work" waits on its store.
+        let (b, hb) = device("B");
+        let home = Linked { store: folder("home-store"), profile_id: "b".repeat(32) };
+        link(&b, &home).unwrap();
+        open_another(&db, b, hb, "home");
+        assert!(link_setup(&db, generation, &work).unwrap_err().contains("PROFILE_CHANGED"));
+        assert!(matches!(open_profile(&db, Some(generation)), Err(e) if e.contains("PROFILE_CHANGED")));
+        undo_setup(&db, generation, None);
+        let now = linked_now(&db).expect("home keeps its store");
+        assert_eq!((now.profile_id, now.store.location), (home.profile_id.clone(), home.store.location.clone()));
+
+        // A sync that started before a profile was opened again doesn't
+        // write into it, even into the same one.
+        let open = open_profile(&db, None).unwrap().unwrap();
+        let (c, hc) = device("B");
+        link(&c, &home).unwrap();
+        open_another(&db, c, hc, "home");
+        let g = db.conn.lock().unwrap();
+        assert!(still_open(&db, g.as_ref().unwrap(), &open).is_err());
+    }
+
+    // Two computers with the same profile set up sync before the folder had
+    // brought either one's file to the other: each started a folder of its
+    // own. The one alone in the later folder joins the first; the one in the
+    // first stays; once together, neither moves.
+    #[test]
+    fn two_computers_set_up_apart_end_up_in_one_folder() {
+        let data = tmp("split").join(STORE_DIR);
+        let (first, later) = ("1".repeat(32), "2".repeat(32));
+        let (na, nb, nc) = ("aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "cccccccccccccccc");
+        let (a, ha) = device("A");
+        let (b, hb) = device("B");
+        a.execute("INSERT INTO servers(name,host,port) VALUES('web','h',22)", []).unwrap();
+        b.execute("INSERT INTO notes(title,body) VALUES('todo','x')", []).unwrap();
+        sync(&a, &ha, &data.join(&first), na);
+        sync(&b, &hb, &data.join(&later), nb);
+
+        assert_eq!(folder_to_join(&data, &KEY, &first, na).unwrap(), None, "the first folder's computer stays");
+        // A computer that isn't alone in its folder stays with the others.
+        let (c, hc) = device("C");
+        sync(&c, &hc, &data.join(&later), nc);
+        assert_eq!(folder_to_join(&data, &KEY, &later, nb).unwrap(), None);
+        std::fs::remove_file(data.join(&later).join(format!("{nc}{DEVICE_EXT}"))).unwrap();
+
+        // Alone, B joins the first folder, and leaves nothing behind.
+        assert_eq!(folder_to_join(&data, &KEY, &later, nb).unwrap(), Some(first.clone()));
+        leave_folder(&data.join(&later), nb).unwrap();
+        assert!(!data.join(&later).exists());
+        sync(&b, &hb, &data.join(&first), nb);
+        sync(&a, &ha, &data.join(&first), na);
+        assert_eq!(names(&a, "servers"), ["web"]);
+        let mut st = a.prepare("SELECT title FROM notes").unwrap();
+        let notes: Vec<String> = st.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(notes, ["todo"]);
+        assert_eq!(names(&b, "servers"), ["web"]);
+        assert_eq!(folder_to_join(&data, &KEY, &first, na).unwrap(), None);
+        assert_eq!(folder_to_join(&data, &KEY, &first, nb).unwrap(), None);
+        // The same computer's file for another profile (another key) in a
+        // folder before it is no reason to move.
+        let other = data.join("0".repeat(32));
+        let f = DeviceFile { profile: "x".into(), device: "X".into(), written: 1, records: vec![] };
+        write_whole(&other, &format!("{nb}{DEVICE_EXT}"), &seal(&[9u8; 32], &f).unwrap()).unwrap();
+        assert_eq!(folder_to_join(&data, &KEY, &first, nb).unwrap(), None);
+    }
+
+    // Leaving a folder another computer is still in takes only this one's file.
+    #[test]
+    fn leaving_a_folder_keeps_the_others_files() {
+        let dir = tmp("leave").join("p");
+        write_whole(&dir, "aaaaaaaaaaaaaaaa.subdev", b"a").unwrap();
+        write_whole(&dir, "bbbbbbbbbbbbbbbb.subdev", b"b").unwrap();
+        write_whole(&dir, KEY_FILE, b"k").unwrap();
+        leave_folder(&dir, "aaaaaaaaaaaaaaaa").unwrap();
+        assert!(!dir.join("aaaaaaaaaaaaaaaa.subdev").exists());
+        assert!(dir.join("bbbbbbbbbbbbbbbb.subdev").exists() && dir.join(KEY_FILE).exists());
     }
 
     #[test]
@@ -1564,7 +1813,7 @@ mod tests {
         std::fs::File::create(dir.join("profile (conflict).key")).unwrap().set_len(MAX_KEY_FILE + 1).unwrap();
         assert_eq!(key_files(&dir), ["abcd"], "the oversized one is skipped, not read");
         std::fs::File::create(dir.join("bbbbbbbbbbbbbbbb.subdev")).unwrap().set_len(MAX_DEVICE_FILE + 1).unwrap();
-        assert_eq!(find_same_profile(&data, &KEY), None);
+        assert_eq!(find_same_profile(&data, &KEY, None), None);
     }
 
     #[test]

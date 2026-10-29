@@ -352,6 +352,14 @@ Until the first signed release, the installers aren't signed, and [Install](#ins
 
 Every release is built by GitHub Actions from this repository's `main` branch, and every change reaches `main` through a pull request whose checks have passed.
 
+**Check a download.** Each release file carries a signed record of where it was built: this repository, its build workflow, and the commit. To check one, install the [GitHub CLI](https://cli.github.com/) and run:
+
+```
+gh attestation verify Submarine-windows-x64-setup.exe --repo paulm981/Submarine
+```
+
+It says which commit the file was built from, or fails if it wasn't built here. Releases made since late October 2026 carry the record; older ones don't.
+
 **Privacy policy:** This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
 
 What Submarine connects to:
