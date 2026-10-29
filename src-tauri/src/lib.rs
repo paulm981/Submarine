@@ -63,6 +63,7 @@ mod term_filter;
 mod vault_backup;
 mod known_hosts;
 mod trust_policy;
+mod secret_policy;
 #[cfg(target_os = "android")]
 mod android_bridge;
 #[cfg(test)]
@@ -9196,6 +9197,11 @@ struct SecretPromptCtx<'a> {
     /// own "Password:" box, i.e. ask again for what the user just declined.
     /// Atomic because the context is borrowed across awaits in a spawned task.
     cancelled: std::sync::atomic::AtomicBool,
+    /// The saved server whose password a prompt asks for: its prompt offers
+    /// "Save password", and a password it got saved goes to it (or its saved
+    /// login) once the login worked. None where there's nothing to save it to,
+    /// or the login name was typed (see `save_offer`).
+    save_to: Option<SaveTarget>,
     /// The ssh-agent for this login (see `AgentSlot`).
     agent: tokio::sync::Mutex<AgentSlot>,
     /// Set when an agent signature failed or timed out after the server had
@@ -9789,6 +9795,19 @@ impl SecretPromptCtx<'_> {
             serde_json::json!({"msg": msg, "type": ty}),
         );
     }
+
+    /// Where a password typed now may be saved, and whether the tick starts
+    /// on: off when this login also tried keys, an ssh-agent's or the ones
+    /// ~/.ssh/config names for the host (a saved password would be used
+    /// instead of them from then on).
+    async fn save_offer(&self) -> Option<SaveTarget> {
+        let to = self.save_to?;
+        let keys = {
+            let slot = self.agent.lock().await;
+            slot.agent.is_some() || !slot.identities.keys.is_empty()
+        };
+        Some(SaveTarget { ticked: to.ticked && !keys, keys, ..to })
+    }
 }
 
 /// Ask the user for ONE value at connect time — a password or key passphrase
@@ -9804,6 +9823,20 @@ async fn prompt_for_secret(
     instructions: &str,
     echo: bool,
 ) -> Option<zeroize::Zeroizing<String>> {
+    prompt_for_secret_offering_save(ctx, label, instructions, echo, None).await.map(|(value, _)| value)
+}
+
+/// `prompt_for_secret`, with a "Save password" tick when `offer_save` (on or
+/// off to start with, as it says); the answer comes with whether it was left
+/// ticked. Nothing is saved here: the caller saves the password once the login
+/// with it worked.
+async fn prompt_for_secret_offering_save(
+    ctx: &SecretPromptCtx<'_>,
+    label: &str,
+    instructions: &str,
+    echo: bool,
+    offer_save: Option<SaveTarget>,
+) -> Option<(zeroize::Zeroizing<String>, bool)> {
     use tauri::Emitter;
     // Superseded or abandoned attempt: never show its prompt over a newer
     // one. It ends the same way a cancelled prompt does.
@@ -9813,22 +9846,24 @@ async fn prompt_for_secret(
     }
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<Vec<String>>>();
     ctx.kbi_txs.lock().await.insert(ctx.nonce.to_string(), tx);
-    let _ = ctx.app.emit(
-        &format!("kbi-prompt-{}", ctx.session_id),
-        serde_json::json!({
-            "nonce": ctx.nonce,
-            // Blank name keeps the modal's generic heading; the label carries
-            // the meaning. Instructions only explain a retry.
-            "name": "",
-            "instructions": instructions,
-            "prompts": [{ "prompt": label, "echo": echo }],
-        }),
-    );
+    let mut payload = serde_json::json!({
+        "nonce": ctx.nonce,
+        // Blank name keeps the modal's generic heading; the label carries
+        // the meaning. Instructions only explain a retry.
+        "name": "",
+        "instructions": instructions,
+        "prompts": [{ "prompt": label, "echo": echo }],
+    });
+    if let Some(to) = offer_save {
+        payload["save"] = to.offer(ctx.app);
+    }
+    let _ = ctx.app.emit(&format!("kbi-prompt-{}", ctx.session_id), payload);
     let answer = match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
         Ok(Ok(Some(mut answers))) => {
             // One prompt → one answer; ignore extras, treat a missing one as "".
             let first = if answers.is_empty() { String::new() } else { answers.swap_remove(0) };
-            Some(zeroize::Zeroizing::new(first))
+            let save = offer_save.is_some() && take_save_choice(ctx.app, ctx.nonce).await;
+            Some((zeroize::Zeroizing::new(first), save))
         }
         // Cancelled (None), timed out, or the sender was dropped.
         _ => {
@@ -9924,6 +9959,8 @@ async fn authenticate_password_prompting<H: russh::client::Handler>(
     let mut password_offered = true;
     let mut rejected = false;
     let mut prompts_used: u32 = 0;
+    // The last typed password was ticked "Save password".
+    let mut save_typed = false;
 
     if nothing_in_hand {
         // An ssh-agent on this device may log in without asking for anything.
@@ -9977,9 +10014,10 @@ async fn authenticate_password_prompting<H: russh::client::Handler>(
                     );
                 }
                 let instructions = if rejected { "The password was rejected. Please try again." } else { "" };
-                match prompt_for_secret(ctx, &format!("Password for {}@{}", user, host), instructions, false).await {
-                    Some(typed) => {
+                match prompt_for_secret_offering_save(ctx, &format!("Password for {}@{}", user, host), instructions, false, ctx.save_offer().await).await {
+                    Some((typed, save)) => {
                         prompts_used += 1;
+                        save_typed = save;
                         (typed, SecretSource::Prompt)
                     }
                     None => {
@@ -9991,6 +10029,15 @@ async fn authenticate_password_prompting<H: russh::client::Handler>(
         };
         match session.authenticate_password(user, password.as_str()).await? {
             russh::client::AuthResult::Success => {
+                // Typed, ticked "Save password", and it worked: saved now.
+                if source == SecretSource::Prompt && save_typed {
+                    if let Some(to) = ctx.save_to {
+                        match save_prompted_password(ctx.app, to, password.as_str()).await {
+                            Ok(to) => ctx.log(&format!("Password saved to {to}."), "success"),
+                            Err(e) => ctx.log(&format!("The password wasn't saved: {e}"), "error"),
+                        }
+                    }
+                }
                 if source != SecretSource::Given {
                     cache_store_secret(ctx.cache, ctx.base, slot, password).await;
                 }
@@ -10006,7 +10053,16 @@ async fn authenticate_password_prompting<H: russh::client::Handler>(
                 if partial_success {
                     // Password accepted, but the server wants another factor
                     // (keyboard-interactive): keep it for reconnects and let the
-                    // caller's 2FA fallback finish the login.
+                    // caller's 2FA fallback finish the login. The password itself
+                    // was right, so a ticked one is saved.
+                    if source == SecretSource::Prompt && save_typed {
+                        if let Some(to) = ctx.save_to {
+                            match save_prompted_password(ctx.app, to, password.as_str()).await {
+                                Ok(to) => ctx.log(&format!("Password saved to {to}."), "success"),
+                                Err(e) => ctx.log(&format!("The password wasn't saved: {e}"), "error"),
+                            }
+                        }
+                    }
                     if source != SecretSource::Given {
                         cache_store_secret(ctx.cache, ctx.base, slot, password).await;
                     }
@@ -10894,6 +10950,10 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     // through the password method (#145): it answers the server's password
     // question once, and only that (see is_password_prompt).
     saved_password: Option<&str>,
+    // The saved server this login is for: the server's password question
+    // offers "Save password", and a ticked answer is saved there once the
+    // login worked (see save_prompted_password).
+    save_to: Option<SaveTarget>,
     // `Some` on a connection that can't ask the user anything (a `::sftp` /
     // `::fwd` one, whose prompts no tab listens to, or a terminal's own login,
     // #230): the saved password still answers the server's password question,
@@ -10937,10 +10997,22 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     let mut answered_with_saved = false;
     // Rounds the server asked nothing in: a server can go on with them for ever.
     let mut empty_rounds = 0u32;
+    // The user's answer to the server's password question, ticked "Save password".
+    let mut to_save: Option<zeroize::Zeroizing<String>> = None;
+    // The user was asked a password question already (secret_policy::kbi_round).
+    let mut password_asked = false;
 
     loop {
         match resp {
-            KeyboardInteractiveAuthResponse::Success => return Some(Ok(true)),
+            KeyboardInteractiveAuthResponse::Success => {
+                if let (Some(password), Some(to)) = (to_save.take(), save_to) {
+                    match save_prompted_password(app, to, password.as_str()).await {
+                        Ok(to) => log(&format!("Password saved to {to}."), "success"),
+                        Err(e) => log(&format!("The password wasn't saved: {e}"), "error"),
+                    }
+                }
+                return Some(Ok(true));
+            }
             KeyboardInteractiveAuthResponse::Failure { .. } => {
                 if answered_with_saved {
                     if unasked.is_some() {
@@ -11035,15 +11107,23 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
                     .iter()
                     .map(|p| serde_json::json!({ "prompt": p.prompt, "echo": p.echo }))
                     .collect();
-                let _ = app.emit(
-                    &format!("kbi-prompt-{}", session_id),
-                    serde_json::json!({
-                        "nonce": nonce,
-                        "name": name,
-                        "instructions": instructions,
-                        "prompts": prompt_payload,
-                    }),
-                );
+                // Only the server's own password question offers the tick: never a code.
+                let password_like = prompts.len() == 1 && is_password_prompt(&prompts[0].prompt, prompts[0].echo);
+                let (offer, forget) = secret_policy::kbi_round(password_like, &mut password_asked);
+                let password_question = save_to.is_some() && offer;
+                if forget {
+                    to_save = None;
+                }
+                let mut payload = serde_json::json!({
+                    "nonce": nonce,
+                    "name": name,
+                    "instructions": instructions,
+                    "prompts": prompt_payload,
+                });
+                if let (true, Some(to)) = (password_question, save_to) {
+                    payload["save"] = to.offer(app);
+                }
+                let _ = app.emit(&format!("kbi-prompt-{}", session_id), payload);
 
                 // 120s: 2FA codes often mean reaching for a phone / authenticator.
                 let answers = match tokio::time::timeout(
@@ -11074,6 +11154,15 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
                 // the SSH auth state machine.
                 let mut answers = answers;
                 answers.resize(prompts.len(), String::new());
+                // A later round (the code after the password, on a typical
+                // Google Authenticator PAM setup) keeps the password's choice.
+                if password_question {
+                    to_save = if take_save_choice(app, nonce).await {
+                        Some(zeroize::Zeroizing::new(answers[0].clone()))
+                    } else {
+                        None
+                    };
+                }
                 if prompts.len() == 1 && is_password_prompt(&prompts[0].prompt, prompts[0].echo) && !answers[0].is_empty() {
                     *typed_password = Some(Zeroizing::new(answers[0].clone()));
                 }
@@ -12021,6 +12110,9 @@ struct Hop {
     /// What the prompted-secret cache knows it as (with its address and user):
     /// a secret typed for one hop never reaches another host.
     cache_id: String,
+    /// The saved server a password typed for it is saved to ("Save password"):
+    /// None for a hop from ~/.ssh/config, or one that logs in with a key.
+    save_to: Option<SaveTarget>,
 }
 
 /// More hops than this in one route is a loop in `~/.ssh/config`.
@@ -12170,7 +12262,8 @@ async fn connect_jump_host(
     for line in &target.log {
         ctx.log(line, "info");
     }
-    let hop = Hop { target, password, key_data, cache_id: format!("jump{jump_server_id}") };
+    let save_to = if key_data.is_none() { SaveTarget::for_server(ctx.app, jump_server_id) } else { None };
+    let hop = Hop { target, password, key_data, cache_id: format!("jump{jump_server_id}"), save_to };
     // The saved jump host is a hop of the route: 1.
     reach_hop(ctx, hop, route, 1).await
 }
@@ -12228,6 +12321,7 @@ fn config_jump_chain<'a>(
                 target,
                 password: None,
                 key_data: None,
+                save_to: None,
             };
             if i == 0 {
                 chain = reach_hop(ctx, hop, route, depth).await?;
@@ -12302,7 +12396,7 @@ async fn login_hop(
     proxy_watch: Option<proxy_command::Watch>,
 ) -> Result<russh::client::Handle<ssh_manager::ClientHandler>, String> {
     use tokio::time::Duration;
-    let Hop { mut target, password, key_data, cache_id } = hop;
+    let Hop { mut target, password, key_data, cache_id, save_to } = hop;
     let identity_agent = target.identity_agent();
     let (host, port, user) = (target.host.clone(), target.port, target.user.clone());
     let identities = target.identities(&user);
@@ -12420,7 +12514,7 @@ async fn login_hop(
     // JumpPassphrase slot (issue #30), keyed by this hop so its secrets never
     // reach another host.
     let base_id = format!("{}|{}|{}:{}|{}", base_session_id(ctx.session_id), cache_id, host, port, user.trim());
-    let prompt_ctx = SecretPromptCtx {
+    let mut prompt_ctx = SecretPromptCtx {
         app: ctx.app,
         session_id: ctx.session_id,
         nonce: &jump_nonce,
@@ -12430,6 +12524,7 @@ async fn login_hop(
         allow_prompt: ctx.allow_prompt,
         attempt: ctx.attempt,
         cancelled: std::sync::atomic::AtomicBool::new(false),
+        save_to,
         agent: AgentSlot::new(ctx.use_agent, identity_agent, identities),
         session_unusable: std::sync::atomic::AtomicBool::new(false),
     };
@@ -12438,6 +12533,11 @@ async fn login_hop(
             Some((name, typed)) => (name, typed, false),
             None => (Zeroizing::new(String::new()), false, true),
         };
+    // A login name typed here isn't saved, so neither is its password: the
+    // next login could be under another name.
+    if !secret_policy::may_save_for_login(user_prompted, &saved_user) {
+        prompt_ctx.save_to = None;
+    }
     // For a jump host that asks for the password through keyboard-interactive
     // (#145). On a connection that can't ask (see `allow_prompt`) it's all
     // keyboard-interactive may send: a code it asks for ends the login there.
@@ -12495,6 +12595,7 @@ async fn login_hop(
                 ctx.kbi_txs,
                 ctx.attempt,
                 kbi_password.as_ref().map(|p| p.as_str()),
+                prompt_ctx.save_offer().await,
                 (!ctx.allow_prompt).then_some(&kbi_unasked),
                 &mut None,
             )
@@ -12939,6 +13040,8 @@ async fn initiate_connection(
     // Quick connect bypasses the DB lookup entirely — we fabricate the
     // same tuple shape from the inline values so all downstream code
     // (auth, tunnel-start, handler setup) doesn't need to branch.
+    // A quick connect has no saved server to save a typed password to.
+    let saved_server = quick_auth.is_none();
     let db_res = if let Some(q) = quick_auth.as_ref() {
         let key_data = q.private_key
             .clone()
@@ -13525,7 +13628,7 @@ async fn initiate_connection(
                 // reuse them; only the primary ever prompts. The key also names
                 // the target (see secrets_target).
                 let base_id = format!("{}|{}", base_session_id(&session_id_clone), secrets_target);
-                let prompt_ctx = SecretPromptCtx {
+                let mut prompt_ctx = SecretPromptCtx {
                     app: &app,
                     session_id: &session_id_clone,
                     nonce: &connect_nonce,
@@ -13535,6 +13638,8 @@ async fn initiate_connection(
                     allow_prompt: allow_kbi,
                     attempt: &attempt,
                     cancelled: std::sync::atomic::AtomicBool::new(false),
+                    // Not for a quick connect (no saved server) or a key login.
+                    save_to: if saved_server && server_id > 0 && key_data.is_none() { SaveTarget::for_server(&app, server_id) } else { None },
                     agent: AgentSlot::new(use_agent, identity_agent.clone(), identities.clone()),
                     session_unusable: std::sync::atomic::AtomicBool::new(false),
                 };
@@ -13546,6 +13651,11 @@ async fn initiate_connection(
                     };
                 if user_prompted {
                     emit_log(&format!("Logging in as {}.", effective_user.as_str()), "info");
+                }
+                // A login name typed here isn't saved, so neither is its
+                // password: the next login could be under another name.
+                if !secret_policy::may_save_for_login(user_prompted, &saved_user) {
+                    prompt_ctx.save_to = None;
                 }
 
                 // For a server that asks for the password through keyboard-
@@ -13621,6 +13731,7 @@ async fn initiate_connection(
                         &kbi_txs_clone,
                         &attempt,
                         kbi_password.as_ref().map(|p| p.as_str()),
+                        prompt_ctx.save_offer().await,
                         (!allow_kbi).then_some(&kbi_unasked),
                         &mut typed_password,
                     )
@@ -14325,6 +14436,310 @@ async fn submit_kbi_response(
         let _ = tx.send(responses);
     }
     Ok(())
+}
+
+/// The "Save password" tick of a password prompt that offered one, recorded
+/// just before the page answers it (`submit_kbi_response`); the prompt takes
+/// it with the answer (`take_save_choice`). Only prompts that are open take
+/// one: anything else is dropped.
+#[tauri::command]
+async fn kbi_save_choice(state: tauri::State<'_, SshState>, nonce: String, save: bool) -> Result<(), String> {
+    if !state.kbi_txs.lock().await.contains_key(&nonce) {
+        return Ok(());
+    }
+    state.kbi_save.lock().await.insert(nonce, save);
+    Ok(())
+}
+
+/// `save_prompted_password`'s database step, once the profile is known to be
+/// the one the login started in: the fork's checks (secret_policy), then the
+/// save itself.
+fn save_typed_password(conn: &rusqlite::Connection, to: &SaveTarget, password: &str) -> Result<String, String> {
+    secret_policy::may_save_now(conn, to.server_id, to.fingerprint, to.vnc)?;
+    store_prompted_password(conn, to.server_id, password)
+}
+
+/// Where a typed password goes, and the words for where it went.
+fn store_prompted_password(conn: &rusqlite::Connection, server_id: i32, password: &str) -> Result<String, String> {
+    // The server's saved login, when it has one that is still there.
+    let (auth_type, credential_id, login_name, login_type): (Option<String>, Option<i32>, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT s.auth_type, c.id, c.name, c.auth_type FROM servers s
+             LEFT JOIN credentials c ON c.id = s.credential_id AND c.deleted = 0 WHERE s.id = ?1",
+            [server_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .map_err(|_| "The server is no longer in this profile.".to_string())?;
+    match (auth_type.as_deref().unwrap_or("vault"), credential_id) {
+        ("custom_key", _) => Err("This server logs in with a key; its password isn't saved.".into()),
+        ("vault", Some(_)) if login_type.as_deref() == Some("key") => {
+            Err("This server's saved login uses a key; its password isn't saved.".into())
+        }
+        ("vault", Some(id)) => {
+            conn.execute("UPDATE credentials SET password = ?1 WHERE id = ?2", rusqlite::params![password, id])
+                .map_err(|e| format!("[DB] {e}"))?;
+            Ok(format!("the saved login \u{201c}{}\u{201d}", login_name.unwrap_or_default()))
+        }
+        _ => {
+            // As normalize_server_identity keeps a server with its own password.
+            conn.execute(
+                "UPDATE servers SET password = ?1, auth_type = 'custom_pass', credential_id = NULL, key_id = NULL WHERE id = ?2",
+                rusqlite::params![password, server_id],
+            )
+            .map_err(|e| format!("[DB] {e}"))?;
+            Ok("this server".to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod prompted_password_tests {
+    use super::store_prompted_password;
+    use rusqlite::Connection;
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE credentials(id INTEGER PRIMARY KEY, name TEXT, auth_type TEXT, username TEXT, password TEXT, deleted INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, username TEXT, password TEXT, credential_id INTEGER, key_id INTEGER, auth_type TEXT);
+             INSERT INTO credentials VALUES (7, 'ops', 'custom_pass', 'ops', 'old-login-pw', 0);
+             INSERT INTO credentials VALUES (8, 'deploy key', 'key', 'deploy', NULL, 0);
+             INSERT INTO credentials VALUES (9, 'gone', 'custom_pass', 'old', 'old-pw', 1);
+             INSERT INTO servers VALUES (1, 'typed', 'root', 'old', NULL, NULL, 'custom_pass');
+             INSERT INTO servers VALUES (2, 'via login', NULL, NULL, 7, NULL, 'vault');
+             INSERT INTO servers VALUES (3, 'key', 'root', NULL, NULL, 4, 'custom_key');
+             INSERT INTO servers VALUES (4, 'nothing saved', 'root', NULL, NULL, NULL, NULL);
+             INSERT INTO servers VALUES (5, 'via key login', NULL, NULL, 8, NULL, 'vault');
+             INSERT INTO servers VALUES (6, 'login deleted', NULL, NULL, 9, NULL, 'vault');",
+        )
+        .unwrap();
+        conn
+    }
+    fn server_pw(conn: &Connection, id: i32) -> (Option<String>, Option<String>) {
+        conn.query_row("SELECT password, auth_type FROM servers WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+    }
+
+    #[test]
+    fn a_typed_password_goes_where_the_server_takes_it_from() {
+        let conn = db();
+        // The server's own password: replaced.
+        assert_eq!(store_prompted_password(&conn, 1, "new-1").unwrap(), "this server");
+        assert_eq!(server_pw(&conn, 1), (Some("new-1".into()), Some("custom_pass".into())));
+        // A server that uses a saved login: that login's password, which is the
+        // one that was asked for; the server itself is left as it is.
+        assert!(store_prompted_password(&conn, 2, "new-2").unwrap().contains("ops"));
+        let login: String = conn.query_row("SELECT password FROM credentials WHERE id = 7", [], |r| r.get(0)).unwrap();
+        assert_eq!(login, "new-2");
+        assert_eq!(server_pw(&conn, 2), (None, Some("vault".into())));
+        // A server with nothing saved, no login: its own password, and it now logs in with it.
+        assert_eq!(store_prompted_password(&conn, 4, "new-4").unwrap(), "this server");
+        assert_eq!(server_pw(&conn, 4), (Some("new-4".into()), Some("custom_pass".into())));
+        // Its saved login was deleted: the server's own password, and the dead
+        // link goes; the deleted login is left alone.
+        assert_eq!(store_prompted_password(&conn, 6, "new-6").unwrap(), "this server");
+        assert_eq!(server_pw(&conn, 6), (Some("new-6".into()), Some("custom_pass".into())));
+        let link: Option<i32> = conn.query_row("SELECT credential_id FROM servers WHERE id = 6", [], |r| r.get(0)).unwrap();
+        assert_eq!(link, None);
+        let gone: String = conn.query_row("SELECT password FROM credentials WHERE id = 9", [], |r| r.get(0)).unwrap();
+        assert_eq!(gone, "old-pw");
+    }
+
+    #[test]
+    fn a_key_server_or_a_gone_one_saves_nothing() {
+        let conn = db();
+        assert!(store_prompted_password(&conn, 3, "pw").unwrap_err().contains("key"));
+        assert_eq!(server_pw(&conn, 3), (None, Some("custom_key".into())));
+        // A saved login that uses a key keeps it, and the server keeps the login.
+        assert!(store_prompted_password(&conn, 5, "pw").unwrap_err().contains("key"));
+        let login: Option<String> = conn.query_row("SELECT password FROM credentials WHERE id = 8", [], |r| r.get(0)).unwrap();
+        assert_eq!(login, None);
+        assert_eq!(server_pw(&conn, 5), (None, Some("vault".into())));
+        assert!(store_prompted_password(&conn, 99, "pw").is_err());
+    }
+}
+
+/// What the user ticked for the prompt answered under `nonce` (false when the
+/// prompt offered no tick, or the page said nothing).
+async fn take_save_choice(app: &tauri::AppHandle, nonce: &str) -> bool {
+    use tauri::Manager;
+    app.state::<SshState>().kbi_save.lock().await.remove(nonce).unwrap_or(false)
+}
+
+/// Saves a password the user typed into a prompt and ticked "Save password"
+/// for, once the login with it worked: into the server's saved login when it
+/// uses one (that login's password was the one asked for), else into the
+/// server itself. A server that logs in with a key keeps its way of logging in.
+/// The vault is written at once, and the page is told so it can refresh and sync.
+async fn save_prompted_password(app: &tauri::AppHandle, to: SaveTarget, password: &str) -> Result<String, String> {
+    use tauri::{Emitter, Manager};
+    let db_state = app.state::<DbState>();
+    let saved_to = {
+        let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED".to_string())?;
+        let conn = guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        // Not into a profile opened since the login started (its server with
+        // the same id is another one).
+        db_state.still_open(to.generation)?;
+        save_typed_password(conn, &to, password)?
+    };
+    save_vault_async(&db_state).await?;
+    let _ = app.emit("server-password-saved", serde_json::json!({ "serverId": to.server_id }));
+    Ok(saved_to)
+}
+
+/// Where a password typed into a prompt goes when "Save password" is ticked
+/// (save_prompted_password): a saved server, in the profile that was open when
+/// the login started.
+#[derive(Clone, Copy, Debug)]
+struct SaveTarget {
+    server_id: i32,
+    /// The open profile's generation then (DbState): nothing is saved into
+    /// another profile.
+    generation: u64,
+    /// Whether the tick starts on: not when this login also tried keys (an
+    /// ssh-agent's, or ~/.ssh/config's for the host), which a saved password
+    /// would be used instead of from then on, nor in a shared profile.
+    ticked: bool,
+    /// This login also tried keys (see `ticked`).
+    keys: bool,
+    /// The profile is shared: a password saved reaches everyone in it
+    /// (secret_policy E4).
+    shared: bool,
+    /// The server as it was when the prompt was shown: a password is saved
+    /// only if it still is (secret_policy::save_fingerprint).
+    fingerprint: u64,
+    /// A VNC server's: saved only while it has no saved login (E3).
+    vnc: bool,
+}
+
+impl SaveTarget {
+    /// For `server_id` in the profile open now; None when none is open.
+    fn for_server(app: &tauri::AppHandle, server_id: i32) -> Option<Self> {
+        use tauri::Manager;
+        let db_state = app.state::<DbState>();
+        let guard = db_state.conn.lock().ok()?;
+        let conn = guard.as_ref()?;
+        let shared = secret_policy::saving_reaches_others(conn);
+        let fingerprint = secret_policy::save_fingerprint(conn, server_id)?;
+        Some(Self { server_id, generation: db_state.generation_now(), ticked: !shared, keys: false, shared, fingerprint, vnc: false })
+    }
+
+    /// The same for a VNC server, unless it has a saved login: a VNC password
+    /// is saved into the server only (secret_policy E3).
+    fn for_vnc_server(app: &tauri::AppHandle, server_id: i32) -> Option<Self> {
+        use tauri::Manager;
+        let to = Self::for_server(app, server_id)?;
+        let db_state = app.state::<DbState>();
+        let guard = db_state.conn.lock().ok()?;
+        secret_policy::vnc_may_save(guard.as_ref()?, server_id).then_some(Self { vnc: true, ..to })
+    }
+
+    /// The "Save password" tick's JSON for a prompt, with a line under it when
+    /// it starts off, or when the password would reach other servers too.
+    fn offer(&self, app: &tauri::AppHandle) -> serde_json::Value {
+        use tauri::Manager;
+        let mut offer = serde_json::json!({ "label": "Save password", "checked": self.ticked });
+        let mut notes = Vec::new();
+        if self.keys {
+            notes.push("Off because this login also tried keys (an ssh-agent's or ~/.ssh/config's): a saved password would be used instead of them.".to_string());
+        }
+        if self.shared {
+            notes.push(secret_policy::SHARED_PROFILE_NOTE.to_string());
+        }
+        let db_state = app.state::<DbState>();
+        if let Ok(guard) = db_state.conn.lock() {
+            if let (Some(conn), true) = (guard.as_ref(), db_state.generation_now() == self.generation) {
+                notes.extend(shared_login_note(conn, self.server_id));
+            }
+        }
+        if !notes.is_empty() {
+            offer["note"] = serde_json::json!(notes.join(" "));
+        }
+        offer
+    }
+}
+
+/// When a server logs in with a saved login that other servers use too, the
+/// line under "Save password" that says so: a password saved there reaches
+/// them as well. None when the login is the server's alone (or a key login,
+/// whose password isn't saved).
+fn shared_login_note(conn: &rusqlite::Connection, server_id: i32) -> Option<String> {
+    let (login_id, login_name): (i32, String) = conn
+        .query_row(
+            "SELECT c.id, COALESCE(c.name, '') FROM servers s
+             JOIN credentials c ON c.id = s.credential_id AND c.deleted = 0
+             WHERE s.id = ?1 AND COALESCE(s.auth_type, 'vault') = 'vault' AND COALESCE(c.auth_type, '') != 'key'",
+            [server_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT COALESCE(name, host, '') FROM servers
+             WHERE credential_id = ?1 AND id != ?2 AND deleted = 0 AND COALESCE(auth_type, 'vault') = 'vault'
+             ORDER BY position, id",
+        )
+        .ok()?;
+    let others: Vec<String> = stmt
+        .query_map(rusqlite::params![login_id, server_id], |r| r.get::<_, String>(0))
+        .ok()?
+        .flatten()
+        .collect();
+    let names = match others.as_slice() {
+        [] => return None,
+        [one] => one.clone(),
+        [first @ .., last] if others.len() <= 3 => format!("{} and {last}", first.join(", ")),
+        _ => format!("{} and {} more", others[..3].join(", "), others.len() - 3),
+    };
+    Some(format!("It goes into the saved login \u{201c}{login_name}\u{201d}, also used by {names}: they get the new password too."))
+}
+
+#[cfg(test)]
+mod shared_login_note_tests {
+    use super::shared_login_note;
+
+    #[test]
+    fn the_line_names_the_other_servers_of_a_shared_login() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE credentials(id INTEGER PRIMARY KEY, name TEXT, auth_type TEXT, deleted INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, host TEXT, credential_id INTEGER, auth_type TEXT,
+                                  position INTEGER NOT NULL DEFAULT 0, deleted INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO credentials VALUES (1, 'work', 'password', 0), (2, 'solo', 'password', 0), (3, 'keys', 'key', 0),
+                                            (4, 'many', 'password', 0), (5, 'gone', 'password', 1);
+             INSERT INTO servers VALUES (1, 'A', 'a', 1, 'vault', 0, 0), (2, 'B', 'b', 1, 'vault', 1, 0),
+                                        (3, NULL, 'c.example', 1, NULL, 2, 0), (4, 'deleted', 'd', 1, 'vault', 3, 1),
+                                        (5, 'own password', 'e', 1, 'custom_pass', 4, 0),
+                                        (6, 'alone', 'f', 2, 'vault', 0, 0),
+                                        (7, 'k1', 'g', 3, 'vault', 0, 0), (8, 'k2', 'h', 3, 'vault', 1, 0),
+                                        (9, 'm1', 'm', 4, 'vault', 0, 0), (10, 'm2', 'm', 4, 'vault', 1, 0), (11, 'm3', 'm', 4, 'vault', 2, 0),
+                                        (12, 'm4', 'm', 4, 'vault', 3, 0), (13, 'm5', 'm', 4, 'vault', 4, 0),
+                                        (14, 'x1', 'x', 5, 'vault', 0, 0), (15, 'x2', 'x', 5, 'vault', 1, 0);",
+        )
+        .unwrap();
+        // B, and a server without a name by its address; not a deleted server, nor one with its own password.
+        assert_eq!(
+            shared_login_note(&conn, 1).as_deref(),
+            Some("It goes into the saved login \u{201c}work\u{201d}, also used by B and c.example: they get the new password too.")
+        );
+        assert_eq!(
+            shared_login_note(&conn, 2).as_deref(),
+            Some("It goes into the saved login \u{201c}work\u{201d}, also used by A and c.example: they get the new password too.")
+        );
+        // The login is the server's alone; a key login (no password to save); the server's own password; a deleted login.
+        for id in [6, 7, 5, 14] {
+            assert_eq!(shared_login_note(&conn, id), None, "server {id}");
+        }
+        // Many: three names and how many more.
+        assert_eq!(
+            shared_login_note(&conn, 9).as_deref(),
+            Some("It goes into the saved login \u{201c}many\u{201d}, also used by m2, m3, m4 and 1 more: they get the new password too.")
+        );
+        conn.execute_batch("UPDATE servers SET deleted = 1 WHERE id IN (12, 13)").unwrap();
+        assert_eq!(
+            shared_login_note(&conn, 9).as_deref(),
+            Some("It goes into the saved login \u{201c}many\u{201d}, also used by m2 and m3: they get the new password too.")
+        );
+    }
 }
 
 // ---- Port forwarding (tunnels) ---------------------------------------------
@@ -15117,12 +15532,12 @@ async fn initiate_rdp(
     };
     let attempt = ssh_manager::ConnectAttempt::new(Arc::clone(&state.session_generation), session_id.clone(), generation);
 
-    let (name, host, port, user, node_key, protocol, jump_id, jump_name) = {
+    let ((name, host, port, user, node_key, protocol, jump_id, jump_name), password, login_key) = {
         let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
         // Its jump host was deleted: never directly without asking (jump_gone.rs).
         jump_gone::refuse(conn, i64::from(server_id))?;
-        conn.query_row(
+        let row = conn.query_row(
             "SELECT s.name, s.host, s.port,
                     CASE WHEN COALESCE(s.auth_type, 'vault') = 'vault' THEN c.username ELSE s.username END,
                     COALESCE(s.uuid, CAST(s.id AS TEXT)), s.protocol, s.jump_host_id, j.name
@@ -15144,7 +15559,8 @@ async fn initiate_rdp(
                 ))
             },
         )
-        .map_err(|_| "Server not found".to_string())?
+        .map_err(|_| "Server not found".to_string())?;
+        (row, secret_policy::rdp_app_password(conn, server_id, rdp_saved_password(conn, server_id)), rdp_login_key(conn, server_id))
     };
     if protocol.as_deref() != Some("rdp") {
         return Err(format!("{name} isn't an RDP server"));
@@ -15172,7 +15588,7 @@ async fn initiate_rdp(
         log(&format!("Opening the RDP server {target}..."), "info");
 
         let (mut session, via) = match jump_id {
-            None => (rdp::RdpSession::direct(target.clone(), user.clone(), options.clone()), None),
+            None => (rdp::RdpSession::direct(server_id, target.clone(), user.clone(), options.clone()), None),
             Some(jid) => {
                 let via_name = jump_name.clone().unwrap_or_else(|| format!("server {jid}"));
                 log(&format!("Going through the SSH server {via_name}..."), "info");
@@ -15213,11 +15629,11 @@ async fn initiate_rdp(
                         }
                     }
                 };
-                match rdp::forward_through(chain, rdp::loopback_for(&node_key), host.clone(), port, closed).await {
+                match rdp::forward_through(chain, &rdp::listen_candidates(&node_key), host.clone(), port, closed).await {
                     Ok((local, parts)) => {
                         let address = local.to_string();
                         log(&format!("Forwarding {address} to {target} through {via_name}."), "success");
-                        (rdp::RdpSession::forwarded(parts, address, user.clone(), options.clone()), Some(via_name))
+                        (rdp::RdpSession::forwarded(parts, server_id, address, user.clone(), options.clone()), Some(via_name))
                     }
                     Err(e) => {
                         log(&e, "error");
@@ -15229,7 +15645,9 @@ async fn initiate_rdp(
         };
 
         let address = session.address.clone();
-        let launched = rdp::pick_app(rdp::find_on_path).and_then(|app| rdp::prepare(app, &session_id, &address, &user, &options));
+        session.login = login_key;
+        let saved = password.as_deref().map(String::as_str);
+        let launched = rdp::pick_app(rdp::find_on_path).and_then(|app| rdp::prepare(app, &session_id, &address, &user, &options, saved));
         let launcher = match launched {
             Ok(l) => {
                 session.file = l.file.clone();
@@ -15249,10 +15667,11 @@ async fn initiate_rdp(
         sessions.lock().await.insert(session_id.clone(), session);
         match launch_rdp_app(&app, &attempt, &session_id, &launcher, windows) {
             Ok(()) => {
-                log(&format!("Opened {} for {address}. It asks for the password itself.", launcher.name), "success");
+                let login = if launcher.secret { "It got the saved password." } else { "It asks for the password itself." };
+                log(&format!("Opened {} for {address}. {login}", launcher.name), "success");
                 let _ = app.emit(
                     &format!("connection-success-{session_id}"),
-                    serde_json::json!({"app": launcher.name, "address": address, "via": via, "tracked": launcher.tracked}),
+                    serde_json::json!({"app": launcher.name, "address": address, "via": via, "tracked": launcher.tracked, "password": launcher.secret}),
                 );
             }
             Err(e) => {
@@ -15270,6 +15689,102 @@ async fn initiate_rdp(
 #[tauri::command]
 fn rdp_share_drives() -> Vec<String> {
     rdp_share::drives()
+}
+
+/// Whose an RDP server's saved password is: its address, its jump host and the
+/// login it uses (its own user, or which saved login and that login's user). An open tab
+/// still goes where it went, so "Open again" hands the password on only while
+/// this is unchanged.
+fn rdp_login_key(conn: &rusqlite::Connection, server_id: i32) -> Option<String> {
+    conn.query_row(
+        "SELECT COALESCE(s.host, '') || ':' || COALESCE(s.port, 0) || '|' || COALESCE(s.jump_host_id, 0) || '|' ||
+                CASE WHEN COALESCE(s.auth_type, 'vault') = 'vault'
+                     THEN 'login ' || COALESCE(c.id, 0) || ' ' || COALESCE(c.username, '')
+                     ELSE 'own ' || COALESCE(s.username, '') END
+         FROM servers s LEFT JOIN credentials c ON s.credential_id = c.id
+         WHERE s.id = ?1",
+        [server_id],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+}
+
+/// An RDP server's saved password, if it has one: its own, or its saved
+/// login's (not a key login's). Remote Desktop Connection gets it.
+fn rdp_saved_password(conn: &rusqlite::Connection, server_id: i32) -> Option<zeroize::Zeroizing<String>> {
+    conn.query_row(
+        "SELECT CASE WHEN COALESCE(s.auth_type, 'vault') = 'vault'
+                     THEN CASE WHEN c.auth_type = 'key' THEN NULL ELSE c.password END
+                     ELSE s.password END
+         FROM servers s LEFT JOIN credentials c ON s.credential_id = c.id
+         WHERE s.id = ?1",
+        [server_id],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+    .filter(|p| !p.is_empty())
+    .map(zeroize::Zeroizing::new)
+}
+
+#[cfg(test)]
+mod rdp_saved_password_tests {
+    use super::rdp_saved_password;
+
+    #[test]
+    fn the_password_an_rdp_app_gets() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE credentials(id INTEGER PRIMARY KEY, auth_type TEXT, password TEXT);
+             CREATE TABLE servers(id INTEGER PRIMARY KEY, auth_type TEXT, password TEXT, credential_id INTEGER);
+             INSERT INTO credentials VALUES (7, 'password', 'login-pw'), (8, 'key', 'not-this');
+             INSERT INTO servers VALUES (1, 'custom_pass', 'own-pw', NULL), (2, 'vault', NULL, 7), (3, 'vault', NULL, 8),
+                                        (4, 'custom_pass', '', NULL), (5, 'vault', NULL, NULL), (6, NULL, 'stale', 7);",
+        )
+        .unwrap();
+        let got = |id| rdp_saved_password(&conn, id).map(|p| p.to_string());
+        assert_eq!(got(1).as_deref(), Some("own-pw"));
+        assert_eq!(got(2).as_deref(), Some("login-pw"), "its saved login's");
+        assert_eq!(got(3), None, "a key login has no password to give");
+        assert_eq!(got(4), None, "an empty one is none");
+        assert_eq!(got(5), None);
+        assert_eq!(got(6).as_deref(), Some("login-pw"), "no auth type is a saved login's");
+        assert_eq!(got(99), None);
+    }
+
+    #[test]
+    fn open_again_sees_when_the_address_or_login_changed() {
+        use super::rdp_login_key;
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE credentials(id INTEGER PRIMARY KEY, username TEXT);
+             CREATE TABLE servers(id INTEGER PRIMARY KEY, host TEXT, port INTEGER, username TEXT, auth_type TEXT, credential_id INTEGER, jump_host_id INTEGER);
+             INSERT INTO credentials VALUES (7, 'alice'), (8, 'bob');
+             INSERT INTO servers VALUES (1, 'a.example', 3389, 'carol', 'custom_pass', NULL, NULL), (2, 'b.example', 3389, NULL, 'vault', 7, NULL);",
+        )
+        .unwrap();
+        let key = |id| rdp_login_key(&conn, id);
+        let (own, via_login) = (key(1), key(2));
+        assert!(own.is_some() && via_login.is_some() && own != via_login);
+        assert_eq!(key(99), None);
+        // Nothing changed: the same.
+        assert_eq!(key(1), own);
+        // Another address, port, jump host, user, saved login or that login's
+        // user: not the same.
+        for change in [
+            "UPDATE servers SET host = 'c.example' WHERE id = 1",
+            "UPDATE servers SET port = 3390 WHERE id = 1",
+            "UPDATE servers SET jump_host_id = 5 WHERE id = 1",
+            "UPDATE servers SET username = 'dave' WHERE id = 1",
+        ] {
+            conn.execute_batch(change).unwrap();
+            assert_ne!(key(1), own, "{change}");
+        }
+        for change in ["UPDATE credentials SET username = 'alicia' WHERE id = 7", "UPDATE servers SET credential_id = 8 WHERE id = 2"] {
+            conn.execute_batch(change).unwrap();
+            assert_ne!(key(2), via_login, "{change}");
+        }
+    }
 }
 
 /// The built-in RDP sessions (rdp_client.rs) by tab: what the page sends them.
@@ -15348,6 +15863,9 @@ async fn rdp_builtin_open(
     // Files shared with the server: a folder or a drive (the tab's per-server
     // option, off unless the user turned it on for the server).
     share: Option<rdp_share::Share>,
+    // Ask for the password even when one is saved: the tab's last try with the
+    // saved one was refused.
+    ask_password: Option<bool>,
     frames: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Result<(), String> {
     use std::sync::Arc;
@@ -15434,24 +15952,36 @@ async fn rdp_builtin_open(
             log(&chosen, "info");
         }
 
-        // The password: saved, else asked for here (it goes nowhere else).
-        let password = if password.is_empty() {
+        // The password: saved, else asked for here (it goes nowhere else). Asked
+        // with a "Save password" tick, and asked again when the saved one was
+        // refused last time. A ticked one is saved once the login worked.
+        let mut save_after_login: Option<zeroize::Zeroizing<String>> = None;
+        // Where a ticked one goes: this server, in the profile open now.
+        let save_target = if server_id > 0 { SaveTarget::for_server(&app, server_id) } else { None };
+        let password = if password.is_empty() || ask_password.unwrap_or(false) {
             let nonce = format!("rdp-{session_id}-{generation}");
             let (ptx, prx) = tokio::sync::oneshot::channel::<Option<Vec<String>>>();
             kbi_txs.lock().await.insert(nonce.clone(), ptx);
             let shown = if user.is_empty() { target.clone() } else { format!("{user} on {target}") };
-            let _ = app.emit(
-                &format!("kbi-prompt-{session_id}"),
-                serde_json::json!({ "nonce": nonce, "name": "", "instructions": "", "prompts": [{ "prompt": format!("Password for {shown}"), "echo": false }] }),
-            );
+            let instructions = if password.is_empty() { "" } else { "The password was rejected. Please try again." };
+            let mut payload = serde_json::json!({ "nonce": nonce, "name": "", "instructions": instructions, "prompts": [{ "prompt": format!("Password for {shown}"), "echo": false }] });
+            if let Some(to) = save_target {
+                payload["save"] = to.offer(&app);
+            }
+            let _ = app.emit(&format!("kbi-prompt-{session_id}"), payload);
             let answer = tokio::time::timeout(std::time::Duration::from_secs(120), prx).await;
             kbi_txs.lock().await.remove(&nonce);
             let _ = app.emit(&format!("kbi-prompt-dismiss-{session_id}"), serde_json::json!({ "nonce": nonce }));
+            let save = take_save_choice(&app, &nonce).await;
             match answer {
                 // The answers are wiped when dropped; the password is taken out.
                 Ok(Ok(Some(a))) if !a.is_empty() => {
                     let mut a = zeroize::Zeroizing::new(a);
-                    zeroize::Zeroizing::new(std::mem::take(&mut a[0]))
+                    let typed = zeroize::Zeroizing::new(std::mem::take(&mut a[0]));
+                    if save {
+                        save_after_login = Some(typed.clone());
+                    }
+                    typed
                 }
                 _ => {
                     log("No password given.", "error");
@@ -15674,8 +16204,25 @@ async fn rdp_builtin_open(
         let was_connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let connected = {
             let flag = Arc::clone(&was_connected);
-            move |w: u16, h: u16| {
+            let (app, sid) = (app.clone(), session_id.clone());
+            move |w: u16, h: u16, nla: bool| {
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                // Logged in with a typed, ticked password: it is saved now. Only
+                // after NLA: without it the server shows its own login screen
+                // whether the password was right or not.
+                if let (Some(password), Some(to)) = (save_after_login, save_target) {
+                    tauri::async_runtime::spawn(async move {
+                        let (msg, ty) = if !nla {
+                            ("The password wasn't saved: without NLA this client can't tell whether the server took it.".to_string(), "info")
+                        } else {
+                            match save_prompted_password(&app, to, password.as_str()).await {
+                                Ok(to) => (format!("Password saved to {to}."), "success"),
+                                Err(e) => (format!("The password wasn't saved: {e}"), "error"),
+                            }
+                        };
+                        let _ = app.emit(&format!("session-log-{sid}"), serde_json::json!({"msg": msg, "type": ty}));
+                    });
+                }
                 connected(w, h)
             }
         };
@@ -15810,6 +16357,38 @@ async fn rdp_builtin_close(rdp_clients: tauri::State<'_, RdpClients>, session_id
 #[cfg(target_os = "linux")]
 static OWN_RENDER_ENV: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
 
+/// Removes `file`, the `.rdp` file with the saved password in it, once the
+/// RDP app started with it has read it: when it first waits for the user
+/// (its security warning, or its login), at the earliest 3 s and at the
+/// latest 30 s after it started, or when it ended. The tab's closing and
+/// the next start's clean-up (`rdp::clear_old_files`) see to the rest.
+#[cfg(windows)]
+fn forget_once_read(child: &tokio::process::Child, file: std::path::PathBuf) {
+    use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
+    use windows::Win32::System::Threading::{GetCurrentProcess, WaitForInputIdle};
+    // A handle of its own: the child's goes when it ends.
+    let process = child.raw_handle().and_then(|h| {
+        let mut own = HANDLE::default();
+        let me = unsafe { GetCurrentProcess() };
+        unsafe { DuplicateHandle(me, HANDLE(h), me, &mut own, 0, false, DUPLICATE_SAME_ACCESS) }.ok()?;
+        Some(own.0 as usize)
+    });
+    tauri::async_runtime::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        if let Some(h) = process {
+            let h = HANDLE(h as *mut core::ffi::c_void);
+            unsafe {
+                WaitForInputIdle(h, 30_000);
+                let _ = CloseHandle(h);
+            }
+        }
+        if let Some(rest) = std::time::Duration::from_secs(3).checked_sub(started.elapsed()) {
+            std::thread::sleep(rest);
+        }
+        let _ = std::fs::remove_file(file);
+    });
+}
+
 /// Starts an RDP app. When its process is the RDP window (`tracked`), the
 /// end of the tab's last open window reaches it as `rdp-app-exited-{id}`,
 /// with the last lines it wrote to stderr when it failed.
@@ -15833,6 +16412,10 @@ fn launch_rdp_app(
         cmd.env_remove(name);
     }
     let mut child = cmd.spawn().map_err(|e| format!("Couldn't start {}: {e}", launcher.name))?;
+    #[cfg(windows)]
+    if let (true, Some(file)) = (launcher.secret, &launcher.file) {
+        forget_once_read(&child, file.clone());
+    }
     let (app, attempt, sid, tracked) = (app.clone(), attempt.clone(), session_id.to_string(), launcher.tracked);
     if tracked {
         windows.fetch_add(1, Ordering::SeqCst);
@@ -15878,6 +16461,7 @@ fn launch_rdp_app(
 async fn rdp_open_again(
     app: tauri::AppHandle,
     state: tauri::State<'_, SshState>,
+    db_state: tauri::State<'_, DbState>,
     rdp_sessions: tauri::State<'_, rdp::RdpSessions>,
     session_id: String,
     options: Option<rdp::RdpOptions>,
@@ -15885,11 +16469,27 @@ async fn rdp_open_again(
     let (launcher, windows) = {
         let mut map = rdp_sessions.lock().await;
         let session = map.get_mut(&session_id).ok_or("This RDP tab isn't open any more")?;
+        if session.forward_gone() {
+            return Err("This tab's way through the SSH server has closed. Reconnect the tab, then open it again.".into());
+        }
         if let Some(options) = options {
             session.options = options.checked();
         }
+        // The saved password as it is now: it may have changed since. Not when
+        // the server's address or login changed since the tab opened: the tab
+        // still goes to the old one, and that password isn't for it.
+        let password = {
+            let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+            let conn = guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+            if rdp_login_key(conn, session.server_id) == session.login {
+                secret_policy::rdp_app_password(conn, session.server_id, rdp_saved_password(conn, session.server_id))
+            } else {
+                None
+            }
+        };
+        let saved = password.as_deref().map(String::as_str);
         // Written again: another copy of the app may have cleared old files.
-        let launcher = rdp::prepare(rdp::pick_app(rdp::find_on_path)?, &session_id, &session.address, &session.username, &session.options)?;
+        let launcher = rdp::prepare(rdp::pick_app(rdp::find_on_path)?, &session_id, &session.address, &session.username, &session.options, saved)?;
         // A different app may need a different file: the old one goes.
         if let Some(new) = &launcher.file {
             if session.file.as_ref() != Some(new) {
@@ -15903,7 +16503,7 @@ async fn rdp_open_again(
     let generation = state.session_generation.lock().await.get(&session_id).copied().unwrap_or(0);
     let attempt = ssh_manager::ConnectAttempt::new(std::sync::Arc::clone(&state.session_generation), session_id.clone(), generation);
     launch_rdp_app(&app, &attempt, &session_id, &launcher, windows)?;
-    Ok(serde_json::json!({"app": launcher.name, "tracked": launcher.tracked}))
+    Ok(serde_json::json!({"app": launcher.name, "tracked": launcher.tracked, "password": launcher.secret}))
 }
 
 /// Open a telnet server (#179): straight to it, or through the SSH server
@@ -16113,6 +16713,9 @@ async fn vnc_open(
     height: u16,
     // The tab's speed and quality choices for this server (the standard ones if none).
     options: Option<vnc_client::Options>,
+    // Ask for the password even when one is saved: the tab's last try with the
+    // saved one was refused.
+    ask_password: Option<bool>,
     frames: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Result<(), String> {
     use std::sync::Arc;
@@ -16301,28 +16904,45 @@ async fn vnc_open(
         };
 
         // The password: saved, else asked for here, and only if the server
-        // wants one (the future runs only then). It goes nowhere else.
+        // wants one (the future runs only then). It goes nowhere else. Asked
+        // with a "Save password" tick, and asked again when the saved one was
+        // refused last time; a ticked one is saved once the server let us in.
+        let save_after_login: Arc<std::sync::Mutex<Option<zeroize::Zeroizing<String>>>> = Arc::default();
+        // Where a ticked one goes: this server, in the profile open now.
+        let save_target = if server_id > 0 { SaveTarget::for_vnc_server(&app, server_id) } else { None };
         let password = {
-            let (app, kbi_txs, sid, target) = (app.clone(), Arc::clone(&kbi_txs), session_id.clone(), target.clone());
+            let (app, kbi_txs, sid, target, keep) = (app.clone(), Arc::clone(&kbi_txs), session_id.clone(), target.clone(), Arc::clone(&save_after_login));
+            let ask_again = ask_password.unwrap_or(false);
             async move {
-                if !password.is_empty() {
+                if !password.is_empty() && !ask_again {
                     return Some(password);
                 }
+                let instructions = if password.is_empty() { "" } else { "The password was rejected. Please try again." };
                 // Asked on a task of its own (the handshake wants a future it
                 // can share across threads).
                 let ask = tokio::spawn(async move {
                     let nonce = format!("vnc-{sid}-{generation}");
                     let (ptx, prx) = tokio::sync::oneshot::channel::<Option<Vec<String>>>();
                     kbi_txs.lock().await.insert(nonce.clone(), ptx);
-                    let _ = app.emit(
-                        &format!("kbi-prompt-{sid}"),
-                        serde_json::json!({ "nonce": nonce, "name": "", "instructions": "", "prompts": [{ "prompt": format!("VNC password for {target}"), "echo": false }] }),
-                    );
+                    let mut payload = serde_json::json!({ "nonce": nonce, "name": "", "instructions": instructions, "prompts": [{ "prompt": format!("VNC password for {target}"), "echo": false }] });
+                    if let Some(to) = save_target {
+                        payload["save"] = to.offer(&app);
+                    }
+                    let _ = app.emit(&format!("kbi-prompt-{sid}"), payload);
                     let answer = tokio::time::timeout(std::time::Duration::from_secs(120), prx).await;
                     kbi_txs.lock().await.remove(&nonce);
                     let _ = app.emit(&format!("kbi-prompt-dismiss-{sid}"), serde_json::json!({ "nonce": nonce }));
+                    let save = take_save_choice(&app, &nonce).await;
                     match answer {
-                        Ok(Ok(Some(mut a))) if !a.is_empty() && !a[0].is_empty() => Some(zeroize::Zeroizing::new(a.swap_remove(0))),
+                        Ok(Ok(Some(mut a))) if !a.is_empty() && !a[0].is_empty() => {
+                            let typed = zeroize::Zeroizing::new(a.swap_remove(0));
+                            if save {
+                                if let Ok(mut slot) = keep.lock() {
+                                    *slot = Some(typed.clone());
+                                }
+                            }
+                            Some(typed)
+                        }
                         _ => None,
                     }
                 });
@@ -16333,8 +16953,20 @@ async fn vnc_open(
         let was_connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let connected = {
             let (app, attempt, sid, target, flag) = (app.clone(), attempt.clone(), session_id.clone(), target.clone(), Arc::clone(&was_connected));
+            let to_save = Arc::clone(&save_after_login);
             move |w: u16, h: u16| {
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                // The server let us in with a typed, ticked password: it is saved now.
+                if let (Some(password), Some(to)) = (to_save.lock().ok().and_then(|mut slot| slot.take()), save_target) {
+                    let (app, sid) = (app.clone(), sid.clone());
+                    tauri::async_runtime::spawn(async move {
+                        let (msg, ty) = match save_prompted_password(&app, to, password.as_str()).await {
+                            Ok(to) => (format!("Password saved to {to}."), "success"),
+                            Err(e) => (format!("The password wasn't saved: {e}"), "error"),
+                        };
+                        let _ = app.emit(&format!("session-log-{sid}"), serde_json::json!({"msg": msg, "type": ty}));
+                    });
+                }
                 if attempt.is_current_now() {
                     let _ = app.emit(&format!("session-log-{sid}"), serde_json::json!({"msg": format!("Connected to {target} ({w}×{h})."), "type": "success"}));
                     let _ = app.emit(&format!("connection-success-{sid}"), serde_json::json!({"address": target, "via": via, "width": w, "height": h}));
@@ -26743,7 +27375,7 @@ pub fn run() {
             add_credential, edit_credential, delete_credential,
             add_ssh_key, edit_ssh_key, delete_ssh_key,
             pick_ssh_key_file, read_ssh_key_file, import_ssh_key_file,
-            initiate_connection, verify_fingerprint_response, submit_kbi_response, disconnect_session, set_use_ssh_config,
+            initiate_connection, verify_fingerprint_response, submit_kbi_response, kbi_save_choice, disconnect_session, set_use_ssh_config,
             initiate_rdp, rdp_open_again, rdp_builtin_open, rdp_builtin_input, rdp_builtin_paste, rdp_builtin_resize, rdp_builtin_close, rdp_share_drives,
             telnet_connect, telnet_open_terminal, vnc_open, vnc_input, vnc_resize, screen_ack,
             start_tunnel, stop_tunnel, list_tunnels, restart_session_tunnels, persist_session_tunnels,

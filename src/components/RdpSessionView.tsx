@@ -11,16 +11,22 @@ import { type PasteKeys, pasteKeysOf, readLocalClipboard } from "../util/rdpClip
 import { scancodeFor } from "../util/scancodes";
 
 // An RDP server's tab (issue #3). By default Submarine opens the system's RDP
-// app (through a forward on a loopback port while the node has an SSH
-// server); then the tab shows how that went and opens the app again on
-// request, and the app asks for the password itself. As this device's
+// app (through a forward on the node's own loopback address while the node
+// has an SSH server); then the tab shows how that went and opens the app
+// again on request. Remote Desktop Connection on Windows gets the saved
+// password; the other apps ask for it themselves. As this device's
 // option, the desktop shows in the tab itself: the experimental built-in
 // client (rdp_client.rs), straight or through the node's SSH server, with the
 // saved password or one asked for here. A phone has only that one, offered
 // in the tab. Either way the tab asks the host-key, certificate and login
 // questions.
 
-type Opened = { app: string; address: string; via: string | null; tracked: boolean };
+// `password`: the app got the saved password (Remote Desktop Connection).
+type Opened = { app: string; address: string; via: string | null; tracked: boolean; password?: boolean };
+
+// How the built-in client says the server refused the user name or password
+// (rdp_client.rs, login_error).
+const PASSWORD_REFUSED = /didn't accept the user name or password/;
 type LogLine = { msg: string; type: string; time: string };
 
 export default function RdpSessionView({ session, displayName, onClose, onStatusChange, isActiveView = false, onPromptChange }: any) {
@@ -53,6 +59,10 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
   // computer's clipboard on its own only then (see rdp-clipboard below).
   const inFrontRef = useRef(isActiveView);
   inFrontRef.current = isActiveView;
+  // The built-in client's saved password was refused: the next connect asks for
+  // it (with a "Save password" tick) instead of trying it again.
+  const askPassword = useRef(false);
+  const passwordRetries = useRef(0);
   // Hidden while the desktop shows; open again on request.
   const [showLog, setShowLog] = useState(false);
 
@@ -105,6 +115,7 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
         clipboard: options.clipboard,
         // A phone shares no files: its backend has no drive to give.
         share: IS_ANDROID ? null : rdpShare(options),
+        askPassword: askPassword.current,
         frames: canvas.newChannel(),
       }).catch(failed);
       setShareClipboard(options.clipboard);
@@ -149,12 +160,22 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
       // connect() cleared the notes below: an app that ends at once may
       // already have reported, ahead of this.
       listen(`connection-success-${id}`, (e: any) => {
+        askPassword.current = false;
+        passwordRetries.current = 0;
         setOpened(e.payload as Opened);
         setStatus("connected");
       }),
       listen(`connection-failed-${id}`, (e: any) => {
-        setReason(String(e.payload?.reason ?? "The connection failed."));
+        const why = String(e.payload?.reason ?? "The connection failed.");
+        askPassword.current = false;
+        setReason(why);
         setStatus("failed");
+        // The server refused the password: ask for it at once, twice at most.
+        if (builtin && PASSWORD_REFUSED.test(why) && passwordRetries.current < 2) {
+          passwordRetries.current += 1;
+          askPassword.current = true;
+          setTimeout(() => connect(), 300);
+        }
       }),
       listen(`session-disconnected-${id}`, (e: any) => {
         setReason(String(e.payload?.reason ?? "The connection closed."));
@@ -222,8 +243,8 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
       // With the options as they are now: they may have changed since.
       const options = readRdpOptions(session.serverUuid);
       setUsedOptions(describeRdpOptions(options));
-      const again = await invoke<{ app: string; tracked: boolean }>("rdp_open_again", { sessionId: session.id, options });
-      setOpened((o) => (o ? { ...o, app: again.app, tracked: again.tracked } : o));
+      const again = await invoke<{ app: string; tracked: boolean; password: boolean }>("rdp_open_again", { sessionId: session.id, options });
+      setOpened((o) => (o ? { ...o, app: again.app, tracked: again.tracked, password: again.password } : o));
       pushLog({ msg: `Opened ${again.app} again.`, type: "success" });
     } catch (e) {
       pushLog({ msg: String(e), type: "error" });
@@ -546,7 +567,8 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
             </p>
             {usedOptions && <p className="text-zinc-400">{usedOptions}</p>}
             <p className="text-zinc-500">
-              It asks for the RDP password itself.{opened.via ? " The connection stays open while this tab does; closing the tab ends it." : ""}
+              {opened.password ? "It got the saved password." : "It asks for the RDP password itself."}
+              {opened.via ? " The connection stays open while this tab does; closing the tab ends it." : ""}
             </p>
             {appFailed && (
               <div className="pt-1 text-red-300/90">

@@ -11,7 +11,7 @@ This page covers:
 
 What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
-The fork is based on the original project's **0.4.0**, with every change up to [#229](https://github.com/SinaXhpm/submarine/pull/229), and [#233](https://github.com/SinaXhpm/submarine/pull/233)–[#237](https://github.com/SinaXhpm/submarine/pull/237), brought in.
+The fork is based on the original project's **0.4.0**, with every change up to [#229](https://github.com/SinaXhpm/submarine/pull/229), [#233](https://github.com/SinaXhpm/submarine/pull/233)–[#237](https://github.com/SinaXhpm/submarine/pull/237), [#241](https://github.com/SinaXhpm/submarine/pull/241) and [#242](https://github.com/SinaXhpm/submarine/pull/242) brought in.
 
 ## What this fork adds
 
@@ -252,18 +252,21 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | `HostKeyAlgorithms` in `~/.ssh/config` ([#170](https://github.com/SinaXhpm/submarine/pull/170)) | Its list decides which host keys are asked for first | Within its list, the kinds of key the app already trusts for the server are still asked for first, so a server with several keys doesn't look changed ([#43](https://github.com/paulm981/Submarine/issues/43)) |
 | Remote Desktop clipboard ([#234](https://github.com/SinaXhpm/submarine/pull/234)) | Text copied on the server goes to this computer's clipboard at once | Only while its tab is in front and the window has the focus; otherwise it waits in the tab's note, so a server can't swap what you paste into a terminal ([#131](https://github.com/paulm981/Submarine/issues/131)) |
 | Remote Desktop shared files ([#234](https://github.com/SinaXhpm/submarine/pull/234)) | A share follows the server record; on macOS and Linux any file in it opens, with no limit on how many | A share goes only to the address it was chosen for. On Linux the kernel's own files (`/proc` and the like) are refused, only folders are listed, and a listing shows a link's own details. On macOS and Linux a server can have at most 1,024 files open ([#131](https://github.com/paulm981/Submarine/issues/131)) |
+| "Save password" in a shared profile ([#241](https://github.com/SinaXhpm/submarine/pull/241)) | The tick starts on | It starts off, and a line under it says everyone in the profile gets the password ([#121](https://github.com/paulm981/Submarine/issues/121)) |
+| A VNC password typed at its prompt ([#241](https://github.com/SinaXhpm/submarine/pull/241)) | Saved to the server's saved login when it has one | Saved only into the server itself: no tick when it has a saved login, which VNC's weak protection mustn't carry ([#121](https://github.com/paulm981/Submarine/issues/121)) |
+| What "Save password" saves ([#241](https://github.com/SinaXhpm/submarine/pull/241)) | The last password the server asked for, wherever the server's record points when the login ends | Only the first password a server asks for, only for the server's saved login name, and nothing if the server was changed while you logged in ([#121](https://github.com/paulm981/Submarine/issues/121)) |
+| The password Remote Desktop Connection gets ([#242](https://github.com/SinaXhpm/submarine/pull/242)) | The server's saved password, or its saved login's | The server's own saved password only, never a saved login's: other servers use that login too ([#121](https://github.com/paulm981/Submarine/issues/121)) |
 | Website ([#229](https://github.com/SinaXhpm/submarine/pull/229)) | `website/` is published at `submarine.sinaxhpm.com` | The folder comes along with merges, unchanged, but the fork doesn't publish it: no workflow builds or deploys it |
 
 ## Changes in the original project not taken yet
 
-Every change up to [#229](https://github.com/SinaXhpm/submarine/pull/229) is taken, and so are [#233](https://github.com/SinaXhpm/submarine/pull/233)–[#237](https://github.com/SinaXhpm/submarine/pull/237). Where the fork takes one differently, the table above says so.
+Every change up to [#229](https://github.com/SinaXhpm/submarine/pull/229) is taken, and so are [#233](https://github.com/SinaXhpm/submarine/pull/233)–[#237](https://github.com/SinaXhpm/submarine/pull/237), [#241](https://github.com/SinaXhpm/submarine/pull/241) and [#242](https://github.com/SinaXhpm/submarine/pull/242). Where the fork takes one differently, the table above says so.
 
 Being brought in, in steps ([#121](https://github.com/paulm981/Submarine/issues/121)):
 
 | The original project's change | Step |
 |---|---|
-| [#241](https://github.com/SinaXhpm/submarine/pull/241), [#242](https://github.com/SinaXhpm/submarine/pull/242): "Save password" on prompts, the RDP app gets the saved password | Next, with fork rules: a saved login shared with other servers never goes to the RDP app or into a VNC password, and in a shared profile the tick starts off |
-| [#238](https://github.com/SinaXhpm/submarine/pull/238)–[#249](https://github.com/SinaXhpm/submarine/pull/249): search and history keys, RDP and VNC tab tools, VNC clipboard | Last |
+| [#238](https://github.com/SinaXhpm/submarine/pull/238)–[#249](https://github.com/SinaXhpm/submarine/pull/249): search and history keys, RDP and VNC tab tools, VNC clipboard | Next |
 
 ## Keeping up with the original project
 
@@ -276,8 +279,10 @@ Being brought in, in steps ([#121](https://github.com/paulm981/Submarine/issues/
 1. **Look before merging.** `git fetch upstream`, then `git merge-tree --write-tree HEAD upstream/main` shows which files would conflict without touching anything. `git log HEAD..upstream/main` lists what's new.
 2. **Decide first when a change collides with the fork.** If one of the original project's changes touches something the fork does its own way (security above all), write the choices down in an issue and settle them before writing code, as [#43](https://github.com/paulm981/Submarine/issues/43) did for ProxyJump and known_hosts (D1 to D8). Then bring such changes in one pull request each, not all at once.
 3. **Merge, don't cherry-pick:** `git merge upstream/main` on a branch. That keeps the history saying what came from where, and leaves the original project's changes as they were, so the next merge has less to sort out. Record a change you leave out with `git merge -s ours <its commit>` and a message saying why. Take it later with `git cherry-pick -x <its commit>`, so the commit says where it came from.
+   - **A sync done in steps** (as [#121](https://github.com/paulm981/Submarine/issues/121) was, one pull request per group of changes) cherry-picks each group with `-x`. Its last step ends with `git merge upstream/main`: by then every change is in, so the merge brings nothing new, but it records that the original project's history is in. Without it, the next sync would offer the same changes again.
 4. **Resolve conflicts toward the original project's text** as it is on its main now. Then put the fork's behavior back the way that changes their code least:
-   - **Fork rules live in fork-only files,** called from one-line hooks in the shared code: `hop_policy.rs` (jump hosts), `trust_policy.rs` (host keys), `remote_sh.rs` (root), `busy.rs` (what's still running). A conflict then touches one line, not the rule.
+   - **Fork rules live in fork-only files,** called from one-line hooks in the shared code: `hop_policy.rs` (jump hosts), `trust_policy.rs` (host keys), `jump_gone.rs` (a deleted jump host), `secret_policy.rs` (saved passwords), `remote_sh.rs` (root), `busy.rs` (what's still running). A conflict then touches one line, not the rule.
+   - **A rule file's tests prove the rule, not just the function:** they run on the app's own tables (`sync_engine_tests::device`) and go through the same steps the app does, and `the_hooks_are_in_place` checks that each hook is still in the shared code, naming any a merge lost. `secret_policy.rs` has both; the other rule files get them in [#136](https://github.com/paulm981/Submarine/issues/136).
    - **Code waiting on the original project** gets a comment, `// fork: until upstream #NNN`, so it's easy to find and drop once they take the fix.
    - **A safety fix the merge itself needs** goes in the first commit, so no commit in the history is unsafe.
 5. **Say what's different.** Anything taken differently goes in the [table above](#where-it-behaves-differently), anything not taken in [not taken yet](#changes-in-the-original-project-not-taken-yet) with a backlog item, and the "up to #N" line at the top moves on.

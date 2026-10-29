@@ -486,6 +486,11 @@ pub struct SshState {
     /// Terminals whose shell is still opening (open_terminal,
     /// open_container_terminal). Locked before `terminal_txs` when both are.
     pub terminal_openings: Arc<Mutex<TerminalOpenings>>,
+    /// The "Save password" tick of a password prompt that offered one, by the
+    /// prompt's nonce: the page records it (`kbi_save_choice`) just before it
+    /// answers, and the prompt takes it with the answer. The password is saved
+    /// only once the login with it worked.
+    pub kbi_save: Arc<Mutex<HashMap<String, bool>>>,
 }
 
 /// Which terminals are still opening, so a close that arrives while one is
@@ -653,6 +658,7 @@ impl SshState {
             sftp_shell: Arc::new(Mutex::new(HashSet::new())),
             prompted_secrets: Arc::new(Mutex::new(HashMap::new())),
             terminal_openings: Arc::new(Mutex::new(TerminalOpenings::default())),
+            kbi_save: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
