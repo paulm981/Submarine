@@ -63,6 +63,7 @@ mod term_filter;
 mod vault_backup;
 mod known_hosts;
 mod trust_policy;
+mod secret_policy;
 #[cfg(target_os = "android")]
 mod android_bridge;
 #[cfg(test)]
@@ -9805,7 +9806,7 @@ impl SecretPromptCtx<'_> {
             let slot = self.agent.lock().await;
             slot.agent.is_some() || !slot.identities.keys.is_empty()
         };
-        Some(SaveTarget { ticked: !keys, ..to })
+        Some(SaveTarget { ticked: to.ticked && !keys, keys, ..to })
     }
 }
 
@@ -14578,8 +14579,13 @@ struct SaveTarget {
     generation: u64,
     /// Whether the tick starts on: not when this login also tried keys (an
     /// ssh-agent's, or ~/.ssh/config's for the host), which a saved password
-    /// would be used instead of from then on.
+    /// would be used instead of from then on, nor in a shared profile.
     ticked: bool,
+    /// This login also tried keys (see `ticked`).
+    keys: bool,
+    /// The profile is shared: a password saved reaches everyone in it
+    /// (secret_policy E4).
+    shared: bool,
 }
 
 impl SaveTarget {
@@ -14588,8 +14594,18 @@ impl SaveTarget {
         use tauri::Manager;
         let db_state = app.state::<DbState>();
         let guard = db_state.conn.lock().ok()?;
-        guard.as_ref()?;
-        Some(Self { server_id, generation: db_state.generation_now(), ticked: true })
+        let shared = secret_policy::saving_reaches_others(guard.as_ref()?);
+        Some(Self { server_id, generation: db_state.generation_now(), ticked: !shared, keys: false, shared })
+    }
+
+    /// The same for a VNC server, unless it has a saved login: a VNC password
+    /// is saved into the server only (secret_policy E3).
+    fn for_vnc_server(app: &tauri::AppHandle, server_id: i32) -> Option<Self> {
+        use tauri::Manager;
+        let to = Self::for_server(app, server_id)?;
+        let db_state = app.state::<DbState>();
+        let guard = db_state.conn.lock().ok()?;
+        secret_policy::vnc_may_save(guard.as_ref()?, server_id).then_some(to)
     }
 
     /// The "Save password" tick's JSON for a prompt, with a line under it when
@@ -14598,8 +14614,11 @@ impl SaveTarget {
         use tauri::Manager;
         let mut offer = serde_json::json!({ "label": "Save password", "checked": self.ticked });
         let mut notes = Vec::new();
-        if !self.ticked {
+        if self.keys {
             notes.push("Off because this login also tried keys (an ssh-agent's or ~/.ssh/config's): a saved password would be used instead of them.".to_string());
+        }
+        if self.shared {
+            notes.push(secret_policy::SHARED_PROFILE_NOTE.to_string());
         }
         let db_state = app.state::<DbState>();
         if let Ok(guard) = db_state.conn.lock() {
@@ -15516,7 +15535,7 @@ async fn initiate_rdp(
             },
         )
         .map_err(|_| "Server not found".to_string())?;
-        (row, rdp_saved_password(conn, server_id), rdp_login_key(conn, server_id))
+        (row, secret_policy::rdp_app_password(conn, server_id, rdp_saved_password(conn, server_id)), rdp_login_key(conn, server_id))
     };
     if protocol.as_deref() != Some("rdp") {
         return Err(format!("{name} isn't an RDP server"));
@@ -16433,7 +16452,7 @@ async fn rdp_open_again(
             let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
             let conn = guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
             if rdp_login_key(conn, session.server_id) == session.login {
-                rdp_saved_password(conn, session.server_id)
+                secret_policy::rdp_app_password(conn, session.server_id, rdp_saved_password(conn, session.server_id))
             } else {
                 None
             }
@@ -16860,7 +16879,7 @@ async fn vnc_open(
         // refused last time; a ticked one is saved once the server let us in.
         let save_after_login: Arc<std::sync::Mutex<Option<zeroize::Zeroizing<String>>>> = Arc::default();
         // Where a ticked one goes: this server, in the profile open now.
-        let save_target = if server_id > 0 { SaveTarget::for_server(&app, server_id) } else { None };
+        let save_target = if server_id > 0 { SaveTarget::for_vnc_server(&app, server_id) } else { None };
         let password = {
             let (app, kbi_txs, sid, target, keep) = (app.clone(), Arc::clone(&kbi_txs), session_id.clone(), target.clone(), Arc::clone(&save_after_login));
             let ask_again = ask_password.unwrap_or(false);
