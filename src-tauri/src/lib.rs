@@ -969,6 +969,14 @@ struct EntitySpec {
 /// VNC server back into an SSH one.
 const LATE_COLS: &[&str] = &["terminal_theme", "highlight", "scope", "protocol"];
 
+/// LATE_COLS whose NULL means "not known here", and so is left out of what
+/// this device sends, as an older peer leaves it out. A server's row inserted
+/// from an older peer's record has them NULL; sent on as null (the store sync
+/// sends every row each time, and a merge may pick that copy), it would
+/// clear the scheme or highlight set on a device that has one. The app's
+/// default is stored as "" instead (`set_server_look`), which is sent.
+const NULL_IS_UNKNOWN: &[&str] = &["terminal_theme", "highlight"];
+
 /// Applied in this order so most FK referents already exist on merge; the two
 /// self-referential FKs (folders.parent_id, servers.jump_host_id) are resolved
 /// in a deferred fixup pass afterwards.
@@ -1151,18 +1159,22 @@ fn collect_local_records(conn: &Connection, key: &[u8; 32], since: &str) -> Resu
             .map_err(|e| format!("[SYNC] SER_QUERY {}: {e}", spec.table))?;
         for row in rows {
             let (uuid, updated_at, mut payload) = row.map_err(|e| format!("[SYNC] SER_ROW {}: {e}", spec.table))?;
-            // A server whose switch to telnet or VNC this device holds still
-            // has that protocol and port everywhere else: an edit here mustn't
-            // undo it (approvals::held_switch).
             if spec.table == "servers" {
+                let mut obj: serde_json::Value = serde_json::from_str(&payload).map_err(|e| format!("[SYNC] SER_ROW {}: {e}", spec.table))?;
+                // A server whose switch to telnet or VNC this device holds still
+                // has that protocol and port everywhere else: an edit here mustn't
+                // undo it (approvals::held_switch).
                 if let Some(switch) = approvals::held_switch(conn, &uuid) {
-                    let mut obj: serde_json::Value = serde_json::from_str(&payload).map_err(|e| format!("[SYNC] SER_ROW {}: {e}", spec.table))?;
                     obj["protocol"] = serde_json::Value::String(switch.protocol);
                     if let Some(port) = switch.port {
                         obj["port"] = serde_json::Value::from(port);
                     }
-                    payload = obj.to_string();
                 }
+                // What this device doesn't know, it doesn't send (NULL_IS_UNKNOWN).
+                if let Some(o) = obj.as_object_mut() {
+                    o.retain(|k, v| !(v.is_null() && NULL_IS_UNKNOWN.contains(&k.as_str())));
+                }
+                payload = obj.to_string();
             }
             out.push(SyncRecord {
                 uuid,
@@ -4692,17 +4704,69 @@ mod sync_engine_tests {
         let theme: Option<String> = c.query_row("SELECT terminal_theme FROM servers WHERE name='prod'", [], |r| r.get(0)).unwrap();
         assert_eq!(theme, None);
 
-        // An explicit null from a current peer still clears it.
-        a.execute("UPDATE servers SET terminal_theme=NULL WHERE name='prod'", []).unwrap();
+        // An explicit null, from a peer that knows the column but stores the
+        // app's default as NULL (a build from before NULL_IS_UNKNOWN), still
+        // clears it.
         let mut recs = collect_local_records(&a, &KEY, "").unwrap();
         for r in recs.iter_mut() {
             if r.entity_type == "servers" {
+                let plain = decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap();
+                let mut obj: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+                obj["terminal_theme"] = serde_json::Value::Null;
+                r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
                 r.updated_at = ha.tick();
             }
         }
         apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
         let theme: Option<String> = b.query_row("SELECT terminal_theme FROM servers WHERE name='prod'", [], |r| r.get(0)).unwrap();
         assert_eq!(theme, None, "a null from a peer that knows the column clears it");
+    }
+
+    // A device that got a server from an older peer (whose record has no
+    // scheme and no highlight set) holds both as NULL: not known here. Its
+    // copy of that record, passed on, must not clear them where they're set:
+    // the store sync sends every row each time, and a merge can pick that
+    // copy. The app's default, chosen here, is "" and does travel.
+    #[test]
+    fn a_scheme_not_known_here_is_not_passed_on_as_cleared() {
+        let (a, ha) = device("A");
+        a.execute("INSERT INTO servers(name, host, port) VALUES('prod','h1',22)", []).unwrap();
+        let id: i32 = a.query_row("SELECT id FROM servers", [], |r| r.get(0)).unwrap();
+        set_server_look(&a, "terminal_theme", id, Some("nord")).unwrap();
+        set_server_look(&a, "highlight", id, Some("network")).unwrap();
+        let (b, hb) = device("B");
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+
+        // An older peer edits the host: its record has neither key.
+        a.execute("UPDATE servers SET host='h2'", []).unwrap();
+        let mut older = collect_local_records(&a, &KEY, "").unwrap();
+        for r in older.iter_mut().filter(|r| r.entity_type == "servers") {
+            let plain = decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap();
+            let mut obj: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+            obj.as_object_mut().unwrap().remove("terminal_theme");
+            obj.as_object_mut().unwrap().remove("highlight");
+            r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
+            r.updated_at = ha.tick();
+        }
+        // C, new, gets the server from it, and passes its copy on to B,
+        // which hasn't seen the older peer's edit yet.
+        let (c, hc) = device("C");
+        apply_remote_records(&c, &KEY, &older, &hc).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&c, &KEY, "").unwrap(), &hb).unwrap();
+        let row: (String, Option<String>, Option<String>) = b
+            .query_row("SELECT host, terminal_theme, highlight FROM servers", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        assert_eq!(row, ("h2".into(), Some("nord".into()), Some("network".into())), "the edit applies, the look stays");
+
+        // Saving the default over a NULL on C isn't a change.
+        let cid: i32 = c.query_row("SELECT id FROM servers", [], |r| r.get(0)).unwrap();
+        assert_eq!(set_server_look(&c, "terminal_theme", cid, None).unwrap(), 0);
+
+        // The app's default chosen on A reaches B.
+        set_server_look(&a, "terminal_theme", id, None).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let theme: Option<String> = b.query_row("SELECT terminal_theme FROM servers", [], |r| r.get(0)).unwrap();
+        assert_eq!(theme.as_deref(), Some(""), "the app's default is a value that travels");
     }
 
     #[test]
@@ -6541,16 +6605,17 @@ async fn setup_master_db_with(
     conn.execute_batch(server_os::RESET_TRIGGER)
         .map_err(|e| format!("[DATABASE] SERVER_OS_TRIGGER_FAILED: {}", e))?;
     // The server's own terminal color scheme (an id from
-    // src/ui/terminalThemes.ts); NULL = the app's default. Synced, and in
-    // LATE_COLS, so an older peer's edit doesn't clear it.
+    // src/ui/terminalThemes.ts); "" = the app's default, NULL = never set
+    // (or set on an older peer only). Synced, and in LATE_COLS and
+    // NULL_IS_UNKNOWN, so an older peer's edit doesn't clear it.
     if let Err(e) = conn.execute("ALTER TABLE servers ADD COLUMN terminal_theme TEXT", []) {
         let s = e.to_string();
         if !s.contains("duplicate column name") {
             return Err(format!("[DATABASE] SERVER_THEME_MIGRATION_FAILED: {}", s));
         }
     }
-    // The server's own highlight set (an id from src/ui/highlight.ts); NULL =
-    // this device's. Synced and in LATE_COLS, like terminal_theme.
+    // The server's own highlight set (an id from src/ui/highlight.ts); "" or
+    // NULL = this device's. Synced and in LATE_COLS, like terminal_theme.
     if let Err(e) = conn.execute("ALTER TABLE servers ADD COLUMN highlight TEXT", []) {
         let s = e.to_string();
         if !s.contains("duplicate column name") {
@@ -7658,19 +7723,29 @@ fn clean_scheme_id(raw: &str) -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 
+/// Set a server's own scheme or highlight set (`column`, one of
+/// NULL_IS_UNKNOWN). `None`, the app's default, is stored as "": a NULL
+/// there means "not known here", which isn't sent to the other devices.
+fn set_server_look(conn: &Connection, column: &str, id: i32, value: Option<&str>) -> rusqlite::Result<usize> {
+    debug_assert!(NULL_IS_UNKNOWN.contains(&column));
+    let value = value.and_then(clean_scheme_id).unwrap_or_default();
+    // No write when nothing changed: every save of the edit panel calls this,
+    // and an UPDATE would restamp the row for sync even with the same value.
+    // Nor is a NULL turned into "": the edit panel shows the default for
+    // both, and saving it isn't a choice made here.
+    conn.execute(
+        &format!("UPDATE servers SET {column}=?1 WHERE id=?2 AND COALESCE({column}, '') IS NOT ?1"),
+        rusqlite::params![value, id],
+    )
+}
+
 /// A server's own terminal color scheme, or `None` for the app's default.
 /// Its own command, like set_server_run_on_connect.
 #[tauri::command]
 async fn set_server_terminal_theme(state: tauri::State<'_, DbState>, id: i32, value: Option<String>) -> Result<(), String> {
-    let value = value.as_deref().and_then(clean_scheme_id);
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-    // No write when nothing changed: every save of the edit panel calls this,
-    // and an UPDATE would restamp the row for sync even with the same value.
-    conn.execute(
-        "UPDATE servers SET terminal_theme=?1 WHERE id=?2 AND terminal_theme IS NOT ?1",
-        rusqlite::params![value, id],
-    ).map_err(|e| format!("[DATABASE] SERVER_THEME_FAILED: {}", e))?;
+    set_server_look(conn, "terminal_theme", id, value.as_deref()).map_err(|e| format!("[DATABASE] SERVER_THEME_FAILED: {}", e))?;
     drop(conn_guard);
     save_vault_internal(&state)?;
     Ok(())
@@ -7680,13 +7755,9 @@ async fn set_server_terminal_theme(state: tauri::State<'_, DbState>, id: i32, va
 /// command, like set_server_terminal_theme.
 #[tauri::command]
 async fn set_server_highlight(state: tauri::State<'_, DbState>, id: i32, value: Option<String>) -> Result<(), String> {
-    let value = value.as_deref().and_then(clean_scheme_id);
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-    conn.execute(
-        "UPDATE servers SET highlight=?1 WHERE id=?2 AND highlight IS NOT ?1",
-        rusqlite::params![value, id],
-    ).map_err(|e| format!("[DATABASE] SERVER_HIGHLIGHT_FAILED: {}", e))?;
+    set_server_look(conn, "highlight", id, value.as_deref()).map_err(|e| format!("[DATABASE] SERVER_HIGHLIGHT_FAILED: {}", e))?;
     drop(conn_guard);
     save_vault_internal(&state)?;
     Ok(())
@@ -7886,14 +7957,15 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
             "position": row.get::<_, i64>(22).unwrap_or(0),
             // Last OS the server reported (server_os.rs); null until then.
             "os": row.get::<_, Option<String>>(23).unwrap_or(None),
-            // Its own terminal color scheme id; null = the app's default.
-            "terminal_theme": row.get::<_, Option<String>>(24).unwrap_or(None),
+            // Its own terminal color scheme id; null = the app's default
+            // (stored as "", see set_server_look).
+            "terminal_theme": row.get::<_, Option<String>>(24).unwrap_or(None).filter(|s| !s.is_empty()),
             // The sync id: the same on every device, and unlike `id` never
             // reused by another profile's server. Keys this device's own
             // per-server settings (see src/util/shellSync.ts).
             "uuid": row.get::<_, Option<String>>(25)?,
             // Its own highlight set id; null = this device's.
-            "highlight": row.get::<_, Option<String>>(26).unwrap_or(None),
+            "highlight": row.get::<_, Option<String>>(26).unwrap_or(None).filter(|s| !s.is_empty()),
             // "ssh", "rdp" (issue #3), "telnet" (#179) or "vnc"; NULL in the
             // table (and anything a newer version may add) is an SSH server.
             "protocol": match row.get::<_, Option<String>>(27)?.as_deref() {
