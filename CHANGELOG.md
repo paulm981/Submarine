@@ -9,6 +9,18 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+### From the original project
+
+- **"Save password" when you type a password.** When a server has no saved password, or its saved one is wrong, the password prompt has a **Save password** tick. Ticked, the password is saved once the login with it works: to the server, to its saved login if it uses one, or to the jump host it was asked for. This covers SSH, jump hosts, the built-in Remote Desktop client and VNC.
+  - The tick starts off when the login also tried keys, or when the profile is shared. In a shared profile, a line under the tick says everyone in it gets the password.
+  - When the saved login is used by other servers too, a line under the tick names them.
+  - A VNC password is saved only into the server itself: there's no tick when a VNC server has a saved login.
+  - A saved Remote Desktop or VNC password that was refused isn't tried again on reconnect.
+  - (Their [#241](https://github.com/SinaXhpm/submarine/pull/241); [#121](https://github.com/paulm981/Submarine/issues/121))
+- **Remote Desktop Connection gets the server's saved password.** On Windows, Remote Desktop Connection is given the server's own saved password, encrypted for your Windows account, in a file that's deleted once the app has read it. A saved login's password is never given to it. The server's form has a password field for an RDP server with its own login. A server opened in the RDP app through an SSH server keeps the same local address each time, so what the app remembers for it is found again. (Their [#242](https://github.com/SinaXhpm/submarine/pull/242); [#121](https://github.com/paulm981/Submarine/issues/121))
+
+## v0.4.0-fork.15
+
 - **Less lag with many tabs and in a Broadcast.**
   - Terminals in tabs you can't see no longer draw their output while it comes in. With many busy tabs open, that drawing slowed the terminal in front to a few frames a second, so what you typed showed up late. Hidden terminals still take in all their output and show it as soon as you look.
   - In a Broadcast, each key costs less: the Wall no longer redraws every tile per key, and terminals report back less often while little output comes in.

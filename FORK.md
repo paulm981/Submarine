@@ -11,7 +11,7 @@ This page covers:
 
 What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
-The fork is based on the original project's **0.4.0**, with every change up to [#229](https://github.com/SinaXhpm/submarine/pull/229), and [#233](https://github.com/SinaXhpm/submarine/pull/233)–[#237](https://github.com/SinaXhpm/submarine/pull/237), brought in.
+The fork is based on the original project's **0.4.0**, with every change up to [#229](https://github.com/SinaXhpm/submarine/pull/229), [#233](https://github.com/SinaXhpm/submarine/pull/233)–[#237](https://github.com/SinaXhpm/submarine/pull/237), [#241](https://github.com/SinaXhpm/submarine/pull/241) and [#242](https://github.com/SinaXhpm/submarine/pull/242) brought in.
 
 ## What this fork adds
 
@@ -252,18 +252,20 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | `HostKeyAlgorithms` in `~/.ssh/config` ([#170](https://github.com/SinaXhpm/submarine/pull/170)) | Its list decides which host keys are asked for first | Within its list, the kinds of key the app already trusts for the server are still asked for first, so a server with several keys doesn't look changed ([#43](https://github.com/paulm981/Submarine/issues/43)) |
 | Remote Desktop clipboard ([#234](https://github.com/SinaXhpm/submarine/pull/234)) | Text copied on the server goes to this computer's clipboard at once | Only while its tab is in front and the window has the focus; otherwise it waits in the tab's note, so a server can't swap what you paste into a terminal ([#131](https://github.com/paulm981/Submarine/issues/131)) |
 | Remote Desktop shared files ([#234](https://github.com/SinaXhpm/submarine/pull/234)) | A share follows the server record; on macOS and Linux any file in it opens, with no limit on how many | A share goes only to the address it was chosen for. On Linux the kernel's own files (`/proc` and the like) are refused, only folders are listed, and a listing shows a link's own details. On macOS and Linux a server can have at most 1,024 files open ([#131](https://github.com/paulm981/Submarine/issues/131)) |
+| "Save password" in a shared profile ([#241](https://github.com/SinaXhpm/submarine/pull/241)) | The tick starts on | It starts off, and a line under it says everyone in the profile gets the password ([#121](https://github.com/paulm981/Submarine/issues/121)) |
+| A VNC password typed at its prompt ([#241](https://github.com/SinaXhpm/submarine/pull/241)) | Saved to the server's saved login when it has one | Saved only into the server itself: no tick when it has a saved login, which VNC's weak protection mustn't carry ([#121](https://github.com/paulm981/Submarine/issues/121)) |
+| The password Remote Desktop Connection gets ([#242](https://github.com/SinaXhpm/submarine/pull/242)) | The server's saved password, or its saved login's | The server's own saved password only, never a saved login's: other servers use that login too ([#121](https://github.com/paulm981/Submarine/issues/121)) |
 | Website ([#229](https://github.com/SinaXhpm/submarine/pull/229)) | `website/` is published at `submarine.sinaxhpm.com` | The folder comes along with merges, unchanged, but the fork doesn't publish it: no workflow builds or deploys it |
 
 ## Changes in the original project not taken yet
 
-Every change up to [#229](https://github.com/SinaXhpm/submarine/pull/229) is taken, and so are [#233](https://github.com/SinaXhpm/submarine/pull/233)–[#237](https://github.com/SinaXhpm/submarine/pull/237). Where the fork takes one differently, the table above says so.
+Every change up to [#229](https://github.com/SinaXhpm/submarine/pull/229) is taken, and so are [#233](https://github.com/SinaXhpm/submarine/pull/233)–[#237](https://github.com/SinaXhpm/submarine/pull/237), [#241](https://github.com/SinaXhpm/submarine/pull/241) and [#242](https://github.com/SinaXhpm/submarine/pull/242). Where the fork takes one differently, the table above says so.
 
 Being brought in, in steps ([#121](https://github.com/paulm981/Submarine/issues/121)):
 
 | The original project's change | Step |
 |---|---|
-| [#241](https://github.com/SinaXhpm/submarine/pull/241), [#242](https://github.com/SinaXhpm/submarine/pull/242): "Save password" on prompts, the RDP app gets the saved password | Next, with fork rules: a saved login shared with other servers never goes to the RDP app or into a VNC password, and in a shared profile the tick starts off |
-| [#238](https://github.com/SinaXhpm/submarine/pull/238)–[#249](https://github.com/SinaXhpm/submarine/pull/249): search and history keys, RDP and VNC tab tools, VNC clipboard | Last |
+| [#238](https://github.com/SinaXhpm/submarine/pull/238)–[#249](https://github.com/SinaXhpm/submarine/pull/249): search and history keys, RDP and VNC tab tools, VNC clipboard | Next |
 
 ## Keeping up with the original project
 
