@@ -2999,6 +2999,15 @@ function DesktopApp() {
                       const idx = visibleIds.indexOf(sess.id);
                       const isVisible = idx >= 0;
                       const isFocused = activeView === sess.id;
+                      // A session with terminals that isn't on screen is left
+                      // out of the layout (display: none), not only made
+                      // invisible: xterm stops drawing only then, and 35
+                      // hidden tabs drawing their output slowed the one in
+                      // front to a few frames a second (#127). Its shell and
+                      // buffer keep running. A remote desktop keeps its size
+                      // instead, for the desktop it asks the server for.
+                      const remote = sess.protocol === "rdp" || sess.protocol === "vnc";
+                      const onScreen = isVisible && viewIsSession;
                       const style: React.CSSProperties = isVisible
                         ? {
                             position: 'absolute',
@@ -3006,13 +3015,16 @@ function DesktopApp() {
                             bottom: 0,
                             left: `${(idx * 100) / visibleIds.length}%`,
                             width: `${100 / visibleIds.length}%`,
+                            ...(onScreen || remote ? {} : { display: 'none' }),
                           }
-                        : {
-                            position: 'absolute',
-                            inset: 0,
-                            opacity: 0,
-                            pointerEvents: 'none',
-                          };
+                        : remote
+                          ? {
+                              position: 'absolute',
+                              inset: 0,
+                              opacity: 0,
+                              pointerEvents: 'none',
+                            }
+                          : { position: 'absolute', inset: 0, display: 'none' };
                       return (
                         <div
                           key={sess.id}
@@ -3113,6 +3125,7 @@ function DesktopApp() {
                                 onClose={getCloseHandler(sess.id)}
                                 onStatusChange={handleSessionStatus}
                                 isActiveView={isFocused}
+                                onScreen={onScreen}
                                 onPromptChange={handlePromptChange}
                               />
                             ) : (
@@ -3126,6 +3139,7 @@ function DesktopApp() {
                               onTerminalsChange={handleTerminalsChange}
                               chromeless={isVisible && isTiled && !isFocused}
                               isActiveView={isFocused}
+                              onScreen={onScreen}
                               compactTabs={appSettings.compactTabs}
                               onPromptChange={handlePromptChange}
                             />

@@ -125,7 +125,7 @@ export const startDiagnostics = () => {
   started = true;
 
   window.addEventListener("error", (e) => {
-    logLine("error", `uncaught: ${describe(e.error ?? e.message)}${e.filename ? ` (${e.filename}:${e.lineno})` : ""}`);
+    logLine("error", `uncaught: ${describe(e.error ?? e.message)}${e.filename ? ` (${e.filename}:${e.lineno}:${e.colno})` : ""}`);
   });
   window.addEventListener("unhandledrejection", (e) => {
     logLine("error", `unhandled rejection: ${describe(e.reason)}`);
@@ -144,12 +144,33 @@ export const startDiagnostics = () => {
     }
   };
   let last = performance.now();
+  // The window was hidden or shown since the last tick: the gap includes time
+  // it wasn't drawing (a hidden window's timers are slowed down on purpose,
+  // and a computer that sleeps stops them), so it's no freeze (#127).
+  let shownOrHidden = false;
+  // The page's own long tasks (over 50 ms), where the web view reports them
+  // (WebView2 does, WebKitGTK and WKWebView don't): a gap the page spent
+  // mostly outside them is the computer, not the window, being held up.
+  let busyMs = 0;
+  const longTasks = typeof PerformanceObserver !== "undefined" && (PerformanceObserver.supportedEntryTypes ?? []).includes("longtask");
+  if (longTasks) {
+    try {
+      new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) busyMs += e.duration;
+      }).observe({ type: "longtask" });
+    } catch {
+      /* not observable after all */
+    }
+  }
   window.setInterval(() => {
     const now = performance.now();
     const gap = now - last;
     last = now;
-    // A hidden window's timers are slowed down on purpose: not a freeze.
-    if (!document.hidden && gap > FREEZE_MS) {
+    const busy = busyMs;
+    busyMs = 0;
+    const changed = shownOrHidden;
+    shownOrHidden = false;
+    if (!document.hidden && !changed && gap > FREEZE_MS && (!longTasks || busy > gap / 2)) {
       const seconds = gap / 1000;
       freezes.push({ at: new Date(), seconds });
       if (freezes.length > 20) freezes.shift();
@@ -159,6 +180,7 @@ export const startDiagnostics = () => {
   }, 1000);
   document.addEventListener("visibilitychange", () => {
     last = performance.now();
+    shownOrHidden = true;
     beat();
   });
   beat();

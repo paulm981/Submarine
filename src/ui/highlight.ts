@@ -652,6 +652,10 @@ const HOLD_MS = 25;
  *  is still highlighted. What programs set is followed throughout. */
 const BUDGET_MS = 300;
 const TAIL_CHARS = 16 * 1024;
+/** The second the budget is counted in, and what was spent in it: one for
+ *  all terminals, since they share the window (each counting its own, 36 in
+ *  a Wall could take ten seconds a second between them, #127). */
+const budget = { start: 0, spent: 0 };
 
 /** Plain text that may be highlighted, with the attributes it's printed in
  *  (a highlight's codes put back what they change). */
@@ -672,8 +676,6 @@ export class HighlightStream {
   private held: Plain | null = null;
   private timer = 0;
   private matcher: Matcher | null = null;
-  private budgetStart = 0;
-  private spent = 0;
 
   /** `late`: text held back at the end of a batch, once it's done waiting. */
   constructor(private readonly late: (text: string) => void) {}
@@ -719,9 +721,9 @@ export class HighlightStream {
       this.timer = 0;
     }
     const t0 = performance.now();
-    if (t0 - this.budgetStart > 1000) {
-      this.budgetStart = t0;
-      this.spent = 0;
+    if (t0 - budget.start > 1000) {
+      budget.start = t0;
+      budget.spent = 0;
     }
     const text = this.decoder.decode(bytes, { stream: true });
     const parts = this.parse(text);
@@ -736,8 +738,8 @@ export class HighlightStream {
         if (t) this.late(t);
       }, HOLD_MS);
     }
-    const out = this.render(parts, this.spent > BUDGET_MS ? tailStart(parts) : 0);
-    this.spent += performance.now() - t0;
+    const out = this.render(parts, budget.spent > BUDGET_MS ? tailStart(parts) : 0);
+    budget.spent += performance.now() - t0;
     return out;
   }
 

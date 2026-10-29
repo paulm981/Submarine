@@ -87,8 +87,11 @@ interface WallLine {
   typed: string;
 }
 const wallLines = new Map<string, WallLine>();
+// The same terminals in the line. Not their marks: every key the Wall types
+// gives each a new one, and comparing those redrew every tile on every key
+// (#127). Which tiles wait for the next line is worked out when it draws.
 const sameMembers = (a: Map<string, number>, b: Map<string, number>) =>
-  a.size === b.size && [...a].every(([tid, shell]) => b.get(tid) === shell);
+  a.size === b.size && [...a.keys()].every((tid) => b.has(tid));
 
 // What a confirm shows of the text about to go out.
 const preview = (text: string) => {

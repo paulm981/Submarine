@@ -9,6 +9,15 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Less lag with many tabs and in a Broadcast.**
+  - Terminals in tabs you can't see no longer draw their output while it comes in. With many busy tabs open, that drawing slowed the terminal in front to a few frames a second, so what you typed showed up late. Hidden terminals still take in all their output and show it as soon as you look.
+  - In a Broadcast, each key costs less: the Wall no longer redraws every tile per key, and terminals report back less often while little output comes in.
+  - Output highlighting now has one time limit shared by all terminals, so many terminals at once can't slow the window down.
+  - Diagnostics no longer report "the window was stuck" when it was only hidden, minimized, or the computer was asleep.
+  - ([#127](https://github.com/paulm981/Submarine/issues/127))
+
+## v0.4.0-fork.14
+
 ### From the original project
 
 - **Speed and quality for Remote Desktop (built-in client) and VNC.** A server's form has **Speed and quality**. For RDP you can choose the colours, desktop effects, the network type and whether to offer RemoteFX. For VNC you can choose the encoding, the colours and the most updates per second. The choices are kept on this computer only. A server you don't change connects exactly as before. (Their [#233](https://github.com/SinaXhpm/submarine/pull/233); [#121](https://github.com/paulm981/Submarine/issues/121))
