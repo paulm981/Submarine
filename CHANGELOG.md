@@ -25,6 +25,7 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
   - Only plain text (ASCII) is shared; the tab says why when text can't go. The clipboard is on by default; you can turn it off per server.
   - Like the Remote Desktop tab, VNC gets a connection mark, a **Settings** panel and a pause while the tab is hidden, which is on by default.
   - A busy screen no longer falls seconds behind, and resizing the window works more reliably.
+  - A Remote Desktop or VNC server that stops taking what you send, or floods the connection, now ends its own session. Before, its tab froze and closing it left the connection open, or it could use up the app's memory.
   - (Their [#247](https://github.com/SinaXhpm/submarine/pull/247) and [#249](https://github.com/SinaXhpm/submarine/pull/249); [#121](https://github.com/paulm981/Submarine/issues/121))
 
 ## v0.4.0-fork.16
