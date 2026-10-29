@@ -44,6 +44,10 @@ export default function VncSessionView({ session, displayName, onClose, onStatus
   // paste didn't go to the server.
   const [shareClipboard, setShareClipboard] = useState(false);
   const [serverCopy, setServerCopy] = useState<string | null>(null);
+  // Whether you're looking at this tab: the server's text goes to this
+  // computer's clipboard on its own only then (see vnc-clipboard below).
+  const inFrontRef = useRef(isActiveView);
+  inFrontRef.current = isActiveView;
   const [pasteNote, setPasteNote] = useState<string | null>(null);
   // The tab's tools: this server's options on this device as the settings
   // panel changes them, the ones the session now open was opened with, and
@@ -161,12 +165,20 @@ export default function VncSessionView({ session, displayName, onClose, onStatus
       }),
       listen(`vnc-link-${id}`, (e: any) => setLink(e.payload as LinkStats)),
       // Text the user copied on the server, for this device's clipboard.
+      // Only while this tab is in front and the window has the focus, as in
+      // the RDP tab: a server that copies while you work elsewhere (in a
+      // terminal, say) could otherwise swap what you're about to paste there.
+      // Then its text waits in the note above the desktop, for you to copy.
       listen(`vnc-clipboard-${id}`, (e: any) => {
         const text = String(e.payload?.text ?? "");
-        navigator.clipboard.writeText(text).then(
-          () => setServerCopy(null),
-          () => setServerCopy(text),
-        );
+        if (!inFrontRef.current || !document.hasFocus()) {
+          setServerCopy(text);
+        } else {
+          navigator.clipboard.writeText(text).then(
+            () => setServerCopy(null),
+            () => setServerCopy(text),
+          );
+        }
         // The server sends its clipboard as Latin-1; the VNC library reads it as
         // UTF-8, so a character beyond ASCII arrives as a replacement mark.
         if (text.includes("\uFFFD")) {
