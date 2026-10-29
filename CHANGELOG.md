@@ -11,6 +11,11 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 - **The graphics card draws the terminals you can see.** It can draw only about 16 terminals at once. In a Wall of 36, the terminals that kept it used to be simply the last ones opened, hidden tabs included, while tiles on screen drew the slower way. Now at most 12 terminals use it, and a terminal on screen comes first: it takes a free place, or one from a terminal you can't see. Switching between a few tabs keeps theirs. **Copy diagnostics** shows how many are in use. ([#127](https://github.com/paulm981/Submarine/issues/127))
 - **Check that a download came from this project.** Each release file now carries a signed record of the repository, workflow and commit it was built from. The release notes and the README show the one command that checks it. ([#48](https://github.com/paulm981/Submarine/issues/48))
+- **Fixes for setting up sync through a folder or git repository.**
+  - Opening another profile while setup is still running no longer links that profile instead, and no longer undoes its own sync settings.
+  - Two computers that set up sync before the folder had copied either one's files now find each other at their next sync and share one folder. Before, each kept syncing only with itself.
+  - A computer on an older version no longer clears a server's color scheme or highlight set on your other computers.
+  - ([#50](https://github.com/paulm981/Submarine/issues/50))
 
 ## v0.4.0-fork.17
 
