@@ -10999,6 +10999,8 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     let mut empty_rounds = 0u32;
     // The user's answer to the server's password question, ticked "Save password".
     let mut to_save: Option<zeroize::Zeroizing<String>> = None;
+    // The user was asked a password question already (secret_policy::kbi_round).
+    let mut password_asked = false;
 
     loop {
         match resp {
@@ -11106,7 +11108,12 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
                     .map(|p| serde_json::json!({ "prompt": p.prompt, "echo": p.echo }))
                     .collect();
                 // Only the server's own password question offers the tick: never a code.
-                let password_question = save_to.is_some() && prompts.len() == 1 && is_password_prompt(&prompts[0].prompt, prompts[0].echo);
+                let password_like = prompts.len() == 1 && is_password_prompt(&prompts[0].prompt, prompts[0].echo);
+                let (offer, forget) = secret_policy::kbi_round(password_like, &mut password_asked);
+                let password_question = save_to.is_some() && offer;
+                if forget {
+                    to_save = None;
+                }
                 let mut payload = serde_json::json!({
                     "nonce": nonce,
                     "name": name,
@@ -12528,7 +12535,7 @@ async fn login_hop(
         };
     // A login name typed here isn't saved, so neither is its password: the
     // next login could be under another name.
-    if user_prompted {
+    if !secret_policy::may_save_for_login(user_prompted, &saved_user) {
         prompt_ctx.save_to = None;
     }
     // For a jump host that asks for the password through keyboard-interactive
@@ -13033,6 +13040,8 @@ async fn initiate_connection(
     // Quick connect bypasses the DB lookup entirely — we fabricate the
     // same tuple shape from the inline values so all downstream code
     // (auth, tunnel-start, handler setup) doesn't need to branch.
+    // A quick connect has no saved server to save a typed password to.
+    let saved_server = quick_auth.is_none();
     let db_res = if let Some(q) = quick_auth.as_ref() {
         let key_data = q.private_key
             .clone()
@@ -13630,7 +13639,7 @@ async fn initiate_connection(
                     attempt: &attempt,
                     cancelled: std::sync::atomic::AtomicBool::new(false),
                     // Not for a quick connect (no saved server) or a key login.
-                    save_to: if server_id > 0 && key_data.is_none() { SaveTarget::for_server(&app, server_id) } else { None },
+                    save_to: if saved_server && server_id > 0 && key_data.is_none() { SaveTarget::for_server(&app, server_id) } else { None },
                     agent: AgentSlot::new(use_agent, identity_agent.clone(), identities.clone()),
                     session_unusable: std::sync::atomic::AtomicBool::new(false),
                 };
@@ -13642,8 +13651,10 @@ async fn initiate_connection(
                     };
                 if user_prompted {
                     emit_log(&format!("Logging in as {}.", effective_user.as_str()), "info");
-                    // A login name typed here isn't saved, so neither is its
-                    // password: the next login could be under another name.
+                }
+                // A login name typed here isn't saved, so neither is its
+                // password: the next login could be under another name.
+                if !secret_policy::may_save_for_login(user_prompted, &saved_user) {
                     prompt_ctx.save_to = None;
                 }
 
@@ -14440,8 +14451,15 @@ async fn kbi_save_choice(state: tauri::State<'_, SshState>, nonce: String, save:
     Ok(())
 }
 
-/// `save_prompted_password`'s database step: where the password goes, and the
-/// words for where it went.
+/// `save_prompted_password`'s database step, once the profile is known to be
+/// the one the login started in: the fork's checks (secret_policy), then the
+/// save itself.
+fn save_typed_password(conn: &rusqlite::Connection, to: &SaveTarget, password: &str) -> Result<String, String> {
+    secret_policy::may_save_now(conn, to.server_id, to.fingerprint, to.vnc)?;
+    store_prompted_password(conn, to.server_id, password)
+}
+
+/// Where a typed password goes, and the words for where it went.
 fn store_prompted_password(conn: &rusqlite::Connection, server_id: i32, password: &str) -> Result<String, String> {
     // The server's saved login, when it has one that is still there.
     let (auth_type, credential_id, login_name, login_type): (Option<String>, Option<i32>, Option<String>, Option<String>) = conn
@@ -14561,7 +14579,7 @@ async fn save_prompted_password(app: &tauri::AppHandle, to: SaveTarget, password
         // Not into a profile opened since the login started (its server with
         // the same id is another one).
         db_state.still_open(to.generation)?;
-        store_prompted_password(conn, to.server_id, password)?
+        save_typed_password(conn, &to, password)?
     };
     save_vault_async(&db_state).await?;
     let _ = app.emit("server-password-saved", serde_json::json!({ "serverId": to.server_id }));
@@ -14586,6 +14604,11 @@ struct SaveTarget {
     /// The profile is shared: a password saved reaches everyone in it
     /// (secret_policy E4).
     shared: bool,
+    /// The server as it was when the prompt was shown: a password is saved
+    /// only if it still is (secret_policy::save_fingerprint).
+    fingerprint: u64,
+    /// A VNC server's: saved only while it has no saved login (E3).
+    vnc: bool,
 }
 
 impl SaveTarget {
@@ -14594,8 +14617,10 @@ impl SaveTarget {
         use tauri::Manager;
         let db_state = app.state::<DbState>();
         let guard = db_state.conn.lock().ok()?;
-        let shared = secret_policy::saving_reaches_others(guard.as_ref()?);
-        Some(Self { server_id, generation: db_state.generation_now(), ticked: !shared, keys: false, shared })
+        let conn = guard.as_ref()?;
+        let shared = secret_policy::saving_reaches_others(conn);
+        let fingerprint = secret_policy::save_fingerprint(conn, server_id)?;
+        Some(Self { server_id, generation: db_state.generation_now(), ticked: !shared, keys: false, shared, fingerprint, vnc: false })
     }
 
     /// The same for a VNC server, unless it has a saved login: a VNC password
@@ -14605,7 +14630,7 @@ impl SaveTarget {
         let to = Self::for_server(app, server_id)?;
         let db_state = app.state::<DbState>();
         let guard = db_state.conn.lock().ok()?;
-        secret_policy::vnc_may_save(guard.as_ref()?, server_id).then_some(to)
+        secret_policy::vnc_may_save(guard.as_ref()?, server_id).then_some(Self { vnc: true, ..to })
     }
 
     /// The "Save password" tick's JSON for a prompt, with a line under it when
@@ -15666,13 +15691,13 @@ fn rdp_share_drives() -> Vec<String> {
     rdp_share::drives()
 }
 
-/// Whose an RDP server's saved password is: its address and the login it uses
-/// (its own user, or which saved login and that login's user). An open tab
+/// Whose an RDP server's saved password is: its address, its jump host and the
+/// login it uses (its own user, or which saved login and that login's user). An open tab
 /// still goes where it went, so "Open again" hands the password on only while
 /// this is unchanged.
 fn rdp_login_key(conn: &rusqlite::Connection, server_id: i32) -> Option<String> {
     conn.query_row(
-        "SELECT COALESCE(s.host, '') || ':' || COALESCE(s.port, 0) || '|' ||
+        "SELECT COALESCE(s.host, '') || ':' || COALESCE(s.port, 0) || '|' || COALESCE(s.jump_host_id, 0) || '|' ||
                 CASE WHEN COALESCE(s.auth_type, 'vault') = 'vault'
                      THEN 'login ' || COALESCE(c.id, 0) || ' ' || COALESCE(c.username, '')
                      ELSE 'own ' || COALESCE(s.username, '') END
@@ -15733,9 +15758,9 @@ mod rdp_saved_password_tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE credentials(id INTEGER PRIMARY KEY, username TEXT);
-             CREATE TABLE servers(id INTEGER PRIMARY KEY, host TEXT, port INTEGER, username TEXT, auth_type TEXT, credential_id INTEGER);
+             CREATE TABLE servers(id INTEGER PRIMARY KEY, host TEXT, port INTEGER, username TEXT, auth_type TEXT, credential_id INTEGER, jump_host_id INTEGER);
              INSERT INTO credentials VALUES (7, 'alice'), (8, 'bob');
-             INSERT INTO servers VALUES (1, 'a.example', 3389, 'carol', 'custom_pass', NULL), (2, 'b.example', 3389, NULL, 'vault', 7);",
+             INSERT INTO servers VALUES (1, 'a.example', 3389, 'carol', 'custom_pass', NULL, NULL), (2, 'b.example', 3389, NULL, 'vault', 7, NULL);",
         )
         .unwrap();
         let key = |id| rdp_login_key(&conn, id);
@@ -15744,10 +15769,12 @@ mod rdp_saved_password_tests {
         assert_eq!(key(99), None);
         // Nothing changed: the same.
         assert_eq!(key(1), own);
-        // Another address, port, user, saved login or that login's user: not the same.
+        // Another address, port, jump host, user, saved login or that login's
+        // user: not the same.
         for change in [
             "UPDATE servers SET host = 'c.example' WHERE id = 1",
             "UPDATE servers SET port = 3390 WHERE id = 1",
+            "UPDATE servers SET jump_host_id = 5 WHERE id = 1",
             "UPDATE servers SET username = 'dave' WHERE id = 1",
         ] {
             conn.execute_batch(change).unwrap();
@@ -16442,6 +16469,9 @@ async fn rdp_open_again(
     let (launcher, windows) = {
         let mut map = rdp_sessions.lock().await;
         let session = map.get_mut(&session_id).ok_or("This RDP tab isn't open any more")?;
+        if session.forward_gone() {
+            return Err("This tab's way through the SSH server has closed. Reconnect the tab, then open it again.".into());
+        }
         if let Some(options) = options {
             session.options = options.checked();
         }

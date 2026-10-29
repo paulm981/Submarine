@@ -15,9 +15,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
   - The tick starts off when the login also tried keys, or when the profile is shared. In a shared profile, a line under the tick says everyone in it gets the password.
   - When the saved login is used by other servers too, a line under the tick names them.
   - A VNC password is saved only into the server itself: there's no tick when a VNC server has a saved login.
+  - Nothing is saved if the server was changed while you logged in, for example by someone else in a shared profile. Only the first password a server asks for is offered for saving, and only when the login name is the server's saved one.
   - A saved Remote Desktop or VNC password that was refused isn't tried again on reconnect.
   - (Their [#241](https://github.com/SinaXhpm/submarine/pull/241); [#121](https://github.com/paulm981/Submarine/issues/121))
-- **Remote Desktop Connection gets the server's saved password.** On Windows, Remote Desktop Connection is given the server's own saved password, encrypted for your Windows account, in a file that's deleted once the app has read it. A saved login's password is never given to it. The server's form has a password field for an RDP server with its own login. A server opened in the RDP app through an SSH server keeps the same local address each time, so what the app remembers for it is found again. (Their [#242](https://github.com/SinaXhpm/submarine/pull/242); [#121](https://github.com/paulm981/Submarine/issues/121))
+- **Remote Desktop Connection gets the server's saved password.** On Windows, Remote Desktop Connection is given the server's own saved password, encrypted for your Windows account, in a file that's deleted once the app has read it. A saved login's password is never given to it. The server's form has a password field for an RDP server with its own login. A server opened in the RDP app through an SSH server keeps the same local address each time, so what the app remembers for it is found again. **Open again** doesn't send the password once the tab's connection through the SSH server has closed. (Their [#242](https://github.com/SinaXhpm/submarine/pull/242); [#121](https://github.com/paulm981/Submarine/issues/121))
 
 ## v0.4.0-fork.15
 

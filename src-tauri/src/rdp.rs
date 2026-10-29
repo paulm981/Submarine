@@ -56,6 +56,12 @@ pub struct RdpSession {
 }
 
 impl RdpSession {
+    /// The forward through the SSH server has ended (its route closed): the
+    /// address the RDP app would be sent to is free for anyone to take.
+    pub fn forward_gone(&self) -> bool {
+        self.accept.as_ref().is_some_and(|task| task.is_finished())
+    }
+
     pub fn direct(server_id: i32, address: String, username: String, options: RdpOptions) -> Self {
         Self { _route: Arc::new(Vec::new()), accept: None, server_id, login: None, address, username, options, file: None, windows: Arc::default() }
     }
@@ -384,6 +390,22 @@ fn files_dir() -> PathBuf {
     std::env::temp_dir().join("submarine-rdp")
 }
 
+/// Whether the folder is this user's own, not a link (on Linux and macOS the
+/// temp folder is shared, and another user could make it first, with links
+/// in it). Always on Windows, where it's in the user's own temp folder.
+fn own_dir(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir() && m.uid() == unsafe { libc::getuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        true
+    }
+}
+
 /// Writes the session's `.rdp` (or `.remmina`) file into this user's temp
 /// folder (readable by this user only on Unix) and returns its path. The
 /// name carries this process's id: another copy of Submarine (a portable
@@ -391,10 +413,14 @@ fn files_dir() -> PathBuf {
 pub fn write_file(session_id: &str, ext: &str, contents: &str) -> Result<PathBuf, String> {
     let dir = files_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't make the folder for the .rdp file: {e}"))?;
+    if !own_dir(&dir) {
+        return Err(format!("{} isn't this user's own folder, so the .rdp file wasn't written there", dir.display()));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("couldn't make the folder for the .rdp file private: {e}"))?;
     }
     let safe: String = session_id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
     let path = dir.join(format!("{}-{safe}.{ext}", std::process::id()));
@@ -419,23 +445,37 @@ pub fn write_file(session_id: &str, ext: &str, contents: &str) -> Result<PathBuf
 /// Desktop Connection has read it (30 s at most), so an older one was left by
 /// a copy that ended first.
 pub fn clear_old_files() {
-    let Ok(entries) = std::fs::read_dir(files_dir()) else { return };
+    let dir = files_dir();
+    if !own_dir(&dir) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
     let day = std::time::Duration::from_secs(24 * 60 * 60);
     let minute = std::time::Duration::from_secs(60);
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(age) = entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()) else { continue };
+        // Only plain files: the folder is checked to be this user's, but not
+        // what was put in it before.
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
         let rdp = path.extension().is_some_and(|e| e == "rdp");
         let ours = rdp || path.extension().is_some_and(|e| e == "remmina");
-        if ours && (age > day || (rdp && age > minute && holds_password(&path))) {
+        // Only Remote Desktop Connection, on Windows, is ever given a password.
+        if ours && (age > day || (cfg!(windows) && rdp && age > minute && holds_password(&path))) {
             let _ = std::fs::remove_file(path);
         }
     }
 }
 
 /// Whether an `.rdp` file carries a password (`password 51:b:`), in either of
-/// the encodings `file_bytes` writes.
+/// the encodings `file_bytes` writes. A file bigger than any this app writes
+/// isn't read.
 fn holds_password(path: &Path) -> bool {
+    if std::fs::metadata(path).map_or(true, |m| m.len() > 64 * 1024) {
+        return false;
+    }
     let Ok(bytes) = std::fs::read(path) else { return false };
     let text = match bytes.strip_prefix(&[0xFF, 0xFE]) {
         Some(utf16) => String::from_utf16_lossy(&utf16.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>()),
