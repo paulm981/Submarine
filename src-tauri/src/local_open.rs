@@ -200,7 +200,8 @@ fn open_in_text_editor(file: &Path) -> Result<(), String> {
     if !query.status.success() || !is_desktop_id(&id) {
         return Err(pick_one.into());
     }
-    let mut child = std::process::Command::new("gtk-launch")
+    // Without this app's own WebKit variables (child_env.rs).
+    let mut child = crate::child_env::clean(&mut std::process::Command::new("gtk-launch"))
         .arg(&id)
         .arg(file)
         .spawn()
@@ -231,7 +232,7 @@ fn start_editor(editor: &Path, file: &Path) -> Result<(), String> {
     } else {
         std::process::Command::new(editor)
     };
-    let mut child = cmd
+    let mut child = crate::child_env::clean(&mut cmd)
         .arg(file)
         .spawn()
         .map_err(|e| format!("couldn't start {}: {}", editor.display(), e))?;

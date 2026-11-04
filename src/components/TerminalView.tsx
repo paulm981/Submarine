@@ -28,6 +28,7 @@ import { readUseLocalShell } from '../util/terminalShell';
 import { IS_ANDROID, IS_LINUX, IS_WINDOWS } from '../util/platform';
 import { readClipboardText } from '../util/clipboard';
 import { readUseSshAgent } from '../util/sshAgent';
+import { parseOsc1337, parseOsc7, type ShellFolder } from '../util/shellFolder';
 
 // Does the recent remote OUTPUT look like a no-echo password / passphrase
 // prompt? Used to skip command-history capture so typed secrets (sudo, su,
@@ -129,6 +130,26 @@ const cycleMod = (s: "off" | "armed" | "locked"): "off" | "armed" | "locked" =>
 // it is given, so each of those left the screen garbled and the cursor out
 // of place.
 const PTY_SIZE_SETTLE_MS = 150;
+// How often a terminal tells the backend what it drew of the output, while
+// output comes in. The backend hands it no more than it draws (Outflow in
+// ssh_manager.rs), so a flood waits there, bounded, not in this page.
+const DRAWN_REPORT_MS = 50;
+// The end of the output that the password-prompt check looks at.
+const PROMPT_TAIL = 2048;
+
+// Output as bytes: straight from base64 where the web view can, which makes
+// none of the big strings a flood left behind for the garbage collector.
+const fromBase64 = (Uint8Array as unknown as { fromBase64?: (s: string) => Uint8Array }).fromBase64?.bind(Uint8Array);
+const decodeOutput = (b64: string): Uint8Array => {
+  if (fromBase64) return fromBase64(b64);
+  const bin = atob(b64);
+  const data = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) data[i] = bin.charCodeAt(i);
+  return data;
+};
+
+// How long the cursor goes on blinking after the last key, click or focus.
+const CURSOR_BLINK_IDLE_MS = 10_000;
 
 // A container's terminal that needed root, and the password wasn't given.
 // A Home terminal on Windows runs in a pseudo-console (ConPTY), which wraps
@@ -158,6 +179,7 @@ const TerminalView = ({
   telnet = false,
   ownLogin = false,
   quickAuth = null,
+  onFolder,
 }: {
   sessionId: string;
   terminalId: string;
@@ -229,20 +251,21 @@ const TerminalView = ({
   ownLogin?: boolean;
   /// A quick connect's login (it has no saved server), for `ownLogin`.
   quickAuth?: unknown;
+  /// The folder the shell says it is in (OSC 7 or OSC 1337 CurrentDir, see
+  /// util/shellFolder), for the SFTP panel's Follow (#245). Reported at
+  /// every prompt; the parent keeps what changed.
+  onFolder?: (terminalId: string, path: string, host: string) => void;
 }) => {
   const commands = local ? LOCAL_COMMANDS : SSH_COMMANDS;
 
   // What draws this terminal's output (set up with its xterm, below). Each
   // open — the first and every reconnect — passes a fresh channel to the
   // backend that hands its messages to it.
-  // It's told which channel each batch came over (its id), which is what the
-  // batch is acknowledged under: after a reconnect, what's still being drawn
-  // from the old channel isn't counted for the new one.
-  const outputRef = useRef<((data: Uint8Array, channel: number) => void) | null>(null);
+  const outputRef = useRef<((data: Uint8Array) => void) | null>(null);
   // Syntax highlighting of the output (src/ui/highlight.ts).
   const highlightRef = useRef<HighlightStream | null>(null);
   const outputChannel = () => {
-    const ch: Channel<ArrayBuffer> = new Channel<ArrayBuffer>((buf) => outputRef.current?.(new Uint8Array(buf), ch.id));
+    const ch: Channel<ArrayBuffer> = new Channel<ArrayBuffer>((buf) => outputRef.current?.(new Uint8Array(buf)));
     return ch;
   };
 
@@ -437,6 +460,8 @@ const TerminalView = ({
   const rootInvoke = useRootInvoke();
   const confirmRef = useRef(confirm);
   confirmRef.current = confirm;
+  const onFolderRef = useRef(onFolder);
+  onFolderRef.current = onFolder;
   // The terminal's input handler (what xterm's onData runs), for keys that
   // don't come from xterm itself — the mobile key bar's arrows and symbols.
   const inputRef = useRef<((data: string) => void) | null>(null);
@@ -969,7 +994,41 @@ const TerminalView = ({
     home.appendChild(dock);
     dockElRef.current = dock;
     setDockEl(dock);
+    // The folder the shell says it is in (#245); xterm has no use of its own
+    // for these. OSC 1337 carries other iTerm2 commands too, which stay ignored.
+    const folder = (f: ShellFolder | null) => {
+      if (f) onFolderRef.current?.(terminalId, f.path, f.host);
+      return !!f;
+    };
+    term.parser.registerOscHandler(7, (data) => { folder(parseOsc7(data)); return true; });
+    term.parser.registerOscHandler(1337, (data) => folder(parseOsc1337(data)));
     term.open(host);
+
+    // The cursor blinks while the terminal is in use and holds still
+    // CURSOR_BLINK_IDLE_MS after the last key, click or focus, the way Windows
+    // and GNOME stop a caret blinking. xterm's DOM renderer blinks with a CSS
+    // animation the browser redraws at every frame: a focused terminal left
+    // alone cost about 5% of a CPU core for it.
+    let lastUse = Date.now();
+    let blinkTimer: number | null = null;
+    const blinkCheck = () => {
+      const left = lastUse + CURSOR_BLINK_IDLE_MS - Date.now();
+      if (left > 0) {
+        blinkTimer = window.setTimeout(blinkCheck, left);
+        return;
+      }
+      blinkTimer = null;
+      term.options.cursorBlink = false;
+    };
+    const markUsed = () => {
+      lastUse = Date.now();
+      if (!term.options.cursorBlink) term.options.cursorBlink = true;
+      if (blinkTimer === null) blinkTimer = window.setTimeout(blinkCheck, CURSOR_BLINK_IDLE_MS);
+    };
+    markUsed();
+    const blinkTextarea = term.textarea;
+    blinkTextarea?.addEventListener('focus', markUsed);
+    host.addEventListener('mousedown', markUsed);
 
     // Draw with the GPU (xterm's WebGL renderer) unless Settings turned it
     // off, while there's a context for it (src/ui/gpuSlots.ts: terminals on
@@ -1123,6 +1182,7 @@ const TerminalView = ({
       // A Wall's line isn't this one's whole any more — unless this is only
       // the terminal saying it got or lost the focus (for vim, tmux).
       if (data !== '\x1b[I' && data !== '\x1b[O') markTyped(terminalId);
+      markUsed();
       showPasswordButton(false);
       // A paste: our right-click path, or xterm's own keyboard paste, which
       // starts with the bracketed-paste marker when the remote program asked
@@ -1447,34 +1507,27 @@ const TerminalView = ({
       }, PTY_SIZE_SETTLE_MS);
     });
 
-    // Output: raw bytes over the channel the terminal was opened with. Once
-    // xterm has processed a batch it's acknowledged, which is what lets the
-    // backend send more (src-tauri/src/term_output.rs): a stream faster than
-    // this window can draw waits there instead of piling up here. Acks are
-    // grouped, at most one per ACK_EVERY bytes or ACK_IDLE_MS, and each names
-    // the channel its output came over. ACK_EVERY is well under the backend's
-    // 1 MiB window, so the slower idle ack never holds output back; it spares
-    // a call per terminal per key in a Wall of many (#127).
-    const ACK_EVERY = 128 * 1024;
-    const ACK_IDLE_MS = 1000;
-    let unacked = 0;
-    let ackChannel = 0;
-    let ackTimer = 0;
-    const sendAck = () => {
-      if (ackTimer) window.clearTimeout(ackTimer);
-      ackTimer = 0;
-      const bytes = unacked;
-      unacked = 0;
-      if (bytes > 0) invoke('terminal_output_ack', { terminalId, channel: ackChannel, bytes }).catch(() => {});
+    // What this view drew of the output goes back (DRAWN_REPORT_MS): one
+    // call while output comes, none when it doesn't. The backend keeps what
+    // is on its way to this page bounded with it (ssh_manager::Outflow): a
+    // stream faster than this window can draw waits there instead of piling
+    // up here.
+    let drawnBytes = 0;
+    let drawnTimer = 0;
+    const drew = (n: number) => {
+      drawnBytes += n;
+      if (drawnTimer) return;
+      drawnTimer = window.setTimeout(() => {
+        drawnTimer = 0;
+        invoke('terminal_drawn', { terminalId, bytes: drawnBytes }).catch(() => {});
+        drawnBytes = 0;
+      }, DRAWN_REPORT_MS);
     };
-    const processed = (channel: number, bytes: number) => {
+    const processed = (bytes: number) => {
       lineBudget = LINE_BUDGET;
       charBudget = CHAR_BUDGET;
       noteTerminalParsed(terminalId, bytes);
-      if (channel !== ackChannel) { sendAck(); ackChannel = channel; }
-      unacked += bytes;
-      if (unacked >= ACK_EVERY) sendAck();
-      else if (!ackTimer) ackTimer = window.setTimeout(sendAck, ACK_IDLE_MS);
+      drew(bytes);
     };
     // Highlighting: the server's own set, or this device's (applyLook
     // follows changes to either). Off, output goes to xterm as it came.
@@ -1482,19 +1535,23 @@ const TerminalView = ({
     highlightRef.current = highlighter;
     let matcher: Matcher | null = matcherForServer(serverId);
     highlighter.setMatcher(matcher, false);
-    outputRef.current = (data: Uint8Array, channel: number) => {
+    outputRef.current = (data: Uint8Array) => {
       const w = readyWatchRef.current;
       if (w) { window.clearTimeout(w.quiet); w.quiet = window.setTimeout(shellReady, SHELL_QUIET_MS); }
       // Counted for the freeze watchdog: received, and still to be drawn.
       // xterm buffers a multibyte sequence split across batches.
       noteTerminalOutput(terminalId, data.length);
       if (!local) noteOutput(terminalId, data);
-      if (highlighter.active) term.write(highlighter.push(data), () => processed(channel, data.length));
-      else term.write(data, () => processed(channel, data.length));
+      // Drawn once xterm has taken it in; also when xterm turned it away
+      // (past its own limit), so the count stays true.
+      try {
+        if (highlighter.active) term.write(highlighter.push(data), () => processed(data.length));
+        else term.write(data, () => processed(data.length));
+      } catch { processed(data.length); }
       // Keep a short tail of decoded output so command-history capture can
       // recognize a no-echo password prompt and skip the typed secret.
       try {
-        const txt = new TextDecoder().decode(data);
+        const txt = new TextDecoder().decode(data.length > PROMPT_TAIL ? data.subarray(data.length - PROMPT_TAIL) : data);
         const combined = recentOutputRef.current + txt;
         recentOutputRef.current = combined.length > 512 ? combined.slice(-512) : combined;
         showPasswordButton(looksLikePasswordPrompt(recentOutputRef.current));
@@ -1681,12 +1738,16 @@ const TerminalView = ({
       stopReadyWatch();
       fontDisposed = true;
       ptyDisposed = true;
+      if (blinkTimer !== null) window.clearTimeout(blinkTimer);
+      blinkTextarea?.removeEventListener('focus', markUsed);
+      host.removeEventListener('mousedown', markUsed);
       window.removeEventListener('submarine-settings-changed', handleSettingsChange);
       resizeObserver.disconnect();
       onDataDisposable.dispose();
       if (inputRef.current === handleData) inputRef.current = null;
       onResizeDisposable.dispose();
       window.clearTimeout(sizeTimer);
+      window.clearTimeout(drawnTimer);
       host.removeEventListener('mousedown', onMouseDown);
       host.removeEventListener('contextmenu', onContextMenu);
       host.removeEventListener('paste', onPasteEvent, true);
@@ -1697,7 +1758,6 @@ const TerminalView = ({
       outputRef.current = null;
       highlighter.dispose();
       if (highlightRef.current === highlighter) highlightRef.current = null;
-      if (ackTimer) window.clearTimeout(ackTimer);
       searchAddon.dispose();
       searchAddonRef.current = null;
       webgl?.dispose();

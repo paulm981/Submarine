@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::task::JoinSet;
 
 use crate::ssh_manager::ClientHandler;
@@ -244,7 +244,7 @@ async fn set_state(app: &AppHandle, status: &Arc<Mutex<MirrorStatus>>, new: &str
 /// Open a dedicated SFTP session on the SSH handle. Each mirror gets its
 /// own subsystem channel so it doesn't contend with the file browser or
 /// another mirror task on a shared one.
-async fn open_sftp(handle: &Arc<Mutex<russh::client::Handle<ClientHandler>>>) -> Result<SftpSession, String> {
+async fn open_sftp(handle: &Arc<RwLock<russh::client::Handle<ClientHandler>>>) -> Result<SftpSession, String> {
     // A server without SFTP gets file access over shell commands.
     crate::open_sftp(handle).await.map(|(sftp, _)| sftp).map_err(|e| format!("sftp init: {}", e))
 }
@@ -281,10 +281,23 @@ async fn sftp_remote_mtime(sftp: &SftpSession, path: &str) -> Option<u64> {
     attr.mtime.map(|t| t as u64)
 }
 
-/// Stream a file to SFTP in 64 KiB chunks. We do NOT set the remote mtime
-/// after upload — some SFTP servers truncated the file on a round-tripped
-/// SETSTAT. Subsequent dry-runs fall back to hash compare, which catches
-/// real changes correctly.
+/// The attributes that give a copy the local file's times and nothing else.
+/// A SETSTAT carrying only these (ACMODTIME) can't touch the size; what some
+/// SFTP servers truncated a file on was every attribute sent back. Both times
+/// go: with one of them alone the other would be sent as 0.
+fn times_of(meta: &std::fs::Metadata) -> Option<FileAttributes> {
+    let secs = |t: std::io::Result<std::time::SystemTime>| {
+        t.ok()?.duration_since(UNIX_EPOCH).ok().and_then(|d| u32::try_from(d.as_secs()).ok())
+    };
+    let mtime = secs(meta.modified())?;
+    Some(FileAttributes { atime: Some(secs(meta.accessed()).unwrap_or(mtime)), mtime: Some(mtime), ..FileAttributes::empty() })
+}
+
+/// Stream a file to SFTP in 64 KiB chunks. The copy gets the local file's
+/// times (`times_of`), set on the temporary file before it is renamed in:
+/// with the upload's own time, every later start found "same size, other
+/// time" and downloaded the copy to hash it (compare_files). A server that
+/// refuses the times leaves the copy with its own, as before.
 ///
 /// Atomic write: we stream into `<remote>.submarine-tmp`, then rename onto
 /// the real destination on success. Without this a mid-write SSH channel
@@ -313,12 +326,16 @@ async fn sftp_upload_file(sftp: &SftpSession, local: &Path, remote: &str) -> Res
         None => tokio::fs::metadata(local).await.ok().and_then(|m| shell_sync_local_mode(&m)),
     };
     let tmp = format!("{}.submarine-tmp", remote);
+    let local_meta = tokio::fs::metadata(local).await.ok();
     let settle = Settle {
         owner: existing.as_ref().and_then(|a| Some((a.uid?, a.gid?))),
         mode,
         mode_required: false,
     };
     sftp_stream_file(sftp, local, &tmp, FileAttributes { permissions: mode, ..FileAttributes::empty() }, settle).await?;
+    if let Some(times) = local_meta.as_ref().and_then(times_of) {
+        let _ = sftp.set_metadata(tmp.as_str(), times).await;
+    }
     // Rename over the destination. On POSIX SFTP servers `sftp.rename` errors
     // if the destination already exists, so we unlink the previous copy first.
     // The lost-atomicity window here (destination missing between remove and
@@ -608,12 +625,17 @@ async fn sftp_sha256(sftp: &SftpSession, remote: &str) -> Result<[u8; 32], Strin
     Ok(hasher.finalize().into())
 }
 
+/// `settle`: when the hashes say "the same" across two times, the copy gets
+/// the local file's times, so the next start needn't hash it again (a copy
+/// uploaded before uploads set them). Only in a real run: a dry run or a
+/// scan changes nothing on the server.
 async fn compare_files(
     sftp: &SftpSession,
     local: &Path,
     remote: &str,
     local_meta: &std::fs::Metadata,
     remote_attr: &FileAttributes,
+    settle: bool,
 ) -> Result<CompareResult, String> {
     let local_size = local_meta.len();
     let remote_size = remote_attr.size.unwrap_or(0);
@@ -637,6 +659,11 @@ async fn compare_files(
     let lh = local_sha256(local).await?;
     let rh = sftp_sha256(sftp, remote).await?;
     if lh == rh {
+        if settle {
+            if let Some(times) = times_of(local_meta) {
+                let _ = sftp.set_metadata(remote, times).await;
+            }
+        }
         return Ok(CompareResult::Identical);
     }
     Ok(if local_secs >= remote_secs { CompareResult::LocalNewer }
@@ -648,7 +675,7 @@ async fn compare_files(
 // ---------------------------------------------------------------------------
 
 pub async fn dry_run(
-    handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
+    handle: Arc<RwLock<russh::client::Handle<ClientHandler>>>,
     spec: MirrorSpec,
 ) -> Result<DryRunReport, String> {
     let local_root = PathBuf::from(&spec.local);
@@ -669,7 +696,7 @@ pub async fn dry_run(
     let mut scanned = 0u32;
     walk_local(&local_root, &local_root, &spec.remote, &spec.excludes, &sftp,
                &spec.conflict_resolution,
-               &mut entries, &mut total_bytes, &mut seen, &mut scanned, &mut Vec::new()).await?;
+               &mut entries, &mut total_bytes, &mut seen, &mut scanned, &mut Vec::new(), false).await?;
     walk_remote(&sftp, &local_root, &spec.remote, &spec.remote, &spec.excludes,
                 &mut entries, &mut total_bytes, &seen, &mut scanned, &mut HashSet::new()).await?;
     Ok(DryRunReport { entries, total_bytes })
@@ -1038,7 +1065,7 @@ async fn shell_sync_scan(sftp: &SftpSession, targets: &[ShellSyncTarget]) -> Res
                 Some(a) if a.is_symlink() => "skip-link",
                 Some(a) if a.is_dir() => "skip-folder",
                 Some(a) if a.permissions.is_some() && !is_plain_file(a) => "skip-other",
-                Some(a) => match compare_files(sftp, &local, &remote, &meta, a).await? {
+                Some(a) => match compare_files(sftp, &local, &remote, &meta, a, false).await? {
                     CompareResult::Identical => continue,
                     CompareResult::LocalNewer => "update",
                     CompareResult::RemoteNewer => "server-newer",
@@ -1124,7 +1151,7 @@ async fn shell_sync_put(sftp: &SftpSession, item: &ShellSyncItem, backup_root: &
 
 /// Preview-only: what `shell_sync_push` would do, with nothing transferred.
 pub async fn shell_sync_preview(
-    handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
+    handle: Arc<RwLock<russh::client::Handle<ClientHandler>>>,
     targets: Vec<ShellSyncTarget>,
 ) -> Result<ShellSyncReport, String> {
     let sftp = open_sftp(&handle).await?;
@@ -1139,7 +1166,7 @@ pub async fn shell_sync_preview(
 /// Scans again, then pushes every file that needs it. A file that fails is
 /// reported and the rest still go.
 pub async fn shell_sync_push(
-    handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
+    handle: Arc<RwLock<russh::client::Handle<ClientHandler>>>,
     targets: Vec<ShellSyncTarget>,
 ) -> Result<ShellSyncPushReport, String> {
     use chrono::{Datelike, Timelike};
@@ -1187,6 +1214,7 @@ async fn walk_local(
     seen: &mut HashSet<String>,
     scanned: &mut u32,
     dirs: &mut Vec<String>,
+    settle: bool,
 ) -> Result<(), String> {
     let mut rd = tokio::fs::read_dir(dir).await.map_err(|e| format!("read_dir {:?}: {}", dir, e))?;
     while let Some(entry) = rd.next_entry().await.map_err(|e| format!("dir iter: {}", e))? {
@@ -1198,7 +1226,7 @@ async fn walk_local(
             // A folder pattern names it with its "/" (`node_modules/`).
             if is_excluded(&format!("{}/", rel), excludes) { continue; }
             dirs.push(rel);
-            Box::pin(walk_local(root, &path, remote_root, excludes, sftp, conflict_mode, out, total, seen, scanned, dirs)).await?;
+            Box::pin(walk_local(root, &path, remote_root, excludes, sftp, conflict_mode, out, total, seen, scanned, dirs, settle)).await?;
             continue;
         }
         if !meta.is_file() { continue; } // skip symlinks / sockets / pipes
@@ -1213,7 +1241,7 @@ async fn walk_local(
             // Missing on the other side is never a conflict — copy across.
             None => "upload-new",
             Some(attr) => {
-                let cmp = compare_files(sftp, &path, &remote_path, &meta, &attr).await?;
+                let cmp = compare_files(sftp, &path, &remote_path, &meta, &attr, settle).await?;
                 match cmp {
                     CompareResult::Identical => continue,
                     // Same-content cases that *do* differ — pick a side per mode.
@@ -1302,7 +1330,7 @@ async fn walk_remote(
 pub async fn start(
     app: AppHandle,
     session_id: String,
-    handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
+    handle: Arc<RwLock<russh::client::Handle<ClientHandler>>>,
     map: MirrorMap,
     spec: MirrorSpec,
 ) -> Result<String, String> {
@@ -1413,7 +1441,7 @@ async fn run_mirror(
     app: AppHandle,
     session_id: String,
     mirror_id: String,
-    handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
+    handle: Arc<RwLock<russh::client::Handle<ClientHandler>>>,
     spec: MirrorSpec,
     status: Arc<Mutex<MirrorStatus>>,
     mut stop_rx: oneshot::Receiver<()>,
@@ -1438,7 +1466,7 @@ async fn run_mirror(
     let mut remote_dirs = HashSet::new();
     walk_local(&local_root, &local_root, &spec.remote, &spec.excludes,
                &*sftp, &spec.conflict_resolution,
-               &mut work, &mut total, &mut seen, &mut scanned, &mut local_dirs).await?;
+               &mut work, &mut total, &mut seen, &mut scanned, &mut local_dirs, true).await?;
     walk_remote(&*sftp, &local_root, &spec.remote, &spec.remote, &spec.excludes,
                 &mut work, &mut total, &seen, &mut scanned, &mut remote_dirs).await?;
     // Folders, empty ones too, end up on both sides: one with files would

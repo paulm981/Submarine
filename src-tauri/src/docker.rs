@@ -109,7 +109,7 @@ async fn run_capture_raw(
             .ok_or_else(|| "Session not connected".to_string())?
     };
     let channel = {
-        let session = session_arc.lock().await;
+        let session = session_arc.read().await;
         session
             .channel_open_session()
             .await
@@ -628,7 +628,7 @@ pub async fn ssh_docker_logs_start(
                 .ok_or_else(|| "Session not connected".to_string())?
         };
         let channel = {
-            let session = session_arc.lock().await;
+            let session = session_arc.read().await;
             session
                 .channel_open_session()
                 .await
@@ -664,11 +664,20 @@ pub async fn ssh_docker_logs_start(
         // `stream.read` is cancel-safe, so racing it against the flush timer in
         // select! never drops data.
         const FLUSH_CAP: usize = 256 * 1024;
+        const FLUSH_WINDOW: std::time::Duration = std::time::Duration::from_millis(30);
         let mut buf = [0u8; 8192];
         // Through a root shell, what came before its line isn't the logs.
         let mut out: Vec<u8> = if marker.is_none() { early } else { Vec::new() };
-        let mut flush = tokio::time::interval(std::time::Duration::from_millis(30));
-        flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The flush timer is armed when bytes come and parked far ahead after a
+        // flush (as the terminal pump's, ssh_manager.rs), so a quiet container
+        // wakes this task zero times instead of ~33 times a second. A flush may
+        // keep the start of a character in `out` (below); the next bytes arm
+        // the timer again, so it can't wait there.
+        let park = || tokio::time::Instant::now() + std::time::Duration::from_secs(24 * 3600);
+        // What came early goes at the first tick.
+        let mut armed = !out.is_empty();
+        let flush_timer = tokio::time::sleep_until(if armed { tokio::time::Instant::now() } else { park() });
+        tokio::pin!(flush_timer);
         // Emit only the complete-UTF-8 PREFIX per streaming flush and KEEP any
         // trailing incomplete multibyte sequence in `out` so the next read can
         // finish it — decoding the whole buffer lossily each flush would turn a
@@ -742,12 +751,21 @@ pub async fn ssh_docker_logs_start(
                             } else {
                                 out.extend_from_slice(&buf[..n]);
                             }
-                            if out.len() >= FLUSH_CAP { flush_logs(&mut out, false); }
+                            if out.len() >= FLUSH_CAP {
+                                flush_logs(&mut out, false);
+                            } else if !armed && !out.is_empty() {
+                                flush_timer.as_mut().reset(tokio::time::Instant::now() + FLUSH_WINDOW);
+                                armed = true;
+                            }
                         }
                         Err(_) => { flush_logs(&mut out, true); break; }
                     }
                 }
-                _ = flush.tick() => { flush_logs(&mut out, false); }
+                _ = &mut flush_timer => {
+                    flush_logs(&mut out, false);
+                    flush_timer.as_mut().reset(park());
+                    armed = false;
+                }
             }
         }
         let _ = app_clone.emit(&close_event, serde_json::json!({}));
@@ -831,7 +849,7 @@ pub async fn open_container_terminal(
                     .ok_or_else(|| "Session not connected".to_string())?
             };
             let channel = {
-                let session = session_arc.lock().await;
+                let session = session_arc.read().await;
                 session
                     .channel_open_session()
                     .await
@@ -876,11 +894,10 @@ pub async fn open_container_terminal(
         .insert(terminal_id.clone(), resize_tx);
     drop(openings);
 
-    // Same pump as the SSH terminal (see open_terminal): coalesced output,
-    // paced to the page (term_output.rs), and a split read/write channel
+    // Same pump as the SSH terminal (see open_terminal): coalesced output
+    // over the page's channel (term_output.rs) and a split read/write channel
     // whose read side is always drained — required by russh's channel
     // backpressure.
-    let output = crate::term_output::OutputSink::open(&terminal_id, on_output);
     // What the container's shell wrote while the password prompt was
     // looked for (root_channel) comes first, through the pump's own filter
     // (term_filter.rs), so a sequence split across the two is cut down too.
@@ -890,7 +907,7 @@ pub async fn open_container_terminal(
         channel,
         rx,
         resize_rx,
-        output,
+        on_output,
         early,
     ));
 

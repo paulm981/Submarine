@@ -191,11 +191,12 @@ async fn open_shared<H: russh::client::Handler + 'static>(
     }
 }
 
-/// Through a tab's own connection to the jump host, which the tab uses too:
-/// only when it's free right now, and for no longer than `limit`.
+/// Through a tab's own connection to the jump host, which the tab uses too
+/// (its channels open side by side, SshState::connections), for no longer
+/// than `limit`.
 async fn open_on_tab(
     server_id: i32,
-    tab: &tokio::sync::Mutex<Handle<ClientHandler>>,
+    tab: &tokio::sync::RwLock<Handle<ClientHandler>>,
     host: &str,
     port: u16,
     limit: Duration,
@@ -203,7 +204,7 @@ async fn open_on_tab(
     if tab_cooldowns().lock().ok()?.get(&server_id).is_some_and(|until| Instant::now() < *until) {
         return Some(Through::NotYet);
     }
-    let h = tab.try_lock().ok()?;
+    let h = tab.try_read().ok()?;
     if h.is_closed() {
         return None;
     }

@@ -54,6 +54,7 @@ mod jump_gone;
 mod ping;
 mod hop_policy;
 mod ai;
+mod child_env;
 mod open_policy;
 mod rdp;
 mod quick_unlock;
@@ -967,7 +968,7 @@ struct EntitySpec {
 /// `protocol` is a server's type (#173: NULL for SSH, "rdp", "telnet",
 /// "vnc"): a peer from before it doesn't turn this device's RDP, telnet or
 /// VNC server back into an SSH one.
-const LATE_COLS: &[&str] = &["terminal_theme", "highlight", "scope", "protocol"];
+const LATE_COLS: &[&str] = &["terminal_theme", "highlight", "scope", "protocol", "run_on_connect_every"];
 
 /// LATE_COLS whose NULL means "not known here", and so is left out of what
 /// this device sends, as an older peer leaves it out. A server's row inserted
@@ -990,7 +991,7 @@ const ENTITIES: &[EntitySpec] = &[
     EntitySpec { table: "credentials", cols: &["name", "auth_type", "username", "password", "edited_by"], fks: &[Fk { key: "key_uuid", col: "key_id", ref_table: "ssh_keys", required: false }] },
     EntitySpec {
         table: "servers",
-        cols: &["name", "host", "port", "username", "password", "proxy_type", "proxy_host", "proxy_port", "tunnels", "auth_type", "autostart", "mirrors", "color", "notes", "run_on_connect", "terminal_theme", "highlight", "protocol", "position", "edited_by"],
+        cols: &["name", "host", "port", "username", "password", "proxy_type", "proxy_host", "proxy_port", "tunnels", "auth_type", "autostart", "mirrors", "color", "notes", "run_on_connect", "run_on_connect_every", "terminal_theme", "highlight", "protocol", "position", "edited_by"],
         fks: &[
             Fk { key: "credential_uuid", col: "credential_id", ref_table: "credentials", required: false },
             Fk { key: "folder_uuid", col: "folder_id", ref_table: "folders", required: false },
@@ -1062,7 +1063,7 @@ fn col_kind(table: &str, col: &str) -> ColKind {
         | ("highlight_rules", "pattern" | "kind" | "color") => ColKind::RequiredText,
         ("servers" | "rdp_links", "port") => ColKind::Int32,
         ("servers", "proxy_port") => ColKind::OptionalInt32,
-        ("servers", "autostart" | "position") => ColKind::OptionalInt,
+        ("servers", "autostart" | "position" | "run_on_connect_every") => ColKind::OptionalInt,
         ("highlight_rules", "match_case" | "bold" | "underline" | "enabled" | "position") => ColKind::OptionalInt,
         ("servers", "tunnels" | "mirrors") => ColKind::ObjectList,
         _ => ColKind::Text,
@@ -4253,7 +4254,7 @@ mod sync_engine_tests {
             "CREATE TABLE folders(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, parent_id INTEGER, color TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE ssh_keys(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, public_key TEXT, private_key TEXT, passphrase TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE credentials(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, auth_type TEXT, username TEXT, password TEXT, key_id INTEGER, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT{});
-             CREATE TABLE servers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT, key_id INTEGER, autostart INTEGER, mirrors TEXT, color TEXT, notes TEXT, run_on_connect TEXT, jump_host_id INTEGER, protocol TEXT, position INTEGER NOT NULL DEFAULT 0, terminal_theme TEXT, highlight TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT{});
+             CREATE TABLE servers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT, key_id INTEGER, autostart INTEGER, mirrors TEXT, color TEXT, notes TEXT, run_on_connect TEXT, run_on_connect_every INTEGER, jump_host_id INTEGER, protocol TEXT, position INTEGER NOT NULL DEFAULT 0, terminal_theme TEXT, highlight TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT{});
              CREATE TABLE commands(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT, scope TEXT);
              CREATE TABLE notes(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE monitor_configs(node_id INTEGER PRIMARY KEY, enabled_metrics TEXT, custom_metrics TEXT, paused INTEGER, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT{});
@@ -4972,6 +4973,61 @@ mod sync_engine_tests {
         }
         apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
         assert_eq!(proto(&b), None, "NULL from a current peer makes it SSH again");
+    }
+
+    // #256: on-connect commands for every new terminal sync, and a peer from
+    // before it (no key) editing the server doesn't turn it off.
+    #[test]
+    fn run_on_connect_every_syncs_and_an_older_peers_edit_keeps_it() {
+        let (a, _ha) = device("A");
+        a.execute(
+            "INSERT INTO servers(name, host, port, run_on_connect, run_on_connect_every) VALUES('web', 'h', 22, 'cd /srv', 1)",
+            [],
+        )
+        .unwrap();
+        let (b, hb) = device("B");
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let got = |c: &Connection| -> Option<i64> {
+            c.query_row("SELECT run_on_connect_every FROM servers WHERE name='web'", [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(got(&b), Some(1), "it syncs");
+
+        a.execute("UPDATE servers SET host='h2' WHERE name='web'", []).unwrap();
+        let ahead = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 60_000;
+        let mut recs = collect_local_records(&a, &KEY, "").unwrap();
+        for r in recs.iter_mut().filter(|r| r.entity_type == "servers") {
+            let mut obj: serde_json::Value = serde_json::from_slice(&decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap()).unwrap();
+            assert!(obj.as_object_mut().unwrap().remove("run_on_connect_every").is_some(), "a current peer always sends the key");
+            r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
+            r.updated_at = format!("{ahead:015}:00000:zzz");
+        }
+        apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+        let host: String = b.query_row("SELECT host FROM servers WHERE name='web'", [], |r| r.get(0)).unwrap();
+        assert_eq!(host, "h2", "the edit applies");
+        assert_eq!(got(&b), Some(1), "and the server keeps it");
+
+        // A current peer turns it off.
+        a.execute("UPDATE servers SET run_on_connect_every=0 WHERE name='web'", []).unwrap();
+        let later = ahead + 60_000;
+        let mut recs = collect_local_records(&a, &KEY, "").unwrap();
+        for r in recs.iter_mut().filter(|r| r.entity_type == "servers") {
+            r.updated_at = format!("{later:015}:00000:zzz");
+        }
+        apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+        assert_eq!(got(&b), Some(0), "off from a current peer is off");
+
+        // And a server new to this device, from an older peer, lands with it off.
+        let (c, _hc) = device("C");
+        c.execute("INSERT INTO servers(name, host, port) VALUES('db', 'h3', 22)", []).unwrap();
+        let mut recs = collect_local_records(&c, &KEY, "").unwrap();
+        for r in recs.iter_mut().filter(|r| r.entity_type == "servers") {
+            let mut obj: serde_json::Value = serde_json::from_slice(&decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap()).unwrap();
+            obj.as_object_mut().unwrap().remove("run_on_connect_every");
+            r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
+        }
+        apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+        let every: Option<i64> = b.query_row("SELECT run_on_connect_every FROM servers WHERE name='db'", [], |r| r.get(0)).unwrap();
+        assert_eq!(every, None);
     }
 
     #[test]
@@ -6448,6 +6504,10 @@ async fn setup_master_db_with(
             // Commands auto-typed into the FIRST terminal on the INITIAL
             // connect (never on reconnect / extra shells). Empty = nothing.
             "ALTER TABLE servers ADD COLUMN run_on_connect TEXT NOT NULL DEFAULT ''",
+            // 1: the on-connect commands also go into every new terminal of
+            // the server (#256). NULL or 0 = the first terminal only. Synced;
+            // nullable so a record from an older peer still lands.
+            "ALTER TABLE servers ADD COLUMN run_on_connect_every INTEGER",
             // ProxyJump: optional id of another server to bounce through. NULL
             // = connect directly. Nullable + additive so old binaries ignore
             // it (no SCHEMA_VERSION bump, matching run_on_connect above).
@@ -6549,7 +6609,7 @@ async fn setup_master_db_with(
             "CREATE TABLE folders (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, parent_id INTEGER, color TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE ssh_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, public_key TEXT, private_key TEXT, passphrase TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE credentials (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, auth_type TEXT, username TEXT, password TEXT, key_id INTEGER, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT, FOREIGN KEY(key_id) REFERENCES ssh_keys(id));
-             CREATE TABLE servers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT DEFAULT 'none', proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT DEFAULT 'vault', key_id INTEGER, autostart INTEGER NOT NULL DEFAULT 0, mirrors TEXT NOT NULL DEFAULT '[]', color TEXT, notes TEXT NOT NULL DEFAULT '', run_on_connect TEXT NOT NULL DEFAULT '', jump_host_id INTEGER, protocol TEXT, position INTEGER NOT NULL DEFAULT 0, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT, FOREIGN KEY(folder_id) REFERENCES folders(id));
+             CREATE TABLE servers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT DEFAULT 'none', proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT DEFAULT 'vault', key_id INTEGER, autostart INTEGER NOT NULL DEFAULT 0, mirrors TEXT NOT NULL DEFAULT '[]', color TEXT, notes TEXT NOT NULL DEFAULT '', run_on_connect TEXT NOT NULL DEFAULT '', run_on_connect_every INTEGER, jump_host_id INTEGER, protocol TEXT, position INTEGER NOT NULL DEFAULT 0, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT, FOREIGN KEY(folder_id) REFERENCES folders(id));
              CREATE TABLE commands (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT, scope TEXT);
              CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE known_hosts (id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT, port INTEGER, fingerprint TEXT, key_type TEXT);
@@ -7700,16 +7760,18 @@ async fn set_server_notes(state: tauri::State<'_, DbState>, id: i32, notes: Stri
 
 /// Per-server commands auto-typed into the first terminal on initial connect.
 /// Stored as a single blob (newline-separated lines); the frontend sends them
-/// only for `-term-0` and only on the first open, never on reconnect. Written
-/// through its own command (like set_server_notes) so it doesn't have to be
-/// threaded through add_server / edit_server's positional parameter lists.
+/// for `-term-0` on the first connect, never on reconnect, and with `every`
+/// also once into each new terminal of the server (#256). Written through its
+/// own command (like set_server_notes) so it doesn't have to be threaded
+/// through add_server / edit_server's positional parameter lists. `every`
+/// left out keeps what the server has.
 #[tauri::command]
-async fn set_server_run_on_connect(state: tauri::State<'_, DbState>, id: i32, value: String) -> Result<(), String> {
+async fn set_server_run_on_connect(state: tauri::State<'_, DbState>, id: i32, value: String, every: Option<bool>) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     conn.execute(
-        "UPDATE servers SET run_on_connect=?1 WHERE id=?2",
-        rusqlite::params![value, id],
+        "UPDATE servers SET run_on_connect=?1, run_on_connect_every=COALESCE(?2, run_on_connect_every) WHERE id=?3",
+        rusqlite::params![value, every.map(i64::from), id],
     ).map_err(|e| format!("[DATABASE] SERVER_RUN_ON_CONNECT_FAILED: {}", e))?;
     drop(conn_guard);
     save_vault_internal(&state)?;
@@ -7843,8 +7905,8 @@ fn clone_server_row(conn: &rusqlite::Connection, id: i32) -> Result<i64, String>
         .map_err(|e| format!("[DATABASE] SERVER_CLONE_FAILED: {}", e))?;
     let result = (|| {
         let affected = conn.execute(
-            "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, terminal_theme, highlight, protocol)
-             SELECT name || ' (copy)', host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, 0, mirrors, color, notes, run_on_connect, jump_host_id, terminal_theme, highlight, protocol
+            "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, run_on_connect_every, jump_host_id, terminal_theme, highlight, protocol)
+             SELECT name || ' (copy)', host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, 0, mirrors, color, notes, run_on_connect, run_on_connect_every, jump_host_id, terminal_theme, highlight, protocol
              FROM servers WHERE id = ?1",
             rusqlite::params![id],
         ).map_err(|e| format!("[DATABASE] SERVER_CLONE_FAILED: {}", e))?;
@@ -7924,7 +7986,7 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
     // ORDER BY (position, id): `position` is the manual drag-to-reorder rank
     // (default 0 for never-reordered rows), and id breaks ties so the order is
     // stable and, before any reorder, identical to the old rowid order.
-    let mut stmt = conn.prepare("SELECT id, name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, updated_at, edited_by, position, os, terminal_theme, uuid, highlight, protocol FROM servers ORDER BY position, id")
+    let mut stmt = conn.prepare("SELECT id, name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, updated_at, edited_by, position, os, terminal_theme, uuid, highlight, protocol, run_on_connect_every FROM servers ORDER BY position, id")
         .map_err(|e| format!("[DATABASE] PREPARE_FAILED: {}", e))?;
 
     let rows = stmt.query_map([], |row| {
@@ -7949,6 +8011,8 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
             "color": row.get::<_, Option<String>>(16)?,
             "notes": row.get::<_, Option<String>>(17)?.unwrap_or_default(),
             "run_on_connect": row.get::<_, Option<String>>(18)?.unwrap_or_default(),
+            // The commands go into every new terminal too, not only the first (#256).
+            "run_on_connect_every": row.get::<_, Option<i64>>(28)?.unwrap_or(0) != 0,
             "jump_host_id": row.get::<_, Option<i32>>(19)?,
             // Attribution: HLC stamp (encodes last-edit time) + who last edited.
             "updated_at": row.get::<_, Option<String>>(20)?,
@@ -13828,7 +13892,7 @@ async fn initiate_connection(
 
                 match auth_res {
                     Ok(true) => {
-                        let session_arc = Arc::new(Mutex::new(session));
+                        let session_arc = Arc::new(tokio::sync::RwLock::new(session));
                         // "Still wanted?" registration guard. The handshake can
                         // take up to ~15s (longer via proxy/jump). If, meanwhile,
                         // a reconnect for this key bumped the generation or a
@@ -14113,24 +14177,22 @@ async fn initiate_connection(
                                 };
 
                                 let is_closed = {
-                                    let h = handle_arc.lock().await;
+                                    let h = handle_arc.read().await;
                                     h.is_closed()
                                 };
 
                                 let mut dead = is_closed;
 
                                 if !dead && tick.is_multiple_of(probe_every) {
-                                    // Active probe: hold the handle lock long
-                                    // enough to start AND finish the round
-                                    // trip — concurrent commands wait, but
-                                    // that's fine, they would block on the
-                                    // same lock to open their own channel
-                                    // anyway. 10s timeout: generous enough
+                                    // Active probe: a round trip on the
+                                    // shared handle (read-locked), so commands
+                                    // and tunnels open their own channels
+                                    // meanwhile. 10s timeout: generous enough
                                     // that a congested-but-alive link doesn't
                                     // strike out spuriously.
                                     let asked_at = ssh_manager::LastHeard::now();
                                     let alive = {
-                                        let h = handle_arc.lock().await;
+                                        let h = handle_arc.read().await;
                                         let answered = if ping_unanswered {
                                             probe_with_channel(&h).await
                                         } else {
@@ -14228,8 +14290,8 @@ async fn initiate_connection(
                                 if dead {
                                     // Re-check generation + verify OUR handle is
                                     // still the registered one before tearing
-                                    // anything down. A slow probe holds the handle
-                                    // lock up to 10s; during that window a manual
+                                    // anything down. A slow probe takes up to
+                                    // 10s; during that window a manual
                                     // reconnect / auto-retry can bump the
                                     // generation and register a fresh, healthy
                                     // connection. Without this guard we'd remove
@@ -14826,7 +14888,7 @@ mod shared_login_note_tests {
 async fn resolve_tunnel_transport(
     state: &SshState,
     session_id: &str,
-) -> Result<(Arc<tokio::sync::Mutex<russh::client::Handle<ssh_manager::ClientHandler>>>, tunnel::ForwardedTargets), String> {
+) -> Result<(Arc<tokio::sync::RwLock<russh::client::Handle<ssh_manager::ClientHandler>>>, tunnel::ForwardedTargets), String> {
     let fwd_key = format!("{}::fwd", session_id);
     let (primary, dedicated) = {
         let conns = state.connections.lock().await;
@@ -14859,7 +14921,7 @@ async fn resolve_tunnel_transport(
 async fn start_tunnel_specs_on(
     app: &tauri::AppHandle,
     sid: &str,
-    handle: &Arc<tokio::sync::Mutex<russh::client::Handle<ssh_manager::ClientHandler>>>,
+    handle: &Arc<tokio::sync::RwLock<russh::client::Handle<ssh_manager::ClientHandler>>>,
     targets: &tunnel::ForwardedTargets,
     tunnels: &Arc<tokio::sync::Mutex<std::collections::HashMap<String, tunnel::ActiveTunnel>>>,
     specs_map: &Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<tunnel::TunnelSpec>>>>,
@@ -16090,7 +16152,11 @@ async fn rdp_builtin_open(
                     }
                 };
                 let local = tcp.local_addr().unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
-                let _ = tcp.set_nodelay(true);
+                // No delay, and TCP keepalive as the VNC tab has: a link that
+                // goes silent (Wi-Fi gone, a NAT that forgot it) ends the
+                // session within about a minute instead of leaving a frozen
+                // picture that says "connected".
+                crate::tunnel::apply_tunnel_sockopts(&tcp);
                 // One stream type for both ways (the session wants Send + Sync).
                 let (ours, theirs) = tokio::io::duplex(256 * 1024);
                 let carrier = tokio::spawn(async move {
@@ -16448,13 +16514,6 @@ async fn rdp_builtin_close(rdp_clients: tauri::State<'_, RdpClients>, session_id
     Ok(())
 }
 
-/// The rendering workarounds this process set for its own WebKit at startup
-/// (software GL, X11 instead of Wayland), unless the user had set them. A
-/// program it starts would inherit them: they're taken out again for an RDP
-/// app, which should run as if the user had started it.
-#[cfg(target_os = "linux")]
-static OWN_RENDER_ENV: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
-
 /// Removes `file`, the `.rdp` file with the saved password in it, once the
 /// RDP app started with it has read it: when it first waits for the user
 /// (its security warning, or its login), at the earliest 3 s and at the
@@ -16505,10 +16564,8 @@ fn launch_rdp_app(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
-    #[cfg(target_os = "linux")]
-    for name in OWN_RENDER_ENV.get().into_iter().flatten() {
-        cmd.env_remove(name);
-    }
+    // As if the user had started it: without this app's own WebKit workarounds.
+    child_env::clean(cmd.as_std_mut());
     let mut child = cmd.spawn().map_err(|e| format!("Couldn't start {}: {e}", launcher.name))?;
     #[cfg(windows)]
     if let (true, Some(file)) = (launcher.secret, &launcher.file) {
@@ -16782,8 +16839,7 @@ async fn telnet_open_terminal(
     state.resize_txs.lock().await.insert(terminal_id.clone(), resize_tx);
     // The output goes to the page's channel, paced like an SSH terminal's
     // (term_output.rs).
-    let output = term_output::OutputSink::open(&terminal_id, on_output);
-    tauri::async_runtime::spawn(telnet::run_pump(app, session_id, terminal_id, conn, output, rx, resize_rx));
+    tauri::async_runtime::spawn(telnet::run_pump(app, session_id, terminal_id, conn, on_output, rx, resize_rx));
     Ok(())
 }
 
@@ -17399,7 +17455,7 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
             _ => None,
         };
 
-        let session = session_arc.lock().await;
+        let session = session_arc.read().await;
         let channel = session.channel_open_session().await.map_err(|e| e.to_string())?;
 
         // Request PTY
@@ -17439,15 +17495,14 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
     // always-draining read/write pump (required by russh's channel
     // backpressure) live in ssh_manager::run_pty_pump — shared with the
     // docker exec terminal. The output goes to the page's channel, paced by
-    // what it has drawn (term_output.rs).
-    let output = term_output::OutputSink::open(&terminal_id, on_output);
+    // what it has drawn (ssh_manager::Outflow, term_output.rs).
     tauri::async_runtime::spawn(crate::ssh_manager::run_pty_pump(
         app.clone(),
         terminal_id.clone(),
         channel,
         rx,
         resize_rx,
-        output,
+        on_output,
         Vec::new(),
     ));
 
@@ -17528,6 +17583,12 @@ async fn type_saved_password(
     tx.send(TerminalCommand::Data(bytes))
         .await
         .map_err(|_| "That terminal isn't open".to_string())
+}
+
+/// What a terminal's page drew of its output (ssh_manager::Outflow).
+#[tauri::command]
+async fn terminal_drawn(terminal_id: String, bytes: u64) {
+    ssh_manager::page_drew(&terminal_id, bytes);
 }
 
 #[tauri::command]
@@ -17860,7 +17921,7 @@ async fn run_info_script(
 
     let start = std::time::Instant::now();
     let channel = {
-        let session = session_arc.lock().await;
+        let session = session_arc.read().await;
         session.channel_open_session().await.map_err(|e| e.to_string())?
     };
     channel.exec(true, script.as_bytes()).await.map_err(|e| e.to_string())?;
@@ -18276,7 +18337,7 @@ async fn run_exec_capture(
             .ok_or_else(|| "Session not connected".to_string())?
     };
     let channel = {
-        let session = session_arc.lock().await;
+        let session = session_arc.read().await;
         session.channel_open_session().await.map_err(|e| e.to_string())?
     };
     channel.exec(true, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
@@ -18434,7 +18495,7 @@ fn root_probe_command(tool: &str, password: bool, args: &[String], no_tickets: b
 async fn exec_probe_with_password<H: russh::client::Handler>(session_arc: &HandleArc<H>, cmd: &str, password: &str, timeout_secs: u64) -> Result<String, String> {
     use russh::ChannelMsg;
     let mut channel = {
-        let session = session_arc.lock().await;
+        let session = session_arc.read().await;
         session.channel_open_session().await.map_err(|e| e.to_string())?
     };
     channel.exec(true, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
@@ -18919,7 +18980,7 @@ async fn exec_fed_capture<H: russh::client::Handler>(
 ) -> Result<(i32, String), String> {
     use russh::ChannelMsg;
     let mut channel = {
-        let session = session_arc.lock().await;
+        let session = session_arc.read().await;
         session.channel_open_session().await.map_err(|e| e.to_string())?
     };
     channel.exec(true, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
@@ -19042,7 +19103,7 @@ async fn root_channel_open<H: russh::client::Handler>(
     hook: Option<TurnHook<'_>>,
 ) -> Result<(russh::Channel<russh::client::Msg>, Option<&'static str>, Vec<u8>), String> {
     let mut channel = {
-        let session = session_arc.lock().await;
+        let session = session_arc.read().await;
         session.channel_open_session().await.map_err(|e| e.to_string())?
     };
     if let Some((cols, rows)) = pty {
@@ -19680,9 +19741,10 @@ struct SftpListResult {
 // `dzdo`, Centrify / Delinea's sudo for Active Directory-managed hosts, takes
 // the same options and is tried the same way; see ELEVATION_TOOLS.
 
-type SessionHandleArc = Arc<tokio::sync::Mutex<russh::client::Handle<ssh_manager::ClientHandler>>>;
+/// A logged-in connection, only ever read-locked (see SshState::connections).
+type SessionHandleArc = Arc<tokio::sync::RwLock<russh::client::Handle<ssh_manager::ClientHandler>>>;
 /// A connection with any client handler: the app's own, or a test's.
-type HandleArc<H> = Arc<tokio::sync::Mutex<russh::client::Handle<H>>>;
+type HandleArc<H> = Arc<tokio::sync::RwLock<russh::client::Handle<H>>>;
 
 const SUDO_NEED_PASSWORD: &str = "[SUDO] NEED_PASSWORD";
 const SUDO_WRONG_PASSWORD: &str = "[SUDO] WRONG_PASSWORD";
@@ -19840,7 +19902,7 @@ async fn exec_with_stdin_capture_upto<H: russh::client::Handler>(
 ) -> Result<String, String> {
     use russh::ChannelMsg;
     let mut channel = {
-        let session = session_arc.lock().await;
+        let session = session_arc.read().await;
         session.channel_open_session().await.map_err(|e| e.to_string())?
     };
     channel.exec(true, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
@@ -20099,7 +20161,7 @@ pub(crate) async fn open_sftp(
     session_arc: &SessionHandleArc,
 ) -> Result<(russh_sftp::client::SftpSession, bool), String> {
     let channel = {
-        let session = session_arc.lock().await;
+        let session = session_arc.read().await;
         session.channel_open_session().await.map_err(|e| e.to_string())?
     };
     match start_sftp(channel).await {
@@ -20207,7 +20269,7 @@ async fn open_elevated_sftp<H: russh::client::Handler>(
     let tag = new_root_tag();
     let password = elevation.password.as_ref().map(|p| p.as_str());
     let mut channel = {
-        let session = session_arc.lock().await;
+        let session = session_arc.read().await;
         session.channel_open_session().await.map_err(|e| e.to_string())?
     };
     // Through a root shell, the shell prints the ready marker and starts
@@ -20549,7 +20611,7 @@ exec "$@"
             let server = TestServer::with_shell(opts);
             let running = server.running.clone();
             let session = connect(server, |_| {}, build_ssh_client_config()).await.expect("in-process SSH connection");
-            Lab { dir, handle: Arc::new(tokio::sync::Mutex::new(session)), running }
+            Lab { dir, handle: Arc::new(tokio::sync::RwLock::new(session)), running }
         }
 
         pub(crate) fn set(&self, file: &str, value: &str) {
@@ -21800,6 +21862,435 @@ async fn sftp_download_file(
     Ok(())
 }
 
+/// How many files of a folder transfer move at once. One by one, each file's
+/// own round trips (open, close) came in a row, so a folder of small files took
+/// a round trip times its files: a thousand of them at 100 ms, about five
+/// minutes. A file's data is pipelined already. Over shell commands (a server
+/// without SFTP) the requests wait their turn anyway: one at a time there.
+const DIR_FILES_AT_ONCE: usize = 4;
+
+/// A file bigger than this moves alone. Each file keeps up to 16 requests in
+/// flight on the one SFTP channel, and each request's time limit runs from
+/// when it was sent: big files at once would put every request behind the
+/// others' data, and on a slow link past its limit. Files up to these sizes
+/// at once have no more in flight than one file had when they moved one by one
+/// (16 reads of 255 KiB; 16 writes of 32 KiB).
+const DIR_FILE_ALONE_DOWN: u64 = 1 << 20;
+const DIR_FILE_ALONE_UP: u64 = 128 << 10;
+
+/// How one file of a folder transfer ended, when not well: stopped by a
+/// cancel, with what the user may need to hear, or failed.
+enum DirFileEnd {
+    Stopped(Option<String>),
+    Failed(String),
+}
+
+/// How a folder transfer's files went.
+enum DirFilesEnd {
+    Done,
+    /// A cancel cut it short; the stopped files' notes.
+    Stopped(Vec<String>),
+    /// The first failure, and the notes of files a cancel stopped after it.
+    Failed(String, Vec<String>),
+}
+
+/// One file of a folder transfer for run_dir_files.
+struct DirJob<Fut> {
+    /// Whether it moves alone (DIR_FILE_ALONE_*).
+    alone: bool,
+    /// Its path in lower case: names that differ only in case are one file on
+    /// a server (or a disk) that ignores case, so they never move at once.
+    key: String,
+    /// Its name in messages.
+    shown: String,
+    run: Fut,
+}
+
+/// Run a folder transfer's files, up to `at_once` at a time (a file that moves
+/// alone, alone), telling `report` every 100 ms. The first failure starts
+/// nothing new; the files in flight finish (stopping one part way could leave
+/// a file it overwrites cut short), then the failure is told. A cancel stops
+/// the files in flight.
+async fn run_dir_files<Fut>(
+    mut jobs: impl Iterator<Item = DirJob<Fut>>,
+    at_once: usize,
+    cancel: &std::sync::atomic::AtomicBool,
+    mut report: impl FnMut(),
+) -> DirFilesEnd
+where
+    Fut: std::future::Future<Output = Result<(), DirFileEnd>> + Send + 'static,
+{
+    use std::sync::atomic::Ordering;
+    let mut running = tokio::task::JoinSet::new();
+    // The files moving now, by task: key, name, alone.
+    let mut moving: std::collections::HashMap<tokio::task::Id, (String, String, bool)> = std::collections::HashMap::new();
+    let mut next: Option<DirJob<Fut>> = None;
+    let mut failure: Option<String> = None;
+    let mut notes = Vec::new();
+    let mut stopped = false;
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        while failure.is_none() && !cancel.load(Ordering::Relaxed) {
+            let Some(job) = next.take().or_else(|| jobs.next()) else { break };
+            let fits = moving.is_empty()
+                || (!job.alone
+                    && moving.len() < at_once.max(1)
+                    && !moving.values().any(|(key, _, alone)| *alone || *key == job.key));
+            if !fits {
+                next = Some(job);
+                break;
+            }
+            let DirJob { alone, key, shown, run } = job;
+            let task = running.spawn(run);
+            moving.insert(task.id(), (key, shown, alone));
+        }
+        if running.is_empty() {
+            break;
+        }
+        tokio::select! {
+            ended = running.join_next_with_id() => {
+                let (id, outcome) = match ended {
+                    Some(Ok((id, outcome))) => (id, Ok(outcome)),
+                    Some(Err(e)) => (e.id(), Err(e)),
+                    None => continue,
+                };
+                let shown = moving.remove(&id).map(|(_, shown, _)| shown).unwrap_or_default();
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(DirFileEnd::Failed(msg))) => {
+                        failure.get_or_insert(msg);
+                    }
+                    Ok(Err(DirFileEnd::Stopped(note))) => {
+                        stopped = true;
+                        notes.extend(note);
+                    }
+                    Err(e) => {
+                        failure.get_or_insert(format!("{shown}: the transfer ended: {e}"));
+                    }
+                }
+            }
+            _ = tick.tick() => report(),
+        }
+    }
+    if let Some(msg) = failure {
+        return DirFilesEnd::Failed(msg, notes);
+    }
+    if stopped || next.is_some() || jobs.next().is_some() {
+        return DirFilesEnd::Stopped(notes);
+    }
+    DirFilesEnd::Done
+}
+
+#[cfg(test)]
+mod dir_files_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+
+    /// What the fake files saw: each start with the files moving then, each end.
+    #[derive(Default)]
+    struct Seen {
+        live: StdMutex<Vec<&'static str>>,
+        starts: StdMutex<Vec<(&'static str, Vec<&'static str>)>>,
+        ends: StdMutex<Vec<&'static str>>,
+    }
+
+    /// A file that takes `ms`, then ends as `end` says ("ok", "fail", "panic"),
+    /// or stops when `cancel` is set (with a note).
+    fn file(name: &'static str, ms: u64, end: &'static str, seen: &Arc<Seen>, cancel: &Arc<AtomicBool>) -> impl std::future::Future<Output = Result<(), DirFileEnd>> + Send + 'static {
+        let (seen, cancel) = (Arc::clone(seen), Arc::clone(cancel));
+        async move {
+            {
+                let mut live = seen.live.lock().unwrap();
+                live.push(name);
+                seen.starts.lock().unwrap().push((name, live.clone()));
+            }
+            for _ in 0..ms / 10 {
+                if cancel.load(Ordering::Relaxed) {
+                    seen.live.lock().unwrap().retain(|n| *n != name);
+                    return Err(DirFileEnd::Stopped(Some(format!("{name} was cut"))));
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            seen.live.lock().unwrap().retain(|n| *n != name);
+            seen.ends.lock().unwrap().push(name);
+            match end {
+                "fail" => Err(DirFileEnd::Failed(format!("{name} broke"))),
+                "panic" => panic!("{name} panicked"),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    fn job<F>(name: &'static str, key: &str, alone: bool, run: F) -> DirJob<F> {
+        DirJob { alone, key: key.to_lowercase(), shown: name.to_string(), run }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_big_file_moves_alone_and_small_ones_four_at_once() {
+        let (seen, cancel) = (Arc::new(Seen::default()), Arc::new(AtomicBool::new(false)));
+        let names = ["s1", "s2", "s3", "s4", "s5", "big", "s6"];
+        let jobs: Vec<_> = names.iter().map(|&n| job(n, n, n == "big", file(n, 100, "ok", &seen, &cancel))).collect();
+        assert!(matches!(run_dir_files(jobs.into_iter(), 4, &cancel, || {}).await, DirFilesEnd::Done));
+        let starts = seen.starts.lock().unwrap();
+        assert_eq!(starts.len(), names.len(), "every file ran");
+        assert!(starts.iter().all(|(_, live)| live.len() <= 4), "at most four at once: {starts:?}");
+        assert!(starts.iter().any(|(_, live)| live.len() == 4), "four at once: {starts:?}");
+        let big = starts.iter().find(|(n, _)| *n == "big").unwrap();
+        assert_eq!(big.1, vec!["big"], "the big file started alone");
+        assert!(starts.iter().all(|(n, live)| *n == "big" || !live.contains(&"big")), "nothing started beside it: {starts:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn names_that_differ_only_in_case_never_move_at_once() {
+        let (seen, cancel) = (Arc::new(Seen::default()), Arc::new(AtomicBool::new(false)));
+        let jobs = vec![
+            job("a", "dir/Notes.txt", false, file("a", 100, "ok", &seen, &cancel)),
+            job("b", "dir/notes.TXT", false, file("b", 100, "ok", &seen, &cancel)),
+            job("c", "dir/other", false, file("c", 100, "ok", &seen, &cancel)),
+        ];
+        assert!(matches!(run_dir_files(jobs.into_iter(), 4, &cancel, || {}).await, DirFilesEnd::Done));
+        let starts = seen.starts.lock().unwrap();
+        assert!(starts.iter().all(|(_, live)| !(live.contains(&"a") && live.contains(&"b"))), "{starts:?}");
+        assert_eq!(starts.len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_lets_the_files_in_flight_finish_and_starts_none() {
+        let (seen, cancel) = (Arc::new(Seen::default()), Arc::new(AtomicBool::new(false)));
+        let jobs = vec![
+            job("f1", "f1", false, file("f1", 50, "fail", &seen, &cancel)),
+            job("f2", "f2", false, file("f2", 200, "ok", &seen, &cancel)),
+            job("f3", "f3", false, file("f3", 200, "ok", &seen, &cancel)),
+            job("f4", "f4", false, file("f4", 200, "ok", &seen, &cancel)),
+            job("f5", "f5", false, file("f5", 200, "ok", &seen, &cancel)),
+        ];
+        match run_dir_files(jobs.into_iter(), 4, &cancel, || {}).await {
+            DirFilesEnd::Failed(msg, notes) => {
+                assert_eq!(msg, "f1 broke");
+                assert!(notes.is_empty());
+            }
+            _ => panic!("the failure is told"),
+        }
+        let ends = seen.ends.lock().unwrap();
+        for n in ["f2", "f3", "f4"] {
+            assert!(ends.contains(&n), "{n} in flight finished whole: {ends:?}");
+        }
+        assert!(!seen.starts.lock().unwrap().iter().any(|(n, _)| *n == "f5"), "nothing new after the failure");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_stops_the_files_in_flight() {
+        let (seen, cancel) = (Arc::new(Seen::default()), Arc::new(AtomicBool::new(false)));
+        let jobs: Vec<_> = ["c1", "c2", "c3"].iter().map(|&n| job(n, n, false, file(n, 1000, "ok", &seen, &cancel))).collect();
+        let stopper = Arc::clone(&cancel);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stopper.store(true, Ordering::Relaxed);
+        });
+        match run_dir_files(jobs.into_iter(), 4, &cancel, || {}).await {
+            DirFilesEnd::Stopped(mut notes) => {
+                notes.sort();
+                assert_eq!(notes, ["c1 was cut", "c2 was cut", "c3 was cut"]);
+            }
+            _ => panic!("a cancel stops it"),
+        }
+        assert!(seen.ends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_file_that_panics_is_named() {
+        let (seen, cancel) = (Arc::new(Seen::default()), Arc::new(AtomicBool::new(false)));
+        let jobs = vec![job("broken.txt", "broken.txt", false, file("x", 10, "panic", &seen, &cancel))];
+        match run_dir_files(jobs.into_iter(), 4, &cancel, || {}).await {
+            DirFilesEnd::Failed(msg, _) => assert!(msg.starts_with("broken.txt: the transfer ended"), "{msg}"),
+            _ => panic!("a panic is a failure"),
+        }
+    }
+}
+
+/// One file of a folder download (sftp_download_dir), into `local_root`: to a
+/// sibling temp renamed over its final name at the end (see
+/// sftp_download_file), so a failure or a cancel part way through a tree
+/// doesn't truncate a file already there. Nothing there is replaced unless
+/// `replace`: a file of that name that came meanwhile (another download
+/// finished first) is left, counted in `skipped`.
+#[allow(clippy::too_many_arguments)]
+async fn download_dir_file(
+    sftp: Arc<russh_sftp::client::SftpSession>,
+    remote_file_path: String,
+    rel: String,
+    local_root: std::path::PathBuf,
+    transferred: Arc<std::sync::atomic::AtomicU64>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    replace: bool,
+    skipped: Arc<std::sync::atomic::AtomicU64>,
+) -> Result<(), DirFileEnd> {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Normalise the relative path's separators for the local OS. On
+    // Unix this is a no-op; on Windows we replace `/` so create_dir_all
+    // produces real nested directories instead of one literal name
+    // containing slashes.
+    let rel_local = if cfg!(windows) { rel.replace('/', "\\") } else { rel.to_string() };
+    let dest = local_root.join(&rel_local);
+    // Defense in depth: every component of `rel` was checked with
+    // is_safe_dir_entry_name during the walk, so this can't fail for a
+    // well-behaved tree — but check before we create or open anything
+    // that the relative part is plain names only (no root, prefix or
+    // `..`), so the join can only land under the destination root.
+    let rel_is_plain = std::path::Path::new(&rel_local)
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !rel_is_plain || !dest.starts_with(&local_root) {
+        return Err(DirFileEnd::Failed(format!("unsafe path escaped destination: {}", dest.display())));
+    }
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await
+            .map_err(|e| DirFileEnd::Failed(format!("mkdir {}: {}", parent.display(), e)))?;
+    }
+    let mut remote_file = sftp.open(&remote_file_path).await
+        .map_err(|e| DirFileEnd::Failed(format!("open {}: {}", remote_file_path, e)))?;
+    let temp = download_temp_path(&dest);
+    let mut local_file = tokio::fs::File::create(&temp).await
+        .map_err(|e| DirFileEnd::Failed(format!("create {}: {}", dest.display(), e)))?;
+    let mut buf = vec![0u8; 256 * 1024];
+    let copied: Result<(), DirFileEnd> = async {
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(DirFileEnd::Stopped(None));
+            }
+            let n = remote_file.read(&mut buf).await
+                .map_err(|e| DirFileEnd::Failed(format!("read {}: {}", remote_file_path, e)))?;
+            if n == 0 {
+                break;
+            }
+            local_file.write_all(&buf[..n]).await
+                .map_err(|e| DirFileEnd::Failed(format!("write {}: {}", dest.display(), e)))?;
+            transferred.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        // See sftp_download_file: a failed last write surfaces here.
+        local_file.flush().await
+            .map_err(|e| DirFileEnd::Failed(format!("flush {}: {}", dest.display(), e)))
+    }.await;
+    drop(local_file);
+    if let Err(end) = copied {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(end);
+    }
+    if let Err(e) = finalize_download(&temp, &dest, replace).await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            skipped.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        return Err(DirFileEnd::Failed(format!("finalize {}: {}", dest.display(), e)));
+    }
+    local_open::mark_from_internet(&dest);
+    Ok(())
+}
+
+/// One file of a folder upload (sftp_upload_dir), to `remote_full`. A cancel
+/// ends it as a single file's cancel does (finish_cancelled_upload): only a
+/// file this upload made is deleted. It waits while another upload writes
+/// the same remote file; `ask_first` (the folder wasn't there when this
+/// upload began, and the user didn't choose to overwrite) is the folder's
+/// `EXISTS:` answer, given when that other upload left a file here.
+#[allow(clippy::too_many_arguments)]
+async fn upload_dir_file(
+    sftp: Arc<russh_sftp::client::SftpSession>,
+    local_file_path: std::path::PathBuf,
+    remote_full: String,
+    shown: String,
+    transferred: Arc<std::sync::atomic::AtomicU64>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    session_id: String,
+    ask_first: Option<String>,
+) -> Result<(), DirFileEnd> {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let halted = || cancel.load(Ordering::Relaxed);
+    let mut local_file = tokio::fs::File::open(&local_file_path).await
+        .map_err(|e| DirFileEnd::Failed(format!("open {:?}: {}", local_file_path, e)))?;
+    // See sftp_upload_file: no truncating open after a cancel.
+    if halted() {
+        return Err(DirFileEnd::Stopped(None));
+    }
+    let Some((_write_turn, waited)) = remote_write_locks().acquire(&session_id, &remote_full, &cancel).await else {
+        return Err(DirFileEnd::Stopped(None));
+    };
+    if let Some(exists) = ask_first.filter(|_| waited) {
+        if sftp.metadata(&remote_full).await.is_ok() {
+            return Err(DirFileEnd::Failed(exists));
+        }
+    }
+    // Whether each file was there isn't asked (a round trip per file):
+    // EXCL alone tells a file this upload created.
+    let (mut remote_file, created) = open_upload_target(&sftp, &remote_full, false).await
+        .map_err(|e| DirFileEnd::Failed(format!("open remote {}: {}", remote_full, e)))?;
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        if halted() {
+            let note = finish_cancelled_upload(&sftp, remote_file, &remote_full, &shown, created).await;
+            return Err(DirFileEnd::Stopped(note));
+        }
+        let n = local_file.read(&mut buf).await
+            .map_err(|e| DirFileEnd::Failed(format!("read {:?}: {}", local_file_path, e)))?;
+        if n == 0 {
+            break;
+        }
+        remote_file.write_all(&buf[..n]).await
+            .map_err(|e| DirFileEnd::Failed(format!("write {}: {}", remote_full, e)))?;
+        transferred.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    // See sftp_upload_file: a failed close must end the card too.
+    remote_file.shutdown().await
+        .map_err(|e| DirFileEnd::Failed(format!("close {}: {}", remote_full, e)))
+}
+
+/// What sftp_upload_dir sends: each file under `root` (its path, its path
+/// relative to `root` in POSIX form, its size), each folder (relative), and
+/// the total size. An explicit stack, so a deep tree can't overflow; on a
+/// blocking thread (the caller's spawn_blocking), as a big tree is many
+/// blocking reads. Err(None) is a cancel.
+#[allow(clippy::type_complexity)]
+fn walk_upload_tree(
+    root: &std::path::Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(Vec<(std::path::PathBuf, String, u64)>, Vec<String>, u64), Option<String>> {
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    let mut total_bytes: u64 = 0;
+    let mut stack: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(None);
+        }
+        let read = std::fs::read_dir(&dir).map_err(|e| Some(format!("read_dir {:?}: {}", dir, e)))?;
+        for entry in read {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            let Ok(ft) = entry.file_type() else { continue };
+            let rel = path
+                .strip_prefix(root)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            if ft.is_dir() {
+                dirs.push(rel);
+                stack.push(path);
+            } else if ft.is_file() {
+                let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                total_bytes = total_bytes.saturating_add(size);
+                files.push((path, rel, size));
+            }
+            // Symlinks and other types skipped — same as sftp_download_dir.
+        }
+    }
+    Ok((files, dirs, total_bytes))
+}
+
 /// Recursive remote directory download. Walks the remote tree under
 /// `remote_path`, mirrors its structure into `local_path/{basename}`, and
 /// streams every file across with progress events aggregated under a SINGLE
@@ -21816,7 +22307,6 @@ async fn sftp_download_dir(
     overwrite: Option<bool>,
 ) -> Result<(), String> {
     use tauri::Emitter;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     // Destination is the PARENT directory. We'll create remote_path's
@@ -22011,9 +22501,8 @@ async fn sftp_download_dir(
     // on one file, the second replacing the first. The second is left out.
     let skipped_case = drop_case_twins(&mut files, cfg!(any(windows, target_os = "macos")));
     // Files left out at the end because something of that name was there
-    // (another download finished first): nothing is replaced unless the user
-    // chose to.
-    let mut skipped_existing: u64 = 0;
+    // (another download finished first) are counted by the jobs: nothing is
+    // replaced unless the user chose to.
     let replace = overwrite == Some(true);
     let notes = |skipped_existing: u64| {
         let notes: Vec<String> = [
@@ -22047,105 +22536,43 @@ async fn sftp_download_dir(
         return Err(format!("create root: {}", e));
     }
 
-    let mut transferred: u64 = 0;
-    let mut last_report = std::time::Instant::now();
-    let mut buf = vec![0u8; 256 * 1024];
-
-    for (remote_file_path, rel, _size) in &files {
-        if cancel.load(Ordering::Relaxed) {
-            emit_progress(transferred, total_bytes, "cancelled", None);
-            return Err("cancelled".into());
+    let transferred = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let skipped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let at_once = if state.sftp_shell.lock().await.contains(&session_id) { 1 } else { DIR_FILES_AT_ONCE };
+    let jobs = files.iter().map(|(remote_file_path, rel, size)| DirJob {
+        alone: *size > DIR_FILE_ALONE_DOWN,
+        // The local name: this disk may ignore case.
+        key: rel.to_lowercase(),
+        shown: rel.clone(),
+        run: download_dir_file(
+            Arc::clone(&sftp),
+            remote_file_path.clone(),
+            rel.clone(),
+            local_root.clone(),
+            Arc::clone(&transferred),
+            Arc::clone(&cancel),
+            replace,
+            Arc::clone(&skipped),
+        ),
+    });
+    let ended = run_dir_files(jobs, at_once, &cancel, || {
+        emit_progress(transferred.load(Ordering::Relaxed), total_bytes, "progress", None)
+    }).await;
+    let got = transferred.load(Ordering::Relaxed);
+    match ended {
+        DirFilesEnd::Done => {
+            emit_progress(got, total_bytes, "done", notes(skipped.load(Ordering::Relaxed)));
+            Ok(())
         }
-
-        // Normalise the relative path's separators for the local OS. On
-        // Unix this is a no-op; on Windows we replace `/` so create_dir_all
-        // produces real nested directories instead of one literal name
-        // containing slashes.
-        let rel_local = if cfg!(windows) { rel.replace('/', "\\") } else { rel.clone() };
-        let dest = local_root.join(&rel_local);
-        // Defense in depth: every component of `rel` was checked with
-        // is_safe_dir_entry_name during the walk, so this can't fail for a
-        // well-behaved tree — but check before we create or open anything
-        // that the relative part is plain names only (no root, prefix or
-        // `..`), so the join can only land under the destination root.
-        let rel_is_plain = std::path::Path::new(&rel_local)
-            .components()
-            .all(|c| matches!(c, std::path::Component::Normal(_)));
-        if !rel_is_plain || !dest.starts_with(&local_root) {
-            emit_progress(transferred, total_bytes, "error",
-                Some(format!("unsafe path escaped destination: {}", dest.display())));
-            return Err(format!("unsafe path escaped destination: {}", dest.display()));
+        DirFilesEnd::Stopped(_) => {
+            emit_progress(got, total_bytes, "cancelled", None);
+            Err("cancelled".into())
         }
-        if let Some(parent) = dest.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                emit_progress(transferred, total_bytes, "error",
-                    Some(format!("mkdir {}: {}", parent.display(), e)));
-                return Err(format!("mkdir {}: {}", parent.display(), e));
-            }
+        DirFilesEnd::Failed(msg, _) => {
+            emit_progress(got, total_bytes, "error", Some(msg.clone()));
+            Err(msg)
         }
-
-        let mut remote_file = match sftp.open(remote_file_path).await {
-            Ok(f) => f,
-            Err(e) => {
-                emit_progress(transferred, total_bytes, "error",
-                    Some(format!("open {}: {}", remote_file_path, e)));
-                return Err(format!("open {}: {}", remote_file_path, e));
-            }
-        };
-        // Each file goes to a sibling temp and is renamed over its final name
-        // at the end (see sftp_download_file), so a failure or cancel part way
-        // through a tree doesn't truncate a file already there.
-        let temp = download_temp_path(&dest);
-        let mut local_file = match tokio::fs::File::create(&temp).await {
-            Ok(f) => f,
-            Err(e) => {
-                emit_progress(transferred, total_bytes, "error",
-                    Some(format!("create {}: {}", dest.display(), e)));
-                return Err(format!("create {}: {}", dest.display(), e));
-            }
-        };
-        let scrap = |tmp: &std::path::Path| { let tmp = tmp.to_path_buf(); async move { let _ = tokio::fs::remove_file(&tmp).await; } };
-
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                drop(local_file);
-                scrap(&temp).await;
-                emit_progress(transferred, total_bytes, "cancelled", None);
-                return Err("cancelled".into());
-            }
-            let n = match remote_file.read(&mut buf).await {
-                Ok(n) => n,
-                Err(e) => { drop(local_file); scrap(&temp).await; emit_progress(transferred, total_bytes, "error", Some(format!("read {}: {}", remote_file_path, e))); return Err(format!("read {}: {}", remote_file_path, e)); }
-            };
-            if n == 0 { break; }
-            if let Err(e) = local_file.write_all(&buf[..n]).await {
-                drop(local_file); scrap(&temp).await; emit_progress(transferred, total_bytes, "error", Some(format!("write {}: {}", dest.display(), e))); return Err(format!("write {}: {}", dest.display(), e));
-            }
-            transferred = transferred.saturating_add(n as u64);
-            if last_report.elapsed() >= std::time::Duration::from_millis(100) {
-                emit_progress(transferred, total_bytes, "progress", None);
-                last_report = std::time::Instant::now();
-            }
-        }
-        // See sftp_download_file: a failed last write surfaces here.
-        if let Err(e) = local_file.flush().await {
-            drop(local_file); scrap(&temp).await; emit_progress(transferred, total_bytes, "error", Some(format!("flush {}: {}", dest.display(), e))); return Err(format!("flush {}: {}", dest.display(), e));
-        }
-        drop(local_file);
-        if let Err(e) = finalize_download(&temp, &dest, replace).await {
-            scrap(&temp).await;
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                skipped_existing += 1;
-                continue;
-            }
-            emit_progress(transferred, total_bytes, "error", Some(format!("finalize {}: {}", dest.display(), e)));
-            return Err(format!("finalize {}: {}", dest.display(), e));
-        }
-        local_open::mark_from_internet(&dest);
     }
-
-    emit_progress(transferred, total_bytes, "done", notes(skipped_existing));
-    Ok(())
 }
 
 /// Puts a finished download at `dest`: over what's there when the user chose
@@ -22514,7 +22941,6 @@ async fn sftp_upload_dir(
     overwrite: Option<bool>,
 ) -> Result<(), String> {
     use tauri::Emitter;
-    use tokio::io::AsyncWriteExt;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     // remote_path is the PARENT directory; we hang the basename of
@@ -22581,73 +23007,83 @@ async fn sftp_upload_dir(
 
     emit_progress(0, 0, "progress", None);
 
-    // Phase 1: enumerate. Collect every local file under local_root along
-    // with its relative path (POSIX-style for the remote side) and size.
-    // Iterative walk with an explicit stack so we never overflow async
-    // recursion on pathological trees.
-    let mut files: Vec<(std::path::PathBuf, String, u64)> = Vec::new();
-    let mut dirs: Vec<String> = Vec::new(); // relative dir paths (POSIX) to mkdir on remote
-    let mut total_bytes: u64 = 0;
-    let mut stack: Vec<std::path::PathBuf> = vec![local_root.clone()];
-
-    while let Some(dir) = stack.pop() {
-        if cancel.load(Ordering::Relaxed) {
-            emit_progress(0, total_bytes, "cancelled", None);
+    // Phase 1: enumerate. Every local file under local_root with its relative
+    // path (POSIX-style for the remote side) and size, and every folder.
+    let walked = {
+        let (root, cancel) = (local_root.clone(), Arc::clone(&cancel));
+        tokio::task::spawn_blocking(move || walk_upload_tree(&root, &cancel)).await
+    };
+    let (files, mut dirs, total_bytes) = match walked {
+        Ok(Ok(walked)) => walked,
+        Ok(Err(None)) => {
+            emit_progress(0, 0, "cancelled", None);
             return Err("cancelled".into());
         }
-        let read = match std::fs::read_dir(&dir) {
-            Ok(r) => r,
-            Err(e) => {
-                emit_progress(0, total_bytes, "error", Some(format!("read_dir {:?}: {}", dir, e)));
-                return Err(format!("read_dir {:?}: {}", dir, e));
-            }
-        };
-        for entry in read {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let path = entry.path();
-            let ft = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            let rel = path
-                .strip_prefix(&local_root)
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_default();
-            if ft.is_dir() {
-                dirs.push(rel);
-                stack.push(path);
-            } else if ft.is_file() {
-                let size = path.metadata().map(|m| m.len()).unwrap_or(0);
-                total_bytes = total_bytes.saturating_add(size);
-                files.push((path, rel, size));
-            }
-            // Symlinks and other types skipped — same as sftp_download_dir.
+        Ok(Err(Some(msg))) => {
+            emit_progress(0, 0, "error", Some(msg.clone()));
+            return Err(msg);
         }
-    }
+        Err(e) => {
+            emit_progress(0, 0, "error", Some(e.to_string()));
+            return Err(e.to_string());
+        }
+    };
+    let at_once = if state.sftp_shell.lock().await.contains(&session_id) { 1 } else { DIR_FILES_AT_ONCE };
 
-    // Phase 2: mkdir the destination folder, then each enumerated subdir.
-    // SFTP's mkdir is per-level; we already collected them in pre-order from
-    // the stack walk but order isn't guaranteed shallow-first, so re-sort
-    // by path depth to make sure parents are created before children.
+    // Phase 2: mkdir the destination folder, then each enumerated subdir, a
+    // level at a time (a parent before its children), a few at once.
     let _ = sftp.create_dir(&remote_root).await;
     dirs.sort_by_key(|d| d.matches('/').count());
-    for rel in &dirs {
+    for level in dirs.chunk_by(|a, b| a.matches('/').count() == b.matches('/').count()) {
         if cancel.load(Ordering::Relaxed) {
             emit_progress(0, total_bytes, "cancelled", None);
             return Err("cancelled".into());
         }
-        let full = format!("{}/{}", remote_root.trim_end_matches('/'), rel);
-        // Tolerate already-exists — a parallel mkdir or an earlier partial
-        // run shouldn't abort the whole upload.
-        if sftp.metadata(&full).await.is_err() {
-            if let Err(e) = sftp.create_dir(&full).await {
-                emit_progress(0, total_bytes, "error", Some(format!("mkdir {}: {}", full, e)));
-                return Err(format!("mkdir {}: {}", full, e));
+        let mut made = tokio::task::JoinSet::new();
+        let mut failure: Option<String> = None;
+        let mut level = level.iter();
+        loop {
+            while made.len() < at_once && failure.is_none() && !cancel.load(Ordering::Relaxed) {
+                let Some(rel) = level.next() else { break };
+                let full = format!("{}/{}", remote_root.trim_end_matches('/'), rel);
+                let sftp = Arc::clone(&sftp);
+                made.spawn(async move {
+                    // Tolerate already-exists — an earlier partial run
+                    // shouldn't abort the whole upload.
+                    if sftp.metadata(&full).await.is_ok() {
+                        return Ok(());
+                    }
+                    match sftp.create_dir(&full).await {
+                        Ok(()) => Ok(()),
+                        // There now after all: made meanwhile, or the same
+                        // folder by another case (Foo, foo) on a server that
+                        // ignores case.
+                        Err(e) => match sftp.metadata(&full).await {
+                            Ok(m) if m.is_dir() => Ok(()),
+                            _ => Err(format!("mkdir {}: {}", full, e)),
+                        },
+                    }
+                });
+            }
+            match made.join_next().await {
+                None => break,
+                Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(msg))) => {
+                    failure.get_or_insert(msg);
+                }
+                Some(Err(e)) => {
+                    failure.get_or_insert(e.to_string());
+                }
             }
         }
+        if let Some(msg) = failure {
+            emit_progress(0, total_bytes, "error", Some(msg.clone()));
+            return Err(msg);
+        }
+    }
+    if cancel.load(Ordering::Relaxed) {
+        emit_progress(0, total_bytes, "cancelled", None);
+        return Err("cancelled".into());
     }
 
     if files.is_empty() {
@@ -22655,96 +23091,56 @@ async fn sftp_upload_dir(
         return Ok(());
     }
 
-    // Phase 3: stream each file up. Same chunked loop as sftp_upload_file,
-    // looped over the file list with a shared progress counter.
-    let mut transferred: u64 = 0;
-    let mut last_report = std::time::Instant::now();
-    let mut buf = vec![0u8; 256 * 1024];
-    use tokio::io::AsyncReadExt;
-
-    for (local_file_path, rel, _size) in &files {
-        if cancel.load(Ordering::Relaxed) {
-            emit_progress(transferred, total_bytes, "cancelled", None);
-            return Err("cancelled".into());
-        }
+    // Phase 3: the files, DIR_FILES_AT_ONCE at a time, with a shared progress
+    // counter. A cancel deletes only the files it was writing that this upload
+    // created; files already sent and the folders made for them stay.
+    let transferred = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let jobs = files.iter().map(|(local_file_path, rel, size)| {
         let remote_full = format!("{}/{}", remote_root.trim_end_matches('/'), rel);
-
-        let mut local_file = match tokio::fs::File::open(local_file_path).await {
-            Ok(f) => f,
-            Err(e) => {
-                emit_progress(transferred, total_bytes, "error",
-                    Some(format!("open {:?}: {}", local_file_path, e)));
-                return Err(format!("open {:?}: {}", local_file_path, e));
-            }
-        };
-        // See sftp_upload_file: no truncating open after a cancel.
-        if cancel.load(Ordering::Relaxed) {
-            emit_progress(transferred, total_bytes, "cancelled", None);
-            return Err("cancelled".into());
+        DirJob {
+            alone: *size > DIR_FILE_ALONE_UP,
+            // The server may ignore case.
+            key: remote_full.to_lowercase(),
+            shown: rel.clone(),
+            run: upload_dir_file(
+                Arc::clone(&sftp),
+                local_file_path.clone(),
+                remote_full,
+                format!("{}/{}", folder_name, rel),
+                Arc::clone(&transferred),
+                Arc::clone(&cancel),
+                session_id.clone(),
+                (overwrite != Some(true)).then(|| format!("EXISTS:{}", remote_root)),
+            ),
         }
-        // Whether each file was there isn't asked (a round trip per file):
-        // EXCL alone tells a file this upload created. A cancel deletes only
-        // the file it was writing; files already sent and the folders made
-        // for them stay.
-        // Wait if another upload is writing this same remote file.
-        let Some((_write_turn, waited)) = remote_write_locks().acquire(&session_id, &remote_full, &cancel).await else {
-            emit_progress(transferred, total_bytes, "cancelled", None);
-            return Err("cancelled".into());
-        };
-        // The folder wasn't there when this upload began, so a file in it
-        // that's there now came from the upload it just waited for: ask
-        // before overwriting it, as for the folder itself.
-        if waited && overwrite != Some(true) && sftp.metadata(&remote_full).await.is_ok() {
-            emit_progress(transferred, total_bytes, "error",
-                Some(format!("{}/{} is already on the server.", folder_name, rel)));
-            return Err(format!("EXISTS:{}", remote_root));
+    });
+    let ended = run_dir_files(jobs, at_once, &cancel, || {
+        emit_progress(transferred.load(Ordering::Relaxed), total_bytes, "progress", None)
+    }).await;
+    let sent = transferred.load(Ordering::Relaxed);
+    match ended {
+        DirFilesEnd::Done => {
+            emit_progress(sent, total_bytes, "done", None);
+            Ok(())
         }
-        let (mut remote_file, created) = match open_upload_target(&sftp, &remote_full, false).await {
-            Ok(opened) => opened,
-            Err(e) => {
-                emit_progress(transferred, total_bytes, "error",
-                    Some(format!("open remote {}: {}", remote_full, e)));
-                return Err(format!("open remote {}: {}", remote_full, e));
-            }
-        };
-
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                let shown = format!("{}/{}", folder_name, rel);
-                let note = finish_cancelled_upload(&sftp, remote_file, &remote_full, &shown, created).await;
-                emit_progress(transferred, total_bytes, "cancelled", note);
-                return Err("cancelled".into());
-            }
-            let n = local_file.read(&mut buf).await
-                .map_err(|e| {
-                    emit_progress(transferred, total_bytes, "error",
-                        Some(format!("read {:?}: {}", local_file_path, e)));
-                    format!("read {:?}: {}", local_file_path, e)
-                })?;
-            if n == 0 { break; }
-            remote_file.write_all(&buf[..n]).await
-                .map_err(|e| {
-                    emit_progress(transferred, total_bytes, "error",
-                        Some(format!("write {}: {}", remote_full, e)));
-                    format!("write {}: {}", remote_full, e)
-                })?;
-            transferred = transferred.saturating_add(n as u64);
-            if last_report.elapsed() >= std::time::Duration::from_millis(100) {
-                emit_progress(transferred, total_bytes, "progress", None);
-                last_report = std::time::Instant::now();
-            }
+        DirFilesEnd::Stopped(notes) => {
+            emit_progress(sent, total_bytes, "cancelled", (!notes.is_empty()).then(|| notes.join(" ")));
+            Err("cancelled".into())
         }
-        // See sftp_upload_file: a failed close must end the card too.
-        remote_file.shutdown().await
-            .map_err(|e| {
-                emit_progress(transferred, total_bytes, "error",
-                    Some(format!("close {}: {}", remote_full, e)));
-                format!("shutdown {}: {}", remote_full, e)
-            })?;
+        // Another upload put a file of this folder there meanwhile: the
+        // page asks before overwriting, as for the folder itself.
+        DirFilesEnd::Failed(msg, _) if msg.starts_with("EXISTS:") => {
+            emit_progress(sent, total_bytes, "error",
+                Some(format!("Files of {} are already on the server: another upload put them there.", folder_name)));
+            Err(msg)
+        }
+        DirFilesEnd::Failed(msg, notes) => {
+            // A cancel after the failure may have cut files short: said too.
+            let msg = if notes.is_empty() { msg } else { format!("{msg} {}", notes.join(" ")) };
+            emit_progress(sent, total_bytes, "error", Some(msg.clone()));
+            Err(msg)
+        }
     }
-
-    emit_progress(transferred, total_bytes, "done", None);
-    Ok(())
 }
 
 /// Flip the cancel flag for an in-flight SFTP transfer. The download / upload
@@ -24065,10 +24461,9 @@ async fn sftp_open_remote_file(
                     };
 
                     // Open the SFTP subsystem, then IMMEDIATELY drop the
-                    // session mutex. Holding it across the whole write serialises
-                    // every open_terminal / cold-cache SFTP-bootstrap request on
-                    // the same session behind this one save — visible as a UI
-                    // freeze whenever the user Ctrl-S's a large remote file.
+                    // session handle's guard: nothing waits on it (it's shared
+                    // for reading), but the save shouldn't keep it longer than
+                    // the open it needs it for.
                     // An elevated tab (file ops as root via sudo) must save
                     // back the same way, or root-owned files can't be written.
                     let elevation = elevation_clone.lock().await.get(&session_id_clone).cloned();
@@ -24175,7 +24570,7 @@ async fn local_open_file(local_path: String, run_program: Option<bool>) -> Resul
         if run_program != Some(true) && safe.is_file() && local_open::runs_when_opened(&safe) {
             return Err(format!("[OPEN] RUNS_WHEN_OPENED: {}", local_path));
         }
-        open::that(&safe).map_err(|e| format!("Failed to open local file: {}", e))?;
+        child_env::open(&safe).map_err(|e| format!("Failed to open local file: {}", e))?;
         Ok(())
     }
 }
@@ -24191,9 +24586,9 @@ async fn local_open_in_explorer(local_path: String) -> Result<(), String> {
     {
         let safe = guard_local_path(&local_path, false)?;
         if safe.is_dir() {
-            open::that(&safe).map_err(|e| format!("Failed to open folder: {}", e))?;
+            child_env::open(&safe).map_err(|e| format!("Failed to open folder: {}", e))?;
         } else if let Some(parent) = safe.parent() {
-            open::that(parent).map_err(|e| format!("Failed to open folder: {}", e))?;
+            child_env::open(parent).map_err(|e| format!("Failed to open folder: {}", e))?;
         }
         Ok(())
     }
@@ -27405,9 +27800,8 @@ pub fn run() {
             local_term::set_webview_env("LIBGL_ALWAYS_SOFTWARE", "1");
             own_render_env.push("LIBGL_ALWAYS_SOFTWARE");
         }
-        // Kept out of the programs this process starts (an RDP app): see
-        // OWN_RENDER_ENV.
-        let _ = OWN_RENDER_ENV.set(own_render_env);
+        // Kept out of the programs this process starts: see child_env.rs.
+        child_env::remember(own_render_env);
         // Sandbox the web process (bubblewrap) when this machine supports it.
         // The rendering flags above still reach it: WebKit's bwrap launcher
         // only sets/unsets a few specific variables, it never clears the
@@ -27523,7 +27917,7 @@ pub fn run() {
             telnet_connect, telnet_open_terminal, vnc_open, vnc_input, vnc_resize, vnc_paste, vnc_shown, screen_ack,
             start_tunnel, stop_tunnel, list_tunnels, restart_session_tunnels, persist_session_tunnels,
             list_tunnel_rules, remove_tunnel_rule, rename_tunnel_rule,
-            open_terminal, local_shell, write_terminal_data, type_saved_password, resize_terminal, close_terminal,
+            open_terminal, local_shell, write_terminal_data, type_saved_password, terminal_drawn, resize_terminal, close_terminal,
             multiexec::write_terminals_data,
             local_term::list_local_shells, local_term::local_shell_set_default,
             local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
@@ -27536,7 +27930,6 @@ pub fn run() {
             ssh_info_probe_section, ssh_systemctl_action, ssh_kill_process,
             ssh_iptables_chain, ssh_nft_chain, ssh_firewall_as_root,
             applog::app_log, applog::ui_heartbeat, applog::open_log_folder, diagnostics_report,
-            term_output::terminal_output_ack,
             highlight::highlight_rules_list, highlight::highlight_rule_save, highlight::highlight_rule_delete, highlight::highlight_rules_reorder,
             docker::ssh_docker_container_action,
             docker::ssh_docker_inspect,
@@ -27873,7 +28266,7 @@ mod clone_server_tests {
             "CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT,
                 credential_id INTEGER, folder_id INTEGER, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER, tunnels TEXT,
                 auth_type TEXT, key_id INTEGER, autostart INTEGER NOT NULL DEFAULT 0, mirrors TEXT, color TEXT, notes TEXT,
-                run_on_connect TEXT NOT NULL DEFAULT '', jump_host_id INTEGER, terminal_theme TEXT, highlight TEXT, protocol TEXT,
+                run_on_connect TEXT NOT NULL DEFAULT '', run_on_connect_every INTEGER, jump_host_id INTEGER, terminal_theme TEXT, highlight TEXT, protocol TEXT,
                 position INTEGER NOT NULL DEFAULT 0, uuid TEXT);
              CREATE TABLE sync_tombstones(uuid TEXT PRIMARY KEY);
              CREATE TRIGGER s_ai AFTER INSERT ON servers WHEN NEW.uuid IS NULL

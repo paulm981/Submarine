@@ -31,8 +31,8 @@ import { SCROLLBACK_KEY, readScrollback } from "./util/terminalScrollback";
 import { USE_LOCAL_SHELL_KEY, readUseLocalShell } from "./util/terminalShell";
 import { USE_SSH_AGENT_KEY, readUseSshAgent } from "./util/sshAgent";
 import { USE_SSH_CONFIG_KEY, readUseSshConfig } from "./util/sshConfig";
-import { DEFAULT_RDP_OPTIONS, rdpAddress, readRdpOptions, writeRdpOptions } from "./util/rdpOptions";
-import { DEFAULT_VNC_OPTIONS, readVncOptions, writeVncOptions } from "./util/vncOptions";
+import { DEFAULT_RDP_OPTIONS, forgetRdpOptions, rdpAddress, readRdpOptions, writeRdpOptions } from "./util/rdpOptions";
+import { DEFAULT_VNC_OPTIONS, forgetVncOptions, readVncOptions, writeVncOptions } from "./util/vncOptions";
 import { Sidebar } from "./components/Sidebar";
 import { NodeGrid } from "./components/NodeGrid";
 import { SessionTree, type TreeItems } from "./components/SessionTree";
@@ -79,7 +79,7 @@ const appWindow = getCurrentWindow();
 // has no tab of its own until it's popped out of the Wall.
 // `serverUuid` is the saved server's sync id, which keys this device's own
 // per-server settings (the Shell button, see util/shellSync.ts).
-type Session = { id: string; serverId: number; serverName: string; serverUuid?: string | null; protocol?: "ssh" | "rdp" | "telnet" | "vnc"; host?: string; port?: number; mirrors?: string; runOnConnect?: string; runOnConnectHeld?: boolean; quickAuth?: QuickAuth | null; wallId?: string };
+type Session = { id: string; serverId: number; serverName: string; serverUuid?: string | null; protocol?: "ssh" | "rdp" | "telnet" | "vnc"; host?: string; port?: number; mirrors?: string; runOnConnect?: string; runOnConnectEvery?: boolean; runOnConnectHeld?: boolean; quickAuth?: QuickAuth | null; wallId?: string };
 
 // The Home view (HomePane): terminals on this computer, where the app opens
 // and where closing the last session tab goes back to. Android has no shells
@@ -399,13 +399,15 @@ function DesktopApp() {
     // in the encrypted vault. Empty string by default — the textarea in the
     // panel renders a placeholder when blank.
     notes: "" as string,
-    // Commands auto-typed into the FIRST terminal on the INITIAL connect only
-    // (never on reconnect or extra shells). Newline-separated. Empty = off.
+    // Commands typed into the first terminal on connect, and again after a
+    // reconnect (SessionView). Newline-separated. Empty = off.
     runOnConnect: "" as string,
     // The server's own terminal color scheme id; "" = the app's.
     terminalTheme: "" as string,
     // The server's own highlight set id (src/ui/highlight.ts); "" = the app's.
     highlight: "" as string,
+    // Also typed once into every new terminal of the server (#256).
+    runOnConnectEvery: false,
     // ProxyJump: id (as a string, like credentialId/folderId) of another node
     // to bounce through. Empty = connect directly. parseInt'd to a number (or
     // null) at save time.
@@ -913,10 +915,20 @@ function DesktopApp() {
     };
   }, [isUnlocked, appSettings.autoSync, appSettings.syncIntervalMin, quietSync]);
 
+  // What this device keeps for a server and the sync doesn't: it goes with the server.
+  const forgetServer = (s: { id: number; uuid?: string | null }) => {
+    if (activeProfile) forgetServerBookmarks(activeProfile, s.id);
+    if (s.uuid) {
+      forgetRdpOptions(s.uuid);
+      forgetVncOptions(s.uuid);
+    }
+  };
+
   const removeServer = async (id: number) => {
+    const server = (servers || []).find((s: any) => s.id === id);
     try {
       await invoke("delete_server", { id });
-      if (activeProfile) forgetServerBookmarks(activeProfile, id);
+      forgetServer(server || { id });
       refreshServers();
       bumpSync();
       addLog("Server removed.", "info");
@@ -928,10 +940,10 @@ function DesktopApp() {
     // which servers go, for the same per-server cleanup removeServer does.
     const tree = folderTree(folders);
     const inside = tree.subtreeOf(id);
-    const gone: number[] = (servers || []).filter((s: any) => inside.has(tree.serverFolder(s) as number)).map((s: any) => s.id);
+    const gone: any[] = (servers || []).filter((s: any) => inside.has(tree.serverFolder(s) as number));
     try {
       await invoke("delete_folder", { id });
-      if (activeProfile) gone.forEach((sid) => forgetServerBookmarks(activeProfile, sid));
+      gone.forEach(forgetServer);
       // delete_folder cascades to the folders, servers and Remote Desktop
       // links inside it (lib.rs), so refresh all three.
       await Promise.all([refreshFolders(), refreshServers(), refreshRdpLinks()]);
@@ -1005,7 +1017,7 @@ function DesktopApp() {
     ]);
     try {
       await invoke("delete_tree_items", { servers: items.servers, links: items.links, folders: items.folders });
-      if (activeProfile) gone.forEach((sid) => forgetServerBookmarks(activeProfile, sid));
+      (servers || []).filter((s: any) => gone.has(s.id)).forEach(forgetServer);
       addLog("Removed from the session tree.", "info");
     } finally {
       await Promise.all([refreshFolders(), refreshServers(), refreshRdpLinks()]);
@@ -1251,6 +1263,8 @@ function DesktopApp() {
     serverUuid: server.uuid ?? null,
     // Commands typed into the first terminal on connect (see SessionView).
     runOnConnect: server.run_on_connect || "",
+    // And into each other terminal of the tab (#256).
+    runOnConnectEvery: !!server.run_on_connect_every,
     // Set or changed by someone this profile is shared with, not allowed
     // here yet: SessionView asks before typing them.
     runOnConnectHeld: (server.held || []).includes("run_on_connect"),
@@ -1489,7 +1503,7 @@ function DesktopApp() {
   // Closing several at once always asks.
   const askCloseSession = () => (!appSettings.confirmCloseSession ? Promise.resolve(true) : confirm({
     title: "Close this session?",
-    message: "The SSH connection will be dropped.",
+    message: "The connection will be dropped.",
     okLabel: "Close",
     destructive: true,
     dontAskAgain: () => setAppSettings(s => ({ ...s, confirmCloseSession: false })),
@@ -1784,6 +1798,7 @@ function DesktopApp() {
       runOnConnect: server.run_on_connect || "",
       terminalTheme: server.terminal_theme || "",
       highlight: server.highlight || "",
+      runOnConnectEvery: !!server.run_on_connect_every,
       jumpHostId: server.jump_host_id?.toString() || "",
       // Attribution (read-only display): who last edited + the HLC stamp.
       editedBy: server.edited_by ?? null,
@@ -1879,9 +1894,9 @@ function DesktopApp() {
                 const cur = sessions.find(s => s.id === activeView);
                 const st = cur ? (sessionStatuses[cur.id] ?? 'connecting') : null;
                 const dotTone =
-                  cur && promptSessions.has(cur.id) ? 'bg-primary animate-pulse' :
+                  cur && promptSessions.has(cur.id) ? 'bg-primary animate-pulse-brief' :
                   st === 'connected'    ? 'bg-emerald-400' :
-                  st === 'connecting'   ? 'bg-amber-400 animate-pulse' :
+                  st === 'connecting'   ? 'bg-amber-400 animate-pulse-brief' :
                   st === 'failed'       ? 'bg-rose-500' :
                   st === 'disconnected' ? 'bg-rose-500' :
                                           'bg-zinc-500';
@@ -1915,9 +1930,9 @@ function DesktopApp() {
                   {sessions.filter(s => !s.wallId).map(s => {
                     const st = sessionStatuses[s.id] ?? 'connecting';
                     const dot =
-                      promptSessions.has(s.id) ? 'bg-primary animate-pulse' :
+                      promptSessions.has(s.id) ? 'bg-primary animate-pulse-brief' :
                       st === 'connected'    ? 'bg-emerald-400' :
-                      st === 'connecting'   ? 'bg-amber-400 animate-pulse' :
+                      st === 'connecting'   ? 'bg-amber-400 animate-pulse-brief' :
                       st === 'idle'         ? 'bg-zinc-500' :
                       'bg-rose-500';
                     const isActive = activeView === s.id;
@@ -2066,7 +2081,7 @@ function DesktopApp() {
                 titleTabClass({ compact, active: on, tone: w.broadcast ? "broadcast" : "primary" })
               }`}
             >
-              {w.broadcast ? <Radio size={12} className="shrink-0 animate-pulse" /> : <LayoutGrid size={12} className="shrink-0" />}
+              {w.broadcast ? <Radio size={12} className="shrink-0 animate-pulse-brief" /> : <LayoutGrid size={12} className="shrink-0" />}
               {/* A terminal on it printed something while the Wall wasn't
                   on screen (on screen, its tiles are being looked at). */}
               <NewsDot terminals={w.members.map(m => m.terminalId)} />
@@ -2093,9 +2108,9 @@ function DesktopApp() {
           // status: the dot pulses in the accent colour until it's answered.
           const waiting = promptSessions.has(s.id);
           const dotTone =
-            waiting               ? "bg-primary animate-pulse" :
+            waiting               ? "bg-primary animate-pulse-brief" :
             st === "connected"    ? "bg-emerald-400" :
-            st === "connecting"   ? "bg-amber-400 animate-pulse" :
+            st === "connecting"   ? "bg-amber-400 animate-pulse-brief" :
             st === "failed"       ? "bg-rose-500" :
             st === "disconnected" ? "bg-rose-500" :
                                     "bg-zinc-500";
@@ -2421,7 +2436,7 @@ function DesktopApp() {
                   : "bg-white/[0.06] border border-white/10 text-zinc-400 hover:bg-white/[0.1] hover:text-white"
               }`}
             >
-              <Radio size={12} className={live ? "animate-pulse" : ""} />
+              <Radio size={12} className={live ? "animate-pulse-brief" : ""} />
               {live && (
                 <span
                   className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-1 rounded-full bg-orange-500 text-[9px] font-bold text-black flex items-center justify-center leading-none"
@@ -3408,7 +3423,7 @@ function DesktopApp() {
                 mounted preserves the live data; the backend pollers were
                 always running, only the UI side was losing state. */}
             <div className={`flex-1 flex flex-col overflow-hidden ${activeView === "monitor" ? "" : "hidden"}`}>
-              <MonitoringPanel servers={servers} refreshServers={refreshServers} addLog={addLog} />
+              <MonitoringPanel servers={servers} refreshServers={refreshServers} addLog={addLog} active={activeView === "monitor"} />
             </div>
 
             {/* Compare workspace — pick any subset of open sessions and
@@ -3623,7 +3638,7 @@ function DesktopApp() {
             }
             // Same separate-write pattern for the on-connect commands.
             try {
-              await invoke("set_server_run_on_connect", { id: savedId, value: newNode.runOnConnect || "" });
+              await invoke("set_server_run_on_connect", { id: savedId, value: newNode.runOnConnect || "", every: !!newNode.runOnConnectEvery });
             } catch (e) {
               addLog(`SAVE_RUN_ON_CONNECT_FAILED: ${e}`, "error");
             }

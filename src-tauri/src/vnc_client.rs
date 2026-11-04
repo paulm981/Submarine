@@ -74,6 +74,12 @@ fn over_corner(r: Rect) -> bool {
 const DRAIN_BUDGET: Duration = Duration::from_millis(10);
 const DRAIN_WAIT: Duration = Duration::from_millis(2);
 
+/// The tick while the tab is hidden: nothing is asked for then, so the loop
+/// only takes what the server sends unasked (a copied text). At TICK_MS a
+/// hidden tab woke the CPU 30-60 times a second for nothing; on a phone with
+/// the app in the background that is battery.
+const PAUSED_TICK: Duration = Duration::from_millis(250);
+
 /// The desktop's size the tab wants, asked of the server one request at a
 /// time (the VNC library refuses a second while one is out), the latest
 /// wanted size winning. A request goes once the server has said its layout
@@ -857,6 +863,8 @@ where
                         paused = !shown;
                         if shown {
                             probe.whole_picture();
+                            // Back to TICK_MS at once (see PAUSED_TICK).
+                            tick.reset_immediately();
                         } else {
                             probe.out = None;
                         }
@@ -1007,6 +1015,9 @@ where
                 // none while the tab is hidden.
                 if pacer.tick(Instant::now(), changed, held || paused) && !send(&client, X11Event::Refresh).await? {
                     break Ok("The VNC server closed the connection.".to_string());
+                }
+                if paused {
+                    tick.reset_after(PAUSED_TICK);
                 }
             }
         }

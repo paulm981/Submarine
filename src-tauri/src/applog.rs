@@ -418,7 +418,7 @@ pub fn open_log_folder() -> Result<(), String> {
     }
     #[cfg(not(any(target_os = "android", target_os = "macos")))]
     {
-        open::that_detached(&dir).map_err(|e| format!("Couldn't open {}: {e}", dir.display()))
+        crate::child_env::open_detached(&dir).map_err(|e| format!("Couldn't open {}: {e}", dir.display()))
     }
     #[cfg(target_os = "android")]
     {

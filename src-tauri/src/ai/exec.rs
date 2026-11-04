@@ -65,7 +65,7 @@ async fn stop_asked(stop: &mut watch::Receiver<bool>) {
 /// Run `command` and collect its output, until it ends, `limit` passes, the
 /// output passes `cap`, or `stop` is set (see the module's notes).
 pub(crate) async fn run<H: client::Handler>(
-    handle: &tokio::sync::Mutex<client::Handle<H>>,
+    handle: &tokio::sync::RwLock<client::Handle<H>>,
     command: &str,
     limit: Duration,
     cap: usize,
@@ -77,7 +77,7 @@ pub(crate) async fn run<H: client::Handler>(
     // under the timeout and Stop too. Nothing runs on the server before the
     // channel exists.
     let open = async {
-        let h = handle.lock().await;
+        let h = handle.read().await;
         h.channel_open_session().await.map_err(|e| format!("Couldn't open a channel to the server: {e}"))
     };
     let mut channel = tokio::select! {
@@ -275,7 +275,7 @@ async fn detached<T: Send + 'static>(stop: &mut watch::Receiver<bool>, deadline:
 /// says, and collect its output as `run` does. `started` hears once the
 /// tool has taken the password (or needed none) and the command started.
 pub(crate) async fn run_root<H: client::Handler + 'static>(
-    handle: &Arc<tokio::sync::Mutex<client::Handle<H>>>,
+    handle: &Arc<tokio::sync::RwLock<client::Handle<H>>>,
     how: RootHow,
     command: &str,
     limit: Duration,
@@ -318,7 +318,7 @@ pub(crate) async fn run_root<H: client::Handler + 'static>(
 
     let mut out = Exec::default();
     let open = async {
-        let h = handle.lock().await;
+        let h = handle.read().await;
         h.channel_open_session().await.map_err(|e| format!("Couldn't open a channel to the server: {e}"))
     };
     let mut channel = match within(&mut stop, deadline, open).await {
@@ -421,7 +421,7 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    pub(crate) type Conn = Arc<tokio::sync::Mutex<client::Handle<TestClient>>>;
+    pub(crate) type Conn = Arc<tokio::sync::RwLock<client::Handle<TestClient>>>;
 
     /// A test server running commands with this machine's sh, and its count
     /// of commands still running. Its signal and close end the `sh` only,
@@ -431,7 +431,7 @@ pub(crate) mod tests {
         let srv = TestServer::with_shell(opts);
         let running = srv.running.clone();
         let h = ssh_test_server::connect(srv, |_| {}, client::Config::default()).await.unwrap();
-        (Arc::new(tokio::sync::Mutex::new(h)), running)
+        (Arc::new(tokio::sync::RwLock::new(h)), running)
     }
 
     pub(crate) async fn server() -> Conn {

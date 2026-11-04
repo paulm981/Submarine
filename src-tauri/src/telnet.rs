@@ -16,8 +16,7 @@
 //! 23 nothing is asked first (a mail or web server would take the requests
 //! for garbage), as the classic telnet client does: it only answers.
 
-use crate::ssh_manager::{ClientHandler, PtySize, TerminalCommand};
-use crate::term_output::OutputSink;
+use crate::ssh_manager::{page_end, page_start, ClientHandler, Outflow, PtySize, TerminalCommand};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
@@ -391,7 +390,8 @@ pub async fn connect_through(route: &[russh::client::Handle<ClientHandler>], hos
 }
 
 /// Drives a tab's telnet connection for its life: the server's text →
-/// coalesced batches to the page (`output`), keys and resizes → the server,
+/// coalesced batches over the page's channel (term_output.rs), keys and
+/// resizes → the server,
 /// then `terminal-closed-{id}`; and `session-disconnected-{session}` when the
 /// server (or the route) ended it rather than the tab. Both carry the
 /// connection's `generation`, so the tab can tell a connection a Reconnect
@@ -404,8 +404,7 @@ pub async fn run_pump(
     session_id: String,
     terminal_id: String,
     conn: Conn,
-    // The page's output channel, paced by what it has drawn (term_output.rs).
-    output: OutputSink,
+    on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
     mut rx: mpsc::Receiver<TerminalCommand>,
     mut resize_rx: watch::Receiver<PtySize>,
 ) {
@@ -423,6 +422,9 @@ pub async fn run_pump(
 
     let first = if telnet_port { telnet.lock().map(|mut t| t.start()).unwrap_or_default() } else { Vec::new() };
     let writer_telnet = Arc::clone(&telnet);
+    // What the page has drawn: what it hasn't stays bounded (ssh_manager::Outflow).
+    let page = page_start(&terminal_id);
+    let writer_page = Arc::clone(&page);
     let writer = tokio::spawn(async move {
         let mut ok = first.is_empty() || write_half.write_all(&first).await.is_ok();
         let mut closed_here = false;
@@ -430,6 +432,7 @@ pub async fn run_pump(
             tokio::select! {
                 cmd = rx.recv() => match cmd {
                     Some(TerminalCommand::Data(keys)) => {
+                        writer_page.keys(&keys);
                         let (mut net, mut echo) = (Vec::new(), Vec::new());
                         if let Ok(t) = writer_telnet.lock() {
                             t.send(&keys, &mut net, &mut echo);
@@ -475,6 +478,8 @@ pub async fn run_pump(
     // Numbers in control sequences are cut down, as in an SSH terminal (term_filter.rs).
     let mut limiter = crate::term_filter::CsiLimiter::default();
     let mut buf = vec![0u8; 16 * 1024];
+    let mut flow = Outflow::default();
+    let mut flush = |b: &mut Vec<u8>| crate::term_output::send(&terminal_id, &on_output, b);
     // Whether the server (or the route) ended it, rather than the tab.
     let server_ended = loop {
         let was_empty = out.is_empty();
@@ -497,28 +502,37 @@ pub async fn run_pump(
             },
             Some(echo) = echo_rx.recv() => out.extend_from_slice(&echo),
             _ = &mut flush_timer => {
-                output.push(&mut out);
-                flush_timer.as_mut().reset(park());
+                let next = if flow.send(&mut out, &page, &mut flush) { park() } else { flow.wait_until() };
+                flush_timer.as_mut().reset(next);
+                continue;
+            }
+            // The page drew some, or keys were typed.
+            _ = page.news.notified() => {
+                if page.take_typed() {
+                    flow.typed(&page);
+                }
+                if page.take_interrupt() {
+                    flow.interrupted(&mut out, &page);
+                }
+                if flow.holds() {
+                    let next = if flow.send(&mut out, &page, &mut flush) { park() } else { flow.wait_until() };
+                    flush_timer.as_mut().reset(next);
+                }
                 continue;
             }
             failed = &mut stop_rx => break failed.unwrap_or(false),
         }
         if out.len() >= FLUSH_CAP {
-            output.push(&mut out);
-            flush_timer.as_mut().reset(park());
+            let next = if flow.send(&mut out, &page, &mut flush) { park() } else { flow.wait_until() };
+            flush_timer.as_mut().reset(next);
         } else if was_empty && !out.is_empty() {
             flush_timer.as_mut().reset(tokio::time::Instant::now() + FLUSH_WINDOW);
         }
     };
-    output.push(&mut out);
+    flow.finish(&mut out, &page, &mut flush);
+    page_end(&terminal_id, &page);
     writer.abort();
-    // Once the page has what's left, like an SSH terminal (run_pty_pump).
-    {
-        let app = app.clone();
-        output.finish(move || {
-            let _ = app.emit(&format!("terminal-closed-{terminal_id}"), serde_json::json!({ "generation": generation }));
-        });
-    }
+    let _ = app.emit(&format!("terminal-closed-{terminal_id}"), serde_json::json!({ "generation": generation }));
     if server_ended {
         let reason = if route.iter().any(|h| h.is_closed()) {
             "The connection to the SSH server closed."

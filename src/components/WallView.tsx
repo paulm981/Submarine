@@ -543,7 +543,7 @@ export const WallView = ({
               : "bg-white/[0.04] border-white/10 text-zinc-300 hover:bg-white/[0.08] hover:text-white"
           }`}
         >
-          <Radio size={11} className={wall.broadcast ? "animate-pulse" : ""} />
+          <Radio size={11} className={wall.broadcast ? "animate-pulse-brief" : ""} />
           Broadcast {wall.broadcast ? "on" : "off"}
         </button>
 

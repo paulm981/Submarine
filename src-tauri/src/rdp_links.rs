@@ -250,7 +250,7 @@ fn launch(link: &RdpLink) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         let file = write_temp_rdp(link, None)?;
-        open::that(&file).map_err(|e| format!("Couldn't open a Remote Desktop app: {}", e))?;
+        crate::child_env::open(&file).map_err(|e| format!("Couldn't open a Remote Desktop app: {}", e))?;
         remove_later(file);
         Ok(())
     }

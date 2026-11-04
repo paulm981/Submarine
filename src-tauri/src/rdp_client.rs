@@ -816,7 +816,7 @@ where
     let should_upgrade = tokio::time::timeout(STEP_TIMEOUT, ironrdp_tokio::connect_begin(&mut framed, &mut connector))
         .await
         .map_err(|_| "The RDP server didn't answer within 30 seconds".to_string())?
-        .map_err(|e| format!("The RDP server didn't answer as one: {e}"))?;
+        .map_err(|e| format!("The RDP server didn't answer as one: {}", with_causes(&e)))?;
     // How the server wants the login done is known now, before TLS and before
     // anything secret goes out: NLA, or the user's say-so, or no login at all.
     let nla = match &connector.state {
@@ -883,7 +883,7 @@ where
     )
     .await
     .map_err(|_| "Logging in to the RDP server didn't finish within 30 seconds".to_string())?
-    .map_err(|e| login_error(&e.to_string()))?;
+    .map_err(|e| login_error(&with_causes(&e)))?;
 
     let size = result.desktop_size;
     desktop_fits(size.width, size.height)?;
@@ -1024,7 +1024,7 @@ where
                     let settling = resized_at.is_some_and(|at| at.elapsed() < RESIZE_SETTLE);
                     if can_measure && !paused && !settling && probe.out.is_none() {
                         let ask = share_data(&stage, ShareDataPdu::RefreshRectangle(RefreshRectanglePdu { areas_to_refresh: vec![probe_rect()] }))?;
-                        tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&ask)).await.map_err(stalled)?.map_err(|e| format!("The connection to the RDP server ended: {e}"))?;
+                        tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&ask)).await.map_err(stalled)?.map_err(link_ended)?;
                         probe.out = Some(tokio::time::Instant::now());
                     }
                     Vec::new()
@@ -1037,7 +1037,7 @@ where
                     stage.process_fastpath_input(&mut image, &fast).map_err(|e| format!("RDP: {e}"))?
                 }
                 pdu = reader.read_pdu() => {
-                    let (action, payload) = pdu.map_err(|e| format!("The connection to the RDP server ended: {e}"))?;
+                    let (action, payload) = pdu.map_err(link_ended)?;
                     stage.process(&mut image, action, &payload).map_err(|e| format!("RDP: {e}"))?
                 }
                 cmd = cmds.recv() => match cmd {
@@ -1084,7 +1084,7 @@ where
                             resize_later = Some((w, h));
                         } else if u32::from(w) != u32::from(image.width()) || u32::from(h) != u32::from(image.height()) {
                             if let Some(Ok(bytes)) = stage.encode_resize(u32::from(w), u32::from(h), None, None) {
-                                tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&bytes)).await.map_err(stalled)?.map_err(|e| format!("The connection to the RDP server ended: {e}"))?;
+                                tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&bytes)).await.map_err(stalled)?.map_err(link_ended)?;
                                 resized_at = Some(tokio::time::Instant::now());
                             }
                         }
@@ -1101,7 +1101,7 @@ where
                                 bottom: image.height().saturating_sub(1),
                             });
                             let bytes = share_data(&stage, ShareDataPdu::SuppressOutput(SuppressOutputPdu { desktop_rect }))?;
-                            tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&bytes)).await.map_err(stalled)?.map_err(|e| format!("The connection to the RDP server ended: {e}"))?;
+                            tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&bytes)).await.map_err(stalled)?.map_err(link_ended)?;
                             paused = !shown;
                             // Paused, a probe out isn't answered; shown, the whole picture comes first.
                             if shown {
@@ -1113,7 +1113,7 @@ where
                             if let Some((w, h)) = resize_later.take().filter(|_| shown) {
                                 if u32::from(w) != u32::from(image.width()) || u32::from(h) != u32::from(image.height()) {
                                     if let Some(Ok(bytes)) = stage.encode_resize(u32::from(w), u32::from(h), None, None) {
-                                        tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&bytes)).await.map_err(stalled)?.map_err(|e| format!("The connection to the RDP server ended: {e}"))?;
+                                        tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&bytes)).await.map_err(stalled)?.map_err(link_ended)?;
                                         resized_at = Some(tokio::time::Instant::now());
                                     }
                                 }
@@ -1148,7 +1148,7 @@ where
         for out in outputs {
             match out {
                 ActiveStageOutput::ResponseFrame(bytes) => {
-                    tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&bytes)).await.map_err(stalled)?.map_err(|e| format!("The connection to the RDP server ended: {e}"))?;
+                    tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&bytes)).await.map_err(stalled)?.map_err(link_ended)?;
                 }
                 ActiveStageOutput::GraphicsUpdate(rect) => {
                     // The probe's corner drawn again: the server answered.
@@ -1184,7 +1184,7 @@ where
                         let step = if activation.next_pdu_hint().is_some() {
                             let (action, pdu) = loop {
                                 tokio::select! {
-                                    read = reader.read_pdu() => break read.map_err(|e| format!("The connection to the RDP server ended: {e}"))?,
+                                    read = reader.read_pdu() => break read.map_err(link_ended)?,
                                     // The tab still hears how the link is doing (a link that
                                     // stops in the middle of a restart isn't "fine" for 30 s).
                                     _ = link_tick.tick() => link(LinkStats { can_measure, can_pause, paused, ..meter.look(probe.rtt(), Some(restarted_at)) }),
@@ -1222,7 +1222,7 @@ where
                         };
                         let written = step.map_err(|e| format!("RDP: {e}"))?;
                         if written.size().is_some() {
-                            tokio::time::timeout(SEND_TIMEOUT, writer.write_all(buf.filled())).await.map_err(stalled)?.map_err(|e| format!("The connection to the RDP server ended: {e}"))?;
+                            tokio::time::timeout(SEND_TIMEOUT, writer.write_all(buf.filled())).await.map_err(stalled)?.map_err(link_ended)?;
                         }
                         if let ConnectionActivationState::Finalized {
                             desktop_size,
@@ -1260,7 +1260,7 @@ where
                                 paused = false;
                                 if can_pause {
                                     let bytes = share_data(&stage, ShareDataPdu::SuppressOutput(SuppressOutputPdu { desktop_rect: None }))?;
-                                    tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&bytes)).await.map_err(stalled)?.map_err(|e| format!("The connection to the RDP server ended: {e}"))?;
+                                    tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&bytes)).await.map_err(stalled)?.map_err(link_ended)?;
                                     paused = true;
                                 }
                             }
@@ -1274,10 +1274,63 @@ where
     }
 }
 
-/// A login failure in words a person can act on.
+/// An error and what caused it, as far down as it goes. IronRDP's own text for
+/// a refused NLA login is just "[CredSSP] CredSSP": the reason, the status the
+/// server answered with (STATUS_LOGON_FAILURE, say), is in what caused it.
+fn with_causes(e: &dyn std::error::Error) -> String {
+    let mut text = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        text.push_str(": ");
+        text.push_str(&c.to_string());
+        cause = c.source();
+    }
+    text
+}
+
+/// The Windows statuses a refused NLA login comes with, in words a person can
+/// act on. The tab asks for the password again on "didn't accept the user name
+/// or password" (RdpSessionView.tsx, PASSWORD_REFUSED); a wrong password or user
+/// name says so, as Windows itself does without telling which.
+const LOGON_STATUSES: &[(&str, &str)] = &[
+    ("STATUS_LOGON_FAILURE", "The RDP server didn't accept the user name or password"),
+    ("STATUS_WRONG_PASSWORD", "The RDP server didn't accept the user name or password"),
+    ("STATUS_NO_SUCH_USER", "The RDP server didn't accept the user name or password"),
+    ("STATUS_PASSWORD_EXPIRED", "The account's password has expired: change it on the server first"),
+    ("STATUS_PASSWORD_MUST_CHANGE", "The account must change its password before it logs in: change it on the server first"),
+    ("STATUS_ACCOUNT_LOCKED_OUT", "The account is locked out on the RDP server (too many wrong passwords)"),
+    ("STATUS_ACCOUNT_DISABLED", "The account is disabled on the RDP server"),
+    ("STATUS_ACCOUNT_RESTRICTION", "The account can't log in this way (an empty password, or a rule of the server's)"),
+    ("STATUS_INVALID_LOGON_HOURS", "The account isn't allowed to log in at this time"),
+    ("STATUS_INVALID_WORKSTATION", "The account isn't allowed to log in from this computer"),
+    ("STATUS_LOGON_TYPE_NOT_GRANTED", "The account isn't allowed to log in over Remote Desktop (it isn't in the Remote Desktop Users group)"),
+    ("STATUS_LOGON_NOT_GRANTED", "The account isn't allowed to log in over Remote Desktop"),
+    ("STATUS_SMARTCARD_LOGON_REQUIRED", "The account has to log in with a smart card"),
+    ("STATUS_CTX_LOGON_DISABLED", "Remote Desktop logins are turned off for this account"),
+    // After NLA, a server that took the password can still turn the account
+    // away (its Early User Authorization Result).
+    ("[CredSSP] access denied", "The RDP server took the password but doesn't let this account in over Remote Desktop (the Remote Desktop Users group)"),
+];
+
+/// How the tab says a running session's connection ended. A server that just
+/// goes away shows up as an unexpected end of the TLS stream, which rustls
+/// words with a link to its own manual; that and a cut link get plain words.
+fn link_ended(e: std::io::Error) -> String {
+    use std::io::ErrorKind::*;
+    match e.kind() {
+        UnexpectedEof => "The RDP server closed the connection.".into(),
+        ConnectionReset | ConnectionAborted | BrokenPipe | TimedOut => format!("The connection to the RDP server was lost ({e})."),
+        _ => format!("The connection to the RDP server ended: {e}"),
+    }
+}
+
+/// A login failure in words a person can act on, with what the client saw.
 fn login_error(e: &str) -> String {
+    if let Some((_, words)) = LOGON_STATUSES.iter().find(|(status, _)| e.contains(status)) {
+        return format!("{words} ({e})");
+    }
     let lower = e.to_lowercase();
-    if lower.contains("logon") || lower.contains("credential") || lower.contains("password") || lower.contains("0xc000006d") || lower.contains("authentication") {
+    if lower.contains("logon") || lower.contains("credential") || lower.contains("password") || lower.contains("authentication") {
         format!("The RDP server didn't accept the user name or password ({e})")
     } else {
         format!("Couldn't log in to the RDP server: {e}")
@@ -1288,6 +1341,58 @@ fn login_error(e: &str) -> String {
 mod tests {
     use super::*;
     use ironrdp::pdu::rdp::capability_sets::CodecProperty;
+
+    /// A refused NLA login, as IronRDP gives it: CredSSP, caused by the
+    /// server's status. The reason used to be lost ("[CredSSP] CredSSP").
+    fn refused(status: connector::sspi::credssp::NStatusCode) -> connector::ConnectorError {
+        connector::ConnectorError::new(
+            "CredSSP",
+            connector::ConnectorErrorKind::Credssp(connector::sspi::Error::new_with_nstatus(
+                connector::sspi::ErrorKind::InvalidToken,
+                "CredSSP server returned an error status",
+                status,
+            )),
+        )
+    }
+
+    #[test]
+    fn a_refused_login_says_why() {
+        use connector::sspi::credssp::NStatusCode;
+        assert_eq!(refused(NStatusCode::LOGON_FAILURE).to_string(), "[CredSSP] CredSSP", "what was shown before");
+        let e = login_error(&with_causes(&refused(NStatusCode::LOGON_FAILURE)));
+        assert!(e.starts_with("The RDP server didn't accept the user name or password ("), "{e}");
+        assert!(e.contains("STATUS_LOGON_FAILURE [0xc000006d]"), "the server's own status stays in: {e}");
+        let e = login_error(&with_causes(&refused(NStatusCode::PASSWORD_EXPIRED)));
+        assert!(e.starts_with("The account's password has expired"), "{e}");
+        let e = login_error(&with_causes(&refused(NStatusCode::ACCOUNT_LOCKED_OUT)));
+        assert!(e.starts_with("The account is locked out"), "{e}");
+        let e = login_error(&with_causes(&refused(NStatusCode::LOGON_TYPE_NOT_GRANTED)));
+        assert!(e.contains("Remote Desktop Users group"), "{e}");
+        let e = login_error(&with_causes(&connector::ConnectorError::new("CredSSP", connector::ConnectorErrorKind::AccessDenied)));
+        assert!(e.starts_with("The RDP server took the password but doesn't let this account in"), "{e}");
+        // A status without words of its own still shows, with what the client saw.
+        let e = login_error(&with_causes(&refused(NStatusCode(0xc000_0001))));
+        assert!(e.starts_with("Couldn't log in to the RDP server: [CredSSP] CredSSP: InvalidToken"), "{e}");
+        assert!(e.contains("0xc0000001"), "{e}");
+        // The tab asks for the password again on a wrong password or user name.
+        let tab = include_str!("../../src/components/RdpSessionView.tsx");
+        assert!(tab.contains("/didn't accept the user name or password/"), "RdpSessionView.tsx: PASSWORD_REFUSED");
+        for status in [NStatusCode::LOGON_FAILURE, NStatusCode::WRONG_PASSWORD, NStatusCode::NO_SUCH_USER] {
+            assert!(login_error(&with_causes(&refused(status))).contains("didn't accept the user name or password"), "{status}");
+        }
+    }
+
+    #[test]
+    fn a_dropped_link_is_said_in_plain_words() {
+        use std::io::{Error, ErrorKind};
+        let gone = Error::new(
+            ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+        );
+        assert_eq!(link_ended(gone), "The RDP server closed the connection.");
+        assert!(link_ended(Error::from(ErrorKind::ConnectionReset)).starts_with("The connection to the RDP server was lost ("));
+        assert_eq!(link_ended(Error::other("boom")), "The connection to the RDP server ended: boom");
+    }
 
     #[test]
     fn domain_forms() {
