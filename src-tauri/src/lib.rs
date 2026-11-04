@@ -2827,6 +2827,10 @@ async fn share_current_profile(
         )
         .map_err(|e| format!("[SHARE] STORE_ROLE: {e}"))?;
     }
+    // Shared now, so it no longer opens by itself (secret_policy, E5).
+    if let Some(profile) = db_state.active_profile.lock().ok().and_then(|p| p.clone()) {
+        secret_policy::stop_opening_by_itself(&app, &profile);
+    }
     save_vault_async(&db_state).await?;
     Ok(ShareResult { share_id })
 }

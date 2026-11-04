@@ -11,7 +11,7 @@ This page covers:
 
 What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
-The fork is based on the original project's **0.4.0**, with every change up to [#272](https://github.com/SinaXhpm/submarine/pull/272) brought in.
+The fork is based on the original project's **0.4.0**, with every change up to [#281](https://github.com/SinaXhpm/submarine/pull/281) brought in.
 
 ## What this fork adds
 
@@ -234,6 +234,8 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | Paste | The webview's clipboard | Read by the app itself, since the webviews on Windows, macOS and Linux refuse the page |
 | Text fields on macOS | Capitalize and correct what's typed | Keep exactly what's typed |
 | Closing a connected session | Always asks | Asks, unless you turn that off in Settings |
+| Opening a profile automatically on Windows ([#275](https://github.com/SinaXhpm/submarine/pull/275), [#281](https://github.com/SinaXhpm/submarine/pull/281)) | For any profile, once turned on | Never for a shared profile: anyone using that Windows account would get everyone's saved logins. It can't be turned on for one, and sharing a profile turns it off (`secret_policy.rs`, E5) |
+| Mac and iPhone builds ([#274](https://github.com/SinaXhpm/submarine/pull/274)) | A signed universal Mac app, iOS and the App Store, built with each release (`apple.yml`) | `apple.yml` is kept as it is but never run: the fork's Mac app is the Apple silicon build added to a release once it's been tried (`build.yml`) |
 | On-connect commands | Typed once the terminal is open, on the first connect; with "each new terminal" ticked, once into each terminal opened later ([#175](https://github.com/SinaXhpm/submarine/pull/175), [#265](https://github.com/SinaXhpm/submarine/pull/265)) | Typed once the shell has printed its login banner, on the first connect and after a reconnect; with "each new terminal" ticked, into each of the tab's terminals too. Held ones are asked about once for all of them |
 | Terminal output | Events, paced by what the window has drawn ([#263](https://github.com/SinaXhpm/submarine/pull/263)) | Paced the same way, but sent over a binary channel instead of events: on Windows, fewer scripts pass through the window's own thread, which handles its keys too |
 | Walls | One Wall of pinned copies of terminals; a copy sets the terminal's size while it's open ([#180](https://github.com/SinaXhpm/submarine/pull/180)) | Walls of their own, each showing the terminals themselves, so a terminal has one size. Broadcast, saved Walls, and Rows ([#190](https://github.com/SinaXhpm/submarine/pull/190)), which aren't saved with a saved Wall yet |
@@ -262,13 +264,13 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 
 ## Changes in the original project not taken yet
 
-Every change up to [#272](https://github.com/SinaXhpm/submarine/pull/272) is taken. Where the fork takes one differently, the table above says so.
+Every change up to [#281](https://github.com/SinaXhpm/submarine/pull/281) is taken. Where the fork takes one differently, the table above says so.
 
 Not taken yet, for the next sync:
 
 | The original project's change | Why not yet |
 |---|---|
-| [#273](https://github.com/SinaXhpm/submarine/pull/273)–[#295](https://github.com/SinaXhpm/submarine/pull/295): patched dependencies, iOS and a universal Mac app signed in CI, quick unlock opening by itself, a phone key bar, a security batch against hostile servers, russh 0.65, sync after a key change, terminals surviving a split, hidden terminals resting, faster uploads | The next two steps of [#142](https://github.com/paulm981/Submarine/issues/142). The security batch touches what the fork changed most, so it gets its own review |
+| [#282](https://github.com/SinaXhpm/submarine/pull/282)–[#295](https://github.com/SinaXhpm/submarine/pull/295): a security batch against hostile servers, russh 0.65, sync after a key change, terminals surviving a split, hidden terminals resting, faster uploads, the macOS icon | The last step of [#142](https://github.com/paulm981/Submarine/issues/142). The security batch touches what the fork changed most, so it gets its own review |
 
 ## Keeping up with the original project
 
@@ -283,7 +285,7 @@ Not taken yet, for the next sync:
 3. **Merge, don't cherry-pick:** `git merge upstream/main` on a branch. That keeps the history saying what came from where, and leaves the original project's changes as they were, so the next merge has less to sort out. Record a change you leave out with `git merge -s ours <its commit>` and a message saying why. Take it later with `git cherry-pick -x <its commit>`, so the commit says where it came from.
    - **A sync done in steps** (as [#121](https://github.com/paulm981/Submarine/issues/121) was, one pull request per group of changes) cherry-picks each group with `-x`. Its last step ends with `git merge upstream/main`: by then every change is in, so the merge brings nothing new, but it records that the original project's history is in. Without it, the next sync would offer the same changes again.
 4. **Resolve conflicts toward the original project's text** as it is on its main now. Then put the fork's behavior back the way that changes their code least:
-   - **Fork rules live in fork-only files,** called from one-line hooks in the shared code: `hop_policy.rs` (jump hosts), `trust_policy.rs` (host keys), `jump_gone.rs` (a deleted jump host), `secret_policy.rs` (saved passwords), `remote_sh.rs` (root), `busy.rs` (what's still running). A conflict then touches one line, not the rule.
+   - **Fork rules live in fork-only files,** called from one-line hooks in the shared code: `hop_policy.rs` (jump hosts), `trust_policy.rs` (host keys), `jump_gone.rs` (a deleted jump host), `secret_policy.rs` (saved passwords, and a shared profile never opening by itself), `remote_sh.rs` (root), `busy.rs` (what's still running). A conflict then touches one line, not the rule.
    - **A rule file's tests prove the rule, not just the function:** they run on the app's own tables (`sync_engine_tests::device`) and go through the same steps the app does, and `the_hooks_are_in_place` checks that each hook is still in the shared code, naming any a merge lost. `secret_policy.rs` has both; the other rule files get them in [#136](https://github.com/paulm981/Submarine/issues/136).
    - **Code waiting on the original project** gets a comment, `// fork: until upstream #NNN`, so it's easy to find and drop once they take the fix.
    - **A safety fix the merge itself needs** goes in the first commit, so no commit in the history is unsafe.
