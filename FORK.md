@@ -11,7 +11,7 @@ This page covers:
 
 What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
-The fork is based on the original project's **0.4.0**, with every change up to [#281](https://github.com/SinaXhpm/submarine/pull/281) brought in.
+The fork is based on the original project's **0.4.0**, with every change up to [#295](https://github.com/SinaXhpm/submarine/pull/295) brought in.
 
 ## What this fork adds
 
@@ -234,6 +234,8 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | Paste | The webview's clipboard | Read by the app itself, since the webviews on Windows, macOS and Linux refuse the page |
 | Text fields on macOS | Capitalize and correct what's typed | Keep exactly what's typed |
 | Closing a connected session | Always asks | Asks, unless you turn that off in Settings |
+| A server moved by someone else in a shared profile ([#285](https://github.com/SinaXhpm/submarine/pull/285)) | Asks before it connects to the new address, and holds its commands and forwards again | The same, from every way a server is opened (a tab, a Wall, the Wall picker). A switch to telnet or VNC is held as before, and stays what it was here until allowed, so it isn't a move yet |
+| Library text into a terminal ([#289](https://github.com/SinaXhpm/submarine/pull/289)) | A paste, asking first when it's more than the card shows | The same, and it also counts as typing for a Wall's line |
 | Opening a profile automatically on Windows ([#275](https://github.com/SinaXhpm/submarine/pull/275), [#281](https://github.com/SinaXhpm/submarine/pull/281)) | For any profile, once turned on | Never for a shared profile: anyone using that Windows account would get everyone's saved logins. It can't be turned on for one, and sharing a profile turns it off (`secret_policy.rs`, E5) |
 | Mac and iPhone builds ([#274](https://github.com/SinaXhpm/submarine/pull/274)) | A signed universal Mac app, iOS and the App Store, built with each release (`apple.yml`) | `apple.yml` is kept as it is but never run: the fork's Mac app is the Apple silicon build added to a release once it's been tried (`build.yml`) |
 | On-connect commands | Typed once the terminal is open, on the first connect; with "each new terminal" ticked, once into each terminal opened later ([#175](https://github.com/SinaXhpm/submarine/pull/175), [#265](https://github.com/SinaXhpm/submarine/pull/265)) | Typed once the shell has printed its login banner, on the first connect and after a reconnect; with "each new terminal" ticked, into each of the tab's terminals too. Held ones are asked about once for all of them |
@@ -248,7 +250,7 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | Jump hosts in one route ([#169](https://github.com/SinaXhpm/submarine/pull/169)) | At most 8 levels of ProxyJump lists, so lists inside lists can add up to many more jump hosts | At most 8 jump hosts in all, counting every list and a saved jump host ([#43](https://github.com/paulm981/Submarine/issues/43)) |
 | `%` in a ProxyJump | Taken as written | Refused with a message: Submarine doesn't fill in `%h`, `%r` and the like there yet ([#43](https://github.com/paulm981/Submarine/issues/43)) |
 | Monitoring and ProxyJump | A server behind a config ProxyJump isn't checked; monitoring has no jump hosts | Monitoring goes through saved jump hosts. A server or a jump host that `~/.ssh/config` reaches through a ProxyJump isn't checked, and the card says why: monitoring can't ask for the jump hosts' passwords ([#43](https://github.com/paulm981/Submarine/issues/43)) |
-| Host keys in `~/.ssh/known_hosts` ([#170](https://github.com/SinaXhpm/submarine/pull/170)) | A key listed there is trusted, before the app's own trusted keys are looked at | The app's own trusted keys (in your vault) come first. A key listed in known_hosts only skips the first-time question: a key that changed still gets the warning, even if known_hosts lists the new one. If known_hosts lists a different key for the server, you get the changed-key warning. A host certificate whose key isn't the one the app trusts gets the same changed-key warning; a certificate that doesn't check out is refused. A key marked `@revoked` is always refused, by Monitoring too ([#43](https://github.com/paulm981/Submarine/issues/43)) |
+| Host keys in `~/.ssh/known_hosts` ([#170](https://github.com/SinaXhpm/submarine/pull/170)) | A key listed there is trusted, before the app's own trusted keys are looked at. A different key of the same kind listed there brings the changed-key warning ([#285](https://github.com/SinaXhpm/submarine/pull/285)) | The app's own trusted keys (in your vault) come first. A key listed in known_hosts only skips the first-time question: a key that changed still gets the warning, even if known_hosts lists the new one. If known_hosts lists a different key for the server, you get the changed-key warning. A host certificate whose key isn't the one the app trusts gets the same changed-key warning; a certificate that doesn't check out is refused. A key marked `@revoked` is always refused, by Monitoring too ([#43](https://github.com/paulm981/Submarine/issues/43)) |
 | Keys known_hosts vouches for ([#170](https://github.com/SinaXhpm/submarine/pull/170)) | Trusted each time, never saved | Saved to the app's trusted keys the first time, as if you had approved it, so Monitoring can check the server and a later change gets the warning. A host certificate isn't saved unless you accept its key at the changed-key warning; Monitoring says it can't check a server only a certificate vouches for, until its key is saved ([#43](https://github.com/paulm981/Submarine/issues/43)) |
 | Key files and certificates from `~/.ssh/config` ([#170](https://github.com/SinaXhpm/submarine/pull/170)) | IdentityFile and CertificateFile are offered, certificates whatever their dates | The same, with "Use settings from ~/.ssh/config" on. A certificate that has expired or isn't valid yet is skipped, and the log says so. As with ssh-agent keys, they're offered to every server the setting applies to, including servers from a shared profile. A key file goes through the same cost limit as a saved key ([#43](https://github.com/paulm981/Submarine/issues/43)) |
 | Turning known_hosts on and off ([#170](https://github.com/SinaXhpm/submarine/pull/170)) | Follows "Use settings from ~/.ssh/config" | The same, with no separate switch: off, known_hosts and the config's key files aren't read at all ([#43](https://github.com/paulm981/Submarine/issues/43)) |
@@ -264,13 +266,13 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 
 ## Changes in the original project not taken yet
 
-Every change up to [#281](https://github.com/SinaXhpm/submarine/pull/281) is taken. Where the fork takes one differently, the table above says so.
+Every change up to [#295](https://github.com/SinaXhpm/submarine/pull/295) is taken. Where the fork takes one differently, the table above says so.
 
 Not taken yet, for the next sync:
 
 | The original project's change | Why not yet |
 |---|---|
-| [#282](https://github.com/SinaXhpm/submarine/pull/282)–[#295](https://github.com/SinaXhpm/submarine/pull/295): a security batch against hostile servers, russh 0.65, sync after a key change, terminals surviving a split, hidden terminals resting, faster uploads, the macOS icon | The last step of [#142](https://github.com/paulm981/Submarine/issues/142). The security batch touches what the fork changed most, so it gets its own review |
+| Nothing at the moment | |
 
 ## Keeping up with the original project
 
