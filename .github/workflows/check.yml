@@ -114,34 +114,6 @@ jobs:
         working-directory: src-tauri
         run: cargo test --locked
 
-      # Temporary (#145): which Windows function the test program imports
-      # that this runner doesn't have (STATUS_ENTRYPOINT_NOT_FOUND).
-      - name: Why the Windows tests didn't start
-        if: failure() && matrix.os_name == 'windows'
-        working-directory: src-tauri
-        shell: pwsh
-        run: |
-          $exe = Get-ChildItem target\debug\deps\submarine_lib-*.exe | Sort-Object LastWriteTime | Select-Object -Last 1
-          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
-          $out = & $dumpbin.FullName /imports $exe.FullName
-          Add-Type -Namespace W -Name K -MemberDefinition '[DllImport("kernel32", CharSet=CharSet.Unicode)] public static extern IntPtr LoadLibraryW(string n); [DllImport("kernel32", CharSet=CharSet.Ansi)] public static extern IntPtr GetProcAddress(IntPtr h, string n);'
-          Set-Location $exe.DirectoryName
-          $dll = $null; $h = [IntPtr]::Zero
-          foreach ($line in $out) {
-            if ($line -match '^\s{4}(\S+\.dll)\s*$') {
-              $dll = $Matches[1]; $h = [W.K]::LoadLibraryW($dll)
-              if ($h -eq [IntPtr]::Zero) { "MISSING DLL $dll" }
-              continue
-            }
-            if ($dll -and $line -match '^\s+[0-9A-F]+\s+(\S+)\s*$') {
-              $fn = $Matches[1]
-              if ($dll -match 'comctl32') { "comctl32 import: $fn" }
-              if ($h -ne [IntPtr]::Zero -and [W.K]::GetProcAddress($h, $fn) -eq [IntPtr]::Zero) { "MISSING $dll!$fn" }
-            }
-          }
-          & $dumpbin.FullName /dependents $exe.FullName
-
       - name: AI bridge tests
         if: matrix.os_name == 'macos'
         working-directory: src-tauri
