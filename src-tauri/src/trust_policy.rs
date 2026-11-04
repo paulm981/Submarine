@@ -87,7 +87,7 @@ pub(crate) fn decide_certificate(on_file: HostKeyVerdict, known_hosts: Option<&H
     let why = match known_hosts.map(|t| t.check_certificate(cert, now)) {
         Some(Verdict::Trusted(why)) => why,
         Some(Verdict::Refused(why)) => return HostKeyDecision::Refused(why),
-        Some(Verdict::Undecided(_)) | None => {
+        Some(Verdict::Undecided(_) | Verdict::Changed { .. }) | None => {
             return HostKeyDecision::Refused(
                 "the server presented a host certificate, and no @cert-authority line in your known_hosts covers this host".into(),
             )

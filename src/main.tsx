@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import ErrorBoundary from "./components/ErrorBoundary";
+import { IS_MOBILE } from "./util/platform";
 import "./App.css";
 // Registers the bundled terminal fonts (@font-face) before any terminal mounts.
 import "./util/bundledFonts";
@@ -32,26 +33,51 @@ window.addEventListener("keydown", (e) => {
   if (e.key === "F5" || reloadCombo) e.preventDefault();
 }, true);
 
-// ── Android soft-keyboard sizing (visualViewport → --vv-h) ──────────────────
+// The webview's own right-click menu has a Reload too, so it stays shut, in
+// the capture phase as above. Only the default is cancelled: the app's own
+// menus and the terminal's paste get the event as before. Two places keep it,
+// and neither has a Reload there: a text field (paste, spell check) and
+// selected text (Copy). A phone's webview has no such menu: a long press
+// selects text there, and cancelling this could cost it its Copy bar.
+const NOT_TEXT_INPUT = /^(checkbox|radio|range|color|file|button|submit|reset|image)$/;
+const inTextField = (target: EventTarget | null) => {
+  const field = target instanceof Element ? target.closest("input, textarea, [contenteditable]") : null;
+  return !!field && !(field instanceof HTMLInputElement && NOT_TEXT_INPUT.test(field.type));
+};
+const onSelectedText = (e: MouseEvent) => {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed) return false;
+  return Array.from(selection.getRangeAt(0).getClientRects()).some((r) =>
+    e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom);
+};
+if (!IS_MOBILE) {
+  window.addEventListener("contextmenu", (e) => {
+    if (!inTextField(e.target) && !onSelectedText(e)) e.preventDefault();
+  }, true);
+}
+
+// ── Android soft-keyboard sizing (visualViewport → #root's height) ──────────
 // The Android on-screen keyboard covers our fixed-bottom UI (MobileKeyBar,
 // Sidebar dock) unless the layout root shrinks with the keyboard. The
 // AndroidManifest sets `windowSoftInputMode="adjustResize"` which shrinks
 // the Activity window on every OS version we support — but on older
 // WebViews (pre-Chromium M139, mid-2025) `100vh` occasionally lags a frame
 // behind the resize. Belt-and-braces: mirror `window.visualViewport.height`
-// into a `--vv-h` CSS variable that `#root` reads (see index.html). On
-// desktop the value equals `innerHeight` and never changes, so there's zero
-// runtime cost.
+// into `#root`'s height (index.html has the first value). On desktop the
+// value equals `innerHeight` and never changes, so there's zero runtime
+// cost. Set on `#root` itself: an inherited CSS variable on <html> made the
+// browser look at the style of every element in the document each time.
 //
 // Fires on:
 //   - visualViewport.resize   → keyboard open/close, pinch-zoom
 //   - visualViewport.scroll   → URL bar collapse / IME partial slide
 //   - window.resize           → window resize (desktop)
 //   - window.orientationchange → device rotation (kb usually re-computes)
+const root = document.getElementById("root") as HTMLElement;
 function syncVvHeight() {
   const vv = window.visualViewport;
   const h = vv ? vv.height : window.innerHeight;
-  document.documentElement.style.setProperty("--vv-h", `${h}px`);
+  root.style.height = `${h}px`;
 }
 syncVvHeight();
 if (window.visualViewport) {
@@ -61,7 +87,7 @@ if (window.visualViewport) {
 window.addEventListener("resize", syncVvHeight);
 window.addEventListener("orientationchange", syncVvHeight);
 
-ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+ReactDOM.createRoot(root).render(
   <ErrorBoundary>
     <App />
   </ErrorBoundary>,

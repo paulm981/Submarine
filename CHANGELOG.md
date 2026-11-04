@@ -11,9 +11,25 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ### From the original project
 
+- **Safer against a hostile server.** A server, or someone on the way to it, can no longer:
+  - put files outside the folder you download to, or stop the app with a huge folder listing (their [#283](https://github.com/SinaXhpm/submarine/pull/283));
+  - freeze the window with a few kilobytes of terminal output, or hold a login forever (their [#284](https://github.com/SinaXhpm/submarine/pull/284));
+  - flood the app from a Remote Desktop or VNC tab (their [#286](https://github.com/SinaXhpm/submarine/pull/286));
+  - take the window down with an odd value in its monitoring answers (their [#289](https://github.com/SinaXhpm/submarine/pull/289)).
+  - ([#142](https://github.com/paulm981/Submarine/issues/142))
+- **Shared profiles hold more for your OK.** A server someone else moved to another address asks before it connects, and its commands and forwards wait for your OK again. A sync that would empty a saved password or key waits for you too. A profile file imported from elsewhere comes in with everything held, and with no trusted host keys. (Their [#285](https://github.com/SinaXhpm/submarine/pull/285) and [#287](https://github.com/SinaXhpm/submarine/pull/287); [#142](https://github.com/paulm981/Submarine/issues/142))
+- **Lock clears more.** Locking a profile now also empties forms that showed a password, and forgets what was kept for its tabs. (Their [#288](https://github.com/SinaXhpm/submarine/pull/288); [#142](https://github.com/paulm981/Submarine/issues/142))
+- **Terminals survive a failed reconnect and a reload,** and a tool that fails shows an error in its own pane instead of taking the tab down. (Their [#288](https://github.com/SinaXhpm/submarine/pull/288); [#142](https://github.com/paulm981/Submarine/issues/142))
+- **Faster:** hidden terminals rest, transfers no longer redraw the file lists, uploads keep more on the way, and a folder download lists several folders at once. (Their [#291](https://github.com/SinaXhpm/submarine/pull/291) and [#292](https://github.com/SinaXhpm/submarine/pull/292); [#142](https://github.com/paulm981/Submarine/issues/142))
+- **Smaller fixes:** a terminal tab's close button no longer covers its name (their [#290](https://github.com/SinaXhpm/submarine/pull/290)), and the macOS icon has the rounded tile (their [#293](https://github.com/SinaXhpm/submarine/pull/293)). ([#142](https://github.com/paulm981/Submarine/issues/142))
+
+## v0.4.0-fork.21
+
+### From the original project
+
 - **Open a profile automatically on Windows,** with no password or Windows Hello, when Submarine starts. It's a switch of its own under **Unlock with Windows Hello**, off unless you turn it on. Anyone using your Windows account can then open that profile, so it's for a computer that's yours alone. After **Lock** it takes the password again until Submarine restarts. (Their [#275](https://github.com/SinaXhpm/submarine/pull/275) and [#281](https://github.com/SinaXhpm/submarine/pull/281); [#142](https://github.com/paulm981/Submarine/issues/142))
   - **In the fork, never for a shared profile:** anyone using that Windows account would get everyone's saved logins. It can't be turned on for one, and sharing a profile turns it off. Windows Hello still works.
-- **Security updates** for the libraries the app is built on. (Their [#273](https://github.com/SinaXhpm/submarine/pull/273); [#142](https://github.com/paulm981/Submarine/issues/142))
+- **Security updates** for the libraries the app is built on. (Their [#273](https://github.com/SinaXhpm/submarine/pull/273) and [#282](https://github.com/SinaXhpm/submarine/pull/282); [#142](https://github.com/paulm981/Submarine/issues/142))
 
 ## v0.4.0-fork.20
 

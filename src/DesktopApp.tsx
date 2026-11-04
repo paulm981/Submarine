@@ -65,10 +65,19 @@ import MonitoringPanel from "./components/MonitoringPanel";
 import PingPanel from "./components/PingPanel";
 import { PING_SOUND_KEY, readPingSound } from "./ui/ping";
 import { INFO_FONT_SIZE_KEY, readInfoFontSize } from "./util/infoFont";
-import { ErrorBoundary } from "./ui/ErrorBoundary";
-import { parseObjectList } from "./util/serverJson";
+import { ErrorBoundary, Guarded } from "./ui/ErrorBoundary";
+import { normalizeMirror, normalizeTunnel, parseObjectList } from "./util/serverJson";
 
 const appWindow = getCurrentWindow();
+
+// How long Lock waits for the open tabs to disconnect: a stuck mirror holds a
+// disconnect for 2 s (mirror.rs), and an ordinary one takes moments.
+const LOGOUT_DISCONNECT_LIMIT_MS = 3000;
+// The login and key forms with nothing in them.
+const EMPTY_CRED = { id: null, name: "", auth_type: "password", username: "", password: "", key_id: null };
+const EMPTY_KEY = { id: null, name: "", public_key: "", private_key: "", passphrase: "" };
+// How long a slide-over takes to slide out (their duration-500).
+const SLIDE_OUT_MS = 500;
 
 // Sessions can be either DB-backed (saved node, `serverId > 0`) or quick
 // connect (one-shot, `serverId === 0` and `quickAuth` populated). SessionView
@@ -360,10 +369,10 @@ function DesktopApp() {
   const [libraryTab, setLibraryTab] = useState<"commands" | "notes">("commands");
 
   const [isCredPanelOpen, setIsCredPanelOpen] = useState(false);
-  const [editCredData, setEditCredData] = useState<any>({ id: null, name: "", auth_type: "password", username: "", password: "", key_id: null });
-  
+  const [editCredData, setEditCredData] = useState<any>(EMPTY_CRED);
+
   const [isKeyPanelOpen, setIsKeyPanelOpen] = useState(false);
-  const [editKeyData, setEditKeyData] = useState<any>({ id: null, name: "", public_key: "", private_key: "", passphrase: "" });
+  const [editKeyData, setEditKeyData] = useState<any>(EMPTY_KEY);
   const [formError, setFormError] = useState("");
   // The five panels share one error line: a panel opening or closing (by ✕,
   // the backdrop or Escape) starts it empty, so one panel's error never
@@ -431,6 +440,25 @@ function DesktopApp() {
   const isMobile = useIsNarrow();
 
   const [newNode, setNewNode] = useState(defaultNode);
+  // A closed panel stays mounted, its fields hidden: what it held goes once it
+  // has slid out, or a revealed password, key or passphrase would stay in the
+  // page after it was put away.
+  useEffect(() => {
+    if (isPanelOpen) return;
+    const t = setTimeout(() => setNewNode(defaultNode), SLIDE_OUT_MS);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPanelOpen]);
+  useEffect(() => {
+    if (isCredPanelOpen) return;
+    const t = setTimeout(() => setEditCredData(EMPTY_CRED), SLIDE_OUT_MS);
+    return () => clearTimeout(t);
+  }, [isCredPanelOpen]);
+  useEffect(() => {
+    if (isKeyPanelOpen) return;
+    const t = setTimeout(() => setEditKeyData(EMPTY_KEY), SLIDE_OUT_MS);
+    return () => clearTimeout(t);
+  }, [isKeyPanelOpen]);
   const [appSettings, setAppSettings] = useState({
     primaryColor: localStorage.getItem('submarine-primary-color') || '#60a5fa',
     backgroundColor: localStorage.getItem('submarine-bg-color') || '#0a0a0c',
@@ -589,14 +617,20 @@ function DesktopApp() {
     setLogs(prev => [...prev.slice(-99), { id, msg, type, time: new Date().toLocaleTimeString() }]);
   }, []);
 
-  // A sync that deleted rows (deleted on another device, or by whoever sent
-  // the server's answer) says so, and where the profile as it was is kept.
-  const logRemoved = useCallback((report: { removed?: number; backup?: string | null }) => {
-    const n = report.removed ?? 0;
-    if (n <= 0) return;
+  // A sync that deleted rows or emptied a saved key or password (done on
+  // another device, or by whoever sent the server's answer) says so, and where
+  // the profile as it was is kept. Renaming that file back isn't enough: the
+  // next sync would do the same again, so the way back is the picker's.
+  const logRemoved = useCallback((report: { removed?: number; emptied?: number; backup?: string | null }) => {
+    const removed = report.removed ?? 0;
+    const emptied = report.emptied ?? 0;
+    if (removed <= 0 && emptied <= 0) return;
     addLog(
-      `Sync removed ${n} item${n === 1 ? "" : "s"} from this profile (deleted elsewhere).` +
-        (report.backup ? ` The profile as it was is kept next to its file as ${report.backup}.` : ""),
+      [
+        removed > 0 && `Sync removed ${removed} item${removed === 1 ? "" : "s"} from this profile (deleted elsewhere).`,
+        emptied > 0 && `Sync emptied a saved key or password in ${emptied} item${emptied === 1 ? "" : "s"} (done elsewhere).`,
+        report.backup && `The profile as it was is kept as ${report.backup}. To go back to it, lock the profile and use its ⋯ menu.`,
+      ].filter(Boolean).join(" "),
       "info",
     );
   }, [addLog]);
@@ -711,16 +745,21 @@ function DesktopApp() {
   };
 
   // What a shared profile waits on the user for: a new key, as a fingerprint
-  // (until it's accepted a sync only pulls, see note_share_key), and
-  // deletions someone else's sync would have made here (see HeldDeletions).
+  // (until it's accepted a sync only pulls, see note_share_key), a grant the
+  // sync couldn't open ("locked" while sharing is, "checking" until a sync has
+  // tried it since, "unreadable" if that didn't open it; see note_share_grant),
+  // and deletions someone else's sync would have made here (see HeldDeletions).
   const [shareKeyChange, setShareKeyChange] = useState<string | null>(null);
+  const [shareGrant, setShareGrant] = useState<"locked" | "checking" | "unreadable" | null>(null);
   const [heldDeletions, setHeldDeletions] = useState<HeldDeletion[]>([]);
   const refreshSharedState = useCallback(async () => {
     try {
-      const s = await invoke<{ current: string | null; pending: string | null }>("share_key_state");
+      const s = await invoke<{ current: string | null; pending: string | null; grant_unread: boolean; grant_refused: boolean; identity_unlocked: boolean }>("share_key_state");
       setShareKeyChange(s.pending);
+      setShareGrant(!s.grant_unread ? null : s.grant_refused ? "unreadable" : s.identity_unlocked ? "checking" : "locked");
     } catch {
       setShareKeyChange(null);
+      setShareGrant(null);
     }
     try {
       setHeldDeletions(await invoke<HeldDeletion[]>("held_deletions_list"));
@@ -737,14 +776,14 @@ function DesktopApp() {
   const handleCloudSync = useCallback(async () => {
     setCloudSyncing(true);
     try {
-      const report = await invoke<{ pushed: number; pulled: number; key_change: boolean; removed?: number; backup?: string | null }>("sync_now");
+      const report = await invoke<{ pushed: number; pulled: number; key_change: boolean; removed?: number; emptied?: number; backup?: string | null }>("sync_now");
       await refreshAll();
       refreshSharedState();
       setLastSyncLabel(`Last synced ${new Date().toLocaleTimeString()}`);
       addLog(`Sync complete — sent ${report.pushed}, received ${report.pulled}.`, "success");
       logRemoved(report);
       if (report.key_change) {
-        addLog("This shared profile's key has changed. Your changes aren't uploaded until you accept the new key (Servers → Review).", "info");
+        addLog("This shared profile's key has changed. Your changes aren't uploaded until you deal with the notice in Servers.", "info");
       }
     } catch (e) {
       const msg = String(e);
@@ -779,13 +818,14 @@ function DesktopApp() {
   // What a shared profile still waits on from an earlier session shows on unlock.
   useEffect(() => {
     if (isUnlocked) refreshSharedState();
-    else { setShareKeyChange(null); setHeldDeletions([]); }
+    else { setShareKeyChange(null); setShareGrant(null); setHeldDeletions([]); }
   }, [isUnlocked, refreshSharedState]);
   // The user compared the new key's fingerprint with the owner's: use it, and
-  // sync, which uploads again.
-  const acceptShareKey = useCallback(async () => {
+  // sync, which uploads again. `fingerprint` is the one they saw: the backend
+  // refuses if another key has come in since.
+  const acceptShareKey = useCallback(async (fingerprint: string) => {
     try {
-      await invoke("accept_share_key");
+      await invoke("accept_share_key", { fingerprint });
       addLog("This shared profile now uses its new key.", "success");
     } catch (e) {
       addLog(`Couldn't switch to the new key: ${e}`, "error");
@@ -814,7 +854,7 @@ function DesktopApp() {
     autoSyncBusy.current = true;
     setCloudSyncing(true);
     try {
-      const report = await invoke<{ pushed: number; pulled: number; key_change: boolean; removed?: number; backup?: string | null }>("sync_now");
+      const report = await invoke<{ pushed: number; pulled: number; key_change: boolean; removed?: number; emptied?: number; backup?: string | null }>("sync_now");
       if (report.pulled > 0) await refreshAllRef.current();
       refreshSharedState();
       setLastSyncLabel(`Last synced ${new Date().toLocaleTimeString()}`);
@@ -841,7 +881,7 @@ function DesktopApp() {
     try {
       const n = await invoke<number>("resolve_held_deletions", { deleteThem });
       const s = n === 1 ? "" : "s";
-      addLog(deleteThem ? `Deleted ${n} item${s} here too.` : `Kept ${n} item${s}.`, "success");
+      addLog(deleteThem ? `Done here too: ${n} item${s}.` : `Kept ${n} item${s}.`, "success");
     } catch (e) {
       addLog(`HELD_DELETIONS: ${e}`, "error");
     }
@@ -1098,6 +1138,10 @@ function DesktopApp() {
         port: s.port,
         mirrors: s.mirrors,
         serverUuid: s.uuid ?? null,
+        // As when it's opened by hand (openServer).
+        runOnConnect: s.run_on_connect || "",
+        runOnConnectEvery: !!s.run_on_connect_every,
+        runOnConnectHeld: (s.held || []).includes("run_on_connect"),
       }));
       setSessions((prev: any[]) => {
         const seen = new Set(prev.map((p) => p.id));
@@ -1132,6 +1176,33 @@ function DesktopApp() {
     });
     return () => { unlisten.then((f) => f()).catch(() => {}); };
   }, [addLog, confirm]);
+  // A shared profile's grant changed while sharing was locked, so the sync
+  // can't tell whether its key did: unlock sharing, and sync, which opens the
+  // grant. A key that did change then waits for the user's OK as usual. The
+  // same passphrase as ever, so no rule for it here but that it's there.
+  const unlockSharing = async () => {
+    const pass = await textPrompt({
+      title: "Unlock sharing",
+      message:
+        "This shared profile's key may have changed. Enter your sharing passphrase to check. " +
+        "Until then this device can't read what's new, and your changes aren't uploaded. The passphrase never leaves this device.",
+      placeholder: "Sharing passphrase",
+      password: true,
+      okLabel: "Unlock",
+      validate: (v) => (v.length < 1 ? "Enter your sharing passphrase" : null),
+    });
+    if (!pass) return;
+    try {
+      await invoke("setup_identity", { encPassphrase: pass });
+      addLog("Sharing unlocked.", "success");
+    } catch (e) {
+      addLog(`Couldn't unlock sharing: ${String(e).replace(/^\[[A-Z_]+\]\s*/, "")}`, "error");
+      return;
+    }
+    await handleCloudSync();
+    // Also when that sync failed: sharing is unlocked either way.
+    await refreshSharedState();
+  };
 
   // Window-close guard. Keep `sessions` mirrored into a ref so the close
   // handler (which is registered ONCE inside useEffect, capturing snapshot
@@ -1183,6 +1254,25 @@ function DesktopApp() {
     }).then((fn) => { unlisten = fn; });
     return () => { if (unlisten) unlisten(); };
   }, [confirm]);
+  // Commands typed since the last save are only in memory. The backend saves
+  // them on exit; a phone's app has no exit to speak of, swiped away in the
+  // background it just ends, so they are saved as it goes there.
+  useEffect(() => {
+    if (!IS_MOBILE) return;
+    const off = listen<boolean>("app-shown", (e) => {
+      if (!e.payload) invoke("persist_vault").catch(() => {});
+    });
+    return () => { off.then((f) => f()); };
+  }, []);
+
+  // A Library panel saves what is being typed as it closes, and at a Lock that
+  // comes after the profile has closed, too late. So the open panels are asked
+  // first: each adds the promise of its save to the list (false: it couldn't).
+  const saveDrafts = async () => {
+    const saves: Promise<boolean>[] = [];
+    window.dispatchEvent(new CustomEvent("submarine-save-drafts", { detail: saves }));
+    return (await Promise.all(saves)).every(Boolean);
+  };
 
   // Lock the current profile and return to the picker. Confirms first when
   // there are open SSH sessions (or Home terminals) because they will be
@@ -1199,14 +1289,46 @@ function DesktopApp() {
         destructive: true,
       });
       if (!ok) return;
-      // Best-effort: tell the backend to clean up each session. We don't
-      // bail if one fails — `close_profile` will drop the DB anyway, and
-      // the OS will eventually reap the sockets.
-      for (const s of sessions) {
-        try { await invoke("disconnect_session", { sessionId: s.id }); }
-        catch (e) { console.error("disconnect on logout failed:", e); }
-      }
     }
+    if (!(await saveDrafts())) {
+      const lockAnyway = await confirm({
+        title: "Lock without saving?",
+        message: "What you were typing in the Library couldn't be saved.\n\nIf you lock now, it is lost.",
+        okLabel: "Lock anyway",
+        cancelLabel: "Stay",
+        destructive: true,
+        safeDefault: true,
+      });
+      if (!lockAnyway) return;
+    }
+    // The last save, before anything is torn down. If it fails (a stick
+    // pulled, a full disk), what changed since the last good save is only in
+    // memory, and locking throws that away: the user's call.
+    try { await invoke("persist_vault"); }
+    catch (e) {
+      const lockAnyway = await confirm({
+        title: "Lock without saving?",
+        message: `This profile couldn't be saved: ${e}\n\nIf you lock it now, everything changed since the last good save is lost.`,
+        okLabel: "Lock anyway",
+        cancelLabel: "Stay",
+        destructive: true,
+        safeDefault: true,
+      });
+      if (!lockAnyway) return;
+    }
+    // Best-effort: tell the backend to clean up each session. We don't
+    // bail if one fails — `close_profile` will drop the DB anyway, and
+    // the OS will eventually reap the sockets. All at once and with a
+    // limit: one tab stuck on a server that stopped answering must not
+    // keep the profile open, with its key in memory, while the screen
+    // still waits for the lock.
+    const disconnects = sessions.map((s) =>
+      invoke("disconnect_session", { sessionId: s.id })
+        .catch((e) => console.error("disconnect on logout failed:", e)));
+    await Promise.race([
+      Promise.all(disconnects),
+      new Promise((done) => setTimeout(done, LOGOUT_DISCONNECT_LIMIT_MS)),
+    ]);
     try { await invoke("close_profile"); }
     catch (e) { addLog(`LOGOUT_EXCEPTION: ${e}`, "error"); }
 
@@ -1221,6 +1343,20 @@ function DesktopApp() {
     setActiveView(START_VIEW);
     setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setRdpLinks([]); setCommands([]);
     osChecked.current.clear();
+    // The next profile numbers its servers from 1 too, so anything kept by
+    // session id would land on its sessions.
+    setMergedSessionIds([]);
+    setSessionStatuses({});
+    setSessionTerminals({});
+    setSessionActiveTerm({});
+    setPromptSessions(new Set());
+    setLastSyncLabel(null);
+    setActiveFolderId(null);
+    setNotes([]);
+    // And no revealed secret stays behind in a form.
+    setNewNode(defaultNode);
+    setEditCredData(EMPTY_CRED);
+    setEditKeyData(EMPTY_KEY);
     addLog("Profile locked.", "info");
   };
 
@@ -1271,7 +1407,34 @@ function DesktopApp() {
     // here yet: SessionView asks before typing them.
     runOnConnectHeld: (server.held || []).includes("run_on_connect"),
   });
-  const openServers = (list: any[]) => {
+  // Someone moved a server (in a shared profile, or in a profile file from
+  // elsewhere) and this device hasn't allowed it: it still connects, but not
+  // unasked (approvals::hold_moved). Cancel has the focus, as for held
+  // commands. The servers that may open; one open already isn't asked about.
+  const passMoved = async (list: any[]) => {
+    const open = new Set(sessions.map((s) => s.id));
+    const ok: any[] = [];
+    for (const server of list) {
+      const moved: string | undefined = open.has(`session-${server.id}`)
+        ? undefined
+        : (server.held || []).find((i: string) => i.startsWith("moved:"));
+      if (moved) {
+        const yes = await confirm({
+          title: "Connect to the new address?",
+          message: `${server.name} now connects to ${server.moved_to || "a new address"}. It connected to ${moved.slice("moved:".length)}, and this device hasn't allowed the change.`,
+          okLabel: "Allow and connect",
+          cancelLabel: "Not now",
+          safeDefault: true,
+        });
+        if (!yes) continue;
+        await allowHeld(server.id, [moved]);
+      }
+      ok.push(server);
+    }
+    return ok;
+  };
+  const openServers = async (all: any[]) => {
+    const list = await passMoved(all);
     if (list.length === 0) return;
     setSessions((prev: Session[]) => {
       const seen = new Set(prev.map((p) => p.id));
@@ -1288,8 +1451,8 @@ function DesktopApp() {
   // already open join with the terminal on screen in their tab. A saved wall
   // that's open already is just shown — plus, when it was just saved
   // (addMissing), the servers it has now and the open one lacks.
-  const openServersAsWall = (all: any[], name: string, opts: { broadcast?: boolean; cols?: number; savedId?: number | null; addMissing?: boolean } = {}) => {
-    const list = all.filter(isSshServer);
+  const openServersAsWall = async (all: any[], name: string, opts: { broadcast?: boolean; cols?: number; savedId?: number | null; addMissing?: boolean } = {}) => {
+    const list = await passMoved(all.filter(isSshServer));
     if (opts.savedId != null) {
       const open = walls.find(w => w.savedId === opts.savedId);
       if (open) {
@@ -1759,8 +1922,12 @@ function DesktopApp() {
       .catch((e) => addLog(`QUICK_NODE_SAVE_FAILED: ${e}`, "error"));
   };
 
-  const handleEditNode = async (server: any, opts?: { focusJump?: boolean }) => {
+  const handleEditNode = async (row: any, opts?: { focusJump?: boolean }) => {
     setFocusJumpVia(!!opts?.focusJump);
+    // The form fills from the table, not from the list on screen: the Ports,
+    // Mirror and Library panels write the row themselves, and Save writes all
+    // of it back.
+    const server = (await invoke<any[]>("get_servers").catch(() => null))?.find((s) => s.id === row.id) ?? row;
     // Servers come back from get_servers with `has_password` (boolean) but
     // no plaintext. Reveal the secret only when the user opens the edit
     // sheet — that way the password never sits in renderer memory during
@@ -1792,9 +1959,9 @@ function DesktopApp() {
       proxyType: server.proxy_type || "none",
       proxyHost: server.proxy_host || "",
       proxyPort: server.proxy_port || 1080,
-      tunnels: parseObjectList(server.tunnels),
+      tunnels: parseObjectList(server.tunnels).map(normalizeTunnel),
       autostart: !!server.autostart,
-      mirrors: parseObjectList(server.mirrors),
+      mirrors: parseObjectList(server.mirrors).map(normalizeMirror),
       color: server.color ?? null,
       notes: server.notes || "",
       runOnConnect: server.run_on_connect || "",
@@ -2725,7 +2892,7 @@ function DesktopApp() {
     </div>
   );
 
-  // h-full (not h-screen) so the layout tracks --vv-h from main.tsx —
+  // h-full (not h-screen) so the layout tracks #root's height from main.tsx —
   // when the Android soft keyboard opens the visualViewport shrinks and the
   // whole flex chain cascades above the keyboard instead of anchoring to
   // the un-shrunken layout viewport.
@@ -2782,6 +2949,7 @@ function DesktopApp() {
 
           <main className="flex-1 flex flex-col min-w-0 min-h-0 bg-transparent relative">
             {activeView === "nodes" && (
+              <ErrorBoundary label="Servers">
               <NodeGrid
                 servers={servers}
                 folders={folders}
@@ -2804,6 +2972,8 @@ function DesktopApp() {
                 onKeepAi={keepAiPolicy}
                 keyChange={shareKeyChange}
                 onAcceptKey={acceptShareKey}
+                shareGrant={shareGrant}
+                onUnlockSharing={unlockSharing}
                 heldDeletions={heldDeletions}
                 onResolveDeletions={resolveHeldDeletions}
                 onRemoveServer={removeServer}
@@ -2820,32 +2990,38 @@ function DesktopApp() {
                 }}
                 isMobile={isMobile}
               />
+              </ErrorBoundary>
             )}
 
             {activeView === "profile" && (
-              <ProfilePanel
-                onSync={handleCloudSync}
-                syncing={cloudSyncing}
-                lastSyncLabel={lastSyncLabel}
-                autoSync={appSettings.autoSync}
-                syncIntervalMin={appSettings.syncIntervalMin}
-                onSetInterval={(m: number) => setAppSettings((s: any) => ({ ...s, syncIntervalMin: m }))}
-                onToggleAutoSync={() => setAppSettings((s: any) => ({ ...s, autoSync: !s.autoSync }))}
-              />
+              <ErrorBoundary label="Profile">
+                <ProfilePanel
+                  onSync={handleCloudSync}
+                  syncing={cloudSyncing}
+                  lastSyncLabel={lastSyncLabel}
+                  autoSync={appSettings.autoSync}
+                  syncIntervalMin={appSettings.syncIntervalMin}
+                  onSetInterval={(m: number) => setAppSettings((s: any) => ({ ...s, syncIntervalMin: m }))}
+                  onToggleAutoSync={() => setAppSettings((s: any) => ({ ...s, autoSync: !s.autoSync }))}
+                />
+              </ErrorBoundary>
             )}
 
             {activeView === "settings" && (
-              <SettingsPanel
-                settings={appSettings}
-                setSettings={setAppSettings}
-                servers={servers}
-                isMobile={isMobile}
-                onOpenLogs={() => setActiveView("logs")}
-                onHighlightRulesChanged={() => { void refreshHighlightRules(); bumpSync(); }}
-              />
+              <ErrorBoundary label="Settings">
+                <SettingsPanel
+                  settings={appSettings}
+                  setSettings={setAppSettings}
+                  servers={servers}
+                  isMobile={isMobile}
+                  onOpenLogs={() => setActiveView("logs")}
+                  onHighlightRulesChanged={() => { void refreshHighlightRules(); bumpSync(); }}
+                />
+              </ErrorBoundary>
             )}
 
             {activeView === "vault" && (
+              <ErrorBoundary label="Logins"><Guarded render={() => (
               <div className="flex-1 flex flex-col p-4 sm:p-8 space-y-6 sm:space-y-8 animate-in overflow-y-auto custom-scrollbar">
                 <header className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 border-b border-zinc-700 pb-5 sm:pb-6 shrink-0">
                   <div className="min-w-0">
@@ -2854,14 +3030,14 @@ function DesktopApp() {
                   </div>
                   <div className="flex flex-wrap gap-2">
                     <button
-                      onClick={() => { setEditCredData({ id: null, name: "", auth_type: "password", username: "", password: "", key_id: null }); setIsCredPanelOpen(true); }}
+                      onClick={() => { setEditCredData(EMPTY_CRED); setIsCredPanelOpen(true); }}
                       title="Add Password"
                       className="h-9 px-2.5 sm:px-4 bg-zinc-900 text-zinc-200 text-[12px] sm:text-[13px] font-bold rounded-xl border border-white/5 hover:bg-zinc-800 transition-all flex items-center gap-1.5"
                     >
                       <Plus size={14} /> <span className="hidden sm:inline">Add Password</span><span className="sm:hidden">Password</span>
                     </button>
                     <button
-                      onClick={() => { setEditKeyData({ id: null, name: "", public_key: "", private_key: "", passphrase: "" }); setIsKeyPanelOpen(true); }}
+                      onClick={() => { setEditKeyData(EMPTY_KEY); setIsKeyPanelOpen(true); }}
                       title="Add Key"
                       className="h-9 px-2.5 sm:px-4 bg-zinc-900 text-zinc-200 text-[12px] sm:text-[13px] font-bold rounded-xl border border-white/5 hover:bg-zinc-800 transition-all flex items-center gap-1.5"
                     >
@@ -2878,7 +3054,7 @@ function DesktopApp() {
                           okLabel: "Generate",
                           validate: (v) => v.length === 0 ? "Name is required" : null,
                         });
-                        if (name) invoke("generate_ssh_key", { name }).then(() => refreshSshKeys());
+                        if (name) invoke("generate_ssh_key", { name }).then(() => refreshSshKeys()).catch((e) => addLog(`KEY_GENERATE_ERROR: ${e}`, "error"));
                       }}
                       title="Generate Key"
                       className="h-9 px-2.5 sm:px-4 bg-primary text-black text-[12px] sm:text-[13px] font-bold rounded-xl shadow-lg shadow-primary/20 flex items-center gap-1.5"
@@ -2916,7 +3092,7 @@ function DesktopApp() {
                                 <button aria-label={`Delete ${c.name}`} onClick={async () => {
                                   const ok = await confirm({ title: "Delete saved password?", message: `“${c.name}” will be removed. Servers using this login will lose it.`, destructive: true });
                                   if (!ok) return;
-                                  invoke("delete_credential", { id: c.id }).then(() => { refreshCredentials(); bumpSync(); });
+                                  invoke("delete_credential", { id: c.id }).then(() => { refreshCredentials(); bumpSync(); }).catch((e) => addLog(`CRED_DELETE_ERROR: ${e}`, "error"));
                                 }} className="text-zinc-500 hover:text-red-500"><Trash2 size={14} /></button>
                               </div>
                             </div>
@@ -2965,7 +3141,7 @@ function DesktopApp() {
                                 <button aria-label={`Delete ${k.name}`} onClick={async () => {
                                   const ok = await confirm({ title: "Delete SSH key?", message: `“${k.name}” will be removed. This key cannot be recovered.`, destructive: true });
                                   if (!ok) return;
-                                  invoke("delete_ssh_key", { id: k.id }).then(() => { refreshSshKeys(); bumpSync(); });
+                                  invoke("delete_ssh_key", { id: k.id }).then(() => { refreshSshKeys(); bumpSync(); }).catch((e) => addLog(`KEY_DELETE_ERROR: ${e}`, "error"));
                                 }} className="text-zinc-500 hover:text-red-500"><Trash2 size={14} /></button>
                               </div>
                             </div>
@@ -2984,6 +3160,7 @@ function DesktopApp() {
                   </section>
                 </div>
               </div>
+              )} /></ErrorBoundary>
             )}
 
             {/* Sessions live in an absolute layer that overlays the rest of
@@ -3022,7 +3199,7 @@ function DesktopApp() {
               // or Tab could land in a terminal nobody can see and send what
               // is typed next to its server.
               return (
-                <div inert={viewIsSession ? undefined : ""} className={`absolute inset-0 flex flex-col overflow-hidden ${!viewIsSession ? 'opacity-0 pointer-events-none' : ''}`}>
+                <div inert={viewIsSession ? undefined : ""} className={`${viewIsSession ? 'absolute inset-0' : 'out-of-view'} flex flex-col overflow-hidden`}>
                   <div className="flex-1 relative bg-black/40">
                     {sessions.map(sess => {
                       const idx = visibleIds.indexOf(sess.id);
@@ -3076,9 +3253,11 @@ function DesktopApp() {
                           // layout collapses to 0 height and the terminal
                           // + tool panels never draw.
                           className={`flex flex-col overflow-hidden ${
-                            isVisible && isTiled
-                              ? `border ${isFocused ? 'border-primary/40 shadow-[inset_0_0_0_1px_rgba(var(--primary),0.15)]' : 'border-white/[0.05]'}`
-                              : ''
+                            !isVisible
+                              ? 'out-of-view'
+                              : isTiled
+                                ? `border ${isFocused ? 'border-primary/40 shadow-[inset_0_0_0_1px_rgba(var(--primary),0.15)]' : 'border-white/[0.05]'}`
+                                : ''
                           }`}
                         >
                           {/* Merged (non-focused) tile header. Only the
@@ -3226,9 +3405,10 @@ function DesktopApp() {
                     onToggle={(m) => (activeWall.members.some(x => x.terminalId === m.terminalId)
                       ? removeWallMember(activeWall, m)
                       : addToWall(activeWall.id, [m]))}
-                    onConnect={(server) => {
+                    onConnect={async (server) => {
                       const sid = `session-${server.id}`;
                       const open = sessions.some(x => x.id === sid);
+                      if (!open && (await passMoved([server])).length === 0) return;
                       if (!open) {
                         setSessions(prev => (prev.some(x => x.id === sid) ? prev : [...prev, { ...sessionFor(server), wallId: activeWall.id }]));
                       }
@@ -3258,7 +3438,7 @@ function DesktopApp() {
                 on narrow viewports and puts both lists under one search
                 box. The sub-tab state (`libraryTab`) is kept at the parent
                 so it survives navigation elsewhere and back. */}
-            {activeView === "library" && (() => {
+            {activeView === "library" && <ErrorBoundary label="Library"><Guarded render={() => {
               const q = libraryQuery.trim().toLowerCase();
               const filteredCommands = q
                 ? commands.filter(c =>
@@ -3368,7 +3548,7 @@ function DesktopApp() {
                                 <button aria-label={`Delete ${cmd.title}`} onClick={async () => {
                                   const ok = await confirm({ title: "Delete command?", message: `“${cmd.title}” will be removed.`, destructive: true });
                                   if (!ok) return;
-                                  invoke("delete_command", { id: cmd.id }).then(() => { refreshCommands(); bumpSync(); });
+                                  invoke("delete_command", { id: cmd.id }).then(() => { refreshCommands(); bumpSync(); }).catch((e) => addLog(`COMMAND_DELETE_ERROR: ${e}`, "error"));
                                 }} className="text-zinc-500 hover:text-red-500 transition-colors"><Trash2 size={14} /></button>
                               </div>
                             </div>
@@ -3401,7 +3581,7 @@ function DesktopApp() {
                                 <button aria-label={`Delete ${n.title || "Untitled"}`} onClick={async () => {
                                   const ok = await confirm({ title: "Delete note?", message: `“${n.title || "Untitled"}” will be removed.`, destructive: true });
                                   if (!ok) return;
-                                  invoke("delete_note", { id: n.id }).then(() => { refreshNotes(); bumpSync(); });
+                                  invoke("delete_note", { id: n.id }).then(() => { refreshNotes(); bumpSync(); }).catch((e) => addLog(`NOTE_DELETE_ERROR: ${e}`, "error"));
                                 }} className="text-zinc-500 hover:text-red-500 transition-colors"><Trash2 size={14} /></button>
                               </div>
                             </div>
@@ -3416,7 +3596,7 @@ function DesktopApp() {
                   )}
                 </div>
               );
-            })()}
+            }} /></ErrorBoundary>}
 
             {/* Monitor is mounted permanently and just CSS-hidden when not
                 active. Unmounting would tear down the sample/history ring
@@ -3425,7 +3605,9 @@ function DesktopApp() {
                 mounted preserves the live data; the backend pollers were
                 always running, only the UI side was losing state. */}
             <div className={`flex-1 flex flex-col overflow-hidden ${activeView === "monitor" ? "" : "hidden"}`}>
-              <MonitoringPanel servers={servers} refreshServers={refreshServers} addLog={addLog} active={activeView === "monitor"} />
+              <ErrorBoundary label="Monitor">
+                <MonitoringPanel servers={servers} refreshServers={refreshServers} addLog={addLog} active={activeView === "monitor"} />
+              </ErrorBoundary>
             </div>
 
             {/* Compare workspace — pick any subset of open sessions and
@@ -3445,6 +3627,7 @@ function DesktopApp() {
                 lengths — the whole point of compare mode is uniform
                 side-by-side. */}
             {activeView === "logs" && (
+              <ErrorBoundary label="Activity"><Guarded render={() => (
               <div className="flex-1 flex flex-col p-3 sm:p-8 space-y-3 sm:space-y-6 animate-in overflow-hidden">
                 <header className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2 sm:gap-3 border-b border-zinc-700 pb-3 sm:pb-6 shrink-0">
                   <div className="flex items-center gap-2 min-w-0">
@@ -3500,6 +3683,7 @@ function DesktopApp() {
                   )}
                 </div>
               </div>
+              )} /></ErrorBoundary>
             )}
 
           </main>
@@ -3527,6 +3711,7 @@ function DesktopApp() {
           the session tree's menus. */}
       <AiTrustModal />
 
+      <ErrorBoundary overlay label="Server form" onReset={() => { setIsPanelOpen(false); setFormError(""); }}>
       <AddNodePanel
         isOpen={isPanelOpen} onClose={() => { setIsPanelOpen(false); setFormError(""); setFocusJumpVia(false); }}
         focusJump={focusJumpVia}
@@ -3624,9 +3809,10 @@ function DesktopApp() {
               // would overwrite the DB value.
               preservePassword: !!newNode.id && !newNode.password_dirty,
             };
+            // These writes share one save, at the end: each writes the whole vault.
             const action = newNode.id
-              ? invoke<void>("edit_server", { id: newNode.id, ...payload }).then(() => newNode.id!)
-              : invoke<number>("add_server", payload);
+              ? invoke<void>("edit_server", { id: newNode.id, ...payload, persist: false }).then(() => newNode.id!)
+              : invoke<number>("add_server", { ...payload, persist: false });
 
             const savedId = await action;
             // Notes live on the server row but go through their own command
@@ -3634,13 +3820,13 @@ function DesktopApp() {
             // through every add/edit_server signature. Empty string is valid
             // — clears any previous note.
             try {
-              await invoke("set_server_notes", { id: savedId, notes: newNode.notes || "" });
+              await invoke("set_server_notes", { id: savedId, notes: newNode.notes || "", persist: false });
             } catch (e) {
               addLog(`SAVE_NOTES_FAILED: ${e}`, "error");
             }
             // Same separate-write pattern for the on-connect commands.
             try {
-              await invoke("set_server_run_on_connect", { id: savedId, value: newNode.runOnConnect || "", every: !!newNode.runOnConnectEvery });
+              await invoke("set_server_run_on_connect", { id: savedId, value: newNode.runOnConnect || "", every: !!newNode.runOnConnectEvery, persist: false });
             } catch (e) {
               addLog(`SAVE_RUN_ON_CONNECT_FAILED: ${e}`, "error");
             }
@@ -3657,24 +3843,30 @@ function DesktopApp() {
             // ProxyJump target — same separate-write pattern. Empty string
             // means "no jump host" → store NULL.
             try {
-              await invoke("set_server_jump_host", { id: savedId, value: newNode.jumpHostId ? parseInt(newNode.jumpHostId) : null });
+              await invoke("set_server_jump_host", { id: savedId, value: newNode.jumpHostId ? parseInt(newNode.jumpHostId) : null, persist: false });
             } catch (e) {
               addLog(`SAVE_JUMP_HOST_FAILED: ${e}`, "error");
             }
             // SSH, RDP, telnet or VNC: the same separate-write pattern.
             try {
-              await invoke("set_server_protocol", { id: savedId, value: isRdp ? "rdp" : isTelnet ? "telnet" : isVnc ? "vnc" : null });
+              await invoke("set_server_protocol", { id: savedId, value: isRdp ? "rdp" : isTelnet ? "telnet" : isVnc ? "vnc" : null, persist: false });
             } catch (e) {
               addLog(`SAVE_PROTOCOL_FAILED: ${e}`, "error");
             }
+            await invoke("persist_vault");
             // An RDP server's options are this device's own, kept by its sync
             // id (a new server has one once it's saved).
             if (isRdp) {
               try {
                 const uuid = (await invoke<any[]>("get_servers")).find((s) => s.id === savedId)?.uuid;
                 // Files shared go to this address only (rdpOptions' shareFor).
+                // Moved here by the user, not by someone else in a shared
+                // profile: what it shares goes with it (sharedFor).
+                const before = servers.find((s) => s.id === newNode.id);
+                const moved = !!before && (before.host !== newNode.host || Number(before.port) !== Number(newNode.port));
                 const o = newNode.rdpOptions || DEFAULT_RDP_OPTIONS;
-                if (uuid) writeRdpOptions(uuid, { ...o, shareFor: o.share !== "off" ? rdpAddress(newNode.host, newNode.port) : "" });
+                const withShare = { ...o, shareFor: o.share !== "off" ? rdpAddress(newNode.host, newNode.port) : "" };
+                if (uuid) writeRdpOptions(uuid, moved ? { ...withShare, sharedFor: "" } : withShare);
               } catch (e) {
                 addLog(`SAVE_RDP_OPTIONS_FAILED: ${e}`, "error");
               }
@@ -3713,16 +3905,20 @@ function DesktopApp() {
         isMobile={isMobile}
         onImported={bumpSync}
       />
+      </ErrorBoundary>
 
-      <QuickConnectModal
-        isOpen={isQuickConnectOpen}
-        onClose={() => setIsQuickConnectOpen(false)}
-        onConnect={openQuickConnect}
-      />
+      <ErrorBoundary overlay label="Quick connect" onReset={() => setIsQuickConnectOpen(false)}>
+        <QuickConnectModal
+          isOpen={isQuickConnectOpen}
+          onClose={() => setIsQuickConnectOpen(false)}
+          onConnect={openQuickConnect}
+        />
+      </ErrorBoundary>
 
 
       {/* The slide-overs stay mounted while closed (to slide out): inert
           then, so Tab can't reach their fields. */}
+      <ErrorBoundary overlay label="Command form" onReset={() => setIsCommandPanelOpen(false)}><Guarded render={() => (
       <div inert={isCommandPanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isCommandPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsCommandPanelOpen(false)}>
         <div ref={commandPanelRef} tabIndex={-1} className={`w-full max-w-[400px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isCommandPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
@@ -3789,7 +3985,9 @@ function DesktopApp() {
           </div>
         </div>
       </div>
+      )} /></ErrorBoundary>
 
+      <ErrorBoundary overlay label="Note form" onReset={() => setIsNotePanelOpen(false)}><Guarded render={() => (
       <div inert={isNotePanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isNotePanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsNotePanelOpen(false)}>
         <div ref={notePanelRef} tabIndex={-1} className={`w-full max-w-[480px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isNotePanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
@@ -3840,7 +4038,9 @@ function DesktopApp() {
           </div>
         </div>
       </div>
+      )} /></ErrorBoundary>
 
+      <ErrorBoundary overlay label="Login form" onReset={() => setIsCredPanelOpen(false)}><Guarded render={() => (
       <div inert={isCredPanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isCredPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsCredPanelOpen(false)}>
         <div ref={credPanelRef} tabIndex={-1} className={`w-full max-w-[400px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isCredPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
@@ -3943,7 +4143,9 @@ function DesktopApp() {
           </div>
         </div>
       </div>
+      )} /></ErrorBoundary>
 
+      <ErrorBoundary overlay label="Key form" onReset={() => setIsKeyPanelOpen(false)}><Guarded render={() => (
       <div inert={isKeyPanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isKeyPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsKeyPanelOpen(false)}>
         <div ref={keyPanelRef} tabIndex={-1} className={`w-full max-w-[450px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isKeyPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
@@ -4053,6 +4255,7 @@ function DesktopApp() {
           </div>
         </div>
       </div>
+      )} /></ErrorBoundary>
     </div>
   );
 }

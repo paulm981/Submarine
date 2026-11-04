@@ -333,6 +333,8 @@ mod tests {
             generation: Default::default(),
             sync_cursor: Default::default(),
             profile_lock: Default::default(),
+            closing: Default::default(),
+            saved_at: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(crate::NOT_SAVED)),
         };
         let s = read_server(&db, 2).unwrap();
         assert_eq!(

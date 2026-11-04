@@ -170,6 +170,7 @@ mod tests {
                 error: None,
             })),
             stop_tx: Mutex::new(None),
+            abort_tx: Mutex::new(None),
             join: Mutex::new(None),
         }
     }

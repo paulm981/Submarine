@@ -46,9 +46,10 @@ const FILE_VERSION: u8 = 1;
 /// The method of a key sealed with DPAPI, opened with no prompt (Windows only).
 const AUTO_METHOD: &str = "windows-auto";
 /// What the UI tells apart: the user closed the prompt (just ask for the
-/// password), the file no longer fits this profile (it was dropped: set it up
-/// again), the platform can't do it here, or a profile was closed in this run
-/// so only the password opens this one (see `profile_closed`).
+/// password), the file no longer fits this profile or its key isn't on this
+/// device (set it up again), the platform can't do it here, or a profile was
+/// closed in this run so only the password opens this one (see
+/// `profile_closed`).
 // Only the Windows and Android prompts can be cancelled.
 #[cfg_attr(not(any(windows, target_os = "android")), allow(dead_code))]
 pub const CANCELLED: &str = "[QUICK_UNLOCK] CANCELLED";
@@ -169,6 +170,13 @@ pub fn forget(app: &tauri::AppHandle, name: &str) {
         forget_platform_key(app, &f);
     }
     let _ = std::fs::remove_file(&path);
+    remove_tmp(&path);
+}
+
+/// What a write that never finished leaves next to the file. With `auto` it's
+/// a key that works, so it can't be left to outlive "off".
+fn remove_tmp(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path.with_extension("json.tmp"));
 }
 
 /// Removes the file when it's the one that opens the profile by itself
@@ -315,6 +323,9 @@ pub async fn quick_unlock_enable(app: tauri::AppHandle, state: tauri::State<'_, 
         std::fs::rename(&tmp, &path).map_err(|e| format!("[FILE] WRITE_FAILED: {e}"))
     })();
     if let Err(e) = written {
+        if let Ok(path) = file_for(&app, &name) {
+            remove_tmp(&path);
+        }
         if !auto {
             platform::forget(&app, &new_id);
         }
@@ -368,15 +379,12 @@ pub async fn quick_unlock(app: tauri::AppHandle, state: tauri::State<'_, DbState
         sealed: B64.decode(&f.sealed).map_err(|_| STALE.to_string())?,
         iv: b64(&f.iv)?,
     };
+    // A key that isn't here says nothing about the file: a portable folder on
+    // another PC gets the same answer, and the file is still good on the PC it
+    // was made on, which is also the only place its Windows Hello key can be
+    // removed from. It stays. What drops a file is the salt check above.
     let opened = if auto { dpapi::open(&sealed).await } else { platform::open(&app, &f.id, &sealed).await };
-    let key = match opened {
-        Ok(k) => k,
-        Err(e) if e == STALE => {
-            forget(&app, &name);
-            return Err(e);
-        }
-        Err(e) => return Err(e),
-    };
+    let key = opened?;
     *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE")? = Some(name.clone());
     match crate::setup_master_db_inner(app.clone(), crate::VaultSecret::Key(key), state.clone(), false).await {
         Ok(_) => {
@@ -839,6 +847,20 @@ mod vault_salt_tests {
         assert_eq!(salt_in(&versioned), VaultSalt::Gone);
         // Something that can't be opened as a file (a folder here) is not a verdict on any vault.
         assert_eq!(salt_in(&dir), VaultSalt::Unreadable);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The write that didn't finish goes, and only that: a failed "turn it on"
+    // leaves what was on as it was.
+    #[test]
+    fn only_the_unfinished_write_is_removed() {
+        let dir = temp("tmp");
+        let path = dir.join("p.json");
+        std::fs::write(&path, b"sealed").unwrap();
+        std::fs::write(dir.join("p.json.tmp"), b"half").unwrap();
+        remove_tmp(&path);
+        assert!(!dir.join("p.json.tmp").exists());
+        assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

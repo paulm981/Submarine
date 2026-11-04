@@ -2,7 +2,9 @@
 // with the server. This device's own settings (localStorage), kept by the
 // server's sync id like shellSync.ts: a window size belongs to this screen,
 // and in a shared profile nobody else may switch on sharing this computer's
-// files. The RDP tab hands them to the backend (src-tauri/src/rdp.rs).
+// files. A server's address is synced, though, so there what is shared stays
+// with the address it was chosen for (`sharedFor`). The RDP tab hands them to
+// the backend (src-tauri/src/rdp.rs).
 
 export interface RdpOptions {
   /** Where it opens: in this computer's RDP app, or in its Submarine tab (the
@@ -47,6 +49,12 @@ export interface RdpOptions {
    *  there only, so that a changed address (by someone else, in a shared
    *  profile) doesn't take them along. */
   shareFor: string;
+  /** The server's address ("host:port", as the backend writes it) all this is
+   *  for. In a shared profile, if the server moves, the clipboard, the files
+   *  and the login without NLA stay off until the user allows them for the new
+   *  address (`rdp::moved`). In a personal profile it follows the server.
+   *  Empty until the server first connects. */
+  sharedFor: string;
 }
 
 export type RdpShareKind = "off" | "folder" | "drive";
@@ -62,7 +70,7 @@ export const RDP_OPTIONS_KEY = "submarine-rdp-options";
 export const DEFAULT_RDP_OPTIONS: RdpOptions = {
   app: "system", fullScreen: true, width: 1600, height: 900, clipboard: true, drives: false, allowNoNla: false,
   colors: 32, effects: "standard", network: "lan", remoteFx: false, resolution: 1, pauseHidden: true,
-  share: "off", sharePath: "", shareReadOnly: false, shareFor: "",
+  share: "off", sharePath: "", shareReadOnly: false, shareFor: "", sharedFor: "",
 };
 
 /** A server's address as a share is kept for (`shareFor`), and as the
@@ -189,6 +197,7 @@ export function readRdpOptions(uuid?: string | null): RdpOptions {
     if (typeof kept.sharePath === "string") o.sharePath = kept.sharePath;
     if (typeof kept.shareReadOnly === "boolean") o.shareReadOnly = kept.shareReadOnly;
     if (typeof kept.shareFor === "string") o.shareFor = kept.shareFor;
+    if (typeof kept.sharedFor === "string") o.sharedFor = kept.sharedFor;
   }
   return o;
 }
@@ -201,6 +210,15 @@ export function writeRdpOptions(uuid: string, options: RdpOptions): void {
   } catch {
     // Best-effort, same as the other per-device prefs.
   }
+}
+
+/** A server connected, and the backend says `target` is the address its
+ *  options are for from now on (`rdp::pins_address`); none when they stay with
+ *  the one they have. */
+export function pinRdpAddress(uuid: string | null | undefined, target: unknown): void {
+  if (!uuid || typeof target !== "string" || !target) return;
+  const o = readRdpOptions(uuid);
+  if (o.sharedFor !== target) writeRdpOptions(uuid, { ...o, sharedFor: target });
 }
 
 export function forgetRdpOptions(uuid: string): void {
