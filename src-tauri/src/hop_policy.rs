@@ -351,9 +351,10 @@ mod tests {
                 ("config_jump_chain", "hop_policy::refuse_tokens(", 1),
                 ("config_jump_chain", "hop_policy::hop_turn(", 1),
                 ("reach_hop", "hop_policy::hop_turn(", 3),
-                ("first_hop_route", "hop_policy::first_hop_in_config(", 1),
             ],
         );
         assert_hooks("monitor.rs", include_str!("monitor.rs"), &[("run_poller", "hop_policy::queue_key(", 1)]);
+        // Moved out of lib.rs into a fork file of its own (#136).
+        assert_hooks("connect_diag.rs", include_str!("connect_diag.rs"), &[("first_hop_route", "hop_policy::first_hop_in_config(", 1)]);
     }
 }
