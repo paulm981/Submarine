@@ -159,7 +159,7 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 - **Native and fast.** Built with Rust + Tauri — boots in under a second, uses around 80 MB of RAM with several sessions open. No Electron, no battery drain.
 - **One window, everything you need.** Terminal, SFTP file browser, port tunnels, folder sync, and saved commands — all live as tabs around each server. No more juggling PuTTY plus WinSCP plus a tunnel app.
 - **Secure by default.** Saved servers are encrypted on disk. Optional cloud sync only ever sees encrypted blobs — your passwords and keys can't be read by anyone but you.
-- **Truly cross-platform.** Same app on Windows, macOS (Apple Silicon + Intel via Rosetta), and every major Linux distro — `.deb`, `.rpm`, Arch package, and AppImage.
+- **Truly cross-platform.** Same app on Windows, macOS (Apple silicon), and every major Linux distro — `.deb`, `.rpm`, Arch package, and AppImage.
 
 ## Key Features
 
@@ -262,7 +262,7 @@ Download from the **[latest release](https://github.com/paulm981/Submarine/relea
 | OS | File |
 |---|---|
 | Windows 10 / 11 | [`Submarine-windows-x64-setup.exe`](https://github.com/paulm981/Submarine/releases/latest/download/Submarine-windows-x64-setup.exe) — installs, or updates an installed copy (profiles and settings are kept). Or [`Submarine-windows-x64-portable.zip`](https://github.com/paulm981/Submarine/releases/latest/download/Submarine-windows-x64-portable.zip), no install — see [portable mode](#portable-mode-windows) |
-| macOS (Apple Silicon, or Intel via Rosetta) | `Submarine-macos-arm64.dmg` or `.app.zip`, in the releases that include macOS (see [Builds on GitHub](#builds-on-github)), or [build it on your Mac](#builds-on-github) |
+| macOS (Apple silicon) | `Submarine-macos-arm64.dmg` or `.app.zip`, in the releases the Mac build has been added to (see [Builds on GitHub](#builds-on-github)), or [build it on your Mac](#builds-on-github) |
 | Debian / Ubuntu / Mint | `Submarine-linux-amd64.deb` — `sudo apt install ./Submarine-linux-amd64.deb` |
 | Fedora / RHEL / openSUSE | `Submarine-linux-x86_64.rpm` — `sudo dnf install ./Submarine-linux-x86_64.rpm` |
 | Arch / Manjaro / EndeavourOS | `Submarine-linux-x86_64.pkg.tar.zst` — `sudo pacman -U Submarine-linux-x86_64.pkg.tar.zst` |
@@ -437,7 +437,7 @@ npm run tauri build        # build release bundle
 
 Each run's files are also kept for 90 days under **Artifacts** on the run's page (GitHub sign-in needed there). Android is built only when the repository variable `BUILD_ANDROID` is `true` and the signing secrets the workflow names are set.
 
-A release includes macOS only when the repository variable `BUILD_MACOS` is `true`. A macOS minute uses ten of the account's GitHub Actions minutes, so releases are Windows and Linux unless macOS is asked for. **Run workflow** with **Build macOS too** ticked builds a Mac test copy, kept under the run's **Artifacts**; like any manual run, it publishes nothing. Pull request checks likewise run on Linux and Windows, and also on macOS when the pull request has the `macos` label.
+A release is Windows and Linux when it's made. A macOS minute uses ten of the account's GitHub Actions minutes, so the Mac build is added only to a release that has been tried: **Run workflow** with **Or: add the Mac build to this release** set to its tag, such as `v0.4.0-fork.19`. It builds the Mac app from that release's own code and adds the `.dmg` and the `.app.zip` to its downloads and its notes. Only a release that has its Windows installer gets one. The Mac app is for Apple silicon (M1 or later); it doesn't run on an Intel Mac. Pull request checks run on Linux and Windows, and on macOS too when the pull request has the `macos` label.
 
 **Building macOS on your own Mac:** install the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) (Xcode's command line tools, Rust, Node 20+), then in a clone of the repository run `npm ci` and `SUBMARINE_VERSION=0.4.0-fork.N npm run tauri build -- --bundles app,dmg` with the release's number. The app and the `.dmg` land in `src-tauri/target/release/bundle/`.
 
