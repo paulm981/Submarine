@@ -9,6 +9,12 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Remote Desktop links are now RDP servers.** Each link becomes an RDP server in the same folder, with its name, address, user name and notes, and opens in your Remote Desktop app as before. ([#42](https://github.com/paulm981/Submarine/issues/42))
+  - RDP servers can do more: open in the tab with the built-in client, share the clipboard or a folder, or go through an SSH server.
+  - On Windows, the window now follows the server's RDP options (full screen unless you change them), not Remote Desktop's Default.rdp.
+  - The MobaXterm import brings Remote Desktop sessions in as RDP servers, still without their saved login.
+  - It syncs as a server. A computer still on an older version gets the RDP server in place of its link.
+
 ### From the original project
 
 - **Safer against a hostile server.** A server, or someone on the way to it, can no longer:

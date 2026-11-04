@@ -44,7 +44,6 @@ import { useAiPane } from "./ui/aiPane";
 import { useAi, sharedWith, aiMarker, openAiTrust, trustTargetFor } from "./util/ai";
 import { AiTrustModal } from "./components/AiTrust";
 import { IS_ANDROID } from "./util/platform";
-import type { RdpLink } from "./components/RdpLinkModal";
 import { folderTree } from "./util/folderTree";
 import { CommandScope, describeScope, parseCommandScope, scopeToJson } from "./util/commandScope";
 import CommandScopePicker from "./components/CommandScopePicker";
@@ -333,9 +332,6 @@ function DesktopApp() {
   const [credentials, setCredentials] = useState<any[]>([]);
   const [sshKeys, setSshKeys] = useState<any[]>([]);
   const [folders, setFolders] = useState<any[]>([]);
-  // Remote Desktop links (src-tauri/src/rdp_links.rs): shown with the servers, open
-  // the system's Remote Desktop client.
-  const [rdpLinks, setRdpLinks] = useState<RdpLink[]>([]);
   // The servers asked for their OS this run, by server, host and port (the
   // OS badge effect below).
   const osChecked = useRef<Set<string>>(new Set());
@@ -698,10 +694,6 @@ function DesktopApp() {
     try { setFolders((await invoke("get_folders")) as any[]); }
     catch (e) { addLog(`SYNC_FOLDERS: ${e}`, "error"); }
   };
-  const refreshRdpLinks = async () => {
-    try { setRdpLinks(await invoke<RdpLink[]>("rdp_list")); }
-    catch (e) { addLog(`SYNC_RDP_LINKS: ${e}`, "error"); }
-  };
   const refreshSavedWalls = async () => {
     try { setSavedWalls(await invoke<SavedWall[]>("wall_list")); }
     catch (e) { addLog(`SYNC_WALLS: ${e}`, "error"); }
@@ -737,7 +729,6 @@ function DesktopApp() {
       refreshCredentials(),
       refreshSshKeys(),
       refreshFolders(),
-      refreshRdpLinks(),
       refreshSavedWalls(),
       refreshCommands(),
       refreshNotes(),
@@ -986,9 +977,9 @@ function DesktopApp() {
     try {
       await invoke("delete_folder", { id });
       gone.forEach(forgetServer);
-      // delete_folder cascades to the folders, servers and Remote Desktop
-      // links inside it (lib.rs), so refresh all three.
-      await Promise.all([refreshFolders(), refreshServers(), refreshRdpLinks()]);
+      // delete_folder cascades to the folders and servers inside it (lib.rs),
+      // so refresh both.
+      await Promise.all([refreshFolders(), refreshServers()]);
       bumpSync();
       addLog("Folder removed.", "info");
     } catch (e) { addLog(`DELETE_EXCEPTION: ${e}`, "error"); }
@@ -1037,10 +1028,9 @@ function DesktopApp() {
   const moveItems = async (items: TreeItems, folderId: number | null) => {
     try {
       if (items.servers.length) await invoke("move_servers", { ids: items.servers, folderId });
-      if (items.links.length) await invoke("move_rdp_links", { ids: items.links, folderId });
       for (const id of items.folders) await invoke("move_folder", { id, parentId: folderId });
     } finally {
-      await Promise.all([refreshFolders(), refreshServers(), refreshRdpLinks()]);
+      await Promise.all([refreshFolders(), refreshServers()]);
       bumpSync();
     }
   };
@@ -1058,29 +1048,13 @@ function DesktopApp() {
       ...(servers || []).filter((s: any) => insideFolders.has(tree.serverFolder(s) as number)).map((s: any) => s.id as number),
     ]);
     try {
-      await invoke("delete_tree_items", { servers: items.servers, links: items.links, folders: items.folders });
+      await invoke("delete_tree_items", { servers: items.servers, folders: items.folders });
       (servers || []).filter((s: any) => gone.has(s.id)).forEach(forgetServer);
       addLog("Removed from the session tree.", "info");
     } finally {
-      await Promise.all([refreshFolders(), refreshServers(), refreshRdpLinks()]);
+      await Promise.all([refreshFolders(), refreshServers()]);
       bumpSync();
     }
-  };
-
-  const openRdp = async (id: number) => {
-    try { await invoke("rdp_open", { id }); }
-    catch (e) { addLog(`RDP_OPEN: ${e}`, "error"); throw e; }
-  };
-
-  const saveRdp = async (link: RdpLink) => {
-    await invoke("rdp_save", { link });
-    await refreshRdpLinks();
-    bumpSync();
-  };
-
-  const removeRdp = async (id: number) => {
-    try { await invoke("rdp_delete", { id }); await refreshRdpLinks(); bumpSync(); }
-    catch (e) { addLog(`RDP_DELETE: ${e}`, "error"); }
   };
 
   const renameFolder = async (id: number, name: string) => {
@@ -1341,7 +1315,7 @@ function DesktopApp() {
     setWalls([]);
     setSavedWalls([]);
     setActiveView(START_VIEW);
-    setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setRdpLinks([]); setCommands([]);
+    setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setCommands([]);
     osChecked.current.clear();
     // The next profile numbers its servers from 1 too, so anything kept by
     // session id would land on its sessions.
@@ -2903,7 +2877,6 @@ function DesktopApp() {
       profile={activeProfile ?? ""}
       servers={servers}
       folders={folders}
-      rdpLinks={rdpLinks}
       sessions={sessions}
       statuses={sessionStatuses}
       waiting={promptSessions}
@@ -2916,13 +2889,11 @@ function DesktopApp() {
         setActiveView(wallId ?? sid);
       }}
       onOpenAsWall={(list, name) => openServersAsWall(list, name)}
-      onOpenRdp={openRdp}
       onEditServer={handleEditNode}
       onNewServer={addServerIn}
       onCloneServer={cloneServer}
       onCreateFolder={createFolder}
       onRenameFolder={renameFolder}
-      onSaveRdp={saveRdp}
       onDelete={deleteItems}
       onMove={moveItems}
       side={treeSide}
@@ -2953,10 +2924,6 @@ function DesktopApp() {
               <NodeGrid
                 servers={servers}
                 folders={folders}
-                rdpLinks={rdpLinks}
-                onOpenRdp={openRdp}
-                onSaveRdp={saveRdp}
-                onRemoveRdp={removeRdp}
                 activeFolderId={activeFolderId}
                 onActiveFolderChange={setActiveFolderId}
                 onOpenServer={openServer}
@@ -3899,7 +3866,7 @@ function DesktopApp() {
           }
         }}
         formError={formError}
-        credentials={credentials} refreshCredentials={refreshCredentials} refreshRdpLinks={refreshRdpLinks} sshKeys={sshKeys} refreshSshKeys={refreshSshKeys} folders={folders} refreshFolders={refreshFolders}
+        credentials={credentials} refreshCredentials={refreshCredentials} sshKeys={sshKeys} refreshSshKeys={refreshSshKeys} folders={folders} refreshFolders={refreshFolders}
         refreshServers={refreshServers}
         servers={servers}
         isMobile={isMobile}

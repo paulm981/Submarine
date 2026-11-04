@@ -14,7 +14,7 @@
 //!   same host, port and user, or saved as a new one with its key, and every
 //!   host behind it is linked to it. Submarine jumps through one host only,
 //!   so a chain of several is reported and left for the user;
-//! - an RDP session becomes a Remote Desktop link (rdp_links.rs) in its folder;
+//! - an RDP session becomes an RDP server in its folder, with no saved login;
 //! - a server already saved with the same name, host, port and folder is
 //!   left alone, so importing the same file twice adds nothing.
 
@@ -48,7 +48,7 @@ pub(crate) struct ImportReport {
     pub jump_linked: usize,
     /// Hosts whose jump chain has more than one hop: imported without one.
     pub multi_hop: Vec<String>,
-    /// Remote Desktop sessions added as RDP links (rdp_links.rs).
+    /// Remote Desktop sessions added as RDP servers.
     pub rdp_added: usize,
     /// Remote Desktop sessions left out, with why ("name: reason").
     pub rdp_skipped: Vec<String>,
@@ -146,7 +146,6 @@ fn login_id(conn: &Connection, logins: &mut HashMap<String, i64>, name: &str, re
 struct Saved {
     /// (name, host, port, folder) → id, for "already saved".
     servers: HashMap<SavedKey, i64>,
-    rdp_links: HashMap<SavedKey, i64>,
     /// The highest `position` in each folder (None: the top level).
     max_position: HashMap<Option<i64>, i64>,
 }
@@ -173,14 +172,7 @@ impl Saved {
             *max = (*max).max(position);
             servers.entry(k).or_insert(id);
         }
-        let mut rdp_links = HashMap::new();
-        let mut stmt = conn.prepare("SELECT id, name, host, port, folder_id FROM rdp_links ORDER BY id")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, key(r)?)))?;
-        for row in rows {
-            let (id, k) = row?;
-            rdp_links.entry(k).or_insert(id);
-        }
-        Ok(Saved { servers, rdp_links, max_position })
+        Ok(Saved { servers, max_position })
     }
 
     /// The position for a row added at the bottom of `folder_id`.
@@ -203,7 +195,7 @@ fn insert_server(
     key_id: Option<i64>,
     folder_id: Option<i64>,
     run_on_connect: &str,
-    telnet: bool,
+    protocol: Option<&str>,
 ) -> rusqlite::Result<i64> {
     // Its own key wins over a Login; then add_server's rule decides which
     // fields the row keeps (normalize_server_identity).
@@ -224,7 +216,7 @@ fn insert_server(
     conn.execute(
         "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, position, protocol)
          VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, 'none', '', 1080, '[]', ?7, ?8, 0, '[]', NULL, '', ?9, ?10, ?11)",
-        params![name, host, port, username, credential_id, folder_id, auth_type, key_id, run_on_connect, position, telnet.then_some("telnet")],
+        params![name, host, port, username, credential_id, folder_id, auth_type, key_id, run_on_connect, position, protocol],
     )?;
     let id = conn.last_insert_rowid();
     saved.servers.entry(saved_key(name, host, port, folder_id)).or_insert(id);
@@ -264,29 +256,22 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
         let folder_id = folders.resolve(conn, &h.folder).map_err(db)?;
 
         if h.rdp {
-            if saved.rdp_links.contains_key(&saved_key(name, host, port, folder_id)) {
+            if saved.servers.contains_key(&saved_key(name, host, port, folder_id)) {
                 report.already_there += 1;
                 continue;
             }
-            // A saved-login name says nothing about the Windows user; leave
-            // it for Remote Desktop to ask (and remember).
-            let link = crate::rdp_links::RdpLink {
-                id: None,
-                name: name.to_string(),
-                host: host.to_string(),
-                port,
-                username: h.user.trim().to_string(),
-                folder_id,
-                notes: String::new(),
-            };
-            // A host Remote Desktop can't take is reported; a database
-            // error still fails the import.
-            if let Err(why) = crate::rdp_links::validate(&link) {
+            // A host or user name an RDP app can't take is reported; a
+            // database error still fails the import.
+            let user = h.user.trim();
+            if let Err(why) = crate::rdp::check_host(host).and_then(|_| crate::rdp::check_user(user)) {
                 report.rdp_skipped.push(format!("{}: {}", name, why));
                 continue;
             }
-            let link_id = crate::rdp_links::save(conn, &link)?;
-            saved.rdp_links.entry(saved_key(name, host, port, folder_id)).or_insert(link_id);
+            // Its saved login, if MobaXterm had one, isn't brought along: a
+            // MobaXterm login is often shared by many servers, and its
+            // password never goes to the Remote Desktop app (FORK.md, E2).
+            // The app asks, and can remember it.
+            insert_server(conn, &mut saved, name, host, port, user, None, None, folder_id, "", Some("rdp")).map_err(db)?;
             report.rdp_added += 1;
             continue;
         }
@@ -304,7 +289,8 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
             None => None,
         };
         let run = h.run_on_connect.as_deref().map(str::trim).unwrap_or("");
-        let id = insert_server(conn, &mut saved, name, host, port, &h.user, credential_id, row.key_id, folder_id, run, h.telnet).map_err(db)?;
+        let id = insert_server(conn, &mut saved, name, host, port, &h.user, credential_id, row.key_id, folder_id, run, h.telnet.then_some("telnet"))
+            .map_err(db)?;
         report.added += 1;
         by_alias.entry(name.to_lowercase()).or_insert(id);
         // `none` is OpenSSH's "no jump host", e.g. to override a wildcard block.
@@ -359,7 +345,7 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
                         Some(c) => Some(login_id(conn, &mut logins, c, &mut report).map_err(db)?),
                         None => None,
                     };
-                    let j = insert_server(conn, &mut saved, &name, &host, port, &user, login, row.jump_key_id, None, "", false).map_err(db)?;
+                    let j = insert_server(conn, &mut saved, &name, &host, port, &user, login, row.jump_key_id, None, "", None).map_err(db)?;
                     report.jump_hosts_created.push(name);
                     j
                 }
@@ -471,12 +457,11 @@ mod tests {
              INSERT INTO ssh_keys(name, private_key) VALUES ('id_jump', 'k1'), ('own', 'k2');",
         )
         .unwrap();
-        conn.execute_batch(crate::rdp_links::SCHEMA).unwrap();
         conn
     }
 
     #[test]
-    fn rdp_sessions_become_links_in_their_folder() {
+    fn rdp_sessions_become_rdp_servers_in_their_folder() {
         let conn = vault();
         let rdp = ImportRow {
             host: ImportedHost {
@@ -494,10 +479,14 @@ mod tests {
         let r = import_rows(&conn, std::slice::from_ref(&rdp)).unwrap();
         assert_eq!((r.rdp_added, r.added), (1, 0));
         assert!(r.logins_created.is_empty(), "no Login for an RDP session");
-        let links = crate::rdp_links::list(&conn).unwrap();
-        assert_eq!(links.len(), 1);
-        assert_eq!((links[0].name.as_str(), links[0].host.as_str(), links[0].port, links[0].username.as_str()), ("desk (GUI)", "desk.example", 3389, ""));
-        let folder: String = conn.query_row("SELECT name FROM folders WHERE id = ?1", [links[0].folder_id.unwrap()], |r| r.get(0)).unwrap();
+        let (name, host, port, user, protocol, credential, folder_id): (String, String, i64, Option<String>, String, Option<i64>, i64) = conn
+            .query_row("SELECT name, host, port, username, protocol, credential_id, folder_id FROM servers", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+            })
+            .unwrap();
+        assert_eq!((name.as_str(), host.as_str(), port, user.as_deref(), protocol.as_str()), ("desk (GUI)", "desk.example", 3389, None, "rdp"));
+        assert_eq!(credential, None, "its MobaXterm login isn't brought along");
+        let folder: String = conn.query_row("SELECT name FROM folders WHERE id = ?1", [folder_id], |r| r.get(0)).unwrap();
         assert_eq!(folder, "Prod");
         let again = import_rows(&conn, &[rdp]).unwrap();
         assert_eq!((again.rdp_added, again.already_there), (0, 1));

@@ -2,12 +2,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   Activity, ArrowLeftRight, Bot, ChevronRight, ChevronsDownUp, Copy, CopyPlus, Folder, FolderInput, FolderOpen, FolderPlus,
-  Eye, LayoutGrid, Monitor, MonitorSmartphone, Pencil, Play, Plus, Search, ShieldAlert, TerminalSquare, Trash2, X,
+  Eye, LayoutGrid, Monitor, Pencil, Play, Plus, Search, ShieldAlert, TerminalSquare, Trash2, X,
 } from "lucide-react";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
 import { FolderRow, indexFolders, subtreeCounts, subtreeIds } from "../util/folderPath";
 import { sessionDot } from "../util/sessionStatus";
-import RdpLinkModal, { type RdpLink } from "./RdpLinkModal";
 import MoveToFolderModal from "./MoveToFolderModal";
 import { OsBadge, osName } from "./OsBadge";
 import { openAiTrust, useAi } from "../util/ai";
@@ -15,24 +14,22 @@ import { pingServers } from "../ui/ping";
 import { jumpHostNote } from "../util/jumpHostNote";
 
 // The session tree beside the main view, in the spirit of MobaXterm's
-// Sessions sidebar: every folder, server and Remote Desktop link as one
-// compact list, with the servers that have a tab open marked by their
+// Sessions sidebar: every folder and server as one compact list, with the servers that have a tab open marked by their
 // connection state. Double-click (or Enter) opens; Ctrl/Shift-click picks
 // several to open together; a folder's menu opens everything in it. The
 // arrow keys move through the rows, and → / ← open and close a folder.
 //
-// It's where the tree is managed too: right-click for new folders, servers
-// and links in a folder, rename, duplicate, move and delete; drag rows onto a
+// It's where the tree is managed too: right-click for new folders and
+// servers in a folder, rename, duplicate, move and delete; drag rows onto a
 // folder (or the empty space below the rows, for the top level) to move them,
 // several at once when they're selected; F2 renames a folder, Delete deletes.
 
 type Row =
   | { kind: "folder"; id: number; name: string; depth: number; open: boolean; count: number }
-  | { kind: "server"; key: string; server: any; depth: number }
-  | { kind: "rdp"; key: string; link: RdpLink; depth: number };
+  | { kind: "server"; key: string; server: any; depth: number };
 
 // What a move or a delete is about, by id.
-export type TreeItems = { servers: number[]; links: number[]; folders: number[] };
+export type TreeItems = { servers: number[]; folders: number[] };
 
 // `row` null: a right-click on the empty space below the rows.
 type Menu = { x: number; y: number; row: Row | null };
@@ -80,8 +77,7 @@ const DRAG_START_PX = 8;
 const DRAG_OPEN_MS = 700;
 const DRAG_SCROLL_PX = 28;
 
-// A server that isn't SSH says what it is, as in the server list; a Remote
-// Desktop link says it's a link, so the two aren't taken for each other.
+// A server that isn't SSH says what it is, as in the server list.
 const BADGE = "shrink-0 px-1 rounded text-[8.5px] font-black tracking-wider border";
 const SERVER_TYPES: Record<string, { label: string; title: string; tone: string }> = {
   rdp: { label: "RDP", title: "RDP server", tone: "bg-sky-500/10 text-sky-300 border-sky-500/20" },
@@ -96,15 +92,14 @@ const wallServers = (list: any[]) => list.filter((s) => (s?.protocol ?? "ssh") =
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 export const SessionTree = ({
-  profile, servers, folders, rdpLinks, sessions, statuses, waiting, activeSessionId,
-  onOpenServers, onShowSession, onOpenAsWall, onOpenRdp, onEditServer, onNewServer, onCloneServer,
-  onCreateFolder, onRenameFolder, onSaveRdp, onDelete, onMove,
+  profile, servers, folders, sessions, statuses, waiting, activeSessionId,
+  onOpenServers, onShowSession, onOpenAsWall, onEditServer, onNewServer, onCloneServer,
+  onCreateFolder, onRenameFolder, onDelete, onMove,
   side, onToggleSide, onClose,
 }: {
   profile: string;
   servers: any[];
   folders: FolderRow[];
-  rdpLinks: RdpLink[];
   sessions: { id: string; serverId: number }[];
   statuses: Record<string, string>;
   waiting: Set<string>;
@@ -114,13 +109,11 @@ export const SessionTree = ({
   onShowSession: (sessionId: string) => void;
   // Several servers on one Wall tab instead of a tab each (WallView).
   onOpenAsWall: (servers: any[], name: string) => void;
-  onOpenRdp: (id: number) => Promise<void>;
   onEditServer: (server: any) => void;
   onNewServer: (folderId: number | null) => void;
   onCloneServer: (id: number) => Promise<void>;
   onCreateFolder: (name: string, parentId: number | null) => Promise<void>;
   onRenameFolder: (id: number, name: string) => Promise<void>;
-  onSaveRdp: (link: RdpLink) => Promise<void>;
   // Everything given, folders with what's in them (tree_moves.rs).
   onDelete: (items: TreeItems) => Promise<void>;
   onMove: (items: TreeItems, folderId: number | null) => Promise<void>;
@@ -139,7 +132,6 @@ export const SessionTree = ({
   const [anchor, setAnchor] = useState<string | null>(null);
   const [menu, setMenu] = useState<Menu | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [rdpDraft, setRdpDraft] = useState<RdpLink | null>(null);
   const [moving, setMoving] = useState<TreeItems | null>(null);
   const [drag, setDrag] = useState<Drag | null>(null);
   // The last move, to put back: where each moved thing was before.
@@ -163,31 +155,28 @@ export const SessionTree = ({
   const index = useMemo(() => indexFolders(folders || []), [folders]);
   const known = (id: number | null | undefined) => (id != null && index.byId.has(id) ? id : null);
 
-  // Servers and links grouped by the folder they show in, sorted by name.
+  // Servers grouped by the folder they show in, sorted by name.
   const contents = useMemo(() => {
-    const m = new Map<number | null, { servers: any[]; links: RdpLink[] }>();
+    const m = new Map<number | null, { servers: any[] }>();
     const at = (id: number | null) => {
-      if (!m.has(id)) m.set(id, { servers: [], links: [] });
+      if (!m.has(id)) m.set(id, { servers: [] });
       return m.get(id)!;
     };
     for (const s of servers || []) at(known(s.folder_id)).servers.push(s);
-    for (const l of rdpLinks || []) at(known(l.folder_id)).links.push(l);
     for (const v of m.values()) {
       v.servers.sort((a, b) => byName(a.name, b.name));
-      v.links.sort((a, b) => byName(a.name, b.name));
     }
     return m;
-  }, [servers, rdpLinks, index]);
+  }, [servers, index]);
 
   // Everything inside each folder, at any depth, for its count.
   const counts = useMemo(
-    () => subtreeCounts(index, [...(servers || []).map((s) => s.folder_id), ...(rdpLinks || []).map((l) => l.folder_id)]),
-    [servers, rdpLinks, index],
+    () => subtreeCounts(index, (servers || []).map((s) => s.folder_id)),
+    [servers, index],
   );
 
   const q = search.trim().toLowerCase();
   const matchesServer = (s: any) => s.name.toLowerCase().includes(q) || String(s.host).toLowerCase().includes(q);
-  const matchesLink = (l: RdpLink) => l.name.toLowerCase().includes(q) || l.host.toLowerCase().includes(q);
   const matchesFolder = (name: string) => name.toLowerCase().includes(q);
   // Servers with a session open (a tab, or a tile on a Wall).
   const openIds = useMemo(() => new Set((sessions || []).map((x) => x.serverId)), [sessions]);
@@ -198,7 +187,7 @@ export const SessionTree = ({
   // The rows on screen, top to bottom. While searching, only matches and
   // the folders leading to them, all open; a folder whose name matches
   // shows everything in it. With "show only open", only servers that are
-  // open (no links, which have no tab) and the folders holding them.
+  // open and the folders holding them.
   const rows = useMemo(() => {
     const out: Row[] = [];
     const hits = new Map<number | null, boolean>();
@@ -214,7 +203,7 @@ export const SessionTree = ({
     const hasHit = (id: number | null): boolean => {
       if (hits.has(id)) return hits.get(id)!;
       const c = contents.get(id);
-      const own = !!c && (c.servers.some((s) => serverOk(s) && matchesServer(s)) || (!openOnly && c.links.some(matchesLink)));
+      const own = !!c && c.servers.some((s) => serverOk(s) && matchesServer(s));
       // A subfolder counts only if it shows: with "show only open", one with
       // nothing open is left out, name match or not.
       const r = own || (index.children.get(id) ?? []).some((f) => (!openOnly || hasOpen(f.id)) && (matchesFolder(f.name) || hasHit(f.id)));
@@ -235,9 +224,6 @@ export const SessionTree = ({
       for (const s of c?.servers ?? []) {
         if (serverOk(s) && (!q || all || matchesServer(s))) out.push({ kind: "server", key: `s:${s.id}`, server: s, depth });
       }
-      for (const l of c?.links ?? []) {
-        if (!openOnly && (!q || all || matchesLink(l))) out.push({ kind: "rdp", key: `r:${l.id}`, link: l, depth });
-      }
     };
     walk(null, 0, false);
     return out;
@@ -257,7 +243,7 @@ export const SessionTree = ({
   const rowKey = (r: Row) => (r.kind === "folder" ? `f:${r.id}` : r.key);
   // The folder a row sits in, or is (for a folder): where "new … here" goes.
   const folderOfRow = (r: Row | null | undefined): number | null =>
-    !r ? null : r.kind === "folder" ? r.id : r.kind === "server" ? known(r.server.folder_id) : known(r.link.folder_id);
+    !r ? null : r.kind === "folder" ? r.id : known(r.server.folder_id);
 
   // The selection is what's on screen: rows hidden by a search or a closed
   // folder, or deleted, drop out of it, so "Open N selected" opens what it
@@ -300,12 +286,6 @@ export const SessionTree = ({
     setAnchor(key);
   };
 
-  const openRdp = async (l: RdpLink) => {
-    setError(null);
-    try { await onOpenRdp(l.id as number); }
-    catch (e: any) { setError(`${l.name}: ${errText(e)}`); }
-  };
-
   // A double-click or Enter on a server. With "show only open" the tree is
   // for getting around, so an open one is shown where it is (its tab, or its
   // Wall) rather than pulled out of its Wall into a tab of its own.
@@ -314,33 +294,30 @@ export const SessionTree = ({
     if (open) onShowSession(open.id); else onOpenServers([server]);
   };
 
-  // Open servers (tabs) and links together, asking first for a big batch.
-  const openMany = async (list: any[], links: RdpLink[]) => {
-    const n = list.length + links.length;
+  // Open servers (tabs), asking first for a big batch.
+  const openMany = async (list: any[]) => {
+    const n = list.length;
     if (n === 0) return;
     if (n > OPEN_MANY && !(await confirm({
       title: `Open ${n} sessions?`,
-      message: `Each one connects as it opens, in a tab of its own${links.length ? `, and each Remote Desktop link opens its own window` : ""}. "Open as wall" puts servers on one tab instead.`,
+      message: `Each one connects as it opens, in a tab of its own. "Open as wall" puts servers on one tab instead.`,
       okLabel: `Open ${n}`,
     }))) return;
-    if (list.length === 1 && links.length === 0) openServer(list[0]);
+    if (list.length === 1) openServer(list[0]);
     else if (list.length) onOpenServers(list);
-    for (const l of links) await openRdp(l);
   };
 
   const pickedItems = (keys: Set<string>) => {
     const list: any[] = [];
-    const links: RdpLink[] = [];
     for (const r of rows) {
       if (r.kind === "server" && keys.has(r.key)) list.push(r.server);
-      if (r.kind === "rdp" && keys.has(r.key)) links.push(r.link);
     }
-    return { list, links };
+    return { list };
   };
 
   const picked = useMemo(() => pickedItems(selected), [selected, rows]);
-  const pickedCount = picked.list.length + picked.links.length;
-  const openSelected = () => openMany(picked.list, picked.links);
+  const pickedCount = picked.list.length;
+  const openSelected = () => openMany(picked.list);
   const pickedWall = useMemo(() => wallServers(picked.list), [picked]);
   const openAsWall = async (all: any[], name: string) => {
     const list = wallServers(all);
@@ -371,11 +348,10 @@ export const SessionTree = ({
   // its folder, which keeps a moved branch whole.
   const itemsFor = (r: Row | null): TreeItems => {
     const keys = !r || selected.has(rowKey(r)) ? selected : new Set([rowKey(r)]);
-    const items: TreeItems = { servers: [], links: [], folders: [] };
+    const items: TreeItems = { servers: [], folders: [] };
     for (const k of keys) {
       const id = Number(k.slice(2));
       if (k.startsWith("s:")) items.servers.push(id);
-      else if (k.startsWith("r:")) items.links.push(id);
       else if (k.startsWith("f:")) items.folders.push(id);
     }
     const inside = new Set(items.folders.flatMap((f) => subtreeIds(index, f).filter((x) => x !== f)));
@@ -383,16 +359,14 @@ export const SessionTree = ({
     return {
       folders: items.folders.filter((f) => !inside.has(f)),
       servers: items.servers.filter((id) => { const f = known(servers.find((x) => x.id === id)?.folder_id); return f == null || !covered.has(f); }),
-      links: items.links.filter((id) => { const f = known(rdpLinks.find((x) => x.id === id)?.folder_id); return f == null || !covered.has(f); }),
     };
   };
-  const itemCount = (it: TreeItems) => it.servers.length + it.links.length + it.folders.length;
+  const itemCount = (it: TreeItems) => it.servers.length + it.folders.length;
   const describe = (it: TreeItems) => {
     if (itemCount(it) === 1) {
       const s = it.servers[0] != null ? servers.find((x) => x.id === it.servers[0]) : null;
-      const l = it.links[0] != null ? rdpLinks.find((x) => x.id === it.links[0]) : null;
       const f = it.folders[0] != null ? index.byId.get(it.folders[0]) : null;
-      return `“${s?.name ?? l?.name ?? f?.name ?? "item"}”`;
+      return `“${s?.name ?? f?.name ?? "item"}”`;
     }
     return plural(itemCount(it), "item");
   };
@@ -404,11 +378,10 @@ export const SessionTree = ({
   const whereNow = (it: TreeItems) => {
     const groups = new Map<number | null, TreeItems>();
     const at = (f: number | null) => {
-      if (!groups.has(f)) groups.set(f, { servers: [], links: [], folders: [] });
+      if (!groups.has(f)) groups.set(f, { servers: [], folders: [] });
       return groups.get(f)!;
     };
     for (const id of it.servers) at(known(servers.find((x) => x.id === id)?.folder_id)).servers.push(id);
-    for (const id of it.links) at(known(rdpLinks.find((x) => x.id === id)?.folder_id)).links.push(id);
     for (const id of it.folders) at(index.parent.get(id) ?? null).folders.push(id);
     return [...groups].map(([folderId, items]) => ({ items, folderId }));
   };
@@ -433,12 +406,11 @@ export const SessionTree = ({
     catch (e: any) { setError(`Couldn't put everything back: ${errText(e)}`); }
   };
 
-  // Every server and link in a folder, at any depth.
+  // Every server in a folder, at any depth.
   const folderItems = (id: number) => {
     const inside = subtreeIds(index, id).map((fid) => contents.get(fid));
     return {
       list: inside.flatMap((c) => c?.servers ?? []),
-      links: inside.flatMap((c) => c?.links ?? []),
     };
   };
 
@@ -473,12 +445,9 @@ export const SessionTree = ({
     catch (e: any) { setError(`Couldn't rename “${current}”: ${errText(e)}`); }
   };
 
-  const newRdp = (folderId: number | null) =>
-    setRdpDraft({ name: "", host: "", port: 3389, username: "", folder_id: folderId, notes: "" });
-
   // Delete what `r` stands for (see itemsFor), once the user says so. What
   // goes is spelt out, counted the way the backend will delete it: a folder
-  // takes every folder, server and link inside it.
+  // takes every folder and server inside it.
   const remove = async (r: Row | null) => {
     const it = itemsFor(r);
     if (itemCount(it) === 0) return;
@@ -487,11 +456,9 @@ export const SessionTree = ({
     const nServers = goneServers.size;
     // Servers staying that go through one of these as their jump host.
     const jumpNote = jumpHostNote(servers, goneServers);
-    const nLinks = new Set([...it.links, ...(rdpLinks || []).filter((x) => folderIds.has(known(x.folder_id) as number)).map((x) => x.id)]).size;
     const parts = [
       folderIds.size && plural(folderIds.size, "folder"),
       nServers && plural(nServers, "server"),
-      nLinks && plural(nLinks, "Remote Desktop link"),
     ].filter(Boolean) as string[];
     const list = parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}` : parts[0];
     const ok = await confirm({
@@ -566,9 +533,9 @@ export const SessionTree = ({
     }
   };
 
-  // Where the pointer would drop: a folder row is that folder; a server or
-  // link row is the folder it's in; the empty space under the rows is the
-  // top level; anywhere outside the list, nowhere.
+  // Where the pointer would drop: a folder row is that folder; a server row
+  // is the folder it's in; the empty space under the rows is the top level;
+  // anywhere outside the list, nowhere.
   const dropTargetAt = (x: number, y: number, it: TreeItems): number | null | undefined => {
     const list = listRef.current;
     const el = document.elementFromPoint(x, y);
@@ -681,9 +648,6 @@ export const SessionTree = ({
         <button className={menuItem} onClick={run(() => onNewServer(folderId))}>
           <Plus size={13} className={menuIcon} /> <span className="truncate">New server{where}</span>
         </button>
-        <button className={menuItem} onClick={run(() => newRdp(folderId))}>
-          <MonitorSmartphone size={13} className={menuIcon} /> <span className="truncate">New Remote Desktop link{where}</span>
-        </button>
       </>
     );
   };
@@ -703,7 +667,7 @@ export const SessionTree = ({
                 // a folder's own menu makes things inside it.
                 setMenu({ x: rect.left, y: rect.bottom + 4, row: null });
               }}
-              title="New folder, server or Remote Desktop link at the top level"
+              title="New folder or server at the top level"
               className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-white/5"
             >
               <Plus size={13} />
@@ -767,7 +731,7 @@ export const SessionTree = ({
       >
         {rows.length === 0 && (
           <div className="px-3 py-6 text-center text-[11.5px] text-zinc-600 italic">
-            {q ? "No matches." : openOnly ? "No server is open. Turn off “show only open” to see them all." : "No sessions yet — right-click for a new folder, server or link."}
+            {q ? "No matches." : openOnly ? "No server is open. Turn off “show only open” to see them all." : "No sessions yet — right-click for a new folder or server."}
           </div>
         )}
         {rows.map((r) => {
@@ -807,20 +771,19 @@ export const SessionTree = ({
             );
           }
           const isSel = selected.has(r.key);
-          const isServer = r.kind === "server";
-          const name = isServer ? r.server.name : r.link.name;
-          const host = isServer ? r.server.host : r.link.host;
-          const status = isServer ? statusOf(r.server.id) : null;
+          const name = r.server.name;
+          const host = r.server.host;
+          const status = statusOf(r.server.id);
           const isActive = !!status && status.id === activeSessionId;
           const isCarried = !!drag && isSel;
-          const type = isServer ? SERVER_TYPES[r.server.protocol ?? ""] : undefined;
+          const type = SERVER_TYPES[r.server.protocol ?? ""];
           return (
             <div
               key={r.key}
               data-key={r.key}
               onPointerDown={press(r)}
               onClick={clicked((e) => select(r, e))}
-              onDoubleClick={() => (isServer ? openServer(r.server) : openRdp(r.link))}
+              onDoubleClick={() => openServer(r.server)}
               onContextMenu={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -832,24 +795,20 @@ export const SessionTree = ({
               className={`h-[22px] pr-2 flex items-center gap-1.5 text-[12px] cursor-pointer ${
                 isSel ? "bg-primary/20 text-white" : isActive ? "bg-white/[0.06] text-white" : "text-zinc-300 hover:bg-white/[0.04]"
               } ${isCarried ? "opacity-50" : ""}`}
-              title={`${name}\n${host}${isServer ? (type ? ` · ${type.title}` : r.server.os ? ` · ${osName(r.server.os)}` : "") : " · Remote Desktop link"}`}
+              title={`${name}\n${host}${type ? ` · ${type.title}` : r.server.os ? ` · ${osName(r.server.os)}` : ""}`}
             >
-              {!isServer
-                ? <MonitorSmartphone size={13} className="shrink-0 text-sky-300" />
-                : type && r.server.protocol !== "telnet"
-                  ? <Monitor size={13} className={`shrink-0 ${r.server.protocol === "vnc" ? "text-violet-300" : "text-sky-300"}`} />
-                  : r.server.os && !type
-                    ? <OsBadge os={r.server.os} size={13} />
-                    : <TerminalSquare size={13} className="shrink-0 text-amber-300/90" />}
-              <span className={`truncate ${isServer ? "" : "text-sky-200"}`}>{name}</span>
-              {isServer && r.server.protocol === "telnet" && (
+              {type && r.server.protocol !== "telnet"
+                ? <Monitor size={13} className={`shrink-0 ${r.server.protocol === "vnc" ? "text-violet-300" : "text-sky-300"}`} />
+                : r.server.os && !type
+                  ? <OsBadge os={r.server.os} size={13} />
+                  : <TerminalSquare size={13} className="shrink-0 text-amber-300/90" />}
+              <span className="truncate">{name}</span>
+              {r.server.protocol === "telnet" && (
                 <span title="Not encrypted: what is typed, passwords too, crosses the network as plain text." className="shrink-0 text-amber-300">
                   <ShieldAlert size={11} aria-label="Not encrypted" />
                 </span>
               )}
-              {!isServer ? (
-                <span title="Remote Desktop link" className={`ml-auto ${BADGE} bg-sky-500/15 text-sky-300 border-sky-500/30`}>LINK</span>
-              ) : type && (
+              {type && (
                 <span title={type.title} className={`ml-auto ${BADGE} ${type.tone}`}>{type.label}</span>
               )}
               {status && (
@@ -909,12 +868,12 @@ export const SessionTree = ({
             newItems(null)
           ) : menu.row.kind === "folder" ? (() => {
             const f = menu.row;
-            const { list, links } = folderItems(f.id);
+            const { list } = folderItems(f.id);
             const many = itemCount(itemsFor(f)) > 1;
             return (
               <>
-                <button className={menuItem} onClick={run(() => openMany(list, links))} disabled={list.length + links.length === 0}>
-                  <Play size={13} className={menuIcon} /> Open all in this folder ({list.length + links.length})
+                <button className={menuItem} onClick={run(() => openMany(list))} disabled={list.length === 0}>
+                  <Play size={13} className={menuIcon} /> Open all in this folder ({list.length})
                 </button>
                 {wallServers(list).length > 0 && (
                   <button className={menuItem} onClick={run(() => openAsWall(list, f.name))}>
@@ -948,11 +907,11 @@ export const SessionTree = ({
           })() : (() => {
             const r = menu.row;
             const many = itemCount(itemsFor(r)) > 1;
-            const host = r.kind === "server" ? r.server.host : r.link.host;
+            const host = r.server.host;
             return (
               <>
-                <button className={menuItem} onClick={run(() => (pickedCount > 1 && selected.has(r.key) ? openSelected() : r.kind === "server" ? openServer(r.server) : openRdp(r.link)))}>
-                  <Play size={13} className={menuIcon} /> {pickedCount > 1 && selected.has(r.key) ? `Open ${pickedCount} selected` : r.kind === "server" ? "Open" : "Open in Remote Desktop"}
+                <button className={menuItem} onClick={run(() => (pickedCount > 1 && selected.has(r.key) ? openSelected() : openServer(r.server)))}>
+                  <Play size={13} className={menuIcon} /> {pickedCount > 1 && selected.has(r.key) ? `Open ${pickedCount} selected` : "Open"}
                 </button>
                 {pickedCount > 1 && selected.has(r.key) && pickedWall.length > 1 && (
                   <button className={menuItem} onClick={run(openSelectedAsWall)}>
@@ -960,7 +919,7 @@ export const SessionTree = ({
                   </button>
                 )}
                 {!many && (
-                  <button className={menuItem} onClick={run(() => (r.kind === "server" ? onEditServer(r.server) : setRdpDraft({ ...r.link })))}>
+                  <button className={menuItem} onClick={run(() => onEditServer(r.server))}>
                     <Pencil size={13} className={menuIcon} /> Edit…
                   </button>
                 )}
@@ -970,15 +929,14 @@ export const SessionTree = ({
                     onClick={run(async () => {
                       setError(null);
                       try {
-                        if (r.kind === "server") await onCloneServer(r.server.id);
-                        else await onSaveRdp({ ...r.link, id: null, name: `${r.link.name} (copy)` });
-                      } catch (e: any) { setError(`Couldn't duplicate “${r.kind === "server" ? r.server.name : r.link.name}”: ${errText(e)}`); }
+                        await onCloneServer(r.server.id);
+                      } catch (e: any) { setError(`Couldn't duplicate “${r.server.name}”: ${errText(e)}`); }
                     })}
                   >
                     <CopyPlus size={13} className={menuIcon} /> Duplicate
                   </button>
                 )}
-                {r.kind === "server" && (() => {
+                {(() => {
                   // Several selected: each server among them.
                   const list = pickedCount > 1 && selected.has(r.key) ? picked.list : [r.server];
                   return list.length > 0 && (
@@ -992,7 +950,7 @@ export const SessionTree = ({
                     <Copy size={13} className={menuIcon} /> Copy host name
                   </button>
                 )}
-                {aiOn && !many && r.kind === "server" && (r.server.protocol ?? "ssh") === "ssh" && (
+                {aiOn && !many && (r.server.protocol ?? "ssh") === "ssh" && (
                   <button className={menuItem} onClick={run(() => openAiTrust({ scope: "server", id: r.server.id, name: r.server.name }))}>
                     <Bot size={13} className={menuIcon} /> AI approval…
                   </button>
@@ -1020,11 +978,6 @@ export const SessionTree = ({
           onPick={(folderId) => { const it = moving; setMoving(null); move(it, folderId); }}
           onClose={() => setMoving(null)}
         />,
-        document.body,
-      )}
-
-      {rdpDraft && createPortal(
-        <RdpLinkModal link={rdpDraft} folders={folders} onSave={onSaveRdp} onClose={() => setRdpDraft(null)} />,
         document.body,
       )}
     </aside>

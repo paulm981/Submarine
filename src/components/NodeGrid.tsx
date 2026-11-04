@@ -1,17 +1,15 @@
-import { Activity, Play, Search, Plus, Server, Globe, Folder, FolderPlus, ChevronLeft, ChevronRight, Trash2, Edit2, Zap, Check, X, Copy, GripVertical, MonitorSmartphone, ShieldAlert, KeyRound } from "lucide-react";
+import { Activity, Play, Search, Plus, Server, Globe, Folder, FolderPlus, ChevronLeft, ChevronRight, Trash2, Edit2, Zap, Check, X, Copy, GripVertical, ShieldAlert, KeyRound } from "lucide-react";
 import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { useConfirm } from "../ui/confirm";
 import { FolderRow, childFolders, folderPath, indexFolders, subtreeCounts, subtreeIds } from "../util/folderPath";
-import RdpLinkModal, { RdpLink } from "./RdpLinkModal";
-import { IS_ANDROID } from "../util/platform";
 import { OsBadge } from "./OsBadge";
 import { HeldReview } from "./HeldReview";
 import { HeldDeletions } from "./HeldDeletions";
 import { pingServers } from "../ui/ping";
 import { jumpHostNote } from "../util/jumpHostNote";
 
-export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFolderIdProp, onActiveFolderChange, onOpenServer, onEditServer, onAddClick, onQuickConnect, onRemoveServer, onRemoveFolder, onRenameFolder, onCreateFolder, onCloneServer, onReorderServers, onOpenRdp, onSaveRdp, onRemoveRdp, onAllowHeld, onKeepSsh, onKeepAi, keyChange, onAcceptKey, shareGrant, onUnlockSharing, heldDeletions, onResolveDeletions, isMobile }: any) => {
+export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp, onActiveFolderChange, onOpenServer, onEditServer, onAddClick, onQuickConnect, onRemoveServer, onRemoveFolder, onRenameFolder, onCreateFolder, onCloneServer, onReorderServers, onAllowHeld, onKeepSsh, onKeepAi, keyChange, onAcceptKey, shareGrant, onUnlockSharing, heldDeletions, onResolveDeletions, isMobile }: any) => {
   const [search, setSearch] = useState("");
   // Changes someone else made in a shared profile that this device holds
   // back until its user allows them (see HeldReview).
@@ -93,12 +91,6 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
   const allFolders: FolderRow[] = folders || [];
   const folderIndex = useMemo(() => indexFolders(allFolders), [folders]);
   const serverCounts = useMemo(() => subtreeCounts(folderIndex, (servers || []).map((s: any) => s.folder_id)), [folderIndex, servers]);
-  // Remote Desktop links open a desktop client (rdp_links.rs), which Android has
-  // no counterpart for here: links that came with a profile stay hidden
-  // there rather than show and fail.
-  const shownRdp: RdpLink[] = IS_ANDROID ? [] : (rdpLinks || []);
-  const rdpCounts = useMemo(() => subtreeCounts(folderIndex, shownRdp.map((l) => l.folder_id)), [folderIndex, rdpLinks]);
-  const canRdp = !!onSaveRdp && !IS_ANDROID;
   // The open folder was deleted (here, or by a sync from another device):
   // back to the top level instead of an empty grid inside a folder that isn't
   // there. The list starts out empty, not unknown, so a folder still open
@@ -108,7 +100,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
   }, [folders, activeFolderId]);
   const crumbs = folderPath(folderIndex, activeFolderId);
   const parentFolderId = activeFolderId != null ? (folderIndex.parent.get(activeFolderId) ?? null) : null;
-  // A server or link whose folder is gone shows at the top level.
+  // A server whose folder is gone shows at the top level.
   const inFolder = (folderId: number | null | undefined) =>
     (folderId != null && folderIndex.byId.has(folderId) ? folderId : null) === activeFolderId;
 
@@ -120,20 +112,10 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
     ? filteredServers
     : filteredServers.filter((s: any) => inFolder(s.folder_id));
 
-  // Matched the way filteredServers matches servers.
-  const displayedRdp: RdpLink[] = shownRdp.filter((l: RdpLink) =>
-    isSearching
-      ? l.name.toLowerCase().includes(search.toLowerCase()) || l.host.includes(search)
-      : inFolder(l.folder_id),
-  );
   const displayedFolders = isSearching ? [] : childFolders(folderIndex, activeFolderId);
 
-  // Add / edit dialog for a Remote Desktop link; null while closed.
-  const [rdpDraft, setRdpDraft] = useState<RdpLink | null>(null);
   // A server card's right-click menu.
   const [cardMenu, setCardMenu] = useState<{ x: number; y: number; server: any } | null>(null);
-  const [rdpError, setRdpError] = useState<string | null>(null);
-  const newRdp = () => setRdpDraft({ name: "", host: "", port: 3389, username: "", folder_id: activeFolderId, notes: "" });
 
   // ── Modern floating drag-to-reorder (pointer-based: mouse AND touch) ────────
   // Grabbing the grip lifts the node out of the grid: a fixed-position clone
@@ -441,63 +423,12 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
     );
   };
 
-  // A Remote Desktop link: same card shape as a server, a sky accent and a
-  // monitor glyph. Click opens the system's Remote Desktop client.
-  const renderRdp = (l: RdpLink) => (
-    <div
-      key={`rdp-${l.id}`}
-      onClick={async () => {
-        setRdpError(null);
-        try { await onOpenRdp(l.id); }
-        catch (e: any) { setRdpError(`${l.name}: ${typeof e === "string" ? e : (e?.message || String(e))}`); }
-      }}
-      title={l.notes || `Remote Desktop link: opens ${l.name} in Remote Desktop`}
-      className="group relative flex items-center gap-3 h-16 pl-3.5 pr-2 rounded-xl bg-gradient-to-br from-sky-950/40 to-[#121216] border border-dashed border-sky-400/30 hover:border-sky-400/60 transition-colors duration-150 cursor-pointer overflow-hidden"
-    >
-      <span aria-hidden className="absolute left-0 top-0 bottom-0 w-[3px] bg-sky-400/70" />
-      <div className="w-9 h-9 rounded-lg bg-[#0078D4] flex items-center justify-center text-white shadow-inner shrink-0">
-        <MonitorSmartphone size={16} />
-      </div>
-      <div className="min-w-0 flex-1">
-        <h3 className="font-bold text-sky-100 text-[13px] truncate tracking-tight leading-tight">{l.name}</h3>
-        <div className="flex items-center gap-1 mt-0.5">
-          <span title="Remote Desktop link" className="shrink-0 px-1 rounded text-[8.5px] font-black tracking-wider bg-sky-500/15 text-sky-300 border border-sky-500/30">LINK</span>
-          <span className="text-[10.5px] text-zinc-300 font-mono truncate">
-            {l.username ? `${l.username} @ ` : ""}{l.host}{l.port && l.port !== 3389 ? `:${l.port}` : ""}
-          </span>
-        </div>
-      </div>
-      <div className="flex items-center gap-0.5 shrink-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 [@media(hover:none)]:!opacity-100 sm:absolute sm:right-1.5 sm:top-1/2 sm:-translate-y-1/2 sm:pl-8 sm:bg-gradient-to-l sm:from-[#121216] sm:via-[#121216] sm:to-transparent transition-all duration-200">
-        <button
-          onClick={(e) => { e.stopPropagation(); setRdpDraft({ ...l }); }}
-          title="Edit"
-          className="p-1.5 rounded-lg text-zinc-500 hover:text-white hover:bg-white/5 transition-all"
-        >
-          <Edit2 size={13} />
-        </button>
-        <button
-          onClick={async (e) => {
-            e.stopPropagation();
-            if (await confirm({ title: 'Delete Remote Desktop link?', message: `“${l.name}” will be removed from this profile.`, destructive: true })) {
-              onRemoveRdp(l.id);
-            }
-          }}
-          title="Delete"
-          className="p-1.5 rounded-lg text-zinc-500 hover:text-red-500 hover:bg-white/5 transition-all"
-        >
-          <Trash2 size={13} />
-        </button>
-      </div>
-    </div>
-  );
-
   // Folders share the compact horizontal language so the grid reads as one
   // surface: a tinted folder glyph, name + server count, inline rename in
   // place, and the same hover lift as server cards.
   const FolderCard = ({ f }: { f: any }) => {
     // Everything inside, at any depth, so a folder of folders isn't "0".
     const serverCount = serverCounts.get(f.id) ?? 0;
-    const rdpCount = rdpCounts.get(f.id) ?? 0;
     const subfolderCount = childFolders(folderIndex, f.id).length;
     const isRenaming = renaming?.id === f.id;
     const accent = f.color || 'rgb(var(--primary))';
@@ -533,13 +464,9 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
           ) : (
             <>
               <h3 className="font-bold text-zinc-100 text-[13px] truncate tracking-tight leading-tight">{f.name}</h3>
-              <span
-                className="text-[10px] text-zinc-500 font-bold uppercase tracking-[0.12em]"
-                title={rdpCount > 0 ? `${rdpCount === 1 ? "1 Remote Desktop link" : `${rdpCount} Remote Desktop links`}, besides the servers` : undefined}
-              >
+              <span className="text-[10px] text-zinc-500 font-bold uppercase tracking-[0.12em]">
                 {subfolderCount > 0 && (subfolderCount === 1 ? '1 folder · ' : `${subfolderCount} folders · `)}
                 {serverCount === 1 ? '1 server' : `${serverCount} servers`}
-                {rdpCount > 0 && (rdpCount === 1 ? ' · 1 link' : ` · ${rdpCount} links`)}
               </span>
             </>
           )}
@@ -565,7 +492,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
           </div>
         ) : (
           <div className="relative flex items-center shrink-0">
-            <span className="text-[10px] bg-black/60 text-zinc-400 px-1.5 py-0.5 rounded-md font-mono group-hover:opacity-0 transition-opacity">{serverCount + rdpCount}</span>
+            <span className="text-[10px] bg-black/60 text-zinc-400 px-1.5 py-0.5 rounded-md font-mono group-hover:opacity-0 transition-opacity">{serverCount}</span>
             <div className="absolute right-0 flex items-center gap-0.5 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 [@media(hover:none)]:!opacity-100 transition-all bg-gradient-to-l from-[#16161b] via-[#16161b] to-transparent pl-6">
               <button
                 onClick={(e) => { e.stopPropagation(); setRenaming({ id: f.id, draft: f.name || "" }); }}
@@ -581,7 +508,7 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
                   const inside = new Set(subtreeIds(folderIndex, f.id));
                   const gone = new Set<number>((servers || []).filter((x: any) => x.folder_id != null && inside.has(x.folder_id)).map((x: any) => x.id));
                   const note = jumpHostNote(servers, gone);
-                  if (await confirm({ title: 'Delete folder?', message: `“${f.name}” and every folder, server and Remote Desktop link inside it will be removed.${note}`, destructive: true })) {
+                  if (await confirm({ title: 'Delete folder?', message: `“${f.name}” and every folder and server inside it will be removed.${note}`, destructive: true })) {
                     onRemoveFolder(f.id);
                   }
                 }}
@@ -726,18 +653,10 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
             >
               <Plus size={13} /> Add server
             </button>
-            {canRdp && (
-              <button
-                onClick={newRdp}
-                className="h-8 px-3 bg-sky-500/10 text-sky-300 border border-sky-500/25 hover:bg-sky-500/20 rounded-lg flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider shrink-0"
-              >
-                <MonitorSmartphone size={13} /> Add Remote Desktop link
-              </button>
-            )}
           </div>
         )}
 
-        {servers?.length === 0 && folders?.length === 0 && shownRdp.length === 0 ? (
+        {servers?.length === 0 && folders?.length === 0 ? (
           <div className="h-full flex items-center justify-center">
             <button
               onClick={onAddClick}
@@ -779,14 +698,6 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
                     className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg bg-amber-500/10 border border-amber-500/25 text-amber-300/90 text-[11px] font-bold uppercase tracking-wider hover:bg-amber-500/20 hover:text-amber-200 transition-colors"
                   >
                     <Zap size={13} /> Quick connect
-                  </button>
-                )}
-                {canRdp && (
-                  <button
-                    onClick={newRdp}
-                    className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg bg-sky-500/10 border border-sky-500/25 text-sky-300 text-[11px] font-bold uppercase tracking-wider hover:bg-sky-500/20 transition-colors"
-                  >
-                    <MonitorSmartphone size={13} /> Add Remote Desktop link
                   </button>
                 )}
               </div>
@@ -844,18 +755,15 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
             {/* Render Servers — honours the live drag order while reordering. */}
             {orderedServers.map((s: any) => renderServer(s))}
 
-            {/* Remote Desktop links, after the servers. Not draggable: no data-sid. */}
-            {displayedRdp.map((l) => renderRdp(l))}
-
             {/* Empty Folder State */}
-            {!isSearching && activeFolderId !== null && newFolder === null && displayedServers.length === 0 && displayedFolders.length === 0 && displayedRdp.length === 0 && (
+            {!isSearching && activeFolderId !== null && newFolder === null && displayedServers.length === 0 && displayedFolders.length === 0 && (
               <div className="col-span-full py-10 text-center text-zinc-600 text-xs italic">
                 Nothing in this folder yet.
               </div>
             )}
 
             {/* Empty Search State */}
-            {isSearching && displayedServers.length === 0 && displayedRdp.length === 0 && (
+            {isSearching && displayedServers.length === 0 && (
               <div className="col-span-full py-10 text-center text-zinc-600 text-xs italic">
                 No matches.
               </div>
@@ -865,18 +773,6 @@ export const NodeGrid = ({ servers, folders, rdpLinks, activeFolderId: activeFol
           </>
         )}
       </div>
-
-      {rdpError && (
-        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-40 max-w-md px-3 py-2 bg-rose-500/15 border border-rose-500/30 rounded-lg text-rose-200 text-[11.5px] flex items-center gap-2">
-          <span className="flex-1">{rdpError}</span>
-          <button onClick={() => setRdpError(null)} className="text-rose-200/70 hover:text-white"><X size={13} /></button>
-        </div>
-      )}
-
-      {rdpDraft && createPortal(
-        <RdpLinkModal link={rdpDraft} folders={allFolders} onSave={onSaveRdp} onClose={() => setRdpDraft(null)} />,
-        document.body
-      )}
 
       {/* A server card's menu. The layer under it takes the click that
           closes it, so that click doesn't also open the card beneath. */}

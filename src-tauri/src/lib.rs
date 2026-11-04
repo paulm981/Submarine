@@ -1263,6 +1263,9 @@ fn apply_remote_records(conn: &Connection, key: &[u8; 32], records: &[SyncRecord
     // Folder moves made on two devices can merge into a loop; undone here, as
     // this device's edit, which the next push carries back (tree_moves.rs).
     tree_moves::break_folder_loops(conn).map_err(|e| format!("[SYNC] FOLDER_LOOP: {e}"))?;
+    // A Remote Desktop link from a device on an older version becomes an RDP
+    // server here, as this device's own did (rdp_links.rs).
+    rdp_links::move_into_servers(conn)?;
     Ok(skipped)
 }
 
@@ -1552,14 +1555,6 @@ fn merge_batch(tx: &Connection, key: &[u8; 32], records: &[&SyncRecord], mut ski
         approvals::hold_changes(tx, table, uuid, before.as_ref())?;
     }
     jump_gone::note_lost(tx, &jumps_before).map_err(|e| format!("[SYNC] JUMP_GONE: {e}"))?;
-    // A Remote Desktop link's folder has no foreign key (rdp_links.rs), so a folder
-    // this batch deleted can leave a link pointing at nothing: one this device
-    // made in it since it last synced. It goes to the top level, not nowhere.
-    tx.execute(
-        "UPDATE rdp_links SET folder_id = NULL WHERE folder_id IS NOT NULL AND folder_id NOT IN (SELECT id FROM folders)",
-        [],
-    )
-    .map_err(|e| format!("[SYNC] RDP_FOLDER_FIXUP: {e}"))?;
     // Everything in place: hold each server whose AI policy the merge
     // loosened, until this device's user allows it.
     if let Some(before) = ai_before {
@@ -4231,6 +4226,7 @@ fn resolve_held(conn: &Connection, key: &[u8; 32], hlc: &hlc::Hlc, delete_them: 
     let done = done?;
     if delete_them {
         tree_moves::break_folder_loops(conn).map_err(|e| format!("[SYNC] FOLDER_LOOP: {e}"))?;
+        rdp_links::move_into_servers(conn)?;
     }
     Ok(done)
 }
@@ -8481,6 +8477,10 @@ async fn setup_master_db_with(
     // this device's OK (see approvals.rs).
     approvals::create_schema(&conn)?;
     create_share_pins(&conn)?;
+    // Remote Desktop links are RDP servers now (issue #42, rdp_links.rs).
+    if rdp_links::move_into_servers(&conn)? > 0 {
+        needs_resave = true;
+    }
 
     // Per-profile sync metadata (the DEK, and later the identity/grant state).
     // Created here so an existing vault gains it on first open under a v6 build.
@@ -21737,7 +21737,6 @@ fn diagnostic_names(db_state: &DbState) -> Option<Vec<(String, &'static str)>> {
         }
     };
     add("SELECT name, host, username, proxy_host FROM servers", &["server", "host", "user", "host"]);
-    add("SELECT name, host, username FROM rdp_links", &["server", "host", "user"]);
     add("SELECT name FROM folders", &["folder"]);
     add("SELECT name, username FROM credentials", &["login", "user"]);
     add("SELECT name FROM ssh_keys", &["key"]);
@@ -30606,7 +30605,7 @@ pub fn run() {
             add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, allow_held, keep_server_ssh, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_terminal_theme, set_server_highlight, set_server_jump_host, set_server_protocol, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
             get_credentials, generate_ssh_key,
             add_folder, rename_folder, delete_folder, get_folders,
-            tree_moves::move_servers, tree_moves::move_rdp_links, tree_moves::move_folder, tree_moves::delete_tree_items,
+            tree_moves::move_servers, tree_moves::move_folder, tree_moves::delete_tree_items,
             add_command, edit_command, set_command_scope, delete_command, get_commands,
             cmd_history_add, cmd_history_list, cmd_history_clear,
             add_note, edit_note, delete_note, get_notes,
@@ -30669,7 +30668,6 @@ pub fn run() {
             about::app_info, about::check_for_updates, about::open_external_url,
             portable::get_storage_info,
             local_open::live_edit_editor_get, local_open::live_edit_editor_pick, local_open::live_edit_editor_reset,
-            rdp_links::rdp_list, rdp_links::rdp_save, rdp_links::rdp_delete, rdp_links::rdp_open,
             multiexec::wall_list, multiexec::wall_save, multiexec::wall_delete,
             multiexec::get_jump_login_limit, multiexec::set_jump_login_limit,
             server_os::detect_server_os,

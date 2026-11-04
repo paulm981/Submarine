@@ -1,24 +1,24 @@
-//! Remote Desktop links: saved RDP targets that open the system's own Remote
-//! Desktop client. Submarine stores the target, never draws the desktop.
+//! Remote Desktop links, the fork's own before RDP servers came in from the
+//! original project (issue #42): a saved RDP target that opened the system's
+//! Remote Desktop app. Each one is now an RDP server set to open in that app
+//! (`app: "system"`, the RDP options' default), so this module only moves
+//! them over.
 //!
-//! - Windows: `mstsc.exe` from System32 (by full path). With no user name it
-//!   gets `/v:host:port`, so the user's own Default.rdp settings apply. With
-//!   one, it gets a short-lived `.rdp` file: Default.rdp's settings plus the
-//!   address and user name.
-//! - Elsewhere the `.rdp` file goes to the default app for `.rdp` (Microsoft's
-//!   Windows App on macOS, Remmina on many Linux desktops).
+//! The `rdp_links` table stays, and still syncs (lib.rs `ENTITIES`): a device
+//! on an older version may still have links, or add one. Whatever comes in is
+//! moved over here too, after the merge, and its deletion goes back out, so
+//! that device gets the RDP server in its place.
 //!
-//! Passwords are never stored here. Remote Desktop's own "Remember me" keeps
-//! them in Windows Credential Manager.
+//! Every device that moves a link gives its server the same id, derived from
+//! the link's (`server_uuid`), so two devices moving the same link make one
+//! server, not two. A link whose server is already here, or was deleted here,
+//! is only removed: an older device's later edit to the link doesn't change a
+//! server someone has since edited (in a shared profile, a new address that
+//! way would skip the question a moved server asks: approvals.rs).
 //!
-//! Links live in the vault's `rdp_links` table and sync like servers do
-//! (lib.rs `ENTITIES`). Its folder_id has no foreign key, unlike servers':
-//! a sync can delete a folder holding a link that only this device has yet,
-//! and that must not fail; the merge moves such links to the top level
-//! (`apply_remote_inner`). delete_folder removes the links itself.
+//! Links never kept a password, so neither does the server.
 
-use crate::DbState;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 pub(crate) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS rdp_links (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,307 +30,217 @@ pub(crate) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS rdp_links (
     notes TEXT NOT NULL DEFAULT ''
 )";
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
-pub(crate) struct RdpLink {
-    #[serde(default)]
-    pub id: Option<i64>,
-    pub name: String,
-    pub host: String,
-    #[serde(default = "default_port")]
-    pub port: u16,
-    #[serde(default)]
-    pub username: String,
-    #[serde(default)]
-    pub folder_id: Option<i64>,
-    #[serde(default)]
-    pub notes: String,
+/// The id of the RDP server a link becomes: the same on every device.
+fn server_uuid(link_uuid: &str) -> Option<String> {
+    crate::derived_entity_uuid("rdp_link_server", &[Some(link_uuid.to_string())])
 }
 
-fn default_port() -> u16 {
-    3389
+struct Link {
+    id: i64,
+    uuid: Option<String>,
+    name: String,
+    host: String,
+    port: i64,
+    username: String,
+    folder_id: Option<i64>,
+    notes: String,
 }
 
-/// A host name, IPv4 or IPv6 address: letters, digits and `.-_:`, optionally
-/// in brackets. Nothing that could end a `.rdp` line or start an mstsc option.
-fn valid_host(host: &str) -> bool {
-    let h = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
-    !h.is_empty()
-        && h.len() <= 253
-        && !h.starts_with(['-', '/'])
-        && h.chars().all(|c| c.is_ascii_alphanumeric() || ".-_:".contains(c))
-}
-
-/// `DOMAIN\user`, `user@domain` or a plain name; no control characters, so
-/// nothing can add a line to the `.rdp` file.
-fn valid_username(user: &str) -> bool {
-    user.len() <= 256 && !user.chars().any(|c| c.is_control())
-}
-
-pub(crate) fn validate(link: &RdpLink) -> Result<(), String> {
-    if link.name.trim().is_empty() {
-        return Err("Give the link a name.".into());
+/// Move every link into an RDP server, in one transaction. Runs outside a
+/// merge (the merge flag off), so the new servers and the links' deletions
+/// are stamped as this device's edits and go out at the next sync. Returns
+/// how many links there were.
+pub(crate) fn move_into_servers(conn: &Connection) -> Result<usize, String> {
+    let db = |e: rusqlite::Error| format!("[DATABASE] RDP_LINK_MOVE: {e}");
+    let has_links: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='rdp_links')", [], |r| r.get(0))
+        .map_err(db)?;
+    if !has_links {
+        return Ok(0);
     }
-    if !valid_host(link.host.trim()) {
-        return Err("The host should be a computer name or an IP address.".into());
+    let links: Vec<Link> = {
+        let mut stmt = conn
+            .prepare("SELECT id, uuid, name, host, port, username, folder_id, notes FROM rdp_links ORDER BY id")
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(Link {
+                    id: r.get(0)?,
+                    uuid: r.get(1)?,
+                    name: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    host: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    port: r.get::<_, Option<i64>>(4)?.unwrap_or(3389),
+                    username: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    folder_id: r.get(6)?,
+                    notes: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                })
+            })
+            .map_err(db)?;
+        rows.collect::<Result<_, _>>().map_err(db)?
+    };
+    if links.is_empty() {
+        return Ok(0);
     }
-    if link.port == 0 {
-        return Err("The port should be between 1 and 65535.".into());
-    }
-    if !valid_username(&link.username) {
-        return Err("The user name can't contain line breaks or control characters.".into());
-    }
-    Ok(())
-}
-
-/// `host:port`, bracketing a bare IPv6 address.
-fn address(host: &str, port: u16) -> String {
-    let host = host.trim();
-    let bracketed = if host.contains(':') && !host.starts_with('[') { format!("[{}]", host) } else { host.to_string() };
-    if port == 3389 { bracketed } else { format!("{}:{}", bracketed, port) }
-}
-
-pub(crate) fn list(conn: &Connection) -> rusqlite::Result<Vec<RdpLink>> {
-    let mut stmt = conn.prepare("SELECT id, name, host, port, username, folder_id, notes FROM rdp_links ORDER BY lower(name), id")?;
-    let rows = stmt.query_map([], |r| {
-        Ok(RdpLink {
-            id: Some(r.get(0)?),
-            name: r.get(1)?,
-            host: r.get(2)?,
-            port: r.get::<_, i64>(3)?.clamp(1, 65535) as u16,
-            username: r.get(4)?,
-            folder_id: r.get(5)?,
-            notes: r.get(6)?,
-        })
-    })?;
-    rows.collect()
-}
-
-pub(crate) fn save(conn: &Connection, link: &RdpLink) -> Result<i64, String> {
-    validate(link)?;
-    let db = |e: rusqlite::Error| format!("[DATABASE] RDP_SAVE_FAILED: {}", e);
-    let (name, host, user) = (link.name.trim(), link.host.trim(), link.username.trim());
-    match link.id {
-        Some(id) => {
-            conn.execute(
-                "UPDATE rdp_links SET name=?1, host=?2, port=?3, username=?4, folder_id=?5, notes=?6 WHERE id=?7",
-                params![name, host, link.port, user, link.folder_id, link.notes, id],
+    let tx = conn.unchecked_transaction().map_err(db)?;
+    for link in &links {
+        let uuid = link.uuid.as_deref().and_then(server_uuid);
+        let known = match &uuid {
+            Some(u) => tx
+                .query_row(
+                    "SELECT 1 FROM servers WHERE uuid = ?1 UNION ALL SELECT 1 FROM sync_tombstones WHERE uuid = ?1 LIMIT 1",
+                    [u],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(db)?
+                .is_some(),
+            None => false,
+        };
+        if !known {
+            // Its folder may have gone (a link's folder has no foreign key).
+            let folder_id: Option<i64> = match link.folder_id {
+                Some(f) => tx.query_row("SELECT id FROM folders WHERE id = ?1", [f], |r| r.get(0)).optional().map_err(db)?,
+                None => None,
+            };
+            let position: i64 = tx
+                .query_row("SELECT COALESCE(MAX(position) + 1, 0) FROM servers WHERE folder_id IS ?1", [folder_id], |r| r.get(0))
+                .map_err(db)?;
+            let port = link.port.clamp(1, 65535);
+            tx.execute(
+                "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port,
+                                      tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, position, protocol)
+                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, 'none', '', 1080, '[]', 'custom_pass', NULL, 0, '[]', NULL, ?6, '', ?7, 'rdp')",
+                params![link.name.trim(), link.host.trim(), port, link.username.trim(), folder_id, link.notes, position],
             )
             .map_err(db)?;
-            Ok(id)
+            // The insert trigger gave it a random id and this device's stamp;
+            // the derived id is what makes two devices' moves one server.
+            if let Some(u) = &uuid {
+                tx.execute("UPDATE servers SET uuid = ?1 WHERE id = ?2", params![u, tx.last_insert_rowid()]).map_err(db)?;
+            }
         }
-        None => {
-            conn.execute(
-                "INSERT INTO rdp_links (name, host, port, username, folder_id, notes) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![name, host, link.port, user, link.folder_id, link.notes],
-            )
-            .map_err(db)?;
-            Ok(conn.last_insert_rowid())
-        }
+        tx.execute("DELETE FROM rdp_links WHERE id = ?1", [link.id]).map_err(db)?;
     }
-}
-
-/// The `.rdp` file for a link: the user's Default.rdp settings (if any) with
-/// the address and user name replaced. Lines that name another computer or
-/// carry a saved password are dropped, not copied to this one; the rest
-/// (screen, redirections, an RD Gateway) are the user's preferences.
-fn rdp_file(link: &RdpLink, defaults: Option<&str>) -> String {
-    const OWN: &[&str] = &["full address:", "alternate full address:", "server port:", "username:", "password 51:"];
-    let mut out = String::new();
-    for line in defaults.unwrap_or("").lines() {
-        let l = line.trim_end_matches('\r');
-        let lower = l.to_ascii_lowercase();
-        if l.trim().is_empty() || OWN.iter().any(|k| lower.starts_with(k)) {
-            continue;
-        }
-        out.push_str(l);
-        out.push_str("\r\n");
-    }
-    out.push_str(&format!("full address:s:{}\r\n", address(&link.host, link.port)));
-    let user = link.username.trim();
-    if !user.is_empty() {
-        out.push_str(&format!("username:s:{}\r\n", user));
-    }
-    out
-}
-
-/// Default.rdp is UTF-16 LE with a byte-order mark, as mstsc writes it; read
-/// UTF-8 too.
-#[cfg(any(windows, test))]
-fn decode_rdp(bytes: &[u8]) -> Option<String> {
-    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        return String::from_utf16(&crate::local_open::utf16le_units(rest)).ok();
-    }
-    String::from_utf8(bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes).to_vec()).ok()
-}
-
-fn encode_rdp(text: &str) -> Vec<u8> {
-    let mut out = vec![0xFF, 0xFE];
-    for unit in text.encode_utf16() {
-        out.extend_from_slice(&unit.to_le_bytes());
-    }
-    out
-}
-
-#[tauri::command]
-pub async fn rdp_list(state: tauri::State<'_, DbState>) -> Result<Vec<RdpLink>, String> {
-    let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
-    let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-    list(conn).map_err(|e| format!("[DATABASE] RDP_LIST_FAILED: {}", e))
-}
-
-#[tauri::command]
-pub async fn rdp_save(state: tauri::State<'_, DbState>, link: RdpLink) -> Result<i64, String> {
-    let id = {
-        let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
-        let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-        save(conn, &link)?
-    };
-    crate::save_vault_internal(&state)?;
-    Ok(id)
-}
-
-#[tauri::command]
-pub async fn rdp_delete(state: tauri::State<'_, DbState>, id: i64) -> Result<(), String> {
-    {
-        let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
-        let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-        conn.execute("DELETE FROM rdp_links WHERE id=?1", params![id])
-            .map_err(|e| format!("[DATABASE] RDP_DELETE_FAILED: {}", e))?;
-    }
-    crate::save_vault_internal(&state)?;
-    Ok(())
-}
-
-/// Open a link in the system's Remote Desktop client.
-#[tauri::command]
-pub async fn rdp_open(state: tauri::State<'_, DbState>, id: i64) -> Result<(), String> {
-    let link = {
-        let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
-        let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-        list(conn)
-            .map_err(|e| format!("[DATABASE] RDP_LIST_FAILED: {}", e))?
-            .into_iter()
-            .find(|l| l.id == Some(id))
-            .ok_or("That Remote Desktop link no longer exists.")?
-    };
-    // Checked again here: the row may predate a rule, or come from an import.
-    validate(&link)?;
-    launch(&link)
-}
-
-#[cfg(target_os = "android")]
-fn launch(_link: &RdpLink) -> Result<(), String> {
-    Err("Remote Desktop links open a desktop Remote Desktop client, which Android doesn't have here.".into())
-}
-
-#[cfg(not(target_os = "android"))]
-fn launch(link: &RdpLink) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        let mstsc = crate::local_open::system32().join("mstsc.exe");
-        if link.username.trim().is_empty() {
-            std::process::Command::new(&mstsc)
-                .arg(format!("/v:{}", address(&link.host, link.port)))
-                .spawn()
-                .map_err(|e| format!("Couldn't start Remote Desktop: {}", e))?;
-            return Ok(());
-        }
-        let defaults = directories::UserDirs::new()
-            .and_then(|d| d.document_dir().map(|p| p.join("Default.rdp")))
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|b| decode_rdp(&b));
-        let file = write_temp_rdp(link, defaults.as_deref())?;
-        std::process::Command::new(&mstsc)
-            .arg(&file)
-            .spawn()
-            .map_err(|e| format!("Couldn't start Remote Desktop: {}", e))?;
-        remove_later(file);
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        let file = write_temp_rdp(link, None)?;
-        crate::child_env::open(&file).map_err(|e| format!("Couldn't open a Remote Desktop app: {}", e))?;
-        remove_later(file);
-        Ok(())
-    }
-}
-
-#[cfg(not(target_os = "android"))]
-fn write_temp_rdp(link: &RdpLink, defaults: Option<&str>) -> Result<std::path::PathBuf, String> {
-    use rand::Rng;
-    let dir = crate::app_temp_root().join("rdp");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Couldn't write the connection file: {}", e))?;
-    let mut tag = [0u8; 8];
-    rand::rng().fill_bytes(&mut tag);
-    let file = dir.join(format!("{}.rdp", hex::encode(tag)));
-    std::fs::write(&file, encode_rdp(&rdp_file(link, defaults)))
-        .map_err(|e| format!("Couldn't write the connection file: {}", e))?;
-    Ok(file)
-}
-
-/// The client reads the file as it starts; it isn't needed after that.
-#[cfg(not(target_os = "android"))]
-fn remove_later(file: std::path::PathBuf) {
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(60));
-        let _ = std::fs::remove_file(file);
-    });
+    tx.commit().map_err(db)?;
+    Ok(links.len())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync_engine_tests::device;
 
-    fn link(host: &str, port: u16, user: &str) -> RdpLink {
-        RdpLink { id: None, name: "box".into(), host: host.into(), port, username: user.into(), folder_id: None, notes: String::new() }
+    const KEY: [u8; 32] = [7u8; 32];
+
+    type Row = (String, String, i64, String, Option<String>, Option<i64>);
+
+    fn servers(c: &Connection) -> Vec<Row> {
+        let mut stmt = c.prepare("SELECT name, host, port, username, protocol, folder_id FROM servers ORDER BY name").unwrap();
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).unwrap();
+        rows.map(Result::unwrap).collect()
     }
 
+    fn count(c: &Connection, sql: &str) -> i64 {
+        c.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    fn sync(from: &Connection, to: &Connection, hlc: &crate::hlc::Hlc) {
+        crate::apply_remote_records(to, &KEY, &crate::collect_local_records(from, &KEY, "").unwrap(), hlc).unwrap();
+    }
+
+    // A link becomes an RDP server with its name, address, user name, notes
+    // and folder, and no password; the link is gone, with a deletion to sync.
     #[test]
-    fn hosts_and_users_that_could_inject_are_refused() {
-        for bad in ["", "-admin", "/edit", "a b", "host\r\nalternate shell:s:cmd", "x;y", "h\"q"] {
-            assert!(validate(&link(bad, 3389, "")).is_err(), "{bad:?}");
+    fn a_link_becomes_an_rdp_server_in_its_folder() {
+        let (a, _ha) = device("A");
+        a.execute_batch(
+            "INSERT INTO folders(name) VALUES('Office');
+             INSERT INTO rdp_links(name, host, port, username, folder_id, notes)
+               VALUES('desk', 'desk.example', 3390, 'CORP\\me', (SELECT id FROM folders WHERE name='Office'), 'by the window'),
+                     ('lab', 'lab.example', 3389, '', 99, '');",
+        )
+        .unwrap();
+        assert_eq!(move_into_servers(&a).unwrap(), 2);
+        let office: i64 = a.query_row("SELECT id FROM folders WHERE name='Office'", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            servers(&a),
+            vec![
+                ("desk".into(), "desk.example".into(), 3390, "CORP\\me".into(), Some("rdp".into()), Some(office)),
+                ("lab".into(), "lab.example".into(), 3389, "".into(), Some("rdp".into()), None),
+            ]
+        );
+        assert_eq!(count(&a, "SELECT COUNT(*) FROM servers WHERE password IS NOT NULL OR credential_id IS NOT NULL"), 0);
+        let notes: String = a.query_row("SELECT notes FROM servers WHERE name='desk'", [], |r| r.get(0)).unwrap();
+        assert_eq!(notes, "by the window");
+        assert_eq!(count(&a, "SELECT COUNT(*) FROM rdp_links"), 0);
+        assert_eq!(count(&a, "SELECT COUNT(*) FROM sync_tombstones WHERE entity_type='rdp_links'"), 2);
+        // Nothing left: nothing to do.
+        assert_eq!(move_into_servers(&a).unwrap(), 0);
+    }
+
+    // Two devices that each move the same synced link make one server.
+    #[test]
+    fn two_devices_moving_the_same_link_make_one_server() {
+        let (a, ha) = device("A");
+        a.execute("INSERT INTO rdp_links(name, host) VALUES('desk', 'desk.example')", []).unwrap();
+        let (b, hb) = device("B");
+        // B moves it once the link has come in (after the merge); A its own.
+        sync(&a, &b, &hb);
+        assert_eq!(count(&b, "SELECT COUNT(*) FROM servers"), 1);
+        move_into_servers(&a).unwrap();
+        let uuid = |c: &Connection| -> String { c.query_row("SELECT uuid FROM servers", [], |r| r.get(0)).unwrap() };
+        assert_eq!(uuid(&a), uuid(&b));
+        sync(&b, &a, &ha);
+        sync(&a, &b, &hb);
+        for c in [&a, &b] {
+            assert_eq!(count(c, "SELECT COUNT(*) FROM servers"), 1);
+            assert_eq!(count(c, "SELECT COUNT(*) FROM rdp_links"), 0);
         }
-        assert!(validate(&link("pc1", 3389, "u\r\nalternate shell:s:cmd")).is_err());
-        for good in ["pc1", "pc1.corp.example", "10.0.0.5", "fe80::1", "[fe80::1]", "srv_01"] {
-            assert!(validate(&link(good, 3389, r"CORP\me")).is_ok(), "{good}");
-        }
-        assert!(validate(&link("pc1", 0, "")).is_err());
     }
 
+    // A device on an older version gets the server and the link's deletion.
+    // An older device's edit to a link already moved doesn't change the
+    // server, nor bring the link back.
     #[test]
-    fn addresses_carry_the_port_only_when_it_isnt_3389() {
-        assert_eq!(address("pc1", 3389), "pc1");
-        assert_eq!(address("pc1", 3390), "pc1:3390");
-        assert_eq!(address("fe80::1", 3390), "[fe80::1]:3390");
-        assert_eq!(address("[fe80::1]", 3389), "[fe80::1]");
+    fn an_older_devices_link_edit_leaves_the_server_as_it_is() {
+        let (old, ho) = device("O");
+        old.execute("INSERT INTO rdp_links(name, host) VALUES('desk', 'desk.example')", []).unwrap();
+        let (new, hn) = device("N");
+        sync(&old, &new, &hn);
+        // The older device takes what comes back by the merge alone, moving
+        // nothing, as an older version does.
+        let back = crate::collect_local_records(&new, &KEY, "").unwrap();
+        crate::with_merge_flag(&old, |c| crate::apply_remote_inner(c, &KEY, &back, &ho, usize::MAX)).unwrap();
+        assert_eq!(count(&old, "SELECT COUNT(*) FROM rdp_links"), 0, "the link's deletion reached it");
+        assert_eq!(count(&old, "SELECT COUNT(*) FROM servers WHERE protocol='rdp'"), 1, "and the server");
+
+        let (old2, _h2) = device("P");
+        old2.execute("INSERT INTO rdp_links(name, host) VALUES('desk', 'desk.example')", []).unwrap();
+        let (new2, hn2) = device("M");
+        sync(&old2, &new2, &hn2);
+        // Its stamp has to sort after the deletion's to come back at all.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        old2.execute("UPDATE rdp_links SET host='elsewhere.example'", []).unwrap();
+        sync(&old2, &new2, &hn2);
+        let host: String = new2.query_row("SELECT host FROM servers", [], |r| r.get(0)).unwrap();
+        assert_eq!(host, "desk.example", "the server isn't moved by a link");
+        assert_eq!(count(&new2, "SELECT COUNT(*) FROM servers"), 1);
+        assert_eq!(count(&new2, "SELECT COUNT(*) FROM rdp_links"), 0);
     }
 
+    // A server deleted here isn't brought back by its link.
     #[test]
-    fn the_file_keeps_default_settings_but_not_another_computers() {
-        let defaults = "screen mode id:i:2\r\nfull address:s:old-pc\r\nusername:s:someone\r\npassword 51:b:01000000D08C\r\nredirectclipboard:i:1\r\n";
-        let f = rdp_file(&link("pc1", 3390, r"CORP\me"), Some(defaults));
-        assert_eq!(f, "screen mode id:i:2\r\nredirectclipboard:i:1\r\nfull address:s:pc1:3390\r\nusername:s:CORP\\me\r\n");
-        assert_eq!(rdp_file(&link("pc1", 3389, ""), None), "full address:s:pc1\r\n");
-    }
-
-    #[test]
-    fn rdp_files_round_trip_as_utf16() {
-        let text = "full address:s:pc1\r\nusername:s:Jürgen\r\n";
-        assert_eq!(decode_rdp(&encode_rdp(text)).as_deref(), Some(text));
-        assert_eq!(decode_rdp(b"\xEF\xBB\xBFscreen mode id:i:1").as_deref(), Some("screen mode id:i:1"));
-    }
-
-    #[test]
-    fn links_save_and_list() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        let mut l = link("pc1", 3389, "me");
-        let id = save(&conn, &l).unwrap();
-        l.id = Some(id);
-        l.name = "renamed".into();
-        save(&conn, &l).unwrap();
-        assert_eq!(list(&conn).unwrap(), vec![l]);
-        assert!(save(&conn, &link("bad host", 3389, "")).is_err());
+    fn a_deleted_server_stays_deleted() {
+        let (old, _ho) = device("O");
+        old.execute("INSERT INTO rdp_links(name, host) VALUES('desk', 'desk.example')", []).unwrap();
+        let (new, hn) = device("N");
+        let recs = crate::collect_local_records(&old, &KEY, "").unwrap();
+        crate::apply_remote_records(&new, &KEY, &recs, &hn).unwrap();
+        new.execute("DELETE FROM servers", []).unwrap();
+        // The same link again, as an older device that synced late sends it.
+        new.execute("DELETE FROM sync_tombstones WHERE entity_type='rdp_links'", []).unwrap();
+        crate::apply_remote_records(&new, &KEY, &recs, &hn).unwrap();
+        assert_eq!(count(&new, "SELECT COUNT(*) FROM servers"), 0);
+        assert_eq!(count(&new, "SELECT COUNT(*) FROM rdp_links"), 0);
     }
 }

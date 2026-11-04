@@ -27,7 +27,7 @@ The tour with more pictures is in [FORK.md](FORK.md), along with where the fork 
     </td>
     <td width="50%" valign="top" align="center">
       <a href="FORK.md#organize-them"><img src="docs/screenshots/fork/highlighting-and-tree.png" alt="The session tree beside a terminal with highlighted log output" /></a>
-      <br/><sub><b>Session tree and highlighting</b>: folders, servers and Remote Desktop links; errors, warnings and addresses colored</sub>
+      <br/><sub><b>Session tree and highlighting</b>: folders and servers; errors, warnings and addresses colored</sub>
     </td>
   </tr>
   <tr>
@@ -53,9 +53,8 @@ The tour with more pictures is in [FORK.md](FORK.md), along with where the fork 
 - **Split**: a second shell on the same server beside the first, to watch a log in one and work in the other.
 
 **Organize them**
-- **A session tree** beside the terminal, with search: folders, servers and Remote Desktop links, managed by drag and drop, rename, move and delete. **Show only open** narrows it to the servers you have open.
-- **Remote Desktop links** saved with your servers, opening in Remote Desktop Connection on Windows.
-- **OS badges** on servers, and a look of their own for Remote Desktop links.
+- **A session tree** beside the terminal, with search: folders and servers (SSH, Remote Desktop, VNC and telnet), managed by drag and drop, rename, move and delete. **Show only open** narrows it to the servers you have open.
+- **OS badges** on servers, and a badge for each server that isn't SSH.
 
 **AI help, without sharing keys** (a first test, off by default)
 - **Turn it on** in **Settings › AI tools**, then start **Claude Code** from Home's menu (the arrow beside **+**, then **AI tools**). It opens already connected to Submarine, through a local channel only your account can use.

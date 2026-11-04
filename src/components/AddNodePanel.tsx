@@ -55,7 +55,7 @@ type ImportedHost = {
   jump_identity_file?: string | null;
   // The jump host's MobaXterm saved login, if it signs in with one.
   jump_credential?: string | null;
-  // A Remote Desktop session: becomes an RDP link, not a server.
+  // A Remote Desktop session: becomes an RDP server.
   rdp?: boolean;
   // A PuTTY telnet session: becomes a telnet server.
   telnet?: boolean;
@@ -93,7 +93,7 @@ type ImportedSshKey = {
   encrypted: boolean;
 };
 
-const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credentials, refreshCredentials, refreshRdpLinks, sshKeys, refreshSshKeys, folders, refreshFolders, refreshServers, servers, isEditMode, formError, isMobile, onImported, focusJump }: any) => {
+const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credentials, refreshCredentials, sshKeys, refreshSshKeys, folders, refreshFolders, refreshServers, servers, isEditMode, formError, isMobile, onImported, focusJump }: any) => {
   // Opened from "Pick a jump host" (a server whose jump host was deleted,
   // see SessionView): Jump via is brought into view and focused.
   const jumpRowRef = useRef<HTMLDivElement | null>(null);
@@ -422,9 +422,6 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     if (refreshCredentials) {
       try { await refreshCredentials(); } catch { /* same */ }
     }
-    if (refreshRdpLinks) {
-      try { await refreshRdpLinks(); } catch { /* same */ }
-    }
     if (keysByPath.size > 0 && refreshSshKeys) {
       try { await refreshSshKeys(); } catch { /* same — the list refreshes on next open */ }
     }
@@ -466,7 +463,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
       `${plural(report.added, "server")} imported` +
       (report.folders_created ? `, ${plural(report.folders_created, "folder")} created` : "") +
       (report.jump_linked ? `, ${report.jump_linked} linked to a jump host` : "") +
-      (report.rdp_added ? `, ${plural(report.rdp_added, "Remote Desktop link")} added` : "") +
+      (report.rdp_added ? `, ${plural(report.rdp_added, "RDP server")} added` : "") +
       (report.already_there ? `; ${report.already_there} already saved, left as they were` : "") +
       ".";
     setImportDone([summary, ...todo].join("\n\n"));

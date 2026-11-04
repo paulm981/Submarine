@@ -35,11 +35,10 @@ Closing a Wall that took your tabs asks whether to put them back or close them. 
 
 ### Organize them
 
-<img src="docs/screenshots/fork/highlighting-and-tree.png" alt="The session tree beside a terminal: folders, servers with OS badges, a Remote Desktop link, and highlighted log output" width="900" />
+<img src="docs/screenshots/fork/highlighting-and-tree.png" alt="The session tree beside a terminal: folders, servers with OS badges, and highlighted log output" width="900" />
 
-- **A session tree** beside the terminal, with search. It holds folders, servers and Remote Desktop links, and you manage it with drag and drop, rename, move and delete. **Show only open** (the eye button) narrows it to the servers you have open.
-- **Remote Desktop links** are saved with your servers and open in Remote Desktop Connection on Windows.
-- **OS badges** on servers, and a look of their own for Remote Desktop links.
+- **A session tree** beside the terminal, with search. It holds folders and servers (SSH, Remote Desktop, VNC and telnet), and you manage it with drag and drop, rename, move and delete. **Show only open** (the eye button) narrows it to the servers you have open.
+- **OS badges** on servers, and a badge for each server that isn't SSH.
 - **Ping** a server from its right-click menu in the tree or the grid, while it reboots, say. A small panel shows each answer and its time, when the server stopped answering and came back, and whether its SSH port answers yet. A quiet sound plays when you can log in again. It's a plain connection to the port, so it works where ping is blocked; behind a jump host it checks from the jump host, over a connection you already have open.
 
 ### Bring your sessions with you
@@ -205,7 +204,7 @@ Also:
 - a folder that OneDrive, Dropbox, Nextcloud, Syncthing or a network share keeps the same on your computers;
 - a private git repository.
 
-No third-party service is involved. Profiles are encrypted with their password before they leave your computer, and Remote Desktop links sync too. The original project's hosted cloud stays off unless you turn it on.
+No third-party service is involved. Profiles are encrypted with their password before they leave your computer. The original project's hosted cloud stays off unless you turn it on.
 
 ### Ready to roll out to a team
 
@@ -227,7 +226,7 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | Live Edit | Refuses a program; on Windows opens a script in Notepad; opens anything else with its default app ([#212](https://github.com/SinaXhpm/submarine/pull/212)) | Refuses a program, and opens anything else in an editor: the one picked in Settings, or Notepad on Windows, the default text editor on macOS, and on Linux the text editor set for plain text. It never runs a file |
 | Root | `sudo` | `sudo` or `dzdo`, and `dzdo su -`. A server without an sftp-server uses the original project's shell file access, under `sudo` only. |
 | Docker | As the user | As the user, or through root where only root may use Docker |
-| Remote Desktop | RDP servers ([#173](https://github.com/SinaXhpm/submarine/pull/173)), opened in the system's RDP app or, experimentally, in the tab ([#199](https://github.com/SinaXhpm/submarine/pull/199)) | The same RDP servers, each with its **Open in** choice of the built-in client or the system's app, per device. Beside them, the fork's Remote Desktop links, imported from MobaXterm and synced, and marked LINK so they aren't taken for RDP servers. Joining Remote Desktop links and RDP servers is next ([#42](https://github.com/paulm981/Submarine/issues/42)) |
+| Remote Desktop | RDP servers ([#173](https://github.com/SinaXhpm/submarine/pull/173)), opened in the system's RDP app or, experimentally, in the tab ([#199](https://github.com/SinaXhpm/submarine/pull/199)) | The same RDP servers, each with its **Open in** choice of the built-in client or the system's app, per device. The fork's own Remote Desktop links are RDP servers now, set to open in the system's app, and the MobaXterm import brings RDP sessions in as RDP servers, without their saved login ([#42](https://github.com/paulm981/Submarine/issues/42)) |
 | VNC password | The server's own, or its saved login's | The server's own only. VNC sends its password with weak protection and doesn't check the server's identity, so a saved login, shared with other servers, is never sent there |
 | A server switched to telnet or VNC by another computer | Switched at once | In a shared profile, held on this computer, like synced on-connect commands: it stays what it was (SSH, or RDP) on its old port here until you allow the switch, or keep it as it was, which changes it back everywhere. Telnet and VNC would send its saved password where it could be read. A held switch stays held if you leave the share |
 | RDP, telnet and VNC servers on Walls | Not pinned to a Wall | Not on a Wall either, even when their folder or a saved Wall is opened as one, so a screen never gets Broadcast keys |
