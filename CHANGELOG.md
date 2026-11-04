@@ -9,7 +9,13 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
-- **The Mac app, for a release you've tried.** Every release still comes out for Windows and Linux. Once one has been tried, one click on GitHub builds the Mac app from that same release and adds it to the release's downloads. A Mac build costs ten times the GitHub minutes, so they go only to releases that work. The Mac app is for Apple silicon (M1 or later); it doesn't run on an Intel Mac, which the README wrongly said it did. ([#140](https://github.com/paulm981/Submarine/issues/140))
+### From the original project
+
+- **Open a profile automatically on Windows,** with no password or Windows Hello, when Submarine starts. It's a switch of its own under **Unlock with Windows Hello**, off unless you turn it on. Anyone using your Windows account can then open that profile, so it's for a computer that's yours alone. After **Lock** it takes the password again until Submarine restarts. (Their [#275](https://github.com/SinaXhpm/submarine/pull/275) and [#281](https://github.com/SinaXhpm/submarine/pull/281); [#142](https://github.com/paulm981/Submarine/issues/142))
+  - **In the fork, never for a shared profile:** anyone using that Windows account would get everyone's saved logins. It can't be turned on for one, and sharing a profile turns it off. Windows Hello still works.
+- **Security updates** for the libraries the app is built on. (Their [#273](https://github.com/SinaXhpm/submarine/pull/273); [#142](https://github.com/paulm981/Submarine/issues/142))
+
+## v0.4.0-fork.20
 
 ### From the original project
 
@@ -29,6 +35,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
   - On a server without SFTP, reading a file can no longer go past its end into running commands. (Their [#269](https://github.com/SinaXhpm/submarine/pull/269))
   - On Linux, programs the app starts (your browser, file manager, editor, ProxyCommand) no longer inherit the app's own graphics workarounds. (Their [#266](https://github.com/SinaXhpm/submarine/pull/266))
   - ([#142](https://github.com/paulm981/Submarine/issues/142))
+
+## v0.4.0-fork.19
+
+- **The Mac app, for a release you've tried.** Every release still comes out for Windows and Linux. Once one has been tried, one click on GitHub builds the Mac app from that same release and adds it to the release's downloads. A Mac build costs ten times the GitHub minutes, so they go only to releases that work. The Mac app is for Apple silicon (M1 or later); it doesn't run on an Intel Mac, which the README wrongly said it did. ([#140](https://github.com/paulm981/Submarine/issues/140))
 
 ## v0.4.0-fork.18
 

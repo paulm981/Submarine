@@ -35,6 +35,10 @@ const VERSION: &str = env!("SUBMARINE_VERSION");
 #[derive(Debug, Clone, Serialize)]
 pub struct AppInfo {
     pub version: String,
+    /// Whether this build looks for new releases on GitHub. Not on iOS and not
+    /// in the Mac App Store build: the App Store updates those (and
+    /// PRIVACY.md says the iOS app doesn't ask GitHub).
+    pub updates: bool,
     pub github_repo_url: String,
     pub github_releases_url: String,
     /// The first 7 characters of the commit it was built from, when known —
@@ -57,11 +61,15 @@ pub fn build_label() -> String {
 pub fn app_info() -> AppInfo {
     AppInfo {
         version: VERSION.to_string(),
+        updates: UPDATES,
         github_repo_url: format!("https://github.com/{}", GITHUB_REPO),
         github_releases_url: format!("https://github.com/{}/releases", GITHUB_REPO),
         commit: BUILD_COMMIT.get(..7).map(str::to_string),
     }
 }
+
+/// See `AppInfo::updates`.
+const UPDATES: bool = !cfg!(any(target_os = "ios", feature = "app-store"));
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UpdateInfo {
@@ -141,6 +149,10 @@ struct GhRelease {
 #[tauri::command]
 pub async fn check_for_updates(watch_upstream: Option<bool>) -> Result<UpdateInfo, String> {
     let current = VERSION.to_string();
+    // The App Store's builds: nothing is asked, nothing is offered.
+    if !UPDATES {
+        return Ok(UpdateInfo::none(current));
+    }
     let url = format!("https://api.github.com/repos/{}/releases?per_page=100", GITHUB_REPO);
 
     // Build a fresh client per call rather than holding state — this is

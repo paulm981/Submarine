@@ -20,6 +20,7 @@ import { RenameInput } from "./ui/renameInput";
 import { forgetServerBookmarks } from "./util/sftpBookmarks";
 import { visibleName } from "./util/fileName";
 import { useIsNarrow } from "./hooks/useViewport";
+import { IS_MOBILE } from "./util/platform";
 import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./util/terminalFont";
 import {
   BOLD_BRIGHT_KEY, CUSTOM_SCHEME_KEY, GPU_KEY, MIN_CONTRAST_KEY, SCHEME_KEY,
@@ -1847,7 +1848,7 @@ function DesktopApp() {
         // since those mark themselves with `no-drag`. Android's window
         // can't be maximized.
         const target = e.target as HTMLElement;
-        if (IS_ANDROID || target.closest('.no-drag')) return;
+        if (IS_MOBILE || target.closest('.no-drag')) return;
         toggleMaximize();
       }}
       className="h-10 bg-[#0d0d10] border-b border-white/5 flex items-center justify-between px-3 select-none shrink-0 z-50 drag absolute top-0 left-0 right-0"
@@ -2456,7 +2457,7 @@ function DesktopApp() {
           no minimise or maximise affordance to surface — so the phone never
           shows the cluster, not even turned sideways, when it is as wide as a
           desktop window. */}
-      {!IS_ANDROID && (
+      {!IS_MOBILE && (
         <div className="flex items-center h-full gap-1 no-drag">
           <button
             onClick={() => appWindow.minimize()}

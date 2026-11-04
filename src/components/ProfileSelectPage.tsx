@@ -9,7 +9,7 @@ import CloudPanel from "./CloudPanel";
 import { StoreRestoreModal } from "./StoreSync";
 import { CloudConfigView, hostOf } from "./SyncServerSetting";
 import logoUrl from "../assets/logo.png";
-import { IS_ANDROID } from "../util/platform";
+import { IS_ANDROID, IS_IOS, IS_MOBILE } from "../util/platform";
 import { PRIVACY_URL } from "../util/links";
 import { useTextPrompt, useConfirm } from "../ui/confirm";
 import { forgetProfileBookmarks } from "../util/sftpBookmarks";
@@ -63,8 +63,9 @@ const watchUpstream = () => {
 };
 // The running version and the project's GitHub page (backend: about::app_info).
 // `commit`: the build's commit, short, when known; `build`: the fork's build
-// number, when known (about::app_info).
-interface AppInfo { version: string; github_repo_url: string; commit: string | null; build: number | null; }
+// number, when known (about::app_info). `updates` is false in the App
+// Store's builds, which don't look on GitHub.
+interface AppInfo { version: string; updates: boolean; github_repo_url: string; commit: string | null; build: number | null; }
 // The GitHub link's fallback, should app_info ever fail (about::GITHUB_REPO).
 const REPO_URL = "https://github.com/paulm981/Submarine";
 
@@ -385,10 +386,11 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     (async () => {
       try {
         const support = await invoke<{ method: string | null; ready: boolean }>("quick_unlock_support");
-        if (!support.method || !support.ready) return;
-        const on = await invoke<boolean>("quick_unlock_status", { name });
-        if (!live || !on) return;
-        setQuick({ name, method: support.method });
+        if (!support.method) return;
+        const status = await invoke<{ method: string | null; can_open: boolean }>("quick_unlock_status", { name });
+        if (!live || !status.method || !status.can_open) return;
+        if (status.method === support.method && !support.ready) return;
+        setQuick({ name, method: status.method });
         if (!autoQuickTried.current && name === lastProfile()) {
           autoQuickTried.current = true;
           void quickUnlock(name);
@@ -398,7 +400,8 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     return () => { live = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected]);
-  const quickLabel = quick?.method === "android-biometric" ? "Unlock with fingerprint" : "Unlock with Windows Hello";
+  const quickLabel = quick?.method === "android-biometric" ? "Unlock with fingerprint"
+    : quick?.method === "windows-auto" ? "Open on this Windows account" : "Unlock with Windows Hello";
   const quickUnlock = async (name: string) => {
     if (busy) return;
     autoQuickTried.current = true;
@@ -408,7 +411,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     } catch (e) {
       const raw = String(e);
       setPending(null);
-      if (raw.includes("[QUICK_UNLOCK] CANCELLED")) {
+      if (raw.includes("[QUICK_UNLOCK] CANCELLED") || raw.includes("[QUICK_UNLOCK] LOCKED")) {
         requestAnimationFrame(() => passwordInputRef.current?.focus());
         return;
       }
@@ -547,7 +550,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
       // name: the system picker doesn't say where it is), null if the user
       // cancelled the save dialog. We only surface a toast in the success case.
       const saved = await invoke<string | null>("export_profile", { name });
-      if (saved) setInfo(IS_ANDROID ? `Saved as ${saved}` : `Exported to ${saved}`);
+      if (saved) setInfo(IS_ANDROID ? `Saved as ${saved}` : IS_IOS ? `Saved as ${saved} in Files › Submarine` : `Exported to ${saved}`);
     } catch (e) {
       setError(cleanErr(e));
     } finally {
@@ -564,9 +567,9 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   const startImport = async () => {
     if (busy) return;
     setError(null); setInfo(null);
-    // Android: no native dialog — the WebView's file input opens the system
-    // picker (Downloads, Drive, messengers…) and hands us the file.
-    if (IS_ANDROID) { importFileRef.current?.click(); return; }
+    // Android and iOS: no native dialog — the WebView's file input opens the
+    // system picker (Downloads, Drive, Files, messengers…) and hands us the file.
+    if (IS_MOBILE) { importFileRef.current?.click(); return; }
     setPending("work");
     try {
       const picked = await invoke<[string, string] | null>("import_profile_pick");
@@ -759,9 +762,12 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
         className="pointer-events-none absolute inset-x-0 top-0 h-[440px]"
         style={{ background: "radial-gradient(60% 70% at 50% 0%, rgb(var(--primary) / 0.11), transparent 72%)" }}
       />
+      {/* On iOS a file input with no type also offers the camera and the
+          photo library; asking for plain data opens the Files picker only. */}
       <input
         ref={importFileRef}
         type="file"
+        accept={IS_IOS ? ".submarine,application/octet-stream" : undefined}
         className="hidden"
         onChange={onImportFilePicked}
       />
@@ -1119,7 +1125,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
             <FooterButton onClick={openRepo} title="Open Submarine on GitHub" icon={<Github size={12} />} label="GitHub" />
             <FooterDot />
             <FooterButton onClick={() => openLink(PRIVACY_URL)} title="What Submarine stores and sends: the privacy policy" icon={<ShieldCheck size={12} />} label="Privacy" />
-            {!update && (
+            {!update && appInfo?.updates !== false && (
               <>
                 <FooterDot />
                 <FooterButton
