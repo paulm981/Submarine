@@ -302,7 +302,7 @@ Not taken yet, for the next sync:
 - **The title bar shows it,** as in `v0.4.0-fork.8`, and the profile screen says when there's a newer release.
 - **When the original project releases a new version** and it's merged, the count starts again. Releases on 0.3.8 ran from `v0.3.8-fork.1` to `v0.3.8-fork.11`; with 0.4.0 in, they're `v0.4.0-fork.1` and on.
 - **The installers keep the same names** in every release, so a link to the latest release's `Submarine-windows-x64-setup.exe` always gets the newest. On Windows the installer itself can only say `0.4.0`; the app still knows it's `0.4.0-fork.8`.
-- **Windows and Linux are in every release; macOS only when asked for,** since a macOS minute costs ten of the account's GitHub Actions minutes. The repository variable `BUILD_MACOS` set to `true` adds it to every release, and **Run workflow** with **Build macOS too** ticked builds a Mac test copy. Or build it on your own Mac: [Builds on GitHub](README.md#builds-on-github) says how.
+- **Windows and Linux are in every release; macOS is added to one once it has been tried,** since a macOS minute costs ten of the account's GitHub Actions minutes. **Run workflow** with **Or: add the Mac build to this release** set to its tag builds the Mac app from that release's code and adds it to the release. Only a release with its Windows installer gets one. Or build it on your own Mac: [Builds on GitHub](README.md#builds-on-github) says how.
 - **Before `v0.3.8-fork.1`,** the fork numbered its builds instead (build 244 was the last). Those builds are told about the new releases.
 
 **Giving back.** Fixes that apply to the original project too go back to it as pull requests.
