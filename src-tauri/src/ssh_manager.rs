@@ -349,6 +349,15 @@ pub(crate) fn page_drew(terminal_id: &str, bytes: u64) {
     }
 }
 
+/// Keys typed into `terminal_id`, for a terminal whose keys don't go through
+/// a pump here (the fork's Home terminals, term_output::pace).
+pub(crate) fn page_keys(terminal_id: &str, keys: &[u8]) {
+    let page = pages().lock().ok().and_then(|p| p.get(terminal_id).cloned());
+    if let Some(page) = page {
+        page.keys(keys);
+    }
+}
+
 /// How much of a terminal's output may be on its way to the page, not drawn
 /// yet: about IN_FLIGHT_SECS of the page's drawing (Outflow::pace), within
 /// these. A page draws a flood slower than an SSH channel brings it:

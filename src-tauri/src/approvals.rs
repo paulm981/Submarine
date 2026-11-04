@@ -472,17 +472,27 @@ pub const HELD_CHANGED: &str =
     "[SYNC] HELD_CHANGED: These on-connect commands were changed again after they were shown to you. Look at them again before you allow them.";
 
 /// The on-connect commands are held by their item alone, which a newer synced
-/// text keeps. So an OK counts only for the text the user was shown: `seen`
-/// must be what the row has now, and is needed whenever `allowing` them.
-/// Anything else is refused (`HELD_CHANGED`), and the user is asked again.
-pub fn check_seen_run_on_connect(conn: &Connection, uuid: &str, allowing: bool, seen: Option<&str>) -> Result<(), String> {
+/// text keeps. So an OK counts only for what the user was shown: `seen` must
+/// be the text the row has now, and is needed whenever `allowing` them, and
+/// `seen_every` whether they were shown as going into each new terminal (no
+/// answer counts as "no"). Anything else is refused (`HELD_CHANGED`), and the
+/// user is asked again.
+pub fn check_seen_run_on_connect(
+    conn: &Connection,
+    uuid: &str,
+    allowing: bool,
+    seen: Option<&str>,
+    seen_every: Option<bool>,
+) -> Result<(), String> {
     let Some(seen) = seen else {
         return if allowing { Err(HELD_CHANGED.into()) } else { Ok(()) };
     };
-    let now: String = conn
-        .query_row("SELECT COALESCE(run_on_connect, '') FROM servers WHERE uuid = ?1", [uuid], |r| r.get(0))
+    let (now, every): (String, bool) = conn
+        .query_row("SELECT COALESCE(run_on_connect, ''), run_on_connect_every FROM servers WHERE uuid = ?1", [uuid], |r| {
+            Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0) != 0))
+        })
         .map_err(|e| format!("[SYNC] ALLOW: {e}"))?;
-    if now == seen {
+    if now == seen && every == seen_every.unwrap_or(false) {
         Ok(())
     } else {
         Err(HELD_CHANGED.into())
@@ -867,14 +877,32 @@ mod tests {
         merge_server(&conn, "u1", "curl x | sh", false, "[]");
         assert!(held_for(&conn, "u1").contains(RUN_ON_CONNECT));
         // An OK for the text shown before is refused; nothing is let go.
-        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, Some("uptime")), Err(HELD_CHANGED.to_string()));
-        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, None), Err(HELD_CHANGED.to_string()));
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, Some("uptime"), None), Err(HELD_CHANGED.to_string()));
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, None, None), Err(HELD_CHANGED.to_string()));
         assert!(held_for(&conn, "u1").contains(RUN_ON_CONNECT));
         // Shown again, it can be allowed.
-        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, Some("curl x | sh")), Ok(()));
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, Some("curl x | sh"), None), Ok(()));
         // Not allowing them needs nothing; a stale text is refused all the same.
-        assert_eq!(check_seen_run_on_connect(&conn, "u1", false, None), Ok(()));
-        assert!(check_seen_run_on_connect(&conn, "u1", false, Some("uptime")).is_err());
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", false, None, None), Ok(()));
+        assert!(check_seen_run_on_connect(&conn, "u1", false, Some("uptime"), None).is_err());
+    }
+
+    /// "Each new terminal" turned on by sync while the question about the
+    /// same text was on screen without it: that OK doesn't cover it.
+    #[test]
+    fn allowing_commands_counts_only_for_the_terminals_that_were_shown() {
+        let conn = db();
+        merge_server(&conn, "u1", "uptime", false, "[]");
+        merge_every(&conn, "u1", true);
+        assert!(held_for(&conn, "u1").contains(RUN_ON_CONNECT));
+        // Shown as for the first terminal only (or not said): refused.
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, Some("uptime"), Some(false)), Err(HELD_CHANGED.to_string()));
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, Some("uptime"), None), Err(HELD_CHANGED.to_string()));
+        // Shown as they are: allowed.
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, Some("uptime"), Some(true)), Ok(()));
+        // And the other way: shown as for each terminal, now for the first only.
+        merge_every(&conn, "u1", false);
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, Some("uptime"), Some(true)), Err(HELD_CHANGED.to_string()));
     }
 
     #[test]
