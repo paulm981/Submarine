@@ -11,6 +11,25 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 - **The Mac app, for a release you've tried.** Every release still comes out for Windows and Linux. Once one has been tried, one click on GitHub builds the Mac app from that same release and adds it to the release's downloads. A Mac build costs ten times the GitHub minutes, so they go only to releases that work. The Mac app is for Apple silicon (M1 or later); it doesn't run on an Intel Mac, which the README wrongly said it did. ([#140](https://github.com/paulm981/Submarine/issues/140))
 
+### From the original project
+
+- **Big bursts of output no longer bog down the window.** A command that prints faster than the terminal can draw (`cat` of a huge file, a binary by mistake) now waits in the app, about a second of drawing at a time. If it falls far behind, the oldest part is skipped, with a note in the terminal saying how much. **Ctrl+C** clears what's waiting, so the prompt comes back quickly. (Their [#263](https://github.com/SinaXhpm/submarine/pull/263); [#142](https://github.com/paulm981/Submarine/issues/142))
+- **On-connect commands can run in every terminal of a tab.** A new box under a server's on-connect commands, **Also run them in each new terminal you open**, types them into every terminal of the tab, not only the first. In a shared profile, turning it on counts as a change you're asked about first, and you're asked once for the whole tab. (Their [#265](https://github.com/SinaXhpm/submarine/pull/265); [#142](https://github.com/paulm981/Submarine/issues/142))
+- **SFTP Follow.** The file pane can follow the folder your terminal is in. (Their [#255](https://github.com/SinaXhpm/submarine/pull/255); [#142](https://github.com/paulm981/Submarine/issues/142))
+- **Folders upload and download a few files at a time,** so a folder of many small files is much faster. Nothing on your computer is replaced unless you chose to, as before. (Their [#261](https://github.com/SinaXhpm/submarine/pull/261); [#142](https://github.com/paulm981/Submarine/issues/142))
+- **An arrow beside the terminal tabs' "+"** opens its menu (split, a terminal with its own login), which used to need a right-click. (Their [#253](https://github.com/SinaXhpm/submarine/pull/253); [#142](https://github.com/paulm981/Submarine/issues/142))
+- **The app does less while you're not using it.** The cursor stops blinking 10 seconds after you last typed or clicked, and the status dots stop pulsing after a few seconds. (Their [#262](https://github.com/SinaXhpm/submarine/pull/262); [#142](https://github.com/paulm981/Submarine/issues/142))
+- **Smaller fixes:**
+  - Selected text in a terminal is visible again. (Their [#252](https://github.com/SinaXhpm/submarine/pull/252))
+  - A slow port forward or tunnel no longer holds up a new terminal or file transfer on the same server. (Their [#260](https://github.com/SinaXhpm/submarine/pull/260))
+  - A mirror's start no longer downloads what it just uploaded. (Their [#259](https://github.com/SinaXhpm/submarine/pull/259))
+  - A refused Remote Desktop login says why. (Their [#258](https://github.com/SinaXhpm/submarine/pull/258))
+  - The terminal takes your keys again after a reconnect. (Their [#271](https://github.com/SinaXhpm/submarine/pull/271))
+  - Closing a connected tab no longer calls every connection SSH, and deleting a server forgets this computer's Remote Desktop and VNC settings for it. (Their [#272](https://github.com/SinaXhpm/submarine/pull/272))
+  - On a server without SFTP, reading a file can no longer go past its end into running commands. (Their [#269](https://github.com/SinaXhpm/submarine/pull/269))
+  - On Linux, programs the app starts (your browser, file manager, editor, ProxyCommand) no longer inherit the app's own graphics workarounds. (Their [#266](https://github.com/SinaXhpm/submarine/pull/266))
+  - ([#142](https://github.com/paulm981/Submarine/issues/142))
+
 ## v0.4.0-fork.18
 
 - **The graphics card draws the terminals you can see.** It can draw only about 16 terminals at once. In a Wall of 36, the terminals that kept it used to be simply the last ones opened, hidden tabs included, while tiles on screen drew the slower way. Now at most 12 terminals use it, and a terminal on screen comes first: it takes a free place, or one from a terminal you can't see. Switching between a few tabs keeps theirs. **Copy diagnostics** shows how many are in use. ([#127](https://github.com/paulm981/Submarine/issues/127))
