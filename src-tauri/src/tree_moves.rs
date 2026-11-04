@@ -1,6 +1,6 @@
 //! Changing the server tree from the session tree — its drag and drop, "Move
-//! to…" and Delete: servers, Remote Desktop links and folders into another
-//! folder (or the top level, `None`), or out of the vault.
+//! to…" and Delete: servers and folders into another folder (or the top
+//! level, `None`), or out of the vault.
 //!
 //! Each command is one transaction and one vault save, however many rows it
 //! touches. Rows already where they're going are left alone, so a no-op
@@ -77,18 +77,6 @@ pub(crate) fn move_servers_in(conn: &Connection, ids: &[i64], folder_id: Option<
     Ok(moved)
 }
 
-/// Remote Desktop links into `folder_id`. Returns how many moved.
-pub(crate) fn move_rdp_links_in(conn: &Connection, ids: &[i64], folder_id: Option<i64>) -> Result<usize, String> {
-    check_folder(conn, folder_id)?;
-    let mut moved = 0;
-    for id in ids {
-        moved += conn
-            .execute("UPDATE rdp_links SET folder_id = ?2 WHERE id = ?1 AND folder_id IS NOT ?2", params![id, folder_id])
-            .map_err(db("RDP_MOVE_FAILED"))?;
-    }
-    Ok(moved)
-}
-
 /// A folder into another (or to the top level) with everything in it. Never
 /// into itself or a folder inside it: that would cut the branch off the tree.
 pub(crate) fn move_folder_in(conn: &Connection, id: i64, parent_id: Option<i64>) -> Result<bool, String> {
@@ -107,13 +95,13 @@ pub(crate) fn move_folder_in(conn: &Connection, id: i64, parent_id: Option<i64>)
     Ok(moved > 0)
 }
 
-/// Server, link and folder ids, in that order.
-type Scope = (Vec<i64>, Vec<i64>, Vec<i64>);
+/// Server and folder ids, in that order.
+type Scope = (Vec<i64>, Vec<i64>);
 
 /// Everything a delete takes: the folders given and every folder inside
-/// them, the servers and links given, and every server and link in those
-/// folders. Loops are broken first, so "inside" means what the page shows.
-pub(crate) fn delete_scope(conn: &Connection, servers: &[i64], links: &[i64], folders: &[i64]) -> Result<Scope, String> {
+/// them, the servers given, and every server in those folders. Loops are
+/// broken first, so "inside" means what the page shows.
+pub(crate) fn delete_scope(conn: &Connection, servers: &[i64], folders: &[i64]) -> Result<Scope, String> {
     break_folder_loops(conn).map_err(db("FOLDER_LOOP_REPAIR_FAILED"))?;
     let mut all_folders: Vec<i64> = Vec::new();
     for f in folders {
@@ -138,11 +126,7 @@ pub(crate) fn delete_scope(conn: &Connection, servers: &[i64], links: &[i64], fo
     all_servers.extend(in_folders("servers")?);
     all_servers.sort_unstable();
     all_servers.dedup();
-    let mut all_links: Vec<i64> = links.to_vec();
-    all_links.extend(in_folders("rdp_links")?);
-    all_links.sort_unstable();
-    all_links.dedup();
-    Ok((all_servers, all_links, all_folders))
+    Ok((all_servers, all_folders))
 }
 
 /// Before servers are deleted, every server that went through one of them as
@@ -168,13 +152,10 @@ pub(crate) fn unlink_jump_hosts(conn: &Connection, servers: &[i64]) -> Result<()
     })
 }
 
-fn delete_in(conn: &Connection, servers: &[i64], links: &[i64], folders: &[i64]) -> Result<(), String> {
+fn delete_in(conn: &Connection, servers: &[i64], folders: &[i64]) -> Result<(), String> {
     unlink_jump_hosts(conn, servers)?;
     for id in servers {
         conn.execute("DELETE FROM servers WHERE id = ?1", params![id]).map_err(db("SERVER_DELETE_FAILED"))?;
-    }
-    for id in links {
-        conn.execute("DELETE FROM rdp_links WHERE id = ?1", params![id]).map_err(db("RDP_DELETE_FAILED"))?;
     }
     for id in folders {
         conn.execute("DELETE FROM folders WHERE id = ?1", params![id]).map_err(db("FOLDER_DELETE_FAILED"))?;
@@ -205,16 +186,11 @@ pub async fn move_servers(state: tauri::State<'_, DbState>, ids: Vec<i64>, folde
 }
 
 #[tauri::command]
-pub async fn move_rdp_links(state: tauri::State<'_, DbState>, ids: Vec<i64>, folder_id: Option<i64>) -> Result<(), String> {
-    with_vault(&state, |conn| move_rdp_links_in(conn, &ids, folder_id).map(|n| ((), n > 0)))
-}
-
-#[tauri::command]
 pub async fn move_folder(state: tauri::State<'_, DbState>, id: i64, parent_id: Option<i64>) -> Result<(), String> {
     with_vault(&state, |conn| move_folder_in(conn, id, parent_id).map(|moved| ((), moved)))
 }
 
-/// Delete servers, links and folders (with everything in the folders) in
+/// Delete servers and folders (with everything in the folders) in
 /// one go: the session tree's Delete on a selection. Each server's monitor
 /// is stopped first, as delete_server does, or it would keep polling a host
 /// whose credentials are gone.
@@ -223,18 +199,17 @@ pub async fn delete_tree_items(
     state: tauri::State<'_, DbState>,
     map: tauri::State<'_, MonitorMap>,
     servers: Vec<i64>,
-    links: Vec<i64>,
     folders: Vec<i64>,
 ) -> Result<(), String> {
-    let (servers, links, folders) = {
+    let (servers, folders) = {
         let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-        delete_scope(conn, &servers, &links, &folders)?
+        delete_scope(conn, &servers, &folders)?
     };
     for id in &servers {
         crate::monitor::stop_monitor(map.inner().clone(), *id as i32).await;
     }
-    with_vault(&state, |conn| delete_in(conn, &servers, &links, &folders).map(|_| ((), true)))
+    with_vault(&state, |conn| delete_in(conn, &servers, &folders).map(|_| ((), true)))
 }
 
 #[cfg(test)]
@@ -251,9 +226,6 @@ mod tests {
              INSERT INTO servers VALUES (10, 'web1', 1, 0, NULL), (11, 'web2', 1, 1, NULL), (12, 'db1', 2, 0, NULL), (13, 'tool', NULL, 0, NULL);",
         )
         .unwrap();
-        conn.execute_batch(crate::rdp_links::SCHEMA).unwrap();
-        conn.execute("INSERT INTO rdp_links (id, name, host, port, username, folder_id, notes) VALUES (20, 'desk', 'desk.example', 3389, '', 1, '')", [])
-            .unwrap();
         conn
     }
 
@@ -282,32 +254,22 @@ mod tests {
     }
 
     #[test]
-    fn links_move_like_servers() {
-        let conn = vault();
-        assert_eq!(move_rdp_links_in(&conn, &[20], Some(3)).unwrap(), 1);
-        assert_eq!(folder_of(&conn, "rdp_links", 20), Some(3));
-        assert_eq!(move_rdp_links_in(&conn, &[20], None).unwrap(), 1);
-        assert_eq!(folder_of(&conn, "rdp_links", 20), None);
-    }
-
-    #[test]
     fn a_loop_from_sync_is_broken_and_a_delete_stays_inside_what_it_names() {
         let conn = vault();
         // Prod (1) inside Lab (3), Lab inside Prod: what two devices' moves
         // can merge into.
         conn.execute_batch("UPDATE folders SET parent_id = 3 WHERE id = 1; UPDATE folders SET parent_id = 1 WHERE id = 3;").unwrap();
-        let (servers, links, folders) = delete_scope(&conn, &[], &[], &[3]).unwrap();
+        let (servers, folders) = delete_scope(&conn, &[], &[3]).unwrap();
         assert_eq!(folders, vec![3], "Lab alone: Prod is no longer inside it");
-        assert!(servers.is_empty() && links.is_empty());
+        assert!(servers.is_empty());
         let roots: Vec<i64> = conn.prepare("SELECT id FROM folders WHERE parent_id IS NULL ORDER BY id").unwrap()
             .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
         assert_eq!(roots, vec![1, 3]);
         // East (2) stays inside Prod.
-        let (servers, links, folders) = delete_scope(&conn, &[13], &[], &[1]).unwrap();
+        let (servers, folders) = delete_scope(&conn, &[13], &[1]).unwrap();
         assert_eq!(folders, vec![1, 2]);
         assert_eq!(servers, vec![10, 11, 12, 13]);
-        assert_eq!(links, vec![20]);
-        delete_in(&conn, &servers, &links, &folders).unwrap();
+        delete_in(&conn, &servers, &folders).unwrap();
         let left: i64 = conn.query_row("SELECT COUNT(*) FROM servers", [], |r| r.get(0)).unwrap();
         assert_eq!(left, 0);
     }
@@ -323,7 +285,7 @@ mod tests {
                BEGIN INSERT INTO stamped VALUES (NEW.id); END;",
         )
         .unwrap();
-        delete_in(&conn, &[13], &[], &[]).unwrap();
+        delete_in(&conn, &[13], &[]).unwrap();
         let jump = |id: i64| -> Option<i64> { conn.query_row("SELECT jump_host_id FROM servers WHERE id=?1", [id], |r| r.get(0)).unwrap() };
         assert_eq!((jump(10), jump(11)), (None, None), "unlinked, not left pointing at nothing");
         assert_eq!(jump(12), Some(10), "another jump host is left alone");
@@ -335,7 +297,7 @@ mod tests {
         let stamped: i64 = conn.query_row("SELECT COUNT(*) FROM stamped", [], |r| r.get(0)).unwrap();
         assert_eq!(stamped, 0, "a local repair, not edits for sync to push");
         // Deleting one behind it as well as it, in one go.
-        delete_in(&conn, &[10, 12], &[], &[]).unwrap();
+        delete_in(&conn, &[10, 12], &[]).unwrap();
         let left: i64 = conn.query_row("SELECT COUNT(*) FROM servers", [], |r| r.get(0)).unwrap();
         assert_eq!(left, 1);
     }

@@ -1733,19 +1733,19 @@ mod tests {
         let (a, ha) = device("A");
         let (b, hb) = device("B");
         a.execute("INSERT INTO servers(name,host,port) VALUES('web','h',22)", []).unwrap();
-        a.execute("INSERT INTO rdp_links(name,host) VALUES('desk','d.example')", []).unwrap();
+        a.execute("INSERT INTO folders(name) VALUES('desk')", []).unwrap();
         assert_eq!(sync(&a, &ha, &dir, "aaaaaaaaaaaaaaaa"), (2, 0));
         // B gets both, and writes its own file with what it now knows.
         let (_, pulled) = sync(&b, &hb, &dir, "bbbbbbbbbbbbbbbb");
         assert_eq!(pulled, 2);
         assert_eq!(names(&b, "servers"), ["web"]);
-        assert_eq!(names(&b, "rdp_links"), ["desk"]);
-        // B renames the link and deletes the server; A picks both up.
-        b.execute("UPDATE rdp_links SET name='desk-2'", []).unwrap();
+        assert_eq!(names(&b, "folders"), ["desk"]);
+        // B renames the folder and deletes the server; A picks both up.
+        b.execute("UPDATE folders SET name='desk-2'", []).unwrap();
         b.execute("DELETE FROM servers", []).unwrap();
         sync(&b, &hb, &dir, "bbbbbbbbbbbbbbbb");
         sync(&a, &ha, &dir, "aaaaaaaaaaaaaaaa");
-        assert_eq!(names(&a, "rdp_links"), ["desk-2"]);
+        assert_eq!(names(&a, "folders"), ["desk-2"]);
         assert!(names(&a, "servers").is_empty());
         // Nothing new: neither file is written again.
         let before = std::fs::metadata(dir.join("aaaaaaaaaaaaaaaa.subdev")).unwrap().modified().unwrap();
