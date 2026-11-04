@@ -13,7 +13,7 @@ import { shellGroups, type LocalShells } from "./HomePane";
 import CopyValue from "./CopyValue";
 import FontPicker from "./FontPicker";
 import { loadInstalledFonts } from "../util/systemFonts";
-import { IS_ANDROID, IS_WINDOWS } from "../util/platform";
+import { IS_ANDROID, IS_MOBILE, IS_WINDOWS } from "../util/platform";
 import { TerminalColorSettings } from "./TerminalSchemes";
 import { HighlightSettings } from "./HighlightSettings";
 import LicensesDialog from "./LicensesDialog";
@@ -1205,7 +1205,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
         </section>
 
         {/* Home Terminal Section */}
-        {!IS_ANDROID && (
+        {!IS_MOBILE && (
           <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
             <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
               <Home size={14} /> Home Terminal
@@ -1215,7 +1215,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
         )}
 
         {/* AI Tools Section */}
-        {!IS_ANDROID && (
+        {!IS_MOBILE && (
           <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
             <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
               <Bot size={14} /> AI Tools
@@ -1225,7 +1225,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
         )}
 
         {/* Live Edit Section */}
-        {!IS_ANDROID && (
+        {!IS_MOBILE && (
           <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
             <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
               <FileEdit size={14} /> Live Edit
@@ -1234,8 +1234,8 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
           </section>
         )}
 
-        {/* Not on Android, which has no ssh-agent or ~/.ssh/config to use. */}
-        {!IS_ANDROID && (
+        {/* Not on a phone or tablet, which has no ssh-agent or ~/.ssh/config to use. */}
+        {!IS_MOBILE && (
           <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
             <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
               <KeyRound size={14} /> Authentication
