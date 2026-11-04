@@ -20,6 +20,12 @@
 //! - Only the first password question of a keyboard-interactive exchange is
 //!   offered for saving (`kbi_round`), and only for the login name the server
 //!   has saved (`may_save_for_login`).
+//! - E5: a shared profile never opens by itself on Windows (quick unlock's
+//!   "open automatically", the original project's #275): anyone using that
+//!   Windows account would get every member's saved logins. It can't be turned
+//!   on for one (`may_open_by_itself`), sharing a profile turns it off
+//!   (`stop_opening_by_itself`), and a shared one that opens that way anyway
+//!   has it turned off.
 //!
 //! The tests at the end run against the app's own tables
 //! (`sync_engine_tests::device`) and go through the same steps the app does
@@ -28,6 +34,19 @@
 
 use rusqlite::Connection;
 use zeroize::Zeroizing;
+
+/// E5: why "Open automatically" is refused for a shared profile.
+pub const SHARED_AUTO_OPEN: &str = "[QUICK_UNLOCK] SHARED: a shared profile doesn't open by itself, as anyone using this Windows account would get everyone's saved logins. Windows Hello still works.";
+
+/// E5: whether the open profile may open by itself (not when it's shared).
+pub fn may_open_by_itself(conn: &Connection) -> bool {
+    !crate::approvals::profile_is_shared(conn)
+}
+
+/// E5: the profile `name` has just been shared: it stops opening by itself.
+pub fn stop_opening_by_itself(app: &tauri::AppHandle, name: &str) {
+    crate::quick_unlock::forget_auto(app, name);
+}
 
 /// E4: the line under "Save password" in a shared profile.
 pub const SHARED_PROFILE_NOTE: &str = "Off because this profile is shared: a password saved here goes to everyone in it.";
@@ -309,6 +328,17 @@ mod tests {
     /// where it must be. A sync that loses one in a merge fails here, naming
     /// it, instead of quietly dropping the rule (FORK.md, "The fork's own
     /// rules").
+    /// E5: a personal profile may open by itself; once it's shared (or
+    /// joined from a share), it may not.
+    #[test]
+    fn a_shared_profile_never_opens_by_itself() {
+        let (conn, _h) = crate::sync_engine_tests::device("a");
+        assert!(may_open_by_itself(&conn), "a personal profile");
+        conn.execute("INSERT INTO sync_meta(key,value) VALUES('share_id','s1')", []).unwrap();
+        assert!(!may_open_by_itself(&conn), "a shared one");
+        assert!(SHARED_AUTO_OPEN.starts_with("[QUICK_UNLOCK] SHARED:"), "the card shows what follows the tag");
+    }
+
     #[test]
     fn the_hooks_are_in_place() {
         let lib = include_str!("lib.rs");
@@ -322,8 +352,16 @@ mod tests {
             ("save_typed_password(conn, &to, password)", 1, "save_prompted_password"),
             ("secret_policy::kbi_round(", 1, "run_keyboard_interactive"),
             ("secret_policy::may_save_for_login(", 2, "login_hop and initiate_connection"),
+            ("secret_policy::stop_opening_by_itself(", 1, "share_current_profile (E5)"),
         ] {
             assert_eq!(lib.matches(hook).count(), times, "lib.rs should call `{hook}` {times}x, in {place}");
+        }
+        let quick_unlock = include_str!("quick_unlock.rs");
+        for (hook, times, place) in [
+            ("secret_policy::may_open_by_itself", 2, "quick_unlock_enable and quick_unlock (E5)"),
+            ("secret_policy::SHARED_AUTO_OPEN", 1, "quick_unlock_enable (E5)"),
+        ] {
+            assert_eq!(quick_unlock.matches(hook).count(), times, "quick_unlock.rs should use `{hook}` {times}x, in {place}");
         }
     }
 }

@@ -179,6 +179,15 @@ fn remove_tmp(path: &std::path::Path) {
     let _ = std::fs::remove_file(path.with_extension("json.tmp"));
 }
 
+/// Removes the file when it's the one that opens the profile by itself
+/// (`AUTO_METHOD`); Windows Hello stays. See secret_policy (E5).
+pub fn forget_auto(app: &tauri::AppHandle, name: &str) {
+    let Ok(path) = file_for(app, name) else { return };
+    if read_file(&path).is_some_and(|f| f.method == AUTO_METHOD) {
+        forget(app, name);
+    }
+}
+
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
@@ -271,6 +280,13 @@ pub async fn quick_unlock_enable(app: tauri::AppHandle, state: tauri::State<'_, 
     if vault_salt(&app, &name) != VaultSalt::Salt(salt) {
         // The open vault isn't the one on disk (not saved yet): nothing to seal against.
         return Err("[QUICK_UNLOCK] NOT_SAVED".into());
+    }
+    // The fork's rule (E5): never for a shared profile.
+    if auto {
+        let guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+        if !guard.as_ref().is_some_and(crate::secret_policy::may_open_by_itself) {
+            return Err(crate::secret_policy::SHARED_AUTO_OPEN.into());
+        }
     }
 
     // What is set up now stays until the new one is in place: a prompt the
@@ -370,8 +386,17 @@ pub async fn quick_unlock(app: tauri::AppHandle, state: tauri::State<'_, DbState
     let opened = if auto { dpapi::open(&sealed).await } else { platform::open(&app, &f.id, &sealed).await };
     let key = opened?;
     *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE")? = Some(name.clone());
-    match crate::setup_master_db_inner(app.clone(), crate::VaultSecret::Key(key), state, false).await {
-        Ok(_) => Ok(()),
+    match crate::setup_master_db_inner(app.clone(), crate::VaultSecret::Key(key), state.clone(), false).await {
+        Ok(_) => {
+            // Shared since it was turned on (E5): this was the last time.
+            if auto {
+                let shared = state.conn.lock().ok().is_some_and(|g| g.as_ref().is_some_and(|c| !crate::secret_policy::may_open_by_itself(c)));
+                if shared {
+                    forget(&app, &name);
+                }
+            }
+            Ok(())
+        }
         Err(e) if e.contains("DECRYPT") => {
             // It opened, but doesn't open this vault: drop it.
             forget(&app, &name);
