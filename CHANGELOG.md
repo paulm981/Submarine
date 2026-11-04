@@ -15,6 +15,8 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
   - The MobaXterm import brings Remote Desktop sessions in as RDP servers, still without their saved login.
   - It syncs as a server. A computer still on an older version gets the RDP server in place of its link.
 
+## v0.4.0-fork.22
+
 ### From the original project
 
 - **Safer against a hostile server.** A server, or someone on the way to it, can no longer:
