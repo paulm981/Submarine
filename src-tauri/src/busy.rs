@@ -217,4 +217,22 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(crate::session_sftp_dir(id).unwrap());
     }
+
+    // Every hook into this file from the original project's code is where it
+    // belongs (fork_hooks.rs): a merge that drops one fails here, while the
+    // tests above would still pass.
+    #[test]
+    fn the_hooks_are_in_place() {
+        use crate::fork_hooks::assert_hooks;
+        let mut lib = vec![("run", "busy::sessions_busy", 1)];
+        for transfer in ["sftp_remove_dir", "sftp_download_file", "sftp_download_dir", "sftp_upload_file", "sftp_upload_dir"] {
+            lib.push((transfer, "busy::RunningTransfer::start(", 1));
+        }
+        assert_hooks("lib.rs", include_str!("lib.rs"), &lib);
+        assert_hooks(
+            "archive.rs",
+            include_str!("archive.rs"),
+            &[("sftp_archive", "busy::running_archive(", 1), ("sftp_extract", "busy::running_archive(", 1)],
+        );
+    }
 }

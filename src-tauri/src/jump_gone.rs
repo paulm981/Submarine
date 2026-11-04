@@ -177,11 +177,16 @@ fn connect_directly(conn: &Connection, server_id: i64) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// The app's own tables (fork_hooks::app_table), so a column a sync
+    /// renames fails here.
     fn vault() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
+        // `folders` first: `servers` names it in a foreign key.
+        for table in ["folders", "servers"] {
+            conn.execute_batch(&crate::fork_hooks::app_table(table)).unwrap();
+        }
         conn.execute_batch(
-            "CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, jump_host_id INTEGER, uuid TEXT);
-             INSERT INTO servers VALUES (1, 'web-gw', NULL, 'u1'), (2, 'db-01', 1, 'u2'), (3, 'web-01', 1, 'u3'), (4, 'tool', NULL, 'u4');",
+            "INSERT INTO servers (id, name, jump_host_id, uuid) VALUES (1, 'web-gw', NULL, 'u1'), (2, 'db-01', 1, 'u2'), (3, 'web-01', 1, 'u3'), (4, 'tool', NULL, 'u4');",
         )
         .unwrap();
         conn
@@ -229,5 +234,29 @@ mod tests {
         assert!(refuse(&conn, 2).unwrap_err().contains("(web-gw)"));
         clear(&conn, 2).unwrap();
         assert!(refuse(&conn, 2).is_ok());
+    }
+
+    // Every hook into this file from the original project's code is where it
+    // belongs (fork_hooks.rs): a merge that drops one fails here, while the
+    // rule's own tests above would still pass.
+    #[test]
+    fn the_hooks_are_in_place() {
+        use crate::fork_hooks::assert_hooks;
+        let mut lib = vec![
+            ("merge_batch", "jump_gone::links_before(", 1),
+            ("merge_batch", "jump_gone::note_lost(", 1),
+            ("repair_links", "jump_gone::note_unresolved(", 1),
+            ("set_server_jump_host", "jump_gone::clear(", 1),
+            ("resume_skipped_line", "jump_gone::CODE", 1),
+            ("run", "jump_gone::jump_host_connect_directly", 1),
+        ];
+        // Every way of connecting to a saved server asks first.
+        for opens in ["initiate_connection", "initiate_rdp", "rdp_builtin_open", "telnet_connect", "vnc_open", "resolve_node_auth_for_monitor"] {
+            lib.push((opens, "jump_gone::refuse(", 1));
+        }
+        assert_hooks("lib.rs", include_str!("lib.rs"), &lib);
+        assert_hooks("tree_moves.rs", include_str!("tree_moves.rs"), &[("unlink_jump_hosts", "jump_gone::note_behind(", 1)]);
+        assert_hooks("monitor.rs", include_str!("monitor.rs"), &[("run_poller", "jump_gone::reason(", 1)]);
+        assert_hooks("ping.rs", include_str!("ping.rs"), &[("read_server", "jump_gone::reason(", 1)]);
     }
 }

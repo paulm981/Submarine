@@ -195,4 +195,41 @@ mod tests {
             assert_eq!(String::from_utf8_lossy(&out.stdout), "[pa'ss $x]", "{shell}");
         }
     }
+
+    // Every hook into this file from the original project's code is where it
+    // belongs (fork_hooks.rs): a merge that drops one, putting a command back
+    // together by hand, fails here, while the tests above would still pass.
+    #[test]
+    fn the_hooks_are_in_place() {
+        use crate::fork_hooks::assert_hooks;
+        assert_hooks(
+            "lib.rs",
+            include_str!("lib.rs"),
+            &[
+                ("login_shell_command", "remote_sh::quote(", 1),
+                ("server_runs_login_shell", "remote_sh::quote(", 1),
+                ("ssh_iptables_chain", "remote_sh::quote_words(", 1),
+                ("ssh_nft_chain", "remote_sh::quote_words(", 1),
+                ("sh_user_command", "remote_sh::sh_command(", 1),
+                ("root_probe_command", "remote_sh::sh_command_encoded(", 1),
+                ("root_shell_line", "remote_sh::sh_command_with(", 1),
+                ("root_exec_command", "remote_sh::sh_command_encoded(", 1),
+                ("root_run", "remote_sh::quote_words(", 1),
+                ("root_channel_start", "remote_sh::quote_words(", 2),
+                ("sftp_probe_command", "remote_sh::sh_command_with(", 1),
+                ("find_sftp_server", "remote_sh::sh_command(", 1),
+                ("probe_sudo_files", "remote_sh::sh_command(", 1),
+            ],
+        );
+        assert_hooks(
+            "docker.rs",
+            include_str!("docker.rs"),
+            &[("", "use crate::remote_sh::quote as shq;", 1), ("run_capture", "remote_sh::sh_command(", 1), ("ssh_docker_logs_start", "remote_sh::sh_command(", 1)],
+        );
+        assert_hooks(
+            "shell_sftp.rs",
+            include_str!("shell_sftp.rs"),
+            &[("", "use crate::remote_sh::quote;", 1), ("encode_script", "remote_sh::octal(", 1)],
+        );
+    }
 }

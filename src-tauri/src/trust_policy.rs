@@ -287,9 +287,9 @@ mod tests {
 
     #[tokio::test]
     async fn monitoring_checks_a_server_unless_only_a_certificate_vouches_for_it() {
+        // The app's own `known_hosts` table (fork_hooks::app_table).
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE known_hosts (id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT, port INTEGER, fingerprint TEXT, key_type TEXT);")
-            .unwrap();
+        conn.execute_batch(&crate::fork_hooks::app_table("known_hosts")).unwrap();
         let ca = key();
         let with_ca = known_hosts(&format!("@cert-authority *.sublab.test {}\n", line(ca.public_key())), "node1.sublab.test", 3022).await;
         let without = known_hosts(&format!("other.example {}\n", line(key().public_key())), "node1.sublab.test", 3022).await;
@@ -460,5 +460,25 @@ mod tests {
         let t = crate::known_hosts::for_host(Some(files), "db.example.com", 22).await.expect("read");
         assert!(matches!(decide_plain_key(HostKeyVerdict::Known, Some(&t), k.public_key()), HostKeyDecision::Refused(_)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Every hook into this file from the original project's code is where it
+    // belongs (fork_hooks.rs): a merge that drops one fails here, while the
+    // rule's own tests above would still pass.
+    #[test]
+    fn the_hooks_are_in_place() {
+        use crate::fork_hooks::assert_hooks;
+        assert_hooks(
+            "lib.rs",
+            include_str!("lib.rs"),
+            &[
+                ("try_config_identities", "trust_policy::offer_client_certificate(", 1),
+                ("client_config_for_target", "trust_policy::keep_known_kinds_first(", 1),
+            ],
+        );
+        let key_check = [("check_server_key", "trust_policy::decide_certificate(", 1), ("check_server_key", "trust_policy::decide_plain_key(", 1)];
+        assert_hooks("ssh_manager.rs", include_str!("ssh_manager.rs"), &key_check);
+        assert_hooks("monitor.rs", include_str!("monitor.rs"), &key_check);
+        assert_hooks("monitor.rs", include_str!("monitor.rs"), &[("with_ssh_config", "trust_policy::known_only_by_certificate(", 1)]);
     }
 }

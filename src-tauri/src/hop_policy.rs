@@ -337,4 +337,23 @@ mod tests {
         assert!(err.contains("didn't open a channel to target:22"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
+
+    // Every hook into this file from the original project's code is where it
+    // belongs (fork_hooks.rs): a merge that drops one fails here, while the
+    // rule's own tests above would still pass.
+    #[test]
+    fn the_hooks_are_in_place() {
+        use crate::fork_hooks::assert_hooks;
+        assert_hooks(
+            "lib.rs",
+            include_str!("lib.rs"),
+            &[
+                ("config_jump_chain", "hop_policy::refuse_tokens(", 1),
+                ("config_jump_chain", "hop_policy::hop_turn(", 1),
+                ("reach_hop", "hop_policy::hop_turn(", 3),
+                ("first_hop_route", "hop_policy::first_hop_in_config(", 1),
+            ],
+        );
+        assert_hooks("monitor.rs", include_str!("monitor.rs"), &[("run_poller", "hop_policy::queue_key(", 1)]);
+    }
 }

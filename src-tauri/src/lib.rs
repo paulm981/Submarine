@@ -67,6 +67,8 @@ mod vault_backup;
 mod known_hosts;
 mod trust_policy;
 mod secret_policy;
+#[cfg(test)]
+mod fork_hooks;
 #[cfg(target_os = "android")]
 mod android_bridge;
 #[cfg(test)]
