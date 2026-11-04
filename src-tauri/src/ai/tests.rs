@@ -1275,7 +1275,7 @@ mod ssh {
 #[cfg(unix)]
 mod root {
     use super::*;
-    use crate::root_over_ssh_tests::Lab;
+    use crate::root_ssh::root_over_ssh_tests::Lab;
 
     /// The root password on every lab: looked for wherever it must never be.
     const PW: &str = "Sentinel-pw 91d2'x";
@@ -1742,7 +1742,7 @@ mod root {
 #[cfg(unix)]
 mod root_language {
     use super::*;
-    use crate::root_over_ssh_tests::Lab;
+    use crate::root_ssh::root_over_ssh_tests::Lab;
 
     /// A kept password that stopped working, on a sudo that answers in
     /// German whatever the locale: the check failing counts as "didn't

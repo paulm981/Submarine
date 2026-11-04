@@ -211,14 +211,21 @@ mod tests {
                 ("ssh_iptables_chain", "remote_sh::quote_words(", 1),
                 ("ssh_nft_chain", "remote_sh::quote_words(", 1),
                 ("sh_user_command", "remote_sh::sh_command(", 1),
+                ("sftp_probe_command", "remote_sh::sh_command_with(", 1),
+                ("find_sftp_server", "remote_sh::sh_command(", 1),
+                ("probe_sudo_files", "remote_sh::sh_command(", 1),
+            ],
+        );
+        // Root over SSH, out of lib.rs into a fork file of its own (#136).
+        assert_hooks(
+            "root_ssh.rs",
+            include_str!("root_ssh.rs"),
+            &[
                 ("root_probe_command", "remote_sh::sh_command_encoded(", 1),
                 ("root_shell_line", "remote_sh::sh_command_with(", 1),
                 ("root_exec_command", "remote_sh::sh_command_encoded(", 1),
                 ("root_run", "remote_sh::quote_words(", 1),
                 ("root_channel_start", "remote_sh::quote_words(", 2),
-                ("sftp_probe_command", "remote_sh::sh_command_with(", 1),
-                ("find_sftp_server", "remote_sh::sh_command(", 1),
-                ("probe_sudo_files", "remote_sh::sh_command(", 1),
             ],
         );
         assert_hooks(
