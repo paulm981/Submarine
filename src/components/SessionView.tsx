@@ -2,10 +2,11 @@ import { useState, useEffect, useLayoutEffect, useRef, useCallback, memo, type C
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { TerminalSquare, Folder, FolderUp, Network, AlertTriangle, Check, X, Play, Library, Info, Container, Plus, SplitSquareHorizontal, Columns, Rows, RotateCw, Loader2, CircleSlash, PanelRight, PanelLeft, PanelBottom, PanelTop, Maximize2, Minimize2, UploadCloud, Bot, LogIn } from "lucide-react";
+import { TerminalSquare, Folder, FolderUp, FolderSync, Network, AlertTriangle, Check, X, Play, Library, Info, Container, Plus, ChevronDown, SplitSquareHorizontal, Columns, Rows, RotateCw, Loader2, CircleSlash, PanelRight, PanelLeft, PanelBottom, PanelTop, Maximize2, Minimize2, UploadCloud, Bot, LogIn } from "lucide-react";
 import TerminalView from "./TerminalView";
 import { AuthPrompts } from "./AuthPrompts";
 import SftpWorkspace, { type SftpView } from "./SftpWorkspace";
+import { nextShellFolder, type ShellFolderState } from "../util/shellFolder";
 import TunnelsPanel from "./TunnelsPanel";
 import InfoPanel from "./InfoPanel";
 import { CmdsPanel } from "./CmdsPanel";
@@ -123,7 +124,7 @@ const SepToggle = ({ on, onToggle, status, hint, onReconnect }: {
         {on && (
           <span
             className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-              status === 'ready' ? 'bg-emerald-400' : status === 'failed' ? 'bg-red-400' : 'bg-amber-400 animate-pulse'
+              status === 'ready' ? 'bg-emerald-400' : status === 'failed' ? 'bg-red-400' : 'bg-amber-400 animate-pulse-brief'
             }`}
           />
         )}
@@ -170,29 +171,46 @@ const SepToggle = ({ on, onToggle, status, hint, onReconnect }: {
   );
 };
 
+// The seconds left until `until` (a Date.now() time), ticking on its own: a
+// reconnect countdown re-renders this number, not the whole session view
+// twice a second, for as long as a server stays down.
+const SecondsLeft = ({ until }: { until: number }) => {
+  const left = () => Math.max(0, Math.ceil((until - Date.now()) / 1000));
+  const [secs, setSecs] = useState(left);
+  useEffect(() => {
+    setSecs(left());
+    const t = setInterval(() => setSecs(left()), 250);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [until]);
+  return <>{secs}</>;
+};
+
 // The title bar of a tool panel with a Dedicated toggle (SFTP, Port
-// Forwarding): the title, the toggle, then the panel's buttons (SFTP's Mirror),
-// full screen and close. In a narrow panel not all of it fits. What gives way,
-// in this order: the title shortens ("SFTP", "Ports"), the title goes, and
-// only then does Mirror lose its word. So the word is there whenever there is
-// room for it. The bar measures itself instead of using fixed widths, because
-// the toggle is wider while its status dot shows and the text's width depends
-// on the font.
+// Forwarding): the title, the toggle, then the panel's buttons (SFTP's Follow
+// and Mirror), full screen and close. In a narrow panel not all of it fits.
+// What gives way, in this order: the title shortens ("SFTP", "Ports"), the
+// title goes, and only then do Follow and Mirror lose their words. So the
+// words are there whenever there is room for them. The bar measures itself
+// instead of using fixed widths, because the toggle is wider while its status
+// dot shows and the text's width depends on the font.
 const TITLE_BAR_GAP = 12; // gap-3 between the title, the toggle and the buttons
-const MIRROR_WORD_GAP = 6; // gap-1.5 between Mirror's icon and its word
+const WORD_GAP = 6; // gap-1.5 between a button's icon and its word
 const TITLE_BAR_TEXT = "text-[10px] font-bold uppercase tracking-wider";
-interface TitleBarFit { title: "full" | "short" | "none"; mirrorWord: boolean }
+interface TitleBarFit { title: "full" | "short" | "none"; words: boolean }
 const TITLE_BAR_FITS: TitleBarFit[] = [
-  { title: "full", mirrorWord: true },
-  { title: "short", mirrorWord: true },
-  { title: "none", mirrorWord: true },
-  { title: "short", mirrorWord: false },
-  { title: "none", mirrorWord: false },
+  { title: "full", words: true },
+  { title: "short", words: true },
+  { title: "none", words: true },
+  { title: "short", words: false },
+  { title: "none", words: false },
 ];
-const ToolTitleBar = ({ title, shortTitle, toggle, mirror, extra, onClose }: {
+const ToolTitleBar = ({ title, shortTitle, toggle, follow, mirror, extra, onClose }: {
   title: string;
   shortTitle: string;
   toggle: React.ReactNode;
+  /** SFTP's Follow button (the remote pane follows the terminal's folder); the other panels have none. */
+  follow?: { on: boolean; onToggle: () => void };
   /** SFTP's Mirror button; the other panels have none. */
   mirror?: { on: boolean; disabled: boolean; onToggle: () => void };
   /** Buttons between Mirror and Close (full screen). */
@@ -202,9 +220,10 @@ const ToolTitleBar = ({ title, shortTitle, toggle, mirror, extra, onClose }: {
   const barRef = useRef<HTMLDivElement | null>(null);
   const toggleRef = useRef<HTMLSpanElement | null>(null);
   const buttonsRef = useRef<HTMLDivElement | null>(null);
-  // Never shown: they only give the three texts' widths.
+  // Never shown: they only give the texts' widths.
   const fullTitleRef = useRef<HTMLSpanElement | null>(null);
   const shortTitleRef = useRef<HTMLSpanElement | null>(null);
+  const followWordRef = useRef<HTMLSpanElement | null>(null);
   const mirrorWordRef = useRef<HTMLSpanElement | null>(null);
   const [fitIndex, setFitIndex] = useState(0);
   const fit = TITLE_BAR_FITS[fitIndex];
@@ -218,12 +237,13 @@ const ToolTitleBar = ({ title, shortTitle, toggle, mirror, extra, onClose }: {
       const style = getComputedStyle(bar);
       const room = bar.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
       if (!(room > 0)) return; // not laid out
-      const word = mirrorWordRef.current ? width(mirrorWordRef.current) + MIRROR_WORD_GAP : 0;
-      const iconButtons = width(buttons) - (fitRef.current.mirrorWord ? word : 0);
+      const wordOf = (el: HTMLElement | null) => (el ? width(el) + WORD_GAP : 0);
+      const word = wordOf(followWordRef.current) + wordOf(mirrorWordRef.current);
+      const iconButtons = width(buttons) - (fitRef.current.words ? word : 0);
       const titles = { full: width(fullTitleRef.current), short: width(shortTitleRef.current), none: 0 };
       const needed = (f: TitleBarFit) =>
         (f.title === "none" ? 0 : titles[f.title] + TITLE_BAR_GAP)
-        + width(toggleBox) + TITLE_BAR_GAP + iconButtons + (f.mirrorWord ? word : 0);
+        + width(toggleBox) + TITLE_BAR_GAP + iconButtons + (f.words ? word : 0);
       // A pixel to spare, so rounding never leaves the last one a hair too wide.
       const first = TITLE_BAR_FITS.findIndex((f) => needed(f) + 1 <= room);
       setFitIndex(first === -1 ? TITLE_BAR_FITS.length - 1 : first);
@@ -244,6 +264,24 @@ const ToolTitleBar = ({ title, shortTitle, toggle, mirror, extra, onClose }: {
       )}
       <span ref={toggleRef} className="shrink-0 whitespace-nowrap">{toggle}</span>
       <div ref={buttonsRef} className="ml-auto flex items-center gap-2 shrink-0">
+        {follow && (
+          <button
+            onClick={follow.onToggle}
+            aria-pressed={follow.on}
+            aria-label="Follow terminal folder"
+            title={follow.on
+              ? "Following the terminal: the remote files go to the folder the terminal is in. Click to stop."
+              : "Follow the terminal: the remote files go to the folder the terminal is in"}
+            className={`h-6 px-2 rounded border flex items-center gap-1.5 ${TITLE_BAR_TEXT} transition-all ${
+              follow.on
+                ? 'text-primary bg-primary/10 border-primary/30'
+                : 'text-zinc-400 border-white/10 hover:text-white hover:bg-white/5'
+            }`}
+          >
+            <FolderSync size={12} className="shrink-0" />
+            {fit.words && <span>Follow</span>}
+          </button>
+        )}
         {mirror && (
           <button
             onClick={mirror.onToggle}
@@ -260,7 +298,7 @@ const ToolTitleBar = ({ title, shortTitle, toggle, mirror, extra, onClose }: {
             }`}
           >
             <FolderUp size={12} className="shrink-0" />
-            {fit.mirrorWord && <span>Mirror</span>}
+            {fit.words && <span>Mirror</span>}
           </button>
         )}
         {extra}
@@ -271,6 +309,7 @@ const ToolTitleBar = ({ title, shortTitle, toggle, mirror, extra, onClose }: {
       <div aria-hidden className="absolute left-0 top-0 invisible pointer-events-none whitespace-nowrap flex gap-4">
         <span ref={fullTitleRef} className={TITLE_BAR_TEXT}>{title}</span>
         <span ref={shortTitleRef} className={TITLE_BAR_TEXT}>{shortTitle}</span>
+        {follow && <span ref={followWordRef} className={TITLE_BAR_TEXT}>Follow</span>}
         {mirror && <span ref={mirrorWordRef} className={TITLE_BAR_TEXT}>Mirror</span>}
       </div>
     </div>
@@ -295,6 +334,16 @@ function nextTerminalNumber(terminals: { title: string; baseTitle?: string; cont
   return `${n}`;
 }
 
+// A server's on-connect commands as they are typed: a line each, blank
+// lines left out, each sent with Enter.
+function onConnectText(commands: string): string {
+  return commands
+    .split(/\r?\n/)
+    .map((l) => l.trimEnd())
+    .filter((l) => l.trim().length > 0)
+    .join('\n') + '\n';
+}
+
 // Servers whose new terminals log in on their own (issue #230): this device's
 // choice, by the server's sync id, never synced.
 const OWN_LOGIN_KEY = "submarine-terminal-own-login";
@@ -315,6 +364,27 @@ function writeOwnLogin(uuid: string, on: boolean) {
   } catch {
     // Best-effort, like the other per-device choices.
   }
+}
+
+// SFTP's Follow (#245): the remote pane goes to the folder the active
+// terminal's shell reports. Off until turned on; this device's choice, for
+// every server tab, which hear of a change through FOLLOW_EVENT.
+const FOLLOW_KEY = "submarine-sftp-follow-terminal";
+const FOLLOW_EVENT = "submarine-sftp-follow-changed";
+function readFollow(): boolean {
+  try {
+    return localStorage.getItem(FOLLOW_KEY) === "on";
+  } catch {
+    return false;
+  }
+}
+function writeFollow(on: boolean) {
+  try {
+    localStorage.setItem(FOLLOW_KEY, on ? "on" : "off");
+  } catch {
+    // Best-effort: the open tabs still hear of it.
+  }
+  window.dispatchEvent(new CustomEvent<boolean>(FOLLOW_EVENT, { detail: on }));
 }
 
 // `displayName`: the session tab's name, which the user may have changed
@@ -643,11 +713,13 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
     .split(/\r?\n/)
     .map((l: string) => l.trimEnd())
     .filter((l: string) => l.trim().length > 0);
-  const onShellReadyFor = (terminalId: string) =>
-    terminalId === startupTerminalId && startupCommands.length > 0
+  const onShellReadyFor = (terminalId: string) => {
+    const container = terminals.find(t => t.id === terminalId)?.container;
+    const gets = terminalId === startupTerminalId || (!!session.runOnConnectEvery && !container);
+    return gets && startupCommands.length > 0
       ? () => {
-          if (startupRanForEpochRef.current === connectionEpoch) return;
-          startupRanForEpochRef.current = connectionEpoch;
+          if (startupRanForEpochRef.current.get(terminalId) === connectionEpoch) return;
+          startupRanForEpochRef.current.set(terminalId, connectionEpoch);
           // Typed line by line, without escape sequences or other control
           // characters (a tab stays): the commands can come from anyone the
           // profile is shared with, and one could press keys nobody saw in
@@ -676,27 +748,30 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           // Someone this profile is shared with set or changed these
           // commands and this device hasn't allowed them: ask, never type
           // them unasked. Cancel has the focus, so a stray Enter is a no.
-          // The OK counts only for the text shown (`runOnConnect`): when the
-          // commands changed again meanwhile, it's refused, and the new
-          // ones are shown.
-          const ask = (text: string) => confirmRef.current({
-            title: "Run the on-connect commands?",
-            message: `Someone you share this profile with set these commands to run when you connect to ${session.serverName}:\n\n${text.trimEnd()}\n\nThey would be typed into your terminal on that server.`,
-            okLabel: "Allow and run",
-            cancelLabel: "Not now",
-            safeDefault: true,
-          }).then(async (ok) => {
+          // The OK counts only for what was shown (the text, and whether they
+          // go into each new terminal): when the commands changed again
+          // meanwhile, it's refused, and the new ones are shown. The answer is
+          // the text allowed, or null.
+          const ask = async (text: string, every: boolean): Promise<string | null> => {
+            const ok = await confirmRef.current({
+              title: "Run the on-connect commands?",
+              message: `Someone you share this profile with set these commands to run when you connect to ${session.serverName}:\n\n${text.trimEnd()}\n\nThey would be typed into your terminal on that server${every ? ", and into each new terminal you open there" : ""}.`,
+              okLabel: "Allow and run",
+              cancelLabel: "Not now",
+              safeDefault: true,
+            });
             if (!ok) {
               addLog(`On-connect commands for ${session.serverName} not run: they are waiting for your OK.`, "info");
-              return;
+              return null;
             }
             try {
-              await invoke("allow_held", { serverId: session.serverId, items: ["run_on_connect"], runOnConnect: text });
+              await invoke("allow_held", { serverId: session.serverId, items: ["run_on_connect"], runOnConnect: text, runOnConnectEvery: every });
               window.dispatchEvent(new Event("submarine-held-changed"));
+              return text;
             } catch (e) {
               if (!String(e).includes("HELD_CHANGED")) {
                 addLog(`ALLOW_FAILED: ${e}`, "error");
-                return;
+                return null;
               }
               window.dispatchEvent(new Event("submarine-held-changed"));
               addLog(`The on-connect commands for ${session.serverName} were changed again. Look at them again before you allow them.`, "warn");
@@ -705,21 +780,24 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                 server = ((await invoke("get_servers")) as any[]).find((s) => s.id === session.serverId);
               } catch (e2) {
                 addLog(`ALLOW_FAILED: ${e2}`, "error");
-                return;
+                return null;
               }
               const now: string = server?.run_on_connect || "";
-              if (!now.trim()) return;
+              if (!now.trim()) return null;
               // Still held: ask about the new text. Not held any more: it was
               // allowed meanwhile, or changed on this device.
-              if ((server?.held || []).includes("run_on_connect")) ask(now);
-              else typeThem(now);
-              return;
+              return (server?.held || []).includes("run_on_connect") ? ask(now, !!server?.run_on_connect_every) : now;
             }
-            typeThem(text);
-          });
-          ask(session.runOnConnect || "");
+          };
+          let asked = onConnectAskRef.current;
+          if (!asked || asked.epoch !== connectionEpoch) {
+            asked = { epoch: connectionEpoch, answer: ask(session.runOnConnect || "", !!session.runOnConnectEvery) };
+            onConnectAskRef.current = asked;
+          }
+          void asked.answer.then((text) => { if (text !== null) typeThem(text); });
         }
       : undefined;
+  };
   const openContainerTerminal = (containerName: string, useSudo: boolean) => {
     const newId = `${session.id}-term-${Date.now()}`;
     setTerminals(prev => [...prev, {
@@ -740,6 +818,27 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
 
   // New terminals of this server log in on their own (its choice on this device).
   const [ownLoginDefault, setOwnLoginDefault] = useState(() => readOwnLogin(session.serverUuid));
+  // SFTP's Follow, and the folder each terminal's shell last reported (a
+  // container's terminal reports none: its folders aren't the server's).
+  const [follow, setFollow] = useState(readFollow);
+  const followRef = useRef(follow);
+  followRef.current = follow;
+  useEffect(() => {
+    const sync = (e: Event) => setFollow(!!(e as CustomEvent<boolean>).detail);
+    window.addEventListener(FOLLOW_EVENT, sync);
+    return () => window.removeEventListener(FOLLOW_EVENT, sync);
+  }, []);
+  const termFoldersRef = useRef(new Map<string, ShellFolderState>());
+  const [, setFolderTick] = useState(0);
+  const onTerminalFolder = useCallback((terminalId: string, path: string, host: string) => {
+    const next = nextShellFolder(termFoldersRef.current.get(terminalId), path, host);
+    if (!next) return;
+    termFoldersRef.current.set(terminalId, next);
+    if (followRef.current) setFolderTick((n) => n + 1);
+  }, []);
+  // What the SFTP panel follows: the active terminal's folder, null while its
+  // shell hasn't said, undefined while Follow is off.
+  const followFolder = follow ? (termFoldersRef.current.get(activeTab) ?? null) : undefined;
   // Bubble our terminals + active-tab up to the parent (App) whenever
   // they change so the Wall pinboard and any other App-level consumers
   // don't have to duplicate the per-session terminal book-keeping.
@@ -774,6 +873,13 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
     if (isActiveView && !was) requestTerminalFocus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isActiveView]);
+  // Connected again: the terminal refused the focus while it was down, and
+  // the Reconnect button that had it is gone. The terminal keeps its guards:
+  // a tab behind others, or a field in use, keeps the focus where it is.
+  useEffect(() => {
+    if (status === 'connected') requestTerminalFocus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status]);
 
   const [activeTool, setActiveTool] = useState<'sftp' | 'tunnels' | 'mirrors' | 'cmds' | 'info' | null>(null);
 
@@ -886,12 +992,41 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // alone. Reset (double-click a divider) flattens back to all-equal.
   const [splitRatios, setSplitRatios] = useState<number[]>([]);
   const paneAreaRef = useRef<HTMLDivElement | null>(null);
-  // "+" button's secondary menu — surfaced via right-click / long-press
-  // so the primary click stays a fast "new tab" without stealing the
-  // advanced flows (split view, compare across servers). Coordinates are
-  // window-space, matching the pattern used by the session tab menu at
-  // App level.
-  const [plusMenu, setPlusMenu] = useState<{ x: number; y: number } | null>(null);
+  // "+" button's secondary menu — the arrow beside "+", or a right-click /
+  // long-press on "+", so the primary click stays a fast "new tab" without
+  // stealing the advanced flows (split view, compare across servers).
+  // Coordinates are window-space, matching the pattern used by the session
+  // tab menu at App level. Opened from the keyboard, its first item takes
+  // the focus.
+  const [plusMenu, setPlusMenu] = useState<{ x: number; y: number; fromKeyboard: boolean } | null>(null);
+  const plusGroupRef = useRef<HTMLDivElement>(null);
+  const plusArrowRef = useRef<HTMLButtonElement>(null);
+  const plusMenuRef = useRef<HTMLDivElement>(null);
+  const openPlusMenu = (fromKeyboard: boolean) => {
+    const r = plusGroupRef.current?.getBoundingClientRect();
+    if (r) setPlusMenu({ x: r.left, y: r.bottom + 4, fromKeyboard });
+  };
+  // A menu opened from the keyboard gives the focus back to the arrow; one
+  // opened with the mouse leaves the focus where it was.
+  const closePlusMenu = () => {
+    const back = !!plusMenu?.fromKeyboard && !!plusMenuRef.current?.contains(document.activeElement);
+    setPlusMenu(null);
+    if (back) plusArrowRef.current?.focus({ preventScroll: true });
+  };
+  // Escape closes it wherever the focus is: after a right-click the focus
+  // is still in the terminal, which would send the Escape to the shell.
+  useEffect(() => {
+    if (!plusMenu) return;
+    if (plusMenu.fromKeyboard) plusMenuRef.current?.querySelector<HTMLElement>('[role^="menuitem"]')?.focus({ preventScroll: true });
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      e.stopPropagation();
+      closePlusMenu();
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [plusMenu]);
   // A terminal tab's own menu (right-click, or a double-click straight into
   // its name editor). A new title goes into `terminals`, so the Wall and
   // split headers show it too.
@@ -1047,7 +1182,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
     return () => { live = false; };
   }, [plusMenu, ai.enabled, isNarrow]);
   const startAiBeside = (tool: { id: string; label: string }) => {
-    setPlusMenu(null);
+    closePlusMenu();
     const name = displayName ?? session.serverName;
     launchAiTool(tool.id, tool.label, session.id, (tabId) => {
       invoke("ai_share", { tabId, sessionId: session.id, name })
@@ -1064,9 +1199,15 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // `dzdo su -`): typed into the first terminal once its shell is up — on
   // the first connect, and again after a reconnect, whose fresh login has
   // lost what they did, as MobaXterm runs a session's command on each start.
-  // Once per connection: the terminal mounting again (into or out of a
-  // split) doesn't type them a second time.
-  const startupRanForEpochRef = useRef(-1);
+  // With the server's "each new terminal" (#256), every terminal of the tab
+  // but a container's gets them too. Once per terminal per connection: the
+  // terminal mounting again (into or out of a split) doesn't type them a
+  // second time. By terminal id: the connection they were typed for.
+  const startupRanForEpochRef = useRef<Map<string, number>>(new Map());
+  // When they are held (set by someone this profile is shared with), one
+  // question per connection for all of the tab's terminals: the text it
+  // allowed, or null.
+  const onConnectAskRef = useRef<{ epoch: number; answer: Promise<string | null> } | null>(null);
   // Asks before typing on-connect commands someone else set in a shared
   // profile. Read through a ref: the shell-ready callback outlives renders.
   const confirm = useConfirm();
@@ -1347,15 +1488,6 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
     };
   }, [session.id, session.serverId]);
 
-  // Force a re-render once per second so the countdown text in the banner
-  // stays current without re-allocating timer state on every render.
-  const [, forceTick] = useState(0);
-  useEffect(() => {
-    if (!nextReconnectAt) return;
-    const t = setInterval(() => forceTick((n) => n + 1), 500);
-    return () => clearInterval(t);
-  }, [nextReconnectAt]);
-
   const scheduleReconnect = (attempt: number) => {
     if (reconnectTimerRef.current) {
       clearTimeout(reconnectTimerRef.current);
@@ -1626,7 +1758,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // slim banner.
   if ((reconnectAttempt === 0 || !everConnected) && (status === 'connecting' || status === 'failed')) {
     const retryWaiting = reconnectAttempt > 0 && nextReconnectAt !== null;
-    const retryIn = nextReconnectAt ? Math.max(0, Math.ceil((nextReconnectAt - Date.now()) / 1000)) : 0;
+    const retryIn = <SecondsLeft until={nextReconnectAt ?? 0} />;
     return (
       <div className="relative flex-1 flex flex-col p-4 sm:p-8 bg-[#0a0a0c] text-white overflow-hidden">
         <div className="max-w-2xl w-full mx-auto flex-1 flex flex-col min-h-0">
@@ -1643,7 +1775,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               }`}
               aria-hidden="true"
             >
-              {status === 'connecting' ? <Loader2 size={16} className="animate-spin" /> : <AlertTriangle size={16} />}
+              {status === 'connecting' ? <Loader2 size={16} className="animate-spin-brief" /> : <AlertTriangle size={16} />}
             </div>
             <div className="min-w-0 flex-1">
               <h2 className="text-sm font-semibold text-zinc-100 truncate" title={session.serverName}>
@@ -1848,40 +1980,51 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           );
         })}
 
-          {/* Single "+" affordance for all terminal-creation flavours.
-              Click adds a plain tab (the 90% case). The right-click menu
-              — also reachable via long-press on touch — surfaces the
-              advanced modes: split-with-new-pane, un-split, and a terminal
-              with its own login (once, or always for this server). That
-              keeps the tab strip visually calm (one small button, no
-              badges, no orientation glyphs stealing attention) while
-              still exposing the power features via a discoverable
-              secondary gesture. */}
-          <button
-            onClick={() => {
-              const newId = `${session.id}-term-${Date.now()}`;
-              setTerminals(prev => [...prev, { id: newId, title: nextTerminalNumber(prev), ownLogin: ownLoginDefault }]);
-              setActiveTab(newId);
-            }}
-            onContextMenu={(e) => {
-              e.preventDefault();
-              const rect = e.currentTarget.getBoundingClientRect();
-              setPlusMenu({ x: rect.left, y: rect.bottom + 4 });
-            }}
-            className="h-10 w-10 sm:h-8 sm:w-8 ml-1 shrink-0 rounded-lg flex items-center justify-center text-zinc-500 hover:bg-white/10 hover:text-white transition-all border border-dashed border-white/10 relative"
-            title="New terminal tab · right-click for more"
-          >
-            <Plus size={14} />
-            {splitTerminals.length >= 2 && (
-              <span
-                className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-1 rounded-full bg-primary text-[9px] font-bold text-black flex items-center justify-center leading-none"
-                aria-hidden="true"
-                title={`Split active (${splitTerminals.length} panes)`}
-              >
-                {splitTerminals.length}
-              </span>
-            )}
-          </button>
+          {/* "+" for all terminal-creation flavours. A click adds a plain
+              tab (the 90% case). The arrow beside it — or a right-click /
+              long-press on "+" — opens the menu with the advanced modes:
+              split-with-new-pane, un-split, and a terminal with its own
+              login (once, or always for this server). A right-click alone
+              went unnoticed (#243); the arrow also lets the keyboard in. */}
+          <div ref={plusGroupRef} className="ml-1 shrink-0 flex items-stretch rounded-lg border border-dashed border-white/10">
+            <button
+              onClick={() => {
+                const newId = `${session.id}-term-${Date.now()}`;
+                setTerminals(prev => [...prev, { id: newId, title: nextTerminalNumber(prev), ownLogin: ownLoginDefault }]);
+                setActiveTab(newId);
+              }}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                openPlusMenu(false);
+              }}
+              className="h-10 w-10 sm:h-8 sm:w-8 rounded-l-lg flex items-center justify-center text-zinc-500 hover:bg-white/10 hover:text-white transition-all relative"
+              title="New terminal"
+              aria-label="New terminal"
+            >
+              <Plus size={14} />
+              {splitTerminals.length >= 2 && (
+                <span
+                  className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-1 rounded-full bg-primary text-[9px] font-bold text-black flex items-center justify-center leading-none"
+                  aria-hidden="true"
+                  title={`Split active (${splitTerminals.length} panes)`}
+                >
+                  {splitTerminals.length}
+                </span>
+              )}
+            </button>
+            <button
+              ref={plusArrowRef}
+              // A click from the keyboard (Enter, Space) has no mouse detail.
+              onClick={(e) => openPlusMenu(e.detail === 0)}
+              aria-haspopup="menu"
+              aria-expanded={!!plusMenu}
+              aria-label="More terminal options"
+              title="More terminal options"
+              className="h-10 w-7 sm:h-8 sm:w-5 rounded-r-lg border-l border-dashed border-white/10 flex items-center justify-center text-zinc-500 hover:bg-white/10 hover:text-white transition-all"
+            >
+              <ChevronDown size={12} />
+            </button>
+          </div>
           {/* Split: another shell on this server beside the one on screen
               (watch a log in one, work in the other). The menu has the rest:
               an open tab beside this one, flip, end the split. */}
@@ -1890,8 +2033,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               onClick={splitWithNew}
               onContextMenu={(e) => {
                 e.preventDefault();
-                const rect = e.currentTarget.getBoundingClientRect();
-                setPlusMenu({ x: rect.left, y: rect.bottom + 4 });
+                openPlusMenu(false);
               }}
               className={`h-10 w-10 sm:h-8 sm:w-8 shrink-0 rounded-lg flex items-center justify-center transition-all border ${
                 splitOn
@@ -2006,9 +2148,9 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
       </div>
       )}
 
-      {/* "+" secondary menu — right-click / long-press on the plus
-          button. Kept intentionally short: same-server "split with new
-          pane", the h/v orientation flip, and un-split. Cross-server
+      {/* "+" secondary menu — the arrow beside "+", or a right-click /
+          long-press on it. Kept intentionally short: same-server "split
+          with new pane", the h/v orientation flip, and un-split. Cross-server
           split lives on the session tab strip (right-click any tab
           → the picker); one entry point per concept keeps the menu
           scannable. Everything else is one primary click on "+". */}
@@ -2016,21 +2158,36 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
         <>
           <div
             className="fixed inset-0 z-[9998]"
-            onClick={() => setPlusMenu(null)}
-            onContextMenu={(e) => { e.preventDefault(); setPlusMenu(null); }}
+            onClick={() => closePlusMenu()}
+            onContextMenu={(e) => { e.preventDefault(); closePlusMenu(); }}
           />
           <div
+            ref={plusMenuRef}
+            role="menu"
+            aria-label="Terminal options"
+            onKeyDown={(e) => {
+              const items = Array.from(plusMenuRef.current?.querySelectorAll<HTMLElement>('[role^="menuitem"]') ?? []);
+              const i = items.indexOf(document.activeElement as HTMLElement);
+              const go = (n: number) => { e.preventDefault(); items[(n + items.length) % items.length]?.focus(); };
+              if (e.key === 'ArrowDown') go(i + 1);
+              else if (e.key === 'ArrowUp') go(i < 0 ? -1 : i - 1);
+              else if (e.key === 'Home') go(0);
+              else if (e.key === 'End') go(-1);
+              else if (e.key === 'Tab') { e.preventDefault(); closePlusMenu(); }
+            }}
             style={{ left: Math.min(plusMenu.x, window.innerWidth - 260), top: Math.min(plusMenu.y, window.innerHeight - 220) }}
             className="fixed z-[9999] w-[240px] bg-[#15151a] border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
           >
             {!isCompact && (
               <>
                 <button
+                  role="menuitem"
+                  tabIndex={-1}
                   onClick={() => {
-                    setPlusMenu(null);
+                    closePlusMenu();
                     splitWithNew();
                   }}
-                  className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left"
+                  className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] focus-visible:bg-white/[0.06] outline-none text-zinc-200 hover:text-white text-left"
                 >
                   {splitOrientation === "h" ? <Columns size={13} className="text-primary/70" /> : <Rows size={13} className="text-primary/70" />}
                   <span className="flex-1">{splitOn ? `Add pane (${splitTerminals.length + 1}-way split)` : "Split with new pane"}</span>
@@ -2042,7 +2199,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                     <button
                       key={t.id}
                       onClick={() => {
-                        setPlusMenu(null);
+                        closePlusMenu();
                         splitWith(t.id);
                       }}
                       className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-300 hover:text-white text-left"
@@ -2052,23 +2209,27 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                     </button>
                   ))}
                 <button
+                  role="menuitem"
+                  tabIndex={-1}
                   onClick={() => {
                     setSplitOrientation(o => o === "h" ? "v" : "h");
-                    setPlusMenu(null);
+                    closePlusMenu();
                   }}
-                  className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-300 hover:text-white text-left"
+                  className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] focus-visible:bg-white/[0.06] outline-none text-zinc-300 hover:text-white text-left"
                 >
                   {splitOrientation === "h" ? <Rows size={13} className="text-zinc-500" /> : <Columns size={13} className="text-zinc-500" />}
                   <span className="flex-1">Flip orientation ({splitOrientation === "h" ? "→ vertical" : "→ horizontal"})</span>
                 </button>
                 {splitOn && (
                   <button
+                    role="menuitem"
+                    tabIndex={-1}
                     onClick={() => {
                       setSplitTerminals([]);
                       setSplitRatios([]);
-                      setPlusMenu(null);
+                      closePlusMenu();
                     }}
-                    className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-300 hover:text-white text-left"
+                    className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] focus-visible:bg-white/[0.06] outline-none text-zinc-300 hover:text-white text-left"
                   >
                     <X size={13} className="text-zinc-500" />
                     <span className="flex-1">Exit split (keep terminals)</span>
@@ -2081,13 +2242,15 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                 server on this device. */}
             <>
                 <button
+                  role="menuitem"
+                  tabIndex={-1}
                   onClick={() => {
-                    setPlusMenu(null);
+                    closePlusMenu();
                     const newId = `${session.id}-term-${Date.now()}`;
                     setTerminals(prev => [...prev, { id: newId, title: nextTerminalNumber(prev), ownLogin: true }]);
                     setActiveTab(newId);
                   }}
-                  className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left"
+                  className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] focus-visible:bg-white/[0.06] outline-none text-zinc-200 hover:text-white text-left"
                 >
                   <LogIn size={13} className="text-primary/70" />
                   <span className="flex-1">New terminal with its own login</span>
@@ -2096,14 +2259,15 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                   <button
                     role="menuitemcheckbox"
                     aria-checked={ownLoginDefault}
+                    tabIndex={-1}
                     onClick={() => {
                       const on = !ownLoginDefault;
                       writeOwnLogin(session.serverUuid, on);
                       setOwnLoginDefault(on);
-                      setPlusMenu(null);
+                      closePlusMenu();
                     }}
                     title="Each new terminal logs in to the server again, as a new connection would, instead of sharing this tab's connection. For servers that tie rights to the login (CA Access Control, for one). Kept on this device."
-                    className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-300 hover:text-white text-left"
+                    className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] focus-visible:bg-white/[0.06] outline-none text-zinc-300 hover:text-white text-left"
                   >
                     {ownLoginDefault ? <Check size={13} className="text-primary" /> : <span className="w-[13px] shrink-0" />}
                     <span className="flex-1">Always for this server</span>
@@ -2253,23 +2417,24 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
         (() => {
           const isAttempting = reconnectAttempt > 0 && status === 'connecting';
           const isWaiting = reconnectAttempt > 0 && nextReconnectAt !== null;
-          const countdown = nextReconnectAt
-            ? Math.max(0, Math.ceil((nextReconnectAt - Date.now()) / 1000))
-            : 0;
+          const secs = <SecondsLeft until={nextReconnectAt ?? 0} />;
           const tone =
             isAttempting ? "bg-indigo-500/10 border-indigo-500/30 text-indigo-300" :
             isWaiting    ? "bg-amber-500/10 border-amber-500/30 text-amber-300" :
                            "bg-red-500/10 border-red-500/30 text-red-400";
+          // The tooltip's heading has no seconds: a tooltip doesn't follow
+          // the countdown.
           const heading =
             isAttempting ? `Reconnecting · attempt ${reconnectAttempt}` :
-            isWaiting    ? `Auto-reconnect in ${countdown}s · attempt ${reconnectAttempt}` :
+            isWaiting    ? `Auto-reconnect · attempt ${reconnectAttempt}` :
                            "Session disconnected";
+          const shownHeading = isWaiting ? <>Auto-reconnect in {secs}s · attempt {reconnectAttempt}</> : heading;
           // A phone's banner stays one line: the short form of the heading
           // (cut with … if even that doesn't fit, never wrapped), no reason,
           // and icon buttons. The wide one is unchanged.
           const shortHeading =
             isAttempting ? `Reconnecting · #${reconnectAttempt}` :
-            isWaiting    ? `Retry in ${countdown}s · #${reconnectAttempt}` :
+            isWaiting    ? <>Retry in {secs}s · #{reconnectAttempt}</> :
                            "Disconnected";
           const btn = "h-8 min-w-8 sm:h-auto sm:min-h-6 px-2 sm:px-3 sm:py-1 rounded-md text-[10px] font-bold uppercase tracking-wider transition-colors flex items-center justify-center gap-1.5";
           return (
@@ -2280,7 +2445,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                 title={disconnectReason ? `${heading} — ${disconnectReason}` : heading}
               >
                 <span className="sm:hidden">{shortHeading}</span>
-                <span className="hidden sm:inline">{heading}</span>
+                <span className="hidden sm:inline">{shownHeading}</span>
                 {disconnectReason && (
                   <span className="hidden sm:inline opacity-70 normal-case font-normal tracking-normal"> — {disconnectReason}</span>
                 )}
@@ -2382,6 +2547,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                   serverName={session.serverName}
                   ownLogin={t.ownLogin}
                   quickAuth={session.quickAuth}
+                  onFolder={t.container ? undefined : onTerminalFolder}
                 />
                 {/* Takes this pane out of the split; its terminal stays as
                     a tab. Top-right, clear of the divider, shown on hover. */}
@@ -2498,6 +2664,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                     onReconnect={reconnectSftpConn}
                   />
                 }
+                follow={sftpView === 'files' ? { on: follow, onToggle: () => writeFollow(!follow) } : undefined}
                 mirror={{
                   on: sftpView === 'mirror',
                   disabled: !session.serverId,
@@ -2514,6 +2681,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                   profile={profile}
                   mirrorsConfig={parseObjectList(session.mirrors)}
                   view={sftpView}
+                  follow={followFolder}
                 />
               </div>
             </div>
@@ -2569,7 +2737,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
             <InfoPanel
               sessionId={session.id}
               disabled={status !== 'connected'}
-              visible={activeTool === 'info'}
+              visible={activeTool === 'info' && isActiveView}
               onOpenContainerTerminal={openContainerTerminal}
             />
           </div>

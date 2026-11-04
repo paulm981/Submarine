@@ -126,7 +126,7 @@ const PingCard = ({ target }: { target: PingTarget }) => {
   return (
     <div className="bg-[#15151a] border border-white/10 rounded-xl shadow-2xl overflow-hidden">
       <div className="flex items-center gap-2 px-3 pt-2.5 pb-1.5">
-        <span className={`shrink-0 h-2 w-2 rounded-full ${level ? TONE_DOT[LEVEL_TONE[level]] : "bg-zinc-600"} ${level && !stopped ? "animate-pulse" : ""}`} />
+        <span className={`shrink-0 h-2 w-2 rounded-full ${level ? TONE_DOT[LEVEL_TONE[level]] : "bg-zinc-600"} ${level && !stopped ? "animate-pulse-brief" : ""}`} />
         <div className="min-w-0 flex-1">
           <div className="text-[12.5px] font-semibold text-zinc-100 truncate" title={target.name}>{target.name}</div>
           <div className="text-[10.5px] font-mono text-zinc-500 truncate" title={target.host}>{target.host}</div>

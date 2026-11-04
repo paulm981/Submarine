@@ -6,9 +6,9 @@
 // the eye every half second.
 export const sessionDot = (st: string, waiting: boolean): { tone: string; title: string } => ({
   tone:
-    waiting               ? "bg-primary animate-pulse" :
+    waiting               ? "bg-primary animate-pulse-brief" :
     st === "connected"    ? "bg-emerald-400" :
-    st === "connecting"   ? "bg-amber-400 animate-pulse" :
+    st === "connecting"   ? "bg-amber-400 animate-pulse-brief" :
     st === "failed"       ? "bg-rose-500" :
     st === "disconnected" ? "bg-rose-500" :
                             "bg-zinc-500",

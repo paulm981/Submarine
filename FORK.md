@@ -11,7 +11,7 @@ This page covers:
 
 What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
-The fork is based on the original project's **0.4.0**, with every change up to [#249](https://github.com/SinaXhpm/submarine/pull/249) brought in.
+The fork is based on the original project's **0.4.0**, with every change up to [#272](https://github.com/SinaXhpm/submarine/pull/272) brought in.
 
 ## What this fork adds
 
@@ -234,7 +234,8 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | Paste | The webview's clipboard | Read by the app itself, since the webviews on Windows, macOS and Linux refuse the page |
 | Text fields on macOS | Capitalize and correct what's typed | Keep exactly what's typed |
 | Closing a connected session | Always asks | Asks, unless you turn that off in Settings |
-| On-connect commands | Typed once the terminal is open, on the first connect ([#175](https://github.com/SinaXhpm/submarine/pull/175)) | Typed once the shell has printed its login banner, on the first connect and after a reconnect |
+| On-connect commands | Typed once the terminal is open, on the first connect; with "each new terminal" ticked, once into each terminal opened later ([#175](https://github.com/SinaXhpm/submarine/pull/175), [#265](https://github.com/SinaXhpm/submarine/pull/265)) | Typed once the shell has printed its login banner, on the first connect and after a reconnect; with "each new terminal" ticked, into each of the tab's terminals too. Held ones are asked about once for all of them |
+| Terminal output | Events, paced by what the window has drawn ([#263](https://github.com/SinaXhpm/submarine/pull/263)) | Paced the same way, but sent over a binary channel instead of events: on Windows, fewer scripts pass through the window's own thread, which handles its keys too |
 | Walls | One Wall of pinned copies of terminals; a copy sets the terminal's size while it's open ([#180](https://github.com/SinaXhpm/submarine/pull/180)) | Walls of their own, each showing the terminals themselves, so a terminal has one size. Broadcast, saved Walls, and Rows ([#190](https://github.com/SinaXhpm/submarine/pull/190)), which aren't saved with a saved Wall yet |
 | Saved password at a prompt ([#182](https://github.com/SinaXhpm/submarine/pull/182)) | Offers this server's password and every saved login | Offers this server's password and its own login; another saved login only when the prompt names its user. Not in Home's local shells |
 | Terminal colors ([#183](https://github.com/SinaXhpm/submarine/pull/183)) | One scheme per device, or one of your own | The fork's schemes, per device or per server (synced). A scheme of your own is for this device only. "Keep text readable" is on by default |
@@ -261,13 +262,13 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 
 ## Changes in the original project not taken yet
 
-Every change up to [#249](https://github.com/SinaXhpm/submarine/pull/249) is taken. Where the fork takes one differently, the table above says so.
+Every change up to [#272](https://github.com/SinaXhpm/submarine/pull/272) is taken. Where the fork takes one differently, the table above says so.
 
 Not taken yet, for the next sync:
 
 | The original project's change | Why not yet |
 |---|---|
-| [#252](https://github.com/SinaXhpm/submarine/pull/252)–[#265](https://github.com/SinaXhpm/submarine/pull/265): selected text visible again, an arrow beside "+", SFTP Follow, an Android fix, refused RDP logins explained, faster mirrors, SSH channels and SFTP folders, an app that does less when idle, terminal floods held in the app, a phone's keyboard in RDP and VNC, on-connect commands in each new terminal | Merged after this round of syncing started. Several touch the terminal's output path, which the fork changed for lag ([#127](https://github.com/paulm981/Submarine/issues/127)), so they get their own review |
+| [#273](https://github.com/SinaXhpm/submarine/pull/273)–[#295](https://github.com/SinaXhpm/submarine/pull/295): patched dependencies, iOS and a universal Mac app signed in CI, quick unlock opening by itself, a phone key bar, a security batch against hostile servers, russh 0.65, sync after a key change, terminals surviving a split, hidden terminals resting, faster uploads | The next two steps of [#142](https://github.com/paulm981/Submarine/issues/142). The security batch touches what the fork changed most, so it gets its own review |
 
 ## Keeping up with the original project
 

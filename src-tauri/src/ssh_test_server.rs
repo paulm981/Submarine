@@ -52,6 +52,8 @@ pub(crate) struct TestServer {
     pub opened_back: Arc<std::sync::Mutex<Vec<(&'static str, bool)>>>,
     /// A `direct-tcpip` open is never answered (a jump host that hangs).
     stall_direct_tcpip: bool,
+    /// Commands started in all.
+    pub started: Arc<AtomicUsize>,
 }
 
 /// How the test server runs `exec` commands with the local `sh` (unix only).
@@ -139,6 +141,7 @@ impl TestServer {
             }
         }
         let running = Arc::clone(&self.running);
+        let started = Arc::clone(&self.started);
         tokio::spawn(async move {
             let Ok(mut child) = cmd.kill_on_drop(true).spawn() else {
                 let _ = handle.exit_status_request(channel, 127).await;
@@ -146,6 +149,7 @@ impl TestServer {
                 return;
             };
             running.fetch_add(1, Ordering::SeqCst);
+            started.fetch_add(1, Ordering::SeqCst);
             let mut stdin = child.stdin.take().unwrap();
             let mut stdout = child.stdout.take().unwrap();
             let mut stderr = child.stderr.take().unwrap();
@@ -466,6 +470,15 @@ where
     Ok(session)
 }
 
+/// Each way of the in-memory pipe between a test client and server. Both are
+/// russh, whose session loop reads nothing while it writes what is pending:
+/// with a big upload and a big download at once, both ends could wait on a
+/// full pipe for good (a real server, OpenSSH or Dropbear, keeps reading).
+/// Room for all the SSH windows let be on the way (8 MiB a channel from the
+/// server to this app's client, 2 MiB back) keeps them from waiting on each
+/// other; only what is waiting in it takes memory.
+const PIPE: usize = 64 * 1024 * 1024;
+
 /// Run `server` on one end of an in-memory pipe and connect a client with
 /// `client_config` to the other; returns the authenticated client handle.
 pub(crate) async fn connect(
@@ -482,14 +495,7 @@ pub(crate) async fn connect_with_client(
     client_config: client::Config,
     client: TestClient,
 ) -> Result<client::Handle<TestClient>, russh::Error> {
-    // Room for everything both ends may have in flight at once. Unlike a real
-    // server (OpenSSH, Dropbear), which keeps reading while it waits to write,
-    // russh at both ends stops reading while a write waits: with a pipe
-    // smaller than the SSH windows (the client's is 8 MiB), a download and an
-    // upload at once could leave each end waiting on the other for good
-    // (shell_sftp's downloads_at_once_stay_apart stalled on a busy machine).
-    // The pipe only takes memory for what's in it.
-    let (client_io, server_io) = tokio::io::duplex(32 * 1024 * 1024);
+    let (client_io, server_io) = tokio::io::duplex(PIPE);
     serve(server, tweak, server_io);
     client_over(client_io, client_config, client).await
 }
@@ -501,7 +507,7 @@ pub(crate) async fn handshake(
     server: TestServer,
     client_config: client::Config,
 ) -> Result<client::Handle<TestClient>, russh::Error> {
-    let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+    let (client_io, server_io) = tokio::io::duplex(PIPE);
     serve(
         server,
         |c| {

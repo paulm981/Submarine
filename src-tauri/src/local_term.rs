@@ -1,7 +1,7 @@
 //! Terminals on this computer, for the Home view: a shell in a pseudo-terminal
 //! (ConPTY on Windows, openpty elsewhere), started in the user's home folder.
 //! Output reaches the page the way an SSH terminal's does — coalesced, over
-//! the page's channel and paced by what it has drawn (term_output.rs), then
+//! the page's channel and paced by what it has drawn (term_output::pace), then
 //! `terminal-closed-{id}` — so the same TerminalView draws both.
 //!
 //! The page only ever names a shell by id from [`shells`]: what each id runs
@@ -592,8 +592,8 @@ mod pty {
     const FLUSH_WINDOW: Duration = Duration::from_millis(8);
 
     /// Open a terminal for the page: output to `on_output`, paced by what
-    /// the page has drawn (term_output.rs), then a line saying the shell has
-    /// ended and `terminal-closed-{id}`.
+    /// the page has drawn (term_output::pace), then a line saying the shell
+    /// has ended and `terminal-closed-{id}`.
     pub fn open(
         app: &tauri::AppHandle,
         terms: &LocalTerms,
@@ -603,9 +603,9 @@ mod pty {
         rows: u16,
         on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
     ) -> Result<(), String> {
-        let output = std::sync::Arc::new(crate::term_output::OutputSink::open(id, on_output));
+        let (output, batches) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let end_output = output.clone();
-        let (end_app, end_id) = (app.clone(), id.to_string());
+        let end_id = id.to_string();
         let ai_app = app.clone();
         // A number past four digits in a control sequence can freeze the
         // page; it's cut down here as for an SSH terminal (term_filter.rs).
@@ -620,21 +620,27 @@ mod pty {
             move |batch: &mut Vec<u8>| {
                 limiter.filter(batch, &mut cut);
                 batch.clear();
-                output.push(&mut cut);
+                if !cut.is_empty() {
+                    let _ = output.send(std::mem::take(&mut cut));
+                }
             },
             move || {
                 // An AI tab's access ends with its tool.
                 if let Some(ai) = ai_app.try_state::<crate::ai::AiState>() {
                     ai.end_tab(&end_id);
                 }
-                end_output.push(
-                    &mut b"\r\n\x1b[2m[The shell has ended. Close this tab, or open a new one with +.]\x1b[0m\r\n".to_vec(),
+                let _ = end_output.send(
+                    b"\r\n\x1b[2m[The shell has ended. Close this tab, or open a new one with +.]\x1b[0m\r\n".to_vec(),
                 );
-                end_output.finish(move || {
-                    let _ = end_app.emit(&format!("terminal-closed-{}", end_id), serde_json::json!({}));
-                });
+                // The end: what's left goes, then terminal-closed.
+                let _ = end_output.send(Vec::new());
             },
-        )
+        )?;
+        let (app, id) = (app.clone(), id.to_string());
+        tauri::async_runtime::spawn(crate::term_output::pace(id.clone(), on_output, batches, move || {
+            let _ = app.emit(&format!("terminal-closed-{id}"), serde_json::json!({}));
+        }));
+        Ok(())
     }
 
     /// Start `shell` in `cwd` in a new pseudo-terminal and run it: each
@@ -998,6 +1004,8 @@ pub async fn local_terminal_write(terms: tauri::State<'_, LocalTerms>, terminal_
     }
     #[cfg(not(target_os = "android"))]
     {
+        // Ctrl+C cuts what waits for the page, as in an SSH terminal.
+        crate::ssh_manager::page_keys(&terminal_id, &data);
         pty::write(&terms, &terminal_id, &data)
     }
 }

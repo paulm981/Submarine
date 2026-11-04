@@ -13,6 +13,7 @@ type HeldServer = {
   port?: number;
   protocol?: string;
   run_on_connect?: string;
+  run_on_connect_every?: boolean;
   edited_by?: string | null;
   held?: string[];
 };
@@ -50,7 +51,10 @@ const keptLabel = (server: HeldServer) => (server.protocol === "rdp" ? "RDP" : "
 /** One held item, in words, with the text it would run when there is one. */
 function describe(item: string, server: HeldServer): { what: string; detail?: string } {
   if (item === "run_on_connect") {
-    return { what: "Types these commands into your terminal when you connect", detail: server.run_on_connect || "" };
+    const where = server.run_on_connect_every
+      ? "into your terminal when you connect, and into each new terminal you open"
+      : "into your terminal when you connect";
+    return { what: `Types these commands ${where}`, detail: server.run_on_connect || "" };
   }
   if (item === "autostart") {
     return { what: "Connects by itself when you unlock this profile" };
@@ -106,8 +110,9 @@ function describe(item: string, server: HeldServer): { what: string; detail?: st
 
 export function HeldReview({ servers, onAllow, onKeepSsh, onKeepAi, onClose }: {
   servers: HeldServer[];
-  /** `runOnConnect`: the on-connect text shown, when those commands are among the items. */
-  onAllow: (serverId: number, items: string[], runOnConnect?: string) => Promise<void>;
+  /** `runOnConnect`: the on-connect text shown, when those commands are among the
+   *  items; `runOnConnectEvery`: whether they were shown as going into each new terminal. */
+  onAllow: (serverId: number, items: string[], runOnConnect?: string, runOnConnectEvery?: boolean) => Promise<void>;
   /** A held switch to telnet or VNC, declined: the server stays SSH (or RDP), everywhere. */
   onKeepSsh?: (serverId: number) => Promise<void>;
   /** A move that lets the AI do more, declined: the server asks every time here. */
@@ -137,7 +142,9 @@ export function HeldReview({ servers, onAllow, onKeepSsh, onKeepAi, onClose }: {
   const allow = async (server: HeldServer, items: string[]) => {
     const commands = items.length === 0 ? (server.held || []).includes("run_on_connect") : items.includes("run_on_connect");
     setBusy(true);
-    try { await onAllow(server.id, items, commands ? server.run_on_connect || "" : undefined); } finally { setBusy(false); }
+    try {
+      await onAllow(server.id, items, commands ? server.run_on_connect || "" : undefined, commands ? !!server.run_on_connect_every : undefined);
+    } finally { setBusy(false); }
   };
   const keepAi = async (serverId: number) => {
     if (!onKeepAi) return;

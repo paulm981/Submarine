@@ -416,7 +416,13 @@ pub fn open_log_folder() -> Result<(), String> {
             Err(format!("Couldn't show {} in Finder.", target.display()))
         }
     }
-    #[cfg(not(any(target_os = "android", target_os = "macos")))]
+    // On Linux the file manager starts without this app's own WebKit
+    // workarounds (child_env.rs).
+    #[cfg(target_os = "linux")]
+    {
+        crate::child_env::open_detached(&dir).map_err(|e| format!("Couldn't open {}: {e}", dir.display()))
+    }
+    #[cfg(windows)]
     {
         open::that_detached(&dir).map_err(|e| format!("Couldn't open {}: {e}", dir.display()))
     }

