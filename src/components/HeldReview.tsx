@@ -110,8 +110,9 @@ function describe(item: string, server: HeldServer): { what: string; detail?: st
 
 export function HeldReview({ servers, onAllow, onKeepSsh, onKeepAi, onClose }: {
   servers: HeldServer[];
-  /** `runOnConnect`: the on-connect text shown, when those commands are among the items. */
-  onAllow: (serverId: number, items: string[], runOnConnect?: string) => Promise<void>;
+  /** `runOnConnect`: the on-connect text shown, when those commands are among the
+   *  items; `runOnConnectEvery`: whether they were shown as going into each new terminal. */
+  onAllow: (serverId: number, items: string[], runOnConnect?: string, runOnConnectEvery?: boolean) => Promise<void>;
   /** A held switch to telnet or VNC, declined: the server stays SSH (or RDP), everywhere. */
   onKeepSsh?: (serverId: number) => Promise<void>;
   /** A move that lets the AI do more, declined: the server asks every time here. */
@@ -141,7 +142,9 @@ export function HeldReview({ servers, onAllow, onKeepSsh, onKeepAi, onClose }: {
   const allow = async (server: HeldServer, items: string[]) => {
     const commands = items.length === 0 ? (server.held || []).includes("run_on_connect") : items.includes("run_on_connect");
     setBusy(true);
-    try { await onAllow(server.id, items, commands ? server.run_on_connect || "" : undefined); } finally { setBusy(false); }
+    try {
+      await onAllow(server.id, items, commands ? server.run_on_connect || "" : undefined, commands ? !!server.run_on_connect_every : undefined);
+    } finally { setBusy(false); }
   };
   const keepAi = async (serverId: number) => {
     if (!onKeepAi) return;

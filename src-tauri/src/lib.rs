@@ -8095,6 +8095,7 @@ async fn allow_held(
     server_id: i32,
     items: Vec<String>,
     run_on_connect: Option<String>,
+    run_on_connect_every: Option<bool>,
 ) -> Result<usize, String> {
     let (allowed, customs) = {
         let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
@@ -8107,7 +8108,7 @@ async fn allow_held(
             items.into_iter().filter(|i| held.contains(i)).collect()
         };
         let allowing_commands = allowed.iter().any(|i| i == approvals::RUN_ON_CONNECT);
-        approvals::check_seen_run_on_connect(conn, &uuid, allowing_commands, run_on_connect.as_deref())?;
+        approvals::check_seen_run_on_connect(conn, &uuid, allowing_commands, run_on_connect.as_deref(), run_on_connect_every)?;
         if allowed.is_empty() {
             return Ok(0);
         }

@@ -55,8 +55,15 @@ pub async fn pace(
                 let next = if flow.send(&mut out, &page, &mut flush) { park() } else { flow.wait_until() };
                 timer.as_mut().reset(next);
             }
-            // The page drew some.
+            // The page drew some, or keys were typed (local_term's writes:
+            // ssh_manager::page_keys).
             _ = page.news.notified() => {
+                if page.take_typed() {
+                    flow.typed(&page);
+                }
+                if page.take_interrupt() {
+                    flow.interrupted(&mut out, &page);
+                }
                 if flow.holds() {
                     let next = if flow.send(&mut out, &page, &mut flush) { park() } else { flow.wait_until() };
                     timer.as_mut().reset(next);
@@ -122,5 +129,46 @@ mod tests {
         assert!(*ended.lock().unwrap());
         assert_eq!(got.lock().unwrap().len(), want.len());
         assert!(*got.lock().unwrap() == want, "in order, nothing cut");
+    }
+
+    /// Ctrl+C typed into a Home terminal behind on a flood cuts what waits,
+    /// as in an SSH terminal (local_term's writes go to page_keys).
+    #[tokio::test(start_paused = true)]
+    async fn ctrl_c_cuts_what_waits_for_the_page() {
+        let id = "t-pace-ctrl-c";
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&got);
+        let channel = Channel::new(move |body| {
+            if let InvokeResponseBody::Raw(b) = body {
+                seen.lock().unwrap().extend_from_slice(&b);
+            }
+            Ok(())
+        });
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let pump = tokio::spawn(pace(id.into(), channel, rx, || {}));
+        let settle = || async {
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        };
+        tx.send(b"hello\n".to_vec()).unwrap();
+        settle().await;
+        crate::ssh_manager::page_drew(id, 6);
+        // 16 MB of lines while the page draws nothing more.
+        let lines: Vec<u8> = (0..1_600_000u32).flat_map(|i| format!("line {i:05}\n").into_bytes()).collect();
+        for part in lines.chunks(256 << 10) {
+            tx.send(part.to_vec()).unwrap();
+        }
+        settle().await;
+        crate::ssh_manager::page_keys(id, b"\x03");
+        settle().await;
+        let drawn = got.lock().unwrap().len() as u64;
+        crate::ssh_manager::page_drew(id, drawn - 6);
+        tx.send(Vec::new()).unwrap();
+        pump.await.unwrap();
+        let shown = String::from_utf8_lossy(&got.lock().unwrap()).into_owned();
+        assert!(shown.contains("of output skipped"), "what waited was cut");
+        assert!(shown.len() < 6 + lines.len(), "not all of it went to the page");
+        assert!(shown.trim_end().ends_with("line 1599999"), "the newest lines are kept");
     }
 }

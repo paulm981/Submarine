@@ -748,13 +748,14 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           // Someone this profile is shared with set or changed these
           // commands and this device hasn't allowed them: ask, never type
           // them unasked. Cancel has the focus, so a stray Enter is a no.
-          // The OK counts only for the text shown (`runOnConnect`): when the
-          // commands changed again meanwhile, it's refused, and the new
-          // ones are shown. The answer is the text allowed, or null.
-          const ask = async (text: string): Promise<string | null> => {
+          // The OK counts only for what was shown (the text, and whether they
+          // go into each new terminal): when the commands changed again
+          // meanwhile, it's refused, and the new ones are shown. The answer is
+          // the text allowed, or null.
+          const ask = async (text: string, every: boolean): Promise<string | null> => {
             const ok = await confirmRef.current({
               title: "Run the on-connect commands?",
-              message: `Someone you share this profile with set these commands to run when you connect to ${session.serverName}:\n\n${text.trimEnd()}\n\nThey would be typed into your terminal on that server${session.runOnConnectEvery ? ", and into each new terminal you open there" : ""}.`,
+              message: `Someone you share this profile with set these commands to run when you connect to ${session.serverName}:\n\n${text.trimEnd()}\n\nThey would be typed into your terminal on that server${every ? ", and into each new terminal you open there" : ""}.`,
               okLabel: "Allow and run",
               cancelLabel: "Not now",
               safeDefault: true,
@@ -764,7 +765,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               return null;
             }
             try {
-              await invoke("allow_held", { serverId: session.serverId, items: ["run_on_connect"], runOnConnect: text });
+              await invoke("allow_held", { serverId: session.serverId, items: ["run_on_connect"], runOnConnect: text, runOnConnectEvery: every });
               window.dispatchEvent(new Event("submarine-held-changed"));
               return text;
             } catch (e) {
@@ -785,12 +786,12 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               if (!now.trim()) return null;
               // Still held: ask about the new text. Not held any more: it was
               // allowed meanwhile, or changed on this device.
-              return (server?.held || []).includes("run_on_connect") ? ask(now) : now;
+              return (server?.held || []).includes("run_on_connect") ? ask(now, !!server?.run_on_connect_every) : now;
             }
           };
           let asked = onConnectAskRef.current;
           if (!asked || asked.epoch !== connectionEpoch) {
-            asked = { epoch: connectionEpoch, answer: ask(session.runOnConnect || "") };
+            asked = { epoch: connectionEpoch, answer: ask(session.runOnConnect || "", !!session.runOnConnectEvery) };
             onConnectAskRef.current = asked;
           }
           void asked.answer.then((text) => { if (text !== null) typeThem(text); });

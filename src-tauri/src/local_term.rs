@@ -1004,6 +1004,8 @@ pub async fn local_terminal_write(terms: tauri::State<'_, LocalTerms>, terminal_
     }
     #[cfg(not(target_os = "android"))]
     {
+        // Ctrl+C cuts what waits for the page, as in an SSH terminal.
+        crate::ssh_manager::page_keys(&terminal_id, &data);
         pty::write(&terms, &terminal_id, &data)
     }
 }

@@ -616,12 +616,13 @@ function DesktopApp() {
   }, [refreshServers]);
   // Allow what this device holds back for a server (see the review dialog in
   // the server list), then show the list as it now is.
-  // `runOnConnect` is the on-connect text the review showed, needed to allow
-  // those commands: when they changed again meanwhile, the OK is refused and
-  // the review shows the new text.
-  const allowHeld = useCallback(async (serverId: number, items: string[], runOnConnect?: string) => {
+  // `runOnConnect` is the on-connect text the review showed, and
+  // `runOnConnectEvery` whether it said they go into each new terminal, needed
+  // to allow those commands: when either changed meanwhile, the OK is refused
+  // and the review shows them as they are now.
+  const allowHeld = useCallback(async (serverId: number, items: string[], runOnConnect?: string, runOnConnectEvery?: boolean) => {
     try {
-      await invoke("allow_held", { serverId, items, runOnConnect: runOnConnect ?? null });
+      await invoke("allow_held", { serverId, items, runOnConnect: runOnConnect ?? null, runOnConnectEvery: runOnConnectEvery ?? null });
       addLog(items.length ? `Allowed ${items.length} held change${items.length === 1 ? "" : "s"}.` : "Allowed the held changes.", "success");
     } catch (e) {
       if (String(e).includes("HELD_CHANGED")) addLog("Those on-connect commands were changed again. Look at them again before you allow them.", "warn");
