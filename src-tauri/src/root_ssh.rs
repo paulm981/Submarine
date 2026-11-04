@@ -1633,6 +1633,146 @@ exec "$@"
     }
 }
 
+// POSIX sh, sent with remote_sh::sh_command (any login shell passes it on
+// unread). `SUB_MODE=pw`
+// makes sudo read the password from stdin; `-k` ignores a cached ticket so
+// the password is really checked. `sudo -l <cmd>` tests the exact command
+// we will run, which also works for sudoers rules scoped to sftp-server.
+macro_rules! sftp_server_find {
+    () => {
+        r#"S=
+for p in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/lib/ssh/sftp-server /usr/libexec/sftp-server /usr/lib/sftp-server /usr/local/libexec/sftp-server /usr/local/lib/sftp-server /usr/lib64/misc/sftp-server; do
+  if [ -x "$p" ]; then S=$p; break; fi
+done
+if [ -z "$S" ] && [ -r /etc/ssh/sshd_config ]; then
+  while read -r k n v rest; do
+    case "$k" in [Ss]ubsystem) if [ "$n" = sftp ]; then case "$v" in /*) if [ -x "$v" ]; then S=$v; fi;; esac; fi;; esac
+  done < /etc/ssh/sshd_config
+fi
+if [ -z "$S" ]; then echo __SUB_SUDO:NO_SFTP_SERVER; exit 0; fi
+echo "__SUB_SUDO:PATH:$S""#
+    };
+}
+
+/// Finds the server's sftp-server, for a root shell to start (find_sftp_server).
+pub(crate) const SFTP_SERVER_FIND: &str = sftp_server_find!();
+/// Finds sftp-server and asks the tool about it, as ROOT_PROBE_SCRIPT does
+/// (root_tool_find; with a password, `READ` once the tool is safe).
+pub(crate) const SUDO_SFTP_PROBE: &str = concat!(
+    root_tool_find!(),
+    "\n",
+    sftp_server_find!(),
+    "\n",
+    r#"if [ -z "$X" ]; then echo __SUB_SUDO:NO_SUDO; exit 0; fi
+if [ "$SUB_MODE" = pw ]; then
+if safe; then :; else echo __SUB_SUDO:UNSAFE; exit 0; fi
+echo __SUB_SUDO:READ
+OUT=$(LC_ALL=C LANG=C "$X" -S -k -p "" -l "$S" 2>&1)
+else OUT=$(LC_ALL=C LANG=C "$X" -n -l "$S" 2>&1); fi
+if [ $? -eq 0 ]; then echo __SUB_SUDO:OK; else echo "__SUB_SUDO:FAIL:$(printf %s "$OUT" | tr "\n" " ")"; fi"#
+);
+
+/// The command that runs SUDO_SFTP_PROBE for `tool`.
+pub(crate) fn sftp_probe_command(tool: &str, password: bool) -> String {
+    let mut env = root_tool_env(tool);
+    env.push(("SUB_MODE", if password { "pw" } else { "n" }.to_string()));
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    remote_sh::sh_command_with("/bin/sh", &env, SUDO_SFTP_PROBE, &[])
+}
+
+/// Programs that can run sftp-server as root, in the order they're tried.
+/// `dzdo` first: a host that has it is managed through it, and sudo there is
+/// often present but not set up for the user. Hosts without dzdo answer
+/// NO_SUDO for it at once and go on to sudo.
+pub(crate) const ELEVATION_TOOLS: &[&str] = &["dzdo", "sudo"];
+
+/// The error worth showing when no tool worked: one the user can act on
+/// before "not allowed", and "not allowed" before "not installed".
+pub(crate) fn elevation_error_rank(e: &str) -> u8 {
+    if e == SUDO_NO_SUDO {
+        0
+    } else if e == SUDO_NOT_ALLOWED {
+        1
+    } else if e == SUDO_NEED_PASSWORD {
+        3
+    } else {
+        2
+    }
+}
+
+/// Find sftp-server and a tool (ELEVATION_TOOLS) that may run it as root.
+/// Returns the sftp-server path and the tool.
+///
+/// Without a password every tool gets a try, so a passwordless sudo isn't
+/// missed behind a dzdo that wants one. With one, a tool that isn't there or
+/// doesn't allow the user hands over to the next, and any other answer (a
+/// wrong password above all) ends it, so a mistyped password counts as one
+/// failed attempt, not one per tool.
+///
+/// When no tool may run sftp-server itself, a root shell is tried next:
+/// without a password (find_root_shell), `dzdo su -` with no password is
+/// how many AD-managed hosts give root, and must not end in a password
+/// prompt; with one (find_root_shell_with_password), `dzdo su -` that asks
+/// for it. Returns the root shell's words too, when that's the way in.
+pub(crate) async fn probe_sudo_sftp<H: russh::client::Handler>(
+    session_arc: &HandleArc<H>,
+    password: Option<&zeroize::Zeroizing<String>>,
+) -> Result<(String, &'static str, Option<&'static str>), String> {
+    let mut best: Option<String> = None;
+    let mut refused: Vec<&'static str> = Vec::new();
+    for tool in ELEVATION_TOOLS {
+        match probe_sudo_sftp_with(session_arc, password.map(|p| p.as_str()), tool).await {
+            Ok(path) => return Ok((path, tool, None)),
+            // A fact about the server, whichever tool asked.
+            Err(e) if e == SUDO_NO_SFTP_SERVER => return Err(e),
+            Err(e) if password.is_some() && e != SUDO_NO_SUDO && e != SUDO_NOT_ALLOWED => return Err(e),
+            Err(e) => {
+                if e == SUDO_NOT_ALLOWED {
+                    refused.push(tool);
+                }
+                if e != SUDO_NO_SUDO {
+                    crate::applog::write_line("root", &format!("SFTP as root: {} may not run sftp-server itself ({})", tool, e));
+                }
+                if best.as_deref().is_none_or(|b| elevation_error_rank(&e) > elevation_error_rank(b)) {
+                    best = Some(e);
+                }
+            }
+        }
+    }
+    let shell = match password {
+        None => find_root_shell(session_arc, &refused, false).await,
+        Some(pw) => find_root_shell_with_password(session_arc, &refused, pw, false).await?,
+    };
+    if let Some((tool, form)) = shell {
+        let path = find_sftp_server(session_arc).await?;
+        crate::applog::write_line("root", &format!("SFTP as root: through `{} {}`", tool, form));
+        return Ok((path, tool, Some(form)));
+    }
+    Err(best.unwrap_or_else(|| SUDO_NO_SUDO.into()))
+}
+
+/// The server's sftp-server, found as the login user.
+pub(crate) async fn find_sftp_server<H: russh::client::Handler>(session_arc: &HandleArc<H>) -> Result<String, String> {
+    let cmd = remote_sh::sh_command(&[], SFTP_SERVER_FIND, &[]);
+    let out = exec_with_stdin_capture(session_arc, &cmd, None, 20).await?;
+    for line in out.lines() {
+        match line.trim().strip_prefix("__SUB_SUDO:") {
+            Some("NO_SFTP_SERVER") => return Err(SUDO_NO_SFTP_SERVER.into()),
+            Some(rest) => {
+                if let Some(p) = rest.strip_prefix("PATH:") {
+                    let p = p.trim();
+                    if !is_safe_remote_exec_path(p) {
+                        return Err(format!("{}: unusual sftp-server path", SUDO_FAILED));
+                    }
+                    return Ok(p.to_string());
+                }
+            }
+            None => {}
+        }
+    }
+    Err(format!("{}: unexpected reply from the server", SUDO_FAILED))
+}
+
 // Every way the original project's code reaches root goes through here
 // (fork_hooks.rs): a sync that drops one of these calls, or the lines that
 // bring this file in, fails here.
@@ -1652,11 +1792,10 @@ mod hook_tests {
                 ("ssh_kill_process", "run_as_root(", 1),
                 ("ssh_iptables_chain", "run_as_root(", 1),
                 ("ssh_nft_chain", "run_as_root(", 1),
-                ("ssh_firewall_as_root", "run_as_root(", 2),
-                ("sftp_probe_command", "root_tool_env(", 1),
-                ("probe_sudo_sftp", "find_root_shell(", 1),
-                ("probe_sudo_sftp", "find_root_shell_with_password(", 1),
                 ("probe_sudo_sftp_with", "exec_probe_with_password(", 1),
+                ("probe_sudo_sftp_with", "sftp_probe_command(", 1),
+                ("probe_sudo_files", "probe_sudo_sftp(", 1),
+                ("open_elevated_sftp", "ELEVATION_TOOLS", 1),
                 ("probe_sudo_files", "password_line(", 1),
                 ("open_elevated_sftp", "root_feed(", 1),
                 ("sftp_set_elevated", "just_rejected(", 1),
