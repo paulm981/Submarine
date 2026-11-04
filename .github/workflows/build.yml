@@ -14,10 +14,12 @@ name: Build
 # Android is built only when the repository variable BUILD_ANDROID is
 # "true" and the signing secrets are set (see the android job).
 #
-# macOS is built only when the repository variable BUILD_MACOS is "true", or
-# when Run workflow is started with "Build macOS" ticked. A macOS minute
-# costs ten of the account's Actions minutes, so a release is Windows and
-# Linux unless macOS is asked for; the release notes list what was built.
+# A release is Windows and Linux. A macOS minute costs ten of the account's
+# Actions minutes, so they go only to a release that has been tried: Run
+# workflow with "Add the Mac build to this release" set to its tag (e.g.
+# v0.4.0-fork.19) builds the Mac app from that tag and adds it to that
+# release (the mac-release job). Only a release with its Windows installer
+# gets one.
 on:
   push:
     branches: [main]
@@ -33,10 +35,10 @@ on:
         description: "Version to build as a test (e.g. v0.0.1-test; at least 0.0.1, the lowest an Android package may have); nothing is published"
         required: true
         default: "v0.0.1-test"
-      macos:
-        description: "Build macOS too"
-        type: boolean
-        default: false
+      macos_for:
+        description: "Or: add the Mac build to this release (its tag, e.g. v0.4.0-fork.19). The version above is then not used."
+        required: false
+        default: ""
 
 # Least privilege by default: the version, build and android jobs only read
 # the repo. Only the release job, which publishes the release, is given
@@ -67,12 +69,17 @@ env:
 jobs:
   # The release this run makes: the original project's version (from
   # tauri.conf.json) and the fork's count, one more than its newest release
-  # of that version. A manual run takes the version typed in.
+  # of that version. A manual run takes the version typed in, or the
+  # release a Mac build is added to.
   version:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.pick.outputs.tag }}
       version: ${{ steps.pick.outputs.version }}
+      # What the build job builds, from which commit (empty: this run's).
+      matrix: ${{ steps.pick.outputs.matrix }}
+      ref: ${{ steps.pick.outputs.ref }}
+      mac_only: ${{ steps.pick.outputs.mac_only }}
     steps:
       # All of history, for the tags. Nothing here pushes.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -90,9 +97,38 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
+          MACOS_FOR: ${{ github.event.inputs.macos_for }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          # Windows: the setup .exe (NSIS), which installs over any earlier
+          # one. No .msi: every release of a version has the same installer
+          # version (see "Stamp version"), and Windows won't install an MSI
+          # over one of the same version.
+          WINDOWS='{"platform":"windows-latest","os_name":"windows","bundles":"nsis","rust_target":"x86_64-pc-windows-msvc"}'
+          # Linux: .deb, .rpm and AppImage, and an Arch package made from the
+          # same binary further down (Tauri's bundler has no Arch backend).
+          LINUX='{"platform":"ubuntu-22.04","os_name":"linux-x64","bundles":"deb,rpm,appimage","rust_target":"x86_64-unknown-linux-gnu"}'
+          # macOS: Apple silicon only (an Intel Mac can't run it), as the
+          # .app (zipped) and a .dmg.
+          MAC='{"platform":"macos-latest","os_name":"macos-arm64","bundles":"app,dmg","rust_target":"aarch64-apple-darwin"}'
+          MATRIX="[$WINDOWS,$LINUX]"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$MACOS_FOR" ]; then
+            if ! printf '%s' "$MACOS_FOR" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-fork\.[0-9]+$'; then
+              echo "::error::Not one of the fork's release tags: $MACOS_FOR"
+              exit 1
+            fi
+            ASSETS="$(gh release view "$MACOS_FOR" --repo "$REPO" --json assets -q '.assets[].name' || true)"
+            if ! grep -qx 'Submarine-windows-x64-setup.exe' <<< "$ASSETS"; then
+              echo "::error::$MACOS_FOR isn't a release with its Windows installer, so it gets no Mac build."
+              exit 1
+            fi
+            RAW="$MACOS_FOR"
+            MATRIX="[$MAC]"
+            echo "ref=refs/tags/$MACOS_FOR" >> "$GITHUB_OUTPUT"
+            echo "mac_only=true" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             RAW="$INPUT_VERSION"
           else
             BASE="$(node -p "require('./src-tauri/tauri.conf.json').version")"
@@ -110,6 +146,7 @@ jobs:
           VERSION="${RAW#v}"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           echo "This run's version: $VERSION"
 
   build:
@@ -117,31 +154,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows: the setup .exe (NSIS), which installs over any earlier
-        # one. No .msi: every release of a version has the same installer
-        # version (see "Stamp version"), and Windows won't install an MSI
-        # over one of the same version.
-        # macOS Apple Silicon. We produce both:
-        #   - Submarine.app (zipped → unzip + double-click, no DMG drag)
-        #   - Submarine_x.y.z_aarch64.dmg (classic DMG installer)
-        # Intel macOS users can run this same arm64 build under Rosetta 2 —
-        # we dropped the dedicated macos-13 (Intel) matrix entry because
-        # GitHub's Intel macOS runner pool is so scarce that jobs would
-        # routinely hit the 45-minute queue timeout and fail the release.
-        # Linux: ship four flavours so users on any major distro can
-        # double-click an installer that matches their package manager:
-        #   - .deb   → Debian / Ubuntu / Mint
-        #   - .rpm   → Fedora / RHEL / openSUSE
-        #   - .AppImage → distro-agnostic, no install required
-        # And a separate Arch step further down produces .pkg.tar.zst
-        # via makepkg inside an Arch Docker container (Tauri's bundler
-        # has no native Arch backend).
-        # macOS only when asked for (see the top).
-        include: ${{ fromJSON(format('[{0}{1},{2}]',
-          '{"platform":"windows-latest","os_name":"windows","bundles":"nsis","rust_target":"x86_64-pc-windows-msvc"}',
-          (vars.BUILD_MACOS == 'true' || inputs.macos == true)
-            && ',{"platform":"macos-latest","os_name":"macos-arm64","bundles":"app,dmg","rust_target":"aarch64-apple-darwin"}' || '',
-          '{"platform":"ubuntu-22.04","os_name":"linux-x64","bundles":"deb,rpm,appimage","rust_target":"x86_64-unknown-linux-gnu"}')) }}
+        # Windows and Linux, or macOS alone (see the version job).
+        include: ${{ fromJSON(needs.version.outputs.matrix) }}
 
     runs-on: ${{ matrix.platform }}
 
@@ -150,6 +164,8 @@ jobs:
       # step (or a compromised dependency) could use it — nothing here pushes.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          # The release's own tag for a Mac build added to it.
+          ref: ${{ needs.version.outputs.ref }}
           persist-credentials: false
 
       # The version job's pick, exposed to later steps via $GITHUB_ENV.
@@ -395,7 +411,7 @@ jobs:
   # a release never waits on secrets that aren't there.
   android:
     needs: version
-    if: vars.BUILD_ANDROID == 'true'
+    if: vars.BUILD_ANDROID == 'true' && needs.version.outputs.mac_only != 'true'
     runs-on: ubuntu-22.04
     env:
       # The NDK this job installs and builds with (the runner image has its
@@ -695,8 +711,6 @@ jobs:
           }
           pick "*-setup.exe"       "Submarine-windows-x64-setup.exe"
           pick "*-portable.zip"    "Submarine-windows-x64-portable.zip"
-          pick "*.dmg"             "Submarine-macos-arm64.dmg"
-          pick "*.app.zip"         "Submarine-macos-arm64.app.zip"
           pick "*.AppImage"        "Submarine-linux-x86_64.AppImage"
           pick "*.deb"             "Submarine-linux-amd64.deb"
           pick "*.rpm"             "Submarine-linux-x86_64.rpm"
@@ -731,16 +745,6 @@ jobs:
             fi
             echo
             echo "These builds aren't code-signed, so the first time Windows may say *\"Windows protected your PC\"*: click **More info → Run anyway**."
-            mac=()
-            has Submarine-macos-arm64.dmg && mac+=("$(link Submarine-macos-arm64.dmg Submarine-macos-arm64.dmg)")
-            has Submarine-macos-arm64.app.zip && mac+=("$(link Submarine-macos-arm64.app.zip Submarine-macos-arm64.app.zip) (unzip and run)")
-            if [ "${#mac[@]}" -gt 0 ]; then
-              echo
-              echo "### macOS (Apple silicon)"
-              (IFS='|'; echo "${mac[*]}" | sed 's/|/ · /g')
-              echo
-              echo "Not notarized by Apple, so the first time macOS says *\"Apple could not verify…\"*: move the app into **Applications**, open it once, then open **System Settings → Privacy & Security** and click **Open Anyway** (on macOS 14 and older, right-click the app → **Open** works too). Or in Terminal: \`xattr -dr com.apple.quarantine /Applications/Submarine.app\`. [Step by step](https://github.com/$REPO#first-open-on-macos)."
-            fi
             linux=()
             has Submarine-linux-x86_64.AppImage && linux+=("$(link Submarine-linux-x86_64.AppImage AppImage)")
             has Submarine-linux-amd64.deb && linux+=("$(link Submarine-linux-amd64.deb .deb)")
@@ -795,3 +799,70 @@ jobs:
             "" \
             "Builds up to 244 say there's a new version and link to it." > moved.md
           gh release edit latest-main --repo "$REPO" --notes-file moved.md || echo "::notice::No Latest build page to update."
+
+  # Adds the Mac build to the release it was asked for (see the top), under
+  # the same names in every release, signed for where it came from like the
+  # release's other files, with the macOS section in the notes.
+  mac-release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    if: needs.version.outputs.mac_only == 'true' && needs.build.result == 'success'
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the Mac build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: submarine-macos-arm64
+          path: dist
+
+      - name: Name the files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-files
+          dmg="$(find dist -type f -name '*.dmg' | head -1)"
+          app="$(find dist -type f -name '*.app.zip' | head -1)"
+          if [ -z "$dmg" ] || [ -z "$app" ]; then
+            echo "::error::The Mac build has no .dmg or no .app.zip."
+            exit 1
+          fi
+          cp "$dmg" release-files/Submarine-macos-arm64.dmg
+          cp "$app" release-files/Submarine-macos-arm64.app.zip
+          ls -la release-files/
+
+      - name: Attest where the files came from
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release-files/*
+
+      - name: Add them to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" release-files/* --repo "$REPO" --clobber
+          gh release view "$TAG" --repo "$REPO" --json body -q .body > old.md
+          if grep -q '^### macOS' old.md; then
+            echo "The notes have their macOS section already."
+            exit 0
+          fi
+          DL="https://github.com/$REPO/releases/download/$TAG"
+          {
+            echo "### macOS (Apple silicon)"
+            echo "[Submarine-macos-arm64.dmg]($DL/Submarine-macos-arm64.dmg) · [Submarine-macos-arm64.app.zip]($DL/Submarine-macos-arm64.app.zip) (unzip and run)"
+            echo
+            echo "For a Mac with Apple silicon (M1 or later); it doesn't run on an Intel Mac. Not notarized by Apple, so the first time macOS says *\"Apple could not verify…\"*: move the app into **Applications**, open it once, then open **System Settings → Privacy & Security** and click **Open Anyway** (on macOS 14 and older, right-click the app → **Open** works too). Or in Terminal: \`xattr -dr com.apple.quarantine /Applications/Submarine.app\`. [Step by step](https://github.com/$REPO#first-open-on-macos)."
+            echo
+          } > mac.md
+          # Before the line on checking a download, or at the end.
+          awk 'FNR == NR { mac = mac $0 "\n"; next }
+               !done && /^\*\*Check a download\*\*/ { printf "%s", mac; done = 1 }
+               { print }
+               END { if (!done) printf "\n%s", mac }' mac.md old.md > notes.md
+          gh release edit "$TAG" --repo "$REPO" --notes-file notes.md
