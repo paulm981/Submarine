@@ -18,8 +18,11 @@ use tracing::{debug, warn};
 
 use super::printer::{PrintTarget, PrinterSpooler, unsupported_response, write_response};
 
-/// Submarine: the most files and folders a server may have open at once.
-const MAX_OPEN: usize = 1_024;
+/// The most file handles a server may hold at once: its open files, and a folder
+/// being listed for each. With this process's handles gone, everything else in
+/// it fails too. Half of what a process starts with: 1024 on a Linux desktop,
+/// 256 for an app on macOS.
+pub const MAX_OPEN_FILES: usize = if cfg!(target_os = "macos") { 128 } else { 512 };
 
 #[derive(Debug, Default)]
 pub struct NixRdpdrBackend {
@@ -44,6 +47,10 @@ impl NixRdpdrBackend {
             file_base,
             ..Default::default()
         }
+    }
+
+    fn at_handle_limit(&self) -> bool {
+        self.file_map.len() + self.file_dir_map.len() >= MAX_OPEN_FILES
     }
 
     /// Accepts print jobs for the virtual printer announced as `device_id` and sends them to
@@ -524,7 +531,8 @@ pub(crate) fn query_volume_information(
                                             reason = "we have to use allow as the useless_conversion isn't triggered on some platforms"
                                         )]
                                         #[allow(clippy::useless_conversion)]
-                                        volume_serial_number: u32::try_from(statvfs.blocks_available()).unwrap(),
+                                        // Over 32 bits on a large free volume; only a serial number here.
+                                        volume_serial_number: u32::try_from(statvfs.blocks_available()).unwrap_or(u32::MAX),
                                         supports_objects: Boolean::False,
                                         volume_label: "IRON_RDP".to_owned(),
                                     },
@@ -770,11 +778,17 @@ pub(crate) fn query_directory(
                     // path ends with *, so its len > 0
                     #[expect(clippy::arithmetic_side_effects)]
                     parent.push_str(&query_path[0..len - 1]);
-                    if let Ok(dirp) = Dir::open(
-                        parent.as_str(),
-                        nix::fcntl::OFlag::O_RDONLY,
-                        nix::sys::stat::Mode::empty(),
-                    ) {
+                    let listed = if backend.at_handle_limit() {
+                        None
+                    } else {
+                        Dir::open(
+                            parent.as_str(),
+                            nix::fcntl::OFlag::O_RDONLY,
+                            nix::sys::stat::Mode::empty(),
+                        )
+                        .ok()
+                    };
+                    if let Some(dirp) = listed {
                         let mut iter = dirp.into_iter();
                         while let Some(Ok(first)) = iter.next() {
                             let file_name = first.file_name();
@@ -861,11 +875,8 @@ pub(crate) fn create_drive(
 ) -> PduResult<Vec<SvcMessage>> {
     let file_id = backend.file_id;
     backend.file_id += 1;
-    // Submarine: at most MAX_OPEN files and folders open at once, as the Windows
-    // backend's limit, so that a server can't use up this process's file
-    // descriptors (and with them every other connection's).
-    if backend.file_map.len() + backend.file_dir_map.len() >= MAX_OPEN {
-        warn!("Too many files open on this share");
+    if backend.at_handle_limit() {
+        warn!("Too many files open for the server");
         let io_response = DeviceIoResponse::new(req_inner.device_io_request, NtStatus::UNSUCCESSFUL);
         let res = RdpdrPdu::DeviceCreateResponse(DeviceCreateResponse {
             device_io_reply: io_response,

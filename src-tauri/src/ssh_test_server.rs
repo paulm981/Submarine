@@ -54,6 +54,14 @@ pub(crate) struct TestServer {
     stall_direct_tcpip: bool,
     /// Commands started in all.
     pub started: Arc<AtomicUsize>,
+    /// Answer every `exec`, whatever the command, with these bytes and then
+    /// output that doesn't end until the channel is gone.
+    flood_exec: Option<Vec<u8>>,
+    /// Channels the client has closed.
+    pub closed: Arc<AtomicUsize>,
+    /// Leave every channel open unanswered, as a wedged server does that still
+    /// answers keepalives.
+    no_answer_to_opens: bool,
 }
 
 /// How the test server runs `exec` commands with the local `sh` (unix only).
@@ -110,10 +118,21 @@ impl TestServer {
         Self { sftp: answer, ..Self::default() }
     }
 
+    /// A server that never answers a channel open.
+    pub(crate) fn not_answering_opens() -> Self {
+        Self { no_answer_to_opens: true, ..Self::default() }
+    }
+
     /// A server without SFTP that runs commands with this machine's `sh`.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn with_shell(opts: ShellOpts) -> Self {
         Self { sftp: SftpAnswer::Refuse, shell: Some(opts), ..Self::default() }
+    }
+
+    /// A server that answers every command with `start` and then output
+    /// without end.
+    pub(crate) fn flooding_every_exec(start: Vec<u8>) -> Self {
+        Self { flood_exec: Some(start), ..Self::default() }
     }
 
     /// Run `command` with `sh -c` for the channel: stdin from the client's
@@ -210,14 +229,14 @@ impl server::Handler for TestServer {
     async fn auth_publickey_offered(
         &mut self,
         _user: &str,
-        key: &russh::keys::PublicKey,
+        offer: russh::server::PublicKeyOffer<'_>,
     ) -> Result<Auth, Self::Error> {
         self.pk_offers.fetch_add(1, Ordering::SeqCst);
-        Ok(if self.accepts(key) { Auth::Accept } else { Auth::reject() })
+        Ok(if self.accepts(offer.public_key) { Auth::Accept } else { Auth::reject() })
     }
 
-    async fn auth_publickey(&mut self, _user: &str, key: &russh::keys::PublicKey) -> Result<Auth, Self::Error> {
-        if !self.accepts(key) {
+    async fn auth_publickey(&mut self, _user: &str, key: russh::server::VerifiedPublicKey<'_>) -> Result<Auth, Self::Error> {
+        if !self.accepts(key.public_key) {
             return Ok(Auth::reject());
         }
         if self.second_factor {
@@ -238,6 +257,11 @@ impl server::Handler for TestServer {
         // Client data is consumed through the `data` callback; the channel
         // object is dropped so its (never read) queue can't stall this server.
         drop(channel);
+        if self.no_answer_to_opens {
+            // Dropped, the reply would be a refusal.
+            std::mem::forget(reply);
+            return Ok(());
+        }
         reply.accept().await;
         Ok(())
     }
@@ -252,12 +276,9 @@ impl server::Handler for TestServer {
         reply: server::ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if self.stall_direct_tcpip {
-            // Kept, never answered.
-            tokio::spawn(async move {
-                let _reply = reply;
-                std::future::pending::<()>().await;
-            });
+        if self.stall_direct_tcpip || self.no_answer_to_opens {
+            // Kept, never answered (dropped, the reply would be a refusal).
+            std::mem::forget(reply);
             return Ok(());
         }
         reply.accept().await;
@@ -309,6 +330,14 @@ impl server::Handler for TestServer {
         #[cfg(unix)]
         if self.shell.is_some() {
             self.spawn_shell(channel, command, session.handle());
+            return Ok(());
+        }
+        if let Some(start) = self.flood_exec.clone() {
+            let handle = session.handle();
+            tokio::spawn(async move {
+                let _ = handle.data(channel, start).await;
+                while handle.data(channel, vec![b'x'; 16 * 1024]).await.is_ok() {}
+            });
             return Ok(());
         }
         if command == "echo" {
@@ -376,6 +405,7 @@ impl server::Handler for TestServer {
     }
 
     async fn channel_close(&mut self, channel: ChannelId, _session: &mut Session) -> Result<(), Self::Error> {
+        self.closed.fetch_add(1, Ordering::SeqCst);
         self.stdin.remove(&channel);
         if self.shell.as_ref().is_some_and(|s| s.keep_running_on_close) {
             return Ok(());

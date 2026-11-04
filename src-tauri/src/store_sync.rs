@@ -574,37 +574,25 @@ fn local_stamps(conn: &Connection) -> Result<HashMap<String, String>, String> {
     Ok(out)
 }
 
-/// Before a merge deletes rows here (items deleted on another computer, or
-/// by whoever can write to the folder or repository), the profile file is
-/// kept as it stands, as the cloud sync does (vault_backup.rs): the file on
-/// disk is still the state from before this merge. How many rows it will
-/// delete, and the copy's file name when one was made.
-fn keep_before_deleting(app: &tauri::AppHandle, profile: &str, conn: &Connection, seen: &Seen) -> (usize, Option<String>) {
-    let removed = crate::rows_to_delete(conn, &seen.records);
-    if removed == 0 {
-        return (0, None);
-    }
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    match crate::profile_path(app, profile).and_then(|p| crate::vault_backup::keep(&p, now)) {
-        Ok(name) => (removed, name),
-        Err(e) => {
-            crate::applog::write_line("sync", &format!("no copy of the profile before a merge that deletes: {e}"));
-            (removed, None)
-        }
-    }
-}
-
-/// Merge what the store holds into the vault; returns this computer's
-/// records after it, and how many items the merge changed here.
-fn merge(conn: &Connection, key: &[u8; 32], hlc: &crate::hlc::Hlc, seen: &Seen) -> Result<(Vec<SyncRecord>, usize), String> {
+/// Merge what the store holds into the vault as the cloud sync does
+/// (`merge_answer`: a copy of the profile kept first when it deletes or
+/// empties rows, and a kept copy just put back stays as it is); returns this
+/// computer's records after it, how many items the merge changed here, and
+/// what it deleted and emptied.
+fn merge(
+    conn: &Connection,
+    key: &[u8; 32],
+    hlc: &crate::hlc::Hlc,
+    seen: &Seen,
+    vault: Result<&Path, &str>,
+    put_back: bool,
+) -> Result<(Vec<SyncRecord>, usize, crate::Merged), String> {
     let before = local_stamps(conn)?;
-    if !seen.records.is_empty() {
-        crate::apply_remote_records(conn, key, &seen.records, hlc)?;
-    }
+    let merged = crate::merge_answer(conn, key, &seen.records, hlc, vault, put_back)?;
     let after = local_stamps(conn)?;
     let changed = after.iter().filter(|(k, v)| before.get(*k) != Some(*v)).count()
         + before.keys().filter(|k| !after.contains_key(*k)).count();
-    Ok((crate::collect_local_records(conn, key, "")?, changed))
+    Ok((crate::collect_local_records(conn, key, "")?, changed, merged))
 }
 
 /// What this computer writes into its profile folder.
@@ -1033,7 +1021,7 @@ fn open_profile(db: &DbState, at: Option<u64>) -> Result<Option<Open>, String> {
     let salt = *db.salt.lock().map_err(|_| "[STATE] LOCK_SALT")?;
     let escrow = match (master, salt) {
         (Some(mk), Some(salt)) => {
-            let rec = crate::build_pw_escrow_record(&mk, &salt, &dek)?;
+            let rec = crate::build_pw_escrow_record(&mk, &salt, &dek, &crate::escrow_stamp(conn))?;
             rec.blob.map(|b| (b, hex::encode(salt)))
         }
         _ => None,
@@ -1058,8 +1046,10 @@ fn still_open(db: &DbState, conn: &Connection, open: &Open) -> Result<(), String
 struct Exchanged {
     pushed: usize,
     pulled: usize,
-    /// Rows the merge deleted here, and the copy of the profile kept first.
+    /// Rows the merge deleted and emptied here, and the copy of the profile
+    /// kept first.
     removed: usize,
+    emptied: usize,
     backup: Option<String>,
     /// The salt `profile.key` was just sealed with, to record once the key
     /// is really in the store (for git, once it's pushed).
@@ -1087,13 +1077,13 @@ async fn exchange(app: &tauri::AppHandle, db: &DbState, dir: PathBuf, open: &Ope
         .await
         .map_err(|e| format!("[STORE] JOIN: {e}"))??;
 
-    let (records, pulled, removed, backup) = {
+    let vault = crate::profile_path(app, &open.profile);
+    let put_back = vault.as_ref().is_ok_and(|p| crate::vault_backup::is_put_back(p));
+    let (records, pulled, merged) = {
         let conn_g = db.conn.lock().map_err(|_| "[STATE] LOCK_CONN")?;
         let conn = conn_g.as_ref().ok_or("[STATE] DB_NOT_OPEN")?;
         still_open(db, conn, open)?;
-        let (removed, backup) = keep_before_deleting(app, &open.profile, conn, &seen);
-        let (records, pulled) = merge(conn, &key, &open.hlc, &seen)?;
-        (records, pulled, removed, backup)
+        merge(conn, &key, &open.hlc, &seen, vault.as_deref().map_err(String::as_str), put_back)?
     };
 
     // Sealed again when it's missing, or when this vault's password (its
@@ -1115,8 +1105,15 @@ async fn exchange(app: &tauri::AppHandle, db: &DbState, dir: PathBuf, open: &Ope
     if pulled > 0 {
         crate::save_vault_async(db).await?;
     }
+    // Only now: if the save failed, the kept rows are still to be kept.
+    if put_back {
+        if let Ok(path) = &vault {
+            crate::vault_backup::clear_put_back(path);
+        }
+    }
     let key_salt = if wrote_key { open.escrow.as_ref().map(|(_, salt)| salt.clone()) } else { None };
-    Ok(Exchanged { pushed, pulled, removed, backup, key_salt })
+    let crate::Merged { removed, emptied, backup, .. } = merged;
+    Ok(Exchanged { pushed, pulled, removed, emptied, backup, key_salt })
 }
 
 /// Sync the open profile with its store. Runs under `STORE_LOCK`.
@@ -1136,14 +1133,14 @@ async fn sync_open(app: &tauri::AppHandle, db: &DbState, open: &Open) -> Result<
             if let Some(salt) = &ex.key_salt {
                 record_key_salt(db, open, salt).await?;
             }
-            Ok(SyncReport { pushed: ex.pushed, pulled: ex.pulled, key_change: false, removed: ex.removed, backup: ex.backup })
+            Ok(SyncReport { pushed: ex.pushed, pulled: ex.pulled, key_change: false, removed: ex.removed, emptied: ex.emptied, backup: ex.backup })
         }
         Kind::Git => {
             let repo = Repo::for_store(app, &open.linked.store)?;
             let data = data_dir(&repo.dir);
             let mut moved: Option<Open> = None;
             let mut pulled = 0;
-            let (mut removed, mut backup) = (0, None);
+            let (mut removed, mut emptied, mut backup) = (0, 0, None);
             // A push refused because another computer pushed first starts
             // over from its commit, which this merge then includes.
             for _ in 0..4 {
@@ -1162,6 +1159,7 @@ async fn sync_open(app: &tauri::AppHandle, db: &DbState, open: &Open) -> Result<
                 let ex = exchange(app, db, data.join(id), open).await?;
                 pulled += ex.pulled;
                 removed += ex.removed;
+                emptied += ex.emptied;
                 backup = ex.backup.or(backup);
                 match repo.push(base.as_deref()).await? {
                     Pushed::Stale => continue,
@@ -1169,7 +1167,7 @@ async fn sync_open(app: &tauri::AppHandle, db: &DbState, open: &Open) -> Result<
                         if let Some(salt) = &ex.key_salt {
                             record_key_salt(db, open, salt).await?;
                         }
-                        return Ok(SyncReport { pushed: ex.pushed, pulled, key_change: false, removed, backup });
+                        return Ok(SyncReport { pushed: ex.pushed, pulled, key_change: false, removed, emptied, backup });
                     }
                 }
             }
@@ -1581,7 +1579,7 @@ mod tests {
     /// does it, minus the vault and the app.
     fn sync(conn: &Connection, hlc: &crate::hlc::Hlc, dir: &Path, node: &str) -> (usize, usize) {
         let seen = read_profile(dir, &KEY, node).unwrap();
-        let (records, pulled) = merge(conn, &KEY, hlc, &seen).unwrap();
+        let (records, pulled, _) = merge(conn, &KEY, hlc, &seen, Err("no file"), false).unwrap();
         let mine = Mine { node, device: node, profile: "work", records: &records, key_file: None };
         (write_profile(dir, &KEY, &seen, &mine).unwrap(), pulled)
     }
@@ -1604,6 +1602,8 @@ mod tests {
             generation: Arc::new(AtomicU64::new(1)),
             sync_cursor: Mutex::new(None),
             profile_lock: Mutex::new(None),
+            closing: Default::default(),
+            saved_at: Arc::new(AtomicU64::new(crate::NOT_SAVED)),
         }
     }
 
@@ -1834,7 +1834,7 @@ mod tests {
         let dir = tmp("key");
         let salt = [3u8; crate::SALT_LEN];
         let mk = crate::derive_key("pass word", &salt).unwrap();
-        let rec = crate::build_pw_escrow_record(&mk, &salt, &KEY).unwrap();
+        let rec = crate::build_pw_escrow_record(&mk, &salt, &KEY, crate::ESCROW_UAT).unwrap();
         write_whole(&dir, KEY_FILE, rec.blob.unwrap().as_bytes()).unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         assert_eq!(rt.block_on(unlock_key(&dir, "pass word")), Some(KEY));
@@ -1983,7 +1983,7 @@ mod tests {
         assert!(read_profile(&linked, &KEY, "aaaaaaaaaaaaaaaa").is_err());
         let (a, ha) = device("A");
         let seen = Seen::default();
-        let recs = merge(&a, &KEY, &ha, &seen).unwrap().0;
+        let recs = merge(&a, &KEY, &ha, &seen, Err("no file"), false).unwrap().0;
         let mine = Mine { node: "aaaaaaaaaaaaaaaa", device: "A", profile: "p", records: &recs, key_file: None };
         assert!(write_profile(&linked, &KEY, &seen, &mine).is_err());
         assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);

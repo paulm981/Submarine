@@ -96,6 +96,27 @@ pub(crate) fn judge_host_key(
     Ok(if prior.is_empty() { HostKeyVerdict::New } else { HostKeyVerdict::Changed { prior } })
 }
 
+/// What a host key verdict comes to, with `listed` what the user's known_hosts
+/// lists for the host when it has another key of this kind (empty otherwise):
+/// whether it's trusted, whether it's the "changed" warning, and what was
+/// trusted before. Those count as keys on file: a key that contradicts them
+/// isn't a first-time host, or a man-in-the-middle would get the plain prompt
+/// where OpenSSH refuses. Only the app's own approval of this very key goes
+/// before them.
+// The fork decides in trust_policy.rs instead (#43), where any other key
+// known_hosts lists for the host brings the changed-key warning.
+#[allow(dead_code)]
+fn host_key_outcome(verdict: HostKeyVerdict, listed: Vec<String>) -> (bool, bool, Vec<String>) {
+    match verdict {
+        HostKeyVerdict::Known => (true, false, Vec::new()),
+        HostKeyVerdict::Changed { mut prior } => {
+            prior.extend(listed);
+            (false, true, prior)
+        }
+        HostKeyVerdict::New => (false, !listed.is_empty(), listed),
+    }
+}
+
 /// Persist a host key the user just approved in the fingerprint prompt.
 ///
 /// When the prompt was a KEY-CHANGED warning (`replace`), every key on file
@@ -302,7 +323,7 @@ impl PageDrawn {
     pub(crate) fn take_interrupt(&self) -> bool {
         self.interrupted.swap(false, std::sync::atomic::Ordering::Relaxed)
     }
-    fn superseded(&self) -> bool {
+    pub(crate) fn superseded(&self) -> bool {
         self.superseded.load(std::sync::atomic::Ordering::Relaxed)
     }
     fn drawn(&self) -> u64 {
@@ -486,7 +507,9 @@ impl Outflow {
         self.hold(out);
         self.trim(AFTER_INTERRUPT_KEEP);
         let on_its_way = self.handed.saturating_sub(page.drawn().saturating_add(self.written_off));
-        let secs = (on_its_way as f64 / self.pace()).clamp(0.25, 1.0);
+        // A long gap with nothing drawn takes the pace to exactly 0 (measure),
+        // and 0 / 0 would pass the clamp as NaN, which from_secs_f64 panics on.
+        let secs = (on_its_way as f64 / self.pace().max(1.0)).clamp(0.25, 1.0);
         self.quiet_until = Some(tokio::time::Instant::now() + std::time::Duration::from_secs_f64(secs));
     }
 
@@ -682,7 +705,9 @@ fn skipped_note(bytes: u64) -> String {
 /// `docker exec -it` (`docker::open_container_terminal`) — for the life of the
 /// tab: output → coalesced batches over the page's channel (`on_output`,
 /// term_output.rs), keystrokes / resizes → the channel, then
-/// `terminal-closed-{id}`. See `pty_pump`.
+/// `terminal-closed-{id}`, whose `shell_ended` says the server ended it
+/// (`exit`), as against a closed terminal or a lost connection. See
+/// `pty_pump`.
 pub async fn run_pty_pump(
     app: AppHandle,
     terminal_id: String,
@@ -695,15 +720,16 @@ pub async fn run_pty_pump(
     early: Vec<u8>,
 ) {
     let page = page_start(&terminal_id);
-    pty_pump(channel, rx, resize_rx, Arc::clone(&page), early, |buf| crate::term_output::send(&terminal_id, &on_output, buf)).await;
+    let shell_ended = pty_pump(channel, rx, resize_rx, Arc::clone(&page), early, |buf| crate::term_output::send(&terminal_id, &on_output, buf)).await;
     page_end(&terminal_id, &page);
-    let _ = app.emit(&format!("terminal-closed-{}", terminal_id), serde_json::json!({}));
+    let _ = app.emit(&format!("terminal-closed-{}", terminal_id), serde_json::json!({ "shell_ended": shell_ended }));
 }
 
 /// The pump behind `run_pty_pump`, with the output sink abstracted (`flush`
 /// gets each coalesced batch and must leave the buffer empty, as
 /// `emit_terminal_batch` does) so tests can run it against a real connection.
 /// `page` is what the page has drawn: what it hasn't stays bounded (Outflow).
+/// Returns whether the server ended the channel.
 ///
 /// The channel is SPLIT so its read side is drained continuously, whatever the
 /// write side is doing. Since russh 0.50 every channel has a bounded queue and
@@ -724,12 +750,15 @@ async fn pty_pump<F>(
     // Output read before the pump took the channel (run_pty_pump).
     early: Vec<u8>,
     mut flush: F,
-) where
+) -> bool
+where
     F: FnMut(&mut Vec<u8>),
 {
     use russh::ChannelMsg;
 
     let (mut read_half, write_half) = channel.split();
+    // The terminal's size, for the output filter below.
+    let sizes = resize_rx.clone();
 
     // Writer: keystrokes + last-wins resizes. It signals `stop` in the same
     // cases the old loop `break`ed on the write side: the UI dropped the
@@ -757,7 +786,12 @@ async fn pty_pump<F>(
                 // collapse to one window_change call.
                 changed = resize_rx.changed() => {
                     if changed.is_err() {
-                        break; // all senders dropped
+                        // All senders dropped: the tab closed. `close_terminal`
+                        // drops the data sender too, so either arm may be the
+                        // one that sees it, and a dropped half closes nothing:
+                        // the shell would stay on the server.
+                        let _ = write_half.close().await;
+                        break;
                     }
                     let size = *resize_rx.borrow();
                     let _ = write_half.window_change(size.cols, size.rows, 0, 0).await;
@@ -777,8 +811,8 @@ async fn pty_pump<F>(
     const FLUSH_CAP: usize = 256 * 1024;
     const FLUSH_WINDOW: std::time::Duration = std::time::Duration::from_millis(8);
     let mut out_buf: Vec<u8> = Vec::new();
-    // What the page shows is cut down first: a number past four digits in a
-    // control sequence can freeze the page (term_filter.rs).
+    // What the page shows is cut down first: numbers in control sequences
+    // can freeze the page (term_filter.rs).
     let mut limiter = crate::term_filter::CsiLimiter::default();
     if !early.is_empty() {
         limiter.filter(&early, &mut out_buf);
@@ -798,12 +832,15 @@ async fn pty_pump<F>(
     // interrupt key ends, or guards a page that draws none (PAGE_STALL). The
     // channel is drained all along.
     let mut flow = Outflow::default();
+    let mut server_ended = false;
     loop {
         tokio::select! {
             msg_opt = read_half.wait() => match msg_opt {
                 Some(ChannelMsg::Data { ref data })
                 | Some(ChannelMsg::ExtendedData { ref data, .. }) => {
                     let was_empty = out_buf.is_empty();
+                    let size = *sizes.borrow();
+                    limiter.set_size(size.cols, size.rows);
                     limiter.filter(data, &mut out_buf);
                     if out_buf.len() >= FLUSH_CAP {
                         let next = if flow.send(&mut out_buf, &page, &mut flush) { park() } else { flow.wait_until() };
@@ -813,9 +850,15 @@ async fn pty_pump<F>(
                     }
                 }
                 // Flush whatever's buffered before the terminal goes away so
-                // the last screenful isn't lost. `None` = channel gone (e.g.
-                // after disconnect_session).
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                // the last screenful isn't lost. The server ended it, unless
+                // that's its answer to the writer having closed it.
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => {
+                    flow.finish(&mut out_buf, &page, &mut flush);
+                    server_ended = stop_rx.try_recv().is_err();
+                    break;
+                }
+                // `None` = channel gone (e.g. after disconnect_session).
+                None => {
                     flow.finish(&mut out_buf, &page, &mut flush);
                     break;
                 }
@@ -852,6 +895,7 @@ async fn pty_pump<F>(
     // Reader done: stop the writer too. Dropping its `rx` makes later
     // write_terminal_data calls silent no-ops, as before.
     writer.abort();
+    server_ended
 }
 
 /// A session's route through its jump hosts (`SshState::jump_connections`):
@@ -1300,6 +1344,9 @@ pub struct ConnectAttempt {
     session_id: String,
     generation: u64,
     abandoned: Arc<std::sync::atomic::AtomicBool>,
+    /// This attempt waits on the user or on this device: the time isn't the
+    /// server's.
+    at_prompt: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ConnectAttempt {
@@ -1309,7 +1356,22 @@ impl ConnectAttempt {
             session_id,
             generation,
             abandoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            at_prompt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Waits on something that isn't the server (an answer at a prompt, a touch
+    /// on a security key, a key being opened): a login's deadline stands still
+    /// meanwhile (see `drive_login`).
+    pub async fn at_prompt<T>(&self, wait: impl std::future::Future<Output = T>) -> T {
+        self.at_prompt.store(true, std::sync::atomic::Ordering::SeqCst);
+        let out = wait.await;
+        self.at_prompt.store(false, std::sync::atomic::Ordering::SeqCst);
+        out
+    }
+
+    pub fn is_at_prompt(&self) -> bool {
+        self.at_prompt.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// No newer attempt has started for the session, and it wasn't disconnected.
@@ -2447,6 +2509,16 @@ mod tests {
             HostKeyVerdict::Changed { prior: vec!["ED (ssh-ed25519)".to_string(), "LEGACY".to_string()] }
         );
         assert_eq!(judge_host_key(&conn, "new", 22, "ECDSA").unwrap(), HostKeyVerdict::New);
+        // A key that contradicts the user's known_hosts isn't a first-time host;
+        // the app's own approval of this very key still stands.
+        let listed = vec!["LISTED (ssh-ed25519)".to_string()];
+        assert_eq!(host_key_outcome(HostKeyVerdict::New, Vec::new()), (false, false, Vec::new()));
+        assert_eq!(host_key_outcome(HostKeyVerdict::New, listed.clone()), (false, true, listed.clone()));
+        assert_eq!(host_key_outcome(HostKeyVerdict::Known, listed.clone()), (true, false, Vec::new()));
+        assert_eq!(
+            host_key_outcome(HostKeyVerdict::Changed { prior: vec!["ON_FILE".to_string()] }, listed),
+            (false, true, vec!["ON_FILE".to_string(), "LISTED (ssh-ed25519)".to_string()])
+        );
     }
 
     #[test]
@@ -2543,6 +2615,41 @@ mod tests {
             .unwrap();
     }
 
+    /// The page tells the user a shell has ended only when the server ended
+    /// it, not when this side closed the terminal.
+    #[tokio::test]
+    async fn pty_pump_tells_a_shell_that_ended_from_a_terminal_closed_here() {
+        use crate::ssh_test_server::{connect, TestServer};
+        use std::time::Duration;
+
+        let session = connect(TestServer::default(), |_| {}, crate::build_ssh_client_config())
+            .await
+            .expect("in-process SSH connection");
+
+        // The "shell" prints a little and ends.
+        let channel = session.channel_open_session().await.unwrap();
+        channel.exec(false, "flood 1024").await.unwrap();
+        let (_tx, rx) = mpsc::channel::<TerminalCommand>(32);
+        let (_resize_tx, resize_rx) = tokio::sync::watch::channel(PtySize { cols: 80, rows: 24 });
+        let page = Arc::new(PageDrawn::default());
+        let ended = tokio::time::timeout(Duration::from_secs(10), pty_pump(channel, rx, resize_rx, page, Vec::new(), |buf: &mut Vec<u8>| buf.clear()))
+            .await
+            .expect("the pump ends with the shell");
+        assert!(ended, "the server ended this one");
+
+        // This one is closed from here (the tab went, or a reconnect replaced it).
+        let channel = session.channel_open_session().await.unwrap();
+        channel.exec(false, "echo").await.unwrap();
+        let (tx, rx) = mpsc::channel::<TerminalCommand>(32);
+        let (_resize_tx, resize_rx) = tokio::sync::watch::channel(PtySize { cols: 80, rows: 24 });
+        let page = Arc::new(PageDrawn::default());
+        drop(tx);
+        let ended = tokio::time::timeout(Duration::from_secs(10), pty_pump(channel, rx, resize_rx, page, Vec::new(), |buf: &mut Vec<u8>| buf.clear()))
+            .await
+            .expect("the pump ends once the terminal is closed");
+        assert!(!ended, "this side closed that one");
+    }
+
     /// A page that stops drawing doesn't stop the channel being drained: what
     /// it can't take waits in the pump (bounded: the oldest is cut, with a
     /// note), the rest of the connection stays free, and the newest goes to
@@ -2606,6 +2713,91 @@ mod tests {
         let skipped = FLOOD - note_at - kept;
         assert_eq!(&got[note_at..note_end], skipped_note(skipped as u64).as_bytes());
         assert!(got[note_end..].iter().all(|&b| b == b'x'));
+    }
+
+    /// Closing a terminal drops its two senders together, so either arm of the
+    /// writer may see it first. Both close the channel, or the shell stays on
+    /// the server and holds one of its MaxSessions slots.
+    #[tokio::test]
+    async fn closing_a_terminal_closes_its_channel_whichever_arm_sees_it() {
+        use crate::ssh_test_server::{connect, TestServer};
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let server = TestServer::default();
+        let closed = Arc::clone(&server.closed);
+        let session = connect(server, |_| {}, crate::build_ssh_client_config())
+            .await
+            .expect("in-process SSH connection");
+        // Enough that the arm that doesn't close would be picked at least once.
+        const TERMINALS: usize = 24;
+        for _ in 0..TERMINALS {
+            let channel = session.channel_open_session().await.unwrap();
+            channel.exec(false, "echo").await.unwrap();
+            let (tx, rx) = mpsc::channel::<TerminalCommand>(32);
+            let (resize_tx, resize_rx) = tokio::sync::watch::channel(PtySize { cols: 80, rows: 24 });
+            let pump = tokio::spawn(pty_pump(channel, rx, resize_rx, Arc::new(PageDrawn::default()), Vec::new(), |buf: &mut Vec<u8>| buf.clear()));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            drop(tx);
+            drop(resize_tx);
+            tokio::time::timeout(Duration::from_secs(10), pump).await.expect("the pump stops").unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while closed.load(Ordering::SeqCst) < TERMINALS {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("only {} of {TERMINALS} channels were closed", closed.load(Ordering::SeqCst)));
+    }
+
+    /// The count of a control sequence is cut to the terminal's size as it is
+    /// at that moment (term_filter.rs).
+    #[tokio::test]
+    async fn pty_pump_cuts_counts_to_the_size_the_terminal_has_now() {
+        use crate::ssh_test_server::{connect, TestServer};
+        use std::time::Duration;
+
+        let session = connect(TestServer::default(), |_| {}, crate::build_ssh_client_config())
+            .await
+            .expect("in-process SSH connection");
+        let channel = session.channel_open_session().await.unwrap();
+        channel.exec(false, "echo").await.unwrap();
+        let (tx, rx) = mpsc::channel::<TerminalCommand>(32);
+        let (resize_tx, resize_rx) = tokio::sync::watch::channel(PtySize { cols: 80, rows: 24 });
+        let got = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink = Arc::clone(&got);
+        let pump = tokio::spawn(pty_pump(channel, rx, resize_rx, Arc::new(PageDrawn::default()), Vec::new(), move |buf: &mut Vec<u8>| {
+            sink.lock().unwrap().extend_from_slice(buf);
+            buf.clear();
+        }));
+        let shows = |wanted: &'static [u8]| {
+            let got = Arc::clone(&got);
+            tokio::time::timeout(Duration::from_secs(10), async move {
+                while !got.lock().unwrap().windows(wanted.len()).any(|w| w == wanted) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+        };
+        tx.send(TerminalCommand::Data(b"\x1b[9999S".to_vec())).await.unwrap();
+        shows(b"\x1b[24S").await.expect("cut to the first size");
+        resize_tx.send(PtySize { cols: 80, rows: 10 }).unwrap();
+        tx.send(TerminalCommand::Data(b"\x1b[9999S".to_vec())).await.unwrap();
+        shows(b"\x1b[10S").await.expect("cut to the new size");
+        drop((tx, resize_tx));
+        tokio::time::timeout(Duration::from_secs(10), pump).await.expect("the pump stops").unwrap();
+    }
+
+    /// A long gap with nothing drawn takes the page's pace to exactly 0 (see
+    /// Outflow::measure); `typed` can then leave nothing on its way, and an
+    /// interrupt would divide 0 by 0, which panics in Duration::from_secs_f64
+    /// and takes the pump with it.
+    #[tokio::test(start_paused = true)]
+    async fn an_interrupt_with_a_pace_of_zero_and_nothing_on_its_way() {
+        let page = PageDrawn::default();
+        let mut flow = Outflow { held: vec![b'x'; 16], pace: Some(0.0), ..Outflow::default() };
+        flow.interrupted(&mut Vec::new(), &page);
+        assert!(flow.quiet());
     }
 
     /// A key file signs a certificate login as an agent would: the signature,

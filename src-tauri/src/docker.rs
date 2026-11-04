@@ -108,13 +108,7 @@ async fn run_capture_raw(
             .map(Arc::clone)
             .ok_or_else(|| "Session not connected".to_string())?
     };
-    let channel = {
-        let session = session_arc.read().await;
-        session
-            .channel_open_session()
-            .await
-            .map_err(|e| e.to_string())?
-    };
+    let channel = crate::shell_sftp::open_session_channel(&session_arc).await?;
     channel
         .exec(true, wrapped.as_bytes())
         .await
@@ -627,13 +621,7 @@ pub async fn ssh_docker_logs_start(
                 .map(Arc::clone)
                 .ok_or_else(|| "Session not connected".to_string())?
         };
-        let channel = {
-            let session = session_arc.read().await;
-            session
-                .channel_open_session()
-                .await
-                .map_err(|e| e.to_string())?
-        };
+        let channel = crate::shell_sftp::open_session_channel(&session_arc).await?;
         let cmd = crate::remote_sh::sh_command(&[], &format!("{} 2>&1", Cmd::Docker(args).shell()), &[]);
         channel
             .exec(true, cmd.as_bytes())
@@ -848,13 +836,7 @@ pub async fn open_container_terminal(
                     .map(Arc::clone)
                     .ok_or_else(|| "Session not connected".to_string())?
             };
-            let channel = {
-                let session = session_arc.read().await;
-                session
-                    .channel_open_session()
-                    .await
-                    .map_err(|e| e.to_string())?
-            };
+            let channel = crate::shell_sftp::open_session_channel(&session_arc).await?;
             channel
                 .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
                 .await

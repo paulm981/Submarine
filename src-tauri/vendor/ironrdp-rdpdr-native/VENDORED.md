@@ -15,13 +15,16 @@ The first two are for one thing: a folder as the root.
    following a reparse point.
 2. `src/windows/file.rs`, `set_information_inner`: the root itself is neither deleted nor renamed
    (`ACCESS_DENIED`). A volume root can't be anyway; a folder root could, once the server had emptied it.
+3. `src/nix/backend.rs`, `create_drive` and `query_directory`: at most 512 file handles at once, 128 on macOS
+   (`MAX_OPEN_FILES`); the next open is answered `UNSUCCESSFUL`, and the next listing finds nothing. Without a
+   limit a server could use up the file handles of the whole process.
+4. `src/nix/backend.rs`, `FILE_FS_VOLUME_INFORMATION`: the volume's serial number, made from its free blocks,
+   no longer panics when they don't fit in 32 bits (a large free volume).
 
-The other two are in the macOS and Linux backend (`src/nix/backend.rs`), found by Submarine's own review:
+One more is in the macOS and Linux backend (`src/nix/backend.rs`), found by the fork's own review (its limit on
+open files, also from that review, is item 3 now):
 
-3. `create_drive`: at most 1,024 files and folders open at once (`MAX_OPEN`), the Windows backend's limit. Without
-   it a server could open files until this process had no file descriptors left, and every other connection in
-   the app failed with it.
-4. `make_query_dir_resp`: a listing gives a link's own details (`symlink_metadata`), not those of what it points
+5. `make_query_dir_resp`: a listing gives a link's own details (`symlink_metadata`), not those of what it points
    to, which may be outside the shared folder.
 
 A folder can't be given a drive letter of its own instead (`subst`): Windows refuses to open such a letter

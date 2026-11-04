@@ -16,7 +16,7 @@
 //! 23 nothing is asked first (a mail or web server would take the requests
 //! for garbage), as the classic telnet client does: it only answers.
 
-use crate::ssh_manager::{page_end, page_start, ClientHandler, Outflow, PtySize, TerminalCommand};
+use crate::ssh_manager::{page_end, ClientHandler, Outflow, PageDrawn, PtySize, TerminalCommand};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
@@ -399,10 +399,13 @@ pub async fn connect_through(route: &[russh::client::Handle<ClientHandler>], hos
 /// writer are separate tasks, so the reader is drained whatever the writer
 /// waits on (a channel through an SSH server stalls its whole connection
 /// otherwise; see `ssh_manager::pty_pump`).
+// The fork's page channel (`on_output`) is the eighth.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_pump(
     app: AppHandle,
     session_id: String,
     terminal_id: String,
+    page: Arc<PageDrawn>,
     conn: Conn,
     on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
     mut rx: mpsc::Receiver<TerminalCommand>,
@@ -410,6 +413,8 @@ pub async fn run_pump(
 ) {
     let Conn { stream, route, telnet_port, generation } = conn;
     let size = *resize_rx.borrow();
+    // The terminal's size, for the output filter below.
+    let sizes = resize_rx.clone();
     let telnet = Arc::new(std::sync::Mutex::new(Telnet::new(size.cols, size.rows)));
     let (mut read_half, mut write_half) = tokio::io::split(stream);
     // Answers the reader owes the server, and text typed here that the
@@ -422,8 +427,6 @@ pub async fn run_pump(
 
     let first = if telnet_port { telnet.lock().map(|mut t| t.start()).unwrap_or_default() } else { Vec::new() };
     let writer_telnet = Arc::clone(&telnet);
-    // What the page has drawn: what it hasn't stays bounded (ssh_manager::Outflow).
-    let page = page_start(&terminal_id);
     let writer_page = Arc::clone(&page);
     let writer = tokio::spawn(async move {
         let mut ok = first.is_empty() || write_half.write_all(&first).await.is_ok();
@@ -492,6 +495,8 @@ pub async fn run_pump(
                     if let Ok(mut t) = telnet.lock() {
                         t.receive(&buf[..n], &mut text, &mut reply);
                     }
+                    let size = *sizes.borrow();
+                    limiter.set_size(size.cols, size.rows);
                     limiter.filter(&text, &mut out);
                     // A server that floods requests past the queue loses the
                     // answers; one that negotiates gets each.
@@ -532,6 +537,10 @@ pub async fn run_pump(
     flow.finish(&mut out, &page, &mut flush);
     page_end(&terminal_id, &page);
     writer.abort();
+    // A Reconnect on a live tab: the terminal is the new pump's now, and open.
+    if page.superseded() {
+        return;
+    }
     let _ = app.emit(&format!("terminal-closed-{terminal_id}"), serde_json::json!({ "generation": generation }));
     if server_ended {
         let reason = if route.iter().any(|h| h.is_closed()) {
