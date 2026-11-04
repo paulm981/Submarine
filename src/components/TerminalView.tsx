@@ -1683,12 +1683,15 @@ const TerminalView = ({
       // xterm buffers a multibyte sequence split across batches.
       noteTerminalOutput(terminalId, data.length);
       if (!local) noteOutput(terminalId, data);
-      // Drawn once xterm has taken it in; also when xterm turned it away
-      // (past its own limit), so the count stays true.
-      try {
-        if (highlighter.active) term.write(highlighter.push(data), () => processed(data.length));
-        else term.write(data, () => processed(data.length));
-      } catch { processed(data.length); }
+      // In pieces when it's mostly control sequences (writePieces). Each is
+      // drawn once xterm has taken it in; also when xterm turned it away (past
+      // its own limit), so the count stays true.
+      for (const piece of writePieces(data)) {
+        try {
+          if (highlighter.active) term.write(highlighter.push(piece), () => processed(piece.length));
+          else term.write(piece, () => processed(piece.length));
+        } catch { processed(piece.length); }
+      }
       // Keep a short tail of decoded output so command-history capture can
       // recognize a no-echo password prompt and skip the typed secret.
       try {

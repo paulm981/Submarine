@@ -834,9 +834,9 @@ pub fn server_uuid(conn: &Connection, server_id: i64) -> Option<String> {
 }
 
 /// A duplicate of a server starts with what the original had not yet been
-/// allowed to do: its on-connect commands, forwards and a held move are
-/// copied along with their held entries, so the copy can't run what the
-/// original couldn't. (Autostart isn't copied at all, and the monitor config
+/// allowed to do: its on-connect commands, forwards, a held move and a held
+/// AI level (ai/trust.rs) are copied along with their held entries, so the
+/// copy, in the same folder, can't run what the original couldn't. (Autostart isn't copied at all, and the monitor config
 /// isn't either.) A held switch to telnet or VNC isn't copied: the copy is the
 /// SSH server its maker sees here, a new server of their own, and syncs as
 /// one. Nothing to do for a server with nothing held, which is every server
@@ -849,8 +849,8 @@ pub fn copy_held(conn: &Connection, from_id: i64, to_id: i64) -> Result<(), Stri
     conn.execute(
         "INSERT OR IGNORE INTO held_approvals (uuid, item, since)
          SELECT ?2, item, since FROM held_approvals
-          WHERE uuid = ?1 AND (item = ?3 OR item LIKE 'tunnel:%' OR item LIKE ?4)",
-        params![from, to, RUN_ON_CONNECT, format!("{MOVED}%")],
+          WHERE uuid = ?1 AND (item = ?3 OR item LIKE 'tunnel:%' OR item LIKE ?4 OR item LIKE ?5)",
+        params![from, to, RUN_ON_CONNECT, format!("{MOVED}%"), format!("{}%", crate::ai::trust::HELD_ITEM)],
     )
     .map(|_| ())
     .map_err(|e| format!("[SYNC] COPY_HELD: {e}"))
@@ -918,19 +918,26 @@ mod tests {
         let conn = db();
         conn.execute("INSERT INTO servers(id, name, uuid, run_on_connect, autostart, tunnels) VALUES (1, 'web', 'u-orig', 'curl x | sh', 1, '[]')", []).unwrap();
         conn.execute("INSERT INTO servers(id, name, uuid, run_on_connect) VALUES (2, 'web (copy)', 'u-copy', 'curl x | sh')", []).unwrap();
-        for item in [RUN_ON_CONNECT, AUTOSTART, "tunnel:R|0.0.0.0:9000|127.0.0.1:22", "metric:uptime"] {
+        let ai = format!("{}{{\"level\":3}}", crate::ai::trust::HELD_ITEM);
+        for item in [RUN_ON_CONNECT, AUTOSTART, "tunnel:R|0.0.0.0:9000|127.0.0.1:22", "metric:uptime", &ai] {
             conn.execute("INSERT INTO held_approvals(uuid, item, since) VALUES ('u-orig', ?1, 1)", [item]).unwrap();
         }
         copy_held(&conn, 1, 2).unwrap();
-        let only_these = vec![RUN_ON_CONNECT.to_string(), "tunnel:R|0.0.0.0:9000|127.0.0.1:22".to_string()];
-        assert_eq!(held_for(&conn, "u-copy").into_iter().collect::<Vec<_>>(), only_these);
-        // The original keeps all four, and doing it twice changes nothing.
-        assert_eq!(held_for(&conn, "u-orig").len(), 4);
+        let mut only_these = vec![RUN_ON_CONNECT.to_string(), "tunnel:R|0.0.0.0:9000|127.0.0.1:22".to_string(), ai.clone()];
+        only_these.sort();
+        let copied = || {
+            let mut v: Vec<String> = held_for(&conn, "u-copy").into_iter().collect();
+            v.sort();
+            v
+        };
+        assert_eq!(copied(), only_these);
+        // The original keeps all five, and doing it twice changes nothing.
+        assert_eq!(held_for(&conn, "u-orig").len(), 5);
         copy_held(&conn, 1, 2).unwrap();
-        assert_eq!(held_for(&conn, "u-copy").into_iter().collect::<Vec<_>>(), only_these);
+        assert_eq!(copied(), only_these);
         // A server that isn't there copies nothing.
         copy_held(&conn, 99, 2).unwrap();
-        assert_eq!(held_for(&conn, "u-copy").len(), 2);
+        assert_eq!(held_for(&conn, "u-copy").len(), 3);
     }
 
     fn merging(conn: &Connection, on: bool) {

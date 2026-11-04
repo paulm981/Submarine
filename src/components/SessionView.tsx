@@ -1284,7 +1284,10 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // deleted, say): no failure event follows, so don't sit on "Connecting…".
   const connectRefused = (e: unknown) => {
     pushLog({ msg: `Failed to initiate: ${e}`, type: 'error' });
-    setDisconnectReason(String(e));
+    // A deleted jump host has a box of its own (noteRefusal); anything else
+    // is said in the banner.
+    if (!String(e).startsWith(JUMP_GONE)) setDisconnectReason(String(e));
+    noteRefusal(e);
     setStatus('failed');
     cancelReconnect();
   };
@@ -1498,11 +1501,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
       unlistenSuccess, unlistenFailed, unlistenDisconnected,
     ]).then(() =>
       invoke("initiate_connection", { sessionId: session.id, serverId: session.serverId, customPassword: customPasswordRef.current || null, quickAuth: session.quickAuth || null, sessionRole: "primary", separateSessions: separateFwdRef.current, useSshAgent: readUseSshAgent() })
-    ).catch(e => {
-      pushLog({ msg: `Failed to initiate: ${e}`, type: 'error' });
-      noteRefusal(e);
-      setStatus('failed');
-    });
+    ).catch(connectRefused);
 
     return () => {
       unlistenLog.then(f => f());
@@ -1551,14 +1550,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
         sessionRole: "primary",
         separateSessions: separateFwdRef.current,
         useSshAgent: readUseSshAgent(),
-      }).catch((e) => {
-        // Refused before any connecting (the server was deleted, say): no
-        // failure event follows, so don't sit on "Connecting…".
-        pushLog({ msg: `Failed to initiate: ${e}`, type: 'error' });
-        noteRefusal(e);
-        setStatus('failed');
-        cancelReconnect();
-      });
+      }).catch(connectRefused);
     }, delay);
   };
 
@@ -1592,13 +1584,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
       sessionRole: "primary",
       separateSessions: separateFwdRef.current,
       useSshAgent: readUseSshAgent(),
-    }).catch((e) => {
-      // Refused before any connecting: no failure event follows.
-      pushLog({ msg: `Failed to initiate: ${e}`, type: 'error' });
-      noteRefusal(e);
-      setStatus('failed');
-      cancelReconnect();
-    });
+    }).catch(connectRefused);
   };
 
   // The choices for a server whose jump host was deleted. Connect directly

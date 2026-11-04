@@ -1434,112 +1434,7 @@ fn apply_remote_inner(
     // sync from corrupting local data.
     let tx = conn.unchecked_transaction().map_err(|e| format!("[SYNC] TX_BEGIN: {e}"))?;
     let size_before = vault_bytes(&tx)?;
-    // FKs to re-resolve once the whole batch has landed. `ref_table` has to ride
-    // along: the lookup used to read `SELECT id FROM {table}` — the row's OWN
-    // table — which was only ever correct because the sole queued FKs were the
-    // self-referential ones (folders.parent_id, servers.jump_host_id), where the
-    // two tables happen to be the same. Any cross-table FK looked up the uuid in
-    // entirely the wrong table, found nothing, and NULLed a perfectly good link.
-    let mut fk_fixups: Vec<FkFixup> = Vec::new();
-    // Per-record application is best-effort: a single record that won't decrypt
-    // or parse — a corrupt or hostile blob from a broken/compromised server — is
-    // logged and skipped, never aborting the merge. One poison record must not be
-    // able to block every OTHER record (or every future sync) from applying.
-    let mut skipped = refused.len();
-    // In a shared profile, whatever a record newly sets running by itself
-    // (commands on connect, autostart, forwards, monitor commands) is held
-    // until this device's user allows it — see approvals.rs. Holding is part
-    // of the merge's transaction: if it can't be recorded, nothing lands. It's
-    // done once the batch is in: a server's jump host lands in the repair pass.
-    let approvals_ready = approvals::ready(&tx);
-    let shared = approvals_ready && approvals::profile_is_shared(&tx);
-    let mut watched = Vec::new();
-    // A viewer's rows go nowhere, so a password they saved here is theirs alone
-    // (each person typing their own is a normal way to share a server list),
-    // and a record with none says nothing about it. The record lands, without
-    // emptying anything (`apply_entity`): held whole, the owner's new address
-    // would stop at this device.
-    let viewer = shared && approvals::is_viewer(&tx);
-    // And a move (a server's folder, a folder's parent) that lets the AI do
-    // more on a server here is held too (ai/trust.rs): each server's AI
-    // policy as it is before the merge, to compare with after it.
-    let ai_before = if shared { ai::trust::before_sync(&tx) } else { None };
-    // Each server's jump host before the merge: one the merge deletes leaves
-    // the servers behind it refusing to go direct (jump_gone.rs).
-    let jumps_before = jump_gone::links_before(&tx);
-    for spec in ENTITIES {
-        let watch = shared && approvals::watches(spec.table);
-        for rec in records.iter().filter(|r| !r.deleted && r.entity_type == spec.table) {
-            // In a shared profile, a record that empties a saved key or
-            // password waits for this device's user, like an SSH key's
-            // deletion (approvals::hold_wipe). A personal profile takes it.
-            if shared && !viewer && empties_a_secret(&tx, key, rec) {
-                approvals::hold_wipe(&tx, rec)?;
-                continue;
-            }
-            // A server's held switch to telnet or VNC stays held after the
-            // share is left, like everything else held: outside a share, only
-            // that part runs, for a server that has one.
-            let held_switch = !watch
-                && approvals_ready
-                && spec.table == "servers"
-                && approvals::held_switch(&tx, &rec.uuid).is_some();
-            // A held switch's protocol and port go back in the row for the
-            // record to merge over, and hold_switch keeps this device's again
-            // after it, whether the record applied or not.
-            let before = if watch || held_switch { approvals::before_merge(&tx, spec.table, &rec.uuid)? } else { None };
-            let tunnels_before = if spec.table == "servers" { stored_tunnels(&tx, &rec.uuid) } else { None };
-            let applied = apply_entity(&tx, key, spec, rec, viewer, &mut fk_fixups);
-            if let Some(old) = tunnels_before {
-                note_synced_tunnels(&tx, &rec.uuid, &old)?;
-            }
-            // Held once the batch is in (below), applied or not: a held
-            // switch's row has to get this device's values back either way.
-            if watch {
-                watched.push((spec.table, &rec.uuid, before));
-            } else if held_switch {
-                approvals::hold_switch(&tx, &rec.uuid, before.as_ref())?;
-            }
-            if let Err(e) = applied {
-                skipped += 1;
-                eprintln!("[SYNC] skipped record uuid={} type={}: {}", rec.uuid, rec.entity_type, e);
-                continue;
-            }
-            if shared {
-                approvals::release_wipe(&tx, rec)?;
-            }
-        }
-    }
-    // In a shared profile, a sync that would delete much of it at once, or an
-    // SSH key, waits for this device's user (approvals::hold_deletions).
-    let tombstones: Vec<&SyncRecord> = records.iter().filter(|r| r.deleted).copied().collect();
-    let held = if shared { approvals::hold_deletions(&tx, &tombstones)? } else { Default::default() };
-    for rec in tombstones.iter().filter(|r| !held.contains(&r.uuid)) {
-        if let Err(e) = in_savepoint(&tx, || apply_tombstone(&tx, rec))? {
-            skipped += 1;
-            eprintln!("[SYNC] skipped tombstone uuid={} type={}: {}", rec.uuid, rec.entity_type, e);
-        }
-    }
-    // Re-resolve every optional FK against the FINAL state of the batch, now that
-    // both the entities and the tombstones have landed.
-    repair_links(&tx, fk_fixups);
-    for (table, uuid, before) in &watched {
-        approvals::hold_changes(&tx, table, uuid, before.as_ref())?;
-    }
-    jump_gone::note_lost(&tx, &jumps_before).map_err(|e| format!("[SYNC] JUMP_GONE: {e}"))?;
-    // A Remote Desktop link's folder has no foreign key (rdp_links.rs), so a folder
-    // this batch deleted can leave a link pointing at nothing: one this device
-    // made in it since it last synced. It goes to the top level, not nowhere.
-    tx.execute(
-        "UPDATE rdp_links SET folder_id = NULL WHERE folder_id IS NOT NULL AND folder_id NOT IN (SELECT id FROM folders)",
-        [],
-    )
-    .map_err(|e| format!("[SYNC] RDP_FOLDER_FIXUP: {e}"))?;
-    // Everything in place: hold each server whose AI policy the merge
-    // loosened, until this device's user allows it.
-    if let Some(before) = ai_before {
-        ai::trust::hold_loosened(&tx, before)?;
-    }
+    let skipped = merge_batch(&tx, key, &records, refused.len(), true)?;
     // Not toward the size the vault can no longer be saved or opened at. An
     // honest server never sends that much, so none of it lands.
     let size_after = vault_bytes(&tx)?;
@@ -1552,6 +1447,123 @@ fn apply_remote_inner(
     tx.commit().map_err(|e| format!("[SYNC] TX_COMMIT: {e}"))?;
     if skipped > 0 {
         eprintln!("[SYNC] merge committed with {skipped} record(s) skipped");
+    }
+    Ok(skipped)
+}
+
+/// One sync batch, inside the merge's transaction `tx`: the records, then the
+/// deletions, then everything that's checked once they're all in (links, the
+/// holds of a shared profile). Returns `skipped` plus the records that didn't
+/// apply. With `hold` false the records are ones held before (a wipe, a big
+/// deletion) that this device's user said yes to: those aren't held again,
+/// but whatever else in them runs by itself, or lets the AI do more, still is.
+fn merge_batch(tx: &Connection, key: &[u8; 32], records: &[&SyncRecord], mut skipped: usize, hold: bool) -> Result<usize, String> {
+    // FKs to re-resolve once the whole batch has landed. `ref_table` has to ride
+    // along: the lookup used to read `SELECT id FROM {table}` — the row's OWN
+    // table — which was only ever correct because the sole queued FKs were the
+    // self-referential ones (folders.parent_id, servers.jump_host_id), where the
+    // two tables happen to be the same. Any cross-table FK looked up the uuid in
+    // entirely the wrong table, found nothing, and NULLed a perfectly good link.
+    let mut fk_fixups: Vec<FkFixup> = Vec::new();
+    // Per-record application is best-effort: a single record that won't decrypt
+    // or parse — a corrupt or hostile blob from a broken/compromised server — is
+    // logged and skipped, never aborting the merge. One poison record must not be
+    // able to block every OTHER record (or every future sync) from applying;
+    // each one counts in `skipped`.
+    //
+    // In a shared profile, whatever a record newly sets running by itself
+    // (commands on connect, autostart, forwards, monitor commands) is held
+    // until this device's user allows it — see approvals.rs. Holding is part
+    // of the merge's transaction: if it can't be recorded, nothing lands. It's
+    // done once the batch is in: a server's jump host lands in the repair pass.
+    let approvals_ready = approvals::ready(tx);
+    let shared = approvals_ready && approvals::profile_is_shared(tx);
+    let mut watched = Vec::new();
+    // A viewer's rows go nowhere, so a password they saved here is theirs alone
+    // (each person typing their own is a normal way to share a server list),
+    // and a record with none says nothing about it. The record lands, without
+    // emptying anything (`apply_entity`): held whole, the owner's new address
+    // would stop at this device.
+    let viewer = shared && approvals::is_viewer(tx);
+    // And a move (a server's folder, a folder's parent) that lets the AI do
+    // more on a server here is held too (ai/trust.rs): each server's AI
+    // policy as it is before the merge, to compare with after it.
+    let ai_before = if shared { ai::trust::before_sync(tx) } else { None };
+    // Each server's jump host before the merge: one the merge deletes leaves
+    // the servers behind it refusing to go direct (jump_gone.rs).
+    let jumps_before = jump_gone::links_before(tx);
+    for spec in ENTITIES {
+        let watch = shared && approvals::watches(spec.table);
+        for rec in records.iter().filter(|r| !r.deleted && r.entity_type == spec.table) {
+            // In a shared profile, a record that empties a saved key or
+            // password waits for this device's user, like an SSH key's
+            // deletion (approvals::hold_wipe). A personal profile takes it.
+            if hold && shared && !viewer && empties_a_secret(tx, key, rec) {
+                approvals::hold_wipe(tx, rec)?;
+                continue;
+            }
+            // A server's held switch to telnet or VNC stays held after the
+            // share is left, like everything else held: outside a share, only
+            // that part runs, for a server that has one.
+            let held_switch = !watch
+                && approvals_ready
+                && spec.table == "servers"
+                && approvals::held_switch(tx, &rec.uuid).is_some();
+            // A held switch's protocol and port go back in the row for the
+            // record to merge over, and hold_switch keeps this device's again
+            // after it, whether the record applied or not.
+            let before = if watch || held_switch { approvals::before_merge(tx, spec.table, &rec.uuid)? } else { None };
+            let tunnels_before = if spec.table == "servers" { stored_tunnels(tx, &rec.uuid) } else { None };
+            let applied = apply_entity(tx, key, spec, rec, viewer, &mut fk_fixups);
+            if let Some(old) = tunnels_before {
+                note_synced_tunnels(tx, &rec.uuid, &old)?;
+            }
+            // Held once the batch is in (below), applied or not: a held
+            // switch's row has to get this device's values back either way.
+            if watch {
+                watched.push((spec.table, &rec.uuid, before));
+            } else if held_switch {
+                approvals::hold_switch(tx, &rec.uuid, before.as_ref())?;
+            }
+            if let Err(e) = applied {
+                skipped += 1;
+                eprintln!("[SYNC] skipped record uuid={} type={}: {}", rec.uuid, rec.entity_type, e);
+                continue;
+            }
+            if shared {
+                approvals::release_wipe(tx, rec)?;
+            }
+        }
+    }
+    // In a shared profile, a sync that would delete much of it at once, or an
+    // SSH key, waits for this device's user (approvals::hold_deletions).
+    let tombstones: Vec<&SyncRecord> = records.iter().filter(|r| r.deleted).copied().collect();
+    let held = if hold && shared { approvals::hold_deletions(tx, &tombstones)? } else { Default::default() };
+    for rec in tombstones.iter().filter(|r| !held.contains(&r.uuid)) {
+        if let Err(e) = in_savepoint(tx, || apply_tombstone(tx, rec))? {
+            skipped += 1;
+            eprintln!("[SYNC] skipped tombstone uuid={} type={}: {}", rec.uuid, rec.entity_type, e);
+        }
+    }
+    // Re-resolve every optional FK against the FINAL state of the batch, now that
+    // both the entities and the tombstones have landed.
+    repair_links(tx, fk_fixups);
+    for (table, uuid, before) in &watched {
+        approvals::hold_changes(tx, table, uuid, before.as_ref())?;
+    }
+    jump_gone::note_lost(tx, &jumps_before).map_err(|e| format!("[SYNC] JUMP_GONE: {e}"))?;
+    // A Remote Desktop link's folder has no foreign key (rdp_links.rs), so a folder
+    // this batch deleted can leave a link pointing at nothing: one this device
+    // made in it since it last synced. It goes to the top level, not nowhere.
+    tx.execute(
+        "UPDATE rdp_links SET folder_id = NULL WHERE folder_id IS NOT NULL AND folder_id NOT IN (SELECT id FROM folders)",
+        [],
+    )
+    .map_err(|e| format!("[SYNC] RDP_FOLDER_FIXUP: {e}"))?;
+    // Everything in place: hold each server whose AI policy the merge
+    // loosened, until this device's user allows it.
+    if let Some(before) = ai_before {
+        ai::trust::hold_loosened(tx, before)?;
     }
     Ok(skipped)
 }
@@ -4172,65 +4184,55 @@ fn resolve_held(conn: &Connection, key: &[u8; 32], hlc: &hlc::Hlc, delete_them: 
             .map_err(|e| format!("[SYNC] HELD: {e}"))?;
         rows.filter_map(Result::ok).collect()
     };
-    let wipes = approvals::held_wipes(conn);
+    // Only rows of the tables a sync carries: their names go into the SQL.
+    let wipes: Vec<SyncRecord> =
+        approvals::held_wipes(conn).into_iter().filter(|r| ENTITIES.iter().any(|s| s.table == r.entity_type)).collect();
     // Like a merge: the triggers stay out of it (no tombstone of our own for a
     // deletion, no stamp for a kept row but the one set here).
     conn.execute("INSERT INTO sync_flags(key,val) VALUES('merge',1) ON CONFLICT(key) DO UPDATE SET val=1", [])
         .map_err(|e| format!("[SYNC] MERGE_ON: {e}"))?;
     let done = (|| -> Result<usize, String> {
         let tx = conn.unchecked_transaction().map_err(|e| format!("[SYNC] TX_BEGIN: {e}"))?;
-        for (uuid, entity_type, stamp) in &held {
-            if !SYNCED_TABLES.contains(&entity_type.as_str()) {
-                continue;
+        let deletions: Vec<SyncRecord> = held
+            .iter()
+            .filter(|(_, entity_type, _)| SYNCED_TABLES.contains(&entity_type.as_str()))
+            .map(|(uuid, entity_type, stamp)| SyncRecord {
+                uuid: uuid.clone(),
+                entity_type: entity_type.clone(),
+                updated_at: stamp.clone(),
+                deleted: true,
+                blob: None,
+            })
+            .collect();
+        if delete_them {
+            // As the merge would have, in the same code: what was held isn't
+            // held again, but whatever else the records change that runs by
+            // itself, or lets the AI do more, still is (merge_batch).
+            let records: Vec<&SyncRecord> = wipes.iter().chain(&deletions).collect();
+            let skipped = merge_batch(&tx, key, &records, 0, false)?;
+            if skipped > 0 {
+                eprintln!("[SYNC] {skipped} held record(s) not applied");
             }
-            if delete_them {
-                let rec = SyncRecord {
-                    uuid: uuid.clone(),
-                    entity_type: entity_type.clone(),
-                    updated_at: stamp.clone(),
-                    deleted: true,
-                    blob: None,
-                };
-                if let Err(e) = in_savepoint(&tx, || apply_tombstone(&tx, &rec))? {
-                    eprintln!("[SYNC] held deletion not applied uuid={uuid}: {e}");
-                }
-            } else {
+        } else {
+            for rec in wipes.iter().chain(&deletions) {
                 tx.execute(
-                    &format!("UPDATE {entity_type} SET updated_at=?1 WHERE uuid=?2"),
-                    rusqlite::params![stamp_past(&hlc.tick(), stamp), uuid],
-                )
-                .map_err(|e| format!("[SYNC] KEEP: {e}"))?;
-            }
-        }
-        let mut fixups = Vec::new();
-        for rec in &wipes {
-            let Some(spec) = ENTITIES.iter().find(|s| s.table == rec.entity_type) else { continue };
-            if delete_them {
-                // As the merge would have: whatever else the record changes
-                // that runs by itself is still held.
-                let watch = approvals::watches(spec.table);
-                let before = if watch { approvals::snapshot(&tx, spec.table, &rec.uuid) } else { None };
-                match apply_entity(&tx, key, spec, rec, false, &mut fixups) {
-                    Ok(()) if watch => approvals::hold_changes(&tx, spec.table, &rec.uuid, before.as_ref())?,
-                    Ok(()) => {}
-                    Err(e) => eprintln!("[SYNC] held record not applied uuid={}: {e}", rec.uuid),
-                }
-            } else {
-                tx.execute(
-                    &format!("UPDATE {} SET updated_at=?1 WHERE uuid=?2", spec.table),
+                    &format!("UPDATE {} SET updated_at=?1 WHERE uuid=?2", rec.entity_type),
                     rusqlite::params![stamp_past(&hlc.tick(), &rec.updated_at), rec.uuid],
                 )
                 .map_err(|e| format!("[SYNC] KEEP: {e}"))?;
             }
         }
-        repair_links(&tx, fixups);
         tx.execute("DELETE FROM held_deletions", []).map_err(|e| format!("[SYNC] HELD_CLEAR: {e}"))?;
         tx.execute("DELETE FROM held_wipes", []).map_err(|e| format!("[SYNC] HELD_CLEAR: {e}"))?;
         tx.commit().map_err(|e| format!("[SYNC] TX_COMMIT: {e}"))?;
         Ok(held.len() + wipes.len())
     })();
     let _ = conn.execute("UPDATE sync_flags SET val=0 WHERE key='merge'", []);
-    done
+    let done = done?;
+    if delete_them {
+        tree_moves::break_folder_loops(conn).map_err(|e| format!("[SYNC] FOLDER_LOOP: {e}"))?;
+    }
+    Ok(done)
 }
 
 /// `fresh` (this device's next stamp), or, when that doesn't sort after
@@ -6427,6 +6429,58 @@ mod sync_engine_tests {
         assert!(approvals::held_for(&b, &server.uuid).is_empty(), "nothing of it landed yet");
         resolve_held(&b, &KEY, &hb, true).unwrap();
         assert!(approvals::held_for(&b, &server.uuid).contains(approvals::RUN_ON_CONNECT));
+    }
+
+    // Nor to the move in it: a record held for its emptied password that also
+    // moves the server into a folder at "Run anything" here lands with the
+    // AI's level held, as any other sync's move would.
+    #[test]
+    fn a_yes_to_a_held_record_still_holds_the_ai_s_level() {
+        let (a, _ha) = device("A");
+        a.execute_batch(
+            "INSERT INTO folders(name) VALUES('Lab');
+             INSERT INTO servers(name,host,port,password) VALUES('db-01','h',22,'pw');",
+        )
+        .unwrap();
+        let (b, hb) = member("B", "editor");
+        ai::trust::create_schema(&b, "this-install-0000").unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let lab: i64 = b.query_row("SELECT id FROM folders WHERE name='Lab'", [], |r| r.get(0)).unwrap();
+        ai::trust::set_level(&b, "folder", lab, Some(3)).unwrap();
+        a.execute("UPDATE servers SET password='', folder_id=(SELECT id FROM folders WHERE name='Lab')", []).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        assert_eq!(approvals::held_wipes(&b).len(), 1, "held for the password");
+        let (db, uuid): (i64, String) = b.query_row("SELECT id, uuid FROM servers", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        resolve_held(&b, &KEY, &hb, true).unwrap();
+        let folder: Option<i64> = b.query_row("SELECT folder_id FROM servers", [], |r| r.get(0)).unwrap();
+        assert_eq!(folder, Some(lab), "the move landed");
+        assert!(
+            approvals::held_for(&b, &uuid).iter().any(|i| i.starts_with(ai::trust::HELD_ITEM)),
+            "the AI's level is held"
+        );
+        let p = ai::trust::policy_for(&b, Some(db));
+        assert!(p.force_ask.is_some(), "every command asks until it's allowed");
+    }
+
+    // A yes to a held deletion of a jump host leaves the servers behind it
+    // refusing to go direct, as a sync's deletion of it does (jump_gone.rs).
+    #[test]
+    fn a_yes_to_a_held_deletion_of_a_jump_host_notes_the_servers_behind_it() {
+        let (a, _ha) = device("A");
+        for i in 0..15 {
+            a.execute("INSERT INTO servers(name,host,port) VALUES(?1,'h',22)", [format!("s{i:02}")]).unwrap();
+        }
+        a.execute("UPDATE servers SET jump_host_id=(SELECT id FROM servers WHERE name='s05') WHERE name='s00'", []).unwrap();
+        let (b, hb) = shared_device("B");
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        a.execute("DELETE FROM servers WHERE name >= 's03'", []).unwrap();
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        assert_eq!(approvals::held_deletions(&b).len(), 12);
+        let s00: i64 = b.query_row("SELECT id FROM servers WHERE name='s00'", [], |r| r.get(0)).unwrap();
+        assert!(jump_gone::reason(&b, s00).is_none());
+        resolve_held(&b, &KEY, &hb, true).unwrap();
+        assert_eq!(count(&b, "servers"), 3);
+        assert!(jump_gone::reason(&b, s00).is_some(), "it won't go direct without asking");
     }
 
     // A copy put back: the first sync keeps what its answer would take away
@@ -14765,20 +14819,24 @@ async fn login_hop(
             && !prompt_ctx.cancelled.load(std::sync::atomic::Ordering::Relaxed)
             && !prompt_ctx.session_unusable.load(std::sync::atomic::Ordering::Relaxed)
         {
-            if let Some(kbi_res) = run_keyboard_interactive(
-                &mut session,
-                &effective_user,
-                ctx.app,
-                ctx.session_id,
-                &jump_nonce,
-                ctx.kbi_txs,
-                ctx.attempt,
-                kbi_password.as_ref().map(|p| p.as_str()),
-                prompt_ctx.save_offer().await,
-                (!ctx.allow_prompt).then_some(&kbi_unasked),
-                &mut None,
-            )
-            .await
+            // Within the login's deadline, and ended by the tab closing.
+            let save_offer = prompt_ctx.save_offer().await;
+            if let Some(kbi_res) = prompt_ctx
+                .login_step(run_keyboard_interactive(
+                    &mut session,
+                    &effective_user,
+                    ctx.app,
+                    ctx.session_id,
+                    &jump_nonce,
+                    ctx.kbi_txs,
+                    ctx.attempt,
+                    kbi_password.as_ref().map(|p| p.as_str()),
+                    save_offer,
+                    (!ctx.allow_prompt).then_some(&kbi_unasked),
+                    &mut None,
+                ))
+                .await
+                .unwrap_or(Some(Err(russh::Error::ConnectionTimeout)))
             {
                 auth_res = kbi_res;
             }
@@ -15906,20 +15964,25 @@ async fn initiate_connection(
                 {
                     let mut typed_password = None;
                     let kbi_unasked = std::sync::atomic::AtomicBool::new(false);
-                    if let Some(kbi_res) = run_keyboard_interactive(
-                        &mut session,
-                        &effective_user,
-                        &app,
-                        &session_id_clone,
-                        &connect_nonce,
-                        &kbi_txs_clone,
-                        &attempt,
-                        kbi_password.as_ref().map(|p| p.as_str()),
-                        prompt_ctx.save_offer().await,
-                        (!allow_kbi).then_some(&kbi_unasked),
-                        &mut typed_password,
-                    )
-                    .await
+                    // Within the login's deadline, and ended by the tab
+                    // closing, as the other login steps are.
+                    let save_offer = prompt_ctx.save_offer().await;
+                    if let Some(kbi_res) = prompt_ctx
+                        .login_step(run_keyboard_interactive(
+                            &mut session,
+                            &effective_user,
+                            &app,
+                            &session_id_clone,
+                            &connect_nonce,
+                            &kbi_txs_clone,
+                            &attempt,
+                            kbi_password.as_ref().map(|p| p.as_str()),
+                            save_offer,
+                            (!allow_kbi).then_some(&kbi_unasked),
+                            &mut typed_password,
+                        ))
+                        .await
+                        .unwrap_or(Some(Err(russh::Error::ConnectionTimeout)))
                     {
                         auth_res = kbi_res;
                     }
@@ -19569,8 +19632,7 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
             _ => None,
         };
 
-        let session = session_arc.read().await;
-        let channel = session.channel_open_session().await.map_err(|e| e.to_string())?;
+        let channel = shell_sftp::open_session_channel(&session_arc).await?;
 
         // Request PTY
         channel.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]).await.map_err(|e| e.to_string())?;
@@ -20602,10 +20664,7 @@ fn root_probe_command(tool: &str, password: bool, args: &[String], no_tickets: b
 /// it printed, up to 64 KB.
 async fn exec_probe_with_password<H: russh::client::Handler>(session_arc: &HandleArc<H>, cmd: &str, password: &str, timeout_secs: u64) -> Result<String, String> {
     use russh::ChannelMsg;
-    let mut channel = {
-        let session = session_arc.read().await;
-        session.channel_open_session().await.map_err(|e| e.to_string())?
-    };
+    let mut channel = shell_sftp::open_session_channel(session_arc).await?;
     channel.exec(true, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
     let mut out: Vec<u8> = Vec::new();
     let work = async {
@@ -21087,10 +21146,7 @@ async fn exec_fed_capture<H: russh::client::Handler>(
     max: usize,
 ) -> Result<(i32, String), String> {
     use russh::ChannelMsg;
-    let mut channel = {
-        let session = session_arc.read().await;
-        session.channel_open_session().await.map_err(|e| e.to_string())?
-    };
+    let mut channel = shell_sftp::open_session_channel(session_arc).await?;
     channel.exec(true, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
     let mut code: Option<u32> = None;
     let work = async {
@@ -21210,10 +21266,7 @@ async fn root_channel_open<H: russh::client::Handler>(
     pty: Option<(u32, u32)>,
     hook: Option<TurnHook<'_>>,
 ) -> Result<(russh::Channel<russh::client::Msg>, Option<&'static str>, Vec<u8>), String> {
-    let mut channel = {
-        let session = session_arc.read().await;
-        session.channel_open_session().await.map_err(|e| e.to_string())?
-    };
+    let mut channel = shell_sftp::open_session_channel(session_arc).await?;
     if let Some((cols, rows)) = pty {
         channel
             .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
@@ -22393,10 +22446,7 @@ async fn open_elevated_sftp<H: russh::client::Handler>(
     let tool = if ELEVATION_TOOLS.contains(&elevation.tool) { elevation.tool } else { "sudo" };
     let tag = new_root_tag();
     let password = elevation.password.as_ref().map(|p| p.as_str());
-    let mut channel = {
-        let session = session_arc.read().await;
-        session.channel_open_session().await.map_err(|e| e.to_string())?
-    };
+    let mut channel = shell_sftp::open_session_channel(session_arc).await?;
     // Through a root shell, the shell prints the ready marker and starts
     // sftp-server; nothing else goes to it before the marker is back. The
     // tool's answer to the password comes before either (root_feed), so a

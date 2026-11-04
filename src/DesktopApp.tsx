@@ -1348,6 +1348,7 @@ function DesktopApp() {
     setMergedSessionIds([]);
     setSessionStatuses({});
     setSessionTerminals({});
+    setSessionActiveTerm({});
     setPromptSessions(new Set());
     setLastSyncLabel(null);
     setActiveFolderId(null);
