@@ -1,7 +1,7 @@
 import { ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Bot, Check, ChevronDown, ChevronRight, Loader2, ShieldAlert, Square, X, Zap } from "lucide-react";
-import { AiDone, AiPending, AiSnapshot, cardsOf, copyCard, runnerWarning } from "../util/ai";
+import { AiDone, AiPending, AiSnapshot, cardsOf, copyCard, runnerWarning, STEERED_BY_OUTPUT } from "../util/ai";
 import { HIDDEN_CONTROLS } from "../util/fileName";
 import { WILDCARD_WARNING } from "./AiTrust";
 
@@ -392,9 +392,9 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
           }}
           onDown={down}
           accept={accept}
-          title={many
+          title={(many
             ? "Runs this, and what this AI tab asks for on these servers from now on, without asking, but for your always-ask list. Ends when the AI tab closes, or a server stops being shared."
-            : "Runs this, and what this AI tab asks for on this server from now on, without asking, but for your always-ask list. Ends when the AI tab closes, or the server stops being shared."}
+            : "Runs this, and what this AI tab asks for on this server from now on, without asking, but for your always-ask list. Ends when the AI tab closes, or the server stops being shared.") + " " + STEERED_BY_OUTPUT}
           className={`${link} flex items-center gap-1`}
         >
           <Zap size={11} className="shrink-0" /> {many ? `Allow everything on these ${many.length} servers until this AI tab closes` : "Allow everything here until this AI tab closes"}

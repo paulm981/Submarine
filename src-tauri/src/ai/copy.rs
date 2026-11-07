@@ -26,6 +26,7 @@
 //! - **Logged** in the audit log as commands are: the request, the decision,
 //!   and how it ended.
 
+use super::boundary::ServerText;
 use super::*;
 use crate::ssh_manager::SshState;
 use serde_json::Value;
@@ -604,6 +605,10 @@ pub(crate) struct Outcome {
     pub left: Option<String>,
     pub notes: Vec<String>,
     pub end: End,
+    /// What the server said about a failure (its error, which may name its
+    /// files): kept apart from Submarine's words in `end`, so the AI is
+    /// given it marked as the server's (boundary.rs).
+    pub said: Option<String>,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -620,15 +625,34 @@ impl Outcome {
         Outcome { end: End::Failed(why.into()), ..Outcome::default() }
     }
 
+    /// Failed: why, in Submarine's words, and what the server said.
+    fn failed_saying(why: impl Into<String>, said: impl Into<String>) -> Outcome {
+        Outcome { end: End::Failed(why.into()), said: Some(said.into()), ..Outcome::default() }
+    }
+
+    /// Why it failed, for you: Submarine's words and the server's.
+    fn why_for_you(&self) -> Option<String> {
+        match (&self.end, &self.said) {
+            (End::Failed(why), Some(said)) => Some(format!("{why} {said}")),
+            (End::Failed(why), None) => Some(why.clone()),
+            _ => None,
+        }
+    }
+
     fn stopped(to: String) -> Outcome {
         Outcome { to, end: End::Stopped, ..Outcome::default() }
     }
 
-    /// The server's part of the AI's answer.
-    pub(crate) fn answer(&self) -> ToolResult {
+    /// The server's part of the AI's answer, `server`'s: what the server
+    /// said goes with it, to be marked as the server's when it's given.
+    pub(crate) fn answer(&self, server: &str) -> ToolResult {
         let so_far = if self.copied > 0 { format!(" {} ({}) copied before that, to {}.", files_text(self.copied), size_text(self.bytes), self.to) } else { String::new() };
         let mut text = match &self.end {
-            End::Failed(why) => return ToolResult::err(format!("Failed: {why}{so_far}")),
+            End::Failed(why) => {
+                let mut r = ToolResult::err(format!("Failed: {why}{so_far}"));
+                r.server_text = self.said.as_ref().map(|said| ServerText { server: server.to_string(), text: said.clone() });
+                return r;
+            }
             End::Stopped => {
                 return ToolResult::err(format!("Stopped before it finished: the request was withdrawn, or the server stopped being shared.{so_far}"));
             }
@@ -662,14 +686,16 @@ pub(crate) fn app_copier(app: tauri::AppHandle) -> Copier {
     })
 }
 
-/// What a transfer command's error means here.
-fn ended_by(err: String, left: impl FnOnce() -> String) -> Result<Option<String>, End> {
+/// What a transfer command's error means here: Ok with what was left, or
+/// how it ended, with what the server said (the error, which may name its
+/// files) when it failed.
+fn ended_by(err: String, left: impl FnOnce() -> String) -> Result<Option<String>, (End, Option<String>)> {
     if err.starts_with("EXISTS:") {
         Ok(Some(left()))
     } else if err == "cancelled" {
-        Err(End::Stopped)
+        Err((End::Stopped, None))
     } else {
-        Err(End::Failed(err))
+        Err((End::Failed("The transfer gave an error.".into()), Some(err)))
     }
 }
 
@@ -686,12 +712,12 @@ async fn run_job(app: tauri::AppHandle, job: Job, stop: Arc<AtomicBool>) -> Outc
     }
     let sftp = match crate::get_sftp_session(&ssh, &job.session_id).await {
         Ok(s) => s,
-        Err(e) => return Outcome::failed(format!("Couldn't open the server's files: {e}")),
+        Err(e) => return Outcome::failed_saying("Couldn't open the server's files.", e),
     };
     let home = if job.plan.source.starts_with('~') || job.plan.destination.starts_with('~') {
         match sftp.canonicalize(".").await {
             Ok(h) => h,
-            Err(e) => return Outcome::failed(format!("Couldn't find the login's home folder: {e}")),
+            Err(e) => return Outcome::failed_saying("Couldn't find the login's home folder.", e.to_string()),
         }
     } else {
         String::new()
@@ -706,7 +732,10 @@ async fn push(app: &tauri::AppHandle, sftp: &russh_sftp::client::SftpSession, jo
     use tauri::Manager;
     let plan = &job.plan;
     let dest = resolve_remote(&plan.destination, home);
-    let to = format!("{dest} on {}", job.server);
+    // What the answer names: the path as the AI gave it, never the home
+    // folder the server gave for `~`, which is the server's words.
+    let shown = &plan.destination;
+    let to = format!("{shown} on {}", job.server);
     // What's sent is what the card showed: counted again, as it is now.
     let source = PathBuf::from(&plan.source);
     let now = {
@@ -727,8 +756,8 @@ async fn push(app: &tauri::AppHandle, sftp: &russh_sftp::client::SftpSession, jo
     };
     match sftp.metadata(&dest).await {
         Ok(m) if m.file_type().is_dir() => {}
-        Ok(_) => return Outcome::failed(format!("{dest} on {} isn't a folder.", job.server)),
-        Err(e) => return Outcome::failed(format!("{dest} isn't there on {}: {e}", job.server)),
+        Ok(_) => return Outcome::failed(format!("{shown} on {} isn't a folder.", job.server)),
+        Err(e) => return Outcome::failed_saying(format!("{shown} isn't there on {}.", job.server), e.to_string()),
     }
     if stop.load(Ordering::Relaxed) {
         return Outcome::stopped(to);
@@ -741,7 +770,7 @@ async fn push(app: &tauri::AppHandle, sftp: &russh_sftp::client::SftpSession, jo
     } else {
         crate::sftp_upload_file(app.clone(), app.state(), job.session_id.clone(), plan.source.clone(), join_remote(&dest, &name), Some(plan.replace)).await
     };
-    let there = join_remote(&dest, &name);
+    let there = join_remote(shown, &name);
     let mut out = Outcome { to, ..Outcome::default() };
     match ended {
         Ok(()) => {
@@ -756,7 +785,10 @@ async fn push(app: &tauri::AppHandle, sftp: &russh_sftp::client::SftpSession, jo
             }
         }) {
             Ok(left) => out.left = left,
-            Err(end) => out.end = end,
+            Err((end, said)) => {
+                out.end = end;
+                out.said = said;
+            }
         },
     }
     if out.end == End::Done && tree.links_skipped > 0 {
@@ -796,7 +828,7 @@ async fn pull(
     let to = dir.display().to_string();
     let meta = match sftp.metadata(&remote).await {
         Ok(m) => m,
-        Err(e) => return Outcome::failed(format!("{remote} isn't there on {}: {e}", job.server)),
+        Err(e) => return Outcome::failed_saying(format!("{} isn't there on {}.", plan.source, job.server), e.to_string()),
     };
     if stop.load(Ordering::Relaxed) {
         return Outcome::stopped(to);
@@ -805,7 +837,7 @@ async fn pull(
         return pull_folder(ssh, sftp, job, &remote, &name, &dir, stop).await;
     }
     if !meta.file_type().is_file() {
-        return Outcome::failed(format!("{remote} on {} isn't a file or a folder.", job.server));
+        return Outcome::failed(format!("{} on {} isn't a file or a folder.", plan.source, job.server));
     }
     let size = meta.size.unwrap_or(0);
     if let Some(why) = over_limits(1, size) {
@@ -824,7 +856,10 @@ async fn pull(
         }
         Err(e) => match ended_by(e, || format!("{} is already on this computer, and Submarine never replaces a file here.", local.display())) {
             Ok(left) => out.left = left,
-            Err(end) => out.end = end,
+            Err((end, said)) => {
+                out.end = end;
+                out.said = said;
+            }
         },
     }
     out
@@ -862,7 +897,7 @@ async fn pull_folder(
         Ok(()) => {}
         Err(None) if too_many.load(Ordering::Relaxed) => return Outcome::failed(over_limits(MAX_FILES + 1, 0).unwrap_or_default()),
         Err(None) => return Outcome::stopped(to),
-        Err(Some(why)) => return Outcome::failed(why),
+        Err(Some(why)) => return Outcome::failed_saying("Couldn't go through the folder on the server.", why),
     }
     let crate::DownloadTree { mut files, total_bytes, skipped_names } = tree;
     if let Some(why) = over_limits(files.len() as u64, total_bytes) {
@@ -902,7 +937,10 @@ async fn pull_folder(
     match ended {
         crate::DirFilesEnd::Done => out.copied = (files.len() as u64).saturating_sub(skipped),
         crate::DirFilesEnd::Stopped(_) => out.end = End::Stopped,
-        crate::DirFilesEnd::Failed(why, _) => out.end = End::Failed(why),
+        crate::DirFilesEnd::Failed(why, _) => {
+            out.end = End::Failed("A file didn't copy.".into());
+            out.said = Some(why);
+        }
     }
     out.skipped = skipped;
     out.notes = [crate::skipped_names_note(skipped_names), crate::downloads::autorun_skipped_note(autorun), crate::downloads::case_twins_note(twins)]
@@ -1271,7 +1309,7 @@ impl AiState {
                 _ = withdrawal(&mut cancel) => None,
             }
         };
-        let to_ai = |o: &Outcome| o.answer();
+        let to_ai = |o: &Outcome| o.answer(name);
         let outcome = match turn {
             None => Outcome::stopped(String::new()),
             Some(turn) => {
@@ -1310,8 +1348,10 @@ impl AiState {
             s.running.retain(|r| r.view.id != id);
         }
         let answer = to_ai(&outcome);
+        // You see it plain; the AI gets the server's words marked.
+        let plain = answer.plain();
         let mut e = entry_for("finished");
-        e.note = Some(answer.text.clone());
+        e.note = Some(plain.clone());
         self.audit(e);
         let mut d = done(
             match outcome.end {
@@ -1319,12 +1359,10 @@ impl AiState {
                 End::Stopped => "stopped",
                 End::Failed(_) => "failed",
             },
-            &answer.text,
+            &plain,
         );
         d.view.ran_without_asking = ran_without_asking;
-        if let End::Failed(why) = &outcome.end {
-            d.view.error = Some(why.clone());
-        }
+        d.view.error = outcome.why_for_you();
         self.remember(epoch, d);
         self.changed();
         answer
