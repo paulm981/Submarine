@@ -13,6 +13,7 @@ import { openAiTrust, useAi } from "../util/ai";
 import { pingServers } from "../ui/ping";
 import { jumpHostNote } from "../util/jumpHostNote";
 import { showKeptSessions } from "./KeptSessions";
+import { BulkItems } from "../fork/bulk/menus";
 
 // The session tree beside the main view, in the spirit of MobaXterm's
 // Sessions sidebar: every folder and server as one compact list, with the servers that have a tab open marked by their
@@ -914,6 +915,16 @@ export const SessionTree = ({
                       <Activity size={13} className={menuIcon} /> {list.length > 1 ? `Ping ${list.length} servers` : "Ping"}
                     </button>
                   );
+                })()}
+                {(() => {
+                  // Bulk push and pull (#159), over the sessions open on
+                  // the servers picked (several selected: each of them).
+                  const list = pickedCount > 1 && selected.has(r.key) ? picked.list : [r.server];
+                  const from = list
+                    .filter((sv) => (sv.protocol ?? "ssh") === "ssh")
+                    .map((sv) => sessions.find((x) => x.serverId === sv.id)?.id)
+                    .filter((id): id is string => !!id && statuses[id] === "connected");
+                  return <BulkItems from={from} className={menuItem} iconClass={menuIcon} onPick={() => setMenu(null)} />;
                 })()}
                 {!many && (
                   <button className={menuItem} onClick={run(() => { navigator.clipboard?.writeText(String(host)).catch(() => {}); })}>

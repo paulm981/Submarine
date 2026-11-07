@@ -1802,7 +1802,7 @@ function DesktopApp() {
                 onClick={() => setTabRename(targetId)}
               >Rename tab</button>
             )}
-            <Fork.TabMoveItems sessions={sessions} targetId={targetId} setSessions={setSessions} onDone={() => setTabMenu(null)} />
+            <Fork.TabMoveItems sessions={sessions} targetId={targetId} setSessions={setSessions} onDone={() => setTabMenu(null)} /><Fork.BulkTabItems targetId={targetId} sessions={sessions} statuses={sessionStatuses} onDone={() => setTabMenu(null)} />
             <button
               className="w-full text-left px-3 py-1.5 hover:bg-primary/15 hover:text-primary text-zinc-200 flex items-center gap-2"
               onClick={() => {
@@ -2897,7 +2897,7 @@ function DesktopApp() {
           </main>
           <Fork.DesktopAiSide v={aiPaneView} isMobile={isMobile} sessions={sessions} setActiveView={setActiveView} />
           <Fork.DesktopSessionTree tree={tree} side="right" isMobile={isMobile} />
-          <Fork.PingPanel />
+          <Fork.PingPanel /><Fork.BulkTransfer sessions={sessions} statuses={sessionStatuses} />
           <Fork.DesktopAiPanel open={aiOpen} onClose={() => setAiOpen(false)} sessions={sessions} setActiveView={setActiveView} />
         </div>
       )}

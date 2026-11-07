@@ -95,6 +95,7 @@ use server_look::*;
 mod clone_server;
 use clone_server::*;
 mod keep_session;
+mod bulk_pick;
 #[cfg(windows)]
 mod windows_clipboard;
 #[cfg(windows)]
@@ -26395,6 +26396,7 @@ pub fn run() {
             about::app_info, about::check_for_updates, about::open_external_url,
             portable::get_storage_info,
             local_open::live_edit_editor_get, local_open::live_edit_editor_pick, local_open::live_edit_editor_reset,
+            bulk_pick::bulk_pick_files,
             multiexec::get_jump_login_limit, multiexec::set_jump_login_limit,
             server_os::detect_server_os,
             fonts::list_system_fonts,
