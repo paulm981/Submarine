@@ -16,17 +16,25 @@
 // project (upstream/main), of a module that isn't. After a deliberate change
 // (a hook added, moved or removed), update the table to match: add the new
 // import under its file, or drop the one that went, in the same pull request.
+//
+// A file that reaches many of the fork's hooks through one import (DesktopApp,
+// through src/fork/desktop) also lists them under `uses`, as written there:
+// each must still be in the file's code, so a merge that drops one fails too.
 
 import { describe, expect, it } from "vitest";
 
-const HOOKS: { file: string; imports: string[] }[] = [
+const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
   {
     file: "src/DesktopApp.tsx",
-    imports: [
-      "./components/AiPanel", "./components/AiSidePane", "./components/AiTrust", "./components/AllTabsMenu",
-      "./components/HomePane", "./components/PingPanel", "./components/SessionTree", "./ui/aiPane", "./ui/highlight",
-      "./ui/ping", "./ui/tabDrag", "./ui/tabStyle", "./ui/terminalDock", "./ui/terminalThemes", "./util/ai",
-      "./util/diagnostics", "./util/fileName", "./util/infoFont",
+    // Everything of the fork's in the main window comes through src/fork/desktop.
+    imports: ["./fork/desktop"],
+    uses: [
+      "Fork.readForkSettings", "Fork.writeForkSettings", "Fork.useServerLooks", "Fork.useHighlightRules", "Fork.useHeldActions",
+      "Fork.useLiveEditKept", "Fork.wouldEnd", "Fork.useOsBadges", "Fork.useCloseSessions", "Fork.useTabKeys", "Fork.useTabStrip",
+      "Fork.useJumpHostPick", "Fork.useSessionTree", "Fork.aiPaneViewOf", "Fork.saveServerLooks", "Fork.sessionPaneStyle",
+      "Fork.tabMenuStyle", "Fork.titleTabClass", "Fork.AppVersion", "Fork.HomeTab", "Fork.HomeView", "Fork.NewsDot",
+      "Fork.TabAiMarker", "Fork.AllTabsButton", "Fork.AiTitleButtons", "Fork.TabMoveItems", "Fork.TabCloseItems",
+      "Fork.DesktopSessionTree", "Fork.DesktopAiSide", "Fork.PingPanel", "Fork.DesktopAiPanel", "Fork.AiTrustModal",
     ],
   },
   {
@@ -60,12 +68,19 @@ const HOOKS: { file: string; imports: string[] }[] = [
 // read by Vite, so the test needs no Node types under the app's tsconfig.
 const SOURCES = import.meta.glob<string>("/src/**/*.{ts,tsx}", { query: "?raw", import: "default", eager: true });
 
+/** `src` without its comments: block ones, and those on a line of their own
+ *  or after the code (" // …"). */
+const codeOf = (src: string): string =>
+  src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "").replace(/\s\/\/ .*$/gm, "");
+
 /** The modules `src` imports (`import … from`, `import "…"`, `import("…")`,
  *  `export … from`), leaving out comments. */
-const importsOf = (src: string): Set<string> => {
-  const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
-  return new Set([...code.matchAll(/\b(?:from|import)\s*\(?\s*["']([^"']+)["']/g)].map((m) => m[1]));
-};
+const importsOf = (src: string): Set<string> =>
+  new Set([...codeOf(src).matchAll(/\b(?:from|import)\s*\(?\s*["']([^"']+)["']/g)].map((m) => m[1]));
+
+/** `name` is in the code (not only in a comment), as a whole word. */
+const uses = (src: string, name: string): boolean =>
+  new RegExp(`${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(codeOf(src));
 
 /** `spec` imported from `file`, as the file it names: "/src/…", or null. */
 const resolve = (file: string, spec: string): string | null => {
@@ -79,13 +94,14 @@ const resolve = (file: string, spec: string): string | null => {
 };
 
 describe("the fork's hooks in the original project's files", () => {
-  for (const { file, imports } of HOOKS) {
+  for (const { file, imports, uses: used = [] } of HOOKS) {
     it(file, () => {
       const src = SOURCES[`/${file}`];
       expect(src, `${file} is gone: move its hooks to where its code went, and update this table`).toBeTypeOf("string");
       const found = importsOf(src);
       expect(imports.filter((i) => !found.has(i)), `fork imports ${file} no longer has`).toEqual([]);
       expect(imports.filter((i) => resolve(file, i) === null), `fork modules ${file} imports that are gone`).toEqual([]);
+      expect(used.filter((u) => !uses(src, u)), `fork hooks ${file} no longer has`).toEqual([]);
     });
   }
 });
