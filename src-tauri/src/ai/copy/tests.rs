@@ -103,7 +103,9 @@ fn local_paths_are_full_with_no_dot_steps() {
         assert!(plain_local(r"\\.\C:\x").is_err());
     }
     assert!(plain_local("relative/path").unwrap_err().contains("isn't a full path"));
-    assert!(plain_local(&typed(&dir.join("..").join("x"))).unwrap_err().contains(".."));
+    // As text: on Windows, joining `..` onto a `\\?\` path takes the step out at once.
+    let sep = std::path::MAIN_SEPARATOR;
+    assert!(plain_local(&format!("{}{sep}..{sep}x", typed(&dir))).unwrap_err().contains(".."));
 }
 
 // -- Where a pull may go --------------------------------------------------------
@@ -280,7 +282,7 @@ fn a_push_counts_what_it_sends_and_follows_no_link() {
         assert!(push_source(&typed(&dir.join("file-link"))).unwrap_err().contains("is a link"));
     }
     let (path, tree) = push_source(&typed(&src)).unwrap();
-    assert_eq!((path, tree.files), (src.clone(), 2));
+    assert_eq!((path, tree.files), (PathBuf::from(typed(&src)), 2));
     // A system folder isn't sent, as the user's own pushes aren't.
     #[cfg(target_os = "linux")]
     assert!(push_source("/etc/hostname").is_err());
