@@ -42,7 +42,7 @@
 //!   the output, the AI's answer, the audit log, the app log or an error.
 
 mod audit;
-mod channel;
+pub(crate) mod channel;
 mod claude;
 mod exec;
 mod filter;
