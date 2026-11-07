@@ -256,9 +256,11 @@ function HomeTerminalSettings() {
 }
 
 // AI tools (#32, src-tauri/src/ai): off by default, on this device only.
-// On, Home's menu lists Claude Code under AI tools, started already connected
-// to Submarine; off, nothing listens and every AI tab's access ends.
-interface AiSettings { enabled: boolean; flash: boolean; claude: string | null; available: boolean }
+// On, Home's menu lists the AI tools installed (Claude Code, Codex: #117)
+// under AI tools, started already connected to Submarine; off, nothing
+// listens and every AI tab's access ends.
+interface AiToolInfo { id: string; label: string; path: string | null }
+interface AiSettings { enabled: boolean; flash: boolean; tools: AiToolInfo[]; available: boolean }
 // Claude Code's own settings that keep it out of your keys: deny rules for
 // its Read tool, and the sandbox's `credentials` for the commands it runs
 // (code.claude.com/docs/en/permissions and /sandboxing).
@@ -314,16 +316,26 @@ function AiToolsSettings() {
         <p className="text-[12px] text-amber-200/90 leading-relaxed rounded-lg border border-amber-400/20 bg-amber-400/[0.06] px-3 py-2">
           Output you allow goes to the AI provider, and so do files the AI tool reads on this computer. Each command's
           output, with the secrets Submarine recognises hidden, is sent to the AI tool and on to its provider: for Claude
-          Code, Anthropic, or the cloud you've set it to use.
+          Code, Anthropic, or the cloud you've set it to use; for Codex, OpenAI.
         </p>
       )}
+      <ul className="text-[12px] text-zinc-400 leading-relaxed space-y-1">
+        {info.tools.map((t) => (
+          <li key={t.id}>
+            {t.path ? (
+              <><span className="text-zinc-200">{t.label}</span> is installed: <span className="font-mono text-[11.5px] text-zinc-300 break-all select-text">{t.path}</span></>
+            ) : (
+              <><span className="text-zinc-200">{t.label}</span> isn't installed on this computer.</>
+            )}
+          </li>
+        ))}
+      </ul>
       <p className="text-[12px] text-zinc-400 leading-relaxed">
-        {info.claude ? (
-          <>Claude Code is installed: <span className="font-mono text-[11.5px] text-zinc-300 break-all select-text">{info.claude}</span>.{" "}
-            {info.enabled ? "Start it from Home: the arrow beside +, then AI tools." : "Turn this on to find it in Home's menu."}</>
-        ) : (
-          <>Claude Code isn't installed on this computer. Install it, then open this again.</>
-        )}
+        {info.tools.some((t) => t.path)
+          ? (info.enabled ? "Start one from Home: the arrow beside +, then AI tools." : "Turn this on to find them in Home's menu.")
+          : "Install one, then open this again."}{" "}
+        Each starts already connected to Submarine, and doesn't ask a second time before it uses Submarine's tools:
+        Submarine asks you before each command itself.
       </p>
       <p className="text-[11.5px] text-zinc-500 leading-relaxed">
         What the AI gets back is filtered: private keys, password and token values, password hashes, access keys and

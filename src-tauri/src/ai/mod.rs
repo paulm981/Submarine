@@ -44,10 +44,12 @@
 mod audit;
 mod channel;
 mod claude;
+mod codex;
 mod exec;
 mod filter;
 pub mod helper;
 mod mcp;
+pub(crate) mod tools;
 pub(crate) mod trust;
 
 use serde::{Deserialize, Serialize};
@@ -1962,16 +1964,24 @@ pub struct AiSettings {
     enabled: bool,
     /// Flash the taskbar when the AI needs you.
     flash: bool,
-    /// Where Claude Code is, when it's installed.
-    claude: Option<String>,
+    /// Each AI tool Home's menu knows (tools.rs).
+    tools: Vec<ToolView>,
     available: bool,
+}
+
+#[derive(Serialize)]
+struct ToolView {
+    id: &'static str,
+    label: &'static str,
+    /// Where it is, when it's installed.
+    path: Option<String>,
 }
 
 fn settings_view(state: &AiState) -> AiSettings {
     AiSettings {
         enabled: state.enabled(),
         flash: state.0.flash.load(Ordering::Relaxed),
-        claude: claude::find().map(|p| p.to_string_lossy().into_owned()),
+        tools: tools::TOOLS.iter().map(|t| ToolView { id: t.id, label: t.label, path: t.find().map(|p| p.to_string_lossy().into_owned()) }).collect(),
         available: cfg!(not(target_os = "android")),
     }
 }
@@ -2243,12 +2253,13 @@ pub async fn ai_trust_remove_rule(state: tauri::State<'_, AiState>, db: tauri::S
 // Home's menu
 // ---------------------------------------------------------------------------
 
-/// An AI tool Home's menu can start, while AI tools are on and it's installed.
+/// The AI tools Home's menu can start, while AI tools are on: those
+/// installed.
 pub(crate) fn home_tools(state: &AiState) -> Vec<(String, String, PathBuf)> {
     if !state.enabled() {
         return Vec::new();
     }
-    claude::find().map(|p| (CLAUDE_ID.to_string(), claude::LABEL.to_string(), p)).into_iter().collect()
+    tools::TOOLS.iter().filter_map(|t| Some((t.id.to_string(), t.label.to_string(), t.find()?))).collect()
 }
 
 /// The program an AI tool runs as `submarine --mcp`: this one, or on Linux
@@ -2309,15 +2320,13 @@ fn workspace(data_dir: &std::path::Path) -> Result<PathBuf, String> {
 /// What Home starts for the AI tool `id` in the terminal `tab_id`.
 pub(crate) fn home_launch(app: &tauri::AppHandle, state: &AiState, id: &str, tab_id: &str) -> Result<HomeLaunch, String> {
     use tauri::Manager;
-    if id != CLAUDE_ID {
-        return Err("Submarine doesn't know that AI tool.".into());
-    }
-    let path = claude::find().ok_or("Claude Code isn't installed on this computer.")?;
+    let tool = tools::by_id(id).ok_or("Submarine doesn't know that AI tool.")?;
+    let path = tool.find().ok_or_else(|| format!("{} isn't installed on this computer.", tool.label))?;
     let helper = helper_path()?;
     let data = app.path().app_data_dir().map_err(|e| format!("Couldn't find Submarine's data folder: {e}"))?;
     let cwd = workspace(&data)?;
-    let launch = claude::launch(&path, &helper, Some(&data))?;
-    let (label, mut env) = state.start_tab(tab_id, claude::SHORT)?;
+    let launch = tool.launch(&path, &helper, Some(&data))?;
+    let (label, mut env) = state.start_tab(tab_id, tool.short)?;
     env.extend(launch.env);
     Ok(HomeLaunch { program: launch.program, args: launch.args, env, env_remove: launch.env_remove, cwd, label })
 }

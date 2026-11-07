@@ -461,7 +461,7 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
         )}
         {snap.enabled && snap.tabs.length === 0 && (
           <p className="p-4 text-zinc-500 leading-relaxed">
-            No AI tab is open. Start Claude Code from Home's menu (the arrow beside +), under AI tools.
+            No AI tab is open. Start an AI tool, such as Claude Code or Codex, from Home's menu (the arrow beside +), under AI tools.
           </p>
         )}
 

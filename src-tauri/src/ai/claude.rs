@@ -1,8 +1,8 @@
-//! Claude Code, the AI tool in Home's menu (#32, Decision 5): where it's
-//! installed, and how it starts already connected (Decision 1).
+//! Claude Code, an AI tool in Home's menu (#32, Decision 5; tools.rs): where
+//! it's installed, and how it starts already connected (Decision 1).
 //!
 //! It starts with `--mcp-config` naming one MCP server,
-//! `submarine-ssh-bridge` (SERVER), which runs this program with `--mcp`
+//! `submarine-ssh-bridge` (tools::SERVER), which runs this program with `--mcp`
 //! (helper.rs). That adds to your own MCP
 //! servers rather than replacing them. The entry's `env` names
 //! `${SUBMARINE_AI_ADDR}`, `${SUBMARINE_AI_TOKEN}` and `${SUBMARINE_AI_PID}`
@@ -21,16 +21,11 @@
 //!   names a file in Submarine's data folder instead. It holds no secret.
 
 use super::channel::{ENV_ADDR, ENV_PID, ENV_TOKEN};
+use super::tools::{self, Launch, SERVER};
 use std::path::{Path, PathBuf};
 
-pub(crate) const LABEL: &str = "Claude Code";
-/// The name its tabs go by in the AI panel ("Claude", "Claude 2").
-pub(crate) const SHORT: &str = "Claude";
-/// The MCP server's name in Claude Code. Not plain "submarine": the allow
-/// rule below would also let through a server of your own by that name.
-/// Claude Code keeps the hyphens in its tools' names
-/// (`mcp__submarine-ssh-bridge__run_command`).
-const SERVER: &str = "submarine-ssh-bridge";
+// Claude Code keeps the hyphens of SERVER in its tools' names
+// (`mcp__submarine-ssh-bridge__run_command`).
 /// Claude Code's rule for every tool of SERVER, which it then uses without
 /// asking. Claude Code's flag takes several values, so it goes last, after
 /// `--mcp-config`'s.
@@ -55,50 +50,30 @@ pub(crate) fn mcp_config(helper: &Path) -> serde_json::Value {
 }
 
 /// Where Claude Code is installed, if it is: its native installer's place
-/// first, then npm's, Homebrew's, then PATH. An app started from Finder or
-/// the Start menu may not have your shell's PATH, so the usual places are
-/// looked in by name.
+/// first, then npm's, Homebrew's, then PATH.
 pub(crate) fn find() -> Option<PathBuf> {
-    let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
     let mut places: Vec<PathBuf> = Vec::new();
     #[cfg(windows)]
     {
-        if let Some(home) = env("USERPROFILE") {
+        if let Some(home) = tools::home() {
             places.push(home.join(r".local\bin\claude.exe"));
         }
-        if let Some(appdata) = env("APPDATA") {
+        if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
             places.push(appdata.join(r"npm\claude.cmd"));
         }
-        if let Some(path) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&path) {
-                places.push(dir.join("claude.exe"));
-                places.push(dir.join("claude.cmd"));
-            }
-        }
+        tools::find_program(places, &["claude.exe", "claude.cmd"])
     }
     #[cfg(not(windows))]
     {
-        if let Some(home) = env("HOME") {
+        if let Some(home) = tools::home() {
             places.push(home.join(".local/bin/claude"));
             places.push(home.join(".claude/local/claude"));
             places.push(home.join(".npm-global/bin/claude"));
         }
         places.push(PathBuf::from("/opt/homebrew/bin/claude"));
         places.push(PathBuf::from("/usr/local/bin/claude"));
-        if let Some(path) = std::env::var_os("PATH") {
-            places.extend(std::env::split_paths(&path).map(|d| d.join("claude")));
-        }
+        tools::find_program(places, &["claude"])
     }
-    places.into_iter().find(|p| p.is_absolute() && p.is_file())
-}
-
-/// What Home starts: a program and its arguments, what to add to its
-/// environment besides the address and the token, and what to take out.
-pub(crate) struct Launch {
-    pub program: PathBuf,
-    pub args: Vec<String>,
-    pub env: Vec<(String, String)>,
-    pub env_remove: Vec<&'static str>,
 }
 
 /// The variables Claude Code logs in with when it's set to use a cloud
@@ -155,21 +130,9 @@ fn env_remove(var: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
 /// where the Windows settings file goes.
 pub(crate) fn launch(claude: &Path, helper: &Path, data_dir: Option<&Path>) -> Result<Launch, String> {
     let config = mcp_config(helper);
-    let mut env = Vec::new();
+    let env = tools::path_with(claude);
     let from_settings = settings_file().map(|f| settings_env(&f)).unwrap_or_default();
     let env_remove = env_remove(|k| from_settings.get(k).cloned().or_else(|| std::env::var(k).ok()));
-    // An npm install is a script run by node: node is often next to it
-    // (nvm, Homebrew), and an app started from the desktop may not have that
-    // folder in its PATH.
-    if let Some(dir) = claude.parent() {
-        let mut paths = vec![dir.to_path_buf()];
-        if let Some(p) = std::env::var_os("PATH") {
-            paths.extend(std::env::split_paths(&p));
-        }
-        if let Ok(joined) = std::env::join_paths(paths) {
-            env.push(("PATH".to_string(), joined.to_string_lossy().into_owned()));
-        }
-    }
     #[cfg(windows)]
     {
         let dir = data_dir.ok_or("Couldn't find Submarine's data folder.")?.join("ai");
@@ -177,12 +140,14 @@ pub(crate) fn launch(claude: &Path, helper: &Path, data_dir: Option<&Path>) -> R
         let file = dir.join("claude-mcp.json");
         let body = serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?;
         std::fs::write(&file, body).map_err(|e| format!("Couldn't write Claude Code's settings: {e}"))?;
-        let file = file.to_string_lossy().into_owned();
-        let is_cmd = claude.extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
-        if is_cmd {
-            return cmd_launch(claude, &file, env, env_remove);
+        let args = with_allowed(vec!["--mcp-config".into(), file.to_string_lossy().into_owned()]);
+        // A `.cmd` wrapper: the `*` means nothing to cmd.exe, and the
+        // wrapper passes it on as it is.
+        if tools::is_cmd(claude) {
+            let (program, args) = tools::through_cmd(claude, args, "Claude Code")?;
+            return Ok(Launch { program, args, env, env_remove });
         }
-        Ok(Launch { program: claude.to_path_buf(), args: with_allowed(vec!["--mcp-config".into(), file]), env, env_remove })
+        Ok(Launch { program: claude.to_path_buf(), args, env, env_remove })
     }
     #[cfg(not(windows))]
     {
@@ -194,28 +159,6 @@ pub(crate) fn launch(claude: &Path, helper: &Path, data_dir: Option<&Path>) -> R
 fn with_allowed(mut args: Vec<String>) -> Vec<String> {
     args.extend(ALLOW_SUBMARINE.map(String::from));
     args
-}
-
-/// A `.cmd` wrapper runs through cmd.exe: `cmd /d /c call "<claude.cmd>"
-/// --mcp-config "<file>" --allowedTools mcp__submarine-ssh-bridge__*`. `call` keeps
-/// cmd from taking the first quote off. cmd.exe reads `%`, `^`, `&`, `|`,
-/// `<`, `>`, `!` and `"` even in paths, so a path with any of them is
-/// refused rather than passed. The `*` means nothing to cmd.exe, and the
-/// wrapper passes it on as it is.
-#[cfg(windows)]
-fn cmd_launch(claude: &Path, file: &str, env: Vec<(String, String)>, env_remove: Vec<&'static str>) -> Result<Launch, String> {
-    let claude = claude.to_string_lossy().into_owned();
-    if !cmd_safe(&claude) || !cmd_safe(file) {
-        return Err("Claude Code's path has a character cmd.exe can't pass on (% ^ & | < > ! \"). Install Claude Code with its own installer (claude.exe) instead.".into());
-    }
-    let cmd = crate::local_open::system32().join("cmd.exe");
-    let args = vec!["/d".into(), "/c".into(), "call".into(), claude, "--mcp-config".into(), file.to_string()];
-    Ok(Launch { program: cmd, args: with_allowed(args), env, env_remove })
-}
-
-#[cfg_attr(not(any(windows, test)), allow(dead_code))]
-fn cmd_safe(s: &str) -> bool {
-    !s.chars().any(|c| "%^&|<>!\"".contains(c))
 }
 
 #[cfg(test)]
@@ -331,13 +274,8 @@ mod tests {
     }
 
     #[test]
-    fn cmd_exe_specials_are_refused() {
-        assert!(cmd_safe(r"C:\Users\Paul M\AppData\Roaming\npm\claude.cmd"));
-        for bad in [r"C:\100%\claude.cmd", r"C:\a&b\claude.cmd", r"C:\x^y\c.cmd", "C:\\q\"\\c.cmd", r"C:\hi!\c.cmd"] {
-            assert!(!cmd_safe(bad), "{bad}");
-        }
-        // What's added after the paths passes cmd.exe as it is.
-        assert!(ALLOW_SUBMARINE.iter().all(|a| cmd_safe(a) && !a.contains(' ')));
+    fn what_follows_the_paths_passes_cmd_exe() {
+        assert!(ALLOW_SUBMARINE.iter().all(|a| tools::cmd_safe(a) && !a.contains(' ')));
     }
 
     #[test]
@@ -348,9 +286,5 @@ mod tests {
         let config = mcp_config(Path::new("/x"));
         let servers = config["mcpServers"].as_object().unwrap();
         assert_eq!(servers.keys().collect::<Vec<_>>(), [SERVER]);
-        // Not a name a server of your own is likely to have, and nothing
-        // Claude Code would change (only `.` and spaces become `_`).
-        assert_ne!(SERVER, "submarine");
-        assert!(SERVER.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'));
     }
 }

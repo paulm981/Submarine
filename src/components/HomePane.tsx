@@ -14,7 +14,8 @@ import { aiStartEnded, takeAiLaunches, takeHomeTabAsk, watchAiLaunches, watchHom
 // (DesktopApp keeps this pane mounted once it has been shown).
 //
 // The menu's AI tools heading (#32) lists the AI tools Home can start —
-// Claude Code — while AI tools are on in Settings and it's installed. Picked,
+// Claude Code and Codex (#117) — while AI tools are on in Settings, those
+// installed. Picked,
 // it opens in a tab of its own, already connected to Submarine; closing the
 // tab ends its access. A server tab's + menu can start it here too (its
 // "Claude Code beside this", src/ui/aiPane.ts), and the AI side pane shows
