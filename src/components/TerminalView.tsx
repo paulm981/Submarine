@@ -12,7 +12,7 @@ import '@xterm/xterm/css/xterm.css';
 import { KeyRound } from 'lucide-react';
 import { useIsNarrow } from '../hooks/useViewport';
 import { MobileKeyBar, ModifiersState, ModKey, SpecialKey } from './MobileKeyBar';
-import { appHotkey, markTyped, registerTerminal, terminalStateChanged } from '../ui/terminalDock';
+import { appHotkey, markTyped, registerTerminal, settleAfterMove, terminalStateChanged } from '../ui/terminalDock';
 import { noteOutput, setLooking, watchTerminal } from '../ui/terminalActivity';
 import { forgetTerminal, logLine, noteTerminalOutput, noteTerminalParsed, noteTerminalRenderer } from '../util/diagnostics';
 import { useConfirm } from '../ui/confirm';
@@ -1857,7 +1857,6 @@ const TerminalView = ({
       },
       moved: (docked) => {
         dockedRef.current = docked;
-        updateGpu();
         setLooking(terminalId, lookingNow());
         // Moving the element can take the keyboard from it without a blur
         // event, so xterm would go on drawing the cursor of a terminal being
@@ -1866,11 +1865,12 @@ const TerminalView = ({
         if (focused && term.textarea && document.activeElement !== term.textarea) {
           term.textarea.dispatchEvent(new FocusEvent('blur'));
         }
-        requestAnimationFrame(() => {
-          try {
-            fitTerminal();
-            term.refresh(0, Math.max(0, term.rows - 1));
-          } catch { /* not laid out yet — the ResizeObserver refits */ }
+        // Refit, redraw and take or give up the GPU a few terminals per
+        // frame, not all of a Wall's at once (terminalDock, #127).
+        settleAfterMove(terminalId, () => {
+          updateGpu();
+          fitTerminal();
+          term.refresh(0, Math.max(0, term.rows - 1));
         });
       },
     });

@@ -69,6 +69,48 @@ const place = (e: DockEntry) => {
   }
 };
 
+// ── Settling after a move ───────────────────────────────────────────────────
+// After a move (into a Wall's tiles, back to the tabs, or when it first opens)
+// a terminal refits to its new box, redraws, and takes or gives up a GPU
+// context. A refit re-wraps the whole scrollback, so for 36 terminals at once
+// that held the window for seconds (#127). They settle a few at a time
+// instead, in the order they moved, within FRAME_BUDGET_MS of each frame: the
+// window keeps answering while the rest catch up.
+
+const FRAME_BUDGET_MS = 8;
+/// Terminal id → what it does once it settles; the latest move's only.
+const settling = new Map<string, () => void>();
+let settleScheduled = false;
+
+const settleSome = () => {
+  settleScheduled = false;
+  const start = performance.now();
+  for (const [id, job] of settling) {
+    settling.delete(id);
+    try {
+      job();
+    } catch {
+      /* not laid out yet: its ResizeObserver refits */
+    }
+    if (performance.now() - start >= FRAME_BUDGET_MS) break;
+  }
+  if (settling.size > 0 && !settleScheduled) {
+    settleScheduled = true;
+    requestAnimationFrame(settleSome);
+  }
+};
+
+/// Runs `job` for `terminalId` in a coming frame, after the terminals that
+/// moved before it. A newer move's job replaces one still waiting.
+export const settleAfterMove = (terminalId: string, job: () => void) => {
+  settling.delete(terminalId);
+  settling.set(terminalId, job);
+  if (!settleScheduled) {
+    settleScheduled = true;
+    requestAnimationFrame(settleSome);
+  }
+};
+
 /// TerminalView registers its terminal once its xterm exists; the returned
 /// function unregisters it (on unmount).
 export const registerTerminal = (e: DockEntry): (() => void) => {
@@ -78,6 +120,7 @@ export const registerTerminal = (e: DockEntry): (() => void) => {
   return () => {
     if (entries.get(e.terminalId) !== e) return;
     entries.delete(e.terminalId);
+    settling.delete(e.terminalId);
     e.host.remove();
     changed();
   };
