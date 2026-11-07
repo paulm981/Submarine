@@ -18,7 +18,8 @@
 // import under its file, or drop the one that went, in the same pull request.
 //
 // A file that reaches many of the fork's hooks through one import (DesktopApp,
-// through src/fork/desktop) also lists them under `uses`, as written there:
+// through src/fork/desktop; TerminalView, through src/fork/terminal) also
+// lists them under `uses`, as written there:
 // each must still be in the file's code, so a merge that drops one fails too.
 
 import { describe, expect, it } from "vitest";
@@ -56,9 +57,17 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
   { file: "src/components/SftpWorkspace.tsx", imports: ["../util/fileName"] },
   {
     file: "src/components/TerminalView.tsx",
-    imports: [
-      "../ui/gpuSlots", "../ui/highlight", "../ui/rootInvoke", "../ui/terminalActivity", "../ui/terminalDock",
-      "../ui/terminalThemes", "../util/clipboard", "../util/diagnostics",
+    // Everything of the fork's in a terminal comes through src/fork/terminal:
+    // `Fork.…`, the state it keeps (`fork.…`) and its part of the xterm
+    // (`forkTerm.…`).
+    imports: ["../fork/terminal"],
+    uses: [
+      "Fork.TerminalProps", "Fork.useTerminal", "Fork.rootOpened", "Fork.schemeForServer", "Fork.savedPasswords",
+      "Fork.xtermLook", "Fork.mountTerminal", "Fork.readClipboardText", "Fork.appHotkey", "Fork.pasteClean",
+      "Fork.TerminalOverlay", "fork.commands.write", "fork.commands.resize", "fork.commands.close", "fork.resetHighlight",
+      "fork.outputChannel", "fork.rootInvoke", "fork.watchForShellReady", "fork.dockElRef", "fork.dockEl", "fork.onScreen",
+      "forkTerm.startGpu", "forkTerm.openLocal", "forkTerm.output", "forkTerm.write", "forkTerm.applyLook",
+      "forkTerm.register", "forkTerm.unmount", "forkTerm.dispose", "forkTerm.undock",
     ],
   },
   { file: "src/main.tsx", imports: ["./util/diagnostics", "./util/nativeMenus", "./util/plainTyping"] },
