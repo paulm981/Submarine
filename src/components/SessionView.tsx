@@ -2582,7 +2582,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                   terminalId={t.id}
                   disabled={status !== 'connected'}
                   isActive={isFocused && onScreen}
-                  visible={onScreen}
+                  shown={onScreen}
                   isActiveView={isActiveView}
                   inView={isActiveView || chromeless}
                   focusSignal={focusTick}
