@@ -40,7 +40,7 @@ class FileRelease(unittest.TestCase):
             text = f.read()
         # Whatever waits under Next release now, plus one line of our own, so
         # there's always something to file.
-        text = text.replace("## Next release\n\n", "## Next release\n\n- **Test.** A line. ([#0](x))\n", 1)
+        text = text.replace("## Next release\n\n", "## Next release\n\n- **Test.** A line. ([#0](x))\n\n", 1)
         got = file_release("v9.9.9-test", text, text)
         self.assertIn("## Next release\n\n## v9.9.9-test\n\n- ", got)
         self.assertEqual(got.count("## v9.9.9-test"), 1)
