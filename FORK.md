@@ -23,6 +23,7 @@ Settings are in tabs across the top: General, Terminal, Servers & sessions, AI t
 
 - **Jump hosts at scale.** A hundred servers behind one jump host log in a few at a time, in terminals and in Monitoring; the number is a setting. Monitoring reaches servers through their jump host too, by the same `~/.ssh/config` name as the terminal.
 - **Split.** A second shell on the same server opens beside the first, so you can watch a log in one and work in the other.
+- **Push and pull files on many servers.** Right-click a tab, or servers in the session tree, and pick **Push files to servers…** or **Pull files from servers…**. Tick the servers; with Broadcast on, its targets come ticked. A push sends files or a folder from this computer into the same folder on each server. A pull fetches a file or folder from each server into a folder of its own here, named after the server. Before anything moves, a summary says how much goes where and what's already there: skip those (the default) or replace them, once for the whole run. Four servers copy at a time, each with its own row; one that fails doesn't stop the others, and **Stop** stops them all. It uses the SFTP pane's own transfers and their checks ([#159](https://github.com/paulm981/Submarine/issues/159)).
 - **Many tabs.** **Ctrl+Shift+K** opens All tabs with its search ready: type part of a name and press Enter. **Ctrl+Tab** and **Ctrl+Shift+Tab** move between tabs. A tab's right-click menu closes the other tabs, the ones to its right, the disconnected ones, or all of them.
 
 ### Organize them
