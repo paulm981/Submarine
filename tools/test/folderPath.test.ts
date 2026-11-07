@@ -1,5 +1,8 @@
+// The page's tests. From the repository root: npm --prefix tools/test ci once,
+// then npm --prefix tools/test test (type check, then vitest).
+
 import { describe, expect, it } from "vitest";
-import { childFolders, folderOptions, folderPath, indexFolders, subtreeCounts, subtreeIds, type FolderRow } from "./folderPath";
+import { childFolders, folderOptions, folderPath, indexFolders, subtreeCounts, subtreeIds, type FolderRow } from "../../src/util/folderPath";
 
 const f = (id: number, name: string, parent_id: number | null = null): FolderRow => ({ id, name, parent_id });
 const names = (rows: FolderRow[]) => rows.map((r) => r.name);

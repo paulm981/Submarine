@@ -1,5 +1,8 @@
+// The page's tests. From the repository root: npm --prefix tools/test ci once,
+// then npm --prefix tools/test test (type check, then vitest).
+
 import { describe, expect, it } from "vitest";
-import { aiMarker, cardsOf, levelTitle, runnerWarning, sharedWith, trustTargetFor, type AiPending, type AiServer, type AiSnapshot } from "./ai";
+import { aiMarker, cardsOf, levelTitle, runnerWarning, sharedWith, trustTargetFor, type AiPending, type AiServer, type AiSnapshot } from "../../src/util/ai";
 
 const pending = (id: number, group: { id: number; size: number } | null = null): AiPending => ({
   id, tab_id: "t", tab_label: "AI", session_id: `s${id}`, server: `srv${id}`, user: null, command: "uptime",

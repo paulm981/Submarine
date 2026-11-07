@@ -1,10 +1,12 @@
+// The page's tests. From the repository root: npm --prefix tools/test ci once,
+// then npm --prefix tools/test test (type check, then vitest).
 // Small helpers of the fork's own, one describe each.
 import { describe, expect, it } from "vitest";
-import { visibleName } from "./fileName";
-import { clampInfoFontSize, DEFAULT_INFO_FONT_SIZE, MAX_INFO_FONT_SIZE, MIN_INFO_FONT_SIZE } from "./infoFont";
-import { jumpHostNote } from "./jumpHostNote";
-import { rangePick } from "./rangePick";
-import { sessionDot } from "./sessionStatus";
+import { visibleName } from "../../src/util/fileName";
+import { clampInfoFontSize, DEFAULT_INFO_FONT_SIZE, MAX_INFO_FONT_SIZE, MIN_INFO_FONT_SIZE } from "../../src/util/infoFont";
+import { jumpHostNote } from "../../src/util/jumpHostNote";
+import { rangePick } from "../../src/util/rangePick";
+import { sessionDot } from "../../src/util/sessionStatus";
 
 describe("visibleName", () => {
   it("drops a right-to-left override, so a name can't pass for another", () => {

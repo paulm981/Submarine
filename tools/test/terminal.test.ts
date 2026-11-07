@@ -1,8 +1,10 @@
+// The page's tests. From the repository root: npm --prefix tools/test ci once,
+// then npm --prefix tools/test test (type check, then vitest).
 // The fork's terminal and tab helpers that decide without a page.
 import { describe, expect, it } from "vitest";
-import { claimGpu, gpuChanged, gpuSlotsInUse, MAX_GPU, releaseGpu, type GpuHolder } from "./gpuSlots";
-import { reorderById } from "./tabDrag";
-import { hasVisibleText } from "./terminalActivity";
+import { claimGpu, gpuChanged, gpuSlotsInUse, MAX_GPU, releaseGpu, type GpuHolder } from "../../src/ui/gpuSlots";
+import { reorderById } from "../../src/ui/tabDrag";
+import { hasVisibleText } from "../../src/ui/terminalActivity";
 
 describe("hasVisibleText", () => {
   it("ignores control codes: colours, a title change, cursor moves", () => {

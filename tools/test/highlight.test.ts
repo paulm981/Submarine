@@ -1,5 +1,8 @@
+// The page's tests. From the repository root: npm --prefix tools/test ci once,
+// then npm --prefix tools/test test (type check, then vitest).
+
 import { describe, expect, it } from "vitest";
-import { buildMatcher, HIGHLIGHT_MINE, HIGHLIGHT_NONE, normalizeRules, ruleProblem, type CustomRule } from "./highlight";
+import { buildMatcher, HIGHLIGHT_MINE, HIGHLIGHT_NONE, normalizeRules, ruleProblem, type CustomRule } from "../../src/ui/highlight";
 
 const rule = (over: Partial<CustomRule>): CustomRule => ({
   pattern: "error", kind: "word", matchCase: false, color: "blue", bold: false, underline: false, enabled: true, ...over,

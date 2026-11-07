@@ -1,0 +1,13 @@
+{
+  "name": "submarine-frontend-tests",
+  "private": true,
+  "type": "module",
+  "description": "The page's tests (vitest), kept out of the app's package.json, which is the original project's. Run from the repository root: npm --prefix tools/test ci, then npm --prefix tools/test test.",
+  "scripts": {
+    "test": "tsc -p tsconfig.json && vitest run"
+  },
+  "devDependencies": {
+    "vite": "6.4.5",
+    "vitest": "4.1.12"
+  }
+}

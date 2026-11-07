@@ -9,6 +9,9 @@
 // and this fails naming any import a merge lost, or a fork module that's
 // gone. An import left in a comment doesn't count.
 //
+// Run it, with the page's other tests, from the repository root:
+// npm --prefix tools/test ci once, then npm --prefix tools/test test.
+//
 // The table is every relative import, in a file that's in the original
 // project (upstream/main), of a module that isn't. After a deliberate change
 // (a hook added, moved or removed), update the table to match: add the new
