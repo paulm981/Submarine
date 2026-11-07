@@ -27,6 +27,7 @@ import { COMPACT_TAB_NAME, COMPACT_TAB_PAD, NewsDot, compactTermTabClass } from 
 import { reorderById, useTabDrag } from "../ui/tabDrag";
 import { ErrorBoundary } from "../ui/ErrorBoundary";
 import { parseObjectList } from "../util/serverJson";
+import { KeptMark, KeptSessions, skipIfKept } from "./KeptSessions";
 
 // What the shell-config push commands answer (mirror.rs' ShellSync* types).
 type ShellSyncShells = { remote_shell: string; local_shell: string; shell_mismatch: boolean };
@@ -745,7 +746,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
     const container = terminals.find(t => t.id === terminalId)?.container;
     const gets = terminalId === startupTerminalId || (!!session.runOnConnectEvery && !container);
     return gets && startupCommands.length > 0
-      ? () => {
+      ? skipIfKept(terminalId, () => {
           if (startupRanForEpochRef.current.get(terminalId) === connectionEpoch) return;
           startupRanForEpochRef.current.set(terminalId, connectionEpoch);
           // Typed line by line, without escape sequences or other control
@@ -822,7 +823,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
             onConnectAskRef.current = asked;
           }
           void asked.answer.then((text) => { if (text !== null) typeThem(text); });
-        }
+        })
       : undefined;
   };
   const openContainerTerminal = (containerName: string, useSudo: boolean) => {
@@ -1975,6 +1976,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               {/* Printed something while it was out of sight (cleared when it
                   comes on screen, so never on the tab in front). */}
               <NewsDot terminals={[t.id]} />
+              <KeptMark terminalId={t.id} />
               {/* Compact tabs cut a long name; the full one is the hover title. */}
               <span className={compactTabs ? COMPACT_TAB_NAME : undefined}>{t.title}</span>
               {isSplitPartner && (
@@ -2329,6 +2331,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
         document.body
       )}
 
+      <KeptSessions session={session} terminals={terminals} openTerminal={(id: string) => { setTerminals(prev => [...prev, { id, title: nextTerminalNumber(prev) }]); setActiveTab(id); }} />
       {/* A terminal tab's menu: its name, edited in place. Enter keeps it
           (an empty one brings back the tab's first title), Esc goes back
           to the menu. */}

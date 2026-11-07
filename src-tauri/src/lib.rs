@@ -94,6 +94,7 @@ mod server_look;
 use server_look::*;
 mod clone_server;
 use clone_server::*;
+mod keep_session;
 #[cfg(windows)]
 mod windows_clipboard;
 #[cfg(windows)]
@@ -18754,12 +18755,13 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
             _ => None,
         };
 
+        let kept = keep_session::start(&app, &session_arc, &session_id, &terminal_id).await;
         let channel = shell_sftp::open_session_channel(&session_arc).await?;
 
         // Request PTY
         channel.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]).await.map_err(|e| e.to_string())?;
-        match login_shell {
-            Some(shell) => channel.exec(true, login_shell_command(&shell).as_bytes()).await,
+        match kept.command_or(login_shell.map(|shell| login_shell_command(&shell))) {
+            Some(command) => channel.exec(true, command.as_bytes()).await,
             None => channel.request_shell(true).await,
         }
         .map_err(|e| e.to_string())?;
@@ -18801,7 +18803,7 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
         rx,
         resize_rx,
         on_output,
-        Vec::new(),
+        keep_session::early(&terminal_id),
     ));
 
     Ok(())
@@ -26345,6 +26347,7 @@ pub fn run() {
             start_tunnel, stop_tunnel, list_tunnels, restart_session_tunnels, persist_session_tunnels,
             list_tunnel_rules, remove_tunnel_rule, rename_tunnel_rule,
             open_terminal, local_shell, write_terminal_data, type_saved_password, terminal_drawn, resize_terminal, close_terminal,
+            keep_session::keep_session_tab, keep_session::keep_session_open, keep_session::keep_session_state, keep_session::keep_session_list, keep_session::keep_session_end,
             local_term::list_local_shells, local_term::local_shell_set_default,
             local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
             local_term::local_terminal_open, local_term::local_terminal_write, local_term::local_windows_build,

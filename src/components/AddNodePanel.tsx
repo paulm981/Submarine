@@ -17,6 +17,7 @@ import { RdpShareFields, RdpSpeedFields } from "./RdpOptionFields";
 import { VncSpeedFields } from "./VncOptionFields";
 import { DEFAULT_VNC_OPTIONS, normalizeVncOptions, type VncOptions } from "../util/vncOptions";
 import { TAG_COLOURS, customTagColour, pickerValue } from "../util/tagColours";
+import { KeepSessionOverride } from "./KeptSessions";
 
 // Compact "2h ago" style relative time for the attribution line.
 function relTime(d: Date): string {
@@ -1342,6 +1343,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               </label>
             </div>
             )}
+            {isSsh && isEditMode && <KeepSessionOverride uuid={servers?.find((s: any) => s.id === newNode.id)?.uuid} />}
 
             {/* A telnet server's tab is a terminal too, so it takes its own
                 colors and highlighting like an SSH server's. */}

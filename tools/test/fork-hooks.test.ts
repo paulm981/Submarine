@@ -31,7 +31,7 @@ const HOOKS: { file: string; imports: string[] }[] = [
   },
   {
     file: "src/components/AddNodePanel.tsx",
-    imports: ["../ui/highlight", "../ui/terminalThemes", "../util/folderPath", "./JumpHostPicker", "./TerminalSchemes"],
+    imports: ["../ui/highlight", "../ui/terminalThemes", "../util/folderPath", "./JumpHostPicker", "./KeptSessions", "./TerminalSchemes"],
   },
   { file: "src/components/DockerTab.tsx", imports: ["../ui/rootInvoke", "../util/infoFont"] },
   { file: "src/components/FilePanel.tsx", imports: ["../util/fileName"] },
@@ -41,13 +41,13 @@ const HOOKS: { file: string; imports: string[] }[] = [
   { file: "src/components/ProfileSelectPage.tsx", imports: ["./StoreSync"] },
   {
     file: "src/components/SessionView.tsx",
-    imports: ["../ui/aiPane", "../ui/tabDrag", "../ui/tabStyle", "../ui/terminalDock", "../util/ai"],
+    imports: ["../ui/aiPane", "../ui/tabDrag", "../ui/tabStyle", "../ui/terminalDock", "../util/ai", "./KeptSessions"],
   },
   {
     file: "src/components/SettingsPanel.tsx",
     imports: [
       "../ui/terminalThemes", "../util/diagnostics", "../util/infoFont", "./AiTrust", "./HighlightSettings", "./HomePane",
-      "./LicensesDialog", "./TerminalSchemes",
+      "./KeptSessions", "./LicensesDialog", "./TerminalSchemes",
     ],
   },
   { file: "src/components/SftpWorkspace.tsx", imports: ["../util/fileName"] },

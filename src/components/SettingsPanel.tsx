@@ -22,6 +22,7 @@ import { windowSummary } from "../util/diagnostics";
 import { MAX_SCROLLBACK, MIN_SCROLLBACK, clampScrollback } from "../util/terminalScrollback";
 import { DEFAULT_INFO_FONT_SIZE, MAX_INFO_FONT_SIZE, MIN_INFO_FONT_SIZE, clampInfoFontSize } from "../util/infoFont";
 import { AiTrustOverview } from "./AiTrust";
+import { KeepSessionSetting } from "./KeptSessions";
 
 // Where this install keeps its data (see src-tauri/src/portable.rs). `portable`
 // means a `submarine-data` folder next to the executable is in use; `warning`
@@ -1061,6 +1062,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
           <TerminalScrollbackSetting settings={settings} setSettings={setSettings} />
 
           <DefaultShellSetting settings={settings} setSettings={setSettings} />
+          <KeepSessionSetting />
 
           <ShellConfigSyncSettings servers={servers} />
         </section>
