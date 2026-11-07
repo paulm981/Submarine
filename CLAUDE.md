@@ -21,6 +21,30 @@ Every line the fork changes inside one of the original project's files can confl
 - **Every pull request says what it does to the footprint:** `scripts/upstream-footprint.sh` before and after (the lines the fork changes in the original project's files). It should only go down, or stay as it is.
 - **One pull request at a time,** its checks green before it merges.
 
+## Speed, security and Rust patterns
+
+Every change is held to these, in review and in the code itself:
+
+**Security first.**
+- Everything from a server, a sync, an import or the AI is untrusted. Check it at the edge: lengths, counts, paths, names. Give it a limit, and refuse what doesn't fit, rather than trying to repair it.
+- Secrets live in `Zeroizing` and are never logged. A token is compared in constant time, and goes only where it's meant to go (an environment variable, not a command line or a file).
+- `unsafe` only for FFI, with a `// SAFETY:` comment saying why each call is sound, and tests that drive it.
+- Paths from outside are walked without following links, or checked with `guard_local_path`, before anything is opened.
+
+**Speed.**
+- Nothing blocking on an async worker: SQLite, file I/O and other synchronous work go in `spawn_blocking`. Never hold a `std::sync::Mutex` guard across an `.await`.
+- Anything that can grow from outside has a bound: channels, queues, buffers, output, retries.
+- Nothing heavy per keystroke or per frame in the page: batch it and coalesce it, and measure before and after when a change is about speed.
+- One command for a batch rather than one per item, across the Tauri bridge or SSH.
+
+**Well-known Rust patterns, not anti-patterns.**
+- Errors go up with `?`. No `unwrap`, `expect` or panic on anything that can fail at run time outside tests. A Tauri command returns an error; it never panics.
+- Borrow rather than clone on a hot path. `&str` and `&[T]` in, owned out only where it's kept.
+- A value that must be one thing is a `static`, not a `const`: each use of a `const` can be a copy of its own.
+- Types say what's valid: an enum, not a string or bool flag; parse once at the edge.
+- Small functions with one job, tested where they're decided. No new clippy warnings (`.github/clippy-warnings`): fix the warning, don't `allow` it, unless the line is the original project's.
+- Follow the code around it. The original project's style holds in their files, so a sync stays small.
+
 ## Before pushing
 
 - Rust, in `src-tauri`: `cargo test --locked` and `cargo clippy --locked --lib` with no more warnings than `.github/clippy-warnings` allows. The tests need a stand-in page: `mkdir -p dist && [ -f dist/index.html ] || echo '<!doctype html><title>Submarine</title>' > dist/index.html`.
