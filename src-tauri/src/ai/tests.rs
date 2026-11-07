@@ -245,8 +245,8 @@ async fn each_ai_tab_only_reaches_what_was_shared_with_it() {
     let r = s.run_command("local-b", "xyz", "uptime", None, false, no_cancel.clone()).await;
     assert!(r.is_error && r.text.contains("isn't shared with you"), "{}", r.text);
     assert!(s.snapshot().pending.is_empty(), "never shown to you");
-    assert!(s.list_shared("local-b").text.contains("No servers"));
-    assert!(s.list_shared("local-a").text.contains("xyz"));
+    assert!(s.list_shared("local-b").await.text.contains("No servers"));
+    assert_eq!(listed_in(&s, "local-a").await["servers"][0]["name"], "xyz");
 }
 
 #[test]
@@ -626,6 +626,126 @@ async fn ask_for(s: &AiState, command: &str) -> (tokio::task::JoinHandle<mcp::To
     wait_for("the request", || s.snapshot().pending.iter().any(|p| !before.contains(&p.id))).await;
     let p = s.snapshot().pending.into_iter().find(|p| !before.contains(&p.id)).unwrap();
     (req, p)
+}
+
+/// list_shared's answer for `tab_id`, parsed: Submarine's own words (the
+/// names are the user's), not tagged as a server's.
+async fn listed_in(s: &AiState, tab_id: &str) -> Value {
+    let r = s.list_shared(tab_id).await;
+    assert!(!r.is_error && r.server_text.is_none(), "{}", r.text);
+    assert!(!r.text.contains("server-output") && !r.text.contains('\n'), "compact, untagged: {}", r.text);
+    serde_json::from_str(&r.text).unwrap_or_else(|_| panic!("not JSON: {}", r.text))
+}
+
+async fn requests_of(s: &AiState) -> String {
+    listed_in(s, "local-1").await["servers"][0]["requests"].as_str().unwrap().to_string()
+}
+
+static ASKS: &str = "asks the user each time";
+static ALLOWED: &str = "runs the user's allowed commands, asks for the rest";
+static ANYTHING: &str = "runs anything";
+
+/// Each shared server says what happens to the AI's requests there (#176),
+/// worked out from its level as the decision is, as the settings change.
+#[tokio::test]
+async fn list_shared_says_what_each_server_does_with_requests() {
+    let (s, shared, _) = state_with_policy(policy(1, &[], &[]));
+    for (p, said) in [
+        (policy(1, &[], &[]), ASKS),
+        (policy(1, &["uptime"], &[]), ASKS),
+        (policy(2, &["uptime"], &[]), ALLOWED),
+        // Level 2 with nothing allowed runs nothing without asking.
+        (policy(2, &[], &[]), ASKS),
+        (policy(3, &[], &["reboot"]), ANYTHING),
+    ] {
+        *shared.lock().unwrap() = p.clone();
+        assert_eq!(requests_of(&s).await, said, "{p:?}");
+    }
+}
+
+/// Each server is read for itself: three at different levels in one answer.
+#[tokio::test]
+async fn list_shared_reads_each_server_s_settings() {
+    let exec: Executor = Arc::new(|_, _, _, _| Box::pin(async { Err("no servers in this test".to_string()) }));
+    let lookup: PolicyLookup = Arc::new(|id| match id {
+        Some(1) => policy(1, &[], &[]),
+        Some(2) => policy(2, &["systemctl status *"], &[]),
+        Some(3) => policy(3, &[], &[]),
+        _ => trust::Policy::unreadable(),
+    });
+    let s = AiState::with(exec, no_root(), Box::new(|| {}), None, lookup, Box::new(|| {}));
+    s.turn_on().unwrap();
+    s.start_tab("local-1", "Claude").unwrap();
+    for (i, name) in ["db1", "web1", "build"].iter().enumerate() {
+        s.share_as("local-1", &format!("sess-{i}"), name, None, Some(i as i64 + 1)).unwrap();
+    }
+    s.share_as("local-1", "sess-q", "quick", None, None).unwrap();
+    let pulls = std::env::temp_dir().join("submarine-ai-pulls");
+    s.set_pull_folders(vec![pulls.clone()]);
+    let l = listed_in(&s, "local-1").await;
+    assert_eq!(
+        l["servers"],
+        json!([
+            { "name": "db1", "requests": ASKS },
+            { "name": "web1", "requests": ALLOWED },
+            { "name": "build", "requests": ANYTHING },
+            { "name": "quick", "requests": ASKS },
+        ])
+    );
+    assert_eq!(l["copy_into"], json!([pulls.to_string_lossy()]));
+}
+
+/// "Allow everything here" counts as runs anything, as it does for commands
+/// and copies; settings held for the user's OK, or that can't be read, ask.
+#[tokio::test]
+async fn list_shared_counts_allow_everything_and_held_settings() {
+    let (s, shared, _) = state_with_policy(policy(1, &[], &[]));
+    s.lock().tabs[0].servers[0].allow_all = true;
+    assert_eq!(requests_of(&s).await, ANYTHING);
+    // Held, or unreadable: it asks, whatever the level or allow everything.
+    *shared.lock().unwrap() = trust::Policy { force_ask: Some(trust::HELD_NOTE.into()), ..policy(3, &[], &[]) };
+    assert_eq!(requests_of(&s).await, ASKS);
+    *shared.lock().unwrap() = trust::Policy::unreadable();
+    assert_eq!(requests_of(&s).await, ASKS);
+    s.lock().tabs[0].servers[0].allow_all = false;
+    assert_eq!(requests_of(&s).await, ASKS);
+}
+
+/// The folders a pull may copy into, and the limits, as they are.
+#[tokio::test]
+async fn list_shared_gives_the_copy_folders_and_the_limits() {
+    let (s, _, _) = state_with_policy(policy(1, &[], &[]));
+    let l = listed_in(&s, "local-1").await;
+    assert_eq!(l["copy_into"], json!([]));
+    assert_eq!(
+        l["limits"],
+        json!({
+            "files_per_copy": copy::MAX_FILES,
+            "bytes_per_copy": copy::MAX_BYTES,
+            "servers_per_request": MAX_GROUP,
+            "timeout_seconds": { "default": DEFAULT_TIMEOUT, "max": MAX_TIMEOUT },
+            "output_bytes_to_you": AI_HEAD + AI_TAIL,
+        })
+    );
+    let (a, b) = (std::env::temp_dir().join("submarine-ai-a"), std::env::temp_dir().join("submarine-ai-b"));
+    s.set_pull_folders(vec![a.clone(), b.clone()]);
+    assert_eq!(listed_in(&s, "local-1").await["copy_into"], json!([a.to_string_lossy(), b.to_string_lossy()]));
+}
+
+/// Nothing that would help the AI pick its way round an approval: no allow
+/// or always-ask rule, no login, no tab. And it stays small with 50 servers.
+#[tokio::test]
+async fn list_shared_says_no_rules_and_stays_small() {
+    let (s, _, _) = state_with_policy(policy(2, &["systemctl status *", "cat /var/log/*"], &["reboot", "rm -rf *"]));
+    for i in 1..50 {
+        s.share_as("local-1", &format!("sess-x{i}"), &format!("web-server-{i:02}.example.internal"), Some("deploy".into()), Some(7)).unwrap();
+    }
+    let r = s.list_shared("local-1").await;
+    assert_eq!(listed_in(&s, "local-1").await["servers"].as_array().unwrap().len(), 50);
+    for secret in ["systemctl", "/var/log", "reboot", "rm -rf", "deploy", "sess-", "Claude"] {
+        assert!(!r.text.contains(secret), "{secret} in {}", r.text);
+    }
+    assert!(r.text.len() < 8 * 1024, "{} bytes", r.text.len());
 }
 
 /// The card offers "Always allow this command here" only for one simple

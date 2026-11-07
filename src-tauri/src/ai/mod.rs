@@ -253,6 +253,38 @@ enum PasswordAsk {
 /// read from the vault in the app, set by hand in tests. Read only.
 type PolicyLookup = Arc<dyn Fn(Option<i64>) -> trust::Policy + Send + Sync>;
 
+/// list_shared's answer (#176), compact JSON in this order.
+#[derive(Serialize)]
+struct Listed<'a> {
+    servers: Vec<ListedServer<'a>>,
+    /// The folders on this computer the user allowed for pulls.
+    copy_into: Vec<String>,
+    limits: ListedLimits,
+}
+
+#[derive(Serialize)]
+struct ListedServer<'a> {
+    name: &'a str,
+    /// trust::Requests::phrase.
+    requests: &'static str,
+}
+
+#[derive(Serialize)]
+struct ListedLimits {
+    files_per_copy: u64,
+    bytes_per_copy: u64,
+    servers_per_request: usize,
+    timeout_seconds: ListedTimeout,
+    /// What the AI gets of one command's output at most.
+    output_bytes_to_you: usize,
+}
+
+#[derive(Serialize)]
+struct ListedTimeout {
+    default: u64,
+    max: u64,
+}
+
 /// A server shared with an AI tab.
 #[derive(Serialize, Clone, Debug)]
 struct SharedServer {
@@ -1521,7 +1553,7 @@ impl AiState {
 
     async fn call_tool(&self, tab_id: &str, name: &str, args: &serde_json::Value, cancel: watch::Receiver<bool>) -> ToolResult {
         match name {
-            "list_shared" => self.list_shared(tab_id),
+            "list_shared" => self.list_shared(tab_id).await,
             "run_command" => {
                 let server = args.get("server").and_then(|v| v.as_str()).unwrap_or("");
                 let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -1553,18 +1585,66 @@ impl AiState {
         }
     }
 
-    fn list_shared(&self, tab_id: &str) -> ToolResult {
-        let s = self.lock();
-        let Some(tab) = s.tabs.iter().find(|t| t.id == tab_id) else {
-            return ToolResult::err("This AI tab's access has ended.");
+    /// What the AI may use, told up front (#176): each shared server and
+    /// what happens to its requests there, the folders it may pull into,
+    /// and the limits. Never which rules a server has, or who shared it.
+    /// The names are the user's, not a server's, so they're not tagged as
+    /// server output.
+    async fn list_shared(&self, tab_id: &str) -> ToolResult {
+        let shared: Vec<(String, Option<i64>, bool)> = {
+            let s = self.lock();
+            let Some(tab) = s.tabs.iter().find(|t| t.id == tab_id) else {
+                return ToolResult::err("This AI tab's access has ended.");
+            };
+            if tab.servers.is_empty() {
+                return ToolResult::ok(
+                    "No servers are shared with you yet. Ask the user to open the server's tab in Submarine and click Share with AI on its toolbar.",
+                );
+            }
+            tab.servers.iter().map(|x| (x.name.clone(), x.server_id, x.allow_all)).collect()
         };
-        if tab.servers.is_empty() {
-            return ToolResult::ok(
-                "No servers are shared with you yet. Ask the user to open the server's tab in Submarine and click Share with AI on its toolbar.",
-            );
+        // Each saved server's settings read once, as early_decision reads
+        // them: off the async workers, as the vault has a lock of its own.
+        // Should that fail, every server asks.
+        let requests: Vec<trust::Requests> = {
+            let lookup = self.0.policy.clone();
+            let each: Vec<(Option<i64>, bool)> = shared.iter().map(|(_, id, all)| (*id, *all)).collect();
+            let n = each.len();
+            tokio::task::spawn_blocking(move || {
+                let mut read: Vec<(Option<i64>, trust::Policy)> = Vec::new();
+                each.into_iter()
+                    .map(|(id, allow_all)| {
+                        let at = match read.iter().position(|(i, _)| *i == id) {
+                            Some(at) => at,
+                            None => {
+                                read.push((id, lookup(id)));
+                                read.len() - 1
+                            }
+                        };
+                        trust::Requests::of(&read[at].1, allow_all)
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap_or_else(|_| vec![trust::Requests::AskEachTime; n])
+        };
+        let servers = shared.iter().zip(requests).map(|((name, _, _), r)| ListedServer { name, requests: r.phrase() }).collect();
+        let copy_into = self.pull_folders().iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let listed = Listed {
+            servers,
+            copy_into,
+            limits: ListedLimits {
+                files_per_copy: copy::MAX_FILES,
+                bytes_per_copy: copy::MAX_BYTES,
+                servers_per_request: MAX_GROUP,
+                timeout_seconds: ListedTimeout { default: DEFAULT_TIMEOUT, max: MAX_TIMEOUT },
+                output_bytes_to_you: AI_HEAD + AI_TAIL,
+            },
+        };
+        match serde_json::to_string(&listed) {
+            Ok(text) => ToolResult::ok(text),
+            Err(e) => ToolResult::err(format!("Submarine couldn't list the shared servers: {e}")),
         }
-        let names: Vec<&str> = tab.servers.iter().map(|x| x.name.as_str()).collect();
-        ToolResult::ok(serde_json::json!({ "servers": names }).to_string())
     }
 
     /// Refused before it reaches you: logged, and the AI told why.

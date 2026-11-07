@@ -829,6 +829,43 @@ pub(crate) fn decide_parsed(policy: &Policy, session_allow: bool, command: &Pars
     Decision::Ask { rule: None }
 }
 
+/// What a server's settings do with the AI's requests, as list_shared says
+/// it up front (#176): what happens, never which rules. Worked out as
+/// decide_parsed and copy::decision do, and never says less asking than
+/// they would: settings that can't be read or are held (`force_ask`) ask
+/// each time, "allow everything here" (`allow_all`) runs anything, and
+/// level 2 with no allow rules asks each time. The always-ask list and
+/// root still ask where they do, which list_shared's description says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Requests {
+    AskEachTime,
+    AllowedCommands,
+    Anything,
+}
+
+impl Requests {
+    pub(crate) fn of(policy: &Policy, allow_all: bool) -> Requests {
+        if policy.force_ask.is_some() {
+            Requests::AskEachTime
+        } else if allow_all || policy.level == RUN_ANYTHING {
+            Requests::Anything
+        } else if policy.level == ALLOWED_COMMANDS && !policy.allow.is_empty() {
+            Requests::AllowedCommands
+        } else {
+            Requests::AskEachTime
+        }
+    }
+
+    /// The words the AI gets.
+    pub(crate) fn phrase(self) -> &'static str {
+        match self {
+            Requests::AskEachTime => "asks the user each time",
+            Requests::AllowedCommands => "runs the user's allowed commands, asks for the rest",
+            Requests::Anything => "runs anything",
+        }
+    }
+}
+
 /// A rule as you typed it, checked: trimmed, not empty, not too long, `*`
 /// only at its end and not alone. An allow rule must be one simple command
 /// itself, or it could never match.
