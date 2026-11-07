@@ -234,6 +234,35 @@ pub(crate) fn mobaxterm_skipped(text: &str) -> Option<String> {
     ))
 }
 
+/// What the pasted-import parser found: the hosts, and a line about the
+/// sessions it can't bring in (MobaXterm's VNC, serial, …).
+#[derive(serde::Serialize)]
+pub(crate) struct ClientImport {
+    pub(crate) hosts: Vec<ImportedHost>,
+    pub(crate) skipped: Option<String>,
+}
+
+/// Save the hosts picked in the import dialog: folders, Logins, jump hosts
+/// and servers in one transaction and one vault save (host_import.rs).
+#[tauri::command]
+pub(crate) async fn import_hosts(
+    state: tauri::State<'_, DbState>,
+    rows: Vec<host_import::ImportRow>,
+) -> Result<host_import::ImportReport, String> {
+    let report = {
+        let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+        let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("[DATABASE] IMPORT_FAILED: {}", e))?;
+        let report = host_import::import_rows(&tx, &rows)?;
+        tx.commit().map_err(|e| format!("[DATABASE] IMPORT_FAILED: {}", e))?;
+        report
+    };
+    save_vault_internal(&state)?;
+    Ok(report)
+}
+
 // Every call from the original project's code into this file (fork_hooks.rs):
 // a sync that drops one, or the lines that bring the file in, fails here.
 #[cfg(test)]
@@ -251,6 +280,7 @@ mod hook_tests {
                 ("parse_ssh_config", "parse_ssh_config_text(", 1),
                 ("parse_client_import", "mobaxterm_skipped(", 1),
                 ("parse_mobaxterm_sessions_in", "expand_mobaxterm_path(", 1),
+                ("run", "import_hosts", 1),
             ],
         );
     }

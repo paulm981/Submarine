@@ -149,42 +149,9 @@ async fn run_capture_raw(
     Ok((code, out))
 }
 
-/// A docker command, a word per argument: `docker …`, or compose's words
-/// (after `docker compose`, or `docker-compose` where the plugin isn't
-/// there). As words, it runs the same through the user's shell and as root.
-enum Cmd {
-    Docker(Vec<String>),
-    Compose(Vec<String>),
-}
-
-fn words(first: &[&str], rest: &[String]) -> Vec<String> {
-    first.iter().map(|w| w.to_string()).chain(rest.iter().cloned()).collect()
-}
-
-/// `docker` and these words.
-fn docker(args: &[&str]) -> Cmd {
-    Cmd::Docker(words(&["docker"], &args.iter().map(|w| w.to_string()).collect::<Vec<_>>()))
-}
-
-impl Cmd {
-    /// As the user's shell runs it.
-    fn shell(&self) -> String {
-        let join = |w: &[String]| w.iter().map(|w| shq(w)).collect::<Vec<_>>().join(" ");
-        match self {
-            Cmd::Docker(w) => join(w),
-            Cmd::Compose(w) => format!("{} {}", compose_prefix(), join(w)),
-        }
-    }
-}
-
-/// The daemon's socket refused the user (it's root's and the docker
-/// group's): root may do it. Only that: a daemon that's down, or a
-/// "permission denied" from inside a container, isn't root's to fix.
-fn daemon_refused(out: &str) -> bool {
-    let lower = out.to_lowercase();
-    lower.contains("permission denied while trying to connect to the docker")
-        || lower.contains("docker.sock: connect: permission denied")
-}
+// The fork's own, in docker/cmd.rs (#136).
+mod cmd;
+pub(crate) use cmd::*;
 
 /// Run a docker command as the user, or as root where the server refuses
 /// the user's own (and, once root has worked, from then on for this tab,
