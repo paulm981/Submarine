@@ -33,7 +33,7 @@ pub(crate) struct Tool {
 }
 
 /// The built-in AI tools, in Home's order.
-pub(crate) const TOOLS: &[Tool] = &[
+pub(crate) static TOOLS: &[Tool] = &[
     Tool { id: super::CLAUDE_ID, label: "Claude Code", short: "Claude", kind: Kind::Claude },
     Tool { id: "ai:codex", label: "Codex", short: "Codex", kind: Kind::Codex },
 ];
