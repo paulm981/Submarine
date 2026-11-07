@@ -178,15 +178,32 @@ fn resolve_remote(path: &str, home: &str) -> String {
 
 /// A path on this computer as the AI gives it: a full path, with no `.` or
 /// `..` step (it's taken as written, or not at all).
+///
+/// The steps are looked for between `/` and `\` on every system, not by how
+/// this one splits a path: Windows doesn't split a `\\?\` path at `/`, so
+/// `\\?\C:\allowed/../x` would have no `..` step as parsed. And on Windows
+/// only a drive (`C:\…`) or a share (`\\server\share\…`) is taken: not the
+/// `\\?\` and `\\.\` forms, which Windows passes on without resolving.
 pub(crate) fn plain_local(typed: &str) -> Result<PathBuf, String> {
     let p = PathBuf::from(typed);
-    if !p.is_absolute() {
+    if !p.is_absolute() || !plain_prefix(&p) {
         return Err(format!("{typed} isn't a full path on this computer."));
     }
-    if p.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir)) {
+    if typed.split(['/', '\\']).any(|step| step == "." || step == "..")
+        || p.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
         return Err(format!("{typed} has a . or .. step: give the path itself."));
     }
     Ok(p)
+}
+
+/// A drive or a share on Windows (not `\\?\…` or `\\.\…`); on other systems,
+/// any full path.
+fn plain_prefix(path: &Path) -> bool {
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) => matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::UNC(..)),
+        _ => !cfg!(windows),
+    }
 }
 
 /// What a push sends: one file, or a folder's files (`is_dir`). Links and
@@ -294,11 +311,22 @@ fn inside(path: &Path, folder: &Path) -> bool {
 /// Blocking: on a blocking thread.
 pub(crate) fn pull_target(typed: &str, allowed: &[PathBuf]) -> Result<PathBuf, String> {
     if allowed.is_empty() {
-        return Err(format!(
-            "The user hasn't allowed any folder on this computer for copies from servers. Ask them to add one in {SETTING}, then copy into it."
-        ));
+        return Err(no_pull_folder());
     }
-    let path = plain_local(typed)?;
+    pull_target_at(&plain_local(typed)?, typed, allowed)
+}
+
+fn no_pull_folder() -> String {
+    format!("The user hasn't allowed any folder on this computer for copies from servers. Ask them to add one in {SETTING}, then copy into it.")
+}
+
+/// pull_target's checks on a path already through plain_local, or resolved
+/// by it (the re-check before each server's copy, on Windows a `\\?\` path
+/// plain_local wouldn't take as typed). `typed` is how it's shown.
+fn pull_target_at(path: &Path, typed: &str, allowed: &[PathBuf]) -> Result<PathBuf, String> {
+    if allowed.is_empty() {
+        return Err(no_pull_folder());
+    }
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(format!("{typed} can't be a folder to copy into."));
     };
@@ -757,7 +785,7 @@ async fn pull(
     // Where it goes, checked again now, and this server's own folder made.
     let place = {
         let (dest, allowed, folder) = (plan.destination.clone(), job.allowed.clone(), job.folder.clone());
-        tokio::task::spawn_blocking(move || pull_target(&dest, &allowed).and_then(|t| server_folder(&t, &folder)))
+        tokio::task::spawn_blocking(move || pull_target_at(Path::new(&dest), &dest, &allowed).and_then(|t| server_folder(&t, &folder)))
             .await
             .unwrap_or_else(|e| Err(e.to_string()))
     };

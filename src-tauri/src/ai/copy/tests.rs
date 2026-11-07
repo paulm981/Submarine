@@ -17,6 +17,16 @@ fn text(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
+/// `p` as the AI would type it: on Windows without the `\\?\` that
+/// canonicalize puts in front, which plain_local refuses.
+fn typed(p: &Path) -> String {
+    let t = text(p);
+    match t.strip_prefix(r"\\?\") {
+        Some(rest) if cfg!(windows) => rest.to_string(),
+        _ => t,
+    }
+}
+
 // -- The arguments ------------------------------------------------------------
 
 #[test]
@@ -82,9 +92,18 @@ fn remote_paths_are_full_or_from_home_and_tidy() {
 #[test]
 fn local_paths_are_full_with_no_dot_steps() {
     let dir = scratch("plain");
-    assert_eq!(plain_local(&text(&dir)).unwrap(), dir);
+    assert_eq!(plain_local(&typed(&dir)).unwrap(), PathBuf::from(typed(&dir)));
+    // A `..` between backslashes counts on every system.
+    assert!(plain_local(&format!("{}\\..\\x", typed(&dir))).unwrap_err().contains(".."));
+    // Windows' `\\?\` form isn't taken: it isn't split at `/`, so a `..` could hide in it.
+    #[cfg(windows)]
+    {
+        assert!(plain_local(&format!(r"\\?\{}", typed(&dir))).is_err());
+        assert!(plain_local(&format!(r"\\?\{}/../x", typed(&dir))).is_err());
+        assert!(plain_local(r"\\.\C:\x").is_err());
+    }
     assert!(plain_local("relative/path").unwrap_err().contains("isn't a full path"));
-    assert!(plain_local(&text(&dir.join("..").join("x"))).unwrap_err().contains(".."));
+    assert!(plain_local(&typed(&dir.join("..").join("x"))).unwrap_err().contains(".."));
 }
 
 // -- Where a pull may go --------------------------------------------------------
@@ -99,33 +118,37 @@ fn a_pull_goes_only_inside_an_allowed_folder() {
     let list = vec![allowed.clone()];
 
     // No folder allowed yet: the message names the setting.
-    let none = pull_target(&text(&allowed), &[]).unwrap_err();
+    let none = pull_target(&typed(&allowed), &[]).unwrap_err();
     assert!(none.contains("Settings › AI tools › Folders the AI may copy into"), "{none}");
 
     // The folder itself, one inside it, one to be made inside it.
-    assert_eq!(pull_target(&text(&allowed), &list).unwrap(), allowed);
-    assert_eq!(pull_target(&text(&allowed.join("logs")), &list).unwrap(), allowed.join("logs"));
-    assert_eq!(pull_target(&text(&allowed.join("new")), &list).unwrap(), allowed.join("new"));
+    assert_eq!(pull_target(&typed(&allowed), &list).unwrap(), allowed);
+    assert_eq!(pull_target(&typed(&allowed.join("logs")), &list).unwrap(), allowed.join("logs"));
+    assert_eq!(pull_target(&typed(&allowed.join("new")), &list).unwrap(), allowed.join("new"));
+    // The re-check before each server takes the resolved path (on Windows,
+    // the `\\?\` form plain_local refuses as typed).
+    let resolved = pull_target(&typed(&allowed.join("logs")), &list).unwrap();
+    assert_eq!(pull_target_at(&resolved, &text(&resolved), &list).unwrap(), resolved);
 
     // A sibling whose name starts the same isn't inside it.
-    assert!(pull_target(&text(&sibling), &list).unwrap_err().contains("isn't inside a folder the user allowed"));
-    assert!(pull_target(&text(&sibling.join("x")), &list).is_err());
+    assert!(pull_target(&typed(&sibling), &list).unwrap_err().contains("isn't inside a folder the user allowed"));
+    assert!(pull_target(&typed(&sibling.join("x")), &list).is_err());
     // Nor is the folder above, or anything else.
-    assert!(pull_target(&text(&root), &list).is_err());
-    assert!(pull_target(&text(&root.join("elsewhere")), &list).is_err());
+    assert!(pull_target(&typed(&root), &list).is_err());
+    assert!(pull_target(&typed(&root.join("elsewhere")), &list).is_err());
 
     // `..` is refused as written, even where it would land inside.
-    let dotted = format!("{}/logs/../new", text(&allowed));
+    let dotted = format!("{}/logs/../new", typed(&allowed));
     assert!(pull_target(&dotted, &list).unwrap_err().contains(".."));
-    let out = format!("{}/../allowed2", text(&allowed));
+    let out = format!("{}/../allowed2", typed(&allowed));
     assert!(pull_target(&out, &list).is_err());
 
     // A parent that isn't there.
-    assert!(pull_target(&text(&allowed.join("no").join("such")), &list).unwrap_err().contains("isn't there"));
+    assert!(pull_target(&typed(&allowed.join("no").join("such")), &list).unwrap_err().contains("isn't there"));
 
     // A file where the folder would be.
     std::fs::write(allowed.join("a-file"), b"x").unwrap();
-    assert!(pull_target(&text(&allowed.join("a-file")), &list).unwrap_err().contains("isn't a folder"));
+    assert!(pull_target(&typed(&allowed.join("a-file")), &list).unwrap_err().contains("isn't a folder"));
 
     // Relative.
     assert!(pull_target("allowed", &list).is_err());
@@ -145,17 +168,17 @@ fn a_pull_never_goes_through_a_link() {
     let list = vec![allowed.clone()];
     // A link inside the allowed folder that leads outside it: as the folder,
     // and as a step on the way.
-    assert!(pull_target(&text(&allowed.join("out")), &list).unwrap_err().contains("link"));
-    assert!(pull_target(&text(&allowed.join("out").join("x")), &list).is_err());
+    assert!(pull_target(&typed(&allowed.join("out")), &list).unwrap_err().contains("link"));
+    assert!(pull_target(&typed(&allowed.join("out").join("x")), &list).is_err());
     // One that leads back inside is still a link.
-    assert!(pull_target(&text(&allowed.join("in")), &list).unwrap_err().contains("link"));
-    assert!(pull_target(&text(&allowed.join("in").join("x")), &list).unwrap_err().contains("link"));
+    assert!(pull_target(&typed(&allowed.join("in")), &list).unwrap_err().contains("link"));
+    assert!(pull_target(&typed(&allowed.join("in").join("x")), &list).unwrap_err().contains("link"));
     // An allowed folder reached through a link of the user's own above it
     // is fine: that link is theirs, outside what they allowed.
     let above = root.parent().unwrap().join(format!("submarine-ai-copy-{}-via-link", std::process::id()));
     let _ = std::fs::remove_file(&above);
     symlink(&root, &above).unwrap();
-    assert_eq!(pull_target(&text(&above.join("allowed").join("real")), &list).unwrap(), allowed.join("real"));
+    assert_eq!(pull_target(&typed(&above.join("allowed").join("real")), &list).unwrap(), allowed.join("real"));
     std::fs::remove_file(&above).unwrap();
     // The server's own folder, made inside it: not a link either.
     symlink(&outside, allowed.join("real").join("web")).unwrap();
@@ -252,11 +275,11 @@ fn a_push_counts_what_it_sends_and_follows_no_link() {
         // The source itself a link: refused.
         symlink(&src, dir.join("app-link")).unwrap();
         assert!(walk_local(&dir.join("app-link")).unwrap_err().contains("is a link"));
-        assert!(push_source(&text(&dir.join("app-link"))).is_err());
+        assert!(push_source(&typed(&dir.join("app-link"))).is_err());
         symlink(dir.join("secret"), dir.join("file-link")).unwrap();
-        assert!(push_source(&text(&dir.join("file-link"))).unwrap_err().contains("is a link"));
+        assert!(push_source(&typed(&dir.join("file-link"))).unwrap_err().contains("is a link"));
     }
-    let (path, tree) = push_source(&text(&src)).unwrap();
+    let (path, tree) = push_source(&typed(&src)).unwrap();
     assert_eq!((path, tree.files), (src.clone(), 2));
     // A system folder isn't sent, as the user's own pushes aren't.
     #[cfg(target_os = "linux")]
@@ -393,7 +416,7 @@ async fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
 fn push_args(name: &str, servers: &[&str]) -> Value {
     let dir = scratch(name);
     std::fs::write(dir.join("app.tar"), b"hello").unwrap();
-    json!({ "direction": "push", "servers": servers, "source": text(&dir.join("app.tar")), "destination": "~/releases" })
+    json!({ "direction": "push", "servers": servers, "source": typed(&dir.join("app.tar")), "destination": "~/releases" })
 }
 
 #[tokio::test]
@@ -417,7 +440,7 @@ async fn the_request_is_checked_before_any_card() {
     assert!(r.is_error && r.text.contains("destination is missing"), "{}", r.text);
     let mut a = args.clone();
     a["servers"] = json!(["s1"]);
-    a["source"] = json!("/no/such/file/here");
+    a["source"] = json!(typed(&scratch("no-such").join("here")));
     let r = copy(&s, a).0.await.unwrap();
     assert!(r.is_error && r.text.contains("Can't read"), "{}", r.text);
     let mut a = args.clone();
@@ -433,7 +456,7 @@ async fn the_request_is_checked_before_any_card() {
 async fn a_pull_with_no_allowed_folder_is_refused_and_logged() {
     let logs = scratch("pull-refused-log");
     let (s, seen) = state(2, |_| 3, false, Some(logs.clone()));
-    let r = copy(&s, json!({ "direction": "pull", "all": true, "source": "/var/log/syslog", "destination": text(&scratch("pull-refused")) })).0.await.unwrap();
+    let r = copy(&s, json!({ "direction": "pull", "all": true, "source": "/var/log/syslog", "destination": typed(&scratch("pull-refused")) })).0.await.unwrap();
     assert!(r.is_error && r.text.contains("Folders the AI may copy into"), "{}", r.text);
     assert_eq!(seen.started.load(Ordering::SeqCst), 0);
     let log = std::fs::read_to_string(logs.join(audit::FILE_NAME)).unwrap();
@@ -517,13 +540,13 @@ async fn a_pull_goes_in_a_folder_for_each_server() {
     let (s, seen) = state(2, |_| 3, false, None);
     let allowed = scratch("pull-ok");
     s.set_pull_folders(vec![allowed.clone()]);
-    let r = copy(&s, json!({ "direction": "pull", "all": true, "source": "~/logs/app.log", "destination": text(&allowed.join("logs")) })).0.await.unwrap();
+    let r = copy(&s, json!({ "direction": "pull", "all": true, "source": "~/logs/app.log", "destination": typed(&allowed.join("logs")) })).0.await.unwrap();
     assert!(!r.is_error, "{}", r.text);
     let mut jobs = seen.jobs.lock().unwrap().clone();
     jobs.sort();
     assert_eq!(jobs, [("s1".to_string(), "s1".to_string()), ("s2".to_string(), "s2".to_string())]);
     // A source that names nothing to copy.
-    let r = copy(&s, json!({ "direction": "pull", "all": true, "source": "~", "destination": text(&allowed) })).0.await.unwrap();
+    let r = copy(&s, json!({ "direction": "pull", "all": true, "source": "~", "destination": typed(&allowed) })).0.await.unwrap();
     assert!(r.is_error && r.text.contains("names no file or folder"), "{}", r.text);
 }
 
@@ -532,7 +555,7 @@ async fn a_pull_s_card_says_where_each_server_s_copy_goes() {
     let (s, _seen) = state(2, |_| 1, false, None);
     let allowed = scratch("pull-card");
     s.set_pull_folders(vec![allowed.clone()]);
-    let (req, _c) = copy(&s, json!({ "direction": "pull", "servers": ["s1", "s2"], "source": "/var/log/nginx", "destination": text(&allowed) }));
+    let (req, _c) = copy(&s, json!({ "direction": "pull", "servers": ["s1", "s2"], "source": "/var/log/nginx", "destination": typed(&allowed) }));
     wait_for("the cards", || s.snapshot().pending.len() == 2).await;
     for p in s.snapshot().pending {
         let c = p.copy.unwrap();
