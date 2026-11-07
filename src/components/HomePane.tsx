@@ -8,8 +8,8 @@ import { aiStartEnded, takeAiLaunches, takeHomeTabAsk, watchAiLaunches, watchHom
 
 // The Home view: terminals on this computer (src-tauri/src/local_term.rs),
 // started in the home folder — PowerShell, Command Prompt, WSL or Git Bash on
-// Windows, the login shell elsewhere; which one is set under Settings › Home
-// terminal. Not server sessions: they never join the session tabs, a
+// Windows, the login shell elsewhere; which one is set under Settings › Terminal
+// (Home Terminal). Not server sessions: they never join the session tabs, a
 // broadcast or the Wall, and they stay open while the user works elsewhere
 // (DesktopApp keeps this pane mounted once it has been shown).
 //
@@ -218,7 +218,7 @@ export const HomePane = ({ visible, onLiveShells }: { visible: boolean; onLiveSh
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-center px-6">
             <TerminalSquare size={28} className="text-zinc-600" />
             <p className="text-[12px] text-zinc-500 max-w-sm leading-relaxed">
-              A terminal on this computer, in your home folder. Pick the shell under Settings › Home terminal.
+              A terminal on this computer, in your home folder. Pick the shell under Settings › Terminal.
             </p>
             <button
               onClick={() => openShell(null)}

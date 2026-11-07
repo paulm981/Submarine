@@ -43,13 +43,7 @@ const HOOKS: { file: string; imports: string[] }[] = [
     file: "src/components/SessionView.tsx",
     imports: ["../ui/aiPane", "../ui/tabDrag", "../ui/tabStyle", "../ui/terminalDock", "../util/ai", "./KeptSessions"],
   },
-  {
-    file: "src/components/SettingsPanel.tsx",
-    imports: [
-      "../ui/terminalThemes", "../util/diagnostics", "../util/infoFont", "./AiTrust", "./HighlightSettings", "./HomePane",
-      "./KeptSessions", "./LicensesDialog", "./TerminalSchemes",
-    ],
-  },
+  { file: "src/components/SettingsPanel.tsx", imports: ["./settings"] },
   { file: "src/components/SftpWorkspace.tsx", imports: ["../util/fileName"] },
   {
     file: "src/components/TerminalView.tsx",

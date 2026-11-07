@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { History, Loader2, X } from "lucide-react";
 import { useFocusTrap } from "../ui/confirm";
+import { LearnMore } from "./settings/parts";
 import {
   KEEP_CHANGED, KEPT_EVENT, SHOW_SESSIONS, firstKept, keepsSessions, keptSessionDetail, keptSessionLabel,
   readKeepDefault, readKeepOverride, sortKeptSessions, writeKeepDefault, writeKeepOverride,
@@ -264,7 +265,7 @@ function SessionsList({ session, on, onClose, openTerminal }: {
         <p className="px-4 py-3 text-[11px] text-zinc-500 leading-relaxed border-t border-white/5">
           {on
             ? "Closing a tab leaves its session running. Type exit in it, or End it here, when you're done."
-            : "This server's new terminals aren't kept: Settings › Terminal, or the server's own settings, turn it on."}
+            : "This server's new terminals aren't kept: Settings › Servers & sessions, or the server's own settings, turn it on."}
         </p>
       </div>
     </div>,
@@ -272,20 +273,22 @@ function SessionsList({ session, on, onClose, openTerminal }: {
   );
 }
 
-/** Settings › Terminal: the choice for every server on this computer. */
+/** Settings › Servers & sessions: the choice for every server on this computer. */
 export function KeepSessionSetting() {
   const [on, setOn] = useState(readKeepDefault);
   return (
     <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 shadow-xl">
-      <div className="flex items-center justify-between gap-4">
+      <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <div className="text-sm font-semibold text-zinc-100">Keep sessions between connections</div>
           <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
-            New terminals run in tmux on the server, or screen where there's no tmux, so a dropped
-            connection, sleep or a closed tab leaves them running, and connecting again takes you back.
-            Type exit to end one. Nothing is installed on a server. A server's own settings can say
-            otherwise. Kept on this computer only.
+            A dropped connection or a closed tab leaves the terminal running, and connecting again takes you back.
           </p>
+          <LearnMore>
+            New terminals run in tmux on the server, or screen where there's no tmux, so sleep leaves them running
+            too. Type exit to end one. Nothing is installed on a server. A server's own settings can say
+            otherwise. Kept on this computer only.
+          </LearnMore>
         </div>
         <button
           role="switch"
