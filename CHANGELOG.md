@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Remote Desktop through an SSH server only lets your own programs in.** When an RDP server opens in this computer's RDP app through an SSH server, Submarine forwards a local address to it. Any user of this computer could connect there and reach the RDP server through your SSH session. Now a connection from a program that isn't running as you is closed at once. ([#135](https://github.com/paulm981/Submarine/issues/135))
+
+## v0.4.0-fork.30
+
 - **A Wall of many terminals opens without freezing the window.** Going into Broadcast or a Wall used to fit every terminal to its tile in one go, which held the window for seconds with 36 servers. They now settle a few at a time, so the window keeps answering while the tiles fill in, usually within a second. ([#127](https://github.com/paulm981/Submarine/issues/127))
 
 ## v0.4.0-fork.23
