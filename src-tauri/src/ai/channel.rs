@@ -232,12 +232,21 @@ pub(crate) mod pipe {
 
     /// Your account's SID, as text (S-1-5-21-…).
     pub(crate) fn my_sid() -> std::io::Result<String> {
+        // SAFETY: the current process's pseudo-handle is always valid.
+        unsafe { user_sid(GetCurrentProcess()) }
+    }
+
+    /// The SID of the account `process` runs as, as text.
+    ///
+    /// # Safety
+    /// `process` must be a valid process handle with query access.
+    pub(crate) unsafe fn user_sid(process: HANDLE) -> std::io::Result<String> {
         // SAFETY: each handle and buffer below is made here, checked, and
         // freed once; TOKEN_USER is read from a buffer the size Windows asked
         // for, aligned for it (u64s).
         unsafe {
             let mut token: HANDLE = std::ptr::null_mut();
-            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
                 return Err(std::io::Error::last_os_error());
             }
             let mut len = 0u32;

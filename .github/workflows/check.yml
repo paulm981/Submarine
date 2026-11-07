@@ -6,7 +6,8 @@ name: Check
 #
 #   • rust (Linux and Windows): the Rust tests.
 #   • rust (macOS): the AI bridge's tests only (#32): the local channel and
-#     `submarine --mcp`, which work differently on each system. A macOS
+#     `submarine --mcp`, which work differently on each system; and
+#     local_peer.rs's (#135), which reads each system's own tables. A macOS
 #     minute costs ten of the account's Actions minutes, so it runs only on
 #     a pull request labelled `macos`, or from Run workflow.
 #   • rust (Windows) also runs `submarine --mcp`'s test as a release build:
@@ -114,11 +115,11 @@ jobs:
         working-directory: src-tauri
         run: cargo test --locked
 
-      - name: AI bridge tests
+      - name: AI bridge tests, and who connects to the RDP forward
         if: matrix.os_name == 'macos'
         working-directory: src-tauri
         run: |
-          cargo test --locked --lib ai::
+          cargo test --locked --lib -- ai:: local_peer::
           cargo test --locked --test mcp_helper
 
       - name: The MCP helper as a windowed program

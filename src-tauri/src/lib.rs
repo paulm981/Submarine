@@ -95,6 +95,7 @@ mod server_look;
 use server_look::*;
 mod clone_server;
 use clone_server::*;
+mod local_peer;
 #[cfg(windows)]
 mod windows_clipboard;
 #[cfg(windows)]

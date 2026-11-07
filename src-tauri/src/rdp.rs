@@ -430,6 +430,8 @@ pub async fn forward_through(
                     let host = host.clone();
                     conns.spawn(async move {
                         let _permit = permit;
+                        // Only a program of this user (#135).
+                        if !crate::local_peer::checked(peer, local).await { return; }
                         crate::tunnel::apply_tunnel_sockopts(&sock);
                         let Some(last) = route.last() else { return };
                         // Bounded: a server that doesn't answer would keep its permit for good.
