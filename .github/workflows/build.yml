@@ -763,6 +763,42 @@ jobs:
           generate_release_notes: true
           files: release-files/*
 
+      # Files this release's changelog lines under its number on main (#163),
+      # so a pull request only ever adds a line under "## Next release" and
+      # never needs a second push to rename it. Only the lines in the commit
+      # released move: one merged meanwhile waits for its own release. A
+      # .md-only commit, which makes no release. If main won't take it, the
+      # release is out all the same; the next pull request files the lines
+      # by hand (CLAUDE.md).
+      - name: Check out main as it is now
+        continue-on-error: true
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          path: main-now
+          fetch-depth: 0
+      - name: Push the changelog's new heading
+        continue-on-error: true
+        shell: bash
+        working-directory: main-now
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git show "$SHA:CHANGELOG.md" > "$RUNNER_TEMP/released.md"
+          python3 scripts/changelog_release.py "$TAG" "$RUNNER_TEMP/released.md" CHANGELOG.md
+          if git diff --quiet; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -qam "Changelog: what shipped in $TAG"
+          for i in 1 2 3; do
+            if git push -q origin HEAD:main; then exit 0; fi
+            git pull -q --rebase origin main
+          done
+          echo "::warning::Couldn't push the changelog's new heading: the next pull request files $TAG's lines by hand."
+          exit 1
+
       # The old "Latest build" page, which builds up to 244 still point to:
       # it now sends people to the releases. Its title is left as it was, so
       # those builds don't announce a "newer build" there; they announce the

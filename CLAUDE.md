@@ -9,7 +9,7 @@
 
 Changes to `.md` files only (docs, this file, the changelog) don't make a release.
 
-When the `## Next release` heading has entries from a release that has already been made, the next pull request that adds a changelog line renames that heading to the release's number (the title bar and the Releases page show it) and starts a new `## Next release` above it.
+A pull request only ever adds its line under `## Next release`. When the merge is released, the release job files the lines of the commit it released under that release's number (`scripts/changelog_release.py`), in a `.md`-only commit on main; a line merged meanwhile stays for its own release. Only if that step couldn't push (the release job says so) does the next pull request file them by hand: the lines of the release that's out go under its number, below `## Next release`.
 
 ## Fork features that don't cost sync time
 
@@ -19,7 +19,7 @@ Every line the fork changes inside one of the original project's files can confl
 - **New features go in files of the fork's own.** The original project's files get one-line hooks only, each checked by a test (`fork_hooks.rs`), so a sync that drops one fails instead of quietly losing the feature.
 - **Where the original project has a feature, the fork uses theirs.** Replacing one of theirs needs the owner's OK in its issue first: the fork's Walls, in place of their Broadcast, were thousands of lines in their busiest files.
 - **Every pull request says what it does to the footprint:** `scripts/upstream-footprint.sh` before and after (the lines the fork changes in the original project's files). It should only go down, or stay as it is.
-- **One pull request at a time,** opened after the last one's release is out, so its changelog heading is right in its first push and the checks run once.
+- **One pull request at a time,** its checks green before it merges.
 
 ## Before pushing
 
