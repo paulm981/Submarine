@@ -20,7 +20,9 @@ name: Check
 #     runs on a fixed Rust version (CLIPPY_RUST), since each Rust release
 #     adds lints that would raise the count on every pull request at once;
 #     move the version and the count together.
-#   • frontend: the TypeScript check and a build of the page. First, that
+#   • frontend: the page's tests (tools/test: the fork's own helpers, and
+#     that the original project's files still import the fork's modules), the
+#     TypeScript check and a build of the page. First, that
 #     src-tauri/src/lib.rs still ends every line with CRLF, as the original
 #     project's does: one written with LF conflicts on every line at the next
 #     sync (#112).
@@ -176,9 +178,20 @@ jobs:
         with:
           node-version: 20
           cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            tools/test/package-lock.json
 
       - name: Install npm deps
         run: npm ci
+
+      # The tests have a package of their own (vitest, pinned by its
+      # lockfile), so the original project's package.json stays as it is.
+      # Its type check, then vitest in Node: a few seconds.
+      - name: Frontend tests
+        run: |
+          npm ci --prefix tools/test
+          npm --prefix tools/test test
 
       # The licence notices, the TypeScript check and the page, as a release
       # builds them.

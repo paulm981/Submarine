@@ -1,0 +1,10 @@
+{
+  // The tests, type-checked with the app's own compiler options (and the
+  // app's TypeScript, from the root's node_modules); vitest's and Vite's
+  // types come from this package.
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "types": ["vite/client"]
+  },
+  "include": ["*.test.ts"]
+}
