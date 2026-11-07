@@ -107,6 +107,20 @@ mod tests {
         conn.execute("INSERT INTO servers (name, host, port, jump_host_id) VALUES ('a', 'h', 22, NULL)", []).unwrap();
     }
 
+    // The fork's tests in files of their own (#136): a sync that drops one of
+    // the lines that bring them in would stop them running, without a word.
+    #[test]
+    fn the_fork_tests_are_in_place() {
+        assert_hooks(
+            "lib.rs",
+            include_str!("lib.rs"),
+            &[("", "    mod fork;", 3), ("", "mod monitor_resume_tests;", 1), ("", "mod clone_server_tests;", 1)],
+        );
+        assert_hooks("monitor.rs", include_str!("monitor.rs"), &[("", "mod jump_host_tests;", 1)]);
+        assert_hooks("docker.rs", include_str!("docker.rs"), &[("", "mod cmd_tests;", 1)]);
+        assert_hooks("about.rs", include_str!("about.rs"), &[("", "mod tests;", 1)]);
+    }
+
     #[test]
     fn a_lost_or_moved_hook_is_named() {
         assert_hooks("x.rs", SRC, &[("a", "hook(", 1), ("b", "hook(", 2)]);
