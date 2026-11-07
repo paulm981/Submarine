@@ -7,7 +7,7 @@ import { localJoin } from "../../fs/localPath";
 import { IS_LINUX } from "../../util/platform";
 import {
   AT_ONCE, type Check as ServerCheck, type Choice, type LocalCount, type LocalEntry, type LocalPick, type Mode, PROGRESS_MS,
-  type Row, type Step, countLocal, failureOf, finalRow, folderNames, isStepEvent, localBase, overwriteFor, percent, pullLine,
+  type Row, type Step, countLocal, failureOf, finalRow, formatBytes, folderNames, isStepEvent, localBase, overwriteFor, percent, pullLine,
   pullStep, pushLine, pushSteps, remoteDirArg, remoteItemArg, rowText, runFew, runTotals, summarize, thereLine, throttle,
 } from "./plan";
 import { canBulk, hideBulk, setBulkRunning, useBulkAsk } from "./store";
@@ -26,6 +26,8 @@ type Session = { id: string; serverName: string; protocol?: string };
 type Phase = "setup" | "checking" | "review" | "running" | "finished";
 type Listing = { current_path: string; entries: LocalEntry[] };
 type RemoteListing = { current_path: string; entries: { name: string; is_dir: boolean }[] };
+/** A file from bulk_pick_files. */
+type PickedFile = { path: string; name: string; size: number };
 type Progress = { id?: string; name?: string; kind?: string; bytes?: number; total?: number; status?: string; error?: string | null };
 
 /** One server in a run: its session, its name, and what its check found. */
@@ -34,8 +36,6 @@ interface Target { sessionId: string; name: string; folder?: string; check: Serv
 const errText = (e: unknown) => (typeof e === "string" ? e : e instanceof Error ? e.message : String(e));
 /** Names on this computer: Windows and macOS don't tell `A` from `a`. */
 const sameName = IS_LINUX ? (s: string) => s : (s: string) => s.toLowerCase();
-/** Rows of a folder listed for picking; past this, pick a smaller folder. */
-const LIST_MAX = 1000;
 
 const btn = "h-8 px-3 rounded-lg text-[12px] font-semibold border transition-colors disabled:opacity-40 disabled:cursor-default";
 const btnPlain = `${btn} border-white/10 bg-white/[0.04] text-zinc-200 hover:bg-white/[0.08]`;
@@ -53,9 +53,7 @@ export const BulkTransfer = ({ sessions, statuses }: { sessions: Session[]; stat
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   // Push: a folder here, and what in it to send (or the folder itself).
-  const [src, setSrc] = useState<{ dir: string; entries: LocalEntry[] } | null>(null);
-  const [whole, setWhole] = useState(false);
-  const [ticked, setTicked] = useState<Set<string>>(new Set());
+  const [src, setSrc] = useState<{ kind: "files"; files: PickedFile[] } | { kind: "folder"; dir: string } | null>(null);
   const [remoteDir, setRemoteDir] = useState("~");
   // Pull: a path on the servers, and the folder here.
   const [remoteItem, setRemoteItem] = useState("");
@@ -113,15 +111,23 @@ export const BulkTransfer = ({ sessions, statuses }: { sessions: Session[]; stat
 
   // ── Setup ──────────────────────────────────────────────────────────────────
 
-  const chooseSource = async () => {
+  // Several files, in the system's dialog (bulk_pick.rs).
+  const chooseFiles = async () => {
+    setError(null);
+    try {
+      const files = await invoke<PickedFile[]>("bulk_pick_files");
+      if (files.length) setSrc({ kind: "files", files });
+    } catch (e) { setError(errText(e)); }
+  };
+
+  // A folder, sent whole.
+  const chooseFolder = async () => {
     setError(null);
     try {
       const dir = await invoke<string | null>("select_local_folder");
       if (!dir) return;
-      const listing = await invoke<Listing>("local_list_dir", { path: dir });
-      setSrc({ dir: listing.current_path, entries: listing.entries });
-      setWhole(false);
-      setTicked(new Set());
+      if (!localBase(dir)) { setError("Choose a folder inside a drive, not the drive itself."); return; }
+      setSrc({ kind: "folder", dir });
     } catch (e) { setError(errText(e)); }
   };
 
@@ -135,14 +141,9 @@ export const BulkTransfer = ({ sessions, statuses }: { sessions: Session[]; stat
 
   const picks: (LocalPick & { size: number })[] = useMemo(() => {
     if (!src) return [];
-    if (whole) {
-      const name = localBase(src.dir);
-      return name ? [{ path: src.dir, name, isDir: true, size: 0 }] : [];
-    }
-    return src.entries
-      .filter((e) => ticked.has(e.path) && !e.is_symlink)
-      .map((e) => ({ path: e.path, name: e.name, isDir: e.is_dir, size: e.size }));
-  }, [src, whole, ticked]);
+    if (src.kind === "folder") return [{ path: src.dir, name: localBase(src.dir), isDir: true, size: 0 }];
+    return src.files.map((f) => ({ path: f.path, name: f.name, isDir: false, size: f.size }));
+  }, [src]);
 
   const servers = usable.filter((s) => picked.has(s.id));
   const ready = servers.length > 0 && (mode === "push" ? picks.length > 0 && remoteDir.trim() !== "" : remoteItem.trim() !== "" && !!localDir);
@@ -377,39 +378,24 @@ export const BulkTransfer = ({ sessions, statuses }: { sessions: Session[]; stat
                   <section className="space-y-1.5">
                     <span className={label}>What to send</span>
                     <div className="flex items-center gap-2">
-                      <button className={btnPlain} onClick={() => void chooseSource()}><FolderOpen size={12} className="inline mr-1.5 -mt-0.5" />Choose a folder…</button>
-                      {src && <span className="truncate font-mono text-[11px] text-zinc-400" title={src.dir}>{src.dir}</span>}
+                      <button className={btnPlain} onClick={() => void chooseFiles()}><File size={12} className="inline mr-1.5 -mt-0.5" />Choose files…</button>
+                      <button className={btnPlain} onClick={() => void chooseFolder()}><FolderOpen size={12} className="inline mr-1.5 -mt-0.5" />Choose a folder…</button>
                     </div>
-                    {src && (
-                      <div className="max-h-48 overflow-y-auto custom-scrollbar rounded-lg border border-white/10 p-1">
-                        {localBase(src.dir) && (
-                          <label className="flex items-center gap-2 px-2 py-1 rounded hover:bg-white/[0.04] cursor-pointer">
-                            <input type="checkbox" className="accent-primary" checked={whole} onChange={() => setWhole((w) => !w)} />
-                            <Folder size={12} className="text-indigo-300 shrink-0" />
-                            <span className="truncate">{localBase(src.dir)} <span className="text-zinc-500">(the whole folder)</span></span>
-                          </label>
-                        )}
-                        {src.entries.slice(0, LIST_MAX).map((e) => (
-                          <label key={e.path} className={`flex items-center gap-2 px-2 py-1 rounded ${whole || e.is_symlink ? "opacity-40" : "hover:bg-white/[0.04] cursor-pointer"}`} title={e.is_symlink ? "A link: links aren't sent" : undefined}>
-                            <input
-                              type="checkbox"
-                              className="accent-primary"
-                              disabled={whole || !!e.is_symlink}
-                              checked={!whole && ticked.has(e.path)}
-                              onChange={() => setTicked((prev) => {
-                                const next = new Set(prev);
-                                if (next.has(e.path)) next.delete(e.path); else next.add(e.path);
-                                return next;
-                              })}
-                            />
-                            {e.is_dir ? <Folder size={12} className="text-indigo-300 shrink-0" /> : <File size={12} className="text-zinc-500 shrink-0" />}
-                            <span className="truncate">{e.name}</span>
-                          </label>
+                    {src?.kind === "folder" && (
+                      <p className="flex items-center gap-2 min-w-0" title={src.dir}>
+                        <Folder size={12} className="text-indigo-300 shrink-0" />
+                        <span className="truncate"><span className="text-zinc-200">{localBase(src.dir)}</span> <span className="text-zinc-500">(the whole folder, from {src.dir})</span></span>
+                      </p>
+                    )}
+                    {src?.kind === "files" && (
+                      <div className="max-h-32 overflow-y-auto custom-scrollbar rounded-lg border border-white/10 p-1">
+                        {src.files.map((f) => (
+                          <p key={f.path} className="flex items-center gap-2 px-2 py-0.5 min-w-0" title={f.path}>
+                            <File size={12} className="text-zinc-500 shrink-0" />
+                            <span className="truncate flex-1">{f.name}</span>
+                            <span className="text-[11px] text-zinc-500 shrink-0">{formatBytes(f.size)}</span>
+                          </p>
                         ))}
-                        {src.entries.length > LIST_MAX && (
-                          <p className="px-2 py-1 text-zinc-500 italic">And {(src.entries.length - LIST_MAX).toLocaleString()} more. Choose a folder with fewer in it, or send the whole folder.</p>
-                        )}
-                        {src.entries.length === 0 && <p className="px-2 py-1 text-zinc-500 italic">This folder is empty.</p>}
                       </div>
                     )}
                   </section>
