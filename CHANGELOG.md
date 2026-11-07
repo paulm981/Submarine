@@ -10,6 +10,9 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 ## Next release
 
 - **Settings is easier to find your way around.** It has tabs now: General, Terminal, Servers & sessions, AI tools, Sync and Help, and it opens on the one you used last. Each setting says what it does in one line; the longer explanations are behind Learn more. No setting works differently. ([#168](https://github.com/paulm981/Submarine/issues/168))
+
+## v0.4.0-fork.38
+
 - **Your sessions can survive a reconnect.** Turn on Keep sessions between connections in Settings › Servers & sessions (or for one server in its form): a terminal then runs inside tmux, or screen, on the server, so after a dropped connection, a sleep or a reconnect you're back where you were, with what was running still running. Nothing asks when you close a tab: the session just keeps running. Type exit to end it, or use Sessions… in the server's right-click menu to see, open or end them. Nothing is ever installed on a server; one without tmux or screen gets a plain shell and a note. ([#126](https://github.com/paulm981/Submarine/issues/126))
 
 ## v0.4.0-fork.36
