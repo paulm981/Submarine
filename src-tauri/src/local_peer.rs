@@ -197,10 +197,10 @@ mod os {
     #[derive(Clone, Copy)]
     struct SocketFdinfo {
         pfi: [u64; 3],
-        // `soi_stat` (struct vinfo_stat, 136 bytes): its owner at 16.
-        stat_head: [u32; 4],
-        stat_uid: u32,
-        stat_rest: [u32; 29],
+        // `soi_stat` (struct vinfo_stat, 136 bytes). Its owner is no help:
+        // proc_pidfdinfo leaves it at 0 for a socket (xnu,
+        // fill_socketinfo), so a socket's owner is its process's.
+        stat: [u64; 17],
         so: u64,
         pcb: u64,
         kind_family: [c_int; 3],
@@ -227,7 +227,9 @@ mod os {
         // SAFETY: geteuid can't fail.
         let me = unsafe { libc::geteuid() };
         let (from, to) = (plain(peer), plain(listening));
-        pids(me).into_iter().any(|pid| sockets(pid).into_iter().any(|fd| socket_of(pid, fd).is_some_and(|s| s.stat_uid == me && ends(&s) == Some((from, to)))))
+        // Only your own processes are listed (PROC_UID_ONLY): a connection
+        // found in one is yours.
+        pids(me).into_iter().any(|pid| sockets(pid).into_iter().any(|fd| socket_of(pid, fd).is_some_and(|s| ends(&s) == Some((from, to)))))
     }
 
     /// The processes of user `uid`.
@@ -299,7 +301,6 @@ mod os {
     #[test]
     fn the_layout_is_the_systems() {
         // Where sys/proc_info.h has them, from the start of socket_fdinfo.
-        assert_eq!(std::mem::offset_of!(SocketFdinfo, stat_uid), 24 + 16);
         assert_eq!(std::mem::offset_of!(SocketFdinfo, so), 24 + 136);
         assert_eq!(std::mem::offset_of!(SocketFdinfo, kind), 24 + 232);
         assert_eq!(std::mem::offset_of!(SocketFdinfo, fport), 24 + 240);
