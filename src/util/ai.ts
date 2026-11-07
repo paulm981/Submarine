@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { formatBytes } from "../fork/bulk/plan";
 
 // AI help on open sessions (#32, src-tauri/src/ai/mod.rs). The backend holds
 // all of it: the AI tabs, what's shared with each, the requests waiting for
@@ -53,7 +54,60 @@ export interface AiPending {
   /// One of a request's servers, when the AI asked for one command on
   /// several (#158): shown as one card, answered together.
   group: { id: number; size: number } | null;
+  /// A copy_files request (#159): what it copies, where. `command` is then
+  /// a one-line summary of it.
+  copy: AiCopy | null;
 }
+
+/// What a copy_files request copies (src-tauri/src/ai/copy.rs, CopyView).
+export interface AiCopy {
+  direction: "push" | "pull";
+  /// Push: the path on this computer; pull: the path on each server.
+  source: string;
+  /// Push: the folder on each server; pull: the folder on this computer.
+  destination: string;
+  /// Push: what's sent, counted on this computer. Pull: null, found when it
+  /// runs.
+  local: { is_dir: boolean; files: number; bytes: number; folders: number; links_skipped: number; others_skipped: number } | null;
+  /// Push: files already on the server are replaced.
+  replace: boolean;
+  /// Pull: the folder of its own this server's copy goes in.
+  into: string | null;
+}
+
+const count = (n: number, one: string, many = `${one}s`) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
+
+/// A copy's card, in words: what it "wants to" do, and its rows (a path's
+/// row is `path`, shown as it is, hidden characters marked), and anything
+/// to warn about.
+export const copyCard = (c: AiCopy): { wants: string; rows: { label: string; value: string; path?: boolean }[]; notes: string[] } => {
+  const push = c.direction === "push";
+  const rows: { label: string; value: string; path?: boolean }[] = push
+    ? [
+        { label: "From this computer", value: c.source, path: true },
+        { label: "To, on each server", value: c.destination, path: true },
+        {
+          label: "What",
+          value: c.local
+            ? `${c.local.is_dir ? "A folder: " : ""}${count(c.local.files, "file")}, ${formatBytes(c.local.bytes)}`
+            : "Counted when it runs",
+        },
+        { label: "Already there", value: c.replace ? "Replaced" : "Left as they are" },
+      ]
+    : [
+        { label: "From each server", value: c.source, path: true },
+        { label: "To this computer", value: c.destination, path: true },
+        { label: "What", value: "Found when it runs" },
+        { label: "Already there", value: "Left as they are: nothing on this computer is replaced" },
+      ];
+  const notes: string[] = [];
+  if (!push) notes.push("Each server's copy goes in a folder of its own inside it, named after the server.");
+  if (push && c.replace) notes.push("Files of the same name already on the servers are replaced.");
+  const links = c.local?.links_skipped ?? 0;
+  if (links > 0) notes.push(`${count(links, "link")} inside ${links === 1 ? "is" : "are"} left out: links on this computer aren't followed.`);
+  return { wants: push ? "wants to copy files to" : "wants to copy files from", rows, notes };
+};
+
 
 /// The cards to show for `pending`: one per request, a request on several
 /// servers (#158) as one card with its servers as `members`, where its
