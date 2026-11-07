@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Bot, Home, Loader2, PanelRightClose, PanelRightOpen, X } from "lucide-react";
-import { AiTab, aiMarker, openAiTrust, sharedWith, trustTargetFor, useAi } from "../util/ai";
+import { AiTab, aiMarker, cardsOf, openAiTrust, sharedWith, trustTargetFor, useAi } from "../util/ai";
 import {
   PANE_MIN_WIDTH, aiStarted, aiPaneState, choosePaneAi, closePaneHere, leftView, resetAiPane, setPaneFolded, setPaneHere,
   setPaneWidth, showHomeTab, useAiPane,
@@ -224,6 +224,8 @@ export const AiSidePane = ({ v, onHome, onGoToServer }: {
 
   if (!m.shows || !current) return null;
   const waiting = ai.pending.filter((p) => p.tab_id === current.id);
+  // Requests, not servers: one on several servers is one (#158).
+  const asks = cardsOf(waiting).length;
 
   if (!m.open) {
     return (
@@ -231,14 +233,14 @@ export const AiSidePane = ({ v, onHome, onGoToServer }: {
         type="button"
         onClick={(e) => act(e.detail === 0)}
         title={`Open the AI pane: ${current.label} (Ctrl+Shift+L)`}
-        aria-label={`Open the AI pane: ${current.label}${waiting.length ? `, ${waiting.length} waiting for you` : ""}`}
+        aria-label={`Open the AI pane: ${current.label}${asks ? `, ${asks} waiting for you` : ""}`}
         className="relative w-7 shrink-0 min-h-0 flex flex-col items-center gap-2 pt-3 bg-[#111114] border-l border-white/10 text-zinc-400 hover:text-white hover:bg-white/[0.04] focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary"
       >
         <PanelRightOpen size={14} />
         <Bot size={14} className="text-primary" />
-        {waiting.length > 0 && (
+        {asks > 0 && (
           <span className="min-w-[14px] h-[14px] px-1 rounded-full bg-primary text-[9px] font-bold text-black flex items-center justify-center leading-none" aria-hidden="true">
-            {waiting.length}
+            {asks}
           </span>
         )}
         <span className="text-[10.5px] font-semibold tracking-wide [writing-mode:vertical-rl] truncate max-h-[50vh]">{current.label}</span>
@@ -315,12 +317,15 @@ export const AiSidePane = ({ v, onHome, onGoToServer }: {
       {/* Its requests, as in the AI panel. */}
       {waiting.length > 0 && (
         <div className="shrink-0 max-h-[45%] overflow-y-auto custom-scrollbar border-b border-white/5">
-          {waiting.map((p) => (
+          {cardsOf(waiting).map(({ p, members }) => (
             <PendingCard
               key={`${p.id}:${p.asked_at}`}
               p={p}
+              members={members}
               level={levelOf(ai, p.tab_id, p.session_id)}
-              decide={(allow, note, password) => run("ai_decide", { id: p.id, allow, note: note ?? null, password: password || null })}
+              decide={(allow, note, password) => members.length > 1 && p.group
+                ? run("ai_decide_group", { group: p.group.id, allow, note: note ?? null })
+                : run("ai_decide", { id: p.id, allow, note: note ?? null, password: password || null })}
               act={run}
               onGoToServer={onGoToServer}
             />

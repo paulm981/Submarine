@@ -1,7 +1,7 @@
 import { ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Bot, Check, ChevronDown, ChevronRight, Loader2, ShieldAlert, Square, X, Zap } from "lucide-react";
-import { AiDone, AiPending, AiSnapshot, runnerWarning } from "../util/ai";
+import { AiDone, AiPending, AiSnapshot, cardsOf, runnerWarning } from "../util/ai";
 import { HIDDEN_CONTROLS } from "../util/fileName";
 import { WILDCARD_WARNING } from "./AiTrust";
 
@@ -86,8 +86,11 @@ const SETTLE_MS = 500;
 /// password) is a new card: its key has the time it was asked again. So when a card above it goes (the AI can withdraw one) and this
 /// one slides up under the pointer, a click meant for the other can't
 /// decide it.
-export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
+export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
   p: AiPending;
+  /// A request on several servers (#158): every server's request, `p`
+  /// first. Its Allow, Deny and "Allow everything" answer them all.
+  members?: AiPending[];
   /// The server's approval level now (#115).
   level: number;
   /// Allow (with the root password typed on a card as root, if any), or
@@ -172,6 +175,7 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
   };
   const down = () => { downHere.current = !moved() && performance.now() >= settledAt.current; };
   const loginIsRoot = p.user === "root";
+  const many = members && members.length > 1 ? members : null;
   // The fields: Enter does nothing, and no key in them reaches the app.
   const fieldKeys = (e: React.KeyboardEvent) => {
     e.stopPropagation();
@@ -181,6 +185,26 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
   const field = "w-full h-7 px-2 bg-black/40 border border-white/10 rounded-md font-mono text-[11px] text-zinc-100 outline-none focus:border-primary/50 placeholder:text-zinc-600";
   return (
     <div ref={ref} className="m-2 rounded-xl border border-primary/30 bg-primary/[0.06] p-3 space-y-2">
+      {many ? (
+        <div className="text-[11.5px] text-zinc-300 space-y-1">
+          <div>
+            <span className="font-bold text-white">{p.tab_label}</span> wants to run this on{" "}
+            <span className="font-bold text-white">{many.length} servers</span>
+            {p.timeout_secs !== 60 && <span className="text-zinc-500"> · stops after {p.timeout_secs}s on each</span>}
+          </div>
+          <ul className="space-y-0.5">
+            {many.map((m) => (
+              <li key={m.id} className="text-[11px]">
+                <NoFocusButton onPick={() => onGoToServer(m.session_id)} className="font-bold text-white hover:underline">{m.server}</NoFocusButton>
+                {m.user && <> as <span className={`font-bold ${m.user === "root" ? "text-amber-300" : "text-zinc-200"}`}>{m.user}</span></>}
+                {m.ask_rule
+                  ? <span className="text-amber-300"> · asks because of your always-ask rule <code className="text-amber-200">{m.ask_rule}</code></span>
+                  : m.note && <span className="text-zinc-500"> · {m.note}</span>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : (
       <div className="text-[11.5px] text-zinc-300">
         <span className="font-bold text-white">{p.tab_label}</span> wants to run on{" "}
         <NoFocusButton onPick={() => onGoToServer(p.session_id)} className="font-bold text-white hover:underline">{p.server}</NoFocusButton>
@@ -189,11 +213,14 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
         ) : p.user && <> as <span className={`font-bold ${loginIsRoot ? "text-amber-300" : "text-white"}`}>{p.user}</span></>}
         {p.timeout_secs !== 60 && <span className="text-zinc-500"> · stops after {p.timeout_secs}s</span>}
       </div>
-      {p.root && (
+      )}
+      {(many ? many.some((m) => m.root) : p.root) && (
         <div className="flex items-start gap-1.5 text-[11px] text-amber-300">
           <ShieldAlert size={13} className="shrink-0 mt-px" />
           <span>
-            {loginIsRoot
+            {many
+              ? "Runs as root on any server above logged in as root; and it asks for root (sudo, dzdo, su, doas or pkexec) where those need no password."
+              : loginIsRoot
               ? "Runs as root: this server's tab is logged in as root."
               : p.as_root
                 ? "The AI asks to run this as root. Submarine runs it through the server's sudo or dzdo, and gives any password only to their own prompt. The AI never sees it."
@@ -207,13 +234,13 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
           <span>It has hidden or control characters, shown below as ⟨U+…⟩.</span>
         </div>
       )}
-      {p.note && (
+      {!many && p.note && (
         <div className="flex items-start gap-1.5 text-[11px] text-amber-300">
           <ShieldAlert size={13} className="shrink-0 mt-px" />
           <span>{p.note}</span>
         </div>
       )}
-      {p.ask_rule && (
+      {!many && p.ask_rule && (
         <div className="flex items-start gap-1.5 text-[11px] text-amber-300">
           <ShieldAlert size={13} className="shrink-0 mt-px" />
           <span>Asks because of your always-ask rule <code className="text-amber-200">{p.ask_rule}</code>.</span>
@@ -259,7 +286,7 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
           accept={accept}
           className="flex-1 h-8 rounded-lg bg-primary/15 border border-primary/40 text-primary text-[11px] font-bold uppercase tracking-wider hover:bg-primary hover:text-zinc-950 flex items-center justify-center gap-1.5"
         >
-          <Check size={13} /> Allow
+          <Check size={13} /> {many ? `Allow on ${many.length} servers` : "Allow"}
         </NoFocusButton>
         <NoFocusButton
           onPick={() => decide(false)}
@@ -271,7 +298,7 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
         </NoFocusButton>
       </div>
       <div className="flex flex-col items-start gap-1">
-        {p.can_allow_always && extra !== "rule" && (
+        {!many && p.can_allow_always && extra !== "rule" && (
           <NoFocusButton onPick={() => setExtra("rule")} className={link}>Always allow this command here…</NoFocusButton>
         )}
         {extra === "rule" && (
@@ -311,16 +338,22 @@ export const PendingCard = ({ p, level, decide, act, onGoToServer }: {
         )}
         <NoFocusButton
           onPick={() => {
+            if (many && p.group) {
+              act("ai_allow_session_group", { group: p.group.id });
+              return;
+            }
             const typed = asksPassword ? password : "";
             setPassword("");
             act("ai_allow_session", { id: p.id, password: typed || null });
           }}
           onDown={down}
           accept={accept}
-          title="Runs this, and what this AI tab asks for on this server from now on, without asking, but for your always-ask list. Ends when the AI tab closes, or the server stops being shared."
+          title={many
+            ? "Runs this, and what this AI tab asks for on these servers from now on, without asking, but for your always-ask list. Ends when the AI tab closes, or a server stops being shared."
+            : "Runs this, and what this AI tab asks for on this server from now on, without asking, but for your always-ask list. Ends when the AI tab closes, or the server stops being shared."}
           className={`${link} flex items-center gap-1`}
         >
-          <Zap size={11} className="shrink-0" /> Allow everything here until this AI tab closes
+          <Zap size={11} className="shrink-0" /> {many ? `Allow everything on these ${many.length} servers until this AI tab closes` : "Allow everything here until this AI tab closes"}
         </NoFocusButton>
         {extra !== "note" && (
           <NoFocusButton onPick={() => setExtra("note")} className={link}>Deny with a note…</NoFocusButton>
@@ -520,12 +553,15 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
         ))}
 
         {/* Waiting for you. */}
-        {snap.pending.map((p) => (
+        {cardsOf(snap.pending).map(({ p, members }) => (
           <PendingCard
             key={`${p.id}:${p.asked_at}`}
             p={p}
+            members={members}
             level={levelOf(snap, p.tab_id, p.session_id)}
-            decide={(allow, note, password) => run("ai_decide", { id: p.id, allow, note: note ?? null, password: password || null })}
+            decide={(allow, note, password) => members.length > 1 && p.group
+              ? run("ai_decide_group", { group: p.group.id, allow, note: note ?? null })
+              : run("ai_decide", { id: p.id, allow, note: note ?? null, password: password || null })}
             act={run}
             onGoToServer={onGoToServer}
           />

@@ -50,7 +50,24 @@ export interface AiPending {
   /// Why it asks where the server's settings otherwise wouldn't: they
   /// couldn't be read, or a change to them waits for your OK.
   note: string | null;
+  /// One of a request's servers, when the AI asked for one command on
+  /// several (#158): shown as one card, answered together.
+  group: { id: number; size: number } | null;
 }
+
+/// The cards to show for `pending`: one per request, a request on several
+/// servers (#158) as one card with its servers as `members`, where its
+/// first is.
+export const cardsOf = (pending: AiPending[]): { p: AiPending; members: AiPending[] }[] => {
+  const out: { p: AiPending; members: AiPending[] }[] = [];
+  for (const p of pending) {
+    const group = p.group?.id;
+    const card = group == null ? undefined : out.find((c) => c.p.group?.id === group);
+    if (card) card.members.push(p);
+    else out.push({ p, members: [p] });
+  }
+  return out;
+};
 export interface AiRunning {
   id: number; tab_label: string; session_id: string; server: string; command: string; started_at: string;
   /// Why it runs without your Allow, if it does.

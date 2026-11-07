@@ -41,7 +41,7 @@ import HomePane from "./components/HomePane";
 import AiPanel from "./components/AiPanel";
 import AiSidePane, { AiPaneButton, type AiPaneView } from "./components/AiSidePane";
 import { useAiPane } from "./ui/aiPane";
-import { useAi, sharedWith, aiMarker, openAiTrust, trustTargetFor } from "./util/ai";
+import { useAi, sharedWith, aiMarker, openAiTrust, trustTargetFor, cardsOf } from "./util/ai";
 import { AiTrustModal } from "./components/AiTrust";
 import { IS_ANDROID } from "./util/platform";
 import { folderTree } from "./util/folderTree";
@@ -2535,19 +2535,19 @@ function DesktopApp() {
           <button
             type="button"
             onClick={() => setAiOpen(o => !o)}
-            title={ai.pending.length ? `AI: ${ai.pending.length} waiting for you` : "AI panel"}
+            title={cardsOf(ai.pending).length ? `AI: ${cardsOf(ai.pending).length} waiting for you` : "AI panel"}
             aria-label="AI panel"
             aria-pressed={aiOpen}
             className={`relative flex items-center justify-center w-7 h-7 rounded-full transition-all ${
-              aiOpen || ai.pending.length
+              aiOpen || cardsOf(ai.pending).length
                 ? "bg-primary/15 border border-primary/40 text-primary"
                 : "bg-white/[0.06] border border-white/10 text-zinc-400 hover:bg-white/[0.1] hover:text-white"
             }`}
           >
             <Bot size={13} />
-            {ai.pending.length > 0 && (
+            {cardsOf(ai.pending).length > 0 && (
               <span className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-1 rounded-full bg-primary text-[9px] font-bold text-black flex items-center justify-center leading-none" aria-hidden="true">
-                {ai.pending.length}
+                {cardsOf(ai.pending).length}
               </span>
             )}
           </button>
