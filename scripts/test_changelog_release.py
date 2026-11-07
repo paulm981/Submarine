@@ -34,6 +34,20 @@ class FileRelease(unittest.TestCase):
         once = file_release("v0.4.0-fork.33", text, text)
         self.assertEqual(file_release("v0.4.0-fork.33", text, once), once)
 
+    def test_fragments_go_under_the_tag_in_order(self):
+        text = HEAD + "## Next release\n\n" + OLD
+        got = file_release("v0.4.0-fork.40", text, text, ["- **B.** Two. ([#9](x))\n", "- **C.** Three.\n  - a sub-point\n"])
+        self.assertEqual(got, HEAD + "## Next release\n\n## v0.4.0-fork.40\n\n- **B.** Two. ([#9](x))\n- **C.** Three.\n  - a sub-point\n\n" + OLD)
+
+    def test_fragments_and_old_style_lines_together(self):
+        text = HEAD + "## Next release\n\n- A. ([#2](x))\n\n" + OLD
+        got = file_release("v0.4.0-fork.40", text, text, ["- B. ([#3](x))\r\n"])
+        self.assertEqual(got, HEAD + "## Next release\n\n## v0.4.0-fork.40\n\n- A. ([#2](x))\n- B. ([#3](x))\n\n" + OLD)
+
+    def test_an_empty_fragment_files_nothing(self):
+        text = HEAD + "## Next release\n\n" + OLD
+        self.assertEqual(file_release("v0.4.0-fork.40", text, text, ["\n", "just prose, no entry\n"]), text)
+
     def test_the_real_changelog_files_cleanly(self):
         path = os.path.join(os.path.dirname(__file__), "..", "CHANGELOG.md")
         with open(path, encoding="utf-8") as f:

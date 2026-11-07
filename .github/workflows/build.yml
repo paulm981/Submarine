@@ -787,11 +787,22 @@ jobs:
         run: |
           set -euo pipefail
           git show "$SHA:CHANGELOG.md" > "$RUNNER_TEMP/released.md"
-          python3 scripts/changelog_release.py "$TAG" "$RUNNER_TEMP/released.md" CHANGELOG.md
-          if git diff --quiet; then exit 0; fi
+          # The released commit's changelog.d files, by issue number, as they
+          # were in that commit; one added since waits for its own release.
+          mapfile -t frags < <(git ls-tree --name-only "$SHA" changelog.d/ | grep -E '/[^/]+\.md$' | grep -v '/README\.md$' | sort -V || true)
+          texts=()
+          for f in "${frags[@]}"; do
+            out="$RUNNER_TEMP/frag-$(basename "$f")"
+            git show "$SHA:$f" > "$out"
+            texts+=("$out")
+          done
+          python3 scripts/changelog_release.py "$TAG" "$RUNNER_TEMP/released.md" CHANGELOG.md "${texts[@]}"
+          for f in "${frags[@]}"; do git rm -q --ignore-unmatch "$f"; done
+          git add CHANGELOG.md
+          if git diff --cached --quiet; then exit 0; fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -qam "Changelog: what shipped in $TAG"
+          git commit -qm "Changelog: what shipped in $TAG"
           for i in 1 2 3; do
             if git push -q origin HEAD:main; then exit 0; fi
             git pull -q --rebase origin main
