@@ -11,7 +11,7 @@ This page covers:
 
 What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
-The fork is based on the original project's **0.4.0**, with every change up to [#295](https://github.com/SinaXhpm/submarine/pull/295) brought in.
+The fork is based on the original project's **0.4.0**, with every change up to [#297](https://github.com/SinaXhpm/submarine/pull/297) brought in.
 
 ## What this fork adds
 
@@ -265,7 +265,7 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 
 ## Changes in the original project not taken yet
 
-Every change up to [#295](https://github.com/SinaXhpm/submarine/pull/295) is taken. Where the fork takes one differently, the table above says so.
+Every change up to [#297](https://github.com/SinaXhpm/submarine/pull/297) is taken. Where the fork takes one differently, the table above says so.
 
 Not taken yet, for the next sync:
 
