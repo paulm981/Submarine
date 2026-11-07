@@ -201,6 +201,11 @@ export const findAiTools = (): Promise<{ id: string; label: string }[]> =>
 // How much the AI may run on a server without asking. Set on a server, a
 // folder or for every server, on this device only; only you change them.
 
+/// Beside "Run anything" and "Allow everything here" (#178): what runs
+/// without asking can be steered by what a server prints.
+export const STEERED_BY_OUTPUT =
+  "Anything a server prints can steer the AI, and this runs what that text talks it into without asking you.";
+
 export const AI_LEVELS: { level: number; title: string; text: string }[] = [
   { level: 1, title: "Ask every time", text: "Every command waits for your Allow." },
   {
@@ -211,7 +216,7 @@ export const AI_LEVELS: { level: number; title: string; text: string }[] = [
   {
     level: 3,
     title: "Run anything, just log it",
-    text: "Every command runs without asking, including sudo where the server doesn't ask for a password. A request to run something as root runs once you've typed the root password for that AI tab, or where the server needs none. Your always-ask list still asks. Everything is in the AI panel and the audit log, and Stop still works.",
+    text: "Every command runs without asking, including sudo where the server doesn't ask for a password. A request to run something as root runs once you've typed the root password for that AI tab, or where the server needs none. Your always-ask list still asks. Everything is in the AI panel and the audit log, and Stop still works. " + STEERED_BY_OUTPUT,
   },
 ];
 

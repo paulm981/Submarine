@@ -5,7 +5,8 @@
 //! the AI panel and runs it once you click Allow, or at once where your
 //! approval level and rules say so (trust.rs, #115), on its own SSH channel
 //! (exec.rs), and gives back the output with known secrets hidden
-//! (filter.rs). Every request and decision goes in the audit log (audit.rs).
+//! (filter.rs), marked as the server's words, not instructions (boundary.rs,
+//! #178). Every request and decision goes in the audit log (audit.rs).
 //!
 //! The AI never gets a key or a password, and never connects to a server.
 //! It can also ask to copy files between this computer and its servers
@@ -44,6 +45,7 @@
 //!   the output, the AI's answer, the audit log, the app log or an error.
 
 mod audit;
+mod boundary;
 mod channel;
 mod claude;
 mod codex;
@@ -152,6 +154,9 @@ const MAX_GROUP: usize = 50;
 /// What the AI gets back from one `run_on_servers` request, its servers'
 /// parts together: each gets its share, cut in the middle.
 const GROUP_AI_BUDGET: usize = 128 * 1024;
+/// What a server sent gets this much of its part at least, whatever
+/// Submarine's own words there take.
+const MIN_SERVER_SHARE: usize = 512;
 /// Commands one AI tab may have running at once on one server, those that
 /// ran without asking included.
 const MAX_RUNNING: usize = 4;
@@ -356,9 +361,11 @@ fn waiting_requests(s: &Shared, tab_id: &str) -> usize {
     mine.filter(|p| p.view.group.is_none()).count() + groups.len()
 }
 
-/// One answer for the AI from a `run_on_servers` request's servers' parts,
-/// in the order it named them: each part cut to its share of
-/// GROUP_AI_BUDGET, keeping its start and end. An error only if every part
+/// One answer for the AI from a `run_on_servers` (or `copy_files`)
+/// request's servers' parts, in the order it named them: each part cut to
+/// its share of GROUP_AI_BUDGET, keeping its start and end. What a server
+/// sent is cut first, inside its part, then marked as the server's
+/// (boundary.rs), so no cut goes through a tag. An error only if every part
 /// is one.
 fn group_answer(parts: &[(String, ToolResult)]) -> ToolResult {
     let share = (GROUP_AI_BUDGET / parts.len().max(1)).max(2 * 1024);
@@ -366,10 +373,15 @@ fn group_answer(parts: &[(String, ToolResult)]) -> ToolResult {
     let n = parts.len();
     let mut text = format!("{n} server{}: {} done, {failed} not.\n", if n == 1 { "" } else { "s" }, n - failed);
     for (name, r) in parts {
-        let body = cut_middle(&r.text, share);
-        text.push_str(&format!("\n=== {name}{} ===\n{body}\n", if r.is_error { " (not run, or failed)" } else { "" }));
+        let ours = cut_middle(&r.text, share);
+        let server_text = r.server_text.as_ref().map(|said| {
+            let room = share.saturating_sub(ours.len() + boundary::extra(&said.server)).max(MIN_SERVER_SHARE);
+            boundary::ServerText { server: said.server.clone(), text: cut_middle(&said.text, room) }
+        });
+        let body = ToolResult { text: ours, is_error: r.is_error, server_text }.for_ai();
+        text.push_str(&format!("\n=== {name}{} ===\n{}\n", if r.is_error { " (not run, or failed)" } else { "" }, body.text));
     }
-    ToolResult { text, is_error: failed == parts.len() }
+    ToolResult { text, is_error: failed == parts.len(), server_text: None }
 }
 
 /// `text` within `max` bytes: its start and end, and a line saying how
@@ -1577,7 +1589,7 @@ impl AiState {
         as_root: bool,
         cancel: watch::Receiver<bool>,
     ) -> ToolResult {
-        self.run_command_in(tab_id, server, command, timeout, as_root, cancel, None).await
+        self.run_command_in(tab_id, server, command, timeout, as_root, cancel, None).await.for_ai()
     }
 
     /// What a server's settings say of `command` there, before it's asked:
@@ -2133,7 +2145,13 @@ impl AiState {
                         filter::HIDDEN
                     ));
                 }
-                let answer = format!("{head}--- output ---\n{}", ai.as_str());
+                // What the server printed goes after Submarine's lines, and
+                // is marked as the server's as it's given (boundary.rs).
+                let answer = ToolResult {
+                    text: head.trim_end().to_string(),
+                    is_error: false,
+                    server_text: Some(boundary::ServerText { server: server.clone(), text: ai.to_string() }),
+                };
                 e.exit_code = exit;
                 e.bytes_returned = Some(ai.len());
                 e.items_hidden = Some(hidden);
@@ -2149,7 +2167,7 @@ impl AiState {
                 d.view.hidden = hidden;
                 d.view.cut = out.cut;
                 d.view.timed_out = out.timed_out;
-                ToolResult::ok(answer)
+                answer
             }
             Err((err, for_ai)) => {
                 e.note = Some(err.clone());
