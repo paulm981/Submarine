@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **The AI can run one command on many servers, and you allow it once.** In a Broadcast of 12 servers, asking the AI to check disk space everywhere now shows one card, Allow on 12 servers, instead of 12. It runs without asking only where every server's settings say it may; otherwise every server waits on the one card. Allow everything on these servers until this AI tab closes covers them all. ([#158](https://github.com/paulm981/Submarine/issues/158))
+
+## v0.4.0-fork.33
+
 - **Remote Desktop works as in the original project again.** The fork's own Remote Desktop changes are gone, so syncing with the original project stays simple. Text copied on the server reaches your clipboard at once, a shared folder follows the server, and Remote Desktop Connection may get a saved login's password, as in the original project. Opening an RDP server through an SSH server works as before. ([#160](https://github.com/paulm981/Submarine/issues/160))
 
 ## v0.4.0-fork.32
