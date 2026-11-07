@@ -9,6 +9,8 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.39
+
 - **Settings is easier to find your way around.** It has tabs now: General, Terminal, Servers & sessions, AI tools, Sync and Help, and it opens on the one you used last. Each setting says what it does in one line; the longer explanations are behind Learn more. No setting works differently. ([#168](https://github.com/paulm981/Submarine/issues/168))
 
 ## v0.4.0-fork.38
