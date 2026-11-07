@@ -10,10 +10,12 @@
 //! reached. Its copy in vendor/ takes a folder as the root, not only a drive
 //! (VENDORED.md there).
 //!
-//! On macOS and Linux IronRDP's backend joins the server's path to the
-//! folder as text, so here every path is checked first (`inside`): names
-//! only, no `..`, and no link on the way. A read-only share refuses every
-//! change there; on Windows the backend does.
+//! On macOS and Linux every path is checked here first (`inside`): names
+//! only, no `..`, and no link on the way. Then the backend's copy in vendor/
+//! reaches it from the folder one name at a time without following a link
+//! (VENDORED.md there, item 6), so a folder swapped for a link after the
+//! check leads nowhere either. A read-only share refuses every change here;
+//! on Windows the backend does.
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -710,5 +712,95 @@ mod tests {
         let base = std::env::temp_dir();
         assert_eq!(inside(&base, &create("/../etc/passwd"), false), None);
         assert_eq!(inside(&base, &create("//server/share"), false), None);
+    }
+
+    // The backend itself never follows a link on the way (#132): a folder
+    // swapped for a link after `inside` checked the path (something else
+    // writing in the shared folder at that moment) leads nowhere. Sent straight
+    // to IronRDP's backend, past `inside`, as if the link had come after it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_backend_itself_never_follows_a_link() {
+        use ironrdp::core::ReadCursor;
+        use ironrdp::rdpdr::pdu::efs::{DeviceIoRequest, ServerDriveIoRequest};
+        use ironrdp::rdpdr::RdpdrBackend;
+        use ironrdp_rdpdr_native::backend::NixRdpdrBackend;
+        use ironrdp_rdpdr_native::beneath;
+        let dir = std::env::temp_dir().join(format!("sub-share-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (share, outside) = (dir.join("share"), dir.join("outside"));
+        std::fs::create_dir_all(share.join("in")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(share.join("in/a.txt"), b"in").unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+        std::os::unix::fs::symlink(&outside, share.join("out")).unwrap();
+        let base = std::fs::canonicalize(&share).unwrap();
+        let b = base.to_string_lossy().into_owned();
+        let mut backend = NixRdpdrBackend::new(b.clone());
+        let mut send = |file_id: u32, major: u32, minor: u32, payload: Vec<u8>| -> Vec<u8> {
+            let mut bytes = Vec::new();
+            for x in [1u32, file_id, 7, major, minor] {
+                bytes.extend(x.to_le_bytes());
+            }
+            bytes.extend(payload);
+            let mut src = ReadCursor::new(&bytes);
+            let io = DeviceIoRequest::decode(&mut src).unwrap();
+            let req = ServerDriveIoRequest::decode(io, &mut src).unwrap();
+            backend.handle_drive_io_request(req).unwrap()[0].encode_unframed_pdu().unwrap()
+        };
+        let utf16 = |path: &str| -> Vec<u16> { path.encode_utf16().chain([0]).collect() };
+        // `disposition` 1 opens, 2 makes a new file.
+        let create = |access: u32, disposition: u32, path: &str| {
+            let units = utf16(path);
+            let mut bytes = Vec::new();
+            for x in [access, 0, 0, 0, 7, disposition, 0, (units.len() * 2) as u32] {
+                bytes.extend(x.to_le_bytes());
+            }
+            bytes.extend(units.iter().flat_map(|u| u.to_le_bytes()));
+            bytes
+        };
+        let list = |path: &str| {
+            let units = utf16(path);
+            let mut bytes = Vec::new();
+            bytes.extend(3u32.to_le_bytes()); // FileBothDirectoryInformation
+            bytes.push(1); // the first query
+            bytes.extend(((units.len() * 2) as u32).to_le_bytes());
+            bytes.extend([0u8; 23]);
+            bytes.extend(units.iter().flat_map(|u| u.to_le_bytes()));
+            bytes
+        };
+        let status = |r: &[u8]| u32::from_le_bytes(r[12..16].try_into().unwrap());
+        let (read, read_write) = (0x0012_0089, 0x0012_019f);
+
+        assert_eq!(status(&send(0, 0, 0, create(read, 1, r"\in\a.txt"))), 0, "a file inside opens");
+        assert_ne!(status(&send(0, 0, 0, create(read, 1, r"\out\secret.txt"))), 0, "not through a link");
+        assert_ne!(status(&send(0, 0, 0, create(read, 1, r"\out"))), 0, "nor the link itself, as a folder");
+        assert_ne!(status(&send(0, 0, 0, create(read_write, 2, r"\out\new.txt"))), 0, "nothing made through it");
+        assert!(!outside.join("new.txt").exists());
+        // A listing through it finds nothing (listed from the opened share).
+        let root = send(0, 0, 0, create(read, 1, r"\"));
+        assert_eq!(status(&root), 0);
+        let root_id = u32::from_le_bytes(root[16..20].try_into().unwrap());
+        assert_ne!(status(&send(root_id, 0x0c, 1, list(r"\out\*"))), 0, "nothing listed through it");
+        assert_eq!(status(&send(root_id, 0x0c, 1, list(r"\in\*"))), 0, "a folder inside lists");
+
+        // Renames, deletions and new folders don't go through it either.
+        let p = |rel: &str| format!("{b}/{rel}");
+        assert!(beneath::rename(&b, &p("in/a.txt"), &p("out/a.txt")).is_err());
+        assert!(!outside.join("a.txt").exists() && base.join("in/a.txt").exists());
+        assert!(beneath::remove_file(&b, &p("out/secret.txt")).is_err());
+        assert!(outside.join("secret.txt").exists());
+        assert!(beneath::create_dir_all(&b, &p("out/made")).is_err());
+        assert!(!outside.join("made").exists());
+        assert!(!beneath::details(&b, &p("out")).unwrap().is_dir, "a link's own details");
+        assert!(beneath::details(&b, &p("in/../../outside")).is_err(), "`..` never walks out");
+        // Inside, all of it works.
+        beneath::create_dir_all(&b, &p("in/x/y")).unwrap();
+        assert!(base.join("in/x/y").is_dir());
+        beneath::rename(&b, &p("in/a.txt"), &p("in/x/b.txt")).unwrap();
+        assert!(base.join("in/x/b.txt").exists());
+        beneath::remove_file(&b, &p("in/x/b.txt")).unwrap();
+        assert!(beneath::details(&b, &p("in/x")).unwrap().is_dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
