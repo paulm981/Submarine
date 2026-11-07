@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   Activity, ArrowLeftRight, Bot, ChevronRight, ChevronsDownUp, Copy, CopyPlus, Folder, FolderInput, FolderOpen, FolderPlus,
-  Eye, Monitor, Pencil, Play, Plus, Search, ShieldAlert, TerminalSquare, Trash2, X,
+  Eye, History, Monitor, Pencil, Play, Plus, Search, ShieldAlert, TerminalSquare, Trash2, X,
 } from "lucide-react";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
 import { FolderRow, indexFolders, subtreeCounts, subtreeIds } from "../util/folderPath";
@@ -12,6 +12,7 @@ import { OsBadge, osName } from "./OsBadge";
 import { openAiTrust, useAi } from "../util/ai";
 import { pingServers } from "../ui/ping";
 import { jumpHostNote } from "../util/jumpHostNote";
+import { showKeptSessions } from "./KeptSessions";
 
 // The session tree beside the main view, in the spirit of MobaXterm's
 // Sessions sidebar: every folder and server as one compact list, with the servers that have a tab open marked by their
@@ -922,6 +923,18 @@ export const SessionTree = ({
                 {aiOn && !many && (r.server.protocol ?? "ssh") === "ssh" && (
                   <button className={menuItem} onClick={run(() => openAiTrust({ scope: "server", id: r.server.id, name: r.server.name }))}>
                     <Bot size={13} className={menuIcon} /> AI approval…
+                  </button>
+                )}
+                {/* Its kept sessions (#126), listed over one of its open tabs. */}
+                {!many && (r.server.protocol ?? "ssh") === "ssh" && r.server.uuid && (
+                  <button
+                    className={menuItem}
+                    onClick={run(() => {
+                      setError(null);
+                      if (!showKeptSessions(r.server.uuid)) setError(`Open “${r.server.name}” first: its sessions are listed over its connection.`);
+                    })}
+                  >
+                    <History size={13} className={menuIcon} /> Sessions…
                   </button>
                 )}
                 {menuSep}
