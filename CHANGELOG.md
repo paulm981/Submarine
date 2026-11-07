@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Codex starts from Home's menu, beside Claude Code.** With AI tools on in Settings, Home's menu lists each AI tool you have installed. Codex opens already connected to Submarine, the same way: it never gets a key or a password, and Submarine asks you before each command it runs on a server. Settings › AI tools shows which are installed. ([#117](https://github.com/paulm981/Submarine/issues/117))
+
+## v0.4.0-fork.30
+
 - **A Wall of many terminals opens without freezing the window.** Going into Broadcast or a Wall used to fit every terminal to its tile in one go, which held the window for seconds with 36 servers. They now settle a few at a time, so the window keeps answering while the tiles fill in, usually within a second. ([#127](https://github.com/paulm981/Submarine/issues/127))
 
 ## v0.4.0-fork.23
