@@ -15,6 +15,8 @@ The fork is based on the original project's **0.4.0**, with every change up to [
 
 ## What this fork adds
 
+Settings are in tabs across the top: General, Terminal, Servers & sessions, AI tools, Sync and Help. **Settings › Terminal** below means that tab ([#168](https://github.com/paulm981/Submarine/issues/168)).
+
 ### Work on many servers at once
 
 **Broadcast and the Wall are the original project's**, as it has them: turn Broadcast on, pick the sessions, and what you type in one of them goes to all of them; pin terminals from any server to the Wall to watch them side by side.
@@ -45,9 +47,9 @@ A result screen says what came in. PuTTY and OpenSSH config imports are there to
 
 ### Jump hosts and your SSH config
 
-With **Use settings from ~/.ssh/config** on (**Settings › Authentication**), servers connect the way `ssh` would:
+With **Use settings from ~/.ssh/config** on (**Settings › Terminal**, under Authentication), servers connect the way `ssh` would:
 
-- **ProxyJump.** A server behind a chain of jump hosts connects, as with `ssh -J`. Each jump host waits its turn to log in (**Logins at a time per jump host**, in **Settings › Servers**), so a hundred servers don't all log in to it at once. A server's own saved jump host or proxy still comes first.
+- **ProxyJump.** A server behind a chain of jump hosts connects, as with `ssh -J`. Each jump host waits its turn to log in (**Logins at a time per jump host**, in **Settings › Servers & sessions**), so a hundred servers don't all log in to it at once. A server's own saved jump host or proxy still comes first.
 - **Key files and certificates.** The IdentityFile keys the config names are tried, each with its certificate (CertificateFile, or `<key>-cert.pub`), so Teleport nodes connect. An expired certificate is skipped, and the log says so.
 - **known_hosts.** A host key listed there skips the first-time question, and is saved to Submarine's own trusted keys. Those always come first: a key that changed gets the warning, even when known_hosts lists the new one. A key marked `@revoked` is always refused.
 - **Host certificates.** A server's certificate is trusted through an `@cert-authority` line in known_hosts, checked as OpenSSH checks it. If the key in it isn't the one Submarine trusts for the server, as after a server is reinstalled, you get the changed-key warning and decide. A certificate that doesn't check out is refused.
@@ -130,7 +132,7 @@ The AI's root requests use it too, with a password of their own, kept for the AI
 ### Files
 
 - **Live Edit keeps your unsent changes.** If a copy on this computer has changes that never reached the server, it's kept in **Submarine unsent edits** in your Downloads folder when you open the file again, disconnect, lock the profile or quit. The window says so. On macOS and Linux, only you can read that folder.
-- **Live Edit opens a file in an editor and never runs it:** the one picked in **Settings › Live Edit**, or else Notepad on Windows, the default text editor on macOS, and on Linux the text editor set for plain text.
+- **Live Edit opens a file in an editor and never runs it:** the one picked under Live Edit in **Settings › General**, or else Notepad on Windows, the default text editor on macOS, and on Linux the text editor set for plain text.
 - **Downloads never replace each other.** If a file of the same name appears while a download runs, you're asked before it's replaced. In a folder download it's left as it was, and the card says how many. On Windows and macOS, which treat `Readme.md` and `README.md` as one name, the second of two such files is left out too, rather than replacing the first.
 - **Two uploads to the same file**, or an upload and a Live Edit save, wait their turn instead of mixing and corrupting it.
 - **A mirror keeps a file's permissions on the server**, with its owner and group where the server allows it, so a script keeps its permission to run. A new file gets the permissions of the one on your computer. A mirror never puts a server's file in a folder that runs programs at login, such as the Startup folder on Windows or `~/.config/autostart` on Linux.
@@ -185,7 +187,7 @@ Also:
 - **xterm.js 6**, drawn on the GPU.
 - **Fast output never freezes the window.** Output is paced by what the screen has drawn, and floods of escape sequences that would lock it up are ignored.
 - **The app's own dark right-click menus** everywhere. No right-click or F5 reloads the app.
-- **Sessions that survive a reconnect** ([#126](https://github.com/paulm981/Submarine/issues/126)). Turn on **Keep sessions between connections** in Settings › Terminal (off until you do), or for one server in its settings (Use the default, Always, Never), and new terminals run in tmux on the server, or in screen where there's no tmux. Nothing ever asks: a dropped connection, sleep or a closed tab leaves the session running, and connecting again takes you back to the same shell, with what was running still running. Type `exit` to end one. A kept terminal's tab has a small mark. **Sessions…** in a server's right-click menu lists them, to open one or end it. On-connect commands go only into a new session. It's this computer's choice and never synced, nothing is installed on a server, and a server with neither gets a plain shell and a one-line note. The work is in `keep_session.rs` and `KeptSessions.tsx`.
+- **Sessions that survive a reconnect** ([#126](https://github.com/paulm981/Submarine/issues/126)). Turn on **Keep sessions between connections** in Settings › Servers & sessions (off until you do), or for one server in its settings (Use the default, Always, Never), and new terminals run in tmux on the server, or in screen where there's no tmux. Nothing ever asks: a dropped connection, sleep or a closed tab leaves the session running, and connecting again takes you back to the same shell, with what was running still running. Type `exit` to end one. A kept terminal's tab has a small mark. **Sessions…** in a server's right-click menu lists them, to open one or end it. On-connect commands go only into a new session. It's this computer's choice and never synced, nothing is installed on a server, and a server with neither gets a plain shell and a one-line note. The work is in `keep_session.rs` and `KeptSessions.tsx`.
 
 ### Your data, your storage
 
@@ -233,7 +235,7 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | Terminal colors ([#183](https://github.com/SinaXhpm/submarine/pull/183)) | One scheme per device, or one of your own | The fork's schemes, per device or per server (synced). A scheme of your own is for this device only. "Keep text readable" is on by default |
 | Key exchange ([#189](https://github.com/SinaXhpm/submarine/pull/189)) | Offers the 1024-bit `diffie-hellman-group1-sha1` last | Never offers it (Logjam). Group exchange over SHA-1 is offered, with groups of 2048 bits or more |
 | Privacy policy ([#225](https://github.com/SinaXhpm/submarine/pull/225)) | The **Privacy** links open the policy on its website | They open this fork's [PRIVACY.md](PRIVACY.md): the same policy, with a note on where the fork differs. **Delete Submarine Cloud account** only deletes the hosted cloud account; profiles on the computer and sync through your own storage stay |
-| Logins to a jump host ([#169](https://github.com/SinaXhpm/submarine/pull/169)) | No queue: every server opened behind a jump host logs in to it at once | Each jump host on the way waits its turn (**Settings › Logins at a time per jump host**), one line per jump host address, shared by a saved jump host and the same machine in a chain; a jump host reached through another has its own line for that way there. A jump host holds its turn only while it logs in ([#43](https://github.com/paulm981/Submarine/issues/43)) |
+| Logins to a jump host ([#169](https://github.com/SinaXhpm/submarine/pull/169)) | No queue: every server opened behind a jump host logs in to it at once | Each jump host on the way waits its turn (**Logins at a time per jump host**, in **Settings › Servers & sessions**), one line per jump host address, shared by a saved jump host and the same machine in a chain; a jump host reached through another has its own line for that way there. A jump host holds its turn only while it logs in ([#43](https://github.com/paulm981/Submarine/issues/43)) |
 | A saved jump host and `~/.ssh/config` ([#169](https://github.com/SinaXhpm/submarine/pull/169)) | A server's own jump host or proxy wins over its config's ProxyJump; a saved jump host's own ProxyJump is followed | The same. A saved jump host's own saved jump host still isn't followed, so chains only ever come from this computer's `~/.ssh/config`, never from synced servers ([#43](https://github.com/paulm981/Submarine/issues/43)) |
 | Jump hosts in one route ([#169](https://github.com/SinaXhpm/submarine/pull/169)) | At most 8 levels of ProxyJump lists, so lists inside lists can add up to many more jump hosts | At most 8 jump hosts in all, counting every list and a saved jump host ([#43](https://github.com/paulm981/Submarine/issues/43)) |
 | `%` in a ProxyJump | Taken as written | Refused with a message: Submarine doesn't fill in `%h`, `%r` and the like there yet ([#43](https://github.com/paulm981/Submarine/issues/43)) |
@@ -261,7 +263,7 @@ Not taken yet, for the next sync:
 
 ## Keeping up with the original project
 
-**Seeing what's new.** In Settings › Updates, turn on **Watch the original project**. The profile screen then says when the original project has changes the fork doesn't have yet, and links to GitHub's view of them. Nothing checks on a schedule: when the maintainer wants a rundown, with a recommendation for each change, they ask for one, and nothing is merged until they say so. Don't use GitHub's **Sync fork** button: the fork has commits of its own, and Sync fork offers to discard them.
+**Seeing what's new.** In Settings › Help, under Updates, turn on **Watch the original project**. The profile screen then says when the original project has changes the fork doesn't have yet, and links to GitHub's view of them. Nothing checks on a schedule: when the maintainer wants a rundown, with a recommendation for each change, they ask for one, and nothing is merged until they say so. Don't use GitHub's **Sync fork** button: the fork has commits of its own, and Sync fork offers to discard them.
 
 **When.** At the start of every batch of work, before anything else, so the fork never falls far behind. A small sync each time is easier than a big one later.
 

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, FileEdit, Server, Home, Scale, ArrowRight, X, KeyRound, LifeBuoy, ClipboardCopy, FolderOpen, EyeOff, Bot } from "lucide-react";
+import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, ArrowRight, X, KeyRound, EyeOff } from "lucide-react";
 import {
   MAX_FONT_SIZE, MIN_FONT_SIZE, clampFontSize, fontFamilyCss,
   isFontAvailable, primaryFontName, sanitizeFontFamily,
@@ -9,20 +9,12 @@ import {
   setShellSyncServer, writeShellSyncPairs,
 } from "../util/shellSync";
 import { invoke } from "@tauri-apps/api/core";
-import { shellGroups, type LocalShells } from "./HomePane";
 import CopyValue from "./CopyValue";
 import FontPicker from "./FontPicker";
 import { loadInstalledFonts } from "../util/systemFonts";
-import { IS_ANDROID, IS_MOBILE, IS_WINDOWS } from "../util/platform";
-import { TerminalColorSettings } from "./TerminalSchemes";
-import { HighlightSettings } from "./HighlightSettings";
-import LicensesDialog from "./LicensesDialog";
-import { DEFAULT_SCHEME } from "../ui/terminalThemes";
-import { windowSummary } from "../util/diagnostics";
 import { MAX_SCROLLBACK, MIN_SCROLLBACK, clampScrollback } from "../util/terminalScrollback";
-import { DEFAULT_INFO_FONT_SIZE, MAX_INFO_FONT_SIZE, MIN_INFO_FONT_SIZE, clampInfoFontSize } from "../util/infoFont";
-import { AiTrustOverview } from "./AiTrust";
-import { KeepSessionSetting } from "./KeptSessions";
+import { IS_ANDROID, IS_MOBILE } from "../util/platform";
+import { ForkSettings, InTab, SettingsTabBar, SshConfigNote, TERMINAL_RESET, TerminalColours, UiCustomizationExtras, useSettingsTab } from "./settings";
 
 // Where this install keeps its data (see src-tauri/src/portable.rs). `portable`
 // means a `submarine-data` folder next to the executable is in use; `warning`
@@ -33,415 +25,8 @@ interface StorageInfo {
   warning: string | null;
 }
 
-// The editor Live Edit opens remote files in (src-tauri/src/local_open.rs).
-interface LiveEditEditor {
-  chosen: string | null;
-  default_label: string;
-}
-
-// How many sessions log in to the same jump host at once (multiexec.rs):
-// opening a folder of servers behind one queues the rest. Kept by the
-// backend, which does the queueing.
-function JumpLoginLimit() {
-  const [limit, setLimit] = useState<number | null>(null);
-  const [draft, setDraft] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    invoke<number>("get_jump_login_limit").then((n) => { setLimit(n); setDraft(String(n)); }).catch(() => setLimit(null));
-  }, []);
-  const save = () => {
-    const n = Number(draft.trim());
-    if (!Number.isInteger(n) || n < 0 || n > 256) {
-      setError("A whole number from 0 to 256.");
-      return;
-    }
-    setError(null);
-    invoke<number>("set_jump_login_limit", { limit: n })
-      .then((v) => { setLimit(v); setDraft(String(v)); })
-      .catch((e) => setError(String(e)));
-  };
-  return (
-    <div className="flex items-center justify-between gap-4">
-      <div className="min-w-0">
-        <div className="text-sm font-semibold text-zinc-100">Logins at a time per jump host</div>
-        <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
-          When many servers behind one jump host open at once (a whole folder opened, say), this many log in to it
-          together and the rest wait their turn — a jump host turns away logins past its own limit (OpenSSH starts
-          at 10). Each jump host in a ProxyJump chain from ~/.ssh/config has its own line too: shared with a saved
-          jump host at the same address, or, behind another jump host, its own for that way there. 0 means no limit. Servers reached directly aren't held back.
-        </p>
-        {error && <p className="text-[11px] text-red-400 mt-1">{error}</p>}
-      </div>
-      <input
-        type="number"
-        min={0}
-        max={256}
-        aria-label="Logins at a time per jump host"
-        value={draft}
-        disabled={limit === null}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={save}
-        onKeyDown={(e) => { if (e.key === "Enter") save(); }}
-        className="shrink-0 w-20 h-9 px-2 bg-zinc-900/60 border border-white/10 rounded-lg text-[13px] text-zinc-50 text-center outline-none focus:border-primary/50"
-      />
-    </div>
-  );
-}
-
-// Submarine Cloud: the original project's hosted sync, sign-in and sharing.
-// Kept by the backend (cloud.rs), which contacts it only while this is on;
-// off by default, as profiles sync through the user's own storage instead.
-function CloudSwitch() {
-  const [on, setOn] = useState<boolean | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    invoke<boolean>("get_cloud_enabled").then(setOn).catch(() => setOn(null));
-  }, []);
-  const toggle = () => {
-    if (on === null) return;
-    setError(null);
-    invoke<boolean>("set_cloud_enabled", { enabled: !on }).then(setOn).catch((e) => setError(String(e)));
-  };
-  return (
-    <div className="flex items-center justify-between gap-4">
-      <div className="min-w-0">
-        <div className="text-sm font-semibold text-zinc-100">Submarine Cloud</div>
-        <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
-          The original project's hosted sync service (submarine.sinaxhpm.com), with sign-in and sharing. While
-          this is off, Submarine never contacts it and its buttons are hidden — profiles sync through your own
-          folder or git repository instead, set up on the Profile tab.
-        </p>
-        {error && <p className="text-[11px] text-red-400 mt-1">{error}</p>}
-      </div>
-      <button
-        role="switch"
-        aria-checked={on === true}
-        aria-label="Submarine Cloud"
-        disabled={on === null}
-        onClick={toggle}
-        className={`relative shrink-0 w-11 h-6 rounded-full transition-colors disabled:opacity-40 ${on ? 'bg-primary' : 'bg-zinc-700'}`}
-      >
-        <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${on ? 'left-[22px]' : 'left-0.5'}`} />
-      </button>
-    </div>
-  );
-}
-
-// Kept by the backend, not in local storage: the editor is started with files
-// from servers, so it can only be set through the native file dialog.
-function LiveEditSettings() {
-  const [editor, setEditor] = useState<LiveEditEditor | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    invoke<LiveEditEditor>("live_edit_editor_get").then(setEditor).catch(() => setEditor(null));
-  }, []);
-  const run = (cmd: string) => {
-    setError(null);
-    invoke<LiveEditEditor>(cmd).then(setEditor).catch((e) => setError(String(e)));
-  };
-  if (!editor) return null;
-  return (
-    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
-      <p className="text-sm text-zinc-400 leading-relaxed">
-        Double-clicking a remote file opens a copy in this editor and uploads it each time you save.
-        It never runs the file.
-      </p>
-      <div className="space-y-1.5">
-        <span className="text-[11px] font-black text-zinc-500 uppercase tracking-wider">Editor</span>
-        {editor.chosen ? (
-          <CopyValue value={editor.chosen} className="max-w-full text-zinc-300">
-            <span className="font-mono text-[11.5px] break-all select-text">{editor.chosen}</span>
-          </CopyValue>
-        ) : (
-          <div className="text-[12.5px] text-zinc-300">{editor.default_label} (default)</div>
-        )}
-      </div>
-      <div className="flex gap-2">
-        <button
-          onClick={() => run("live_edit_editor_pick")}
-          className="flex-1 px-4 h-9 bg-primary/10 border border-primary/30 text-primary rounded-xl text-xs font-bold uppercase hover:bg-primary hover:text-zinc-950 transition-all"
-        >
-          Choose editor…
-        </button>
-        {editor.chosen && (
-          <button
-            onClick={() => run("live_edit_editor_reset")}
-            className="px-4 h-9 bg-zinc-900 border border-white/5 text-zinc-300 rounded-xl text-xs font-bold uppercase hover:bg-white/5 transition-all"
-          >
-            Use {editor.default_label}
-          </button>
-        )}
-      </div>
-      {error && <p className="text-[11.5px] text-red-400">{error}</p>}
-    </div>
-  );
-}
-
-// The shell Home terminals start (src-tauri/src/local_term.rs). Kept by the
-// backend, like Live Edit's editor: a program of your own is picked in the
-// native dialog, never typed in here.
-function HomeTerminalSettings() {
-  const [info, setInfo] = useState<LocalShells | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    invoke<LocalShells>("list_local_shells").then(setInfo).catch((e) => setError(String(e)));
-  }, []);
-  const run = (cmd: string, args?: Record<string, unknown>) => {
-    setError(null);
-    invoke<LocalShells>(cmd, args).then(setInfo).catch((e) => setError(String(e)));
-  };
-  if (!info) return error ? <p className="text-[11.5px] text-red-400">Couldn't list the shells: {error}</p> : null;
-  return (
-    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
-      <p className="text-sm text-zinc-400 leading-relaxed">
-        Home opens a terminal on this computer, in your home folder. New ones start this shell; the arrow
-        beside + in Home starts any of the others.
-      </p>
-      {shellGroups(info).map((g) => (
-        <div key={g.name} className="space-y-1.5">
-          <span className="text-[11px] font-black text-zinc-500 uppercase tracking-wider">{g.name}</span>
-          <div className="flex flex-col gap-1">
-            {g.shells.map((s) => (
-              <label key={s.id} className="flex items-center gap-2.5 px-3 min-h-9 py-1.5 rounded-xl border border-white/5 bg-zinc-900/60 hover:bg-white/[0.04] cursor-pointer">
-                <input
-                  type="radio"
-                  name="home-shell"
-                  checked={info.default_id === s.id}
-                  onChange={() => run("local_shell_set_default", { id: s.id })}
-                  className="accent-[var(--primary-hex)]"
-                />
-                <span className="min-w-0">
-                  <span className="block text-[12.5px] text-zinc-200">{s.label}</span>
-                  {s.detail && <span className="block text-[11px] text-zinc-500 break-all">{s.detail}</span>}
-                </span>
-              </label>
-            ))}
-            {g.notes.map((n, i) => (
-              <p key={i} className="text-[11.5px] text-zinc-500 leading-relaxed px-1">{n}</p>
-            ))}
-          </div>
-        </div>
-      ))}
-      {info.custom && (
-        <div className="space-y-1">
-          <CopyValue value={info.custom} className="max-w-full text-zinc-300">
-            <span className="font-mono text-[11.5px] break-all select-text">{info.custom}</span>
-          </CopyValue>
-          {info.custom_missing && (
-            <p className="text-[11.5px] text-amber-400/90 leading-relaxed">
-              That program isn't there any more, so Home uses the shell checked above. Choose it again, or forget it.
-            </p>
-          )}
-        </div>
-      )}
-      <div className="flex gap-2">
-        <button
-          onClick={() => run("local_shell_pick_custom")}
-          className="flex-1 px-4 h-9 bg-primary/10 border border-primary/30 text-primary rounded-xl text-xs font-bold uppercase hover:bg-primary hover:text-zinc-950 transition-all"
-        >
-          Choose program…
-        </button>
-        {info.custom && (
-          <button
-            onClick={() => run("local_shell_clear_custom")}
-            className="px-4 h-9 bg-zinc-900 border border-white/5 text-zinc-300 rounded-xl text-xs font-bold uppercase hover:bg-white/5 transition-all"
-          >
-            Forget it
-          </button>
-        )}
-      </div>
-      {error && <p className="text-[11.5px] text-red-400">{error}</p>}
-    </div>
-  );
-}
-
-// AI tools (#32, src-tauri/src/ai): off by default, on this device only.
-// On, Home's menu lists the AI tools installed (Claude Code, Codex: #117)
-// under AI tools, started already connected to Submarine; off, nothing
-// listens and every AI tab's access ends.
-interface AiToolInfo { id: string; label: string; path: string | null }
-interface AiSettings { enabled: boolean; flash: boolean; tools: AiToolInfo[]; available: boolean }
-// Claude Code's own settings that keep it out of your keys: deny rules for
-// its Read tool, and the sandbox's `credentials` for the commands it runs
-// (code.claude.com/docs/en/permissions and /sandboxing).
-const KEY_FOLDERS = ["~/.ssh", "~/.aws", "~/.config/gcloud", "~/.azure"];
-const CLAUDE_KEYS_OUT = JSON.stringify({
-  permissions: { deny: KEY_FOLDERS.map((f) => `Read(${f}/**)`) },
-  sandbox: { enabled: true, credentials: { files: KEY_FOLDERS.map((path) => ({ path, mode: "deny" })) } },
-}, null, 2);
-function AiToolsSettings() {
-  const [info, setInfo] = useState<AiSettings | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    invoke<AiSettings>("ai_settings").then(setInfo).catch((e) => setError(String(e)));
-  }, []);
-  const toggle = () => {
-    if (!info) return;
-    setError(null);
-    invoke<AiSettings>("ai_set_enabled", { enabled: !info.enabled }).then(setInfo).catch((e) => setError(String(e)));
-  };
-  const toggleFlash = () => {
-    if (!info) return;
-    setError(null);
-    invoke<AiSettings>("ai_set_flash", { flash: !info.flash }).then(setInfo).catch((e) => setError(String(e)));
-  };
-  if (!info) return error ? <p className="text-[11.5px] text-red-400">{error}</p> : null;
-  return (
-    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-3 shadow-xl">
-      <div className="flex items-center justify-between gap-4">
-        <div className="min-w-0">
-          <div className="text-sm font-semibold text-zinc-100">AI tools</div>
-          <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
-            Let an AI tool started from Home ask Submarine to run commands on server tabs you share with it.
-            It never gets a key or a password, and never connects to a server itself: Submarine runs each command
-            on its own connection, after you click Allow in the AI panel, or at once where you've said it may (below).
-            Each AI tab only reaches the tabs shared with it, and closing it ends its access. When it asks to run something
-            as root, Submarine runs it through the server's sudo or dzdo, and asks you for the root password on the request
-            if the server wants one. The AI never sees it. The password is only as safe as the server account, though: a
-            program running as that account could catch it. A sudoers rule that needs no password for the commands you want
-            is safer.
-          </p>
-        </div>
-        <button
-          role="switch"
-          aria-checked={info.enabled}
-          aria-label="AI tools"
-          onClick={toggle}
-          className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${info.enabled ? 'bg-primary' : 'bg-zinc-700'}`}
-        >
-          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${info.enabled ? 'left-[22px]' : 'left-0.5'}`} />
-        </button>
-      </div>
-      {info.enabled && (
-        <p className="text-[12px] text-amber-200/90 leading-relaxed rounded-lg border border-amber-400/20 bg-amber-400/[0.06] px-3 py-2">
-          Output you allow goes to the AI provider, and so do files the AI tool reads on this computer. Each command's
-          output, with the secrets Submarine recognises hidden, is sent to the AI tool and on to its provider: for Claude
-          Code, Anthropic, or the cloud you've set it to use; for Codex, OpenAI.
-        </p>
-      )}
-      <ul className="text-[12px] text-zinc-400 leading-relaxed space-y-1">
-        {info.tools.map((t) => (
-          <li key={t.id}>
-            {t.path ? (
-              <><span className="text-zinc-200">{t.label}</span> is installed: <span className="font-mono text-[11.5px] text-zinc-300 break-all select-text">{t.path}</span></>
-            ) : (
-              <><span className="text-zinc-200">{t.label}</span> isn't installed on this computer.</>
-            )}
-          </li>
-        ))}
-      </ul>
-      <p className="text-[12px] text-zinc-400 leading-relaxed">
-        {info.tools.some((t) => t.path)
-          ? (info.enabled ? "Start one from Home: the arrow beside +, then AI tools." : "Turn this on to find them in Home's menu.")
-          : "Install one, then open this again."}{" "}
-        Each starts already connected to Submarine, and doesn't ask a second time before it uses Submarine's tools:
-        Submarine asks you before each command itself.
-      </p>
-      <p className="text-[11.5px] text-zinc-500 leading-relaxed">
-        What the AI gets back is filtered: private keys, password and token values, password hashes, access keys and
-        passwords in URLs are replaced with [hidden by Submarine]. The filter catches common shapes, not everything.
-        Every request and decision is logged on this computer, in ai-audit.log in the log folder (Troubleshooting).
-      </p>
-      <p className="text-[11.5px] text-zinc-500 leading-relaxed">
-        The AI tool starts in a folder of its own, without your SSH agent and the usual cloud logins (AWS, Azure, Google
-        Cloud, GitHub) in its environment. But it runs as you, so ssh run by it can still log in with an agent named by
-        IdentityAgent in ~/.ssh/config (1Password, Secretive, Bitwarden, Pageant), a connection your own terminal keeps
-        open (ControlMaster), or a key file with no passphrase or with its passphrase in the macOS Keychain. What it runs
-        can also read your files and use the network.
-      </p>
-      <p className="text-[11.5px] text-zinc-500 leading-relaxed">
-        To keep Claude Code out of your keys, add this to ~/.claude/settings.json. The deny rules stop its own Read tool;
-        the sandbox stops the commands it runs, which by default can read these folders too. The sandbox runs on macOS,
-        Linux and WSL2, not on Windows itself: for production servers on Windows, run Submarine and its AI tools in WSL2
-        or a virtual machine.
-      </p>
-      <pre className="whitespace-pre-wrap break-all rounded-lg bg-black/40 border border-white/5 p-2 font-mono text-[10.5px] text-zinc-400 select-text">{CLAUDE_KEYS_OUT}</pre>
-      <div className="flex items-center justify-between gap-4 pt-3 border-t border-white/5">
-        <div className="min-w-0">
-          <div className="text-[12.5px] font-semibold text-zinc-100">Flash the taskbar when the AI needs you</div>
-          <p className="text-[11.5px] text-zinc-500 leading-relaxed mt-0.5">
-            When a command waits for your Allow and Submarine isn't the window in front, its taskbar button flashes.
-            Nothing else moves or takes the keyboard.
-          </p>
-        </div>
-        <button
-          role="switch"
-          aria-checked={info.flash}
-          aria-label="Flash the taskbar when the AI needs you"
-          onClick={toggleFlash}
-          className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${info.flash ? 'bg-primary' : 'bg-zinc-700'}`}
-        >
-          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${info.flash ? 'left-[22px]' : 'left-0.5'}`} />
-        </button>
-      </div>
-      <div className="pt-3 border-t border-white/5 space-y-2">
-        <div className="text-sm font-semibold text-zinc-100">How much the AI may run without asking</div>
-        <p className="text-[11.5px] text-zinc-500 leading-relaxed">
-          Kept on this computer only: never synced, so a shared profile can't change it, and the AI can't either.
-          A profile file exported or copied to another computer arrives asking every time, with only its always-ask list.
-          Whatever you choose, every command is in the AI panel and the audit log, and Stop ends it.
-        </p>
-        <AiTrustOverview />
-      </div>
-      {error && <p className="text-[11.5px] text-red-400">{error}</p>}
-    </div>
-  );
-}
-
 // Slider covers the everyday range; the number field takes anything 1–99.
 const SLIDER_MAX = 40;
-
-// The Info panel's text size (util/infoFont), with the − / + buttons the
-// terminal's font size has. Per-device, like the rest of this card.
-function InfoFontSizeSetting({ settings, setSettings }: any) {
-  const size = clampInfoFontSize(settings.infoFontSize);
-  const setSize = (n: number) => setSettings((s: any) => ({ ...s, infoFontSize: clampInfoFontSize(n) }));
-  return (
-    <div className="space-y-3 pt-6 border-t border-white/5">
-      <div className="flex justify-between items-center gap-3">
-        <label htmlFor="info-font-size" className="text-[11px] font-black text-zinc-500 uppercase tracking-wider">Info Panel Text Size (px)</label>
-        <div className="flex items-center gap-1.5">
-          <button
-            type="button"
-            aria-label="Smaller Info panel text"
-            onClick={() => setSize(size - 1)}
-            disabled={size <= MIN_INFO_FONT_SIZE}
-            className="w-8 h-8 flex items-center justify-center bg-black border border-white/10 rounded-lg text-zinc-300 hover:text-white hover:border-primary/40 disabled:opacity-30 transition-colors"
-          >
-            <Minus size={14} />
-          </button>
-          <output
-            id="info-font-size"
-            aria-live="polite"
-            className="w-14 h-8 flex items-center justify-center bg-black border border-white/10 rounded-lg text-[12px] font-bold text-white"
-          >
-            {size}
-          </output>
-          <button
-            type="button"
-            aria-label="Larger Info panel text"
-            onClick={() => setSize(size + 1)}
-            disabled={size >= MAX_INFO_FONT_SIZE}
-            className="w-8 h-8 flex items-center justify-center bg-black border border-white/10 rounded-lg text-zinc-300 hover:text-white hover:border-primary/40 disabled:opacity-30 transition-colors"
-          >
-            <Plus size={14} />
-          </button>
-        </div>
-      </div>
-      <p className="text-[11.5px] text-zinc-500 leading-relaxed">
-        The text in a server's Info panel, from {MIN_INFO_FONT_SIZE} to {MAX_INFO_FONT_SIZE}. Its smaller labels and icons grow with it.
-        {size !== DEFAULT_INFO_FONT_SIZE && (
-          <>
-            {" "}
-            <button type="button" onClick={() => setSize(DEFAULT_INFO_FONT_SIZE)} className="font-semibold text-zinc-400 hover:text-white">
-              Back to {DEFAULT_INFO_FONT_SIZE}
-            </button>
-          </>
-        )}
-      </p>
-    </div>
-  );
-}
 
 // "Use my default shell" (open_terminal in lib.rs): offered only where this
 // computer has a shell of its own to start, which the backend knows
@@ -524,12 +109,9 @@ function SshConfigSetting({ settings, setSettings }: any) {
             ~/.ssh/config connects to its HostName and Port, takes its User when no username is
             saved, uses the ssh-agent IdentityAgent names, and goes through its ProxyCommand (such
             as cloudflared or tsh) or ProxyJump unless the server has a jump host or proxy of its
-            own. Its IdentityFile keys and CertificateFile certificates are tried when a server has
-            no saved password or key (Teleport, for one), and when the saved one doesn't work. The
-            host keys and certificate
-            authorities in your known_hosts are trusted without the first-time prompt. The host
-            keys this app already trusts still come first: a changed key always gets the warning,
-            and a key known_hosts marks @revoked is refused. Host
+            own. Its IdentityFile keys and CertificateFile certificates log in when a server has
+            no saved password or key (Teleport, for one), and the host keys and certificate
+            authorities in your known_hosts are trusted without the first-time prompt. Host
             blocks are matched against a server's address and its name; Include and Match are
             followed, Match exec is never run. These files are only read, and nothing from them
             is synced. Turn off to use only what's saved for each server.
@@ -935,7 +517,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
   // Read-only storage summary from the backend: where data lives and whether
   // a `submarine-data` folder next to the exe (portable mode) is in use.
   const [storage, setStorage] = useState<StorageInfo | null>(null);
-  const [licensesOpen, setLicensesOpen] = useState(false);
+  const [tab, setTab] = useSettingsTab();
   useEffect(() => {
     invoke<StorageInfo>("get_storage_info").then(setStorage).catch(() => setStorage(null));
   }, []);
@@ -949,14 +531,16 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
         <p className="text-[13px] text-zinc-400 mt-2">
           Tweak how Submarine looks and feels.
           {' '}
-          <span className="text-zinc-500 italic">Per-device — preferences live in this machine's local storage and don't sync with your profile.</span>
+          <span className="text-zinc-500 italic">Per-device — preferences live in this machine's local storage and don't sync with your cloud profile.</span>
         </p>
       </header>
+      <SettingsTabBar tab={tab} onChange={setTab} />
 
       {/* Columns rather than a grid: the sections are very different heights, and
           a 2-col grid rows them up so a short card leaves a tall empty gap beside
           it. Column flow packs them, and break-inside-avoid keeps a card whole. */}
       <div className="columns-1 md:columns-2 gap-4 sm:gap-8">
+        <InTab tab={tab}>
         {/* Appearance Section */}
         <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
           <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
@@ -1027,25 +611,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
                 ))}
               </div>
             </div>
-            <InfoFontSizeSetting settings={settings} setSettings={setSettings} />
-            <div className="flex items-center justify-between gap-4 pt-6 border-t border-white/5">
-              <div className="min-w-0">
-                <div className="text-sm font-semibold text-zinc-100">Compact tabs</div>
-                <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
-                  Flat tabs that touch, with a thin line under the one in front, so more fit across. Long names are
-                  cut short (hover for the whole name). Off, tabs are the rounded pills.
-                </p>
-              </div>
-              <button
-                role="switch"
-                aria-checked={!!settings.compactTabs}
-                aria-label="Compact tabs"
-                onClick={() => setSettings((s: any) => ({ ...s, compactTabs: !s.compactTabs }))}
-                className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${settings.compactTabs ? 'bg-primary' : 'bg-zinc-700'}`}
-              >
-                <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${settings.compactTabs ? 'left-[22px]' : 'left-0.5'}`} />
-              </button>
-            </div>
+            <UiCustomizationExtras settings={settings} setSettings={setSettings} />
           </div>
         </section>
 
@@ -1056,144 +622,15 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
           </div>
 
           <TerminalFontSettings settings={settings} setSettings={setSettings} />
-          <TerminalColorSettings settings={settings} setSettings={setSettings} />
-          <HighlightSettings settings={settings} setSettings={setSettings} onRulesChanged={onHighlightRulesChanged} />
+
+          <TerminalColours settings={settings} setSettings={setSettings} onHighlightRulesChanged={onHighlightRulesChanged} />
 
           <TerminalScrollbackSetting settings={settings} setSettings={setSettings} />
 
           <DefaultShellSetting settings={settings} setSettings={setSettings} />
-          <KeepSessionSetting />
-
+          
           <ShellConfigSyncSettings servers={servers} />
         </section>
-
-        {/* Servers Section */}
-        <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
-          <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
-            <Server size={14} /> Servers
-          </div>
-
-          <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
-            <div className="flex items-center justify-between gap-4">
-              <div className="min-w-0">
-                <div className="text-sm font-semibold text-zinc-100">Show each server's OS</div>
-                <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
-                  The first time a server connects, Submarine reads <span className="font-mono text-zinc-300">/etc/os-release</span>{' '}
-                  (or <span className="font-mono text-zinc-300">uname</span> / <span className="font-mono text-zinc-300">ver</span>)
-                  in the background for the badge beside its name. Turn off where every command is recorded or a
-                  key only allows one command.
-                </p>
-              </div>
-              <button
-                role="switch"
-                aria-checked={settings.detectOs !== false}
-                onClick={() => setSettings((s: any) => ({ ...s, detectOs: !(s.detectOs !== false) }))}
-                className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${settings.detectOs !== false ? 'bg-primary' : 'bg-zinc-700'}`}
-              >
-                <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${settings.detectOs !== false ? 'left-[22px]' : 'left-0.5'}`} />
-              </button>
-            </div>
-            <div className="flex items-center justify-between gap-4">
-              <div className="min-w-0">
-                <div className="text-sm font-semibold text-zinc-100">Ask before closing a connected session</div>
-                <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
-                  Closing a tab whose SSH connection is up asks first. Off, it just closes. Closing several sessions
-                  at once, or quitting with sessions open, still asks.
-                </p>
-              </div>
-              <button
-                role="switch"
-                aria-checked={settings.confirmCloseSession !== false}
-                aria-label="Ask before closing a connected session"
-                onClick={() => setSettings((s: any) => ({ ...s, confirmCloseSession: !(s.confirmCloseSession !== false) }))}
-                className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${settings.confirmCloseSession !== false ? 'bg-primary' : 'bg-zinc-700'}`}
-              >
-                <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${settings.confirmCloseSession !== false ? 'left-[22px]' : 'left-0.5'}`} />
-              </button>
-            </div>
-            <div className="flex items-center justify-between gap-4">
-              <div className="min-w-0">
-                <div className="text-sm font-semibold text-zinc-100">Play a sound when a pinged server answers again</div>
-                <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
-                  A short, quiet tone when a server you're pinging (right-click it, then Ping) can be logged in to
-                  again, after a reboot, say.
-                </p>
-              </div>
-              <button
-                role="switch"
-                aria-checked={settings.pingSound !== false}
-                aria-label="Play a sound when a pinged server answers again"
-                onClick={() => setSettings((s: any) => ({ ...s, pingSound: !(s.pingSound !== false) }))}
-                className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${settings.pingSound !== false ? 'bg-primary' : 'bg-zinc-700'}`}
-              >
-                <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${settings.pingSound !== false ? 'left-[22px]' : 'left-0.5'}`} />
-              </button>
-            </div>
-            <JumpLoginLimit />
-          </div>
-        </section>
-
-        {/* Updates Section */}
-        <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
-          <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
-            <RefreshCw size={14} /> Updates
-          </div>
-
-          <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
-            <p className="text-sm text-zinc-400 leading-relaxed">
-              Every change to the fork is a release, numbered like v0.4.0-fork.2 and shown in the title bar. The
-              profile screen says when there's a newer one. Built from source, it also says when the fork's main has
-              changes to pull and rebuild.
-            </p>
-            <div className="flex items-center justify-between gap-4 border-t border-white/5 pt-4">
-              <div className="min-w-0">
-                <div className="text-sm font-semibold text-zinc-100">Watch the original project</div>
-                <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
-                  For whoever maintains the fork: also say when SinaXhpm/Submarine has changes the fork doesn't
-                  have yet, to bring in with a sync pull request (FORK.md says how).
-                </p>
-              </div>
-              <button
-                role="switch"
-                aria-checked={!!settings.watchUpstream}
-                onClick={() => setSettings((s: any) => ({ ...s, watchUpstream: !s.watchUpstream }))}
-                className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${settings.watchUpstream ? 'bg-primary' : 'bg-zinc-700'}`}
-              >
-                <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${settings.watchUpstream ? 'left-[22px]' : 'left-0.5'}`} />
-              </button>
-            </div>
-          </div>
-        </section>
-
-        {/* Home Terminal Section */}
-        {!IS_MOBILE && (
-          <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
-            <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
-              <Home size={14} /> Home Terminal
-            </div>
-            <HomeTerminalSettings />
-          </section>
-        )}
-
-        {/* AI Tools Section */}
-        {!IS_MOBILE && (
-          <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
-            <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
-              <Bot size={14} /> AI Tools
-            </div>
-            <AiToolsSettings />
-          </section>
-        )}
-
-        {/* Live Edit Section */}
-        {!IS_MOBILE && (
-          <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
-            <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
-              <FileEdit size={14} /> Live Edit
-            </div>
-            <LiveEditSettings />
-          </section>
-        )}
 
         {/* Not on a phone or tablet, which has no ssh-agent or ~/.ssh/config to use. */}
         {!IS_MOBILE && (
@@ -1204,6 +641,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
 
             <SshAgentSetting settings={settings} setSettings={setSettings} />
             <SshConfigSetting settings={settings} setSettings={setSettings} />
+            <SshConfigNote />
           </section>
         )}
 
@@ -1241,10 +679,10 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
           </section>
         )}
 
-        {/* Sync Section */}
+        {/* Cloud Section */}
         <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
           <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
-            <Cloud size={14} /> Sync
+            <Cloud size={14} /> Cloud Sync
           </div>
 
           <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
@@ -1253,8 +691,8 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
                 <div className="text-sm font-semibold text-zinc-100">Auto-sync</div>
                 <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
                   Keep open profiles synced in the background — shortly after you make a change, when
-                  you return to the window, and every few minutes to pick up changes made on your other
-                  computers. Turn off to sync only with the Sync now button.
+                  you return to the window, and every few minutes to pull in others' edits on shared
+                  profiles. Turn off to sync only with the manual button.
                 </p>
               </div>
               <button
@@ -1275,15 +713,8 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
                 on the Profile tab, next to Sync now.
               </div>
             )}
-
-            <div className="border-t border-white/5 pt-4">
-              <CloudSwitch />
-            </div>
           </div>
         </section>
-
-        {/* Troubleshooting */}
-        <TroubleshootingSettings />
 
         {/* Maintenance Section */}
         <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
@@ -1316,10 +747,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
             <button
               onClick={() => {
                 if(window.confirm('Reset all UI customizations?')) {
-                  setSettings((s: any) => ({
-                    ...s, primaryColor: '#60a5fa', backgroundColor: '#0a0a0c', terminalFontSize: 14, terminalFontFamily: '',
-                    terminalScheme: DEFAULT_SCHEME, terminalGpu: IS_WINDOWS, terminalMinContrast: true, terminalBoldBright: true,
-                  }));
+                  setSettings((s: any) => ({ ...s, primaryColor: '#60a5fa', backgroundColor: '#0a0a0c', terminalFontSize: 14, terminalFontFamily: '', ...TERMINAL_RESET }));
                 }
               }}
               className="px-4 h-9 bg-zinc-900 border border-white/5 text-zinc-300 rounded-xl text-xs font-bold uppercase hover:bg-white/5 transition-all w-full"
@@ -1328,84 +756,10 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
             </button>
           </div>
         </section>
-
-        {/* Open-source licenses */}
-        <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
-          <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
-            <Scale size={14} /> Open-source licenses
-          </div>
-          <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
-            <p className="text-sm text-zinc-400 leading-relaxed">
-              Submarine is MIT-licensed and built on open-source packages, fonts and color schemes. See each one
-              and its licence.
-            </p>
-            <button
-              onClick={() => setLicensesOpen(true)}
-              className="px-4 h-9 bg-zinc-900 border border-white/5 text-zinc-300 rounded-xl text-xs font-bold uppercase hover:bg-white/5 transition-all w-full flex items-center justify-center gap-2"
-            >
-              <Scale size={13} /> Open-source licenses
-            </button>
-          </div>
-        </section>
+        <ForkSettings tab={tab} settings={settings} setSettings={setSettings} />
+        </InTab>
       </div>
-      {licensesOpen && <LicensesDialog onClose={() => setLicensesOpen(false)} />}
     </div>
-  );
-};
-
-// Settings → Troubleshooting: the app's log (src-tauri/src/applog.rs) and a
-// copy of what's needed to look into a problem, with the servers' names,
-// hosts and addresses replaced.
-const TroubleshootingSettings = () => {
-  const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null);
-  const [busy, setBusy] = useState(false);
-  const say = (ok: boolean, text: string) => {
-    setStatus({ ok, text });
-    window.setTimeout(() => setStatus((s) => (s?.text === text ? null : s)), 8000);
-  };
-  const copy = async () => {
-    setBusy(true);
-    try {
-      const report = await invoke<string>("diagnostics_report", { ui: windowSummary() });
-      await navigator.clipboard.writeText(report);
-      say(true, `Copied ${report.split("\n").length} lines. Paste them to whoever is helping you.`);
-    } catch (e) {
-      say(false, `Couldn't copy: ${e}`);
-    } finally {
-      setBusy(false);
-    }
-  };
-  const openFolder = () => {
-    invoke("open_log_folder").catch((e) => say(false, String(e)));
-  };
-  const btn = "px-4 h-9 bg-zinc-900 border border-white/5 text-zinc-300 rounded-xl text-xs font-bold uppercase hover:bg-white/5 transition-all flex-1 flex items-center justify-center gap-2 disabled:opacity-50";
-  return (
-    <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
-      <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
-        <LifeBuoy size={14} /> Troubleshooting
-      </div>
-      <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
-        <p className="text-sm text-zinc-400 leading-relaxed">
-          Submarine keeps a log on this computer: connections, errors, and when the window freezes and which
-          terminal was busy then. If something goes wrong, click <span className="text-zinc-200">Copy diagnostics</span>{" "}
-          soon after and paste it to whoever is helping you. Server, folder and user names, host names and
-          addresses are replaced with placeholders.
-        </p>
-        <div className="flex flex-col sm:flex-row gap-2">
-          <button onClick={copy} disabled={busy} className={btn}>
-            <ClipboardCopy size={13} /> Copy diagnostics
-          </button>
-          {!IS_ANDROID && (
-            <button onClick={openFolder} className={btn}>
-              <FolderOpen size={13} /> Open log folder
-            </button>
-          )}
-        </div>
-        {status && (
-          <p className={`text-[11.5px] leading-relaxed ${status.ok ? "text-emerald-300/90" : "text-rose-300"}`}>{status.text}</p>
-        )}
-      </div>
-    </section>
   );
 };
 
