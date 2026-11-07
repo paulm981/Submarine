@@ -18,7 +18,8 @@
 // import under its file, or drop the one that went, in the same pull request.
 //
 // A file that reaches many of the fork's hooks through one import (DesktopApp,
-// through src/fork/desktop; TerminalView, through src/fork/terminal) also
+// through src/fork/desktop; TerminalView, through src/fork/terminal;
+// SessionView, through src/fork/session) also
 // lists them under `uses`, as written there:
 // each must still be in the file's code, so a merge that drops one fails too.
 
@@ -51,7 +52,17 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
   { file: "src/components/ProfileSelectPage.tsx", imports: ["./StoreSync"] },
   {
     file: "src/components/SessionView.tsx",
-    imports: ["../ui/aiPane", "../ui/tabDrag", "../ui/tabStyle", "../ui/terminalDock", "../util/ai", "./KeptSessions"],
+    // Everything of the fork's in a server's tab comes through src/fork/session:
+    // `Fork.…`, and what its hooks give (`jumpGone.…`, `split.…`, onShellReadyFor).
+    imports: ["../fork/session"],
+    uses: [
+      "Fork.useJumpGone", "Fork.useTermDrag", "Fork.useShareWithAi", "Fork.useOnConnect", "Fork.diagnoseConnect",
+      "Fork.splitShown", "Fork.splitActions", "Fork.stripLook", "Fork.termTabProps", "Fork.termTabLook",
+      "Fork.termCloseLook", "Fork.paneLook", "Fork.TermTabLabel", "Fork.SplitButton", "Fork.ShareWithAiButton",
+      "Fork.SplitBesideItems", "Fork.AiBesideItems", "Fork.KeptSessions", "Fork.TermMoveItems", "Fork.ShareWithAiMenu",
+      "Fork.JumpGoneChoices", "jumpGone.refused", "jumpGone.clear", "split.closeTerminal", "split.splitWithNew",
+      "split.splitWith", "split.removeFromSplit", "onShellReadyFor",
+    ],
   },
   { file: "src/components/SettingsPanel.tsx", imports: ["./settings"] },
   { file: "src/components/SftpWorkspace.tsx", imports: ["../util/fileName"] },

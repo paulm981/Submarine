@@ -1,8 +1,8 @@
-import { useState, useEffect, useLayoutEffect, useRef, useCallback, memo, type CSSProperties } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, memo } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { TerminalSquare, Folder, FolderUp, FolderSync, Network, AlertTriangle, Check, X, Play, Library, Info, Container, Plus, ChevronDown, SplitSquareHorizontal, Columns, Rows, RotateCw, Loader2, CircleSlash, PanelRight, PanelLeft, PanelBottom, PanelTop, Maximize2, Minimize2, UploadCloud, Bot, LogIn } from "lucide-react";
+import { TerminalSquare, Folder, FolderUp, FolderSync, Network, AlertTriangle, Check, X, Play, Library, Info, Container, Plus, ChevronDown, SplitSquareHorizontal, Columns, Rows, RotateCw, Loader2, CircleSlash, PanelRight, PanelLeft, PanelBottom, PanelTop, Maximize2, Minimize2, UploadCloud, LogIn } from "lucide-react";
 import TerminalView from "./TerminalView";
 import { AuthPrompts } from "./AuthPrompts";
 import SftpWorkspace, { type SftpView } from "./SftpWorkspace";
@@ -11,23 +11,16 @@ import TunnelsPanel from "./TunnelsPanel";
 import InfoPanel from "./InfoPanel";
 import { CmdsPanel } from "./CmdsPanel";
 import { RenameInput } from "../ui/renameInput";
-import { useIsCompact, useIsNarrow } from "../hooks/useViewport";
-import { useAi, sharedWith, findAiTools } from "../util/ai";
-import { launchAiTool } from "../ui/aiPane";
-import { IS_ANDROID } from "../util/platform";
+import { useIsCompact } from "../hooks/useViewport";
 import { fontFamilyCss, readFontFamily, readFontSize } from "../util/terminalFont";
 import { readShellSyncPairs, useShellSyncServer, type ShellSyncPair } from "../util/shellSync";
 import { readUseLocalShell } from "../util/terminalShell";
 import { readUseSshAgent } from "../util/sshAgent";
 import { useSlideOverFocus } from "../ui/slideOverFocus";
 import { useConfirm } from "../ui/confirm";
-import { dockedTerminal } from "../ui/terminalDock";
-import { withoutPasteControls } from "../util/pasteText";
-import { COMPACT_TAB_NAME, COMPACT_TAB_PAD, NewsDot, compactTermTabClass } from "../ui/tabStyle";
-import { reorderById, useTabDrag } from "../ui/tabDrag";
+import * as Fork from "../fork/session";
 import { ErrorBoundary } from "../ui/ErrorBoundary";
 import { parseObjectList } from "../util/serverJson";
-import { KeptMark, KeptSessions, skipIfKept } from "./KeptSessions";
 
 // What the shell-config push commands answer (mirror.rs' ShellSync* types).
 type ShellSyncShells = { remote_shell: string; local_shell: string; shell_mismatch: boolean };
@@ -39,10 +32,6 @@ type ShellSyncPushResult = { pushed: number; bytes: number; failed: { remote: st
 // Remembered per device like the panel's size; compact windows ignore it and
 // show the tool full screen.
 type ToolDock = "right" | "left" | "bottom" | "top";
-
-// The start of a connect refused because the server's jump host was deleted
-// (src-tauri/src/jump_gone.rs, CODE).
-const JUMP_GONE = "[JUMP_GONE]";
 const TOOL_DOCK_KEY = "submarine-tool-dock";
 const DOCK_OPTIONS: { id: ToolDock; label: string; Icon: typeof PanelRight }[] = [
   { id: "right", label: "Right of the terminal", Icon: PanelRight },
@@ -409,10 +398,9 @@ function writeFollow(on: boolean) {
 
 // `displayName`: the session tab's name, which the user may have changed
 // from the server's (DesktopApp's tabNames). `profile`: the unlocked
-// profile's name, for what is kept per server on this device.
-// `onScreen`: this session is on screen at all. DesktopApp takes one that
-// isn't out of the layout, so its terminals can't be measured and mustn't fit.
-const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onStatusChange, chromeless = false, onTerminalsChange, isActiveView = false, onScreen: sessionOnScreen = true, onPromptChange, compactTabs = false }: any) => {
+// profile's name, for what is kept per server on this device. `sessionShown`:
+// this session is on screen, not behind another one or another view.
+const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onStatusChange, chromeless = false, onTerminalsChange, isActiveView = false, shown: sessionShown = true, onPromptChange, compactTabs = false }: any) => {
   const [status, setStatus] = useState<'connecting' | 'connected' | 'failed' | 'disconnected'>('connecting');
 
   // Bubble every status change up to the parent so the session-tab strip
@@ -425,13 +413,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
     }
   }, [status, session?.id, onStatusChange]);
   const [disconnectReason, setDisconnectReason] = useState<string>("");
-  // Refused before connecting because the server's jump host was deleted
-  // (src-tauri/src/jump_gone.rs): what to say, and the two choices.
-  const [jumpGone, setJumpGone] = useState<string | null>(null);
-  const noteRefusal = (e: unknown) => {
-    const text = String(e);
-    if (text.startsWith(JUMP_GONE)) setJumpGone(text.slice(JUMP_GONE.length).trim());
-  };
+  const jumpGone = Fork.useJumpGone(session.serverId, () => reconnect(), (msg) => pushLog({ msg, type: 'error' }));
   const [logs, setLogs] = useState<{ msg: string, type: string, time?: string }[]>([]);
   // Cap to keep a chatty session (monitors, mirrors, MOTD spam) from
   // ballooning React state — each render copies the whole array, so an
@@ -712,8 +694,8 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   };
 
   // Terminal IDs MUST be unique across every open session, not just within
-  // this one — the backend keys each terminal's input, size and output pacing
-  // by its id, and any collision means two tabs end up on the same PTY.
+  // this one — the backend dispatches `terminal-output-<id>` events globally
+  // and any collision means two tabs end up reading from the same PTY.
   // Scoping the id by `session.id` ensures Server A's "term-0" never clashes
   // with Server B's "term-0".
   // A terminal slot is either a regular login shell (the default) or a
@@ -732,100 +714,6 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // we used to mint a brand-new terminal_id and remount TerminalView,
   // which dropped the entire visual buffer of their previous session.
   const [connectionEpoch, setConnectionEpoch] = useState(0);
-
-  // See startupRanForEpochRef. Typed only once the terminal's shell is open
-  // and has printed its login banner (TerminalView's onShellReady): typed
-  // any sooner, through a slow jump host, they reached a terminal that
-  // wasn't open yet and were dropped without a word.
-  const startupTerminalId = `${session.id}-term-0`;
-  const startupCommands = (session.runOnConnect || "")
-    .split(/\r?\n/)
-    .map((l: string) => l.trimEnd())
-    .filter((l: string) => l.trim().length > 0);
-  const onShellReadyFor = (terminalId: string) => {
-    const container = terminals.find(t => t.id === terminalId)?.container;
-    const gets = terminalId === startupTerminalId || (!!session.runOnConnectEvery && !container);
-    return gets && startupCommands.length > 0
-      ? skipIfKept(terminalId, () => {
-          if (startupRanForEpochRef.current.get(terminalId) === connectionEpoch) return;
-          startupRanForEpochRef.current.set(terminalId, connectionEpoch);
-          // Typed line by line, without escape sequences or other control
-          // characters (a tab stays): the commands can come from anyone the
-          // profile is shared with, and one could press keys nobody saw in
-          // the text (pasteText.ts). The terminal says when any were left out.
-          const typeThem = (text: string) => {
-            const asSet = text.split(/\r\n|\r|\n/);
-            const lines = asSet
-              .map((l: string) => withoutPasteControls(l).trimEnd())
-              .filter((l: string) => l.trim().length > 0);
-            const cleaned = asSet.some((l: string) => withoutPasteControls(l) !== l);
-            if (cleaned) {
-              dockedTerminal(terminalId)?.term.write(
-                '\r\n\x1b[33mSubmarine: control characters were left out of the on-connect commands.\x1b[0m\r\n',
-              );
-              addLog(`Control characters were left out of the on-connect commands for ${session.serverName}.`, "warn");
-            }
-            if (lines.length === 0) return;
-            const bytes = Array.from(new TextEncoder().encode(lines.join('\n') + '\n'));
-            invoke('write_terminal_data', { terminalId, data: bytes }).catch(() => {});
-          };
-          if (!session.runOnConnectHeld) {
-            typeThem(session.runOnConnect || "");
-            return;
-          }
-          // Someone this profile is shared with set or changed these
-          // commands and this device hasn't allowed them: ask, never type
-          // them unasked. Cancel has the focus, so a stray Enter is a no.
-          // The OK counts only for what was shown (the text, and whether they
-          // go into each new terminal): when the commands changed again
-          // meanwhile, it's refused, and the new ones are shown. The answer is
-          // the text allowed, or null.
-          const ask = async (text: string, every: boolean): Promise<string | null> => {
-            const ok = await confirmRef.current({
-              title: "Run the on-connect commands?",
-              message: `Someone you share this profile with set these commands to run when you connect to ${session.serverName}:\n\n${text.trimEnd()}\n\nThey would be typed into your terminal on that server${every ? ", and into each new terminal you open there" : ""}.`,
-              okLabel: "Allow and run",
-              cancelLabel: "Not now",
-              safeDefault: true,
-            });
-            if (!ok) {
-              addLog(`On-connect commands for ${session.serverName} not run: they are waiting for your OK.`, "info");
-              return null;
-            }
-            try {
-              await invoke("allow_held", { serverId: session.serverId, items: ["run_on_connect"], runOnConnect: text, runOnConnectEvery: every });
-              window.dispatchEvent(new Event("submarine-held-changed"));
-              return text;
-            } catch (e) {
-              if (!String(e).includes("HELD_CHANGED")) {
-                addLog(`ALLOW_FAILED: ${e}`, "error");
-                return null;
-              }
-              window.dispatchEvent(new Event("submarine-held-changed"));
-              addLog(`The on-connect commands for ${session.serverName} were changed again. Look at them again before you allow them.`, "warn");
-              let server: any;
-              try {
-                server = ((await invoke("get_servers")) as any[]).find((s) => s.id === session.serverId);
-              } catch (e2) {
-                addLog(`ALLOW_FAILED: ${e2}`, "error");
-                return null;
-              }
-              const now: string = server?.run_on_connect || "";
-              if (!now.trim()) return null;
-              // Still held: ask about the new text. Not held any more: it was
-              // allowed meanwhile, or changed on this device.
-              return (server?.held || []).includes("run_on_connect") ? ask(now, !!server?.run_on_connect_every) : now;
-            }
-          };
-          let asked = onConnectAskRef.current;
-          if (!asked || asked.epoch !== connectionEpoch) {
-            asked = { epoch: connectionEpoch, answer: ask(session.runOnConnect || "", !!session.runOnConnectEvery) };
-            onConnectAskRef.current = asked;
-          }
-          void asked.answer.then((text) => { if (text !== null) typeThem(text); });
-        })
-      : undefined;
-  };
   const openContainerTerminal = (containerName: string, useSudo: boolean) => {
     const newId = `${session.id}-term-${Date.now()}`;
     setTerminals(prev => [...prev, {
@@ -838,12 +726,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   };
 
   const [activeTab, setActiveTab] = useState<string>(`${session.id}-term-0`);
-  // Dragging a terminal tab to a new place reorders `terminals` (the Wall
-  // picker, which reads them through onTerminalsChange, follows). The
-  // terminals stay mounted: only their order in the strip changes.
-  const termDrag = useTabDrag(`terms-${session.id}`, (dragId, overId, after) =>
-    setTerminals(prev => reorderById(prev, dragId, overId, after)));
-
+  const termDrag = Fork.useTermDrag(session.id, setTerminals);
   // New terminals of this server log in on their own (its choice on this device).
   const [ownLoginDefault, setOwnLoginDefault] = useState(() => readOwnLogin(session.serverUuid));
   // SFTP's Follow, and the folder each terminal's shell last reported (a
@@ -1019,7 +902,6 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // panes redistributes those two panes' share and leaves the rest
   // alone. Reset (double-click a divider) flattens back to all-equal.
   const [splitRatios, setSplitRatios] = useState<number[]>([]);
-  const paneAreaRef = useRef<HTMLDivElement | null>(null);
   // "+" button's secondary menu — the arrow beside "+", or a right-click /
   // long-press on "+", so the primary click stays a fast "new tab" without
   // stealing the advanced flows (split view, compare across servers).
@@ -1073,69 +955,6 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // We collapse to a stacked single-pane view: when a tool is open, the
   // tool takes full width and the terminal is hidden behind a back-chip.
   const isCompact = useIsCompact();
-  // DesktopApp shows the AI side pane only in a window this wide, so
-  // "Claude Code beside this" is offered only then.
-  const isNarrow = useIsNarrow();
-
-  // The split is on screen when it has 2+ panes, there's room, and the tab in
-  // front is one of them. Picking another tab shows that one alone; picking
-  // one of the split's tabs again brings the split back as it was.
-  const splitOn = splitTerminals.length >= 2 && !isCompact && splitTerminals.includes(activeTab);
-  const splitShares = () => {
-    const total = splitRatios.reduce((a, b) => a + (b || 0), 0) || splitTerminals.length;
-    let at = 0;
-    return splitTerminals.map((_, i) => {
-      const size = (splitRatios[i] ?? 1) / total;
-      const share = { start: at, size };
-      at += size;
-      return share;
-    });
-  };
-  const paneRect = (slot: number): CSSProperties => {
-    const { start, size } = splitShares()[slot];
-    return splitOrientation === "h"
-      ? { left: `${start * 100}%`, width: `${size * 100}%`, top: 0, bottom: 0 }
-      : { top: `${start * 100}%`, height: `${size * 100}%`, left: 0, right: 0 };
-  };
-  const dividerPos = (slotIdx: number): CSSProperties => {
-    const { start, size } = splitShares()[slotIdx];
-    const at = `calc(${(start + size) * 100}% - 2px)`;
-    return splitOrientation === "h" ? { left: at } : { top: at };
-  };
-  // Show `id` beside what's on screen: added to the split in front, or a new
-  // split of the tab in front and `id`.
-  const splitWith = (id: string) => {
-    if (splitOn) {
-      if (splitTerminals.includes(id)) return;
-      setSplitTerminals(prev => [...prev, id]);
-      setSplitRatios(prev => [...prev, 1]);
-    } else if (id !== activeTab) {
-      setSplitTerminals([activeTab, id]);
-      setSplitRatios([1, 1]);
-    }
-  };
-  // Another shell on this server, beside the one(s) on screen.
-  const splitWithNew = () => {
-    const newId = `${session.id}-term-${Date.now()}`;
-    setTerminals(prev => [...prev, { id: newId, title: nextTerminalNumber(prev), ownLogin: ownLoginDefault }]);
-    splitWith(newId);
-    setActiveTab(newId);
-  };
-  // A pane leaves the split and stays open as a tab; with one pane left the
-  // split ends.
-  const removeFromSplit = (id: string) => {
-    const idx = splitTerminals.indexOf(id);
-    if (idx < 0) return;
-    const nextTerms = splitTerminals.filter(x => x !== id);
-    if (nextTerms.length < 2) {
-      setSplitTerminals([]);
-      setSplitRatios([]);
-    } else {
-      setSplitTerminals(nextTerms);
-      setSplitRatios(prev => prev.filter((_, i) => i !== idx));
-    }
-    if (activeTab === id) setActiveTab(nextTerms[0] ?? id);
-  };
   // Width of the right-side tool pane in pixels. The divider drag updates this
   // and we sync it to localStorage so subsequent sessions remember the split.
   // First-time default is a quarter of the current window width — looks right
@@ -1186,61 +1005,19 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   });
   // Anchor of the open "Panel position" menu, if any.
   const [dockMenu, setDockMenu] = useState<{ x: number; y: number } | null>(null);
-  // Share with AI (#32): this tab, with one AI tab; the menu picks which
-  // when more than one is open. Stopping takes it from every AI tab.
-  const ai = useAi();
-  const aiSharedWith = sharedWith(ai, session.id);
-  const [aiMenu, setAiMenu] = useState<{ x: number; y: number } | null>(null);
-  const shareWithAi = (tabId: string) => {
-    setAiMenu(null);
-    invoke("ai_share", { tabId, sessionId: session.id, name: displayName ?? session.serverName })
-      .catch((e) => addLog(`AI_SHARE: ${e}`, "error"));
-  };
-  const stopSharingWithAi = () => {
-    invoke("ai_unshare", { sessionId: session.id }).catch((e) => addLog(`AI_UNSHARE: ${e}`, "error"));
-  };
-  // The + menu's "Claude Code beside this" (#100): the AI tools Home's menu
-  // offers, looked for as the menu opens. Picked, it starts in Home, this tab
-  // is shared with it, and the AI side pane shows it beside this tab.
-  const [aiTools, setAiTools] = useState<{ id: string; label: string }[]>([]);
-  useEffect(() => {
-    if (!plusMenu || !ai.enabled || IS_ANDROID || isNarrow) return;
-    let live = true;
-    void findAiTools().then((t) => { if (live) setAiTools(t); });
-    return () => { live = false; };
-  }, [plusMenu, ai.enabled, isNarrow]);
-  const startAiBeside = (tool: { id: string; label: string }) => {
-    closePlusMenu();
-    const name = displayName ?? session.serverName;
-    launchAiTool(tool.id, tool.label, session.id, (tabId) => {
-      invoke("ai_share", { tabId, sessionId: session.id, name })
-        .catch((e) => addLog(`AI_SHARE: ${e}`, "error"));
-    });
-  };
+  const aiShare = Fork.useShareWithAi({ session, displayName, addLog, plusMenu, closePlusMenu });
   // SFTP pane: the file browser or Mirror (the button in its title bar).
   const [sftpView, setSftpView] = useState<SftpView>("files");
   const mainAreaRef = useRef<HTMLDivElement | null>(null);
   const toolPanelRef = useRef<HTMLDivElement | null>(null);
 
   const initiatedRef = useRef(false);
-  // Per-node "run on connect" commands (servers.run_on_connect, e.g.
-  // `dzdo su -`): typed into the first terminal once its shell is up — on
-  // the first connect, and again after a reconnect, whose fresh login has
-  // lost what they did, as MobaXterm runs a session's command on each start.
-  // With the server's "each new terminal" (#256), every terminal of the tab
-  // but a container's gets them too. Once per terminal per connection: the
-  // terminal mounting again (into or out of a split) doesn't type them a
-  // second time. By terminal id: the connection they were typed for.
-  const startupRanForEpochRef = useRef<Map<string, number>>(new Map());
-  // When they are held (set by someone this profile is shared with), one
-  // question per connection for all of the tab's terminals: the text it
-  // allowed, or null.
-  const onConnectAskRef = useRef<{ epoch: number; answer: Promise<string | null> } | null>(null);
   // Asks before typing on-connect commands someone else set in a shared
-  // profile. Read through a ref: the shell-ready callback outlives renders.
+  // profile. Read through a ref: the connect listener is registered once.
   const confirm = useConfirm();
   const confirmRef = useRef(confirm);
   confirmRef.current = confirm;
+  const onShellReadyFor = Fork.useOnConnect({ session, terminals, connectionEpoch, confirmRef, addLog });
 
   // ---- Auto-reconnect: fixed 5s cadence, retried FOREVER -------------------
   // After a previously-good session drops we retry every 5 seconds, forever —
@@ -1284,10 +1061,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // deleted, say): no failure event follows, so don't sit on "Connecting…".
   const connectRefused = (e: unknown) => {
     pushLog({ msg: `Failed to initiate: ${e}`, type: 'error' });
-    // A deleted jump host has a box of its own (noteRefusal); anything else
-    // is said in the banner.
-    if (!String(e).startsWith(JUMP_GONE)) setDisconnectReason(String(e));
-    noteRefusal(e);
+    if (!jumpGone.refused(e)) setDisconnectReason(String(e));
     setStatus('failed');
     cancelReconnect();
   };
@@ -1446,20 +1220,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
       // or a setting stops the cycle; Reconnect is still there.
       if (event.payload?.retry === true) {
         scheduleReconnect(reconnectAttemptRef.current + 1);
-        // Say what got through (name, port, jump host) under the error. It
-        // runs beside the countdown, and is dropped if that moved on (the next
-        // attempt started, or Cancel) before the answer came back.
-        const waiting = reconnectAttemptRef.current;
-        // A Quick Connect target goes without its password or key: the check
-        // only needs where it goes (and the user, for ~/.ssh/config).
-        const q = session.quickAuth;
-        const quickTarget = q ? { host: q.host, port: q.port, username: q.username } : null;
-        invoke<string[]>("diagnose_connect", { serverId: session.serverId, quickTarget })
-          .then((lines) => {
-            if (reconnectAttemptRef.current !== waiting || !reconnectTimerRef.current) return;
-            lines.forEach((msg) => pushLog({ msg, type: 'info' }));
-          })
-          .catch(() => {});
+        Fork.diagnoseConnect(session, reconnectAttemptRef, reconnectTimerRef, pushLog);
       } else {
         cancelReconnect();
       }
@@ -1534,9 +1295,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
     updateAttempt(attempt);
     setNextReconnectAt(Date.now() + delay);
     reconnectTimerRef.current = setTimeout(() => {
-      // Fired: no countdown is waiting any more, so a diagnosis that comes
-      // back from here on is about an attempt that's over (see above).
-      reconnectTimerRef.current = null;
+      reconnectTimerRef.current = null; // no countdown waits now (Fork.diagnoseConnect)
       setNextReconnectAt(null);
       setStatus('connecting');
       // Seen in the connect view while a first connect is being retried.
@@ -1573,7 +1332,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
     setKbiPrompt(null);
     setKbiValues([]);
     setDisconnectReason("");
-    setJumpGone(null);
+    jumpGone.clear();
     resetSecondaryStatus();
     primarySeparateRef.current = separateFwdRef.current;
     invoke("initiate_connection", {
@@ -1586,38 +1345,6 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
       useSshAgent: readUseSshAgent(),
     }).catch(connectRefused);
   };
-
-  // The choices for a server whose jump host was deleted. Connect directly
-  // takes this click: it clears the note (and a link to nothing) and
-  // connects; the host key is checked as always. Pick a jump host opens the
-  // server's form at Jump via (DesktopApp).
-  const connectDirectly = () => {
-    invoke("jump_host_connect_directly", { serverId: session.serverId })
-      .then(() => reconnect())
-      .catch((e) => pushLog({ msg: `Couldn't change it: ${e}`, type: 'error' }));
-  };
-  const pickJumpHost = () => {
-    window.dispatchEvent(new CustomEvent("submarine-pick-jump-host", { detail: { serverId: session.serverId } }));
-  };
-  const jumpGoneChoices = jumpGone && (
-    <div role="alert" className="mb-3 sm:mb-4 px-3 py-2.5 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-200 text-[12px] leading-relaxed">
-      <p>{jumpGone}</p>
-      <div className="mt-2 flex flex-wrap gap-2">
-        <button
-          onClick={connectDirectly}
-          className="h-7 px-3 rounded-lg bg-amber-500/15 border border-amber-500/40 text-amber-100 hover:bg-amber-500/25 text-[11px] font-semibold"
-        >
-          Connect directly
-        </button>
-        <button
-          onClick={pickJumpHost}
-          className="h-7 px-3 rounded-lg bg-white/5 border border-white/10 text-zinc-200 hover:bg-white/10 hover:text-white text-[11px] font-semibold"
-        >
-          Pick a jump host
-        </button>
-      </div>
-    </div>
-  );
 
   // Tab-strip right-click "Reconnect" fires a DOM CustomEvent rather than
   // round-tripping through React props — keeps DesktopApp's tab UI decoupled
@@ -1869,8 +1596,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           {/* Auth failed. Its own row, so it never squeezes the header. */}
           {status === 'failed' && isAuthError && <div className="mb-3 sm:mb-4">{retryPassword}</div>}
 
-          {status === 'failed' && jumpGoneChoices}
-
+          {status === 'failed' && <Fork.JumpGoneChoices jumpGone={jumpGone} />}
           {/* Log Window. `min-h-0` is what makes it actually scroll: a flex
               child defaults to min-height:auto (its content height), so without
               this the box grows to fit every line and the parent's
@@ -1910,7 +1636,11 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   }
 
   const DockIcon = (DOCK_OPTIONS.find((o) => o.id === toolDock) ?? DOCK_OPTIONS[0]).Icon;
+  // The split tiles only in a window with room for it; a compact one shows
+  // the active terminal alone, and the split is back when there's room again.
+  const splitOn = Fork.splitShown(splitTerminals, isCompact, activeTab);
   const panes = splitPanes(splitTerminals.map((_, i) => splitRatios[i] ?? 1));
+  const split = Fork.splitActions({ sessionId: session.id, splitOn, splitTerminals, setSplitTerminals, setSplitRatios, activeTab, setActiveTab, terminals, setTerminals, nextTerminalNumber, ownLogin: ownLoginDefault });
 
   // Connected State with Nested Tabs
   return (
@@ -1929,7 +1659,8 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
       {!chromeless && (
       <div inert={shellSyncOpen ? "" : undefined} className="h-12 border-b border-white/5 bg-[#121214]/50 flex items-center px-2 sm:px-4 shrink-0 justify-between gap-1">
         <div
-          className={`flex items-center ${compactTabs ? "gap-0" : "gap-1"} overflow-x-auto no-scrollbar flex-1 mr-1 sm:mr-4 mask-fade-right`}
+          className="flex items-center gap-1 overflow-x-auto no-scrollbar flex-1 mr-1 sm:mr-4 mask-fade-right"
+          {...Fork.stripLook(compactTabs)}
           onWheel={(e) => { e.currentTarget.scrollLeft += e.deltaY; }}
         >
         {terminals.map(t => {
@@ -1938,47 +1669,31 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           // a softer accent, so the pairing is obvious at a glance.
           const isFocusedHalf = activeTab === t.id;
           const isSplitPartner = !!(splitTerminals.includes(t.id) && !isFocusedHalf);
-          const drag = termDrag.tabMark(t.id);
           return (
-          <div key={t.id} className={`group relative flex items-center select-none ${drag.dim ? 'opacity-50' : ''}`}
-            {...termDrag.tabProps(t.id)}
-            style={drag.style}
+          <div key={t.id} className="group relative flex items-center"
+            {...Fork.termTabProps(termDrag, t.id)}
             onContextMenu={(e) => { e.preventDefault(); setTermMenu({ x: e.clientX, y: e.clientY, termId: t.id }); }}
             onDoubleClick={(e) => { setTermMenu({ x: e.clientX, y: e.clientY, termId: t.id }); setTermRename(t.id); }}
           >
             <button
               onClick={() => {
-                // A tab outside the split shows alone; the split stays as it
-                // was for when one of its tabs is picked again (splitOn).
                 setActiveTab(t.id);
                 // Land the caret in the terminal even when the active one
                 // didn't change (re-clicking the current tab, or focus was in
                 // a tool pane / another input) — issue #51.
                 requestTerminalFocus();
               }}
-              title={t.container ? `${t.title} · Container: ${t.container.name}` : t.title}
-              className={`h-8 ${compactTabs
-                ? `${COMPACT_TAB_PAD} ${terminals.length > 1 ? 'pr-6' : ''} gap-1.5 text-[10px] ${
-                    compactTermTabClass(isFocusedHalf, isSplitPartner ? "merged" : "primary")
-                  }`
-                : `px-3 sm:px-4 ${terminals.length > 1 ? 'pr-8 sm:pr-8' : ''} rounded-lg gap-2 text-[11px] ${
-                    isFocusedHalf
-                      ? 'bg-primary/10 text-primary border border-primary/20 shadow-inner'
-                      : isSplitPartner
-                        ? 'bg-primary/[0.04] text-primary/70 border border-primary/10'
-                        : 'text-zinc-300 bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/20 hover:text-white'
-                  }`
-              } flex items-center font-bold uppercase tracking-wider transition-all ${t.container ? 'ring-1 ring-sky-400/30' : ''}`}
+              title={t.container ? `Container: ${t.container.name}` : undefined}
+              className={`h-8 px-3 sm:px-4 ${terminals.length > 1 ? 'pr-8 sm:pr-8' : ''} rounded-lg flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider transition-all ${
+                isFocusedHalf
+                  ? 'bg-primary/10 text-primary border border-primary/20 shadow-inner'
+                  : isSplitPartner
+                    ? 'bg-primary/[0.04] text-primary/70 border border-primary/10'
+                    : 'text-zinc-300 bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/20 hover:text-white'
+              } ${t.container ? 'ring-1 ring-sky-400/30' : ''}`}
+              {...Fork.termTabLook(t, compactTabs, isFocusedHalf, isSplitPartner, terminals.length)}
             >
-              {t.container
-                ? <Container size={compactTabs ? 12 : 14} className="text-sky-300 shrink-0" />
-                : <TerminalSquare size={compactTabs ? 12 : 14} className="shrink-0" />}
-              {/* Printed something while it was out of sight (cleared when it
-                  comes on screen, so never on the tab in front). */}
-              <NewsDot terminals={[t.id]} />
-              <KeptMark terminalId={t.id} />
-              {/* Compact tabs cut a long name; the full one is the hover title. */}
-              <span className={compactTabs ? COMPACT_TAB_NAME : undefined}>{t.title}</span>
+              <Fork.TermTabLabel t={t} compactTabs={compactTabs} />
               {isSplitPartner && (
                 <SplitSquareHorizontal size={10} className="text-primary/60" />
               )}
@@ -1987,21 +1702,11 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               <button
                 onClick={(e) => {
                   e.stopPropagation();
-                  const rest = terminals.filter(x => x.id !== t.id);
-                  setTerminals(rest);
-                  // A closed terminal leaves the split too, or the layout
-                  // would keep a slot for it.
-                  removeFromSplit(t.id);
-                  // The one in front closed: the split's next pane, else the
-                  // first tab left (not the closed one, when it was first).
-                  if (activeTab === t.id) {
-                    const nextInSplit = splitTerminals.find(id => id !== t.id && rest.some(x => x.id === id));
-                    setActiveTab(nextInSplit ?? rest[0].id);
-                  }
+                  split.closeTerminal(t.id);
                 }}
                 aria-label="Close terminal"
-                data-no-tab-drag
-                className={`absolute right-1 top-1/2 -translate-y-1/2 ${compactTabs ? 'w-4 h-4' : 'w-5 h-5'} flex items-center justify-center rounded opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100 hover:bg-white/5 hover:text-red-400 text-zinc-500 transition-all`}
+                className="absolute right-1 top-1/2 -translate-y-1/2 w-5 h-5 flex items-center justify-center rounded opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100 hover:bg-white/5 hover:text-red-400 text-zinc-500 transition-all"
+                {...Fork.termCloseLook(compactTabs)}
               >
                 <X size={compactTabs ? 10 : 12} />
               </button>
@@ -2055,29 +1760,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               <ChevronDown size={12} />
             </button>
           </div>
-          {/* Split: another shell on this server beside the one on screen
-              (watch a log in one, work in the other). The menu has the rest:
-              an open tab beside this one, flip, end the split. */}
-          {!isCompact && (
-            <button
-              onClick={splitWithNew}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                openPlusMenu(false);
-              }}
-              className={`h-10 w-10 sm:h-8 sm:w-8 shrink-0 rounded-lg flex items-center justify-center transition-all border ${
-                splitOn
-                  ? 'text-primary border-primary/30 bg-primary/10 hover:bg-primary/20'
-                  : 'text-zinc-500 border-dashed border-white/10 hover:bg-white/10 hover:text-white'
-              }`}
-              title={splitOn
-                ? "Add another pane: one more shell on this server · right-click for more"
-                : "Split: another shell on this server, side by side · right-click for more"}
-              aria-label="Split"
-            >
-              {splitOrientation === "h" ? <Columns size={14} /> : <Rows size={14} />}
-            </button>
-          )}
+          <Fork.SplitButton show={!isCompact} splitOn={splitOn} orientation={splitOrientation} onClick={split.splitWithNew} onMenu={() => openPlusMenu(false)} />
         </div>
 
         {/* Tool rail: icon + text label. The label collapses to icon-only on
@@ -2126,38 +1809,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               <span className="hidden md:inline text-[11px] font-semibold tracking-tight">Shell</span>
             </button>
           )}
-          {/* Share with AI: while AI tools are on (Settings › AI tools). Lit
-              while shared; a click then stops sharing. */}
-          {ai.enabled && (
-            <button
-              onClick={(e) => {
-                if (aiSharedWith.length > 0) return stopSharingWithAi();
-                if (ai.tabs.length === 1) return shareWithAi(ai.tabs[0].id);
-                const r = e.currentTarget.getBoundingClientRect();
-                setAiMenu({ x: r.right, y: r.bottom + 4 });
-              }}
-              disabled={aiSharedWith.length === 0 && (status !== 'connected' || ai.tabs.length === 0)}
-              title={aiSharedWith.length > 0
-                ? `Shared with ${aiSharedWith.map(t => t.label).join(", ")} — click to stop sharing`
-                : ai.tabs.length === 0
-                  ? "Share with AI: start an AI tool from Home's menu first"
-                  : status !== 'connected'
-                    ? "Share with AI: once this tab is connected"
-                    : "Share with AI: let an AI tab ask to run commands here. Each one waits for your Allow, unless you have set this server to run commands without asking"}
-              aria-label="Share with AI"
-              aria-pressed={aiSharedWith.length > 0}
-              className={`h-10 sm:h-8 px-2.5 rounded-lg flex items-center gap-1.5 transition-all disabled:opacity-40 disabled:pointer-events-none ${
-                aiSharedWith.length > 0
-                  ? 'bg-primary/10 text-primary border border-primary/20 shadow-inner'
-                  : 'text-zinc-300 bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/20 hover:text-white'
-              }`}
-            >
-              <Bot size={14} className={`shrink-0 ${ai.running.some(r => r.session_id === session.id) ? 'animate-pulse' : ''}`} />
-              <span className="hidden md:inline text-[11px] font-semibold tracking-tight">
-                {aiSharedWith.length > 0 ? `Shared with ${aiSharedWith.map(t => t.label).join(", ")}` : "Share with AI"}
-              </span>
-            </button>
-          )}
+          <Fork.ShareWithAiButton share={aiShare} status={status} sessionId={session.id} />
           {/* Where the tool pane sits around the terminal. Compact windows
               show the tool full screen, so there is nothing to place. */}
           {!isCompact && (
@@ -2215,29 +1867,14 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                   tabIndex={-1}
                   onClick={() => {
                     closePlusMenu();
-                    splitWithNew();
+                    split.splitWithNew();
                   }}
                   className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] focus-visible:bg-white/[0.06] outline-none text-zinc-200 hover:text-white text-left"
                 >
                   {splitOrientation === "h" ? <Columns size={13} className="text-primary/70" /> : <Rows size={13} className="text-primary/70" />}
                   <span className="flex-1">{splitOn ? `Add pane (${splitTerminals.length + 1}-way split)` : "Split with new pane"}</span>
                 </button>
-                {/* An open tab beside the one(s) on screen. */}
-                {terminals
-                  .filter(t => t.id !== activeTab && !(splitOn && splitTerminals.includes(t.id)))
-                  .map(t => (
-                    <button
-                      key={t.id}
-                      onClick={() => {
-                        closePlusMenu();
-                        splitWith(t.id);
-                      }}
-                      className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-300 hover:text-white text-left"
-                    >
-                      <SplitSquareHorizontal size={13} className="text-zinc-500" />
-                      <span className="flex-1 truncate">Show tab {t.title} beside this one</span>
-                    </button>
-                  ))}
+                <Fork.SplitBesideItems terminals={terminals} activeTab={activeTab} splitOn={splitOn} splitTerminals={splitTerminals} pick={(id) => { closePlusMenu(); split.splitWith(id); }} />
                 <button
                   role="menuitem"
                   tabIndex={-1}
@@ -2305,22 +1942,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                   </button>
                 )}
             </>
-            {ai.enabled && !IS_ANDROID && !isNarrow && aiTools.map((tool, i) => (
-              <button
-                key={tool.id}
-                onClick={() => startAiBeside(tool)}
-                disabled={status !== 'connected'}
-                title={status !== 'connected'
-                  ? `${tool.label} beside this: once this tab is connected`
-                  : `Start ${tool.label} in Home, share this tab with it, and show it beside this tab`}
-                className={`w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left disabled:opacity-40 disabled:pointer-events-none ${
-                  i === 0 && !isCompact ? 'mt-1 pt-1.5 border-t border-white/5' : ''
-                }`}
-              >
-                <Bot size={13} className="text-primary/70" />
-                <span className="flex-1">{tool.label} beside this</span>
-              </button>
-            ))}
+            <Fork.AiBesideItems share={aiShare} status={status} isCompact={isCompact} />
             {/* Splitting THIS session's view with another server's tab
                 lives on the session tab strip (right-click the tab).
                 That way the picker is anchored to the tab it operates
@@ -2331,7 +1953,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
         document.body
       )}
 
-      <KeptSessions session={session} terminals={terminals} openTerminal={(id: string) => { setTerminals(prev => [...prev, { id, title: nextTerminalNumber(prev) }]); setActiveTab(id); }} />
+      <Fork.KeptSessions session={session} terminals={terminals} openTerminal={(id: string) => { setTerminals(prev => [...prev, { id, title: nextTerminalNumber(prev) }]); setActiveTab(id); }} />
       {/* A terminal tab's menu: its name, edited in place. Enter keeps it
           (an empty one brings back the tab's first title), Esc goes back
           to the menu. */}
@@ -2361,54 +1983,13 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                 <span className="flex-1">Rename tab</span>
               </button>
             )}
-            {/* Moving the tab without dragging it (keyboard, touchpad). */}
-            {terminals.length > 1 && (() => {
-              const at = terminals.findIndex(t => t.id === termMenu.termId);
-              const moveTo = (to: number) => {
-                setTerminals(prev => reorderById(prev, termMenu.termId, terminals[to].id, to > at));
-                setTermMenu(null);
-              };
-              const item = "w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left disabled:opacity-40 disabled:hover:bg-transparent";
-              return (
-                <>
-                  <button disabled={at <= 0} onClick={() => moveTo(at - 1)} className={item}>
-                    <span className="flex-1">Move left</span>
-                  </button>
-                  <button disabled={at >= terminals.length - 1} onClick={() => moveTo(at + 1)} className={item}>
-                    <span className="flex-1">Move right</span>
-                  </button>
-                </>
-              );
-            })()}
+            <Fork.TermMoveItems terminals={terminals} termId={termMenu.termId} setTerminals={setTerminals} close={() => setTermMenu(null)} />
           </div>
         </>,
         document.body
       )}
 
-      {aiMenu && createPortal(
-        <>
-          <div className="fixed inset-0 z-[9998]" onClick={() => setAiMenu(null)} onContextMenu={(e) => { e.preventDefault(); setAiMenu(null); }} />
-          <div
-            role="menu"
-            style={{ left: Math.max(8, aiMenu.x - 220), top: aiMenu.y }}
-            className="fixed z-[9999] w-[220px] bg-[#15151a] border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
-          >
-            <div className="px-3 pt-1 pb-0.5 text-[9.5px] font-bold uppercase tracking-wider text-zinc-500">Share {displayName ?? session.serverName} with</div>
-            {ai.tabs.map((t) => (
-              <button
-                key={t.id}
-                role="menuitem"
-                onClick={() => shareWithAi(t.id)}
-                className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left"
-              >
-                <Bot size={13} className="text-zinc-500 shrink-0" />
-                <span className="flex-1 truncate">{t.label}</span>
-              </button>
-            ))}
-          </div>
-        </>,
-        document.body,
-      )}
+      <Fork.ShareWithAiMenu share={aiShare} name={displayName ?? session.serverName} />
       {dockMenu && createPortal(
         <>
           <div
@@ -2514,8 +2095,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
         })()
       )}
 
-      {status === 'failed' && jumpGone && <div className="shrink-0 px-3 sm:px-4 pt-2">{jumpGoneChoices}</div>}
-
+      {status === 'failed' && <Fork.JumpGoneChoices jumpGone={jumpGone} box="shrink-0 px-3 sm:px-4 pt-2" />}
       {/* Tab Content Split Pane. Side-by-side on roomy desktop; on narrow
           (`isCompact`) viewports the tool pane takes over the full width
           and the terminal is hidden — the tool tabs themselves act as the
@@ -2540,49 +2120,51 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
             the viewport is roomy enough, we tile those terminals side-by-side
             (or stacked, per `splitOrientation`) with draggable dividers
             between adjacent panes. All OTHER terminals stay mounted but
-            hidden — so switching a tab that isn't in the split preserves
-            its scrollback. The tiles fill the whole left panel; the tool
-            side panel continues to work exactly as before. */}
-        <div ref={paneAreaRef} className={`relative ${
+            hidden, and a change of the split remounts none of them. The tiles
+            fill the whole left panel; the tool side panel continues to work
+            exactly as before. */}
+        <div className={`relative ${
           activeTool && toolAlone ? 'hidden'
             : dockTopBottom && !toolAlone ? 'w-full flex-1 min-h-0'
             : 'h-full flex-1 min-w-0'
         }`}>
-          {/* One flat list, whatever the layout: each terminal keeps the same
-              place in the tree whether it's a pane of the split, the tab on
-              screen or hidden, so splitting, un-splitting or switching never
-              remounts a terminal (which would close its shell and open a
-              fresh one — a `tail -f` you were watching would be gone). The
-              split only changes where each one is drawn. A terminal not on
-              screen stays mounted (its shell keeps running) but inert, so
-              Tab can't land in it. */}
+          {/* One flat list under this one parent, whatever the split does: a
+              terminal that changed parent would be remounted, which ends its
+              shell and wipes its scrollback. Only each terminal's box differs:
+              a pane has its place in the area, the rest wait out of view, at
+              the size of all of it. */}
           {terminals.map(t => {
             const slot = splitOn ? splitTerminals.indexOf(t.id) : -1;
             const inSplit = slot >= 0;
-            const shown = inSplit || (!splitOn && activeTab === t.id);
             const isFocused = activeTab === t.id;
-            const onScreen = sessionOnScreen && shown && !(activeTool && toolAlone);
+            const inView = splitOn ? inSplit : isFocused;
+            const shown = inView && !(activeTool && toolAlone);
             return (
               <div
                 key={t.id}
-                inert={shown ? undefined : ""}
-                style={inSplit ? paneRect(slot) : undefined}
+                // A background tab stays mounted (its shell keeps running) but
+                // inert, so Tab can't land in a terminal that isn't shown.
+                inert={inView ? undefined : ""}
+                style={inSplit ? paneBox(panes[slot], splitOrientation) : undefined}
                 onMouseDown={inSplit ? () => setActiveTab(t.id) : undefined}
                 onTouchStart={inSplit ? () => setActiveTab(t.id) : undefined}
-                className={`group/pane absolute ${inSplit ? 'min-w-0 min-h-0 border' : 'inset-0'} ${
-                  // A terminal behind another tab is left out of the layout,
-                  // so xterm stops drawing it (#127); it keeps its buffer.
-                  shown ? 'opacity-100 z-10' : 'hidden'
-                } ${inSplit ? (isFocused
-                  ? 'border-primary/40 shadow-[inset_0_0_0_1px_rgba(var(--primary),0.15)]'
-                  : 'border-white/[0.03]') : ''}`}
+                className={`absolute ${
+                  inSplit
+                    ? `z-10 border ${
+                        isFocused
+                          ? "border-primary/40 shadow-[inset_0_0_0_1px_rgba(var(--primary),0.15)]"
+                          : "border-white/[0.03]"
+                      }`
+                    : inView ? 'inset-0 opacity-100 z-10' : 'out-of-view z-0'
+                }`}
+                {...Fork.paneLook(inSplit, inView, isFocused)}
               >
                 <TerminalView
                   sessionId={session.id}
                   terminalId={t.id}
                   disabled={status !== 'connected'}
-                  isActive={isFocused && onScreen}
-                  shown={onScreen}
+                  isActive={shown && isFocused && sessionShown}
+                  shown={shown && sessionShown}
                   isActiveView={isActiveView}
                   inView={isActiveView || chromeless}
                   focusSignal={focusTick}
@@ -2595,13 +2177,16 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                   quickAuth={session.quickAuth}
                   onFolder={t.container ? undefined : onTerminalFolder}
                 />
-                {/* Takes this pane out of the split; its terminal stays as
-                    a tab. Top-right, clear of the divider, shown on hover. */}
+                {/* Per-pane detach affordance — pulls the pane out of
+                    the split without killing the underlying terminal.
+                    Positioned top-right so it doesn't fight the
+                    divider (which lies on the pane's right/bottom
+                    edge). Hidden until pane hover, tiny hit area. */}
                 {inSplit && (
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
-                      removeFromSplit(t.id);
+                      split.removeFromSplit(t.id);
                     }}
                     title="Take this pane out of the split (it stays open as a tab)"
                     className="absolute top-1 right-1 z-30 h-5 w-5 rounded flex items-center justify-center bg-black/40 border border-white/10 text-zinc-400 hover:text-white hover:bg-black/60 opacity-0 hover:opacity-100 group-hover/pane:opacity-100 focus-visible:opacity-100 transition-opacity"
@@ -2612,62 +2197,76 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               </div>
             );
           })}
-          {/* Dividers between neighbouring panes: drag resizes those two,
-              double-click makes them all equal, right-click flips the
-              orientation. */}
-          {splitOn && splitTerminals.slice(0, -1).map((id, slotIdx) => (
-            <div
-              key={`divider-${id}`}
-              style={dividerPos(slotIdx)}
-              onMouseDown={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                const area = paneAreaRef.current;
-                if (!area) return;
-                const rect = area.getBoundingClientRect();
-                const total = splitOrientation === "h" ? rect.width : rect.height;
-                const startClient = splitOrientation === "h" ? e.clientX : e.clientY;
-                const sumGrow = splitRatios.reduce((a, b) => a + (b || 0), 0) || splitTerminals.length;
-                const pxPerUnit = total / sumGrow;
-                const startA = splitRatios[slotIdx] ?? 1;
-                const startB = splitRatios[slotIdx + 1] ?? 1;
-                const move = (ev: MouseEvent) => {
-                  const client = splitOrientation === "h" ? ev.clientX : ev.clientY;
-                  const deltaUnits = (client - startClient) / pxPerUnit;
-                  // Only the two panes either side change; neither goes
-                  // below 0.3 units (about 15% of their combined span).
-                  const minPair = 0.3;
-                  const combined = startA + startB;
-                  const nextA = Math.max(minPair, Math.min(combined - minPair, startA + deltaUnits));
-                  setSplitRatios(prev => {
-                    const copy = prev.slice();
-                    copy[slotIdx] = nextA;
-                    copy[slotIdx + 1] = combined - nextA;
-                    return copy;
-                  });
-                };
-                const up = () => {
-                  window.removeEventListener("mousemove", move);
-                  window.removeEventListener("mouseup", up);
-                };
-                window.addEventListener("mousemove", move);
-                window.addEventListener("mouseup", up);
-              }}
-              onDoubleClick={(e) => {
-                e.stopPropagation();
-                setSplitRatios(splitTerminals.map(() => 1));
-              }}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                setSplitOrientation(o => o === "h" ? "v" : "h");
-              }}
-              title="Drag to resize · double-click resets · right-click flips orientation"
-              className={`absolute z-20 bg-white/5 hover:bg-primary/40 transition-colors ${
-                splitOrientation === "h" ? "top-0 bottom-0 w-1 cursor-col-resize" : "left-0 right-0 h-1 cursor-row-resize"
-              }`}
-            />
-          ))}
+          {/* The dividers, a layer of their own over the panes: one on the
+              edge between each pane and the next. */}
+          {splitOn && (
+            <div className="absolute inset-0 z-20 pointer-events-none">
+              {panes.slice(0, -1).map((pane, slotIdx) => {
+                const edge = `calc(${pane.start + pane.size}% - 2px)`; // the fork: centred on the edge
+                return (
+                  <div
+                    key={slotIdx}
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      const container = e.currentTarget.parentElement;
+                      if (!container) return;
+                      const rect = container.getBoundingClientRect();
+                      const total = splitOrientation === "h" ? rect.width : rect.height;
+                      const startClient = splitOrientation === "h" ? e.clientX : e.clientY;
+                      const sumGrow = splitRatios.reduce((a, b) => a + (b || 0), 0) || splitTerminals.length;
+                      const pxPerUnit = total / sumGrow;
+                      const startA = splitRatios[slotIdx] ?? 1;
+                      const startB = splitRatios[slotIdx + 1] ?? 1;
+                      const move = (ev: MouseEvent) => {
+                        const client = splitOrientation === "h" ? ev.clientX : ev.clientY;
+                        const deltaUnits = (client - startClient) / pxPerUnit;
+                        // Redistribute between the two adjacent panes
+                        // only — the rest of the row stays untouched.
+                        // Clamp each so neither collapses below 0.3
+                        // units (≈15% of the pair's original span).
+                        const minPair = 0.3;
+                        const combined = startA + startB;
+                        const nextA = Math.max(minPair, Math.min(combined - minPair, startA + deltaUnits));
+                        const nextB = combined - nextA;
+                        setSplitRatios(prev => {
+                          const copy = prev.slice();
+                          copy[slotIdx] = nextA;
+                          copy[slotIdx + 1] = nextB;
+                          return copy;
+                        });
+                      };
+                      const up = () => {
+                        window.removeEventListener("mousemove", move);
+                        window.removeEventListener("mouseup", up);
+                      };
+                      window.addEventListener("mousemove", move);
+                      window.addEventListener("mouseup", up);
+                    }}
+                    onDoubleClick={(e) => {
+                      e.stopPropagation();
+                      // Reset all panes to equal share, not just this
+                      // divider's pair — matches the "reset layout"
+                      // idiom users expect from tmux/tiling WMs.
+                      setSplitRatios(splitTerminals.map(() => 1));
+                    }}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setSplitOrientation(o => o === "h" ? "v" : "h");
+                    }}
+                    title="Drag to resize · double-click resets · right-click flips orientation"
+                    style={splitOrientation === "h" ? { left: edge } : { top: edge }}
+                    className={`absolute pointer-events-auto bg-white/5 hover:bg-primary/40 transition-colors ${
+                      splitOrientation === "h"
+                        ? "top-0 bottom-0 w-1 cursor-col-resize"
+                        : "left-0 right-0 h-1 cursor-row-resize"
+                    }`}
+                  />
+                );
+              })}
+            </div>
+          )}
         </div>
 
         {/* Resizable divider — only useful when both panes are visible. */}
