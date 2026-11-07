@@ -11,6 +11,16 @@ Changes to `.md` files only (docs, this file, the changelog) don't make a releas
 
 When the `## Next release` heading has entries from a release that has already been made, the next pull request that adds a changelog line renames that heading to the release's number (the title bar and the Releases page show it) and starts a new `## Next release` above it.
 
+## Fork features that don't cost sync time
+
+Every line the fork changes inside one of the original project's files can conflict at the next sync; files only the fork has cost nothing. So ([#163](https://github.com/paulm981/Submarine/issues/163)):
+
+- **A sync comes first.** When the original project has changes the fork doesn't, bring them in before any other work (FORK.md, "Keeping up with the original project").
+- **New features go in files of the fork's own.** The original project's files get one-line hooks only, each checked by a test (`fork_hooks.rs`), so a sync that drops one fails instead of quietly losing the feature.
+- **Where the original project has a feature, the fork uses theirs.** Replacing one of theirs needs the owner's OK in its issue first: the fork's Walls, in place of their Broadcast, were thousands of lines in their busiest files.
+- **Every pull request says what it does to the footprint:** `scripts/upstream-footprint.sh` before and after (the lines the fork changes in the original project's files). It should only go down, or stay as it is.
+- **One pull request at a time,** opened after the last one's release is out, so its changelog heading is right in its first push and the checks run once.
+
 ## Before pushing
 
 - Rust, in `src-tauri`: `cargo test --locked` and `cargo clippy --locked --lib` with no more warnings than `.github/clippy-warnings` allows. The tests need a stand-in page: `mkdir -p dist && [ -f dist/index.html ] || echo '<!doctype html><title>Submarine</title>' > dist/index.html`.

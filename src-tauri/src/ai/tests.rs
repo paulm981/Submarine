@@ -100,7 +100,7 @@ async fn the_helper_talks_mcp_over_stdin_and_stdout() {
     h.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await;
     let tools = h.call(2, "tools/list", json!({})).await;
     let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["list_shared", "run_command"]);
+    assert_eq!(names, ["list_shared", "run_command", "run_on_servers"]);
     // MCP's standard hints.
     let listed_tools = &tools["result"]["tools"];
     assert_eq!(listed_tools[0]["annotations"], json!({ "readOnlyHint": true }));
@@ -1787,4 +1787,156 @@ mod root_language {
         s.decide(s.snapshot().pending[0].id, false).unwrap();
         assert_eq!(req.await.unwrap().text, "Denied by the user. The root password typed for it was refused.");
     }
+}
+
+// -- One request on several servers (#158) ------------------------------
+
+/// An AiState whose AI tab "local-1" has servers s7, s8 and s9 shared
+/// (sessions sess-7…, saved ids 7…), each at the level `level` gives it.
+/// Commands answer with their session's name.
+fn state_for_group(level: fn(i64) -> u8) -> AiState {
+    let exec: Executor = Arc::new(|session, _, _, _| {
+        Box::pin(async move { Ok(exec::Exec { output: format!("hello from {session}").into_bytes(), exit_status: Some(0), ..exec::Exec::default() }) })
+    });
+    let s = AiState::with(exec, no_root(), Box::new(|| {}), None, Arc::new(move |id| policy(level(id.unwrap_or(0)), &[], &[])), Box::new(|| {}));
+    s.turn_on().unwrap();
+    s.start_tab("local-1", "Claude").unwrap();
+    for id in [7, 8, 9] {
+        s.share_as("local-1", &format!("sess-{id}"), &format!("s{id}"), Some("deploy".into()), Some(id)).unwrap();
+    }
+    s
+}
+
+fn on_servers(s: &AiState, servers: &[&str], all: bool, command: &str) -> tokio::task::JoinHandle<mcp::ToolResult> {
+    let (s2, servers, command) = (s.clone(), servers.iter().map(|n| n.to_string()).collect::<Vec<_>>(), command.to_string());
+    tokio::spawn(async move {
+        let (_c, cancel) = watch::channel(false);
+        s2.run_on_servers("local-1", servers, all, &command, None, cancel).await
+    })
+}
+
+#[tokio::test]
+async fn several_servers_that_would_all_run_it_run_it_at_once() {
+    let s = state_for_group(|_| 3);
+    let r = on_servers(&s, &["s9", "s7"], false, "uptime").await.unwrap();
+    assert!(!r.is_error, "{}", r.text);
+    assert!(s.snapshot().pending.is_empty());
+    // A part each, in the order named.
+    let (nine, seven) = (r.text.find("=== s9 ===").unwrap(), r.text.find("=== s7 ===").unwrap());
+    assert!(nine < seven, "{}", r.text);
+    assert!(r.text.contains("hello from sess-9") && r.text.contains("hello from sess-7") && !r.text.contains("sess-8"));
+    assert!(r.text.starts_with("2 servers: 2 done, 0 not."));
+}
+
+#[tokio::test]
+async fn one_server_that_asks_makes_the_whole_request_ask_on_one_card() {
+    // s8 asks every time; s7 and s9 would run anything.
+    let s = state_for_group(|id| if id == 8 { 1 } else { 3 });
+    let req = on_servers(&s, &[], true, "uptime");
+    wait_for("the cards", || s.snapshot().pending.len() == 3).await;
+    let pending = s.snapshot().pending;
+    let group = pending[0].group.unwrap();
+    assert!(pending.iter().all(|p| p.group == Some(group)) && group.size == 3);
+    // Those that would have run say why they ask.
+    for p in &pending {
+        assert_eq!(p.note.is_some(), p.server != "s8", "{}: {:?}", p.server, p.note);
+    }
+    // It counts as one request waiting.
+    assert_eq!(waiting_requests(&s.lock(), "local-1"), 1);
+    s.decide_group(group.id, true, None).unwrap();
+    let r = req.await.unwrap();
+    assert!(!r.is_error && r.text.starts_with("3 servers: 3 done"), "{}", r.text);
+    assert!(s.snapshot().pending.is_empty());
+    assert!(s.decide_group(group.id, true, None).is_err(), "nothing waits any more");
+}
+
+#[tokio::test]
+async fn denying_the_card_denies_every_server_with_the_note() {
+    let s = state_for_group(|_| 1);
+    let req = on_servers(&s, &["s7", "s8"], false, "rm -rf /tmp/x");
+    wait_for("the cards", || s.snapshot().pending.len() == 2).await;
+    let group = s.snapshot().pending[0].group.unwrap();
+    s.decide_group(group.id, false, Some("not on production".into())).unwrap();
+    let r = req.await.unwrap();
+    assert!(r.is_error, "{}", r.text);
+    assert_eq!(r.text.matches("Denied by the user: not on production").count(), 2, "{}", r.text);
+}
+
+#[tokio::test]
+async fn allow_everything_on_the_card_covers_each_of_its_servers() {
+    let s = state_for_group(|_| 1);
+    let req = on_servers(&s, &["s7", "s9"], false, "uptime");
+    wait_for("the cards", || s.snapshot().pending.len() == 2).await;
+    s.allow_session_group(s.snapshot().pending[0].group.unwrap().id).unwrap();
+    assert!(!req.await.unwrap().is_error);
+    let on = |name: &str| s.snapshot().tabs[0].servers.iter().find(|x| x.name == name).unwrap().allow_all;
+    assert!(on("s7") && on("s9") && !on("s8"));
+    // So the next request on those two runs at once.
+    let r = on_servers(&s, &["s7", "s9"], false, "df -h").await.unwrap();
+    assert!(!r.is_error && s.snapshot().pending.is_empty(), "{}", r.text);
+}
+
+#[tokio::test]
+async fn a_request_on_several_servers_is_checked_first() {
+    let s = state_for_group(|_| 3);
+    let r = on_servers(&s, &["s7", "nope"], false, "uptime").await.unwrap();
+    assert!(r.is_error && r.text.contains("Not shared with you: nope"), "{}", r.text);
+    let r = on_servers(&s, &[], false, "uptime").await.unwrap();
+    assert!(r.is_error && r.text.contains("Name the servers"), "{}", r.text);
+    let r = on_servers(&s, &["s7"], false, " ").await.unwrap();
+    assert!(r.is_error && r.text.contains("No command"), "{}", r.text);
+    let many: Vec<String> = (0..=MAX_GROUP).map(|i| format!("x{i}")).collect();
+    let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+    let r = on_servers(&s, &refs, false, "uptime").await.unwrap();
+    assert!(r.is_error && r.text.contains(&format!("At most {MAX_GROUP}")), "{}", r.text);
+    // A server named twice runs once.
+    let r = on_servers(&s, &["s7", "s7"], false, "uptime").await.unwrap();
+    assert!(r.text.starts_with("1 server: 1 done"), "{}", r.text);
+}
+
+#[tokio::test]
+async fn waiting_requests_count_a_group_once_toward_the_limit() {
+    let s = state_for_group(|_| 1);
+    let group = on_servers(&s, &[], true, "uptime");
+    wait_for("the cards", || s.snapshot().pending.len() == 3).await;
+    let mut singles = Vec::new();
+    for name in ["s7", "s8"] {
+        let s2 = s.clone();
+        singles.push(tokio::spawn(async move {
+            let (_c, cancel) = watch::channel(false);
+            s2.run_command("local-1", name, "uptime", None, false, cancel).await
+        }));
+    }
+    wait_for("the singles", || s.snapshot().pending.len() == 5).await;
+    // Three requests wait: the group and two more. A fourth is refused, a
+    // group as much as a single one.
+    let r = on_servers(&s, &["s9"], false, "uptime").await.unwrap();
+    assert!(r.is_error && r.text.contains("already waiting"), "{}", r.text);
+    for p in s.snapshot().pending.iter().filter(|p| p.group.is_none()) {
+        s.decide(p.id, false).unwrap();
+    }
+    let g = s.snapshot().pending[0].group.unwrap();
+    s.decide_group(g.id, false, None).unwrap();
+    group.await.unwrap();
+    for x in singles {
+        x.await.unwrap();
+    }
+}
+
+#[test]
+fn many_servers_share_what_the_ai_gets_back() {
+    let long = "a".repeat(100 * 1024) + "THE END";
+    let parts: Vec<(String, mcp::ToolResult)> = (0..10).map(|i| (format!("s{i}"), mcp::ToolResult::ok(long.clone()))).collect();
+    let r = group_answer(&parts);
+    assert!(r.text.len() < GROUP_AI_BUDGET + 4 * 1024, "{}", r.text.len());
+    // Each part keeps its end, and says what was left out.
+    assert_eq!(r.text.matches("THE END").count(), 10);
+    assert_eq!(r.text.matches("bytes left out here by Submarine").count(), 10);
+    // Short parts are as they were; an error only if every part is one.
+    let mixed = [("a".to_string(), mcp::ToolResult::ok("fine")), ("b".to_string(), mcp::ToolResult::err("Denied by the user."))];
+    let r = group_answer(&mixed);
+    assert!(!r.is_error && r.text.contains("=== b (not run, or failed) ===\nDenied by the user."));
+    assert!(group_answer(&mixed[1..]).is_error);
+    // Cut on a character's edge.
+    assert!(cut_middle(&"é".repeat(5000), 2001).is_char_boundary(0));
 }

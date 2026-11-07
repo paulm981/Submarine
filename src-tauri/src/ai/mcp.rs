@@ -22,7 +22,8 @@ const MAX_MESSAGE: usize = 1024 * 1024;
 const INSTRUCTIONS: &str = "Submarine runs commands on servers the user has shared with you, over the SSH connections it already holds. \
 You never get credentials. Depending on the approval level the user chose for each server, a command runs at once or waits until \
 the user clicks Allow in Submarine, and may be denied, sometimes with a note saying why. \
-Call list_shared to see the servers you can use. Output you get back is filtered: secrets it recognises are replaced with [hidden by Submarine]. \
+Call list_shared to see the servers you can use. For the same command on several servers, use run_on_servers: \
+the user allows it once, for all of them. Output you get back is filtered: secrets it recognises are replaced with [hidden by Submarine]. \
 To run a command as root, set as_root on run_command rather than typing sudo, su or dzdo yourself: Submarine asks the user, \
 and supplies any password itself. You never see or need it.";
 
@@ -56,6 +57,27 @@ Returns the exit code and the output (stdout and stderr together), with secrets 
                     "as_root": { "type": "boolean", "description": "Run it as root, through the server's sudo or dzdo. The user is asked, and types any password in Submarine; you never get it. Give the plain command, without sudo." }
                 },
                 "required": ["server", "command"],
+                "additionalProperties": false
+            },
+            "annotations": { "destructiveHint": true, "openWorldHint": true }
+        },
+        {
+            "name": "run_on_servers",
+            "description": "Run one shell command on several shared servers at once, or on all of them, as one request: the user \
+allows it once, on one card, for every server it names (or it runs at once, where every server's settings say so). \
+Use this instead of run_command for the same command on more than one server. The servers run it side by side, each as \
+run_command would (no terminal, nothing on stdin, the same timeout and output limits). Returns one answer with a part per \
+server, in the order named: its exit code and output, secrets replaced by [hidden by Submarine], each part shortened in the \
+middle if all of them together are long. Not as root: for that, use run_command with as_root, one server at a time.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "servers": { "type": "array", "items": { "type": "string" }, "description": "The servers' names, as list_shared gives them." },
+                    "all": { "type": "boolean", "description": "Every server shared with you, instead of naming them." },
+                    "command": { "type": "string", "description": "The command line, run by each account's login shell." },
+                    "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": super::MAX_TIMEOUT, "description": "Stop it on each server after this many seconds (default 60)." }
+                },
+                "required": ["command"],
                 "additionalProperties": false
             },
             "annotations": { "destructiveHint": true, "openWorldHint": true }

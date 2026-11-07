@@ -144,6 +144,11 @@ const AI_TAIL: usize = 32 * 1024;
 const RATE_MAX: usize = 20;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_WAITING: usize = 3;
+/// The most servers one `run_on_servers` request names (#158).
+const MAX_GROUP: usize = 50;
+/// What the AI gets back from one `run_on_servers` request, its servers'
+/// parts together: each gets its share, cut in the middle.
+const GROUP_AI_BUDGET: usize = 128 * 1024;
 /// Commands one AI tab may have running at once on one server, those that
 /// ran without asking included.
 const MAX_RUNNING: usize = 4;
@@ -311,6 +316,76 @@ struct PendingView {
     /// Why it asks when the server's settings would otherwise not: they
     /// couldn't be read, or a change to them waits for your OK.
     note: Option<String>,
+    /// One of a `run_on_servers` request's servers (#158): the panel shows
+    /// them as one card, answered together.
+    group: Option<GroupView>,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
+struct GroupView {
+    id: u64,
+    /// How many servers the request named.
+    size: usize,
+}
+
+/// What `early_decision` found.
+struct Early {
+    looked_up: Option<(Option<i64>, bool)>,
+    root_cmd: bool,
+    opens_shell: bool,
+    policy: Option<trust::Policy>,
+    decision: trust::Decision,
+}
+
+/// The requests of AI tab `tab_id` waiting for you: a `run_on_servers`
+/// request counts once, however many servers it names.
+fn waiting_requests(s: &Shared, tab_id: &str) -> usize {
+    let mine = s.pending.iter().filter(|p| p.view.tab_id == tab_id);
+    let groups: std::collections::BTreeSet<u64> = mine.clone().filter_map(|p| p.view.group.map(|g| g.id)).collect();
+    mine.filter(|p| p.view.group.is_none()).count() + groups.len()
+}
+
+/// One answer for the AI from a `run_on_servers` request's servers' parts,
+/// in the order it named them: each part cut to its share of
+/// GROUP_AI_BUDGET, keeping its start and end. An error only if every part
+/// is one.
+fn group_answer(parts: &[(String, ToolResult)]) -> ToolResult {
+    let share = (GROUP_AI_BUDGET / parts.len().max(1)).max(2 * 1024);
+    let failed = parts.iter().filter(|(_, r)| r.is_error).count();
+    let n = parts.len();
+    let mut text = format!("{n} server{}: {} done, {failed} not.\n", if n == 1 { "" } else { "s" }, n - failed);
+    for (name, r) in parts {
+        let body = cut_middle(&r.text, share);
+        text.push_str(&format!("\n=== {name}{} ===\n{body}\n", if r.is_error { " (not run, or failed)" } else { "" }));
+    }
+    ToolResult { text, is_error: failed == parts.len() }
+}
+
+/// `text` within `max` bytes: its start and end, and a line saying how
+/// much was left out between them.
+fn cut_middle(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let half = max / 2;
+    let mut head = half;
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len() - half;
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}\n[… {} bytes left out here by Submarine …]\n{}", &text[..head], tail - head, &text[tail..])
+}
+
+/// What a `run_on_servers` request tells each of its servers' requests.
+#[derive(Clone, Copy)]
+struct GroupRef {
+    id: u64,
+    size: usize,
+    /// Some server would ask, so they all do.
+    ask: bool,
 }
 
 /// Your answer to a request.
@@ -420,6 +495,8 @@ struct Shared {
     running: Vec<Running>,
     history: VecDeque<Done>,
     next_id: u64,
+    /// Numbers the `run_on_servers` requests (GroupView).
+    next_group: u64,
     /// Numbers the live connections (Tab::live).
     next_conn: u64,
     /// Counts the times the history was cleared: a request remembers its
@@ -1096,6 +1173,139 @@ impl AiState {
         result
     }
 
+    /// The requests of `run_on_servers` request `group` waiting for you.
+    fn group_members(&self, group: u64) -> Vec<u64> {
+        self.lock().pending.iter().filter(|p| p.view.group.is_some_and(|g| g.id == group)).map(|p| p.view.id).collect()
+    }
+
+    /// Your answer to a whole `run_on_servers` request (#158): each of its
+    /// servers' requests answered as one would be. Some may not be allowed
+    /// now (too many already running there, or unshared): they're named.
+    fn decide_group(&self, group: u64, allow: bool, note: Option<String>) -> Result<(), String> {
+        let members = self.group_members(group);
+        if members.is_empty() {
+            return Err("That request isn't waiting any more.".into());
+        }
+        let failed: Vec<String> = members
+            .into_iter()
+            .filter_map(|id| if allow { self.answer(id, Answer::Allow { by: BY_YOU.into(), password: None }) } else { self.deny(id, note.clone()) }.err())
+            .collect();
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(failed.join(" "))
+        }
+    }
+
+    /// "Allow everything on these servers until this AI tab closes": each of
+    /// a `run_on_servers` request's servers as "Allow everything here" on
+    /// its own card.
+    fn allow_session_group(&self, group: u64) -> Result<(), String> {
+        let members = self.group_members(group);
+        if members.is_empty() {
+            return Err("That request isn't waiting any more.".into());
+        }
+        let failed: Vec<String> = members.into_iter().filter_map(|id| self.allow_session(id, None).err()).collect();
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(failed.join(" "))
+        }
+    }
+
+    /// A `run_on_servers` request counted against AI tab `tab_id`'s limits
+    /// as one request: the rate, and how many may wait for you.
+    fn admit_group(&self, tab_id: &str) -> Result<String, (String, String)> {
+        let mut s = self.lock();
+        let waiting = waiting_requests(&s, tab_id);
+        let Some(tab) = s.tabs.iter_mut().find(|t| t.id == tab_id) else {
+            return Err((String::new(), "This AI tab's access has ended.".into()));
+        };
+        let label = tab.label.clone();
+        if let Some(cutoff) = Instant::now().checked_sub(RATE_WINDOW) {
+            while tab.asked.front().is_some_and(|t| *t < cutoff) {
+                tab.asked.pop_front();
+            }
+        }
+        if tab.asked.len() >= RATE_MAX {
+            return Err((label, format!("Too many requests: at most {RATE_MAX} a minute. Wait a moment.")));
+        }
+        tab.asked.push_back(Instant::now());
+        if waiting >= MAX_WAITING {
+            return Err((label, format!("{MAX_WAITING} requests are already waiting for the user. Wait for them first.")));
+        }
+        Ok(label)
+    }
+
+    /// One command on several shared servers, or all of them (#158): one
+    /// request, one card. It runs without asking only where every server's
+    /// settings would run it; else every server asks, on the one card. The
+    /// servers run side by side, and the AI gets one answer, a part each.
+    async fn run_on_servers(&self, tab_id: &str, servers: Vec<String>, all: bool, command: &str, timeout: Option<u64>, cancel: watch::Receiver<bool>) -> ToolResult {
+        let names: Vec<String> = {
+            let s = self.lock();
+            let Some(tab) = s.tabs.iter().find(|t| t.id == tab_id) else {
+                return ToolResult::err("This AI tab's access has ended.");
+            };
+            let shared: Vec<String> = tab.servers.iter().map(|x| x.name.clone()).collect();
+            let mut names: Vec<String> = if all { shared.clone() } else { servers };
+            let mut seen = std::collections::HashSet::new();
+            names.retain(|n| seen.insert(n.clone()));
+            if names.is_empty() {
+                return ToolResult::err(if all || shared.is_empty() {
+                    "No servers are shared with you. Ask the user to click Share with AI on a server's tab.".to_string()
+                } else {
+                    "Name the servers in servers, or set all to true.".to_string()
+                });
+            }
+            if names.len() > MAX_GROUP {
+                return ToolResult::err(format!("At most {MAX_GROUP} servers in one request."));
+            }
+            let unknown: Vec<String> = names.iter().filter(|n| !shared.contains(n)).map(|n| for_log(n, MAX_LOGGED_NAME)).collect();
+            if !unknown.is_empty() {
+                return ToolResult::err(format!(
+                    "Not shared with you: {}. Shared: {}. Ask the user to click Share with AI on its tab.",
+                    unknown.join(", "),
+                    if shared.is_empty() { "none".to_string() } else { shared.join(", ") }
+                ));
+            }
+            names
+        };
+        if command.trim().is_empty() {
+            return ToolResult::err("No command was given.");
+        }
+        if let Err((label, why)) = self.admit_group(tab_id) {
+            return self.refuse(&label, "", command, why);
+        }
+        // Whether every server would run it without asking.
+        let mut ask = false;
+        for name in &names {
+            if self.early_decision(tab_id, name, command, false).await.decision.approved_by().is_none() {
+                ask = true;
+                break;
+            }
+        }
+        let group = {
+            let mut s = self.lock();
+            s.next_group += 1;
+            GroupRef { id: s.next_group, size: names.len(), ask }
+        };
+        let mut parts = tokio::task::JoinSet::new();
+        for (i, name) in names.iter().enumerate() {
+            let (me, tab, name, cmd, cancel) = (self.clone(), tab_id.to_string(), name.clone(), command.to_string(), cancel.clone());
+            parts.spawn(async move { (i, me.run_command_in(&tab, &name, &cmd, timeout, false, cancel, Some(group)).await) });
+        }
+        let mut results: Vec<Option<ToolResult>> = (0..names.len()).map(|_| None).collect();
+        while let Some(joined) = parts.join_next().await {
+            if let Ok((i, r)) = joined {
+                results[i] = Some(r);
+            }
+        }
+        let results: Vec<(String, ToolResult)> =
+            names.into_iter().zip(results).map(|(n, r)| (n, r.unwrap_or_else(|| ToolResult::err("It stopped unexpectedly.")))).collect();
+        group_answer(&results)
+    }
+
     /// "Allow everything here" ends for the shared servers `which` picks,
     /// in every AI tab. Returns how many it was on for.
     fn end_allow_all(&self, which: impl Fn(&SharedServer) -> bool, why: &str) -> usize {
@@ -1284,6 +1494,21 @@ impl AiState {
                 };
                 self.run_command(tab_id, server, command, timeout, as_root, cancel).await
             }
+            "run_on_servers" => {
+                let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                let timeout = args.get("timeout_seconds").and_then(|v| v.as_u64());
+                let servers = match args.get("servers") {
+                    None | Some(serde_json::Value::Null) => Vec::new(),
+                    Some(serde_json::Value::Array(a)) if a.iter().all(|v| v.is_string()) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                    Some(_) => return ToolResult::err("servers must be a list of server names."),
+                };
+                let all = match args.get("all") {
+                    None | Some(serde_json::Value::Null) => false,
+                    Some(serde_json::Value::Bool(b)) => *b,
+                    Some(_) => return ToolResult::err("all must be true or false."),
+                };
+                self.run_on_servers(tab_id, servers, all, command, timeout, cancel).await
+            }
             _ => ToolResult::err(format!("Submarine has no tool called {name}.")),
         }
     }
@@ -1322,8 +1547,16 @@ impl AiState {
         command: &str,
         timeout: Option<u64>,
         as_root: bool,
-        mut cancel: watch::Receiver<bool>,
+        cancel: watch::Receiver<bool>,
     ) -> ToolResult {
+        self.run_command_in(tab_id, server, command, timeout, as_root, cancel, None).await
+    }
+
+    /// What a server's settings say of `command` there, before it's asked:
+    /// the share they were read for (its saved id and "allow everything"),
+    /// whether the command asks for root or opens a shell, the settings, and
+    /// the decision.
+    async fn early_decision(&self, tab_id: &str, server: &str, command: &str, as_root: bool) -> Early {
         // The named server's settings, read before the lock (the vault has
         // its own) and checked again under it.
         let looked_up = {
@@ -1349,12 +1582,29 @@ impl AiState {
             .await
             .unwrap_or_else(|_| (true, false, Some(trust::Policy::unreadable()), trust::Decision::Ask { rule: None }))
         };
+        Early { looked_up, root_cmd, opens_shell, policy, decision: early }
+    }
+
+    /// `run_command`, or one server's part of a `run_on_servers` request
+    /// (`group`), which was counted against the limits as a whole.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_command_in(
+        &self,
+        tab_id: &str,
+        server: &str,
+        command: &str,
+        timeout: Option<u64>,
+        as_root: bool,
+        mut cancel: watch::Receiver<bool>,
+        group: Option<GroupRef>,
+    ) -> ToolResult {
+        let Early { looked_up, root_cmd, opens_shell, policy, decision: early } = self.early_decision(tab_id, server, command, as_root).await;
         // Checked before anything is shown to you or runs.
         let (label, session_id, server, user, id, epoch, rx, stop_tx, stop_rx, auto, card) = {
             let mut s = self.lock();
             let next_id = s.next_id + 1;
             let epoch = s.epoch;
-            let waiting = s.pending.iter().filter(|p| p.view.tab_id == tab_id).count();
+            let waiting = waiting_requests(&s, tab_id);
             let Some(tab) = s.tabs.iter_mut().find(|t| t.id == tab_id) else {
                 return ToolResult::err("This AI tab's access has ended.");
             };
@@ -1366,7 +1616,8 @@ impl AiState {
                     tab.asked.pop_front();
                 }
             }
-            if tab.asked.len() >= RATE_MAX {
+            // A group's servers were counted as one request (admit_group).
+            if group.is_none() && tab.asked.len() >= RATE_MAX {
                 let log = tab.rate_logged.is_none_or(|t| t.elapsed() >= RATE_WINDOW);
                 if log {
                     tab.rate_logged = Some(Instant::now());
@@ -1378,7 +1629,9 @@ impl AiState {
                 }
                 return self.refuse(&label, server, command, why);
             }
-            tab.asked.push_back(Instant::now());
+            if group.is_none() {
+                tab.asked.push_back(Instant::now());
+            }
             let refuse = |why: String| (label.clone(), why);
             let checked: Result<SharedServer, (String, String)> = (|| {
                 if command.trim().is_empty() {
@@ -1423,6 +1676,9 @@ impl AiState {
             // share as it is now (not one shared again meanwhile, or whose
             // "allow everything" changed): else it asks.
             let decision = if looked_up == Some((found.server_id, found.allow_all)) { early } else { trust::Decision::Ask { rule: None } };
+            // Another server of the same request asks, so this one does too.
+            let held_for_group = group.is_some_and(|g| g.ask) && decision.approved_by().is_some();
+            let decision = if held_for_group { trust::Decision::Ask { rule: None } } else { decision };
             let auto = decision.approved_by();
             let running_there = s.running.iter().filter(|r| r.tab_id == tab_id && r.session_id == found.session_id).count();
             if running_there >= MAX_RUNNING {
@@ -1434,7 +1690,7 @@ impl AiState {
                     format!("{MAX_RUNNING} of your commands are already running on {}. Wait for one to finish.", found.name),
                 );
             }
-            if auto.is_none() && waiting >= MAX_WAITING {
+            if auto.is_none() && group.is_none() && waiting >= MAX_WAITING {
                 drop(s);
                 return self.refuse(&label, server, command, format!("{MAX_WAITING} requests are already waiting for the user. Wait for them first."));
             }
@@ -1469,8 +1725,13 @@ impl AiState {
                     && !as_root
                     && policy.as_ref().is_some_and(|p| p.force_ask.is_none())
                     && trust::is_simple_on(command, policy.as_ref().is_some_and(|p| p.windows)),
-                note: policy.as_ref().and_then(|p| p.force_ask.clone()).filter(|_| ask_rule.is_none()),
+                note: policy
+                    .as_ref()
+                    .and_then(|p| p.force_ask.clone())
+                    .or_else(|| held_for_group.then(|| "This server's settings would run it, but others in this request ask, so it asks with them.".to_string()))
+                    .filter(|_| ask_rule.is_none()),
                 ask_rule,
+                group: group.map(|g| GroupView { id: g.id, size: g.size }),
             };
             let rx = match &auto {
                 // Runs now: in the running list with its stop signal, in
@@ -1514,7 +1775,7 @@ impl AiState {
         let entry_for = |event: &'static str| {
             let mut e = audit::Entry::new(event, &label);
             e.id = Some(id);
-            e.request = Some("run_command");
+            e.request = Some(if group.is_some() { "run_on_servers" } else { "run_command" });
             e.server = Some(server.clone());
             e.user = user.clone();
             e.command = Some(for_log(command, MAX_LOGGED_COMMAND));
@@ -2088,6 +2349,20 @@ pub async fn ai_end_allow_all(state: tauri::State<'_, AiState>, tab_id: String, 
 
 /// "Allow everything here until this AI tab closes", from the card, with
 /// the root password typed on it, if it's a card as root that asks for one.
+/// Allow or deny a whole `run_on_servers` request (#158), on every server
+/// it names.
+#[tauri::command]
+pub async fn ai_decide_group(state: tauri::State<'_, AiState>, group: u64, allow: bool, note: Option<String>) -> Result<(), String> {
+    state.decide_group(group, allow, note)
+}
+
+/// "Allow everything on these servers until this AI tab closes", for a
+/// `run_on_servers` request's servers.
+#[tauri::command]
+pub async fn ai_allow_session_group(state: tauri::State<'_, AiState>, group: u64) -> Result<(), String> {
+    state.allow_session_group(group)
+}
+
 #[tauri::command]
 pub async fn ai_allow_session(state: tauri::State<'_, AiState>, id: u64, password: Option<String>) -> Result<(), String> {
     let password = typed_password(password)?;
