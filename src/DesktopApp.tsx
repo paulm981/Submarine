@@ -2365,7 +2365,7 @@ function DesktopApp() {
                               onTerminalsChange={handleTerminalsChange}
                               chromeless={isVisible && isTiled && !isFocused}
                               isActiveView={isFocused}
-                              onScreen={onScreen}
+                              shown={isVisible && viewIsSession}
                               compactTabs={appSettings.compactTabs}
                               onPromptChange={handlePromptChange}
                             />
