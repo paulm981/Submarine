@@ -9,6 +9,7 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Shared folders in Remote Desktop can't be left through a link, on macOS and Linux.** Every file the server opens, lists, renames or deletes is now reached from the shared folder one folder at a time, refusing any link on the way. Before, a link that appeared just after Submarine's check (from something else writing in the folder) would have been followed. ([#132](https://github.com/paulm981/Submarine/issues/132))
 - **A Wall of many terminals opens without freezing the window.** Going into Broadcast or a Wall used to fit every terminal to its tile in one go, which held the window for seconds with 36 servers. They now settle a few at a time, so the window keeps answering while the tiles fill in, usually within a second. ([#127](https://github.com/paulm981/Submarine/issues/127))
 
 ## v0.4.0-fork.23
