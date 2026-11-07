@@ -13,9 +13,10 @@ use ironrdp_rdpdr::{
     RdpdrBackend, RdpdrBackendFactory, RdpdrBackendFactoryResult, RdpdrBackendProduct, RdpdrDrive, RdpdrPrinter,
 };
 use ironrdp_svc::SvcMessage;
-use nix::dir::{Dir, OwningIter};
+use nix::dir::OwningIter;
 use tracing::{debug, warn};
 
+use super::beneath;
 use super::printer::{PrintTarget, PrinterSpooler, unsupported_response, write_response};
 
 /// The most file handles a server may hold at once: its open files, and a folder
@@ -405,7 +406,7 @@ pub(crate) fn query_information(
                     None => 0,
                 };
                 let name = &path[name_index..];
-                let file_attribute = get_file_attributes(&meta, name);
+                let file_attribute = get_file_attributes(&(&meta).into(), name);
                 if FileInformationClassLevel::FILE_BASIC_INFORMATION == req_inner.file_info_class_lvl {
                     let basic_info = FileBasicInformation {
                         creation_time: transform_to_filetime(meta.ctime()),
@@ -595,13 +596,15 @@ pub(crate) fn set_information(
     backend: &mut NixRdpdrBackend,
     req_inner: ServerDriveSetInformationRequest,
 ) -> PduResult<Vec<SvcMessage>> {
+    let base = backend.file_base.clone();
     match backend.file_path_map.get(&req_inner.device_io_request.file_id) {
         Some(file) => {
             match &req_inner.set_buffer {
                 FileInformationClass::Rename(info) => {
                     let mut to = backend.file_base.clone();
                     to.push_str(&info.file_name.replace('\\', "/"));
-                    if let Err(error) = std::fs::rename(file, to) {
+                    // Submarine: both ends reached without following a link (#132).
+                    if let Err(error) = beneath::rename(&base, file, &to) {
                         warn!(?error, "Rename file error");
                         let res = RdpdrPdu::ClientDriveSetInformationResponse(
                             ClientDriveSetInformationResponse::new(&req_inner, NtStatus::UNSUCCESSFUL)
@@ -614,7 +617,7 @@ pub(crate) fn set_information(
                     //nothing to do
                 }
                 FileInformationClass::Disposition(_) => {
-                    if let Err(error) = std::fs::remove_file(file) {
+                    if let Err(error) = beneath::remove_file(&base, file) {
                         warn!(?error, "Remove file error");
                         let res = RdpdrPdu::ClientDriveSetInformationResponse(
                             ClientDriveSetInformationResponse::new(&req_inner, NtStatus::UNSUCCESSFUL)
@@ -672,9 +675,9 @@ pub(crate) fn transform_to_filetime(time_in_secs: i64) -> i64 {
     time
 }
 
-pub(crate) fn get_file_attributes(meta: &std::fs::Metadata, file_name: &str) -> FileAttributes {
+pub(crate) fn get_file_attributes(meta: &beneath::Details, file_name: &str) -> FileAttributes {
     let mut file_attribute = FileAttributes::empty();
-    if meta.is_dir() {
+    if meta.is_dir {
         file_attribute |= FileAttributes::FILE_ATTRIBUTE_DIRECTORY;
     }
     if file_attribute.is_empty() {
@@ -684,13 +687,14 @@ pub(crate) fn get_file_attributes(meta: &std::fs::Metadata, file_name: &str) -> 
     if file_name.len() > 1 && file_name.starts_with('.') && file_name.as_bytes()[1] != b'.' {
         file_attribute |= FileAttributes::FILE_ATTRIBUTE_HIDDEN;
     }
-    if meta.permissions().readonly() {
+    if meta.readonly {
         file_attribute |= FileAttributes::FILE_ATTRIBUTE_READONLY;
     }
     file_attribute
 }
 
 pub(crate) fn make_query_dir_resp(
+    base: &str,
     find_file_name: Option<String>,
     device_io_request: DeviceIoRequest,
     file_class: FileInformationClassLevel,
@@ -718,17 +722,18 @@ pub(crate) fn make_query_dir_resp(
             };
             let file_name = &file_full_path[file_last_slash..];
             // Submarine: a link's own details, not those of what it points to,
-            // which may be outside the shared folder.
-            match std::fs::symlink_metadata(&file_full_path) {
+            // which may be outside the shared folder; reached without following
+            // a link on the way (beneath.rs, #132).
+            match beneath::details(base, &file_full_path) {
                 Ok(meta) => {
                     let file_attribute = get_file_attributes(&meta, file_name);
                     if file_class == FileInformationClassLevel::FILE_BOTH_DIRECTORY_INFORMATION {
                         let info = FileBothDirectoryInformation::new(
-                            transform_to_filetime(meta.ctime()),
-                            transform_to_filetime(meta.ctime()),
-                            transform_to_filetime(meta.atime()),
-                            transform_to_filetime(meta.mtime()),
-                            i64::try_from(meta.size()).unwrap(),
+                            transform_to_filetime(meta.ctime),
+                            transform_to_filetime(meta.ctime),
+                            transform_to_filetime(meta.atime),
+                            transform_to_filetime(meta.mtime),
+                            i64::try_from(meta.size).unwrap_or(i64::MAX),
                             file_attribute,
                             file_name.to_owned(),
                         );
@@ -767,6 +772,7 @@ pub(crate) fn query_directory(
     backend: &mut NixRdpdrBackend,
     req_inner: ServerDriveQueryDirectoryRequest,
 ) -> PduResult<Vec<SvcMessage>> {
+    let base = backend.file_base.clone();
     match backend.file_path_map.get(&req_inner.device_io_request.file_id) {
         Some(parent_pos_for_next) => {
             let mut find_file_name = None;
@@ -781,12 +787,8 @@ pub(crate) fn query_directory(
                     let listed = if backend.at_handle_limit() {
                         None
                     } else {
-                        Dir::open(
-                            parent.as_str(),
-                            nix::fcntl::OFlag::O_RDONLY,
-                            nix::sys::stat::Mode::empty(),
-                        )
-                        .ok()
+                        // Submarine: without following a link on the way (#132).
+                        beneath::open_dir(&base, &parent).ok()
                     };
                     if let Some(dirp) = listed {
                         let mut iter = dirp.into_iter();
@@ -810,6 +812,7 @@ pub(crate) fn query_directory(
                     find_file_name = Some(full_path);
                 }
                 make_query_dir_resp(
+                    &base,
                     find_file_name,
                     req_inner.device_io_request,
                     req_inner.file_info_class_lvl,
@@ -828,6 +831,7 @@ pub(crate) fn query_directory(
                     }
                 }
                 make_query_dir_resp(
+                    &base,
                     find_file_name,
                     req_inner.device_io_request,
                     req_inner.file_info_class_lvl,
@@ -885,12 +889,15 @@ pub(crate) fn create_drive(
         });
         return Ok(vec![SvcMessage::from(res)]);
     }
+    let base = backend.file_base.clone();
     let mut path = String::from(backend.file_base.as_str());
     path.push_str(&req_inner.path.replace('\\', "/"));
     // first process directory
-    match std::fs::metadata(&path) {
+    // Submarine: what is there, as itself (a link is no folder), reached
+    // without following a link on the way; so is every open below (#132).
+    match beneath::details(&base, &path) {
         Ok(meta) => {
-            if meta.is_dir() {
+            if meta.is_dir {
                 if req_inner.create_disposition == CreateDisposition::FILE_CREATE {
                     warn!("Attempt to create directory, but it exists");
                     let io_response = DeviceIoResponse::new(req_inner.device_io_request, NtStatus::UNSUCCESSFUL);
@@ -928,10 +935,9 @@ pub(crate) fn create_drive(
             if req_inner.create_options.bits() & CreateOptions::FILE_DIRECTORY_FILE.bits() != 0 {
                 if (req_inner.create_disposition == CreateDisposition::FILE_CREATE
                     || req_inner.create_disposition == CreateDisposition::FILE_OPEN_IF)
-                    && std::fs::create_dir_all(path.as_str()).is_ok()
+                    && beneath::create_dir_all(&base, &path).is_ok()
                 {
-                    let mut fs = std::fs::OpenOptions::new();
-                    match fs.read(true).open(&path) {
+                    match beneath::open(&base, &path, nix::fcntl::OFlag::O_RDONLY, 0) {
                         Ok(file) => {
                             debug!("create drive file_id:{},path:{}", file_id, path);
                             backend.file_map.insert(file_id, file);
@@ -960,27 +966,24 @@ pub(crate) fn create_drive(
         }
     }
 
-    let mut fs = std::fs::OpenOptions::new();
-    if CreateDisposition::FILE_OPEN_IF == req_inner.create_disposition {
-        fs.create(true).write(true).read(true);
-    }
-    if CreateDisposition::FILE_CREATE == req_inner.create_disposition {
-        fs.create_new(true).write(true).read(true);
-    }
-    if CreateDisposition::FILE_SUPERSEDE == req_inner.create_disposition {
-        fs.create(true).write(true).append(true).read(true);
-    }
-    if CreateDisposition::FILE_OPEN == req_inner.create_disposition {
-        fs.read(true);
-    }
-    if CreateDisposition::FILE_OVERWRITE == req_inner.create_disposition {
-        fs.write(true).truncate(true).read(true);
-    }
-    if CreateDisposition::FILE_OVERWRITE_IF == req_inner.create_disposition {
-        fs.write(true).truncate(true).create(true).read(true);
-    }
+    // Submarine: the same opens as std::fs::OpenOptions made, as flags for
+    // beneath::open (#132).
+    use nix::fcntl::OFlag;
+    let flags = match req_inner.create_disposition {
+        CreateDisposition::FILE_OPEN_IF => Some(OFlag::O_RDWR | OFlag::O_CREAT),
+        CreateDisposition::FILE_CREATE => Some(OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL),
+        CreateDisposition::FILE_SUPERSEDE => Some(OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_APPEND),
+        CreateDisposition::FILE_OPEN => Some(OFlag::O_RDONLY),
+        CreateDisposition::FILE_OVERWRITE => Some(OFlag::O_RDWR | OFlag::O_TRUNC),
+        CreateDisposition::FILE_OVERWRITE_IF => Some(OFlag::O_RDWR | OFlag::O_TRUNC | OFlag::O_CREAT),
+        _ => None,
+    };
+    let opened = match flags {
+        Some(flags) => beneath::open(&base, &path, flags, 0o666),
+        None => Err(std::io::Error::from_raw_os_error(nix::libc::EINVAL)),
+    };
 
-    match fs.open(&path) {
+    match opened {
         Ok(file) => {
             debug!("create drive file_id:{},path:{}", file_id, path);
             backend.file_map.insert(file_id, file);
