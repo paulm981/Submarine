@@ -1,7 +1,7 @@
 import { ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Bot, Check, ChevronDown, ChevronRight, Loader2, ShieldAlert, Square, X, Zap } from "lucide-react";
-import { AiDone, AiPending, AiSnapshot, cardsOf, runnerWarning } from "../util/ai";
+import { AiDone, AiPending, AiSnapshot, cardsOf, copyCard, runnerWarning } from "../util/ai";
 import { HIDDEN_CONTROLS } from "../util/fileName";
 import { WILDCARD_WARNING } from "./AiTrust";
 
@@ -176,6 +176,8 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
   const down = () => { downHere.current = !moved() && performance.now() >= settledAt.current; };
   const loginIsRoot = p.user === "root";
   const many = members && members.length > 1 ? members : null;
+  // A copy_files request (#159): its own words in place of a command.
+  const copy = p.copy ? copyCard(p.copy) : null;
   // The fields: Enter does nothing, and no key in them reaches the app.
   const fieldKeys = (e: React.KeyboardEvent) => {
     e.stopPropagation();
@@ -185,7 +187,29 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
   const field = "w-full h-7 px-2 bg-black/40 border border-white/10 rounded-md font-mono text-[11px] text-zinc-100 outline-none focus:border-primary/50 placeholder:text-zinc-600";
   return (
     <div ref={ref} className="m-2 rounded-xl border border-primary/30 bg-primary/[0.06] p-3 space-y-2">
-      {many ? (
+      {copy ? (
+        <div className="text-[11.5px] text-zinc-300 space-y-1">
+          <div>
+            <span className="font-bold text-white">{p.tab_label}</span> {copy.wants}{" "}
+            {many ? <span className="font-bold text-white">{many.length} servers</span> : (
+              <NoFocusButton onPick={() => onGoToServer(p.session_id)} className="font-bold text-white hover:underline">{p.server}</NoFocusButton>
+            )}
+            {!many && p.user && <> as <span className={`font-bold ${loginIsRoot ? "text-amber-300" : "text-white"}`}>{p.user}</span></>}
+          </div>
+          {many && (
+            <ul className="space-y-0.5">
+              {many.map((m) => (
+                <li key={m.id} className="text-[11px]">
+                  <NoFocusButton onPick={() => onGoToServer(m.session_id)} className="font-bold text-white hover:underline">{m.server}</NoFocusButton>
+                  {m.user && <> as <span className={`font-bold ${m.user === "root" ? "text-amber-300" : "text-zinc-200"}`}>{m.user}</span></>}
+                  {m.copy?.into && <span className="text-zinc-500"> → <span className="font-mono text-zinc-300 break-all">{showPlainly(m.copy.into)}</span></span>}
+                  {m.note && <span className="text-zinc-500"> · {m.note}</span>}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      ) : many ? (
         <div className="text-[11.5px] text-zinc-300 space-y-1">
           <div>
             <span className="font-bold text-white">{p.tab_label}</span> wants to run this on{" "}
@@ -246,10 +270,30 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
           <span>Asks because of your always-ask rule <code className="text-amber-200">{p.ask_rule}</code>.</span>
         </div>
       )}
-      {/* The whole command, never cut off. */}
+      {copy ? (
+        <div className="rounded-lg bg-black/50 border border-white/10 p-2 space-y-1 text-[11px]">
+          {copy.rows.map((r) => (
+            <div key={r.label}>
+              <span className="text-zinc-500">{r.label}: </span>
+              {r.path
+                ? <span className="font-mono text-zinc-100 break-all select-text">{showPlainly(r.value)}</span>
+                : <span className="text-zinc-100">{r.value}</span>}
+            </div>
+          ))}
+          {!many && p.copy?.into && (
+            <div>
+              <span className="text-zinc-500">This server's copy: </span>
+              <span className="font-mono text-zinc-100 break-all select-text">{showPlainly(p.copy.into)}</span>
+            </div>
+          )}
+          {copy.notes.map((n) => <div key={n} className="text-zinc-400">{n}</div>)}
+        </div>
+      ) : (
+      /* The whole command, never cut off. */
       <pre className="whitespace-pre-wrap break-all rounded-lg bg-black/50 border border-white/10 p-2 font-mono text-[11.5px] text-zinc-100 select-text">
         {showPlainly(p.command)}
       </pre>
+      )}
       {asksPassword && (
         <div className="space-y-1">
           {p.password === "wrong" && (

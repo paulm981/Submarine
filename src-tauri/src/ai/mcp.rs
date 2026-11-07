@@ -23,7 +23,8 @@ const INSTRUCTIONS: &str = "Submarine runs commands on servers the user has shar
 You never get credentials. Depending on the approval level the user chose for each server, a command runs at once or waits until \
 the user clicks Allow in Submarine, and may be denied, sometimes with a note saying why. \
 Call list_shared to see the servers you can use. For the same command on several servers, use run_on_servers: \
-the user allows it once, for all of them. Output you get back is filtered: secrets it recognises are replaced with [hidden by Submarine]. \
+the user allows it once, for all of them. To copy a file or a folder between this computer and one or more servers, use copy_files: \
+one request, one card for the user. Output you get back is filtered: secrets it recognises are replaced with [hidden by Submarine]. \
 To run a command as root, set as_root on run_command rather than typing sudo, su or dzdo yourself: Submarine asks the user, \
 and supplies any password itself. You never see or need it.";
 
@@ -34,7 +35,7 @@ pub(crate) fn tools() -> Value {
     json!([
         {
             "name": "list_shared",
-            "description": "List the servers the user has shared with you in Submarine. Only these can be used with run_command.",
+            "description": "List the servers the user has shared with you in Submarine. Only these can be used with run_command, run_on_servers and copy_files.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             "annotations": { "readOnlyHint": true }
         },
@@ -78,6 +79,31 @@ middle if all of them together are long. Not as root: for that, use run_command 
                     "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": super::MAX_TIMEOUT, "description": "Stop it on each server after this many seconds (default 60)." }
                 },
                 "required": ["command"],
+                "additionalProperties": false
+            },
+            "annotations": { "destructiveHint": true, "openWorldHint": true }
+        },
+        {
+            "name": "copy_files",
+            "description": "Copy a file or a folder between this computer and one or more shared servers, as one request: the user \
+allows it once, on one card that shows the direction, the source, the destination, the servers, how many files and how big \
+(for a push; a pull finds out when it runs), and whether files already there are replaced or left. It runs without asking only \
+where every server's settings say run anything. push sends a file or folder from this computer to a folder on each server; \
+links on this computer are never followed. pull fetches a file or folder from each server into a folder on this computer that \
+the user has allowed for AI tools in Submarine's settings, each server's copy in a folder of its own named after the server; \
+it never replaces a file on this computer. At most 1,000 files and 2 GB to or from each server. Four servers copy at a time. \
+Returns one answer with a part per server: what was copied, what was left because it was already there, or why it failed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "direction": { "type": "string", "enum": ["push", "pull"], "description": "push: from this computer to the servers. pull: from the servers to this computer." },
+                    "servers": { "type": "array", "items": { "type": "string" }, "description": "The servers' names, as list_shared gives them." },
+                    "all": { "type": "boolean", "description": "Every server shared with you, instead of naming them." },
+                    "source": { "type": "string", "description": "push: a file or folder on this computer, as a full path. pull: a file or folder on each server, as a full path or ~/…." },
+                    "destination": { "type": "string", "description": "push: a folder on each server that's there already (a full path, or ~/…); the file or folder goes inside it. pull: a folder on this computer, as a full path, inside one the user allowed; it's made if it isn't there." },
+                    "replace": { "type": "boolean", "description": "push only: replace files already on the servers. Without it they're left as they are, and the answer says so." }
+                },
+                "required": ["direction", "source", "destination"],
                 "additionalProperties": false
             },
             "annotations": { "destructiveHint": true, "openWorldHint": true }

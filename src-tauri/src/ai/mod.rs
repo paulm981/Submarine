@@ -8,6 +8,8 @@
 //! (filter.rs). Every request and decision goes in the audit log (audit.rs).
 //!
 //! The AI never gets a key or a password, and never connects to a server.
+//! It can also ask to copy files between this computer and its servers
+//! (`copy_files`, copy.rs, #159), on one card, with the app's own transfers.
 //!
 //! - **Off by default** (Settings › AI tools). Off, nothing listens, Home
 //!   lists no AI tools, and turning it off ends every AI tab's access.
@@ -45,6 +47,7 @@ mod audit;
 mod channel;
 mod claude;
 mod codex;
+mod copy;
 mod exec;
 mod filter;
 pub mod helper;
@@ -179,6 +182,11 @@ struct Settings {
     /// in front. On unless turned off.
     #[serde(default = "on")]
     flash: bool,
+    /// The folders on this computer `copy_files` may pull into (#159):
+    /// none until you add one. Only Settings changes them; no MCP tool
+    /// reaches them.
+    #[serde(default)]
+    pull_folders: Vec<String>,
 }
 
 fn on() -> bool {
@@ -187,7 +195,7 @@ fn on() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { enabled: false, flash: true }
+        Settings { enabled: false, flash: true, pull_folders: Vec::new() }
     }
 }
 
@@ -319,6 +327,9 @@ struct PendingView {
     /// One of a `run_on_servers` request's servers (#158): the panel shows
     /// them as one card, answered together.
     group: Option<GroupView>,
+    /// For a `copy_files` request (#159): what it copies, where. Its
+    /// `command` is then a one-line summary of it, for the lists and the log.
+    copy: Option<copy::CopyView>,
 }
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq)]
@@ -517,6 +528,11 @@ struct Inner {
     /// taskbar flashing), if `flash` is on.
     attention: Box<dyn Fn() + Send + Sync>,
     flash: AtomicBool,
+    /// Where `copy_files` may pull into (Settings::pull_folders).
+    pull_folders: Mutex<Vec<PathBuf>>,
+    /// Does a `copy_files` request's copying on one server: the app's own
+    /// SFTP transfers, or a test's. None: copying isn't available.
+    copier: Mutex<Option<copy::Copier>>,
 }
 
 #[derive(Clone)]
@@ -666,6 +682,8 @@ impl AiState {
             policy,
             attention,
             flash: AtomicBool::new(true),
+            pull_folders: Mutex::new(Vec::new()),
+            copier: Mutex::new(None),
         }))
     }
 
@@ -728,6 +746,8 @@ impl AiState {
         let state = AiState::with(exec, root_exec, changed, app.path().app_log_dir().ok(), policy, attention);
         let settings: Settings = crate::local_open::read_setting(app, SETTINGS_FILE).unwrap_or_default();
         state.0.flash.store(settings.flash, Ordering::Relaxed);
+        state.set_pull_folders(copy::kept_folders(&settings.pull_folders));
+        state.set_copier(copy::app_copier(app.clone()));
         if settings.enabled {
             let s = state.clone();
             tauri::async_runtime::spawn(async move {
@@ -1142,11 +1162,11 @@ impl AiState {
             let mut s = self.lock();
             let p = s.pending.iter().find(|p| p.view.id == id).ok_or("That request isn't waiting any more.")?;
             let (tab_id, session_id) = (p.view.tab_id.clone(), p.view.session_id.clone());
-            let others: Vec<(u64, String, Option<i64>, bool)> = s
+            let others: Vec<(u64, String, Option<i64>, bool, bool)> = s
                 .pending
                 .iter()
                 .filter(|o| o.view.id != id && o.view.tab_id == tab_id && o.view.session_id == session_id && o.view.ask_rule.is_none())
-                .map(|o| (o.view.id, o.view.command.clone(), o.view.server_id, o.view.as_root))
+                .map(|o| (o.view.id, o.view.command.clone(), o.view.server_id, o.view.as_root, o.view.copy.is_some()))
                 .collect();
             let tab = s.tabs.iter_mut().find(|t| t.id == tab_id).ok_or("That AI tab isn't open any more.")?;
             let label = tab.label.clone();
@@ -1163,9 +1183,10 @@ impl AiState {
         // Each as it would be decided now (an always-ask rule added since
         // it was asked still holds it). One as root runs with what this AI
         // tab has for root there, or asks for the password again.
-        for (other, command, server_id, as_root) in others {
+        for (other, command, server_id, as_root, is_copy) in others {
             let p = (self.0.policy)(server_id);
-            let d = trust::decide_parsed(&p, true, &trust::Parsed::new(&command), as_root);
+            // A copy's `command` is only its summary: it's decided as a copy.
+            let d = if is_copy { copy::decision(&p, true) } else { trust::decide_parsed(&p, true, &trust::Parsed::new(&command), as_root) };
             if let Some(by) = d.approved_by() {
                 let _ = self.answer(other, Answer::Allow { by, password: None });
             }
@@ -1237,39 +1258,45 @@ impl AiState {
         Ok(label)
     }
 
+    /// The servers a request on several names (`servers`, or every one
+    /// shared with the AI tab when `all`), each once, in the order named:
+    /// none, more than MAX_GROUP, or one not shared with it, is refused.
+    fn named_servers(&self, tab_id: &str, servers: Vec<String>, all: bool) -> Result<Vec<String>, String> {
+        let s = self.lock();
+        let tab = s.tabs.iter().find(|t| t.id == tab_id).ok_or("This AI tab's access has ended.")?;
+        let shared: Vec<String> = tab.servers.iter().map(|x| x.name.clone()).collect();
+        let mut names: Vec<String> = if all { shared.clone() } else { servers };
+        let mut seen = std::collections::HashSet::new();
+        names.retain(|n| seen.insert(n.clone()));
+        if names.is_empty() {
+            return Err(if all || shared.is_empty() {
+                "No servers are shared with you. Ask the user to click Share with AI on a server's tab.".to_string()
+            } else {
+                "Name the servers in servers, or set all to true.".to_string()
+            });
+        }
+        if names.len() > MAX_GROUP {
+            return Err(format!("At most {MAX_GROUP} servers in one request."));
+        }
+        let unknown: Vec<String> = names.iter().filter(|n| !shared.contains(n)).map(|n| for_log(n, MAX_LOGGED_NAME)).collect();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "Not shared with you: {}. Shared: {}. Ask the user to click Share with AI on its tab.",
+                unknown.join(", "),
+                if shared.is_empty() { "none".to_string() } else { shared.join(", ") }
+            ));
+        }
+        Ok(names)
+    }
+
     /// One command on several shared servers, or all of them (#158): one
     /// request, one card. It runs without asking only where every server's
     /// settings would run it; else every server asks, on the one card. The
     /// servers run side by side, and the AI gets one answer, a part each.
     async fn run_on_servers(&self, tab_id: &str, servers: Vec<String>, all: bool, command: &str, timeout: Option<u64>, cancel: watch::Receiver<bool>) -> ToolResult {
-        let names: Vec<String> = {
-            let s = self.lock();
-            let Some(tab) = s.tabs.iter().find(|t| t.id == tab_id) else {
-                return ToolResult::err("This AI tab's access has ended.");
-            };
-            let shared: Vec<String> = tab.servers.iter().map(|x| x.name.clone()).collect();
-            let mut names: Vec<String> = if all { shared.clone() } else { servers };
-            let mut seen = std::collections::HashSet::new();
-            names.retain(|n| seen.insert(n.clone()));
-            if names.is_empty() {
-                return ToolResult::err(if all || shared.is_empty() {
-                    "No servers are shared with you. Ask the user to click Share with AI on a server's tab.".to_string()
-                } else {
-                    "Name the servers in servers, or set all to true.".to_string()
-                });
-            }
-            if names.len() > MAX_GROUP {
-                return ToolResult::err(format!("At most {MAX_GROUP} servers in one request."));
-            }
-            let unknown: Vec<String> = names.iter().filter(|n| !shared.contains(n)).map(|n| for_log(n, MAX_LOGGED_NAME)).collect();
-            if !unknown.is_empty() {
-                return ToolResult::err(format!(
-                    "Not shared with you: {}. Shared: {}. Ask the user to click Share with AI on its tab.",
-                    unknown.join(", "),
-                    if shared.is_empty() { "none".to_string() } else { shared.join(", ") }
-                ));
-            }
-            names
+        let names = match self.named_servers(tab_id, servers, all) {
+            Ok(names) => names,
+            Err(why) => return ToolResult::err(why),
         };
         if command.trim().is_empty() {
             return ToolResult::err("No command was given.");
@@ -1509,6 +1536,7 @@ impl AiState {
                 };
                 self.run_on_servers(tab_id, servers, all, command, timeout, cancel).await
             }
+            "copy_files" => self.copy_files(tab_id, args, cancel).await,
             _ => ToolResult::err(format!("Submarine has no tool called {name}.")),
         }
     }
@@ -1732,6 +1760,7 @@ impl AiState {
                     .filter(|_| ask_rule.is_none()),
                 ask_rule,
                 group: group.map(|g| GroupView { id: g.id, size: g.size }),
+                copy: None,
             };
             let rx = match &auto {
                 // Runs now: in the running list with its stop signal, in
@@ -2227,6 +2256,8 @@ pub struct AiSettings {
     flash: bool,
     /// Each AI tool Home's menu knows (tools.rs).
     tools: Vec<ToolView>,
+    /// The folders `copy_files` may pull into (#159).
+    pull_folders: Vec<String>,
     available: bool,
 }
 
@@ -2243,8 +2274,16 @@ fn settings_view(state: &AiState) -> AiSettings {
         enabled: state.enabled(),
         flash: state.0.flash.load(Ordering::Relaxed),
         tools: tools::TOOLS.iter().map(|t| ToolView { id: t.id, label: t.label, path: t.find().map(|p| p.to_string_lossy().into_owned()) }).collect(),
+        pull_folders: state.pull_folders().iter().map(|p| p.to_string_lossy().into_owned()).collect(),
         available: cfg!(not(target_os = "android")),
     }
+}
+
+/// The AI tools settings file, with what holds now and `enabled` and
+/// `flash` as given.
+fn save_settings(app: &tauri::AppHandle, state: &AiState, enabled: bool, flash: bool) -> Result<(), String> {
+    let pull_folders = state.pull_folders().iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    crate::local_open::write_setting(app, SETTINGS_FILE, &Settings { enabled, flash, pull_folders }, "the AI tools setting")
 }
 
 #[tauri::command]
@@ -2258,7 +2297,7 @@ pub async fn ai_set_enabled(app: tauri::AppHandle, state: tauri::State<'_, AiSta
         return Err("AI tools aren't available on Android.".into());
     }
     let flash = state.0.flash.load(Ordering::Relaxed);
-    crate::local_open::write_setting(&app, SETTINGS_FILE, &Settings { enabled, flash }, "the AI tools setting")?;
+    save_settings(&app, &state, enabled, flash)?;
     if enabled {
         state.turn_on()?;
     } else {
@@ -2271,8 +2310,44 @@ pub async fn ai_set_enabled(app: tauri::AppHandle, state: tauri::State<'_, AiSta
 #[tauri::command]
 pub async fn ai_set_flash(app: tauri::AppHandle, state: tauri::State<'_, AiState>, flash: bool) -> Result<AiSettings, String> {
     let enabled = state.enabled();
-    crate::local_open::write_setting(&app, SETTINGS_FILE, &Settings { enabled, flash }, "the AI tools setting")?;
+    save_settings(&app, &state, enabled, flash)?;
     state.0.flash.store(flash, Ordering::Relaxed);
+    Ok(settings_view(&state))
+}
+
+/// "Add a folder…" under "Folders the AI may copy into" (#159): the
+/// system's folder picker, then the folder it gives is added, once checked
+/// (copy::allowable_folder). Closed without a pick, nothing changes. The
+/// page never names the folder, and no MCP tool reaches this.
+#[tauri::command]
+pub async fn ai_add_pull_folder(app: tauri::AppHandle, state: tauri::State<'_, AiState>) -> Result<AiSettings, String> {
+    #[cfg(mobile)]
+    {
+        let _ = (&app, &state);
+        Err("Copying files with an AI tool isn't available on a phone or tablet.".into())
+    }
+    #[cfg(desktop)]
+    {
+        let Some(picked) = rfd::AsyncFileDialog::new().set_title("Choose a folder the AI may copy files into").pick_folder().await else {
+            return Ok(settings_view(&state));
+        };
+        let path = picked.path().to_path_buf();
+        let folder = tokio::task::spawn_blocking(move || copy::allowable_folder(&path)).await.map_err(|e| e.to_string())??;
+        if state.add_pull_folder(folder.clone())? {
+            save_settings(&app, &state, state.enabled(), state.0.flash.load(Ordering::Relaxed))?;
+            state.log_setting(format!("AI tools may copy files into {}", folder.display()));
+        }
+        Ok(settings_view(&state))
+    }
+}
+
+/// Remove a folder from "Folders the AI may copy into".
+#[tauri::command]
+pub async fn ai_remove_pull_folder(app: tauri::AppHandle, state: tauri::State<'_, AiState>, path: String) -> Result<AiSettings, String> {
+    if state.remove_pull_folder(std::path::Path::new(&path)) {
+        save_settings(&app, &state, state.enabled(), state.0.flash.load(Ordering::Relaxed))?;
+        state.log_setting(format!("AI tools may no longer copy files into {path}"));
+    }
     Ok(settings_view(&state))
 }
 

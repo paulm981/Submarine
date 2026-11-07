@@ -1,15 +1,17 @@
 // Settings › AI tools (#32, src-tauri/src/ai): off by default, on this
 // device only. On, Home's menu lists the AI tools installed (Claude Code,
 // Codex: #117) under AI tools, started already connected to Submarine; off,
-// nothing listens and every AI tab's access ends.
+// nothing listens and every AI tab's access ends. The folders the AI may
+// copy files into (#159) are kept here too: added only with the system's
+// folder picker, and no tool of the AI's can change them.
 import { useEffect, useState } from "react";
-import { Bot } from "lucide-react";
+import { Bot, FolderPlus, X } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { AiTrustOverview } from "../AiTrust";
 import { LearnMore, SettingsSection, SwitchRow } from "./parts";
 
 interface AiToolInfo { id: string; label: string; path: string | null }
-interface AiSettings { enabled: boolean; flash: boolean; tools: AiToolInfo[]; available: boolean }
+interface AiSettings { enabled: boolean; flash: boolean; tools: AiToolInfo[]; pull_folders: string[]; available: boolean }
 
 // Claude Code's own settings that keep it out of your keys: deny rules for
 // its Read tool, and the sandbox's `credentials` for the commands it runs
@@ -35,6 +37,14 @@ function AiToolsSettings() {
     if (!info) return;
     setError(null);
     invoke<AiSettings>("ai_set_flash", { flash: !info.flash }).then(setInfo).catch((e) => setError(String(e)));
+  };
+  const addFolder = () => {
+    setError(null);
+    invoke<AiSettings>("ai_add_pull_folder").then(setInfo).catch((e) => setError(String(e)));
+  };
+  const removeFolder = (path: string) => {
+    setError(null);
+    invoke<AiSettings>("ai_remove_pull_folder", { path }).then(setInfo).catch((e) => setError(String(e)));
   };
   if (!info) return error ? <p className="text-[11.5px] text-red-400">{error}</p> : null;
   return (
@@ -124,6 +134,46 @@ function AiToolsSettings() {
           onToggle={toggleFlash}
         />
       </div>
+      {info.available && (
+        <div className="pt-3 border-t border-white/5 space-y-2">
+          <div className="text-sm font-semibold text-zinc-100">Folders the AI may copy into</div>
+          <p className="text-[11.5px] text-zinc-500 leading-relaxed">
+            When the AI copies files from your servers to this computer, they go only into one of these folders, each
+            server's in a folder of its own, and never replace a file that's there. None to start with: until you add one,
+            the AI can't copy anything here.
+          </p>
+          <LearnMore>
+            A folder of its own is best, such as one for AI downloads, rather than your home folder. Copies to your servers
+            can come from anywhere on this computer, as you allow each one on its card. Kept on this computer only; the AI
+            can't change this list.
+          </LearnMore>
+          {info.pull_folders.length > 0 && (
+            <ul className="space-y-1">
+              {info.pull_folders.map((f) => (
+                <li key={f} className="flex items-center gap-2 rounded-lg border border-white/5 bg-black/20 px-2 py-1">
+                  <span className="flex-1 font-mono text-[11.5px] text-zinc-300 break-all select-text">{f}</span>
+                  <button
+                    type="button"
+                    onClick={() => removeFolder(f)}
+                    title="Remove this folder"
+                    aria-label={`Remove ${f}`}
+                    className="shrink-0 p-1 rounded text-zinc-500 hover:text-red-300 hover:bg-white/5"
+                  >
+                    <X size={13} />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <button
+            type="button"
+            onClick={addFolder}
+            className="h-8 px-3 rounded-lg border border-white/10 bg-white/[0.03] text-[12px] text-zinc-200 hover:border-primary/40 hover:text-white flex items-center gap-1.5"
+          >
+            <FolderPlus size={13} /> Add a folder…
+          </button>
+        </div>
+      )}
       <div className="pt-3 border-t border-white/5 space-y-2">
         <div className="text-sm font-semibold text-zinc-100">How much the AI may run without asking</div>
         <p className="text-[11.5px] text-zinc-500 leading-relaxed">

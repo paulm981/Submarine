@@ -2,12 +2,12 @@
 // then npm --prefix tools/test test (type check, then vitest).
 
 import { describe, expect, it } from "vitest";
-import { aiMarker, cardsOf, levelTitle, runnerWarning, sharedWith, trustTargetFor, type AiPending, type AiServer, type AiSnapshot } from "../../src/util/ai";
+import { aiMarker, cardsOf, copyCard, levelTitle, runnerWarning, sharedWith, trustTargetFor, type AiCopy, type AiPending, type AiServer, type AiSnapshot } from "../../src/util/ai";
 
 const pending = (id: number, group: { id: number; size: number } | null = null): AiPending => ({
   id, tab_id: "t", tab_label: "AI", session_id: `s${id}`, server: `srv${id}`, user: null, command: "uptime",
   root: false, as_root: false, root_via: null, password: "none", timeout_secs: 60, asked_at: "", server_id: null,
-  ask_rule: null, can_allow_always: true, note: null, group,
+  ask_rule: null, can_allow_always: true, note: null, group, copy: null,
 });
 
 const server = (over: Partial<AiServer> = {}): AiServer => ({
@@ -35,6 +35,46 @@ describe("cardsOf", () => {
 
   it("shows nothing for nothing", () => {
     expect(cardsOf([])).toEqual([]);
+  });
+});
+
+describe("copyCard", () => {
+  const push: AiCopy = {
+    direction: "push", source: "/home/me/app", destination: "~/releases", replace: false, into: null,
+    local: { is_dir: true, files: 1200, bytes: 3 * 1024 * 1024, folders: 4, links_skipped: 0, others_skipped: 0 },
+  };
+  const row = (c: AiCopy, label: string) => copyCard(c).rows.find((r) => r.label === label)?.value;
+
+  it("says what a push sends, from where, to where", () => {
+    const card = copyCard(push);
+    expect(card.wants).toBe("wants to copy files to");
+    expect(row(push, "From this computer")).toBe("/home/me/app");
+    expect(row(push, "To, on each server")).toBe("~/releases");
+    expect(row(push, "What")).toBe(`A folder: ${(1200).toLocaleString()} files, 3.0 MB`);
+    expect(row(push, "Already there")).toBe("Left as they are");
+    expect(card.rows.filter((r) => r.path).map((r) => r.value)).toEqual(["/home/me/app", "~/releases"]);
+    expect(card.notes).toEqual([]);
+  });
+
+  it("says when files are replaced, and when links are left out", () => {
+    const one = { ...push, replace: true, local: { ...push.local!, is_dir: false, files: 1, bytes: 5, links_skipped: 2 } };
+    expect(row(one, "What")).toBe("1 file, 5 bytes");
+    expect(row(one, "Already there")).toBe("Replaced");
+    expect(copyCard(one).notes).toEqual([
+      "Files of the same name already on the servers are replaced.",
+      "2 links inside are left out: links on this computer aren't followed.",
+    ]);
+  });
+
+  it("says a pull finds what it copies when it runs, and replaces nothing here", () => {
+    const pull: AiCopy = { direction: "pull", source: "/var/log/nginx", destination: "/home/me/AI", replace: false, local: null, into: "/home/me/AI/web" };
+    const card = copyCard(pull);
+    expect(card.wants).toBe("wants to copy files from");
+    expect(row(pull, "From each server")).toBe("/var/log/nginx");
+    expect(row(pull, "To this computer")).toBe("/home/me/AI");
+    expect(row(pull, "What")).toBe("Found when it runs");
+    expect(row(pull, "Already there")).toContain("nothing on this computer is replaced");
+    expect(card.notes[0]).toContain("a folder of its own");
   });
 });
 
