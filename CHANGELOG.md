@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.46
+
+- **What a server prints reaches the AI marked as the server's words, not instructions.** A log line that tells the AI to run something is now clearly data to it: the output comes between two tags the server can't fake, with a line saying not to follow it, and Submarine's own lines, such as the exit code, stay outside. At **Run anything** and **Allow everything here**, Submarine now says plainly that text a server prints can steer the AI. ([#178](https://github.com/paulm981/Submarine/issues/178))
+
 ## v0.4.0-fork.44
 
 - **The AI can copy files to and from many servers at once.** It asks once, on one card that shows what goes where, how many files and how big, and whether files already there are replaced. Files come to this computer only into a folder you add in Settings › AI tools, each server's in a folder of its own, and never replace what's there. ([#159](https://github.com/paulm981/Submarine/issues/159))
