@@ -20,7 +20,9 @@ name: Check
 #     runs on a fixed Rust version (CLIPPY_RUST), since each Rust release
 #     adds lints that would raise the count on every pull request at once;
 #     move the version and the count together.
-#   • frontend: the TypeScript check and a build of the page. First, that
+#   • frontend: the page's tests (npm test: the fork's own helpers, and that
+#     the original project's files still import the fork's modules), the
+#     TypeScript check and a build of the page. First, that
 #     src-tauri/src/lib.rs still ends every line with CRLF, as the original
 #     project's does: one written with LF conflicts on every line at the next
 #     sync (#112).
@@ -179,6 +181,11 @@ jobs:
 
       - name: Install npm deps
         run: npm ci
+
+      # Vitest, in Node: a second or two (src/fork-hooks.test.ts and the
+      # fork's helpers).
+      - name: Frontend tests
+        run: npm test
 
       # The licence notices, the TypeScript check and the page, as a release
       # builds them.
