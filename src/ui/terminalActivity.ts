@@ -7,8 +7,8 @@ import { useSyncExternalStore } from "react";
 // Output already reaches every terminal while it is hidden (TerminalView keeps
 // them all mounted), so this only listens on that same path: TerminalView
 // reports each chunk (`noteOutput`) and whether the terminal is on screen
-// (`setLooking`). A terminal on screen — in its tab, in a split, or in a Wall
-// that is showing — never has news; looking at it clears it.
+// (`setLooking`). A terminal on screen — in its tab, in a split, or in the
+// AI side pane — never has news; looking at it clears it.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Output in this long after you leave a terminal is ignored: the prompt

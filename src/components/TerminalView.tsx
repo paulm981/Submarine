@@ -12,7 +12,8 @@ import '@xterm/xterm/css/xterm.css';
 import { KeyRound } from 'lucide-react';
 import { useIsNarrow } from '../hooks/useViewport';
 import { MobileKeyBar, ModifiersState, ModKey, SpecialKey } from './MobileKeyBar';
-import { appHotkey, markTyped, registerTerminal, settleAfterMove, terminalStateChanged } from '../ui/terminalDock';
+import { useBroadcast } from '../ui/broadcast';
+import { appHotkey, registerTerminal, settleAfterMove, terminalStateChanged } from '../ui/terminalDock';
 import { noteOutput, setLooking, watchTerminal } from '../ui/terminalActivity';
 import { forgetTerminal, logLine, noteTerminalOutput, noteTerminalParsed, noteTerminalRenderer } from '../util/diagnostics';
 import { useConfirm } from '../ui/confirm';
@@ -44,6 +45,14 @@ const looksLikePasswordPrompt = (out: string): boolean => {
   const tail = clean.slice(-160);
   return /(?:password|passphrase)\b[^:\n]*:\s*$/i.test(tail);
 };
+
+// What the terminal says by itself, not what was typed: its answers to a
+// program's questions (device attributes, status, cursor position, a mode, a
+// colour, a setting) and its focus and mouse reports. They belong to that one
+// program, so a broadcast doesn't copy them: elsewhere they arrive as typed
+// text. F3 with a modifier looks like a cursor position (ESC [ 1 ; 2 R), so
+// that key stays on its own server too.
+const TERMINAL_REPLY = /^\x1b(?:\[[?>]?[0-9;]*[cnRt]|\[\??[0-9;]*\$y|\[[IO]|\[<[0-9;]+[Mm]|\][0-9]+;[^\x07\x1b]*(?:\x07|\x1b\\)|P[01]\$r[^\x1b]*\x1b\\)$/;
 
 // The user a password prompt asks about, when it names one, so a saved
 // password is only offered for that user (#182 in the original project):
@@ -123,6 +132,33 @@ const LINE_FINALS = new Set<string>(['S', 'T', 'L', 'M']);
 const cycleMod = (s: "off" | "armed" | "locked"): "off" | "armed" | "locked" =>
   s === "off" ? "armed" : s === "armed" ? "locked" : "off";
 
+// A terminal can be shown in two places, its session tab and a Wall tile, but
+// its PTY has one size (#174). A Wall tile only exists while the Wall is on
+// screen, so while one is open it sets the size; the session tab, hidden
+// behind it, sends nothing. When the tile goes away the tab gives the PTY its
+// own size back. ptySizes remembers what each PTY was last
+// given, so the same size isn't sent twice.
+const ptySizes = new Map<string, { cols: number; rows: number }>();
+const wallTiles = new Map<string, number>();
+const sendPtySize = (terminalId: string, cols: number, rows: number, command = 'resize_terminal') => {
+  const last = ptySizes.get(terminalId);
+  if (last && last.cols === cols && last.rows === rows) return;
+  ptySizes.set(terminalId, { cols, rows });
+  invoke(command, { terminalId, cols, rows }).catch(() => {});
+};
+// Once the PTY is (re)opened: the backend drops resizes while a shell is
+// starting, so the size is sent again, the open Wall tile's if there is one.
+const resendPtySize = (terminalId: string, cols: number, rows: number, command?: string) => {
+  const size = (wallTiles.get(terminalId) ?? 0) > 0 ? ptySizes.get(terminalId) ?? { cols, rows } : { cols, rows };
+  ptySizes.delete(terminalId);
+  sendPtySize(terminalId, size.cols, size.rows, command);
+};
+const WALL_TILE_CLOSED = 'submarine-wall-tile-closed';
+// A terminal's output reaches the page over the channel its own view opened
+// it with (src-tauri/src/term_output.rs), not as events a Wall tile could
+// listen to: the session tab's view hands each batch on to the tiles showing
+// the same terminal.
+const wallTileOutput = new Map<string, Set<(data: Uint8Array) => void>>();
 // How long a terminal's size must hold before its PTY gets it. A layout
 // change passes through sizes for a few frames: the narrow and the wide
 // layout swap at 640 px (the terminal is 2 columns wide for a frame) and
@@ -201,6 +237,7 @@ const TerminalView = ({
   connectionEpoch = 0,
   serverId = 0,
   serverName = "",
+  attachOnly = false,
   local,
   onShellReady,
   telnet = false,
@@ -211,6 +248,14 @@ const TerminalView = ({
   sessionId: string;
   terminalId: string;
   disabled?: boolean;
+  /// Attach-only mode: the PTY behind this terminal is owned by
+  /// another TerminalView instance (typically the one inside the
+  /// session tab). This instance ONLY listens to output events and
+  /// forwards input — it doesn't call open_terminal on mount,
+  /// close_terminal on unmount, or fight over resize_terminal. Used
+  /// by the Wall pinboard so pinning a terminal doesn't duplicate the
+  /// PTY or tear it down when Wall is closed.
+  attachOnly?: boolean;
   /// Tells us when this terminal is the visible one in its parent. Used to
   /// trigger a refit + refresh whenever we become visible — without this,
   /// xterm's internal canvas can be left holding stale glyphs from before
@@ -223,7 +268,7 @@ const TerminalView = ({
   visible?: boolean;
   /// True only when this terminal's SessionView is the frontmost server
   /// tab (DesktopApp's active view). Auto-focus is gated on this so a
-  /// background session — or one shown in a Wall — never steals the
+  /// background session — or an attach-only Wall mirror — never steals the
   /// keyboard while the user is typing in the visible one.
   isActiveView?: boolean;
   /// This terminal's server is on screen (in front, or a tile of a split):
@@ -262,8 +307,8 @@ const TerminalView = ({
   serverName?: string;
   /// A shell on this computer (the Home view) instead of one on a server:
   /// `shell` is a list_local_shells id, or null for the default; `onOpened` gets
-  /// the label of the shell that started. A local terminal is never shown in
-  /// a Wall or broadcast to, and keeps no command history — it isn't a
+  /// the label of the shell that started. A local terminal is never pinned
+  /// to the Wall or broadcast to, and keeps no command history — it isn't a
   /// server session. An AI tab's can be moved into the AI side pane.
   local?: { shell: string | null; onOpened?: (label: string) => void; onFailed?: () => void };
   /// Called each time this terminal's SSH shell has been opened (first
@@ -378,10 +423,10 @@ const TerminalView = ({
     shellConnRef.current = sessionId;
   };
   const terminalRef = useRef<HTMLDivElement>(null);
-  // What a Wall moves into its tile (terminalDock): the div xterm draws
-  // into, and over it this terminal's search box, Saved password button and
-  // toast, so they go with it. The ref is for long-lived handlers, the state
-  // to render the overlays into it.
+  // What the AI side pane moves beside a server tab (terminalDock): the div
+  // xterm draws into, and over it this terminal's search box, Saved password
+  // button and toast, so they go with it. The ref is for long-lived handlers,
+  // the state to render the overlays into it.
   const dockElRef = useRef<HTMLDivElement | null>(null);
   const [dockEl, setDockEl] = useState<HTMLDivElement | null>(null);
   const xtermRef = useRef<Terminal | null>(null);
@@ -395,7 +440,6 @@ const TerminalView = ({
   const disabledRef = useRef(disabled);
   useEffect(() => {
     disabledRef.current = disabled;
-    terminalStateChanged();
   }, [disabled]);
   // Mirror of `isActive`, for the focus signal's callback.
   const isActiveRef = useRef(isActive);
@@ -412,17 +456,14 @@ const TerminalView = ({
     visibleRef.current = visible ?? isActive;
     gpuUpdateRef.current();
   }, [visible, isActive]);
-  // While a Wall shows this terminal (src/ui/terminalDock.ts) its xterm sits
-  // in the Wall's tile, on screen whatever this tab is doing — so it refits
-  // to the tile even when it isn't the tab's active terminal.
+  // While the AI side pane shows this terminal (src/ui/terminalDock.ts) its
+  // xterm sits in the pane, on screen whatever its own tab is doing — so it
+  // refits to the pane even when it isn't the tab's active terminal.
   const dockedRef = useRef(false);
   // Activity mark (src/ui/terminalActivity.ts): looking = shown in a server
-  // tab that is on screen, or in a Wall tile.
+  // tab that is on screen, or in the AI side pane.
   const inViewRef = useRef(inView ?? isActiveView);
   const lookingNow = () => (visibleRef.current && inViewRef.current) || dockedRef.current;
-  // Its shell is open (open_terminal has answered, again after a reconnect):
-  // what a Wall's broadcast checks, with `disabled`, before typing into it.
-  const ptyLiveRef = useRef(false);
   // Mirror of isActiveView, read inside focusTerminal's rAF / signal
   // callbacks (which would otherwise close over a stale value).
   const isActiveViewRef = useRef(isActiveView);
@@ -472,6 +513,60 @@ const TerminalView = ({
   // gate as search: only pop it when the user is focused inside this
   // terminal's DOM subtree, so multi-tab windows don't fire N overlays.
   const [showHistory, setShowHistory] = useState(false);
+
+  // Broadcast context. `stateRef` gives us live access from inside the
+  // xterm.onData closure without re-binding on every state change.
+  // Callback identities on `broadcast` are stable (useCallback) so the
+  // register effect below can depend on those directly without churn.
+  const broadcast = useBroadcast();
+  const broadcastRef = broadcast.stateRef;
+  const registerActiveTerminal = broadcast.registerActiveTerminal;
+  const unregisterActiveTerminal = broadcast.unregisterActiveTerminal;
+
+  // Register this terminal as the "active" one for its session whenever
+  // isActive flips true. Broadcast fan-out reads from sessionTerminalMap
+  // to know which of a session's tabs is currently visible / receiving
+  // input; a stale mapping to a background terminal would silently swallow
+  // the mirrored keystrokes. Unregister only if we still hold the slot —
+  // avoids racing with the newly-active terminal during a tab swap.
+  useEffect(() => {
+    if (!isActive) return;
+    registerActiveTerminal(sessionId, terminalId);
+    return () => {
+      unregisterActiveTerminal(sessionId, terminalId);
+    };
+  }, [isActive, sessionId, terminalId, registerActiveTerminal, unregisterActiveTerminal]);
+
+  // ── Broadcast fan-out ──────────────────────────────────────────────────
+  // Broadcast writes AFTER the local write so if the fan-out throws
+  // synchronously it doesn't drop the source shell's own byte. We only
+  // fan out when there are 2+ selected targets — a single target would
+  // let the user broadcast to a single foreign session, which is
+  // technically fine but almost always a footgun ("wait, why did that
+  // command run there instead of here?"). 2+ makes the intent explicit.
+  const broadcastInput = (bytes: number[]) => {
+    const bcast = broadcastRef.current;
+    // Fan out ONLY when the source session is itself one of the armed
+    // targets. Without this guard, typing into an unrelated session (not in
+    // the target set) still wrote to every target — so a command meant only
+    // for the focused server would silently execute on the broadcast group.
+    // Requiring the source to be a member makes "this pane broadcasts to the
+    // group" the explicit, safe model.
+    if (bcast.enabled && bcast.targetSessionIds.size >= 2 && bcast.targetSessionIds.has(sessionId)) {
+      for (const targetSid of bcast.targetSessionIds) {
+        if (targetSid === sessionId) continue; // skip source; already written
+        const targetTid = bcast.sessionTerminalMap[targetSid];
+        if (!targetTid) continue; // target has no live terminal — silently skip
+        invoke('write_terminal_data', {
+          terminalId: targetTid,
+          data: bytes,
+        }).catch(() => {
+          // Dead target — do NOT surface. The user asked for fire-and-forget
+          // fan-out; failures here would spam their console every keystroke.
+        });
+      }
+    }
+  };
 
   // Buffer keystrokes locally so we can log "the command line the user
   // typed" on each Enter press. Best-effort: pastes, arrow-key edits,
@@ -584,8 +679,8 @@ const TerminalView = ({
         bytes = [0x09];
       }
     }
-    markTyped(terminalId);
     invoke(commands.write, { terminalId, data: bytes }).catch(console.error);
+    broadcastInput(bytes);
     if (consumes) consumeArmedModifiers();
   };
 
@@ -606,17 +701,17 @@ const TerminalView = ({
     if (held) term.write(held);
     // Visible separator. \x1b[33m = yellow, \x1b[0m = reset.
     term.write('\r\n\x1b[33m── reconnected ──\x1b[0m\r\n');
-    ptyLiveRef.current = false;
-    terminalStateChanged();
-    const opened = () => { markTyped(terminalId); ptyLiveRef.current = true; terminalStateChanged(); };
+    // Attach-only viewers piggyback on someone else's PTY, so they
+    // must not re-open the PTY on reconnect either — the owner
+    // already did it and this instance just needs to keep reading
+    // events off the same terminal_id.
+    if (attachOnly) return;
     // As on the first open: the backend only takes resizes once the shell is
     // up, so a resize that landed while it was starting again (the window
     // was being dragged, a panel opened) is sent once more when it is. Without
     // this the shell kept the size it was reopened with, and wrapped its lines
     // at the wrong column until the next resize.
-    const syncSize = () => {
-      invoke('resize_terminal', { terminalId, cols: term.cols, rows: term.rows }).catch(() => {});
-    };
+    const syncSize = () => resendPtySize(terminalId, term.cols, term.rows);
     const ce = containerExecRef.current;
     if (telnet) {
       invoke('telnet_open_terminal', {
@@ -625,7 +720,7 @@ const TerminalView = ({
         cols: term.cols || 80,
         rows: term.rows || 24,
         onOutput: outputChannel(),
-      }).then(() => { syncSize(); opened(); }, e => {
+      }).then(syncSize, e => {
         term.writeln(`\x1b[31mReconnect failed: ${e}\x1b[0m`);
       });
     } else if (ce) {
@@ -640,7 +735,7 @@ const TerminalView = ({
         onOutput: outputChannel(),
       }, 'Open the container terminal').then((r) => {
         if (r === null) { term.writeln(ROOT_CANCELLED); return; }
-        syncSize(); opened();
+        syncSize();
       }, e => {
         term.writeln(`\x1b[31mReconnect into container failed: ${e instanceof Error ? e.message : e}\x1b[0m`);
       });
@@ -659,7 +754,7 @@ const TerminalView = ({
             onOutput: outputChannel(),
           }).then(() => true);
         })
-        .then((ok) => { if (ok) { syncSize(); opened(); watchForShellReady(); } }, e => {
+        .then((ok) => { if (ok) { syncSize(); watchForShellReady(); } }, e => {
           term.writeln(`\x1b[31mReconnect failed: ${e}\x1b[0m`);
         });
     }
@@ -700,8 +795,8 @@ const TerminalView = ({
   // user can type the moment a terminal tab (or its server tab) is selected
   // — issue #51. Bails in every situation where grabbing focus is wrong:
   //   • touch devices — focusing xterm pops the soft keyboard unasked;
-  //   • a terminal whose SessionView isn't the frontmost server tab, or one
-  //     a Wall is showing (isActiveView=false) — never steal from the
+  //   • a terminal whose SessionView isn't the frontmost server tab, or an
+  //     attach-only Wall mirror (isActiveView=false) — never steal from the
   //     session the user is actually looking at;
   //   • a disconnected / not-yet-connected terminal (dead PTY; the reconnect
   //     banner or the connect-log view owns the screen). This also covers
@@ -817,7 +912,7 @@ const TerminalView = ({
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (!(e.ctrlKey || e.metaKey) || !e.shiftKey) return;
-      // Where the terminal is now: its tab, or a Wall's tile.
+      // Where the terminal is now: its tab, or the AI side pane.
       const wrapper = dockElRef.current;
       if (!wrapper) return;
       const active = document.activeElement;
@@ -1055,8 +1150,8 @@ const TerminalView = ({
         return true;
       });
     }
-    // xterm draws into a div of its own, which a Wall can borrow (see
-    // src/ui/terminalDock.ts) — so the mouse, resize and focus handling
+    // xterm draws into a div of its own, which the AI side pane can borrow
+    // (see src/ui/terminalDock.ts) — so the mouse, resize and focus handling
     // below is bound to it, not to this component's wrapper.
     const home = terminalRef.current;
     const dock = document.createElement('div');
@@ -1183,9 +1278,15 @@ const TerminalView = ({
     // its PTY after the close was sent.
     const openTimer = window.setTimeout(() => {
       fitTerminal();
-      
-      // Start PTY Session with correct dimensions only ONCE.
-      if (!openedRef.current) {
+      // A Wall tile sets the size while it's open, also when fit() kept
+      // xterm's default size and so fired no resize.
+      if (attachOnly && (wallTiles.get(terminalId) ?? 0) > 0) sendPtySize(terminalId, term.cols, term.rows);
+
+      // Start PTY Session with correct dimensions only ONCE. Attach-only
+      // instances skip this entirely — they hitch onto an existing PTY
+      // opened by the primary instance and would collide with it if they
+      // tried to open the same terminal_id a second time.
+      if (!openedRef.current && !attachOnly) {
         openedRef.current = true;
         // Branch: a `containerExec` prop means we want a docker-exec
         // session into a specific container, not the regular login
@@ -1195,10 +1296,7 @@ const TerminalView = ({
         // The backend only takes resizes once the shell is up, so a refit
         // that landed while it was starting (e.g. the chosen font finished
         // loading and changed the cell size) is sent again once it's open.
-        const syncSize = () => {
-          invoke(commands.resize, { terminalId, cols: term.cols, rows: term.rows }).catch(() => {});
-        };
-        const opened = () => { markTyped(terminalId); ptyLiveRef.current = true; terminalStateChanged(); };
+        const syncSize = () => resendPtySize(terminalId, term.cols, term.rows, commands.resize);
         if (telnet) {
           invoke('telnet_open_terminal', {
             sessionId,
@@ -1206,7 +1304,7 @@ const TerminalView = ({
             cols: term.cols || 80,
             rows: term.rows || 24,
             onOutput: outputChannel(),
-          }).then(() => { syncSize(); opened(); }, e => {
+          }).then(syncSize, e => {
             term.writeln(`\x1b[31mFailed to open terminal: ${e}\x1b[0m`);
           });
         } else if (local) {
@@ -1237,7 +1335,7 @@ const TerminalView = ({
             onOutput: outputChannel(),
           }, 'Open the container terminal').then((r) => {
             if (r === null) { term.writeln(ROOT_CANCELLED); return; }
-            syncSize(); opened();
+            syncSize();
           }, e => {
             term.writeln(`\x1b[31mFailed to attach to container: ${e instanceof Error ? e.message : e}\x1b[0m`);
           });
@@ -1254,7 +1352,7 @@ const TerminalView = ({
               useLocalShell: readUseLocalShell(),
               onOutput: outputChannel(),
             }).then(() => true);
-          }).then((ok) => { if (ok) { syncSize(); opened(); watchForShellReady(); } }, e => {
+          }).then((ok) => { if (ok) { syncSize(); watchForShellReady(); } }, e => {
             term.writeln(`\x1b[31mFailed to open terminal: ${e}\x1b[0m`);
           });
         }
@@ -1271,9 +1369,6 @@ const TerminalView = ({
     // forwarded verbatim because we can't sensibly "Ctrl" a phrase.
     const handleData = (data: string) => {
       if (disabledRef.current) return;
-      // A Wall's line isn't this one's whole any more — unless this is only
-      // the terminal saying it got or lost the focus (for vim, tmux).
-      if (data !== '\x1b[I' && data !== '\x1b[O') markTyped(terminalId);
       markUsed();
       showPasswordButton(false);
       // One write, to this terminal only. Enter in a call of its own could
@@ -1328,6 +1423,7 @@ const TerminalView = ({
         terminalId,
         data: bytes,
       }).catch(console.error);
+      if (!TERMINAL_REPLY.test(data)) broadcastInput(bytes);
       // A local shell keeps no history.
       if (local) return;
 
@@ -1402,7 +1498,7 @@ const TerminalView = ({
       }
     };
     // The mobile key bar's arrow and symbol keys come through here too, so
-    // they're recorded exactly like typed input.
+    // they're broadcast and recorded exactly like typed input.
     inputRef.current = handleData;
     const onDataDisposable = term.onData(handleData);
 
@@ -1500,7 +1596,7 @@ const TerminalView = ({
     // can copy.
     const onWindowBlur = () => { selectionArmed = false; };
     // Every paste reaches the terminal here: the clipboard, xterm's own paste,
-    // and a Wall's Broadcast. No escape sequence or other control character
+    // and the Library. No escape sequence or other control character
     // gets through (see pasteText.ts); the callers clean it first so they can
     // say so and show what will be pasted, and this is the last check.
     const pasteText = (text: string) => {
@@ -1584,8 +1680,8 @@ const TerminalView = ({
       void pasteClipboard(true);
     };
     // One key handler (xterm allows only one):
-    //  - the app's own shortcuts (broadcast on/off, pause) pass by the shell —
-    //    DesktopApp acts on them;
+    //  - the app's own shortcuts (jump to a tab, the AI side pane) pass by
+    //    the shell — the app acts on them;
     //  - Ctrl+Shift+A / Ctrl+Shift+C select all / copy, on the SHIFTED combo
     //    so plain Ctrl+A (start of line) and Ctrl+C (SIGINT) still reach the
     //    shell, as every readline/zle user expects;
@@ -1624,10 +1720,11 @@ const TerminalView = ({
     host.addEventListener('contextmenu', onContextMenu);
     host.addEventListener('paste', onPasteEvent, true);
     // A paste from outside the terminal (see TERMINAL_PASTE): the Library's
-    // commands. A Wall shows this same xterm, so it's taken once.
+    // commands. Only the view that owns the PTY takes it: a Wall tile would
+    // send the text again.
     const onPasteRequest = (e: Event) => {
       const { terminalId: target, text, enter } = (e as CustomEvent<TerminalPaste>).detail;
-      if (target !== terminalId) return;
+      if (attachOnly || target !== terminalId) return;
       pasteRequestRef.current = { enter };
       try {
         pasteText(text);
@@ -1644,12 +1741,22 @@ const TerminalView = ({
     const onResizeDisposable = term.onResize(() => {
       window.clearTimeout(sizeTimer);
       sizeTimer = window.setTimeout(() => {
-        invoke(commands.resize, { terminalId, cols: term.cols, rows: term.rows }).catch(() => {});
+        if (!attachOnly && (wallTiles.get(terminalId) ?? 0) > 0) return;
+        sendPtySize(terminalId, term.cols, term.rows, commands.resize);
       }, PTY_SIZE_SETTLE_MS);
     });
+    // The session tab's view: the Wall tile that set the size has closed.
+    const onWallTileClosed = (e: Event) => {
+      if ((e as CustomEvent<string>).detail !== terminalId) return;
+      if ((wallTiles.get(terminalId) ?? 0) > 0) return;
+      sendPtySize(terminalId, term.cols, term.rows, commands.resize);
+    };
+    if (attachOnly) wallTiles.set(terminalId, (wallTiles.get(terminalId) ?? 0) + 1);
+    else window.addEventListener(WALL_TILE_CLOSED, onWallTileClosed);
 
     // What this view drew of the output goes back (DRAWN_REPORT_MS): one
-    // call while output comes, none when it doesn't. The backend keeps what
+    // call while output comes, none when it doesn't. A Wall tile doesn't
+    // tell; the session tab's view does. The backend keeps what
     // is on its way to this page bounded with it (ssh_manager::Outflow): a
     // stream faster than this window can draw waits there instead of piling
     // up here.
@@ -1667,6 +1774,7 @@ const TerminalView = ({
     const processed = (bytes: number) => {
       lineBudget = LINE_BUDGET;
       charBudget = CHAR_BUDGET;
+      if (attachOnly) return;
       noteTerminalParsed(terminalId, bytes);
       drew(bytes);
     };
@@ -1680,9 +1788,13 @@ const TerminalView = ({
       const w = readyWatchRef.current;
       if (w) { window.clearTimeout(w.quiet); w.quiet = window.setTimeout(shellReady, SHELL_QUIET_MS); }
       // Counted for the freeze watchdog: received, and still to be drawn.
-      // xterm buffers a multibyte sequence split across batches.
-      noteTerminalOutput(terminalId, data.length);
-      if (!local) noteOutput(terminalId, data);
+      // xterm buffers a multibyte sequence split across batches. The same
+      // batch goes to the Wall tiles showing this terminal.
+      if (!attachOnly) {
+        noteTerminalOutput(terminalId, data.length);
+        if (!local) noteOutput(terminalId, data);
+        wallTileOutput.get(terminalId)?.forEach((tile) => tile(data));
+      }
       // In pieces when it's mostly control sequences (writePieces). Each is
       // drawn once xterm has taken it in; also when xterm turned it away (past
       // its own limit), so the count stays true.
@@ -1701,6 +1813,12 @@ const TerminalView = ({
         showPasswordButton(looksLikePasswordPrompt(recentOutputRef.current));
       } catch { /* decode hiccup on a split multibyte chunk — ignore */ }
     };
+    const fromOwner = (data: Uint8Array) => outputRef.current?.(data);
+    if (attachOnly) {
+      const tiles = wallTileOutput.get(terminalId) ?? new Set();
+      tiles.add(fromOwner);
+      wallTileOutput.set(terminalId, tiles);
+    }
 
     // Coalesce resize bursts via rAF, and skip the refit on hidden tabs
     // so SIGWINCH doesn't leak to background PTYs (the become-visible
@@ -1741,7 +1859,7 @@ const TerminalView = ({
       if (term.options.theme !== theme) {
         term.options.theme = theme;
         setBackground(theme.background);
-        // A Wall tile showing this terminal repaints its padding to match.
+        // The AI side pane showing this terminal repaints its padding to match.
         terminalStateChanged();
       }
       const ratio = readMinContrast() ? MIN_CONTRAST_RATIO : 1;
@@ -1832,29 +1950,23 @@ const TerminalView = ({
     };
     window.visualViewport?.addEventListener('resize', onVvResize);
 
-    // A server terminal can be shown in a Wall and typed to from there.
-    // Whether its xterm has the keyboard, by the focus events xterm itself
-    // goes by (see `moved`).
+    // A terminal can be moved into the AI side pane. Whether its xterm has
+    // the keyboard, by the focus events xterm itself goes by (see `moved`).
     let focused = false;
     const onTextFocus = () => { focused = true; };
     const onTextBlur = () => { focused = false; };
     term.textarea?.addEventListener('focus', onTextFocus);
     term.textarea?.addEventListener('blur', onTextBlur);
-    // Server terminals, for Walls; and an AI tab's, which the AI side pane
-    // shows beside a server tab. Other Home shells stay in Home.
-    const dockable = !local || !!local.shell?.startsWith('ai:');
+    // An AI tab's terminal, which the AI side pane shows beside a server tab;
+    // and server terminals, which the pane gives the keyboard back to. Other
+    // Home shells stay in Home, and a Wall tile's mirror is never moved.
+    const dockable = !attachOnly && (!local || !!local.shell?.startsWith('ai:'));
     const unregister = !dockable ? null : registerTerminal({
       terminalId,
       sessionId,
       term,
       host: dock,
       home,
-      live: () => !disabledRef.current && ptyLiveRef.current,
-      paste: (text) => {
-        if (disabledRef.current || !ptyLiveRef.current) return false;
-        pasteText(text);
-        return true;
-      },
       moved: (docked) => {
         dockedRef.current = docked;
         setLooking(terminalId, lookingNow());
@@ -1866,7 +1978,7 @@ const TerminalView = ({
           term.textarea.dispatchEvent(new FocusEvent('blur'));
         }
         // Refit, redraw and take or give up the GPU a few terminals per
-        // frame, not all of a Wall's at once (terminalDock, #127).
+        // frame, not all at once (terminalDock, #127).
         settleAfterMove(terminalId, () => {
           updateGpu();
           fitTerminal();
@@ -1875,7 +1987,7 @@ const TerminalView = ({
       },
     });
 
-    const unwatch = local ? null : watchTerminal(terminalId, sessionId);
+    const unwatch = local || attachOnly ? null : watchTerminal(terminalId, sessionId);
     setLooking(terminalId, lookingNow());
 
     return () => {
@@ -1883,7 +1995,6 @@ const TerminalView = ({
       unregister?.();
       term.textarea?.removeEventListener('focus', onTextFocus);
       term.textarea?.removeEventListener('blur', onTextBlur);
-      ptyLiveRef.current = false;
       window.clearTimeout(openTimer);
       stopReadyWatch();
       fontDisposed = true;
@@ -1909,6 +2020,7 @@ const TerminalView = ({
       window.visualViewport?.removeEventListener('resize', onVvResize);
       if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
       outputRef.current = null;
+      wallTileOutput.get(terminalId)?.delete(fromOwner);
       highlighter.dispose();
       if (highlightRef.current === highlighter) highlightRef.current = null;
       searchAddon.dispose();
@@ -1916,13 +2028,25 @@ const TerminalView = ({
       webgl?.dispose();
       releaseGpu(gpuSlot);
       gpuUpdateRef.current = () => {};
-      forgetTerminal(terminalId);
       term.dispose();
       dock.remove();
       if (dockElRef.current === dock) dockElRef.current = null;
       setDockEl((cur) => (cur === dock ? null : cur));
-      invoke(commands.close, { terminalId }).catch(console.error);
-      closeOwn();
+      // Only the PTY owner tears the backend PTY down on unmount.
+      // Attach-only viewers unmount without closing so the primary
+      // xterm (in the session tab) keeps working.
+      if (!attachOnly) {
+        forgetTerminal(terminalId);
+        invoke(commands.close, { terminalId }).catch(console.error);
+        closeOwn();
+        window.removeEventListener(WALL_TILE_CLOSED, onWallTileClosed);
+        ptySizes.delete(terminalId);
+      } else {
+        const left = (wallTiles.get(terminalId) ?? 1) - 1;
+        if (left > 0) wallTiles.set(terminalId, left);
+        else wallTiles.delete(terminalId);
+        window.dispatchEvent(new CustomEvent(WALL_TILE_CLOSED, { detail: terminalId }));
+      }
     };
   }, [sessionId, terminalId]);
 
@@ -1936,8 +2060,8 @@ const TerminalView = ({
         ref={terminalRef}
         className="flex-1 min-h-0 w-full overflow-hidden select-text"
       />
-      {/* Over the terminal, inside what a Wall moves (dockEl), so they go
-          with it into a tile. */}
+      {/* Over the terminal, inside what the AI side pane moves (dockEl), so
+          they go with it. */}
       {dockEl && createPortal(
         <>
           {/* Search chip — floats above xterm, so it never displaces the
@@ -2079,7 +2203,6 @@ const TerminalView = ({
           if (disabledRef.current) return;
           const payload = execute ? command + "\r" : command;
           const bytes = Array.from(new TextEncoder().encode(payload));
-          markTyped(terminalId);
           invoke(commands.write, { terminalId, data: bytes }).catch(console.error);
           // Mirror the inserted command into the local buffer so the next
           // Enter (if the user typed one manually) still logs correctly.

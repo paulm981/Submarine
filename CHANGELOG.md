@@ -9,6 +9,8 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Broadcast works as in the original project again.** The Broadcast button in the title bar opens a list: tick the sessions, turn it on, and what you type in any of them goes to all of them. The Wall is the original project's pinboard again: right-click a tab and pin its terminal there. The fork's own Walls are gone (saved walls, pausing a server, paste and Send to all, Ctrl+Shift+B), which keeps syncing with the original project simple. Walls you saved stay in your profile, unused. ([#162](https://github.com/paulm981/Submarine/issues/162))
+
 ## v0.4.0-fork.34
 
 - **The AI can run one command on many servers, and you allow it once.** In a Broadcast of 12 servers, asking the AI to check disk space everywhere now shows one card, Allow on 12 servers, instead of 12. It runs without asking only where every server's settings say it may; otherwise every server waits on the one card. Allow everything on these servers until this AI tab closes covers them all. ([#158](https://github.com/paulm981/Submarine/issues/158))

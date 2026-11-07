@@ -14,14 +14,13 @@ import { PendingCard, levelOf } from "./AiPanel";
 // The AI side pane (#100): an AI tab beside the server tab you're working in,
 // so working with it doesn't mean going back and forth to Home.
 //
-// It follows sharing: on a server tab shared with an AI tab, or a Wall with a
-// server shared with one, it's on the right, open or folded to a thin bar as
+// It follows sharing: on a server tab shared with an AI tab, it's on the right, open or folded to a thin bar as
 // you last left it (Ctrl+Shift+L, or a click). Anywhere else there's none,
 // unless the title bar's button opens it there; it then stays until it's
 // closed or you leave that tab.
 //
-// It shows the AI tab's own terminal, moved out of Home (src/ui/terminalDock.ts,
-// as a Wall borrows a server's terminal) while the pane is open and back when
+// It shows the AI tab's own terminal, moved out of Home (src/ui/terminalDock.ts)
+// while the pane is open and back when
 // it folds or closes, or you go to Home. The conversation is only ever in one
 // place. The header says which AI tab it is, whether this tab is shared with
 // it, and has its requests' Allow and Deny — the AI panel's own cards, with
@@ -38,13 +37,11 @@ import { PendingCard, levelOf } from "./AiPanel";
 
 /// What's on screen, as the pane needs it (DesktopApp).
 export interface AiPaneView {
-  /// The view on screen (DesktopApp's activeView): "home", a Wall's id, a
-  /// server tab's session id, or a page such as Settings.
+  /// The view on screen (DesktopApp's activeView): "home", a server tab's
+  /// session id, or a page such as Settings.
   view: string;
   /// The server tab on screen, if one is.
   session: { id: string; name: string; ssh: boolean; connected: boolean; terminalId: string } | null;
-  /// The Wall on screen, if one is: the sessions on it.
-  wallSessions: string[] | null;
 }
 
 interface Model {
@@ -68,11 +65,7 @@ const useModel = (v: AiPaneView): Model => {
   const ai = useAi();
   const pane = useAiPane();
   const allowed = !IS_ANDROID && ai.enabled && v.view !== "home";
-  const relevant = v.session
-    ? sharedWith(ai, v.session.id)
-    : v.wallSessions
-      ? ai.tabs.filter((t) => t.servers.some((s) => v.wallSessions!.includes(s.session_id)))
-      : [];
+  const relevant = v.session ? sharedWith(ai, v.session.id) : [];
   const starting = pane.starting && !ai.tabs.some((t) => t.id === pane.starting!.id)
     ? { id: pane.starting.id, label: pane.starting.label, servers: [], intruder_at: null }
     : null;
@@ -375,10 +368,6 @@ const ShareLine = ({ v, tab, shared, starting, onShare, onUnshare }: {
         Share
       </button>
     );
-  } else if (v.wallSessions) {
-    const n = new Set(v.wallSessions.filter((sid) => tab.servers.some((s) => s.session_id === sid))).size;
-    const all = new Set(v.wallSessions).size;
-    text = `${n} of ${all} server${all === 1 ? "" : "s"} on this Wall ${n === 1 ? "is" : "are"} shared with ${tab.label}.`;
   } else {
     text = `Nothing here is shared with ${tab.label}.`;
   }

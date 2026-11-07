@@ -13,7 +13,7 @@ export const MAX_GPU = 12;
 
 export interface GpuHolder {
   /** Whether the terminal is on screen now (its tab in front, a pane of the
-   *  split, or a Wall's tile). */
+   *  split, a Wall's tile, or the AI side pane). */
   onScreen: () => boolean;
   /** Give the GPU up: dispose the WebGL addon and draw with the DOM. */
   evict: () => void;

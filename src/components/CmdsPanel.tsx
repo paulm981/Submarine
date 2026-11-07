@@ -1,7 +1,6 @@
 import { Fragment, useState, useEffect, useRef } from "react";
 import { parseCommandScope, scopeMatches, serverScopeIds } from "../util/commandScope";
 import { invoke } from "@tauri-apps/api/core";
-import { dockedTerminal, markTyped } from "../ui/terminalDock";
 import { Play, RefreshCw, Search, X, Terminal, StickyNote, ClipboardCopy, ChevronDown, ChevronRight, Pencil, Check, Server } from "lucide-react";
 import { useConfirm } from "../ui/confirm";
 import { pasteIntoTerminal, withoutPasteControls } from "../util/pasteText";
@@ -287,8 +286,6 @@ export const CmdsPanel = ({ activeTab, onClose, headerActions, serverId, serverN
       });
       if (!ok) return;
     }
-    // A Wall's line isn't this one's whole any more.
-    markTyped(activeTab);
     pasteIntoTerminal({ terminalId: activeTab, text: clean, enter: execute });
   };
 

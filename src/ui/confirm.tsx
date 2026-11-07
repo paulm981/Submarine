@@ -92,23 +92,7 @@ export interface ConfirmOptions {
   safeDefault?: boolean;
 }
 
-// A confirm with a third button between Cancel and OK. Returned from
-// useChoice(): it resolves to the button that closed it — "ok", "alt", or
-// null for Cancel, Esc, ✕ and the backdrop — so the caller hears about the
-// third button only once the dialog has really closed.
-export interface ChoiceOptions extends ConfirmOptions {
-  altLabel: string;
-  /** The third button is red (it closes or deletes something); otherwise a
-   *  plain grey one. `destructive` is for the OK button only. */
-  altDestructive?: boolean;
-  /** Shows a "Remember my answer" box; called with the button that closed
-   *  the dialog when it's ticked and the answer is OK or the third button
-   *  (the caller saves it as its setting). Cancel remembers nothing. */
-  remember?: (answer: "ok" | "alt") => void;
-}
-export type ChoiceResult = "ok" | "alt" | null;
-
-type Resolver = (value: ChoiceResult) => void;
+type Resolver = (value: boolean) => void;
 
 // File-conflict modal. Returned from useOverwritePrompt(). The caller picks
 // one of five outcomes; in a batch operation, the "all" variants are sticky
@@ -150,13 +134,12 @@ export interface TextPromptOptions {
 }
 
 const ConfirmContext = createContext<((opts: ConfirmOptions | string) => Promise<boolean>) | null>(null);
-const ChoiceContext = createContext<((opts: ChoiceOptions) => Promise<ChoiceResult>) | null>(null);
 const OverwriteContext = createContext<((opts: OverwritePromptOptions) => Promise<OverwriteChoice>) | null>(null);
 const TextPromptContext = createContext<((opts: TextPromptOptions) => Promise<string | null>) | null>(null);
 
 // A request for a prompt, waiting for its turn or on screen.
 type Pending =
-  | { id: number; kind: "confirm"; opts: ConfirmOptions & Partial<ChoiceOptions>; resolve: Resolver }
+  | { id: number; kind: "confirm"; opts: ConfirmOptions; resolve: Resolver }
   | { id: number; kind: "overwrite"; opts: OverwritePromptOptions; resolve: (c: OverwriteChoice) => void }
   | { id: number; kind: "text"; opts: TextPromptOptions; resolve: (v: string | null) => void };
 
@@ -165,9 +148,9 @@ type Pending =
 // the prompt before it and must not answer this one too.
 const CHAIN_GRACE_MS = 500;
 
-const sameConfirm = (a: ConfirmOptions & Partial<ChoiceOptions>, b: ConfirmOptions & Partial<ChoiceOptions>) =>
+const sameConfirm = (a: ConfirmOptions, b: ConfirmOptions) =>
   a.title === b.title && a.message === b.message && a.okLabel === b.okLabel &&
-  a.cancelLabel === b.cancelLabel && !!a.destructive === !!b.destructive && a.altLabel === b.altLabel;
+  a.cancelLabel === b.cancelLabel && !!a.destructive === !!b.destructive;
 
 export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => {
   // Every request, of any kind, waits in one line, and only the first in line
@@ -188,8 +171,7 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
   const chainedAtRef = useRef(-Infinity);
   const [, repaint] = useReducer((n: number) => n + 1, 0);
   const [tpValue, setTpValue] = useState("");
-  // The confirm's "Don't ask again" or "Remember my answer" box, unticked
-  // for each new confirm.
+  // The confirm's "Don't ask again" box, unticked for each new confirm.
   const [dontAsk, setDontAsk] = useState(false);
   const [tpError, setTpError] = useState<string | null>(null);
 
@@ -221,25 +203,19 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
     repaint();
   }, [primeText]);
 
-  const choice = useCallback((opts: ConfirmOptions & Partial<ChoiceOptions>) => {
-    return new Promise<ChoiceResult>((resolve) => {
+  const confirm = useCallback((opts: ConfirmOptions | string) => {
+    return new Promise<boolean>((resolve) => {
+      const normalized = typeof opts === "string" ? { message: opts } : opts;
       // The same question already in line (the window asked to close again
       // while "Close Submarine?" is up) is not asked twice: the repeat is
       // answered "no" and the one already waiting stands.
-      if (queueRef.current.some((p) => p.kind === "confirm" && sameConfirm(p.opts, opts))) {
-        resolve(null);
+      if (queueRef.current.some((p) => p.kind === "confirm" && sameConfirm(p.opts, normalized))) {
+        resolve(false);
         return;
       }
-      enqueue({ id: nextIdRef.current++, kind: "confirm", opts, resolve });
+      enqueue({ id: nextIdRef.current++, kind: "confirm", opts: normalized, resolve });
     });
   }, [enqueue]);
-
-  // A plain confirm is a choice with no third button: OK is true, anything
-  // else false.
-  const confirm = useCallback(async (opts: ConfirmOptions | string) => {
-    const normalized = typeof opts === "string" ? { message: opts } : opts;
-    return (await choice(normalized)) === "ok";
-  }, [choice]);
 
   const overwritePrompt = useCallback((opts: OverwritePromptOptions) => {
     return new Promise<OverwriteChoice>((resolve) => {
@@ -267,10 +243,9 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
     return true;
   };
 
-  const close = (value: ChoiceResult) => {
+  const close = (value: boolean) => {
     if (state && advance(state)) {
-      if (value === "ok" && dontAsk) state.opts.dontAskAgain?.();
-      if (value !== null && dontAsk) state.opts.remember?.(value);
+      if (value && dontAsk) state.opts.dontAskAgain?.();
       state.resolve(value);
     }
   };
@@ -293,20 +268,20 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
   // Esc cancels, Enter confirms — matches the native dialog conventions so
   // muscle memory keeps working. A key still held down from before (auto
   // repeat) answers nothing: it was not pressed for this prompt. When focus
-  // is on one of the panel's own controls (Cancel, ✕, a third button, the
-  // "Don't ask again" box), Enter does what that control does natively, so
+  // is on one of the panel's own controls (Cancel, ✕, the "Don't ask again"
+  // box), Enter does what that control does natively, so
   // tabbing to Cancel and pressing Enter cancels. Only an Enter with focus on
   // none of them takes the default: OK, or Cancel in a prompt whose default
   // is Cancel (`safeDefault`), so an Enter alone never says yes there.
   useEffect(() => {
     if (!state) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { e.preventDefault(); if (!e.repeat) close(null); }
+      if (e.key === "Escape") { e.preventDefault(); if (!e.repeat) close(false); }
       if (e.key === "Enter")  {
         if (e.repeat) { e.preventDefault(); return; }
         if (isPanelControl(e.target, confirmPanelRef.current)) return;
         e.preventDefault();
-        close(state.opts.safeDefault ? null : "ok");
+        close(!state.opts.safeDefault);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -349,7 +324,6 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
 
   return (
     <ConfirmContext.Provider value={confirm}>
-     <ChoiceContext.Provider value={choice}>
      <OverwriteContext.Provider value={overwritePrompt}>
       <TextPromptContext.Provider value={textPrompt}>
       {children}
@@ -420,7 +394,7 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
       {state && createPortal(
         <div key={state.id}
              className="fixed inset-0 z-[9999] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
-             onClick={() => close(null)}>
+             onClick={() => close(false)}>
           <div ref={confirmPanelRef}
                role="dialog"
                aria-modal="true"
@@ -434,7 +408,7 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
                   {state.opts.title || (state.opts.destructive ? "Confirm action" : "Are you sure?")}
                 </span>
               </div>
-              <button aria-label="Close" onClick={() => close(null)} className="text-zinc-500 hover:text-white shrink-0">
+              <button aria-label="Close" onClick={() => close(false)} className="text-zinc-500 hover:text-white shrink-0">
                 <X size={12} />
               </button>
             </div>
@@ -443,30 +417,19 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
             <p className="text-[12px] text-zinc-300 leading-relaxed mb-4 whitespace-pre-wrap break-words max-h-[60vh] overflow-y-auto custom-scrollbar">
               {state.opts.message}
             </p>
-            {/* With three buttons the box has a line of its own above them. */}
-            <div className="flex flex-wrap items-center justify-end gap-2">
-              {(state.opts.dontAskAgain || state.opts.remember) && (
-                <label className={`mr-auto flex items-center gap-2 text-[11px] text-zinc-400 cursor-pointer select-none ${state.opts.altLabel ? "basis-full mb-1" : ""}`}>
+            <div className="flex items-center justify-end gap-2">
+              {state.opts.dontAskAgain && (
+                <label className="mr-auto flex items-center gap-2 text-[11px] text-zinc-400 cursor-pointer select-none">
                   <input type="checkbox" className="accent-primary" checked={dontAsk} onChange={(e) => setDontAsk(e.target.checked)} />
-                  {state.opts.remember ? "Remember my answer" : "Don't ask again"}
+                  Don't ask again
                 </label>
               )}
-              <button onClick={() => close(null)}
+              <button onClick={() => close(false)}
                       data-default-focus={state.opts.safeDefault ? true : undefined}
                       className="px-3 h-8 rounded text-[11px] font-bold uppercase tracking-wider bg-white/[0.04] border border-white/10 text-zinc-300 hover:bg-white/[0.08] hover:text-white">
                 {state.opts.cancelLabel || "Cancel"}
               </button>
-              {state.opts.altLabel && (
-                <button onClick={() => close("alt")}
-                        className={`px-3 h-8 rounded text-[11px] font-bold uppercase tracking-wider border ${
-                          state.opts.altDestructive
-                            ? "bg-rose-500/15 border-rose-500/40 text-rose-300 hover:bg-rose-500/25"
-                            : "bg-white/[0.04] border-white/10 text-zinc-300 hover:bg-white/[0.08] hover:text-white"
-                        }`}>
-                  {state.opts.altLabel}
-                </button>
-              )}
-              <button onClick={() => close("ok")}
+              <button onClick={() => close(true)}
                       data-default-focus={state.opts.safeDefault ? undefined : true}
                       className={`px-3 h-8 rounded text-[11px] font-bold uppercase tracking-wider border ${
                         state.opts.destructive
@@ -531,7 +494,6 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
       )}
       </TextPromptContext.Provider>
      </OverwriteContext.Provider>
-     </ChoiceContext.Provider>
     </ConfirmContext.Provider>
   );
 };
@@ -545,12 +507,6 @@ export const useTextPrompt = () => {
 export const useConfirm = () => {
   const ctx = useContext(ConfirmContext);
   if (!ctx) throw new Error("useConfirm must be used within <ConfirmProvider>");
-  return ctx;
-};
-
-export const useChoice = () => {
-  const ctx = useContext(ChoiceContext);
-  if (!ctx) throw new Error("useChoice must be used within <ConfirmProvider>");
   return ctx;
 };
 
