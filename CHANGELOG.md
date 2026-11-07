@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Codex starts from Home's menu, beside Claude Code.** With AI tools on in Settings, Home's menu lists each AI tool you have installed. Codex opens already connected to Submarine, the same way: it never gets a key or a password, and Submarine asks you before each command it runs on a server. Settings › AI tools shows which are installed. ([#117](https://github.com/paulm981/Submarine/issues/117))
+
+## v0.4.0-fork.31
+
 - **Shared folders in Remote Desktop can't be left through a link, on macOS and Linux.** Every file the server opens, lists, renames or deletes is now reached from the shared folder one folder at a time, refusing any link on the way. Before, a link that appeared just after Submarine's check (from something else writing in the folder) would have been followed. ([#132](https://github.com/paulm981/Submarine/issues/132))
 
 ## v0.4.0-fork.30
