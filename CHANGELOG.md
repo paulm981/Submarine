@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.44
+
+- **The AI can copy files to and from many servers at once.** It asks once, on one card that shows what goes where, how many files and how big, and whether files already there are replaced. Files come to this computer only into a folder you add in Settings › AI tools, each server's in a folder of its own, and never replace what's there. ([#159](https://github.com/paulm981/Submarine/issues/159))
+
 ## v0.4.0-fork.42
 
 - **Push and pull files on many servers at once.** Right-click a tab, or servers in the session tree, and pick Push files to servers… or Pull files from servers…. A summary shows what goes where and what's already there before anything moves: skip those or replace them, once for the whole run. Four servers copy at a time, each with its own progress row, and Stop stops them all. ([#159](https://github.com/paulm981/Submarine/issues/159))
