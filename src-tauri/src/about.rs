@@ -243,44 +243,9 @@ fn newest_release(releases: Vec<GhRelease>) -> Option<(String, String)> {
     best
 }
 
-impl UpdateInfo {
-    fn none(current: String) -> Self {
-        UpdateInfo {
-            current,
-            latest: None,
-            has_update: false,
-            release_url: None,
-            main_ahead: None,
-            main_url: None,
-            upstream_ahead: None,
-            upstream_url: None,
-        }
-    }
-}
-
-/// The commits the fork's main has that this build doesn't (for a build made
-/// from source), and — when asked — the commits the original project's main
-/// has that the fork's doesn't. Best effort, like the rest: None when GitHub
-/// couldn't tell, or it wasn't asked.
-async fn commit_counts(client: &reqwest::Client, watch_upstream: bool) -> (Option<u64>, Option<u64>) {
-    let upstream_owner = UPSTREAM_REPO.split('/').next().unwrap_or(UPSTREAM_REPO);
-    let upstream_head = format!("{}:main", upstream_owner);
-    let main = async {
-        if BUILD_COMMIT.is_empty() {
-            None
-        } else {
-            ahead_by(client, BUILD_COMMIT, "main").await
-        }
-    };
-    let upstream = async {
-        if watch_upstream {
-            ahead_by(client, "main", &upstream_head).await
-        } else {
-            None
-        }
-    };
-    tokio::join!(main, upstream)
-}
+// The fork's own, in about/commit_counts.rs (#136).
+mod commit_counts;
+pub(crate) use commit_counts::*;
 
 /// True when `a > b` under dotted-number compare: "0.2.0" > "0.1.5",
 /// "1.0.0" > "0.9.9". The fork's releases of a version come after it, in

@@ -488,6 +488,42 @@ pub(crate) fn sweep_session_temp(session_id: &str) {
     }
 }
 
+/// Moves every Live Edit copy in another run's temp root
+/// (`sftp_<session>/<hash>/<file>`) to `unsent_edits_dir`, and says so.
+/// Only real folders and regular files: a link is never followed.
+pub(crate) fn keep_live_edit_copies_of(root: &Path) {
+    let real_dirs = |dir: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|rd| rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).collect())
+            .unwrap_or_default()
+    };
+    let Some(folder) = unsent_edits_dir() else { return };
+    let mut kept = Vec::new();
+    for session in real_dirs(root) {
+        if !session.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("sftp_")) {
+            continue;
+        }
+        for copy_dir in real_dirs(&session) {
+            let Ok(files) = std::fs::read_dir(&copy_dir) else { continue };
+            for file in files.flatten() {
+                if !file.file_type().is_ok_and(|t| t.is_file()) {
+                    continue;
+                }
+                if kept.is_empty() && make_unsent_edits_dir(&folder).is_err() {
+                    return;
+                }
+                let name = file.file_name().to_string_lossy().into_owned();
+                if let Some(dest) = move_to_free_name(&file.path(), &folder, &name) {
+                    kept.push(dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name));
+                }
+            }
+        }
+    }
+    if !kept.is_empty() {
+        report_kept(&folder, &kept);
+    }
+}
+
 // Every call from the original project's code into this file (fork_hooks.rs):
 // a sync that drops one, or the lines that bring the file in, fails here.
 #[cfg(test)]
@@ -505,11 +541,8 @@ mod hook_tests {
                 ("disconnect_session", "sweep_session_temp(", 1),
                 ("teardown_connection_key", "sweep_session_temp(", 1),
                 ("teardown_profile", "sweep_session_temp(", 1),
-                ("keep_live_edit_copies_of", "make_unsent_edits_dir(", 1),
-                ("keep_live_edit_copies_of", "move_to_free_name(", 1),
-                ("keep_live_edit_copies_of", "report_kept(", 1),
-                ("keep_live_edit_copies_of", "= unsent_edits_dir()", 1),
                 ("remove_own_temp", "keep_unsent_edits(", 1),
+                ("sweep_old_temp_roots", "keep_live_edit_copies_of(", 1),
                 ("sftp_open_remote_file", "live_edit_copies(", 3),
                 ("sftp_open_remote_file", "live_edit_watchers(", 2),
                 ("sftp_open_remote_file", "sha256_of(", 2),

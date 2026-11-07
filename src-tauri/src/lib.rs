@@ -89,6 +89,16 @@ mod diagnostics;
 use diagnostics::*;
 mod synced_tunnels;
 use synced_tunnels::*;
+mod sync_diff;
+use sync_diff::*;
+mod server_look;
+use server_look::*;
+mod clone_server;
+use clone_server::*;
+#[cfg(windows)]
+mod windows_clipboard;
+#[cfg(windows)]
+use windows_clipboard::*;
 #[cfg(test)]
 mod fork_hooks;
 #[cfg(target_os = "android")]
@@ -2703,59 +2713,6 @@ async fn profile_sync_stats(
     let diff = remote.map(|server| sync_diff(&local, &server, &server_names));
 
     Ok(ProfileSyncStats { total_records, vault_bytes, recent_edits, diff, devices, unreadable })
-}
-
-/// How this vault's records compare with a sync partner's, item by item —
-/// each side's newest stamp per item (a live row or its tombstone).
-fn sync_diff(
-    local: &[SyncRecord],
-    server: &[SyncRecord],
-    server_names: &std::collections::HashMap<String, String>,
-) -> SyncDiff {
-    use std::collections::HashMap;
-    fn newest(records: &[SyncRecord]) -> HashMap<&str, (&str, &str)> {
-        let mut m: HashMap<&str, (&str, &str)> = HashMap::new();
-        // The reserved escrow record is bookkeeping, not user data.
-        for r in records.iter().filter(|r| r.entity_type != ESCROW_ETYPE) {
-            let e = m.entry(r.uuid.as_str()).or_insert((r.updated_at.as_str(), r.entity_type.as_str()));
-            if r.updated_at.as_str() > e.0 {
-                *e = (r.updated_at.as_str(), r.entity_type.as_str());
-            }
-        }
-        m
-    }
-    let local_map = newest(local);
-    let server_map = newest(server);
-
-    let mut in_sync = 0usize;
-    let mut needs_push = 0usize;
-    let mut needs_pull = 0usize;
-    let mut out: Vec<String> = Vec::new();
-
-    let mut uuids: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    uuids.extend(local_map.keys());
-    uuids.extend(server_map.keys());
-    for u in uuids {
-        let l = local_map.get(u).map(|(ua, _)| *ua).unwrap_or("");
-        let s = server_map.get(u).map(|(ua, _)| *ua).unwrap_or("");
-        let is_server = local_map.get(u).map(|(_, et)| *et == "servers").unwrap_or(false)
-            || server_map.get(u).map(|(_, et)| *et == "servers").unwrap_or(false);
-        if l == s {
-            in_sync += 1;
-        } else {
-            if l > s {
-                needs_push += 1;
-            } else {
-                needs_pull += 1;
-            }
-            if is_server && out.len() < 20 {
-                if let Some(name) = server_names.get(u) {
-                    out.push(name.clone());
-                }
-            }
-        }
-    }
-    SyncDiff { in_sync, needs_push, needs_pull, out_of_sync_nodes: out }
 }
 
 // ===========================================================================
@@ -9043,53 +9000,6 @@ async fn set_server_run_on_connect(state: tauri::State<'_, DbState>, id: i32, va
     Ok(())
 }
 
-/// Keep only what a scheme id can contain (lowercase letters, digits, dashes),
-/// at most 64 of them; empty = none.
-fn clean_scheme_id(raw: &str) -> Option<String> {
-    let id: String = raw.trim().to_ascii_lowercase().chars().filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-').take(64).collect();
-    (!id.is_empty()).then_some(id)
-}
-
-/// Set a server's own scheme or highlight set (`column`, one of
-/// NULL_IS_UNKNOWN). `None`, the app's default, is stored as "": a NULL
-/// there means "not known here", which isn't sent to the other devices.
-fn set_server_look(conn: &Connection, column: &str, id: i32, value: Option<&str>) -> rusqlite::Result<usize> {
-    debug_assert!(NULL_IS_UNKNOWN.contains(&column));
-    let value = value.and_then(clean_scheme_id).unwrap_or_default();
-    // No write when nothing changed: every save of the edit panel calls this,
-    // and an UPDATE would restamp the row for sync even with the same value.
-    // Nor is a NULL turned into "": the edit panel shows the default for
-    // both, and saving it isn't a choice made here.
-    conn.execute(
-        &format!("UPDATE servers SET {column}=?1 WHERE id=?2 AND COALESCE({column}, '') IS NOT ?1"),
-        rusqlite::params![value, id],
-    )
-}
-
-/// A server's own terminal color scheme, or `None` for the app's default.
-/// Its own command, like set_server_run_on_connect.
-#[tauri::command]
-async fn set_server_terminal_theme(state: tauri::State<'_, DbState>, id: i32, value: Option<String>) -> Result<(), String> {
-    let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
-    let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-    set_server_look(conn, "terminal_theme", id, value.as_deref()).map_err(|e| format!("[DATABASE] SERVER_THEME_FAILED: {}", e))?;
-    drop(conn_guard);
-    save_vault_internal(&state)?;
-    Ok(())
-}
-
-/// A server's own highlight set, or `None` for this device's. Its own
-/// command, like set_server_terminal_theme.
-#[tauri::command]
-async fn set_server_highlight(state: tauri::State<'_, DbState>, id: i32, value: Option<String>) -> Result<(), String> {
-    let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
-    let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-    set_server_look(conn, "highlight", id, value.as_deref()).map_err(|e| format!("[DATABASE] SERVER_HIGHLIGHT_FAILED: {}", e))?;
-    drop(conn_guard);
-    save_vault_internal(&state)?;
-    Ok(())
-}
-
 /// ProxyJump target for a node: `Some(other_server_id)` to bounce through that
 /// server, or `None` to connect directly. Written through its own command
 /// (like set_server_notes / set_server_run_on_connect) so it stays out of
@@ -9160,52 +9070,6 @@ async fn clone_server(state: tauri::State<'_, DbState>, id: i32) -> Result<i64, 
     drop(conn_guard);
     save_vault_internal(&state)?;
     Ok(new_id)
-}
-
-/// The copy itself, all or nothing: when any step fails nothing of it stays.
-/// Undone in a savepoint rather than by deleting the copy afterwards, as a
-/// delete would leave a sync tombstone for a server no other device ever saw.
-fn clone_server_row(conn: &rusqlite::Connection, id: i32) -> Result<i64, String> {
-    conn.execute("SAVEPOINT clone_server", [])
-        .map_err(|e| format!("[DATABASE] SERVER_CLONE_FAILED: {}", e))?;
-    let result = (|| {
-        let affected = conn.execute(
-            "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, run_on_connect_every, jump_host_id, terminal_theme, highlight, protocol)
-             SELECT name || ' (copy)', host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, 0, mirrors, color, notes, run_on_connect, run_on_connect_every, jump_host_id, terminal_theme, highlight, protocol
-             FROM servers WHERE id = ?1",
-            rusqlite::params![id],
-        ).map_err(|e| format!("[DATABASE] SERVER_CLONE_FAILED: {}", e))?;
-        if affected == 0 {
-            return Err(format!("[DATABASE] SERVER_CLONE_FAILED: no row with id {}", id));
-        }
-        let new_id = conn.last_insert_rowid();
-        // Place the clone at the bottom of its folder's manual order (the INSERT
-        // above doesn't copy `position`, so without this it would default to 0 and
-        // jump to the top). Same append logic as add_server, folder taken from the
-        // clone's own row.
-        let _ = conn.execute(
-            "UPDATE servers SET position = COALESCE((SELECT MAX(position) FROM servers s2 WHERE s2.id != servers.id AND s2.folder_id IS servers.folder_id), -1) + 1 WHERE id = ?1",
-            rusqlite::params![new_id],
-        );
-        // What the original wasn't allowed to run yet (a shared profile's held
-        // commands and forwards) stays held on the copy, so duplicating isn't a
-        // way around the approval. See approvals::copy_held. A duplicate that
-        // came without its held entries would run what the original couldn't,
-        // so a failure here takes the copy back too.
-        approvals::copy_held(conn, id as i64, new_id)?;
-        Ok(new_id)
-    })();
-    match result {
-        Ok(new_id) => {
-            conn.execute("RELEASE clone_server", [])
-                .map_err(|e| format!("[DATABASE] SERVER_CLONE_FAILED: {}", e))?;
-            Ok(new_id)
-        }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK TO clone_server; RELEASE clone_server;");
-            Err(e)
-        }
-    }
 }
 
 #[tauri::command]
@@ -23034,42 +22898,6 @@ fn sweep_old_temp_roots(temp: &Path, age: std::time::Duration) {
     }
 }
 
-/// Moves every Live Edit copy in another run's temp root
-/// (`sftp_<session>/<hash>/<file>`) to `unsent_edits_dir`, and says so.
-/// Only real folders and regular files: a link is never followed.
-fn keep_live_edit_copies_of(root: &Path) {
-    let real_dirs = |dir: &Path| -> Vec<PathBuf> {
-        std::fs::read_dir(dir)
-            .map(|rd| rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).collect())
-            .unwrap_or_default()
-    };
-    let Some(folder) = unsent_edits_dir() else { return };
-    let mut kept = Vec::new();
-    for session in real_dirs(root) {
-        if !session.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("sftp_")) {
-            continue;
-        }
-        for copy_dir in real_dirs(&session) {
-            let Ok(files) = std::fs::read_dir(&copy_dir) else { continue };
-            for file in files.flatten() {
-                if !file.file_type().is_ok_and(|t| t.is_file()) {
-                    continue;
-                }
-                if kept.is_empty() && make_unsent_edits_dir(&folder).is_err() {
-                    return;
-                }
-                let name = file.file_name().to_string_lossy().into_owned();
-                if let Some(dest) = move_to_free_name(&file.path(), &folder, &name) {
-                    kept.push(dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name));
-                }
-            }
-        }
-    }
-    if !kept.is_empty() {
-        report_kept(&folder, &kept);
-    }
-}
-
 /// The most a remote file read whole into memory may be: live-edit opens the
 /// file in an editor and drag stages it, both for ordinary files a person
 /// edits or drags, so a huge or endless one (a 6 GB image, a broken server's
@@ -23997,35 +23825,6 @@ struct ImportedHost {
     /// A telnet session (PuTTY's): imported as a telnet server.
     #[serde(default)]
     telnet: bool,
-}
-
-/// What the pasted-import parser found: the hosts, and a line about the
-/// sessions it can't bring in (MobaXterm's VNC, serial, …).
-#[derive(serde::Serialize)]
-struct ClientImport {
-    hosts: Vec<ImportedHost>,
-    skipped: Option<String>,
-}
-
-/// Save the hosts picked in the import dialog: folders, Logins, jump hosts
-/// and servers in one transaction and one vault save (host_import.rs).
-#[tauri::command]
-async fn import_hosts(
-    state: tauri::State<'_, DbState>,
-    rows: Vec<host_import::ImportRow>,
-) -> Result<host_import::ImportReport, String> {
-    let report = {
-        let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
-        let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("[DATABASE] IMPORT_FAILED: {}", e))?;
-        let report = host_import::import_rows(&tx, &rows)?;
-        tx.commit().map_err(|e| format!("[DATABASE] IMPORT_FAILED: {}", e))?;
-        report
-    };
-    save_vault_internal(&state)?;
-    Ok(report)
 }
 
 /// Read the user's OpenSSH client config (default `~/.ssh/config`) and
@@ -26314,63 +26113,6 @@ async fn clipboard_read_text(app: tauri::AppHandle) -> Result<String, String> {
         let _ = app;
         Err("Reading the clipboard here is only for Linux, Windows and macOS.".to_string())
     }
-}
-
-/// The Win32 clipboard's text (CF_UNICODETEXT).
-#[cfg(windows)]
-fn windows_clipboard_text() -> Result<String, String> {
-    use std::ffi::c_void;
-    const CF_UNICODETEXT: u32 = 13;
-    #[link(name = "user32")]
-    extern "system" {
-        fn OpenClipboard(owner: *mut c_void) -> i32;
-        fn CloseClipboard() -> i32;
-        fn IsClipboardFormatAvailable(format: u32) -> i32;
-        fn GetClipboardData(format: u32) -> *mut c_void;
-    }
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GlobalLock(mem: *mut c_void) -> *mut c_void;
-        fn GlobalUnlock(mem: *mut c_void) -> i32;
-        fn GlobalSize(mem: *mut c_void) -> usize;
-    }
-    struct Opened;
-    impl Drop for Opened {
-        fn drop(&mut self) {
-            unsafe { CloseClipboard() };
-        }
-    }
-    // Only one program can have the clipboard open, and some hold it for a
-    // moment (clipboard managers, Remote Desktop sharing the clipboard).
-    let mut opened = None;
-    for _ in 0..10 {
-        if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
-            opened = Some(Opened);
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    let Some(_opened) = opened else {
-        return Err("Another program is using the clipboard — try again.".to_string());
-    };
-    if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) } == 0 {
-        return Ok(String::new());
-    }
-    let mem = unsafe { GetClipboardData(CF_UNICODETEXT) };
-    if mem.is_null() {
-        return Ok(String::new());
-    }
-    let ptr = unsafe { GlobalLock(mem) } as *const u16;
-    if ptr.is_null() {
-        return Ok(String::new());
-    }
-    // Up to the first NUL, and never past the block's own size.
-    let units = unsafe { GlobalSize(mem) } / 2;
-    let wide = unsafe { std::slice::from_raw_parts(ptr, units) };
-    let len = wide.iter().position(|&c| c == 0).unwrap_or(units);
-    let text = String::from_utf16_lossy(&wide[..len]);
-    unsafe { GlobalUnlock(mem) };
-    Ok(text)
 }
 
 /// `submarine --mcp`: the helper an AI tool started from Home runs as its
