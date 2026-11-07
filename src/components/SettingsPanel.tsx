@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, FileEdit, Server, Home, Scale, ArrowRight, X, KeyRound, LifeBuoy, ClipboardCopy, FolderOpen, EyeOff, Bot, LayoutGrid } from "lucide-react";
+import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, FileEdit, Server, Home, Scale, ArrowRight, X, KeyRound, LifeBuoy, ClipboardCopy, FolderOpen, EyeOff, Bot } from "lucide-react";
 import {
   MAX_FONT_SIZE, MIN_FONT_SIZE, clampFontSize, fontFamilyCss,
   isFontAvailable, primaryFontName, sanitizeFontFamily,
@@ -21,7 +21,6 @@ import { DEFAULT_SCHEME } from "../ui/terminalThemes";
 import { windowSummary } from "../util/diagnostics";
 import { MAX_SCROLLBACK, MIN_SCROLLBACK, clampScrollback } from "../util/terminalScrollback";
 import { DEFAULT_INFO_FONT_SIZE, MAX_INFO_FONT_SIZE, MIN_INFO_FONT_SIZE, clampInfoFontSize } from "../util/infoFont";
-import type { WallCloseTaken } from "../util/wallClose";
 import { AiTrustOverview } from "./AiTrust";
 
 // Where this install keeps its data (see src-tauri/src/portable.rs). `portable`
@@ -65,7 +64,7 @@ function JumpLoginLimit() {
       <div className="min-w-0">
         <div className="text-sm font-semibold text-zinc-100">Logins at a time per jump host</div>
         <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
-          When many servers behind one jump host open at once (a folder opened as a wall), this many log in to it
+          When many servers behind one jump host open at once (a whole folder opened, say), this many log in to it
           together and the rest wait their turn — a jump host turns away logins past its own limit (OpenSSH starts
           at 10). Each jump host in a ProxyJump chain from ~/.ssh/config has its own line too: shared with a saved
           jump host at the same address, or, behind another jump host, its own for that way there. 0 means no limit. Servers reached directly aren't held back.
@@ -475,50 +474,6 @@ function DefaultShellSetting({ settings, setSettings }: any) {
         >
           <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${settings.useLocalShell ? 'left-[22px]' : 'left-0.5'}`} />
         </button>
-      </div>
-    </div>
-  );
-}
-
-// What closing a Wall does with the tabs Broadcast took into it
-// (util/wallClose). Per-device, in the app's settings. The question's
-// "Remember my answer" box sets it too.
-const WALL_CLOSE_CHOICES: { value: WallCloseTaken; label: string }[] = [
-  { value: "ask", label: "Ask each time" },
-  { value: "back", label: "Put them back as tabs" },
-  { value: "close", label: "Close them all" },
-];
-
-function WallCloseSetting({ settings, setSettings }: any) {
-  const current: WallCloseTaken = settings.wallCloseTaken ?? "ask";
-  return (
-    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
-      <div className="min-w-0">
-        <div id="wall-close-taken-label" className="text-sm font-semibold text-zinc-100">When I close a Wall that took my tabs</div>
-        <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
-          Turning Broadcast on takes the servers' tabs into the Wall. Closing the Wall can put them back as tabs
-          or close them. <span className="text-zinc-300">Close them all</span> still asks if one of them is busy:
-          a file is uploading or downloading, an archive is being made or unpacked, a mirror is running, a
-          Live Edit file has changes not sent yet, or an AI command is running there. <span className="text-zinc-300">Back to tabs</span> on the Wall's bar always puts
-          them back without asking.
-        </p>
-      </div>
-      <div role="radiogroup" aria-labelledby="wall-close-taken-label" className="flex flex-wrap gap-2">
-        {WALL_CLOSE_CHOICES.map((c) => (
-          <button
-            key={c.value}
-            role="radio"
-            aria-checked={current === c.value}
-            onClick={() => setSettings((s: any) => ({ ...s, wallCloseTaken: c.value }))}
-            className={`px-3 h-9 rounded-xl text-xs font-bold border transition-all ${
-              current === c.value
-                ? "bg-primary/15 border-primary/40 text-primary"
-                : "bg-zinc-900 border-white/5 text-zinc-300 hover:bg-white/5"
-            }`}
-          >
-            {c.label}
-          </button>
-        ))}
       </div>
     </div>
   );
@@ -1174,14 +1129,6 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onHighlightRulesChan
             </div>
             <JumpLoginLimit />
           </div>
-        </section>
-
-        {/* Walls Section */}
-        <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
-          <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
-            <LayoutGrid size={14} /> Walls
-          </div>
-          <WallCloseSetting settings={settings} setSettings={setSettings} />
         </section>
 
         {/* Updates Section */}

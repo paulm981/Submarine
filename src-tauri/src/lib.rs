@@ -59,7 +59,6 @@ mod child_env;
 mod open_policy;
 mod rdp;
 mod quick_unlock;
-mod busy;
 mod rdp_client;
 mod rdp_share;
 mod term_filter;
@@ -7829,7 +7828,8 @@ async fn setup_master_db_with(
     // The user's own highlight rules (highlight.rs): synced, made with their
     // sync columns, before the backfill and triggers below.
     conn.execute(highlight::SCHEMA, []).map_err(|e| format!("[DATABASE] HIGHLIGHT_TABLE_FAILED: {}", e))?;
-    // Saved walls (multiexec.rs): device-local too, added the same way.
+    // Saved walls (multiexec.rs): device-local too, added the same way. No
+    // longer used, but kept, so a profile's saved walls aren't lost.
     conn.execute(multiexec::SCHEMA, []).map_err(|e| format!("[DATABASE] WALLS_TABLE_FAILED: {}", e))?;
     // The AI's approval levels and rules (ai/trust.rs, #115): device-local
     // too, so a shared profile never changes how much the AI may do here,
@@ -18810,9 +18810,6 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
 #[tauri::command]
 async fn write_terminal_data(state: tauri::State<'_, SshState>, terminal_id: String, data: Vec<u8>) -> Result<(), String> {
     use crate::ssh_manager::TerminalCommand;
-    // Right after a broadcast this terminal may still have keys queued for
-    // it (multiexec.rs); these go behind them.
-    let Some(data) = multiexec::into_feed(&terminal_id, data) else { return Ok(()) };
     // Clone the Sender OUT of the map, then release the map lock before we
     // await on send(). If we held the guard across the send, a saturated
     // 32-slot mpsc on a slow SSH link would block every other terminal's
@@ -18875,10 +18872,7 @@ async fn type_saved_password(
         return Err("That password has a line break or another control character, so it isn't typed".into());
     }
     let tx = ssh.terminal_txs.lock().await.get(&terminal_id).cloned().ok_or("That terminal isn't open")?;
-    // Behind any keys a broadcast still has queued for it, as typing goes
-    // (write_terminal_data), so it can't land ahead of a queued line.
-    let Some(bytes) = multiexec::into_feed(&terminal_id, password.as_bytes().to_vec()) else { return Ok(()) };
-    tx.send(TerminalCommand::Data(bytes))
+    tx.send(TerminalCommand::Data(password.as_bytes().to_vec()))
         .await
         .map_err(|_| "That terminal isn't open".to_string())
 }
@@ -20771,7 +20765,6 @@ async fn sftp_remove_dir(
     };
 
     let id = session_transfer_id(&session_id);
-    let _running = busy::RunningTransfer::start(&session_id);
     let cancel = Arc::new(AtomicBool::new(false));
     let cancels_map = Arc::clone(&state.transfer_cancels);
     cancels_map.lock().await.insert(id.clone(), Arc::clone(&cancel));
@@ -21008,7 +21001,6 @@ async fn sftp_download_file(
         .unwrap_or("file")
         .to_string();
     let id = session_transfer_id(&session_id);
-    let _running = busy::RunningTransfer::start(&session_id);
     let event_name = format!("sftp-transfer-{}", session_id);
     let emit_progress = |bytes: u64, status: &str, error: Option<String>| {
         let _ = app.emit(
@@ -21968,7 +21960,6 @@ async fn sftp_download_dir(
     let folder_name = if folder_name.is_empty() { "folder".to_string() } else { folder_name };
 
     let id = session_transfer_id(&session_id);
-    let _running = busy::RunningTransfer::start(&session_id);
     let event_name = format!("sftp-transfer-{}", session_id);
 
     // Register cancel flag early so the user can abort even during the
@@ -22164,7 +22155,6 @@ async fn sftp_upload_file(
         .unwrap_or("file")
         .to_string();
     let id = session_transfer_id(&session_id);
-    let _running = busy::RunningTransfer::start(&session_id);
     let event_name = format!("sftp-transfer-{}", session_id);
     let emit_progress = |bytes: u64, status: &str, error: Option<String>| {
         let _ = app.emit(
@@ -22359,7 +22349,6 @@ async fn sftp_upload_dir(
     }
 
     let id = session_transfer_id(&session_id);
-    let _running = busy::RunningTransfer::start(&session_id);
     let event_name = format!("sftp-transfer-{}", session_id);
 
     // Cancel flag registered before the slow enumeration so the user can
@@ -26034,9 +26023,8 @@ async fn monitor_resume_all(
     ))
 }
 
-/// The clipboard's text, for a paste into the terminal (a right-click, or
-/// the Wall's paste). The desktop frontends all ask here; Android reads it
-/// in the page.
+/// The clipboard's text, for a paste into the terminal (a right-click). The
+/// desktop frontends all ask here; Android reads it in the page.
 ///
 /// WebKitGTK refuses the page's `navigator.clipboard.readText()` (#89). And
 /// where the webview reads the clipboard itself (a keyboard paste, or the
@@ -26357,7 +26345,6 @@ pub fn run() {
             start_tunnel, stop_tunnel, list_tunnels, restart_session_tunnels, persist_session_tunnels,
             list_tunnel_rules, remove_tunnel_rule, rename_tunnel_rule,
             open_terminal, local_shell, write_terminal_data, type_saved_password, terminal_drawn, resize_terminal, close_terminal,
-            multiexec::write_terminals_data,
             local_term::list_local_shells, local_term::local_shell_set_default,
             local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
             local_term::local_terminal_open, local_term::local_terminal_write, local_term::local_windows_build,
@@ -26395,7 +26382,7 @@ pub fn run() {
             import_hosts, host_import::pick_client_import_file,
             sftp_list_dir, sftp_create_dir, sftp_remove_file, sftp_remove_dir,
             sftp_rename, sftp_set_permissions, sftp_set_owner, sftp_stat,
-            sftp_download_file, sftp_download_dir, sftp_upload_file, sftp_upload_dir, sftp_cancel_transfer, busy::sessions_busy, sftp_batch_limits, sftp_open_remote_file,
+            sftp_download_file, sftp_download_dir, sftp_upload_file, sftp_upload_dir, sftp_cancel_transfer, sftp_batch_limits, sftp_open_remote_file,
             sftp_set_elevated, sftp_elevation_status, sftp_login_user, sftp_resolve_owners,
             archive::local_archive, archive::local_extract, archive::sftp_archive, archive::sftp_extract,
             local_open_file, local_open_in_explorer, sftp_prepare_drag,
@@ -26405,7 +26392,6 @@ pub fn run() {
             about::app_info, about::check_for_updates, about::open_external_url,
             portable::get_storage_info,
             local_open::live_edit_editor_get, local_open::live_edit_editor_pick, local_open::live_edit_editor_reset,
-            multiexec::wall_list, multiexec::wall_save, multiexec::wall_delete,
             multiexec::get_jump_login_limit, multiexec::set_jump_login_limit,
             server_os::detect_server_os,
             fonts::list_system_fonts,

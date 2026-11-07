@@ -22,8 +22,8 @@ The tour with more pictures is in [FORK.md](FORK.md), along with where the fork 
 <table>
   <tr>
     <td width="50%" valign="top" align="center">
-      <a href="FORK.md#work-on-many-servers-at-once"><img src="docs/screenshots/fork/wall-broadcast.png" alt="A Wall of six terminals behind one jump host, Broadcast on, one paused" /></a>
-      <br/><sub><b>Walls</b>: type to many servers at once, with some paused</sub>
+      <a href="FORK.md#a-better-terminal"><img src="docs/screenshots/fork/home-shells.png" alt="The Home view's shell menu: the login shell marked as default, and the other installed shells" /></a>
+      <br/><sub><b>Home</b>: terminals on this computer, beside your servers</sub>
     </td>
     <td width="50%" valign="top" align="center">
       <a href="FORK.md#organize-them"><img src="docs/screenshots/fork/highlighting-and-tree.png" alt="The session tree beside a terminal with highlighted log output" /></a>
@@ -46,7 +46,6 @@ The tour with more pictures is in [FORK.md](FORK.md), along with where the fork 
 - **Session import that keeps your setup**: from MobaXterm, nested folders, saved logins, jump hosts and their keys, startup commands such as `dzdo su -`, and Remote Desktop sessions come over as they were, and a result screen says what came in. PuTTY and OpenSSH config imports are there too.
 
 **Work on many servers at once**
-- **Walls with broadcast input**: terminals from many servers side by side. With Broadcast on, typing goes to all of them. Click into one to type to it alone, pause the ones to leave out (several at once: Ctrl-click their titles, or **Pause all** and resume the few you want), or paste or send a set of commands to all. A server that connects or reconnects partway through a line waits for the next one, so it never gets only the end of a command. Walls can be saved by name, and a whole folder opens as one. Closing a Wall can remember whether to put its tabs back or close them, and still asks first when a transfer, archive job, mirror or unsent Live Edit change is under way.
 - **Many tabs, easily**: **Ctrl+Shift+K** jumps to a tab by typing part of its name, **Ctrl+Tab** moves between tabs, and a tab's right-click menu closes the others, those to the right, the disconnected ones, or all of them.
 - **Jump hosts at scale**: a hundred servers behind one jump host log in a few at a time (the limit is a setting), and Monitoring reaches servers through their jump host too. **Jump via** in the server form is a search box.
 - **Your `~/.ssh/config`**: ProxyJump chains, IdentityFile keys and certificates (Teleport included), and your known_hosts. Submarine's own trusted host keys always come first, so a changed key always gets the warning. [More in FORK.md](FORK.md#jump-hosts-and-your-ssh-config).
@@ -94,8 +93,8 @@ The original project's README follows.
 ## At a glance
 
 - **One window, many tools per server** — terminal, SFTP, tunnels, folder mirror, Docker, live server info, and a per-server command library, all as tabs around the same session
-- **Watch many servers at once** — session **split view** to tile any two sessions side-by-side, plus **Walls**: grids of terminals from any servers, saved by name, a whole folder opened as one
-- **Broadcast input** — on a Wall, type once and every terminal gets it; click into one to type to it alone (**Type to all** on the bar, or the ✕ on its tile, goes back), pause the ones to leave out, paste or send a set of commands to all (like tmux `synchronize-panes`, across servers)
+- **Watch many servers at once** — session **split view** to tile any two sessions side-by-side, plus a global **Wall** pinboard for arbitrary terminals across hosts in a grid you control
+- **Broadcast input** — type once, send to N selected sessions simultaneously (Tmux `synchronize-panes` for cross-server)
 - **Native and cross-platform** — Windows, macOS, Linux (`.deb` / `.rpm` / Arch / AppImage), and Android — same encrypted vault everywhere
 - **Zero-knowledge cloud sync** — profiles are Argon2id + AES-256-GCM sealed on your device before upload; the server (and everyone else) only sees ciphertext. Browser dashboard at [`api.sinaxhpm.com/account`](https://api.sinaxhpm.com/account/) to manage your account and stored profiles
 - **Docker manager** — containers, logs (live tail), stats, prune, and `docker exec` shells as first-class session tabs

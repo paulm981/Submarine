@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   Activity, ArrowLeftRight, Bot, ChevronRight, ChevronsDownUp, Copy, CopyPlus, Folder, FolderInput, FolderOpen, FolderPlus,
-  Eye, LayoutGrid, Monitor, Pencil, Play, Plus, Search, ShieldAlert, TerminalSquare, Trash2, X,
+  Eye, Monitor, Pencil, Play, Plus, Search, ShieldAlert, TerminalSquare, Trash2, X,
 } from "lucide-react";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
 import { FolderRow, indexFolders, subtreeCounts, subtreeIds } from "../util/folderPath";
@@ -65,9 +65,6 @@ const UNDO_MS = 15000;
 
 // More than this many sessions at once asks first: each one connects.
 const OPEN_MANY = 10;
-// A wall is one tab however many it holds; past this many it still asks,
-// as each one connects.
-const WALL_MANY = 30;
 // More servers than this pinged at once asks first (pingMany).
 const PING_MANY = 10;
 // How far the pointer travels before a press becomes a drag, how long a drag
@@ -86,14 +83,11 @@ const SERVER_TYPES: Record<string, { label: string; title: string; tone: string 
 };
 
 const errText = (e: any) => (typeof e === "string" ? e : (e?.message || String(e)));
-// A Wall holds SSH terminals only: RDP, telnet and VNC servers are left off
-// it, so they aren't counted for one either.
-const wallServers = (list: any[]) => list.filter((s) => (s?.protocol ?? "ssh") === "ssh");
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 export const SessionTree = ({
   profile, servers, folders, sessions, statuses, waiting, activeSessionId,
-  onOpenServers, onShowSession, onOpenAsWall, onEditServer, onNewServer, onCloneServer,
+  onOpenServers, onShowSession, onEditServer, onNewServer, onCloneServer,
   onCreateFolder, onRenameFolder, onDelete, onMove,
   side, onToggleSide, onClose,
 }: {
@@ -105,10 +99,8 @@ export const SessionTree = ({
   waiting: Set<string>;
   activeSessionId: string;
   onOpenServers: (servers: any[]) => void;
-  // Go to a server that's already open: its tab, or the Wall it's on.
+  // Go to a server that's already open: its tab.
   onShowSession: (sessionId: string) => void;
-  // Several servers on one Wall tab instead of a tab each (WallView).
-  onOpenAsWall: (servers: any[], name: string) => void;
   onEditServer: (server: any) => void;
   onNewServer: (folderId: number | null) => void;
   onCloneServer: (id: number) => Promise<void>;
@@ -178,7 +170,7 @@ export const SessionTree = ({
   const q = search.trim().toLowerCase();
   const matchesServer = (s: any) => s.name.toLowerCase().includes(q) || String(s.host).toLowerCase().includes(q);
   const matchesFolder = (name: string) => name.toLowerCase().includes(q);
-  // Servers with a session open (a tab, or a tile on a Wall).
+  // Servers with a session open (a tab).
   const openIds = useMemo(() => new Set((sessions || []).map((x) => x.serverId)), [sessions]);
   // Searching or showing only what's open lists matches with their folders
   // all open, so folders can't be opened or closed meanwhile.
@@ -287,8 +279,7 @@ export const SessionTree = ({
   };
 
   // A double-click or Enter on a server. With "show only open" the tree is
-  // for getting around, so an open one is shown where it is (its tab, or its
-  // Wall) rather than pulled out of its Wall into a tab of its own.
+  // for getting around, so an open one is shown in its tab.
   const openServer = (server: any) => {
     const open = openOnly ? sessions.find((x) => x.serverId === server.id) : undefined;
     if (open) onShowSession(open.id); else onOpenServers([server]);
@@ -300,7 +291,7 @@ export const SessionTree = ({
     if (n === 0) return;
     if (n > OPEN_MANY && !(await confirm({
       title: `Open ${n} sessions?`,
-      message: `Each one connects as it opens, in a tab of its own. "Open as wall" puts servers on one tab instead.`,
+      message: "Each one connects as it opens, in a tab of its own.",
       okLabel: `Open ${n}`,
     }))) return;
     if (list.length === 1) openServer(list[0]);
@@ -318,21 +309,9 @@ export const SessionTree = ({
   const picked = useMemo(() => pickedItems(selected), [selected, rows]);
   const pickedCount = picked.list.length;
   const openSelected = () => openMany(picked.list);
-  const pickedWall = useMemo(() => wallServers(picked.list), [picked]);
-  const openAsWall = async (all: any[], name: string) => {
-    const list = wallServers(all);
-    if (list.length === 0) return;
-    if (list.length > WALL_MANY && !(await confirm({
-      title: `Open ${list.length} servers as a wall?`,
-      message: "Each one connects as it opens. Behind a jump host they log in a few at a time (Settings › Servers).",
-      okLabel: `Open ${list.length}`,
-    }))) return;
-    onOpenAsWall(list, name);
-  };
-  const openSelectedAsWall = () => openAsWall(pickedWall, `${pickedWall.length} servers`);
-  // Many at once is asked about first, as a big Wall is: each check is a
-  // connection, and a server or jump host that bans repeated ones could ban
-  // you, or the jump host.
+  // Many at once is asked about first: each check is a connection, and a
+  // server or jump host that bans repeated ones could ban you, or the jump
+  // host.
   const pingMany = async (list: any[]) => {
     if (list.length > PING_MANY && !(await confirm({
       title: `Ping ${list.length} servers?`,
@@ -875,11 +854,6 @@ export const SessionTree = ({
                 <button className={menuItem} onClick={run(() => openMany(list))} disabled={list.length === 0}>
                   <Play size={13} className={menuIcon} /> Open all in this folder ({list.length})
                 </button>
-                {wallServers(list).length > 0 && (
-                  <button className={menuItem} onClick={run(() => openAsWall(list, f.name))}>
-                    <LayoutGrid size={13} className={menuIcon} /> Open as wall ({wallServers(list).length})
-                  </button>
-                )}
                 <button className={menuItem} onClick={run(() => toggleFolder(f.id))}>
                   <ChevronRight size={13} className={menuIcon} /> {f.open ? "Collapse" : "Expand"}
                 </button>
@@ -913,11 +887,6 @@ export const SessionTree = ({
                 <button className={menuItem} onClick={run(() => (pickedCount > 1 && selected.has(r.key) ? openSelected() : openServer(r.server)))}>
                   <Play size={13} className={menuIcon} /> {pickedCount > 1 && selected.has(r.key) ? `Open ${pickedCount} selected` : "Open"}
                 </button>
-                {pickedCount > 1 && selected.has(r.key) && pickedWall.length > 1 && (
-                  <button className={menuItem} onClick={run(openSelectedAsWall)}>
-                    <LayoutGrid size={13} className={menuIcon} /> Open {pickedWall.length} servers as a wall
-                  </button>
-                )}
                 {!many && (
                   <button className={menuItem} onClick={run(() => onEditServer(r.server))}>
                     <Pencil size={13} className={menuIcon} /> Edit…

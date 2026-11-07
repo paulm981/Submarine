@@ -21,7 +21,7 @@ import { readUseLocalShell } from "../util/terminalShell";
 import { readUseSshAgent } from "../util/sshAgent";
 import { useSlideOverFocus } from "../ui/slideOverFocus";
 import { useConfirm } from "../ui/confirm";
-import { dockedTerminal, markTyped } from "../ui/terminalDock";
+import { dockedTerminal } from "../ui/terminalDock";
 import { withoutPasteControls } from "../util/pasteText";
 import { COMPACT_TAB_NAME, COMPACT_TAB_PAD, NewsDot, compactTermTabClass } from "../ui/tabStyle";
 import { reorderById, useTabDrag } from "../ui/tabDrag";
@@ -766,7 +766,6 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
             }
             if (lines.length === 0) return;
             const bytes = Array.from(new TextEncoder().encode(lines.join('\n') + '\n'));
-            markTyped(terminalId);
             invoke('write_terminal_data', { terminalId, data: bytes }).catch(() => {});
           };
           if (!session.runOnConnectHeld) {

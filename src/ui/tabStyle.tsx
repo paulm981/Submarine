@@ -1,15 +1,15 @@
 import { useHasNews } from "./terminalActivity";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// How tabs look, in one place: the title bar's tabs (Home, Walls, servers)
+// How tabs look, in one place: the title bar's tabs (Home, servers)
 // and each server's terminal tabs. Two looks, picked in Settings ›
 // Appearance: rounded pills, or compact — flat tabs that touch, with a thin
 // line under the one in front.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// primary: a server or Home; merged: a server shown in a split beside the
-/// one in front; broadcast: a Wall that is broadcasting.
-export type TabTone = "primary" | "merged" | "broadcast";
+/// one in front.
+export type TabTone = "primary" | "merged";
 
 // Colours for the compact look: `on` is the tab in front.
 const COMPACT: Record<TabTone, { on: string; off: string }> = {
@@ -20,10 +20,6 @@ const COMPACT: Record<TabTone, { on: string; off: string }> = {
   merged: {
     on: "text-primary border-b-primary bg-primary/[0.07]",
     off: "text-primary/80 border-b-primary/40 hover:bg-white/[0.06]",
-  },
-  broadcast: {
-    on: "text-orange-200 border-b-orange-400 bg-orange-500/[0.1]",
-    off: "text-orange-300/90 border-b-orange-400/40 hover:bg-orange-500/10",
   },
 };
 
@@ -37,13 +33,9 @@ const PILL: Record<TabTone, { on: string; off: string }> = {
     on: "bg-primary/15 text-primary border-primary/40 shadow-inner shadow-primary/10",
     off: "bg-primary/[0.05] text-primary/80 border-primary/25 hover:bg-primary/10",
   },
-  broadcast: {
-    on: "bg-orange-500/20 text-orange-200 border-orange-400/50 shadow-inner",
-    off: "bg-orange-500/[0.08] text-orange-300/90 border-orange-400/30 hover:bg-orange-500/15",
-  },
 };
 
-/// Shape and colours of a title-bar tab (Home, a Wall, a server). The caller
+/// Shape and colours of a title-bar tab (Home, a server). The caller
 /// adds its own width or padding (`COMPACT_TAB_PAD` in the compact look).
 export const titleTabClass = ({ compact, active, tone = "primary" }: { compact: boolean; active: boolean; tone?: TabTone }): string =>
   compact

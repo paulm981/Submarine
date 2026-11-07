@@ -4,9 +4,8 @@ import { useSyncExternalStore } from "react";
 // The AI side pane (#100): an AI tab's terminal shown beside a server tab.
 //
 // The AI tab itself lives in Home (HomePane), as a terminal on this computer.
-// The pane shows that same terminal, moved the way a Wall borrows a server's
-// (src/ui/terminalDock.ts) — never a copy, so the conversation is only ever
-// in one place. This is the state the pane, the title bar and Home share:
+// The pane shows that same terminal, moved there (src/ui/terminalDock.ts) —
+// never a copy, so the conversation is only ever in one place. This is the state the pane, the title bar and Home share:
 //   • whether the pane is folded, and its width (remembered on this device);
 //   • the view the title bar's button opened it on, where nothing is shared;
 //   • which AI tab it shows when there's more than one;
