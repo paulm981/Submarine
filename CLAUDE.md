@@ -4,12 +4,12 @@
 
 1. **An issue first.** Every change has an issue: an existing one, or a new one opened before the work starts. The issue says what and why; a design that grows goes in the issue, so it's kept.
 2. **A pull request that closes it.** The pull request's body starts with `Closes #N` (one line per issue it finishes; `Part of #N` when it does only some of one). GitHub links them and closes the issue on merge. One pull request may close several small issues that don't touch the same code.
-3. **A line in CHANGELOG.md** for what someone using the app will notice, ending with the issue's link, e.g. `([#45](https://github.com/paulm981/Submarine/issues/45))`. It goes under `## Next release` at the top. Never guess a version number: every merge to main is a release and takes the next number, so two pull requests open at once can't both know theirs.
+3. **A changelog line** for what someone using the app will notice, ending with the issue's link, e.g. `([#45](https://github.com/paulm981/Submarine/issues/45))`. It goes in a file of its own, `changelog.d/<issue>.md` (see its README), not in CHANGELOG.md: two pull requests then never change the same lines, and the release's own commit never conflicts with one that's open. Never guess a version number: every merge to main is a release and takes the next number.
 4. **The release** is made by the merge itself (`.github/workflows/build.yml`): it's numbered with the original project's version and the fork's count, such as `v0.4.0-fork.N`, and its page lists the merged pull requests, each linking its issues. So a pull request's title is written for the person using the app, not for the code.
 
 Changes to `.md` files only (docs, this file, the changelog) don't make a release.
 
-A pull request only ever adds its line under `## Next release`. When the merge is released, the release job files the lines of the commit it released under that release's number (`scripts/changelog_release.py`), in a `.md`-only commit on main; a line merged meanwhile stays for its own release. Only if that step couldn't push (the release job says so) does the next pull request file them by hand: the lines of the release that's out go under its number, below `## Next release`.
+When the merge is released, the release job puts the released commit's `changelog.d` lines under that release's number in CHANGELOG.md and deletes the files (`scripts/changelog_release.py`), in a `.md`-only commit on main; a file merged meanwhile waits for its own release. Only if that step couldn't push (the release job says so) does the next pull request do it by hand.
 
 ## Fork features that don't cost sync time
 

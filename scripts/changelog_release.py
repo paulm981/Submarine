@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Files a release's changelog lines under its own heading (#163).
 
-Pull requests only ever add a line under `## Next release`. When a merge is
+A pull request adds its line as a file of its own, `changelog.d/<issue>.md`,
+so two pull requests never change the same lines of CHANGELOG.md, and the
+release's own commit never conflicts with one that's open. When a merge is
 released as TAG, the release job runs this on main as it is by then:
 
-    changelog_release.py TAG RELEASED_CHANGELOG CURRENT_CHANGELOG
+    changelog_release.py TAG RELEASED_CHANGELOG CURRENT_CHANGELOG [FRAGMENT...]
+
+Each FRAGMENT is a file from `changelog.d/` as it was in the released commit:
+its lines go under `## TAG`, in the order given, and the job then deletes the
+fragment files. Lines still written straight under `## Next release` (the way
+before fragments) are filed too:
 
 RELEASED_CHANGELOG is CHANGELOG.md as it was in the commit that was released.
 The entries under its `## Next release` move from CURRENT_CHANGELOG's
@@ -50,8 +57,18 @@ def split(text):
     return lines[:start], lines[start + 1:end], lines[end:]
 
 
-def file_release(tag, released, current):
-    """`current` with `released`'s Next release entries under `## tag`."""
+def fragment_entries(fragments):
+    """The entries in fragment files' texts, in the order given."""
+    out = []
+    for text in fragments:
+        out += entries(text.replace("\r\n", "\n").split("\n"))
+    return out
+
+
+def file_release(tag, released, current, fragments=()):
+    """`current` with `released`'s Next release entries, and the entries of
+    `fragments` (the texts of the released commit's changelog.d files), under
+    `## tag`."""
     if f"## {tag}" in current.split("\n"):
         return current
     old = split(released)
@@ -59,11 +76,9 @@ def file_release(tag, released, current):
     if old is None or now is None:
         return current
     shipped = entries(old[1])
-    if not shipped:
-        return current
     before, section, after = now
     waiting = [e for e in entries(section) if e not in shipped]
-    moved = [e for e in entries(section) if e in shipped]
+    moved = [e for e in entries(section) if e in shipped] + fragment_entries(fragments)
     if not moved:
         return current
     out = before + [NEXT, ""]
@@ -84,7 +99,11 @@ def main():
         released = f.read()
     with open(current_path, encoding="utf-8") as f:
         current = f.read()
-    result = file_release(tag, released, current)
+    fragments = []
+    for path in sys.argv[4:]:
+        with open(path, encoding="utf-8") as f:
+            fragments.append(f.read())
+    result = file_release(tag, released, current, fragments)
     if result != current:
         with open(current_path, "w", encoding="utf-8") as f:
             f.write(result)
