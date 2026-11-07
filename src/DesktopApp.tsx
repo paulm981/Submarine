@@ -6,7 +6,7 @@ import {
   Plus, X, RefreshCw, Terminal, Key, Trash2,
   ArrowLeftRight, Shield, User, Cpu, TerminalSquare, List, Edit2,
   StickyNote, Search, Square, Copy, ChevronLeft, MoreVertical, Radio,
-  ChevronDown, Columns, LayoutGrid, Pin, PinOff, Home, Bot, Server
+  ChevronDown, Columns, LayoutGrid, Pin, PinOff, Server
 } from "lucide-react";
 import { useBroadcast } from "./ui/broadcast";
 
@@ -18,16 +18,9 @@ import { useConfirm, useTextPrompt } from "./ui/confirm";
 import { useSlideOverFocus } from "./ui/slideOverFocus";
 import { RenameInput } from "./ui/renameInput";
 import { forgetServerBookmarks } from "./util/sftpBookmarks";
-import { visibleName } from "./util/fileName";
 import { useIsNarrow } from "./hooks/useViewport";
 import { IS_MOBILE } from "./util/platform";
 import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./util/terminalFont";
-import {
-  BOLD_BRIGHT_KEY, CUSTOM_SCHEME_KEY, GPU_KEY, MIN_CONTRAST_KEY, SCHEME_KEY,
-  readBoldBright, readGpu, readMinContrast, readSchemeId, setServerSchemes,
-} from "./ui/terminalThemes";
-import { HIGHLIGHT_KEY, normalizeRules, onSlowRule, readHighlightId, setCustomRules, setServerHighlights } from "./ui/highlight";
-import { logLine } from "./util/diagnostics";
 import { SCROLLBACK_KEY, readScrollback } from "./util/terminalScrollback";
 import { USE_LOCAL_SHELL_KEY, readUseLocalShell } from "./util/terminalShell";
 import { USE_SSH_AGENT_KEY, readUseSshAgent } from "./util/sshAgent";
@@ -36,24 +29,13 @@ import { DEFAULT_RDP_OPTIONS, forgetRdpOptions, readRdpOptions, writeRdpOptions 
 import { DEFAULT_VNC_OPTIONS, forgetVncOptions, readVncOptions, writeVncOptions } from "./util/vncOptions";
 import { Sidebar } from "./components/Sidebar";
 import { NodeGrid } from "./components/NodeGrid";
-import { SessionTree, type TreeItems } from "./components/SessionTree";
-import HomePane from "./components/HomePane";
-import AiPanel from "./components/AiPanel";
-import AiSidePane, { AiPaneButton, type AiPaneView } from "./components/AiSidePane";
-import { useAiPane } from "./ui/aiPane";
-import { useAi, sharedWith, aiMarker, openAiTrust, trustTargetFor, cardsOf } from "./util/ai";
-import { AiTrustModal } from "./components/AiTrust";
-import { IS_ANDROID } from "./util/platform";
+import * as Fork from "./fork/desktop";
 import { folderTree } from "./util/folderTree";
 import { CommandScope, describeScope, parseCommandScope, scopeToJson } from "./util/commandScope";
 import CommandScopePicker from "./components/CommandScopePicker";
 import type { HeldDeletion } from "./components/HeldDeletions";
 import AddNodePanel from "./components/AddNodePanel";
 import TerminalView from "./components/TerminalView";
-import AllTabsMenu from "./components/AllTabsMenu";
-import { appHotkey } from "./ui/terminalDock";
-import { COMPACT_TAB_NAME, COMPACT_TAB_PAD, NewsDot, titleTabClass } from "./ui/tabStyle";
-import { reorderById, useTabDrag } from "./ui/tabDrag";
 import SettingsPanel from "./components/SettingsPanel";
 import ProfilePanel from "./components/ProfilePanel";
 import { SessionView } from "./components/SessionView";
@@ -61,9 +43,6 @@ import RdpSessionView from "./components/RdpSessionView";
 import TelnetSessionView from "./components/TelnetSessionView";
 import VncSessionView from "./components/VncSessionView";
 import MonitoringPanel from "./components/MonitoringPanel";
-import PingPanel from "./components/PingPanel";
-import { PING_SOUND_KEY, readPingSound } from "./ui/ping";
-import { INFO_FONT_SIZE_KEY, readInfoFontSize } from "./util/infoFont";
 import { ErrorBoundary, Guarded } from "./ui/ErrorBoundary";
 import { normalizeMirror, normalizeTunnel, parseObjectList } from "./util/serverJson";
 
@@ -82,17 +61,11 @@ const SLIDE_OUT_MS = 500;
 // connect (one-shot, `serverId === 0` and `quickAuth` populated). SessionView
 // forwards `quickAuth` to `initiate_connection` which uses it instead of
 // looking up the DB row.
-// `host`: the server's host when its tab was opened, which the OS badge
-// check goes by (an edit made while the tab is open doesn't move it).
+// `host` and `port`: as the tab was opened (Fork.DesktopSession).
 // `serverUuid` is the saved server's sync id, which keys this device's own
 // per-server settings (the Shell button, see util/shellSync.ts).
 type Session = { id: string; serverId: number; serverName: string; serverUuid?: string | null; protocol?: "ssh" | "rdp" | "telnet" | "vnc"; host?: string; port?: number; mirrors?: string; runOnConnect?: string; runOnConnectEvery?: boolean; runOnConnectHeld?: boolean; quickAuth?: QuickAuth | null };
-
-// The Home view (HomePane): terminals on this computer, where the app opens
-// and where closing the last session tab goes back to. Android has no shells
-// to offer, so it keeps the server grid there.
-const HAS_HOME = !IS_ANDROID;
-const START_VIEW = HAS_HOME ? "home" : "nodes";
+const { START_VIEW, BOLD_BRIGHT_KEY, MIN_CONTRAST_KEY, readBoldBright, readMinContrast } = Fork;
 
 const hexToRgb = (hex: string) => {
   const r = parseInt(hex.slice(1, 3), 16);
@@ -118,18 +91,8 @@ function DesktopApp() {
   const [cloudSyncing, setCloudSyncing] = useState(false);
   const [lastSyncLabel, setLastSyncLabel] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<string>(START_VIEW);
-  // HomePane mounts the first time Home is shown and then stays mounted, so
-  // its shells keep running while the user is in a session.
-  const [homeShown, setHomeShown] = useState(false);
-  useEffect(() => { if (activeView === "home") setHomeShown(true); }, [activeView]);
   const [sessions, setSessions] = useState<Session[]>([]);
-  // AI help (#32, src-tauri/src/ai): what every AI tab has and asks for, and
-  // whether the AI panel is open (the title bar's AI button).
-  const ai = useAi();
-  const [aiOpen, setAiOpen] = useState(false);
-  // The AI side pane beside a server tab (#100, AiSidePane). Starting an AI
-  // tool from a server tab mounts Home, where it runs, if it never was.
-  const aiPane = useAiPane();
+  const [aiOpen, setAiOpen] = useState(false); // the AI panel (Fork.AiTitleButtons)
   // Tracks the live status of each open session ('connecting' | 'connected'
   // | 'failed' | 'disconnected', or 'idle' for an RDP tab on Android that
   // has nothing to connect yet). Updated via the callback every SessionView
@@ -237,35 +200,8 @@ function DesktopApp() {
     const h = Math.floor((wallAreaH - 2 * WALL_SPACE - (rows - 1) * WALL_SPACE) / rows);
     return `${Math.max(wallRows ? 120 : 220, h)}px`;
   })();
-  // The title bar's All tabs ▾ menu: every session, searchable.
-  const [allTabsOpen, setAllTabsOpen] = useState(false);
-  // The terminal on screen in a session's tab.
-  const terminalOf = (sid: string) => sessionActiveTerm[sid] ?? `${sid}-term-0`;
-  // What the AI side pane needs of the view on screen.
-  const paneSession = sessions.find(s => s.id === activeView);
-  const aiPaneView: AiPaneView = {
-    view: activeView,
-    session: paneSession ? {
-      id: paneSession.id,
-      name: tabLabel(paneSession),
-      ssh: (paneSession.protocol ?? "ssh") === "ssh",
-      connected: sessionStatuses[paneSession.id] === "connected",
-      terminalId: terminalOf(paneSession.id),
-    } : null,
-  };
-  // The tab strip scrolls the tab on screen into view — with dozens open, a
-  // tab picked from All tabs lands past the edge.
-  const tabStripRef = useRef<HTMLDivElement>(null);
-  // Dragging a server tab to a new place reorders `sessions` itself, so
-  // Ctrl+Tab (tabOrderRef) and All tabs follow it.
-  const sessionDrag = useTabDrag("sessions", (dragId, overId, after) =>
-    setSessions(prev => reorderById(prev, dragId, overId, after)));
-  useEffect(() => {
-    const strip = tabStripRef.current;
-    if (!strip) return;
-    const tab = [...strip.querySelectorAll<HTMLElement>("[data-tab]")].find(el => el.dataset.tab === activeView);
-    tab?.scrollIntoView({ block: "nearest", inline: "nearest" });
-  }, [activeView, sessions]);
+  const aiPaneView = Fork.aiPaneViewOf(activeView, sessions, sessionStatuses, sessionActiveTerm, tabLabel);
+  const { tabStripRef, sessionDrag } = Fork.useTabStrip(activeView, sessions, setSessions);
   // Mobile-only session picker toggle. Horizontally-scrolling tabs eat
   // the whole title row on a 400 px phone; replacing them with a compact
   // dropdown gives the tab strip predictable width and matches iOS/
@@ -307,16 +243,6 @@ function DesktopApp() {
     appWindow.toggleMaximize().catch(console.error);
   }, []);
 
-  // Version for the title bar, from the build itself (about::app_info) rather
-  // than hardcoded so it can never drift from the real build: a release's
-  // whole version (v0.4.0-fork.2), and the commit in the tooltip when built
-  // from source. Shown faded next to the brand name; renders nothing if the
-  // call ever fails.
-  const [appVersion, setAppVersion] = useState<{ version: string; commit: string | null } | null>(null);
-  useEffect(() => {
-    invoke<{ version: string; commit: string | null }>("app_info").then(setAppVersion).catch(() => {});
-  }, []);
-
   // Persist the user's current folder across NodeGrid unmount/remount cycles.
   // NodeGrid is conditionally rendered (`activeView === "nodes" && ...`), so
   // its local state used to vanish the moment the user opened a session tab
@@ -325,30 +251,11 @@ function DesktopApp() {
   // for the whole profile session.
   const [activeFolderId, setActiveFolderId] = useState<number | null>(null);
   const [isPanelOpen, setIsPanelOpen] = useState(false);
-  // The form opened at Jump via ("Pick a jump host", see below).
-  const [focusJumpVia, setFocusJumpVia] = useState(false);
   const [isQuickConnectOpen, setIsQuickConnectOpen] = useState(false);
   const [servers, setServers] = useState<any[]>([]);
   const [credentials, setCredentials] = useState<any[]>([]);
   const [sshKeys, setSshKeys] = useState<any[]>([]);
   const [folders, setFolders] = useState<any[]>([]);
-  // The servers asked for their OS this run, by server, host and port (the
-  // OS badge effect below).
-  const osChecked = useRef<Set<string>>(new Set());
-
-  // The session tree (desktop): shown or hidden, and on which side. Per
-  // device, like the other UI preferences.
-  const readPref = (key: string, fallback: string) => {
-    try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
-  };
-  const writePref = (key: string, value: string) => {
-    try { localStorage.setItem(key, value); } catch { /* per-device nicety only */ }
-  };
-  const [treeOpen, setTreeOpen] = useState(() => readPref("submarine-session-tree-open", "1") === "1");
-  const [treeSide, setTreeSide] = useState<"left" | "right">(() => (readPref("submarine-session-tree-side", "right") === "left" ? "left" : "right"));
-  useEffect(() => writePref("submarine-session-tree-open", treeOpen ? "1" : "0"), [treeOpen]);
-  useEffect(() => writePref("submarine-session-tree-side", treeSide), [treeSide]);
-
   const [commands, setCommands] = useState<any[]>([]);
   const [logs, setLogs] = useState<{ msg: string, type: string, time: string }[]>([]);
   const [isCommandPanelOpen, setIsCommandPanelOpen] = useState(false);
@@ -370,9 +277,7 @@ function DesktopApp() {
   const [isKeyPanelOpen, setIsKeyPanelOpen] = useState(false);
   const [editKeyData, setEditKeyData] = useState<any>(EMPTY_KEY);
   const [formError, setFormError] = useState("");
-  // The five panels share one error line: a panel opening or closing (by ✕,
-  // the backdrop or Escape) starts it empty, so one panel's error never
-  // shows in the next.
+  // One error line for the five panels: opening or closing one empties it.
   useEffect(() => { setFormError(""); }, [isPanelOpen, isCommandPanelOpen, isNotePanelOpen, isCredPanelOpen, isKeyPanelOpen]);
   const commandPanelRef = useSlideOverFocus(isCommandPanelOpen);
   const notePanelRef = useSlideOverFocus(isNotePanelOpen);
@@ -461,21 +366,10 @@ function DesktopApp() {
     terminalFontSize: readFontSize(),
     // '' = the built-in cross-platform monospace stack (see util/terminalFont).
     terminalFontFamily: readFontFamily(),
-    // Terminal colors (src/ui/terminalThemes.ts), GPU drawing and minimum
-    // contrast. A server's own colors, when it has some, win over the scheme.
-    terminalScheme: readSchemeId(),
-    terminalGpu: readGpu(),
-    terminalMinContrast: readMinContrast(),
-    // A scheme of this device's own, pasted as Windows Terminal JSON ("" for
-    // none; the scheme "custom"), and bold text in bright colors. Both from
-    // the original project (#183).
-    terminalCustomScheme: (() => { try { return localStorage.getItem(CUSTOM_SCHEME_KEY) || ""; } catch { return ""; } })(),
-    terminalBoldBright: readBoldBright(),
-    // Which highlight set terminals use (src/ui/highlight.ts), unless their
-    // server has its own.
-    terminalHighlight: readHighlightId(),
     // Lines each terminal keeps above the screen. See util/terminalScrollback.
     terminalScrollback: readScrollback(),
+    terminalBoldBright: readBoldBright(),
+    terminalMinContrast: readMinContrast(),
     // Off by default: terminals start the remote account's own shell, same
     // as before this setting existed. See util/terminalShell.
     useLocalShell: readUseLocalShell(),
@@ -491,23 +385,7 @@ function DesktopApp() {
     // "pull collaborators' changes" timer — your own edits still push ~6s after
     // you stop typing regardless of this.
     syncIntervalMin: Math.max(1, parseInt(localStorage.getItem('submarine-sync-interval-min') || '5', 10) || 5),
-    // Read each server's OS for its badge (server_os.rs). Defaults ON.
-    detectOs: localStorage.getItem('submarine-detect-os') !== 'off',
-    // Fork maintainers only: the update check also counts the original
-    // project's new commits (about.rs). Defaults OFF.
-    watchUpstream: localStorage.getItem('submarine-watch-upstream') === 'on',
-    // Ask before closing a tab whose session is connected (Settings ›
-    // Servers, or "Don't ask again" in the prompt). Defaults ON.
-    confirmCloseSession: localStorage.getItem('submarine-confirm-close') !== 'off',
-    // A short sound when a server being pinged answers again (Settings ›
-    // Servers). Per-device; defaults ON. See ui/ping.
-    pingSound: readPingSound(),
-    // The Info panel's text size (Settings › UI Customization). Per-device.
-    // See util/infoFont.
-    infoFontSize: readInfoFontSize(),
-    // Flat tabs that touch, instead of pills (title bar and each server's
-    // terminal tabs). Per-device; defaults OFF.
-    compactTabs: localStorage.getItem('submarine-compact-tabs') === 'on',
+    ...Fork.readForkSettings(),
   });
 
   useEffect(() => {
@@ -519,40 +397,23 @@ function DesktopApp() {
     localStorage.setItem('submarine-bg-color', appSettings.backgroundColor);
     localStorage.setItem(FONT_SIZE_KEY, appSettings.terminalFontSize.toString());
     localStorage.setItem(FONT_FAMILY_KEY, appSettings.terminalFontFamily);
-    // The scheme of this device's own first, so "custom" finds it.
-    if (appSettings.terminalCustomScheme) localStorage.setItem(CUSTOM_SCHEME_KEY, appSettings.terminalCustomScheme);
-    else localStorage.removeItem(CUSTOM_SCHEME_KEY);
-    localStorage.setItem(SCHEME_KEY, appSettings.terminalScheme);
-    localStorage.setItem(BOLD_BRIGHT_KEY, appSettings.terminalBoldBright ? 'on' : 'off');
-    localStorage.setItem(GPU_KEY, appSettings.terminalGpu ? 'on' : 'off');
-    localStorage.setItem(MIN_CONTRAST_KEY, appSettings.terminalMinContrast ? 'on' : 'off');
-    localStorage.setItem(HIGHLIGHT_KEY, appSettings.terminalHighlight);
     localStorage.setItem(SCROLLBACK_KEY, String(appSettings.terminalScrollback));
+    localStorage.setItem(BOLD_BRIGHT_KEY, appSettings.terminalBoldBright ? 'on' : 'off');
+    localStorage.setItem(MIN_CONTRAST_KEY, appSettings.terminalMinContrast ? 'on' : 'off');
     localStorage.setItem(USE_LOCAL_SHELL_KEY, appSettings.useLocalShell ? 'on' : 'off');
     localStorage.setItem(USE_SSH_AGENT_KEY, appSettings.useSshAgent ? 'on' : 'off');
     localStorage.setItem(USE_SSH_CONFIG_KEY, appSettings.useSshConfig ? 'on' : 'off');
     invoke("set_use_ssh_config", { enabled: appSettings.useSshConfig }).catch(() => {});
     localStorage.setItem('submarine-auto-sync', appSettings.autoSync ? 'on' : 'off');
     localStorage.setItem('submarine-sync-interval-min', String(appSettings.syncIntervalMin));
-    localStorage.setItem('submarine-detect-os', appSettings.detectOs ? 'on' : 'off');
-    localStorage.setItem('submarine-watch-upstream', appSettings.watchUpstream ? 'on' : 'off');
-    localStorage.setItem('submarine-confirm-close', appSettings.confirmCloseSession ? 'on' : 'off');
-    localStorage.setItem(PING_SOUND_KEY, appSettings.pingSound ? 'on' : 'off');
-    localStorage.setItem('submarine-compact-tabs', appSettings.compactTabs ? 'on' : 'off');
-    localStorage.setItem(INFO_FONT_SIZE_KEY, String(appSettings.infoFontSize));
+    Fork.writeForkSettings(appSettings);
     // Tell already-mounted terminals to re-fit with the new font size / face.
     // Without this dispatch the listener in TerminalView is dead code and
     // users have to close+reopen every terminal to see a size change.
     window.dispatchEvent(new CustomEvent('submarine-settings-changed'));
   }, [appSettings]);
 
-  // Servers' own terminal colors and highlighting: open terminals follow
-  // when one changes (an edit here, or one that came in with a sync).
-  useEffect(() => {
-    const schemes = setServerSchemes(servers);
-    const highlights = setServerHighlights(servers);
-    if (schemes || highlights) window.dispatchEvent(new CustomEvent('submarine-settings-changed'));
-  }, [servers]);
+  Fork.useServerLooks(servers);
 
   useEffect(() => {
     // Nothing to set up before the first screen:
@@ -647,41 +508,16 @@ function DesktopApp() {
   }, [refreshServers]);
   // Allow what this device holds back for a server (see the review dialog in
   // the server list), then show the list as it now is.
-  // `runOnConnect` is the on-connect text the review showed, and
-  // `runOnConnectEvery` whether it said they go into each new terminal, needed
-  // to allow those commands: when either changed meanwhile, the OK is refused
-  // and the review shows them as they are now.
-  const allowHeld = useCallback(async (serverId: number, items: string[], runOnConnect?: string, runOnConnectEvery?: boolean) => {
+  const allowHeld = useCallback(async (serverId: number, items: string[]) => {
     try {
-      await invoke("allow_held", { serverId, items, runOnConnect: runOnConnect ?? null, runOnConnectEvery: runOnConnectEvery ?? null });
+      await invoke("allow_held", { serverId, items });
       addLog(items.length ? `Allowed ${items.length} held change${items.length === 1 ? "" : "s"}.` : "Allowed the held changes.", "success");
     } catch (e) {
-      if (String(e).includes("HELD_CHANGED")) addLog("Those on-connect commands were changed again. Look at them again before you allow them.", "warn");
-      else addLog(`ALLOW_FAILED: ${e}`, "error");
+      addLog(`ALLOW_FAILED: ${e}`, "error");
     }
     await refreshServers();
   }, [addLog, refreshServers]);
-  // Decline a held switch to telnet or VNC: the server stays SSH (or RDP),
-  // and the other computers get it back as that with the next sync.
-  const keepServerSsh = useCallback(async (serverId: number) => {
-    try {
-      if (await invoke<boolean>("keep_server_ssh", { serverId })) addLog("Kept the server as it was.", "success");
-    } catch (e) {
-      addLog(`KEEP_SSH_FAILED: ${e}`, "error");
-    }
-    await refreshServers();
-  }, [addLog, refreshServers]);
-  // A teammate's move that let the AI do more on a server, kept as it was:
-  // the server stays at "Ask every time" here until it's changed (#115).
-  const keepAiPolicy = useCallback(async (serverId: number) => {
-    try {
-      await invoke("ai_keep_policy", { serverId });
-      addLog("The AI asks before every command on that server, as before.", "success");
-    } catch (e) {
-      addLog(`AI_KEEP_FAILED: ${e}`, "error");
-    }
-    await refreshServers();
-  }, [addLog, refreshServers]);
+  const { allowHeldSeen, keepServerSsh, keepAiPolicy } = Fork.useHeldActions(addLog, refreshServers);
   const refreshCredentials = useCallback(async () => {
     try { setCredentials((await invoke("get_credentials")) as any[]); }
     catch (e) { addLog(`SYNC_CREDENTIALS: ${e}`, "error"); }
@@ -702,22 +538,7 @@ function DesktopApp() {
     try { setNotes((await invoke("get_notes")) as any[]); }
     catch (e) { addLog(`SYNC_NOTES: ${e}`, "error"); }
   };
-  // The user's own highlight rules (synced with the profile): open terminals
-  // pick up a change.
-  const refreshHighlightRules = useCallback(async () => {
-    try {
-      if (setCustomRules(normalizeRules(await invoke("highlight_rules_list")))) {
-        window.dispatchEvent(new CustomEvent('submarine-settings-changed'));
-      }
-    } catch (e) { addLog(`SYNC_HIGHLIGHT_RULES: ${e}`, "error"); }
-  }, [addLog]);
-  useEffect(() => {
-    onSlowRule((label) => {
-      const msg = `The highlight rule "${label}" was too slow on this output, so it's off until Submarine restarts.`;
-      addLog(msg, "warn");
-      logLine("warn", `[highlight] ${msg}`);
-    });
-  }, [addLog]);
+  const refreshHighlightRules = Fork.useHighlightRules(addLog);
   const refreshAll = async () => {
     await Promise.all([
       refreshHighlightRules(),
@@ -754,11 +575,11 @@ function DesktopApp() {
     }
   }, []);
 
-  // Per-entity sync of the currently-open profile, through the user's own
-  // folder or repository (store_sync.rs) or Submarine Cloud: merges in what's
-  // there and sends this computer's changes (Last-Write-Wins by HLC), all of
-  // it encrypted. A guard prevents overlapping runs; on success we reload all
-  // local lists so a pulled change shows at once.
+  // Per-entity cloud sync of the currently-open profile. Pushes every locally
+  // changed record and merges back the server's view (Last-Write-Wins by HLC),
+  // without the server ever decrypting anything. A guard prevents overlapping
+  // runs; on success we reload all local lists so a pulled change shows at once.
+  // (The fork's also syncs through the user's own folder or repository: store_sync.rs.)
   const handleCloudSync = useCallback(async () => {
     setCloudSyncing(true);
     try {
@@ -972,84 +793,10 @@ function DesktopApp() {
     try {
       await invoke("delete_folder", { id });
       gone.forEach(forgetServer);
-      // delete_folder cascades to the folders and servers inside it (lib.rs),
-      // so refresh both.
       await Promise.all([refreshFolders(), refreshServers()]);
       bumpSync();
       addLog("Folder removed.", "info");
     } catch (e) { addLog(`DELETE_EXCEPTION: ${e}`, "error"); }
-  };
-
-  // A new server in a folder (or at the top level): the Add server panel,
-  // with that folder already picked.
-  const addServerIn = (folderId?: number | null) => {
-    setNewNode({
-      ...defaultNode,
-      folderId: folderId != null ? String(folderId) : "",
-    });
-    setFormError("");
-    setIsPanelOpen(true);
-  };
-
-  // Rethrows so the session tree can say it failed; the grid ignores that.
-  const cloneServer = async (id: number) => {
-    try {
-      const copyId = await invoke<number>("clone_server", { id });
-      // An RDP server's window and sharing options are this device's own,
-      // kept by sync id (util/rdpOptions): the copy starts with the same.
-      const original = (servers || []).find((s: any) => s.id === id);
-      if (original?.protocol === "rdp" && original.uuid) {
-        try {
-          const copy = (await invoke<any[]>("get_servers")).find((s) => s.id === copyId);
-          if (copy?.uuid) writeRdpOptions(copy.uuid, readRdpOptions(original.uuid));
-        } catch (e) {
-          addLog(`CLONE_RDP_OPTIONS_FAILED: ${e}`, "error");
-        }
-      }
-      refreshServers(); bumpSync(); addLog("Node cloned.", "success");
-    }
-    catch (e) { addLog(`CLONE_ERROR: ${e}`, "error"); throw e; }
-  };
-
-  const createFolder = async (name: string, parentId: number | null) => {
-    await invoke("add_folder", { name, parentId });
-    await refreshFolders();
-    bumpSync();
-    addLog(`Folder "${name}" created.`, "info");
-  };
-
-  // The session tree's drag and drop and "Move to…" (tree_moves.rs).
-  // Rethrows so the tree can say what didn't move.
-  const moveItems = async (items: TreeItems, folderId: number | null) => {
-    try {
-      if (items.servers.length) await invoke("move_servers", { ids: items.servers, folderId });
-      for (const id of items.folders) await invoke("move_folder", { id, parentId: folderId });
-    } finally {
-      await Promise.all([refreshFolders(), refreshServers()]);
-      bumpSync();
-    }
-  };
-
-  // The session tree's Delete (tree_moves::delete_tree_items): one call and
-  // one vault save however much is selected. Rethrows so the tree can say
-  // what failed.
-  const deleteItems = async (items: TreeItems) => {
-    // The servers that go, the picked ones and those in the picked folders,
-    // for the same per-server cleanup removeServer does.
-    const tree = folderTree(folders);
-    const insideFolders = new Set<number>(items.folders.flatMap((f) => [...tree.subtreeOf(f)]));
-    const gone = new Set<number>([
-      ...items.servers,
-      ...(servers || []).filter((s: any) => insideFolders.has(tree.serverFolder(s) as number)).map((s: any) => s.id as number),
-    ]);
-    try {
-      await invoke("delete_tree_items", { servers: items.servers, folders: items.folders });
-      (servers || []).filter((s: any) => gone.has(s.id)).forEach(forgetServer);
-      addLog("Removed from the session tree.", "info");
-    } finally {
-      await Promise.all([refreshFolders(), refreshServers()]);
-      bumpSync();
-    }
   };
 
   const renameFolder = async (id: number, name: string) => {
@@ -1102,8 +849,6 @@ function DesktopApp() {
         serverId: s.id,
         serverName: s.name,
         host: s.host,
-        // The port it was opened with, so the OS check below asks that one
-        // rather than whatever the server's port is by then.
         port: s.port,
         mirrors: s.mirrors,
         serverUuid: s.uuid ?? null,
@@ -1127,23 +872,7 @@ function DesktopApp() {
   const confirm = useConfirm();
   const textPrompt = useTextPrompt();
 
-  // Live Edit copies with changes that were never uploaded, kept when their
-  // session ended or the profile was locked (keep_unsent_edits in lib.rs).
-  useEffect(() => {
-    const unlisten = listen<{ folder: string; files: string[] }>("live-edit-kept", async (e) => {
-      const { folder, files } = e.payload;
-      const what = files.length === 1 ? `${visibleName(files[0])} has changes` : `${files.length} files have changes`;
-      addLog(`Live Edit: ${what} that were never uploaded to the server. Kept in ${folder}.`, "info");
-      const ok = await confirm({
-        title: "Unsent edits kept",
-        message: `${what} that were never uploaded to the server. ${files.length === 1 ? "It's" : "They're"} kept in:\n\n${folder}`,
-        okLabel: "Show folder",
-        cancelLabel: "OK",
-      });
-      if (ok) invoke("local_open_in_explorer", { localPath: folder }).catch(() => {});
-    });
-    return () => { unlisten.then((f) => f()).catch(() => {}); };
-  }, [addLog, confirm]);
+  Fork.useLiveEditKept(addLog);
   // A shared profile's grant changed while sharing was locked, so the sync
   // can't tell whether its key did: unlock sharing, and sync, which opens the
   // grant. A key that did change then waits for the user's OK as usual. The
@@ -1178,22 +907,8 @@ function DesktopApp() {
   // the user opening/closing tabs and either over- or under-confirm.
   const sessionsRef = useRef(sessions);
   useEffect(() => { sessionsRef.current = sessions; }, [sessions]);
-  // Home terminals still running (HomePane), which closing the window or
-  // locking the profile ends too.
-  const homeShellsRef = useRef(0);
-
-  // What closing or locking would end, for the confirmations below, or null
-  // when there's nothing to ask about. One Home shell on its own doesn't
-  // count — the app always has one, and every lock would ask.
-  const wouldEnd = () => {
-    const ssh = sessionsRef.current.length;
-    const local = homeShellsRef.current;
-    if (ssh === 0 && local < 2) return null;
-    const parts = [];
-    if (ssh > 0) parts.push(`${ssh} SSH session${ssh === 1 ? "" : "s"}`);
-    if (local > 0) parts.push(`${local} terminal${local === 1 ? "" : "s"} on this computer`);
-    return { what: parts.join(" and "), many: ssh + local > 1 };
-  };
+  const homeShellsRef = useRef(0); // Home's terminals (Fork.HomeView)
+  const wouldEnd = () => Fork.wouldEnd(sessionsRef.current.length, homeShellsRef.current);
 
   // Intercept BOTH the in-app X button (which calls appWindow.close()) AND
   // OS-level closes (Alt+F4, taskbar context-menu close, system shutdown).
@@ -1243,9 +958,8 @@ function DesktopApp() {
   };
 
   // Lock the current profile and return to the picker. Confirms first when
-  // there are open SSH sessions (or Home terminals) because they will be
-  // torn down — accidental double-clicks on the lock icon shouldn't kill
-  // the user's terminal work.
+  // there are open SSH sessions because they will be torn down — accidental
+  // double-clicks on the lock icon shouldn't kill the user's terminal work.
   const handleLogout = async () => {
     const ending = wouldEnd();
     if (ending) {
@@ -1307,8 +1021,7 @@ function DesktopApp() {
     setSessions([]);
     setTabNames({});
     setActiveView(START_VIEW);
-    setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setCommands([]);
-    osChecked.current.clear();
+    setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setCommands([]); setNotes([]);
     // The next profile numbers its servers from 1 too, so anything kept by
     // session id would land on its sessions: an armed broadcast most of all.
     broadcast.disable();
@@ -1321,7 +1034,6 @@ function DesktopApp() {
     setPromptSessions(new Set());
     setLastSyncLabel(null);
     setActiveFolderId(null);
-    setNotes([]);
     // And no revealed secret stays behind in a form.
     setNewNode(defaultNode);
     setEditCredData(EMPTY_CRED);
@@ -1329,191 +1041,54 @@ function DesktopApp() {
     addLog("Profile locked.", "info");
   };
 
-  // Each server's OS, for the badges in the session tree and the server grid
-  // (src-tauri/src/server_os.rs): read once, when a server whose OS isn't
-  // known yet connects, unless Settings turns it off. Moving a server to
-  // another host or port forgets its OS, so it is read again; a server that
-  // can't answer isn't asked again until the app restarts (osChecked).
-  useEffect(() => {
-    if (!appSettings.detectOs) return;
-    for (const s of sessions) {
-      // Only an SSH server has a shell to ask (not an RDP one).
-      if (s.serverId <= 0 || !s.host || (s.protocol ?? "ssh") !== "ssh" || sessionStatuses[s.id] !== "connected") continue;
-      const server = servers.find((x: any) => x.id === s.serverId);
-      if (!server || server.os) continue;
-      // The port the session connected to, like its host: the server may
-      // have been edited since it opened.
-      const port = s.port ?? server.port;
-      const key = `${server.id}|${s.host}|${port}`;
-      if (osChecked.current.has(key)) continue;
-      osChecked.current.add(key);
-      invoke<string | null>("detect_server_os", { sessionId: s.id, serverId: s.serverId, host: s.host, port })
-        .then((os) => { if (os) refreshServers(); })
-        .catch(() => {});
-    }
-  }, [sessionStatuses, sessions, servers, appSettings.detectOs]);
-
-  // Open servers, each in its own tab (one already open is just shown);
-  // focus lands on the first. Several at once from the session tree's
-  // multi-select and "Open all".
-  const sessionFor = (server: any): Session => ({
-    id: `session-${server.id}`,
-    serverId: server.id,
-    serverName: server.name,
-    protocol: ["rdp", "telnet", "vnc"].includes(server.protocol) ? server.protocol : "ssh",
-    host: server.host,
-    port: server.port,
-    // Pass the raw mirrors JSON through to SessionView so the
-    // MirrorsPanel can pre-populate "Saved on this node" without
-    // another round-trip to the backend.
-    mirrors: server.mirrors,
-    serverUuid: server.uuid ?? null,
-    // Commands typed into the first terminal on connect (see SessionView).
-    runOnConnect: server.run_on_connect || "",
-    // And into each other terminal of the tab (#256).
-    runOnConnectEvery: !!server.run_on_connect_every,
-    // Set or changed by someone this profile is shared with, not allowed
-    // here yet: SessionView asks before typing them.
-    runOnConnectHeld: (server.held || []).includes("run_on_connect"),
-  });
-  // Someone moved a server (in a shared profile, or in a profile file from
-  // elsewhere) and this device hasn't allowed it: it still connects, but not
-  // unasked (approvals::hold_moved). Cancel has the focus, as for held
-  // commands. The servers that may open; one open already isn't asked about.
-  const passMoved = async (list: any[]) => {
-    const open = new Set(sessions.map((s) => s.id));
-    const ok: any[] = [];
-    for (const server of list) {
-      const moved: string | undefined = open.has(`session-${server.id}`)
-        ? undefined
-        : (server.held || []).find((i: string) => i.startsWith("moved:"));
+  const openServer = async (server: any) => {
+    const sessionId = `session-${server.id}`;
+    const existing = sessions.find(s => s.id === sessionId);
+    if (!existing) {
+      // Someone moved this server and this device hasn't allowed it: it still
+      // connects, but not unasked. Cancel has the focus, as for held commands.
+      const moved: string | undefined = (server.held || []).find((i: string) => i.startsWith("moved:"));
       if (moved) {
-        const yes = await confirm({
+        const ok = await confirm({
           title: "Connect to the new address?",
           message: `${server.name} now connects to ${server.moved_to || "a new address"}. It connected to ${moved.slice("moved:".length)}, and this device hasn't allowed the change.`,
           okLabel: "Allow and connect",
           cancelLabel: "Not now",
           safeDefault: true,
         });
-        if (!yes) continue;
+        if (!ok) return;
         await allowHeld(server.id, [moved]);
       }
-      ok.push(server);
+      setSessions((prev: Session[]) => prev.some((s) => s.id === sessionId) ? prev : [...prev, {
+        id: sessionId,
+        serverId: server.id,
+        serverName: server.name,
+        protocol: ["rdp", "telnet", "vnc"].includes(server.protocol) ? server.protocol : "ssh",
+        host: server.host,
+        port: server.port,
+        // Pass the raw mirrors JSON through to SessionView so the
+        // MirrorsPanel can pre-populate "Saved on this node" without
+        // another round-trip to the backend.
+        mirrors: server.mirrors,
+        serverUuid: server.uuid ?? null,
+        // Commands to auto-run once on the first terminal (see SessionView).
+        runOnConnect: server.run_on_connect || "",
+        // And once into each new terminal of the tab (#256).
+        runOnConnectEvery: !!server.run_on_connect_every,
+        // Set or changed elsewhere, not allowed here yet: SessionView asks
+        // before typing them.
+        runOnConnectHeld: (server.held || []).includes("run_on_connect"),
+      }]);
     }
-    return ok;
-  };
-  const openServers = async (all: any[]) => {
-    const list = await passMoved(all);
-    if (list.length === 0) return;
-    setSessions((prev: Session[]) => {
-      const seen = new Set(prev.map((p) => p.id));
-      const fresh = list
-        .filter((server) => !seen.has(`session-${server.id}`))
-        .map(sessionFor);
-      return [...prev, ...fresh];
-    });
-    setActiveView(`session-${list[0].id}`);
-  };
 
-  // Closing one connected session asks first — unless that's turned off in
-  // Settings › Servers, or with "Don't ask again" right in the prompt.
-  // Closing several at once always asks.
-  const askCloseSession = () => (!appSettings.confirmCloseSession ? Promise.resolve(true) : confirm({
-    title: "Close this session?",
-    message: "The connection will be dropped.",
-    okLabel: "Close",
-    destructive: true,
-    dontAskAgain: () => setAppSettings(s => ({ ...s, confirmCloseSession: false })),
-  }));
-
-  // Close sessions by id (All tabs ▾), asking first when any is connected.
-  // Unmounting a SessionView disconnects it.
-  // False when the user said no.
-  const closeSessions = async (ids: string[]): Promise<boolean> => {
-    if (ids.length === 0) return true;
-    const connected = ids.filter(id => sessionStatuses[id] === "connected").length;
-    if (connected > 0) {
-      const ok = ids.length === 1 ? await askCloseSession() : await confirm({
-        title: `Close ${ids.length} sessions?`,
-        message: connected === 1 ? "1 of them is connected; its SSH connection will be dropped." : `${connected} of them are connected; ${connected} SSH connections will be dropped.`,
-        okLabel: "Close",
-        destructive: true,
-      });
-      if (!ok) return false;
-    }
-    const closing = new Set(ids);
-    for (const id of closing) clearTabName(id);
-    setSessions(prev => prev.filter(s => !closing.has(s.id)));
-    setSessionStatuses(prev => {
-      const next = { ...prev };
-      for (const id of closing) delete next[id];
-      return next;
-    });
-    setMergedSessionIds(prev => {
-      const next = prev.filter(id => !closing.has(id));
-      return next.length < 2 ? [] : next;
-    });
-    for (const id of closing) {
-      broadcast.removeSession(id);
-      unpinSessionFromWall(id);
-    }
-    setActiveView(prev => (closing.has(prev) ? START_VIEW : prev));
-    return true;
+    setActiveView(sessionId);
   };
-
-  // A tab's right-click menu: close tabs other than it, after it, the
-  // disconnected ones, or every session. Tabs in title-bar order.
-  const closeTabs = async (which: "others" | "right" | "dead" | "all", targetId: string) => {
-    const tabs = sessions.map(s => s.id);
-    const at = tabs.indexOf(targetId);
-    const ids =
-      which === "others" ? tabs.filter(id => id !== targetId) :
-      which === "right" ? tabs.slice(at + 1) :
-      which === "dead" ? tabs.filter(id => ["failed", "disconnected"].includes(sessionStatuses[id] ?? "connecting")) :
-      sessions.map(s => s.id);
-    await closeSessions(ids);
-  };
-
-  // Ctrl+Shift+K opens All tabs ▾ to jump by name (its search is focused);
-  // Ctrl+Tab / Ctrl+Shift+Tab step through the title bar left to right:
-  // Home, then the server tabs. From a view that isn't a tab
-  // (Settings, the vault…) they go to the first or last tab. preventDefault
-  // keeps the webview from doing anything of its own with Ctrl+Tab.
-  const tabOrderRef = useRef<string[]>([]);
-  tabOrderRef.current = [
-    ...(HAS_HOME && isUnlocked ? ["home"] : []),
-    ...sessions.map(s => s.id),
-  ];
-  const stepTabRef = useRef((_dir: 1 | -1) => {});
-  stepTabRef.current = (dir) => {
-    const order = tabOrderRef.current;
-    if (order.length === 0) return;
-    const at = order.indexOf(activeView);
-    const next = at < 0 ? (dir > 0 ? 0 : order.length - 1) : (at + dir + order.length) % order.length;
-    // Leaves a split the way a plain click on a tab does: only for a tab
-    // that isn't part of it. (Set anew each render, so this is the current
-    // split.)
-    if (!mergedSessionIds.includes(order[next])) setMergedSessionIds([]);
-    setActiveView(order[next]);
-  };
-  const canJumpRef = useRef(false);
-  canJumpRef.current = isUnlocked && sessions.length > 0;
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const k = appHotkey(e);
-      if (k !== "jump" && k !== "next" && k !== "prev") return;
-      e.preventDefault();
-      if (e.repeat && k === "jump") return;
-      // Not under a dialog: what it asks about is the view as it is.
-      if (document.querySelector('[aria-modal="true"]')) return;
-      if (k === "jump") { if (canJumpRef.current) setAllTabsOpen(true); }
-      else stepTabRef.current(k === "next" ? 1 : -1);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  const openServer = (server: any) => openServers([server]);
+  Fork.useOsBadges({ profile: activeProfile, sessions, statuses: sessionStatuses, servers, detectOs: appSettings.detectOs, refreshServers });
+  const { askCloseSession, closeSessions, closeTabs } = Fork.useCloseSessions({
+    sessions, statuses: sessionStatuses, confirmClose: appSettings.confirmCloseSession, setAppSettings, clearTabName, setSessions,
+    setSessionStatuses, setMergedSessionIds, broadcast, unpinSessionFromWall, setActiveView,
+  });
+  const [allTabsOpen, setAllTabsOpen] = Fork.useTabKeys({ isUnlocked, sessions, activeView, mergedSessionIds, setMergedSessionIds, setActiveView });
 
   // Spawn a session from inline Quick Connect auth AND leave behind a reusable
   // node in the root directory so the target can be reconnected later without
@@ -1602,18 +1177,13 @@ function DesktopApp() {
     setIsPanelOpen(true);
   };
 
-  // "Pick a jump host", from a tab whose server's jump host was deleted
-  // (SessionView): its form, at Jump via.
-  useEffect(() => {
-    const onPick = (e: Event) => {
-      const id = (e as CustomEvent<{ serverId: number }>).detail?.serverId;
-      const server = (servers || []).find((x: any) => x.id === id);
-      if (server) void handleEditNode(server, { focusJump: true });
-    };
-    window.addEventListener("submarine-pick-jump-host", onPick);
-    return () => window.removeEventListener("submarine-pick-jump-host", onPick);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [servers]);
+  const [focusJumpVia, setFocusJumpVia] = Fork.useJumpHostPick(servers, handleEditNode);
+  const tree = Fork.useSessionTree({
+    profile: activeProfile, servers, folders, sessions, statuses: sessionStatuses, waiting: promptSessions, activeView,
+    setSessions, setActiveView, setMergedSessionIds, allowHeld, editServer: handleEditNode, renameFolder,
+    newServer: { setNewNode, defaultNode, setFormError, setIsPanelOpen }, refreshFolders, refreshServers, bumpSync, addLog, forgetServer,
+  });
+  const { createFolder, cloneServer } = tree;
 
   // Render helper, NOT a component — it is invoked as `{TitleBar()}` below,
   // never as `<TitleBar />`. Rendering it as a JSX element would give it a
@@ -1647,15 +1217,7 @@ function DesktopApp() {
       <div className="hidden sm:flex items-center gap-2 pr-4 pl-[75px] md:pl-2" data-tauri-drag-region>
         <img src={logoUrl} alt="" draggable={false} className="h-6 w-auto max-w-[24px] object-contain select-none" />
         <span className="text-[12px] font-bold text-white tracking-tight">Submarine</span>
-        {appVersion && (
-          <span
-            data-tauri-drag-region
-            title={appVersion.commit ? `Built from commit ${appVersion.commit}` : undefined}
-            className="text-[11px] text-zinc-500/60 tracking-tight tabular-nums"
-          >
-            v{appVersion.version}
-          </span>
-        )}
+        <Fork.AppVersion />
       </div>
 
       {/* Mobile session picker — replaces the horizontal tab strip on
@@ -1842,21 +1404,7 @@ function DesktopApp() {
         className={`${isMobile ? 'hidden' : 'flex'} flex-1 ${appSettings.compactTabs ? 'gap-0 pb-0' : 'gap-1 pb-1'} overflow-x-auto no-scrollbar h-full items-end`}
         onWheel={(e) => { e.currentTarget.scrollLeft += e.deltaY; }}
       >
-        {/* Home stays first, like MobaXterm's home tab: always there to go
-            back to, and not a session — no status, no close, never in a
-            broadcast or a split. */}
-        {HAS_HOME && isUnlocked && (
-          <div
-            onClick={() => setActiveView("home")}
-            title="Home — terminals on this computer"
-            aria-label="Home"
-            className={`no-drag flex items-center justify-center h-7 w-9 cursor-pointer transition-all shrink-0 ${
-              titleTabClass({ compact: appSettings.compactTabs, active: activeView === "home" })
-            }`}
-          >
-            <Home size={14} className="shrink-0" />
-          </div>
-        )}
+        <Fork.HomeTab show={isUnlocked} active={activeView === "home"} compact={appSettings.compactTabs} onClick={() => setActiveView("home")} />
         {sessions.map(s => {
           const st = sessionStatuses[s.id] ?? "connecting";
           // Dot palette: green = connected, amber = connecting, red = failed
@@ -1885,14 +1433,11 @@ function DesktopApp() {
           // connected?" and "is it broadcasting?" at a glance.
           const isBroadcastTarget = broadcast.enabled && broadcast.targetSessionIds.has(s.id);
           const isMergedTab = mergedSessionIds.includes(s.id);
-          // Compact tabs: flat, touching, a thin underline for the one in
-          // front; long names are cut (the full one is the hover title).
-          const compact = appSettings.compactTabs;
+          const compact = appSettings.compactTabs; // flat tabs that touch
           const drag = sessionDrag.tabMark(s.id);
           return (
             <div
               key={s.id}
-              // data-tab (what the strip scrolls into view) comes with these.
               {...sessionDrag.tabProps(s.id)}
               style={drag.style}
               onClick={(e) => {
@@ -1939,17 +1484,15 @@ function DesktopApp() {
               // pill and break the row's height.
               title={isMergedTab ? `${tabLabel(s)} · split beside current view (Ctrl-click to unpair)` : tabLabel(s)}
               className={`group no-drag select-none flex items-center h-7 cursor-pointer transition-all shrink-0 ${drag.dim ? 'opacity-50' : ''} ${
-                compact ? COMPACT_TAB_PAD : 'px-2.5 sm:px-4'
-              } ${titleTabClass({ compact, active: activeView === s.id, tone: isMergedTab ? "merged" : "primary" })}`}
+                compact ? Fork.COMPACT_TAB_PAD : 'px-2.5 sm:px-4'
+              } ${Fork.titleTabClass({ compact, active: activeView === s.id, tone: isMergedTab ? "merged" : "primary" })}`}
             >
               <span
                 title={dotTitle}
                 className={`w-2 h-2 rounded-full ${compact ? 'mr-1.5' : 'mr-2'} shrink-0 ${dotTone}`}
                 aria-label={dotTitle}
               />
-              {/* Something printed in one of its terminals while you weren't
-                  looking; clears when you look at that terminal. */}
-              <NewsDot sessions={[s.id]} className="mr-1.5" />
+              <Fork.NewsDot sessions={[s.id]} className="mr-1.5" />
               {isBroadcastTarget && (
                 <span
                   title="Broadcast target"
@@ -1960,37 +1503,7 @@ function DesktopApp() {
               {isMergedTab && (
                 <Columns size={9} className="text-primary/70 mr-1 shrink-0" />
               )}
-              {/* Shared with an AI tab; lit while one is doing something here.
-                  Amber, with a click to change it, where the AI may run
-                  commands here without asking (#115). */}
-              {(() => {
-                const with_ = sharedWith(ai, s.id);
-                if (with_.length === 0) return null;
-                const busy = ai.running.some(r => r.session_id === s.id) || ai.pending.some(p => p.session_id === s.id);
-                const entries = with_.flatMap(t => t.servers.filter(x => x.session_id === s.id));
-                const loosest = entries.find(x => x.allow_all || x.level >= 3) ?? entries.find(x => x.level === 2);
-                const marker = loosest ? aiMarker(loosest) : null;
-                if (loosest && marker) {
-                  return (
-                    <button
-                      type="button"
-                      onClick={(e) => { e.stopPropagation(); openAiTrust(trustTargetFor(loosest)); }}
-                      title={`Shared with ${with_.map(t => t.label).join(", ")}. ${marker}. Click to change it.`}
-                      aria-label={marker}
-                      className={`mr-1 shrink-0 flex items-center gap-0.5 rounded px-0.5 text-amber-300 hover:bg-amber-400/15 ${busy ? "animate-pulse" : ""}`}
-                    >
-                      <Bot size={10} />
-                      {/* The marker's words, the Bot icon standing for "AI:". */}
-                      <span className="text-[9.5px] font-semibold whitespace-nowrap">{marker.replace(/^AI: /, "")}</span>
-                    </button>
-                  );
-                }
-                return (
-                  <span title={`Shared with ${with_.map(t => t.label).join(", ")}`} aria-label="Shared with AI" className={`mr-1 shrink-0 flex ${busy ? "text-primary animate-pulse" : "text-zinc-400"}`}>
-                    <Bot size={10} />
-                  </span>
-                );
-              })()}
+              <Fork.TabAiMarker sessionId={s.id} />
               {/* Node name display. Was 10 px + uppercase on desktop — that
                   combination gave the smallest, hardest-to-read name in the
                   whole title bar even though it's the ID users need most.
@@ -2003,7 +1516,7 @@ function DesktopApp() {
               <button
                 type="button"
                 aria-current={activeView === s.id ? "page" : undefined}
-                className={`text-[11px] font-semibold whitespace-nowrap tracking-tight rounded outline-none focus-visible:ring-2 focus-visible:ring-primary/60 ${compact ? COMPACT_TAB_NAME : ''}`}
+                className={`text-[11px] font-semibold whitespace-nowrap tracking-tight rounded outline-none focus-visible:ring-2 focus-visible:ring-primary/60 ${compact ? Fork.COMPACT_TAB_NAME : ''}`}
               >
                 {tabLabel(s)}
               </button>
@@ -2056,42 +1569,10 @@ function DesktopApp() {
           );
         })}
       </div>
-      {/* All tabs ▾: every session, searchable (Ctrl+Shift+K), anchored at
-          the right edge however many tabs are open. */}
-      {isUnlocked && sessions.length > 0 && (
-        <div className="relative no-drag shrink-0 mx-0.5">
-          <button
-            type="button"
-            onClick={() => setAllTabsOpen(v => !v)}
-            title={`All sessions (${sessions.length}) — Ctrl+Shift+K to jump by name`}
-            aria-label="All sessions"
-            className={`relative flex items-center justify-center w-7 h-7 rounded-full transition-all ${
-              allTabsOpen
-                ? "bg-primary/15 border border-primary/40 text-primary"
-                : "bg-white/[0.06] border border-white/10 text-zinc-400 hover:bg-white/[0.1] hover:text-white"
-            }`}
-          >
-            <List size={12} />
-            <span
-              className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-1 rounded-full bg-zinc-300 text-[9px] font-bold text-black flex items-center justify-center leading-none"
-              aria-hidden="true"
-            >
-              {sessions.length}
-            </span>
-          </button>
-          {allTabsOpen && (
-            <AllTabsMenu
-              sessions={sessions.map(s => ({ ...s, label: tabLabel(s) }))}
-              statuses={sessionStatuses}
-              waiting={promptSessions}
-              activeView={activeView}
-              onShowSession={(sid) => { setAllTabsOpen(false); setMergedSessionIds([]); setActiveView(sid); }}
-              onCloseSessions={(ids) => { void closeSessions(ids); }}
-              onDismiss={() => setAllTabsOpen(false)}
-            />
-          )}
-        </div>
-      )}
+      <Fork.AllTabsButton
+        show={isUnlocked} open={allTabsOpen} setOpen={setAllTabsOpen} sessions={sessions} label={tabLabel} statuses={sessionStatuses}
+        waiting={promptSessions} activeView={activeView} onShow={(sid) => { setMergedSessionIds([]); setActiveView(sid); }} onClose={closeSessions}
+      />
       {/* Wall trigger — moved OUT of the scrollable tab strip and next
           to the Broadcast pill so both multi-session affordances live
           in the same "utility cluster" at the right edge of the title
@@ -2254,31 +1735,7 @@ function DesktopApp() {
           )}
         </div>
       )}
-      {/* AI: opens the AI panel; counts the requests waiting for you. */}
-      {isUnlocked && ai.enabled && (
-        <div className="relative no-drag shrink-0 mx-1 flex items-center gap-1">
-          {HAS_HOME && !isMobile && <AiPaneButton v={aiPaneView} />}
-          <button
-            type="button"
-            onClick={() => setAiOpen(o => !o)}
-            title={cardsOf(ai.pending).length ? `AI: ${cardsOf(ai.pending).length} waiting for you` : "AI panel"}
-            aria-label="AI panel"
-            aria-pressed={aiOpen}
-            className={`relative flex items-center justify-center w-7 h-7 rounded-full transition-all ${
-              aiOpen || cardsOf(ai.pending).length
-                ? "bg-primary/15 border border-primary/40 text-primary"
-                : "bg-white/[0.06] border border-white/10 text-zinc-400 hover:bg-white/[0.1] hover:text-white"
-            }`}
-          >
-            <Bot size={13} />
-            {cardsOf(ai.pending).length > 0 && (
-              <span className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-1 rounded-full bg-primary text-[9px] font-bold text-black flex items-center justify-center leading-none" aria-hidden="true">
-                {cardsOf(ai.pending).length}
-              </span>
-            )}
-          </button>
-        </div>
-      )}
+      <Fork.AiTitleButtons show={isUnlocked} isMobile={isMobile} v={aiPaneView} open={aiOpen} onToggle={() => setAiOpen(o => !o)} />
       {/* Window controls: desktop only, at any window width (the window has
           no frame of its own, so a narrow one still needs them). Android has
           its own gesture nav / system back button, and the WebView window has
@@ -2321,13 +1778,7 @@ function DesktopApp() {
           <div className="fixed inset-0 z-[60]" onClick={() => { setTabMenu(null); setTabRename(null); }} onContextMenu={(e) => { e.preventDefault(); setTabMenu(null); setTabRename(null); }} />
           <div
             className="fixed z-[70] bg-[#15151a] border border-white/10 rounded-md shadow-2xl py-1 min-w-[240px] text-[11px] no-drag overflow-y-auto custom-scrollbar"
-            // With the split list and the close items, the menu can
-            // be taller than the space under the click: it moves up as far
-            // as it can, and scrolls inside what's left.
-            style={(() => {
-              const top = Math.max(8, Math.min(tabMenu.y, window.innerHeight - 380));
-              return { left: Math.min(tabMenu.x, window.innerWidth - 260), top, maxHeight: window.innerHeight - top - 8 };
-            })()}
+            style={Fork.tabMenuStyle(tabMenu.x, tabMenu.y, window.innerWidth, window.innerHeight)}
           >
             {/* The tab's name. The editor opens inside this menu: Enter
                 keeps the name (an empty one goes back to the server's),
@@ -2351,29 +1802,7 @@ function DesktopApp() {
                 onClick={() => setTabRename(targetId)}
               >Rename tab</button>
             )}
-            {/* Moving the tab without dragging it (keyboard, touchpad). */}
-            {(() => {
-              const tabs = sessions.map(s => s.id);
-              const at = tabs.indexOf(targetId);
-              const moveTo = (to: number) => {
-                setSessions(prev => reorderById(prev, targetId, tabs[to], to > at));
-                setTabMenu(null);
-              };
-              return (
-                <>
-                  <button
-                    disabled={at <= 0}
-                    className="w-full text-left px-3 py-1.5 hover:bg-white/10 text-zinc-200 disabled:opacity-40 disabled:hover:bg-transparent"
-                    onClick={() => moveTo(at - 1)}
-                  >Move left</button>
-                  <button
-                    disabled={at < 0 || at >= tabs.length - 1}
-                    className="w-full text-left px-3 py-1.5 hover:bg-white/10 text-zinc-200 disabled:opacity-40 disabled:hover:bg-transparent"
-                    onClick={() => moveTo(at + 1)}
-                  >Move right</button>
-                </>
-              );
-            })()}
+            <Fork.TabMoveItems sessions={sessions} targetId={targetId} setSessions={setSessions} onDone={() => setTabMenu(null)} />
             <button
               className="w-full text-left px-3 py-1.5 hover:bg-primary/15 hover:text-primary text-zinc-200 flex items-center gap-2"
               onClick={() => {
@@ -2519,28 +1948,7 @@ function DesktopApp() {
                 setTabMenu(null);
               }}
             >Close tab</button>
-            {(() => {
-              const tabs = sessions.map(s => s.id);
-              const at = tabs.indexOf(targetId);
-              const others = tabs.length - (at >= 0 ? 1 : 0);
-              const right = at >= 0 ? tabs.length - at - 1 : 0;
-              const dead = tabs.filter(id => ["failed", "disconnected"].includes(sessionStatuses[id] ?? "connecting")).length;
-              const item = (label: string, n: number, which: "others" | "right" | "dead" | "all", enabled = n > 0) => (
-                <button
-                  disabled={!enabled}
-                  className="w-full text-left px-3 py-1.5 hover:bg-rose-500/15 hover:text-rose-300 text-zinc-200 disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-zinc-200"
-                  onClick={() => { setTabMenu(null); void closeTabs(which, targetId); }}
-                >{label} ({n})</button>
-              );
-              return (
-                <>
-                  {item("Close other tabs", others, "others")}
-                  {item("Close tabs to the right", right, "right")}
-                  {item("Close disconnected tabs", dead, "dead")}
-                  {item("Close all tabs", sessions.length, "all")}
-                </>
-              );
-            })()}
+            <Fork.TabCloseItems tabs={sessions.map(s => s.id)} targetId={targetId} statuses={sessionStatuses} onPick={(which) => { setTabMenu(null); void closeTabs(which, targetId); }} />
           </div>
         </>
         );
@@ -2554,33 +1962,6 @@ function DesktopApp() {
   // the un-shrunken layout viewport.
   if (loading) return <div className="h-full bg-black flex items-center justify-center font-mono text-xs text-primary animate-pulse">Loading…</div>;
 
-  const sessionTree = (
-    <SessionTree
-      profile={activeProfile ?? ""}
-      servers={servers}
-      folders={folders}
-      sessions={sessions}
-      statuses={sessionStatuses}
-      waiting={promptSessions}
-      activeSessionId={activeView}
-      onOpenServers={openServers}
-      onShowSession={(sid) => {
-        setMergedSessionIds([]);
-        setActiveView(sid);
-      }}
-      onEditServer={handleEditNode}
-      onNewServer={addServerIn}
-      onCloneServer={cloneServer}
-      onCreateFolder={createFolder}
-      onRenameFolder={renameFolder}
-      onDelete={deleteItems}
-      onMove={moveItems}
-      side={treeSide}
-      onToggleSide={() => setTreeSide((s) => (s === "left" ? "right" : "left"))}
-      onClose={() => setTreeOpen(false)}
-    />
-  );
-
   return (
     <div className="h-full w-full bg-background flex flex-col overflow-hidden text-zinc-200 select-none">
       {TitleBar()}
@@ -2593,9 +1974,9 @@ function DesktopApp() {
         // tab-order stays intuitive and <main> grabs the full screen width
         // (terminal gains the ~50px the vertical rail used to eat).
         <div inert={overlayOpen ? "" : undefined} className={`flex-1 flex ${isMobile ? 'flex-col-reverse' : ''} overflow-hidden pt-10`}>
-          <Sidebar activeTab={activeView.startsWith('session-') ? 'nodes' : activeView} setActiveTab={setActiveView} isMobile={isMobile} onLogout={handleLogout} profileName={activeProfile} syncing={cloudSyncing} hasHome={HAS_HOME}
-            treeOpen={treeOpen} onToggleTree={isMobile ? undefined : () => setTreeOpen((v) => !v)} />
-          {!isMobile && treeOpen && treeSide === "left" && sessionTree}
+          <Sidebar activeTab={activeView.startsWith('session-') ? 'nodes' : activeView} setActiveTab={setActiveView} isMobile={isMobile} onLogout={handleLogout} profileName={activeProfile} syncing={cloudSyncing} hasHome={Fork.HAS_HOME}
+            treeOpen={tree.open} onToggleTree={isMobile ? undefined : () => tree.setOpen((v) => !v)} />
+          <Fork.DesktopSessionTree tree={tree} side="left" isMobile={isMobile} />
 
           <main className="flex-1 flex flex-col min-w-0 min-h-0 bg-transparent relative">
             {activeView === "nodes" && (
@@ -2607,13 +1988,20 @@ function DesktopApp() {
                 onActiveFolderChange={setActiveFolderId}
                 onOpenServer={openServer}
                 onEditServer={handleEditNode}
-                // When invoked from inside a folder header, seed the new
-                // node's folderId so the user doesn't have to re-pick the
-                // folder they just clicked into. Bare invocation (from the
-                // root grid's "Add server" card) stays at the empty default.
-                onAddClick={addServerIn}
+                onAddClick={(folderId?: number | null) => {
+                  // When invoked from inside a folder header, seed the new
+                  // node's folderId so the user doesn't have to re-pick the
+                  // folder they just clicked into. Bare invocation (from the
+                  // root grid's "Add server" card) stays at the empty default.
+                  setNewNode({
+                    ...defaultNode,
+                    folderId: folderId != null ? String(folderId) : "",
+                  });
+                  setFormError("");
+                  setIsPanelOpen(true);
+                }}
                 onQuickConnect={() => setIsQuickConnectOpen(true)}
-                onAllowHeld={allowHeld}
+                onAllowHeld={allowHeldSeen}
                 onKeepSsh={keepServerSsh}
                 onKeepAi={keepAiPolicy}
                 keyChange={shareKeyChange}
@@ -2625,9 +2013,8 @@ function DesktopApp() {
                 onRemoveServer={removeServer}
                 onRemoveFolder={removeFolder}
                 onRenameFolder={renameFolder}
-                onCreateFolder={(name: string, parentId: number | null) =>
-                  createFolder(name, parentId).catch((e) => { addLog(`Couldn't create the folder: ${e}`, "error"); throw e; })}
-                onCloneServer={(id: number) => cloneServer(id).catch(() => {})}
+                onCreateFolder={createFolder}
+                onCloneServer={cloneServer}
                 onReorderServers={async (ids: number[]) => {
                   // Rethrow on failure so NodeGrid drops its optimistic order
                   // override and reverts to the real (unchanged) arrangement.
@@ -2851,36 +2238,20 @@ function DesktopApp() {
                       const idx = visibleIds.indexOf(sess.id);
                       const isVisible = idx >= 0;
                       const isFocused = activeView === sess.id;
-                      // A session with terminals that isn't on screen is left
-                      // out of the layout (display: none), not only made
-                      // invisible: xterm stops drawing only then, and 35
-                      // hidden tabs drawing their output slowed the one in
-                      // front to a few frames a second (#127). Its shell and
-                      // buffer keep running. A remote desktop keeps its size
-                      // instead, for the desktop it asks the server for.
-                      const remote = sess.protocol === "rdp" || sess.protocol === "vnc";
                       const onScreen = isVisible && viewIsSession;
-                      const style: React.CSSProperties = isVisible
+                      const style: React.CSSProperties | undefined = isVisible
                         ? {
                             position: 'absolute',
                             top: 0,
                             bottom: 0,
                             left: `${(idx * 100) / visibleIds.length}%`,
                             width: `${100 / visibleIds.length}%`,
-                            ...(onScreen || remote ? {} : { display: 'none' }),
                           }
-                        : remote
-                          ? {
-                              position: 'absolute',
-                              inset: 0,
-                              opacity: 0,
-                              pointerEvents: 'none',
-                            }
-                          : { position: 'absolute', inset: 0, display: 'none' };
+                        : undefined;
                       return (
                         <div
                           key={sess.id}
-                          style={style}
+                          style={Fork.sessionPaneStyle(style, onScreen, sess.protocol)}
                           inert={isVisible ? undefined : ""}
                           onMouseDownCapture={() => {
                             // Focus shift ONLY — tile positions live in
@@ -3264,14 +2635,7 @@ function DesktopApp() {
               </div>
             )}
 
-            {/* Home — terminals on this computer. Mounted the first time
-                it's shown and only hidden after that (like the sessions
-                canvas above), so its shells keep running. */}
-            {HAS_HOME && (homeShown || aiPane.homeNeeded) && (
-              <div className={`absolute inset-0 flex flex-col overflow-hidden bg-background ${activeView === "home" ? "" : "opacity-0 pointer-events-none"}`}>
-                <HomePane visible={activeView === "home"} onLiveShells={(n) => { homeShellsRef.current = n; }} />
-              </div>
-            )}
+            <Fork.HomeView visible={activeView === "home"} shells={homeShellsRef} />
 
             {/* Library = Commands + Notes merged.
                 Commands and Notes used to be two distinct rails; both are
@@ -3531,29 +2895,14 @@ function DesktopApp() {
             )}
 
           </main>
-          {HAS_HOME && !isMobile && (
-            <AiSidePane
-              v={aiPaneView}
-              onHome={() => setActiveView("home")}
-              onGoToServer={(sid) => { if (sessions.some(x => x.id === sid)) setActiveView(sid); }}
-            />
-          )}
-          {!isMobile && treeOpen && treeSide === "right" && sessionTree}
-          <PingPanel />
-          {aiOpen && ai.enabled && (
-            <AiPanel
-              snap={ai}
-              onClose={() => setAiOpen(false)}
-              onGoToServer={(sid) => { if (sessions.some(x => x.id === sid)) setActiveView(sid); }}
-            />
-          )}
+          <Fork.DesktopAiSide v={aiPaneView} isMobile={isMobile} sessions={sessions} setActiveView={setActiveView} />
+          <Fork.DesktopSessionTree tree={tree} side="right" isMobile={isMobile} />
+          <Fork.PingPanel />
+          <Fork.DesktopAiPanel open={aiOpen} onClose={() => setAiOpen(false)} sessions={sessions} setActiveView={setActiveView} />
         </div>
       )}
 
-      {/* How much the AI may run without asking, for a server, a folder or
-          every server (#115): opened from a tab's AI marker, the AI pane or
-          the session tree's menus. */}
-      <AiTrustModal />
+      <Fork.AiTrustModal />
 
       <ErrorBoundary overlay label="Server form" onReset={() => { setIsPanelOpen(false); setFormError(""); }}>
       <AddNodePanel
@@ -3593,13 +2942,11 @@ function DesktopApp() {
             // port, login (its own or a saved one) and maybe an SSH server to
             // go through; nothing that runs over SSH (forwards, mirrors,
             // autostart, a proxy, a key). Its saved password is kept: an RDP
-            // server's for the built-in client and Remote Desktop Connection
-            // (which never gets a saved login's: secret_policy.rs), a telnet
-            // server's for the terminal's password button, a VNC server's for
-            // its login. A VNC server never has a saved login: VNC sends its
-            // password with weak protection and doesn't check the server's
-            // identity, so a shared login's password would be open to anyone
-            // on the path.
+            // server's for the built-in client and Remote Desktop Connection, a
+            // telnet server's for the terminal's password button, a VNC
+            // server's for its login.
+            // (Fork: an RDP server's never a saved login's, secret_policy.rs. A VNC server has
+            // no saved login: VNC sends its password weakly protected to a server it can't check.)
             const isRdp = newNode.protocol === "rdp";
             const isTelnet = newNode.protocol === "telnet";
             const isVnc = newNode.protocol === "vnc";
@@ -3674,16 +3021,7 @@ function DesktopApp() {
             } catch (e) {
               addLog(`SAVE_RUN_ON_CONNECT_FAILED: ${e}`, "error");
             }
-            try {
-              await invoke("set_server_terminal_theme", { id: savedId, value: newNode.terminalTheme || null });
-            } catch (e) {
-              addLog(`SAVE_TERMINAL_THEME_FAILED: ${e}`, "error");
-            }
-            try {
-              await invoke("set_server_highlight", { id: savedId, value: newNode.highlight || null });
-            } catch (e) {
-              addLog(`SAVE_HIGHLIGHT_FAILED: ${e}`, "error");
-            }
+            await Fork.saveServerLooks(savedId, newNode, addLog);
             // ProxyJump target — same separate-write pattern. Empty string
             // means "no jump host" → store NULL.
             try {
