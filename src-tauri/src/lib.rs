@@ -16941,7 +16941,7 @@ async fn initiate_rdp(
             },
         )
         .map_err(|_| "Server not found".to_string())?;
-        (row, secret_policy::rdp_app_password(conn, server_id, rdp_saved_password(conn, server_id)), rdp_login_key(conn, server_id), approvals::profile_is_shared(conn))
+        (row, rdp_saved_password(conn, server_id), rdp_login_key(conn, server_id), approvals::profile_is_shared(conn))
     };
     if protocol.as_deref() != Some("rdp") {
         return Err(format!("{name} isn't an RDP server"));
@@ -17090,13 +17090,13 @@ fn rdp_share_drives() -> Vec<String> {
     rdp_share::drives()
 }
 
-/// Whose an RDP server's saved password is: its address, its jump host and the
-/// login it uses (its own user, or which saved login and that login's user). An open tab
+/// Whose an RDP server's saved password is: its address and the login it uses
+/// (its own user, or which saved login and that login's user). An open tab
 /// still goes where it went, so "Open again" hands the password on only while
 /// this is unchanged.
 fn rdp_login_key(conn: &rusqlite::Connection, server_id: i32) -> Option<String> {
     conn.query_row(
-        "SELECT COALESCE(s.host, '') || ':' || COALESCE(s.port, 0) || '|' || COALESCE(s.jump_host_id, 0) || '|' ||
+        "SELECT COALESCE(s.host, '') || ':' || COALESCE(s.port, 0) || '|' ||
                 CASE WHEN COALESCE(s.auth_type, 'vault') = 'vault'
                      THEN 'login ' || COALESCE(c.id, 0) || ' ' || COALESCE(c.username, '')
                      ELSE 'own ' || COALESCE(s.username, '') END
@@ -17176,9 +17176,9 @@ mod rdp_saved_password_tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE credentials(id INTEGER PRIMARY KEY, username TEXT);
-             CREATE TABLE servers(id INTEGER PRIMARY KEY, host TEXT, port INTEGER, username TEXT, auth_type TEXT, credential_id INTEGER, jump_host_id INTEGER);
+             CREATE TABLE servers(id INTEGER PRIMARY KEY, host TEXT, port INTEGER, username TEXT, auth_type TEXT, credential_id INTEGER);
              INSERT INTO credentials VALUES (7, 'alice'), (8, 'bob');
-             INSERT INTO servers VALUES (1, 'a.example', 3389, 'carol', 'custom_pass', NULL, NULL), (2, 'b.example', 3389, NULL, 'vault', 7, NULL);",
+             INSERT INTO servers VALUES (1, 'a.example', 3389, 'carol', 'custom_pass', NULL), (2, 'b.example', 3389, NULL, 'vault', 7);",
         )
         .unwrap();
         let key = |id| rdp_login_key(&conn, id);
@@ -17187,12 +17187,10 @@ mod rdp_saved_password_tests {
         assert_eq!(key(99), None);
         // Nothing changed: the same.
         assert_eq!(key(1), own);
-        // Another address, port, jump host, user, saved login or that login's
-        // user: not the same.
+        // Another address, port, user, saved login or that login's user: not the same.
         for change in [
             "UPDATE servers SET host = 'c.example' WHERE id = 1",
             "UPDATE servers SET port = 3390 WHERE id = 1",
-            "UPDATE servers SET jump_host_id = 5 WHERE id = 1",
             "UPDATE servers SET username = 'dave' WHERE id = 1",
         ] {
             conn.execute_batch(change).unwrap();
@@ -17596,14 +17594,6 @@ async fn rdp_builtin_open(
         // Files shared with the server; one that isn't there is said and left
         // out. What is shared goes to the tab with the connection.
         let mut shared = serde_json::Value::Null;
-        // Only to the address they were chosen for (rdp_share::Share::address).
-        let share = share.filter(|share| {
-            let ok = share.chosen_for(&host, port);
-            if !ok {
-                log("Files aren't shared: this server's address has changed since you chose to share them. Open its form, check what it shares, and save.", "warning");
-            }
-            ok
-        });
         let drive = share.and_then(|share| match rdp_share::channel(&share) {
             Ok(channel) => {
                 let how = if share.read_only { ", read only" } else { "" };
@@ -17919,9 +17909,6 @@ async fn rdp_open_again(
     let (launcher, windows) = {
         let mut map = rdp_sessions.lock().await;
         let session = map.get_mut(&session_id).ok_or("This RDP tab isn't open any more")?;
-        if session.forward_gone() {
-            return Err("This tab's way through the SSH server has closed. Reconnect the tab, then open it again.".into());
-        }
         // The saved password as it is now: it may have changed since. Not when
         // the server's address or login changed since the tab opened: the tab
         // still goes to the old one, and that password isn't for it.
@@ -17929,7 +17916,7 @@ async fn rdp_open_again(
             let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
             let conn = guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
             let password = if rdp_login_key(conn, session.server_id) == session.login {
-                secret_policy::rdp_app_password(conn, session.server_id, rdp_saved_password(conn, session.server_id))
+                rdp_saved_password(conn, session.server_id)
             } else {
                 None
             };

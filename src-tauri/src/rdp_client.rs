@@ -66,15 +66,6 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// server that takes the connection and then says nothing doesn't keep the
 /// tab, its socket and its SSH route forever.
 const STEP_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How long a write to the server may wait. A server that stops reading fills
-/// the socket and the write would wait for good: the session would hear no
-/// Close, and the tab would close with the connection still open.
-const SEND_TIMEOUT: Duration = Duration::from_secs(10);
-
-fn stalled(_: tokio::time::error::Elapsed) -> String {
-    "RDP: the server stopped taking what this side sends".into()
-}
 /// Below this, a desktop is too small to be of use; above, too big to send.
 const MIN_SIDE: u16 = 200;
 const MAX_SIDE: u16 = 8192;
@@ -1276,7 +1267,7 @@ where
                     let settling = resized_at.is_some_and(|at| at.elapsed() < RESIZE_SETTLE);
                     if can_measure && !paused && !settling && probe.out.is_none() {
                         let ask = share_data(&stage, ShareDataPdu::RefreshRectangle(RefreshRectanglePdu { areas_to_refresh: vec![probe_rect()] }))?;
-                        tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&ask)).await.map_err(stalled)?.map_err(link_ended)?;
+                        writer.write_all(&ask).await.map_err(link_ended)?;
                         probe.out = Some(tokio::time::Instant::now());
                     }
                     Vec::new()
@@ -1301,7 +1292,7 @@ where
                         if let Ok(outs) = stage.graceful_shutdown() {
                             for o in outs {
                                 if let ActiveStageOutput::ResponseFrame(b) = o {
-                                    let _ = tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&b)).await;
+                                    let _ = writer.write_all(&b).await;
                                 }
                             }
                         }
@@ -1340,7 +1331,7 @@ where
                             resize_later = Some((w, h));
                         } else if u32::from(w) != u32::from(image.width()) || u32::from(h) != u32::from(image.height()) {
                             if let Some(Ok(bytes)) = stage.encode_resize(u32::from(w), u32::from(h), None, None) {
-                                tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&bytes)).await.map_err(stalled)?.map_err(link_ended)?;
+                                writer.write_all(&bytes).await.map_err(link_ended)?;
                                 resized_at = Some(tokio::time::Instant::now());
                             }
                         }
@@ -1357,7 +1348,7 @@ where
                                 bottom: image.height().saturating_sub(1),
                             });
                             let bytes = share_data(&stage, ShareDataPdu::SuppressOutput(SuppressOutputPdu { desktop_rect }))?;
-                            tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&bytes)).await.map_err(stalled)?.map_err(link_ended)?;
+                            writer.write_all(&bytes).await.map_err(link_ended)?;
                             paused = !shown;
                             // Paused, a probe out isn't answered; shown, the whole picture comes first.
                             if shown {
@@ -1369,7 +1360,7 @@ where
                             if let Some((w, h)) = resize_later.take().filter(|_| shown) {
                                 if u32::from(w) != u32::from(image.width()) || u32::from(h) != u32::from(image.height()) {
                                     if let Some(Ok(bytes)) = stage.encode_resize(u32::from(w), u32::from(h), None, None) {
-                                        tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&bytes)).await.map_err(stalled)?.map_err(link_ended)?;
+                                        writer.write_all(&bytes).await.map_err(link_ended)?;
                                         resized_at = Some(tokio::time::Instant::now());
                                     }
                                 }
@@ -1410,7 +1401,7 @@ where
         for out in outputs {
             match out {
                 ActiveStageOutput::ResponseFrame(bytes) => {
-                    tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&bytes)).await.map_err(stalled)?.map_err(link_ended)?;
+                    writer.write_all(&bytes).await.map_err(link_ended)?;
                 }
                 ActiveStageOutput::GraphicsUpdate(rect) => {
                     // The probe's corner drawn again: the server answered.
@@ -1477,7 +1468,7 @@ where
                         };
                         let written = step.map_err(|e| format!("RDP: {e}"))?;
                         if written.size().is_some() {
-                            tokio::time::timeout(SEND_TIMEOUT, writer.write_all(buf.filled())).await.map_err(stalled)?.map_err(link_ended)?;
+                            writer.write_all(buf.filled()).await.map_err(link_ended)?;
                         }
                         if let ConnectionActivationState::Finalized {
                             desktop_size,
@@ -1513,7 +1504,7 @@ where
                                 paused = false;
                                 if can_pause {
                                     let bytes = share_data(&stage, ShareDataPdu::SuppressOutput(SuppressOutputPdu { desktop_rect: None }))?;
-                                    tokio::time::timeout(SEND_TIMEOUT, writer.write_all(&bytes)).await.map_err(stalled)?.map_err(link_ended)?;
+                                    writer.write_all(&bytes).await.map_err(link_ended)?;
                                     paused = true;
                                 }
                             }

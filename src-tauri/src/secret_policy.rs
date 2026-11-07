@@ -2,10 +2,6 @@
 //! #241 and #242), kept out of the original project's code, which calls in
 //! here from one-line hooks.
 //!
-//! - E2. Remote Desktop Connection gets only the server's own saved password,
-//!   never a saved login's: that login is for every server that uses it, and
-//!   in the app's `.rdp` file and the app's own memory of it, it would be out
-//!   of Submarine's hands.
 //! - E3. A VNC password typed at its prompt is saved only into the server
 //!   itself: no "Save password" tick when the server has a saved login. VNC
 //!   sends its password with weak protection and doesn't check the server's
@@ -33,7 +29,6 @@
 //! column or reroutes a step shows up here.
 
 use rusqlite::Connection;
-use zeroize::Zeroizing;
 
 /// E5: why "Open automatically" is refused for a shared profile.
 pub const SHARED_AUTO_OPEN: &str = "[QUICK_UNLOCK] SHARED: a shared profile doesn't open by itself, as anyone using this Windows account would get everyone's saved logins. Windows Hello still works.";
@@ -117,12 +112,6 @@ pub fn may_save_for_login(name_typed_now: bool, saved_user: &str) -> bool {
     !name_typed_now && !saved_user.trim().is_empty()
 }
 
-/// E2: what Remote Desktop Connection may get of `saved`, the password the
-/// server logs in with: the server's own, never its saved login's.
-pub fn rdp_app_password(conn: &Connection, server_id: i32, saved: Option<Zeroizing<String>>) -> Option<Zeroizing<String>> {
-    saved.filter(|_| !uses_saved_login(conn, server_id))
-}
-
 /// E3: whether a VNC password typed at the prompt may be offered for saving.
 pub fn vnc_may_save(conn: &Connection, server_id: i32) -> bool {
     !uses_saved_login(conn, server_id)
@@ -147,18 +136,6 @@ mod tests {
         )
         .unwrap();
         conn
-    }
-
-    #[test]
-    fn the_rdp_app_gets_a_servers_own_password_only() {
-        let conn = db();
-        let pw = || Some(Zeroizing::new("pw".to_string()));
-        assert_eq!(rdp_app_password(&conn, 1, pw()).as_deref().map(String::as_str), Some("pw"), "its own");
-        assert!(rdp_app_password(&conn, 2, pw()).is_none(), "a saved login's");
-        assert!(rdp_app_password(&conn, 3, pw()).is_none(), "a saved login's, from before auth types");
-        assert!(rdp_app_password(&conn, 4, pw()).is_some(), "no login linked: nothing of one to keep back");
-        assert!(rdp_app_password(&conn, 5, pw()).is_some(), "its own, a stale link aside");
-        assert!(rdp_app_password(&conn, 1, None).is_none());
     }
 
     #[test]
@@ -308,15 +285,6 @@ mod tests {
     }
 
     #[test]
-    fn in_the_apps_tables_the_rdp_app_gets_only_a_servers_own_password() {
-        let conn = app_db();
-        let for_app = |id| rdp_app_password(&conn, id, crate::rdp_saved_password(&conn, id)).map(|p| p.to_string());
-        assert_eq!(for_app(4).as_deref(), Some("rdp-pw"), "its own");
-        assert_eq!(crate::rdp_saved_password(&conn, 5).as_deref().map(String::as_str), Some("login-pw"), "the built-in client may use the login");
-        assert_eq!(for_app(5), None, "Remote Desktop Connection never gets the login's");
-    }
-
-    #[test]
     fn in_the_apps_tables_a_shared_profile_starts_the_tick_off() {
         let conn = app_db();
         assert!(!saving_reaches_others(&conn));
@@ -343,7 +311,6 @@ mod tests {
     fn the_hooks_are_in_place() {
         let lib = include_str!("lib.rs");
         for (hook, times, place) in [
-            ("secret_policy::rdp_app_password(", 2, "initiate_rdp and rdp_open_again (E2)"),
             ("SaveTarget::for_vnc_server(", 1, "vnc_open's save target (E3)"),
             ("secret_policy::saving_reaches_others(", 1, "SaveTarget::for_server (E4)"),
             ("secret_policy::SHARED_PROFILE_NOTE", 1, "SaveTarget::offer (E4)"),

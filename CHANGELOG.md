@@ -9,6 +9,7 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+- **Remote Desktop works as in the original project again.** The fork's own Remote Desktop changes are gone, so syncing with the original project stays simple. Text copied on the server reaches your clipboard at once, a shared folder follows the server, and Remote Desktop Connection may get a saved login's password, as in the original project. Opening an RDP server through an SSH server works as before. ([#160](https://github.com/paulm981/Submarine/issues/160))
 - **Codex starts from Home's menu, beside Claude Code.** With AI tools on in Settings, Home's menu lists each AI tool you have installed. Codex opens already connected to Submarine, the same way: it never gets a key or a password, and Submarine asks you before each command it runs on a server. Settings › AI tools shows which are installed. ([#117](https://github.com/paulm981/Submarine/issues/117))
 
 ## v0.4.0-fork.31
