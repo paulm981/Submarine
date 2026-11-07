@@ -235,10 +235,9 @@ gtk = "0.18"
 gdk = "0.18"
 
 # Files shared with an RDP server by the built-in client (rdp_share.rs):
-# IronRDP's own drive backends, from the same pinned revision, in a copy
-# (vendor/, see its VENDORED.md) whose Windows backend can share one folder,
-# not only a whole drive. On Windows it checks every path itself; on macOS and
-# Linux rdp_share.rs checks them in front of it. A phone has none.
+# IronRDP's own drive backends, from the same pinned revision. On Windows it
+# checks every path itself; on macOS and Linux rdp_share.rs checks them in
+# front of it. A phone has none.
 [target.'cfg(any(windows, target_os = "macos", target_os = "linux"))'.dependencies]
 ironrdp-rdpdr-native = { path = "vendor/ironrdp-rdpdr-native" }
 

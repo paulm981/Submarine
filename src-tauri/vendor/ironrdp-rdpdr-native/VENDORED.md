@@ -21,19 +21,6 @@ The first two are for one thing: a folder as the root.
 4. `src/nix/backend.rs`, `FILE_FS_VOLUME_INFORMATION`: the volume's serial number, made from its free blocks,
    no longer panics when they don't fit in 32 bits (a large free volume).
 
-One more is in the macOS and Linux backend (`src/nix/backend.rs`), found by the fork's own review (its limit on
-open files, also from that review, is item 3 now):
-
-5. `make_query_dir_resp`: a listing gives a link's own details (`symlink_metadata`), not those of what it points
-   to, which may be outside the shared folder.
-6. `src/nix/beneath.rs` (new), used for every open, listing, rename, deletion and new folder in
-   `src/nix/backend.rs`: a path is reached from the shared folder one name at a time (`openat` with
-   `O_NOFOLLOW`, then `fstatat`, `renameat`, `unlinkat` or `mkdirat` from the last folder), so a link anywhere
-   on the way fails the call instead of being followed. It used to go by the whole path as text, and the
-   system followed any link in it: Submarine checks each path before it gets here, but a folder swapped for a
-   link in between would have been followed. Anything that isn't a file or a folder (a FIFO, a device) is
-   refused on open, and `..` is never walked. Like the Windows backend, below the root.
-
 A folder can't be given a drive letter of its own instead (`subst`): Windows refuses to open such a letter
 with `OBJ_DONT_REPARSE` (`STATUS_REPARSE_POINT_ENCOUNTERED`), which this backend uses for every open.
 

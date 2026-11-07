@@ -10,7 +10,7 @@ import { readUseSshAgent } from "../util/sshAgent";
 import { IS_MOBILE, IS_WINDOWS } from "../util/platform";
 import type { LinkStats } from "../util/screenLink";
 import {
-  RDP_BUILTIN_EXPERIMENTAL, RDP_NO_NLA_PREFIX, RDP_PRESETS, describeRdpOptions, pinRdpAddress, rdpGraphics, rdpNeedsReconnect, rdpAddress, rdpShare, readRdpOptions, writeRdpOptions,
+  RDP_BUILTIN_EXPERIMENTAL, RDP_NO_NLA_PREFIX, RDP_PRESETS, describeRdpOptions, pinRdpAddress, rdpGraphics, rdpNeedsReconnect, rdpShare, readRdpOptions, writeRdpOptions,
   type RdpOptions,
 } from "../util/rdpOptions";
 import { type PasteKeys, pasteKeysOf, readLocalClipboard, takeServerCopy } from "../util/rdpClipboard";
@@ -221,12 +221,8 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
         setAppFailed(Array.isArray(e.payload?.said) ? e.payload.said : []);
       }),
       // Text the user copied on the server, for this computer's clipboard.
-      // Only while this tab is in front and the window has the focus: a server
-      // that copies while you work elsewhere (in a terminal, say) could
-      // otherwise swap what you're about to paste there. Then its text waits
-      // in the note above the desktop, for you to copy.
       listen(`rdp-clipboard-${id}`, (e: any) => {
-        takeServerCopy(String(e.payload?.text ?? ""), inFront.current && document.hasFocus(), setServerCopy);
+        takeServerCopy(String(e.payload?.text ?? ""), inFront.current, setServerCopy);
       }),
     ]);
     // A phone connects once the built-in client is chosen in the tab.
@@ -330,11 +326,6 @@ export default function RdpSessionView({ session, displayName, onClose, onStatus
   // over what the server form may have changed meanwhile.
   const setOpt = (patch: Partial<RdpOptions>) => {
     const next = { ...(session.serverUuid ? readRdpOptions(session.serverUuid) : opts), ...patch };
-    // Files chosen here go to this tab's server address only, as from the
-    // server form (rdpOptions' shareFor): a changed address shares nothing.
-    if ("share" in patch || "sharePath" in patch || "shareReadOnly" in patch) {
-      next.shareFor = next.share !== "off" && session.host ? rdpAddress(session.host, session.port ?? 3389) : "";
-    }
     setOpts(next);
     if (session.serverUuid) writeRdpOptions(session.serverUuid, next);
   };
