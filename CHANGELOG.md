@@ -9,6 +9,11 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.55
+
+- **The AI knows each server's OS,** from the badge Submarine already shows, so it writes commands for the right system. ([#193](https://github.com/paulm981/Submarine/issues/193))
+- **"Try on web1 first" on a request for several servers.** It runs on one server, and you see its result before you allow the rest. ([#193](https://github.com/paulm981/Submarine/issues/193))
+
 ## v0.4.0-fork.54
 
 - **Many terminals open without freezing the window.** Opening a Wall of 36 terminals, or starting a profile with many servers, held the window for seconds. Terminals now open a few at a time, the one you're looking at first, and share what they measure of the font, so the window keeps answering while the rest catch up. ([#127](https://github.com/paulm981/Submarine/issues/127))
