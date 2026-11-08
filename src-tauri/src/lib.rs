@@ -57,13 +57,13 @@ mod hop_policy;
 mod ai;
 mod child_env;
 mod open_policy;
+mod known_hosts;
 mod rdp;
 mod quick_unlock;
 mod rdp_client;
 mod rdp_share;
 mod term_filter;
 mod vault_backup;
-mod known_hosts;
 mod trust_policy;
 mod secret_policy;
 // Root over SSH (sudo / dzdo), the fork's own: root_ssh.rs. Its macro
@@ -6508,11 +6508,8 @@ async fn teardown_profile(
         ssh.forwarded_targets.lock().await.remove(sid);
         ssh.sftp_sessions.lock().await.remove(sid);
         ssh.sftp_elevation.lock().await.remove(sid);
-        ssh.root_access.lock().await.remove(sid);
-        ssh.root_gates.lock().await.remove(sid);
-        ssh.docker_root.lock().await.remove(sid);
+        ssh.forget_fork_session(sid).await; // ssh_manager/root_state.rs
         ssh.sftp_shell.lock().await.remove(sid);
-        ssh.session_users.lock().await.remove(sid);
         ssh.connections.lock().await.remove(sid);
         sweep_session_temp(sid);
     }
@@ -6547,13 +6544,8 @@ async fn teardown_profile(
     ssh.forwarded_targets.lock().await.clear();
     ssh.sftp_sessions.lock().await.clear();
     ssh.sftp_elevation.lock().await.clear();
-    ssh.root_access.lock().await.clear();
-    ssh.root_gates.lock().await.clear();
-    ssh.docker_root.lock().await.clear();
+    ssh.forget_fork_sessions().await; // ssh_manager/root_state.rs
     ssh.sftp_shell.lock().await.clear();
-    ssh.session_servers.lock().await.clear();
-    ssh.session_users.lock().await.clear();
-    ssh.terminal_servers.lock().await.clear();
     // Wipe every connect-time secret the user typed this profile (issue #30).
     ssh.prompted_secrets.lock().await.clear();
     ssh.connections.lock().await.clear();
@@ -13715,13 +13707,7 @@ async fn initiate_connection(
         .unwrap_or_else(|| "primary".to_string());
     let is_secondary = role != "primary";
     let separate = separate_sessions.unwrap_or(false);
-    // A tab that connects again (a reconnect) is no longer shared with an AI
-    // tab: it's shared again by hand (#32, open question 11).
-    if !is_secondary {
-        if let Some(ai) = app.try_state::<ai::AiState>() {
-            ai.session_gone(&session_id, "reconnected");
-        }
-    }
+    if !is_secondary { ai::tab_gone(&app, &session_id, "reconnected"); } // no longer shared with an AI tab
     // Only the PRIMARY drives interactive keyboard-interactive (2FA) auth. A
     // secondary connection that hit a 2FA challenge would emit a `kbi-prompt`
     // the UI isn't wired to answer for the suffixed session id, so it would just
@@ -13785,20 +13771,7 @@ async fn initiate_connection(
     let term_prefix = format!("{}-term-", session_id);
     state.terminal_txs.lock().await.retain(|k, _| !k.starts_with(&term_prefix));
     state.resize_txs.lock().await.retain(|k, _| !k.starts_with(&term_prefix));
-    // A reconnect replays the session's forward list. When sync changed this
-    // server's saved forwards since the session read them (another computer
-    // deleted one, say), the list starts again from the saved ones first, so
-    // the reconnect doesn't bring back a forward that's gone. The list is
-    // kept under the base session id, which the `::fwd` connection replays
-    // too. A first connect (no list yet) reads the saved ones anyway, and
-    // other connections (`::sftp`) have none: neither may use up the change,
-    // which another tab on this server may still need.
-    let rules_key = session_id.strip_suffix("::fwd").unwrap_or(&session_id);
-    if (role == "primary" || role == "forward") && state.session_tunnel_specs.lock().await.contains_key(rules_key) {
-        if let Err(e) = refresh_synced_session_rules(state.inner(), db_state.inner(), rules_key, Some(server_id)).await {
-            println!("[BACKEND] {}: the saved forwards weren't read again: {}", session_id, e);
-        }
-    }
+    refresh_rules_for_reconnect(state.inner(), db_state.inner(), &session_id, &role, server_id).await; // synced_tunnels.rs
     // This attempt, as its prompts and failure report see it: once a newer
     // attempt starts (or the tab disconnects) they stay quiet.
     let attempt = ssh_manager::ConnectAttempt::new(
@@ -17989,11 +17962,8 @@ async fn disconnect_session(
     // the in-memory sudo password.
     state.sftp_sessions.lock().await.remove(&session_id);
     state.sftp_elevation.lock().await.remove(&session_id);
-    state.root_access.lock().await.remove(&session_id);
-    state.root_gates.lock().await.remove(&session_id);
-    state.docker_root.lock().await.remove(&session_id);
+    state.forget_fork_session(&session_id).await; // ssh_manager/root_state.rs
     state.sftp_shell.lock().await.remove(&session_id);
-    state.session_users.lock().await.remove(&session_id);
     state.connections.lock().await.remove(&session_id);
     // Drop any ProxyJump bastion handle for this session — closes the jump
     // connection once the target it was carrying is gone.
@@ -18038,10 +18008,7 @@ async fn disconnect_session(
     // this IS a primary id (no `::` suffix) — a direct disconnect of a secondary
     // must not recurse into non-existent grandchildren.
     if !session_id.contains("::") {
-        // The tab is gone: no AI tab can reach it any more.
-        if let Some(ai) = app.try_state::<ai::AiState>() {
-            ai.session_gone(&session_id, "tab closed");
-        }
+        ai::tab_gone(&app, &session_id, "tab closed"); // no AI tab can reach it any more
         teardown_connection_key(state.inner(), mirrors.inner(), &format!("{}::sftp", session_id)).await;
         teardown_connection_key(state.inner(), mirrors.inner(), &format!("{}::fwd", session_id)).await;
         // Explicitly disconnecting a whole tab also forgets any connect-time
