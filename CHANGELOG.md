@@ -9,6 +9,11 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.60
+
+- **Highlighting follows terminal programs more closely, and keeps its colors on Solarized.** Text after a program saves and restores its colors (as `less` and `vim` do on exit), or after some rarer escape sequences, is highlighted or left alone correctly. On Solarized, whose bright colors are grays, bright highlights show in their normal color. ([#49](https://github.com/paulm981/Submarine/issues/49))
+- **Your highlighting rules no longer lose edits.** Turning a rule on or off changes only that, not an edit made on another computer; Enter can't add a rule twice; a rule deleted on another computer isn't shown, and saving it says it was deleted. ([#49](https://github.com/paulm981/Submarine/issues/49))
+
 ## v0.4.0-fork.59
 
 - **Right-click a file name in a terminal** to copy its path or edit it in your editor (Live Edit). Paste is still the first entry, and right-click anywhere else pastes as before. ([#40](https://github.com/paulm981/Submarine/issues/40))
