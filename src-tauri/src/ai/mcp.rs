@@ -1,7 +1,14 @@
 //! MCP over the local channel: newline-delimited JSON-RPC 2.0, as an MCP
 //! client (Claude Code) speaks it to a stdio server — the helper passes the
-//! lines through unchanged. Only what Submarine needs: `initialize`, `ping`,
-//! `tools/list`, `tools/call`, and `notifications/cancelled`.
+//! lines through unchanged. Only what Submarine needs: `tools/list`,
+//! `tools/call` and `notifications/cancelled`, with `initialize` and `ping`
+//! for clients of 2025-11-25 and before, and `server/discover` for 2026-07-28.
+//!
+//! Both kinds are served side by side (#177). A 2026-07-28 request names its
+//! version, and the client's capabilities, in its own `_meta`, with no
+//! handshake: it's checked, and answered as that revision has it. A request
+//! that names no version is answered as before, whether `initialize` came
+//! first or not.
 //!
 //! What a client can make it hold is bounded: answers waiting to go out
 //! (QUEUE, then reading waits), the `id`s it echoes (a string or a number,
@@ -14,9 +21,26 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, watch, Semaphore};
 
-/// The protocol versions this server knows; a client asking for another gets
-/// the newest of these.
-const VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+/// The protocol versions this server knows, newest first. The first MODERN
+/// of them carry the version on every request (2026-07-28 on); the rest open
+/// with `initialize`, and a client asking it for another gets the newest of
+/// those.
+static VERSIONS: &[&str] = &["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+const MODERN: usize = 1;
+/// Where a 2026-07-28 request says what it speaks: its `_meta` keys.
+const PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+const CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+const CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
+/// The longest protocol version taken: the error for an unknown one says
+/// which was asked for, and a long one is never echoed back.
+const MAX_VERSION: usize = 32;
+/// The spec's error for a version the server doesn't serve.
+const UNSUPPORTED_VERSION: i64 = -32022;
+/// How long a 2026-07-28 client may keep the tool list and what
+/// `server/discover` says. The tools change only when Submarine does, and
+/// asking again over the local channel costs nothing, so never: a client is
+/// not left with an old list after an update.
+const CACHE_MS: u64 = 0;
 const MAX_MESSAGE: usize = 1024 * 1024;
 
 const INSTRUCTIONS: &str = "Submarine runs commands on servers the user has shared with you, over SSH connections it already holds. \
@@ -196,6 +220,90 @@ fn error(id: &Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
+fn server_info() -> Value {
+    json!({ "name": "submarine", "version": env!("CARGO_PKG_VERSION") })
+}
+
+/// A result as 2026-07-28 gives it: complete, and saying whose it is.
+fn complete(mut result: Value) -> Value {
+    if let Some(r) = result.as_object_mut() {
+        r.insert("resultType".into(), json!("complete"));
+        r.insert("_meta".into(), json!({ "io.modelcontextprotocol/serverInfo": server_info() }));
+    }
+    result
+}
+
+/// What a request says it speaks.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Speaks {
+    /// No version on the request: served as before 2026-07-28.
+    Unnamed,
+    /// One of VERSIONS, named in the request's own `_meta`.
+    Named(&'static str),
+}
+
+impl Speaks {
+    /// 2026-07-28 or later: no handshake, and its results say so.
+    fn modern(self) -> bool {
+        matches!(self, Speaks::Named(v) if VERSIONS[..MODERN].contains(&v))
+    }
+}
+
+/// Why a request's own version, or what comes with it, is refused.
+#[derive(PartialEq, Debug)]
+enum Refused {
+    /// Something the revision requires is missing, or isn't what it says.
+    Malformed(&'static str),
+    /// A version this server doesn't serve.
+    Unsupported(String),
+}
+
+/// What a request speaks, from its `_meta`. A request with none of the
+/// 2026-07-28 keys names no version; one with any of them must name a
+/// version we serve and, for 2026-07-28, the client's capabilities.
+fn speaks(params: &Value) -> Result<Speaks, Refused> {
+    let Some(meta) = params.get("_meta").and_then(Value::as_object) else { return Ok(Speaks::Unnamed) };
+    if ![PROTOCOL_VERSION, CLIENT_CAPABILITIES, CLIENT_INFO].iter().any(|k| meta.contains_key(*k)) {
+        return Ok(Speaks::Unnamed);
+    }
+    let Some(asked) = meta.get(PROTOCOL_VERSION) else {
+        return Err(Refused::Malformed("Invalid params: _meta has no io.modelcontextprotocol/protocolVersion."));
+    };
+    let Some(asked) = asked.as_str().filter(|v| v.len() <= MAX_VERSION) else {
+        return Err(Refused::Malformed("Invalid params: io.modelcontextprotocol/protocolVersion must be a short string."));
+    };
+    let Some(version) = VERSIONS.iter().copied().find(|v| *v == asked) else {
+        return Err(Refused::Unsupported(asked.to_string()));
+    };
+    let speaks = Speaks::Named(version);
+    if speaks.modern() {
+        if !meta.get(CLIENT_CAPABILITIES).is_some_and(Value::is_object) {
+            return Err(Refused::Malformed("Invalid params: _meta has no io.modelcontextprotocol/clientCapabilities object."));
+        }
+        if meta.get(CLIENT_INFO).is_some_and(|i| !i.is_object()) {
+            return Err(Refused::Malformed("Invalid params: io.modelcontextprotocol/clientInfo must be an object."));
+        }
+    }
+    Ok(speaks)
+}
+
+/// The answer to a refused request: the spec's error, naming the versions
+/// we serve when it was the version.
+fn refusal(id: &Value, refused: Refused) -> Value {
+    match refused {
+        Refused::Malformed(why) => error(id, -32602, why),
+        Refused::Unsupported(asked) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": UNSUPPORTED_VERSION,
+                "message": "Unsupported protocol version",
+                "data": { "supported": VERSIONS, "requested": asked },
+            },
+        }),
+    }
+}
+
 /// Answers waiting to go out, at most. Past it the connection's reading
 /// waits for the client to take some: a client that sends and never reads
 /// can't pile them up.
@@ -287,23 +395,53 @@ where
             };
             let id = id.clone();
             drop(msg);
-            let answer = match method.as_str() {
-                "initialize" => {
+            // What the request speaks, before anything is done for it.
+            let speaks = match speaks(&params) {
+                Ok(s) => s,
+                Err(refused) => {
+                    if out_tx.send(refusal(&id, refused)).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let answer = match (method.as_str(), speaks.modern()) {
+                // The handshake, for clients of 2025-11-25 and before: it
+                // settles on one of those versions, whatever was asked.
+                ("initialize", _) => {
+                    let legacy = &VERSIONS[MODERN..];
                     let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
-                    let version = if VERSIONS.contains(&asked) { asked } else { VERSIONS[0] };
+                    let version = legacy.iter().copied().find(|v| *v == asked).unwrap_or(legacy[0]);
                     reply(
                         &id,
                         json!({
                             "protocolVersion": version,
                             "capabilities": { "tools": { "listChanged": false } },
-                            "serverInfo": { "name": "submarine", "version": env!("CARGO_PKG_VERSION") },
+                            "serverInfo": server_info(),
                             "instructions": INSTRUCTIONS,
                         }),
                     )
                 }
-                "ping" => reply(&id, json!({})),
-                "tools/list" => reply(&id, json!({ "tools": tools() })),
-                "tools/call" => {
+                // Gone in 2026-07-28.
+                ("ping", false) => reply(&id, json!({})),
+                // 2026-07-28's way to learn the versions, the capabilities
+                // and the instructions; it needs a version on the request.
+                ("server/discover", _) if speaks == Speaks::Unnamed => {
+                    refusal(&id, Refused::Malformed("Invalid params: _meta has no io.modelcontextprotocol/protocolVersion."))
+                }
+                ("server/discover", _) => reply(
+                    &id,
+                    complete(json!({
+                        "supportedVersions": VERSIONS,
+                        "capabilities": { "tools": { "listChanged": false } },
+                        "instructions": INSTRUCTIONS,
+                        "ttlMs": CACHE_MS,
+                        "cacheScope": "public",
+                    })),
+                ),
+                ("tools/list", false) => reply(&id, json!({ "tools": tools() })),
+                ("tools/list", true) => reply(&id, complete(json!({ "tools": tools(), "ttlMs": CACHE_MS, "cacheScope": "public" }))),
+                ("tools/call", modern) => {
                     let Ok(slot) = slots.clone().try_acquire_owned() else {
                         if out_tx.send(error(&id, -32000, "Too many requests at once: wait for an answer first.")).await.is_err() {
                             break;
@@ -348,7 +486,8 @@ where
                             .unwrap_or(false);
                         // A cancelled request gets no answer (MCP's rule).
                         if !was_cancelled {
-                            let _ = out.send(reply(&id, json!({ "content": [{ "type": "text", "text": r.text }], "isError": r.is_error }))).await;
+                            let result = json!({ "content": [{ "type": "text", "text": r.text }], "isError": r.is_error });
+                            let _ = out.send(reply(&id, if modern { complete(result) } else { result })).await;
                         }
                     });
                     continue;
@@ -542,6 +681,148 @@ mod tests {
         let a = recv(&mut r).await;
         assert_eq!(a["id"], 1);
         assert_eq!(a["result"]["content"][0]["text"], "Denied by the user.", "{a}");
+    }
+
+    /// What a 2026-07-28 client puts in each request's `_meta`.
+    fn meta(version: &str) -> Value {
+        json!({
+            "io.modelcontextprotocol/protocolVersion": version,
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": { "name": "test", "version": "1" },
+        })
+    }
+
+    async fn call(w: &mut DuplexStream, r: &mut BufReader<DuplexStream>, id: u64, method: &str, params: Value) -> Value {
+        send(w, json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })).await;
+        let a = recv(r).await;
+        assert_eq!(a["id"], id, "{a}");
+        a
+    }
+
+    #[test]
+    fn the_versions_newest_first_modern_before_legacy() {
+        assert_eq!(VERSIONS[0], "2026-07-28");
+        assert!(VERSIONS.windows(2).all(|v| v[0] > v[1]));
+        assert!(MODERN >= 1 && MODERN < VERSIONS.len());
+        assert!(Speaks::Named("2026-07-28").modern());
+        assert!(!Speaks::Named("2025-11-25").modern() && !Speaks::Unnamed.modern());
+        assert!(VERSIONS.iter().all(|v| v.len() <= MAX_VERSION));
+    }
+
+    /// A 2026-07-28 client goes straight to tools/list and tools/call, with
+    /// no handshake, and gets that revision's results (#177).
+    #[tokio::test]
+    async fn a_2026_client_needs_no_handshake() {
+        let (_s, mut w, mut r, _t) = connection(1 << 20);
+        let listed = call(&mut w, &mut r, 1, "tools/list", json!({ "_meta": meta("2026-07-28") })).await;
+        let result = &listed["result"];
+        assert_eq!(result["tools"], tools());
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!((result["ttlMs"].as_u64(), result["cacheScope"].as_str()), (Some(CACHE_MS), Some("public")));
+        assert_eq!(result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "submarine");
+        let called = call(&mut w, &mut r, 2, "tools/call", json!({ "name": "list_shared", "arguments": {}, "_meta": meta("2026-07-28") })).await;
+        let result = &called["result"];
+        assert_eq!((&result["resultType"], &result["isError"]), (&json!("complete"), &json!(false)), "{called}");
+        assert!(result["content"][0]["text"].as_str().unwrap().contains("xyz"), "{called}");
+        assert_eq!(result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "submarine");
+        // The instructions come with server/discover, as do the versions.
+        let found = call(&mut w, &mut r, 3, "server/discover", json!({ "_meta": meta("2026-07-28") })).await;
+        let result = &found["result"];
+        assert_eq!(result["supportedVersions"], json!(VERSIONS));
+        assert_eq!(result["instructions"], INSTRUCTIONS);
+        assert_eq!(result["capabilities"], json!({ "tools": { "listChanged": false } }));
+        assert_eq!((&result["resultType"], result["ttlMs"].as_u64(), &result["cacheScope"]), (&json!("complete"), Some(CACHE_MS), &json!("public")));
+        // ping is gone in 2026-07-28.
+        assert_eq!(call(&mut w, &mut r, 4, "ping", json!({ "_meta": meta("2026-07-28") })).await["error"]["code"], -32601);
+    }
+
+    /// An older client's handshake and answers are as they were.
+    #[tokio::test]
+    async fn an_older_client_is_answered_as_before() {
+        let (_s, mut w, mut r, _t) = connection(1 << 20);
+        let init = call(&mut w, &mut r, 1, "initialize", json!({ "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "test", "version": "1" } })).await;
+        assert_eq!(
+            init["result"],
+            json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": { "tools": { "listChanged": false } },
+                "serverInfo": { "name": "submarine", "version": env!("CARGO_PKG_VERSION") },
+                "instructions": INSTRUCTIONS,
+            })
+        );
+        send(&mut w, json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await;
+        let listed = call(&mut w, &mut r, 2, "tools/list", json!({ "_meta": { "progressToken": 5 } })).await;
+        assert_eq!(listed["result"], json!({ "tools": tools() }));
+        let called = call(&mut w, &mut r, 3, "tools/call", json!({ "name": "list_shared", "arguments": {} })).await;
+        assert_eq!(called["result"].as_object().unwrap().keys().collect::<Vec<_>>(), ["content", "isError"]);
+        assert_eq!(call(&mut w, &mut r, 4, "ping", json!({})).await["result"], json!({}));
+        // A handshake settles on a handshake version, whatever is asked:
+        // the newest of those for 2026-07-28 or one it doesn't know.
+        for asked in ["2026-07-28", "1999-01-01", ""] {
+            let init = call(&mut w, &mut r, 5, "initialize", json!({ "protocolVersion": asked })).await;
+            assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
+        }
+        // server/discover needs a version on the request.
+        assert_eq!(call(&mut w, &mut r, 6, "server/discover", json!({})).await["error"]["code"], -32602);
+    }
+
+    /// A version the server doesn't serve gets the spec's error, naming the
+    /// ones it does, and nothing is done for the request.
+    #[tokio::test]
+    async fn an_unknown_version_is_told_ours() {
+        let (s, mut w, mut r, _t) = connection(1 << 20);
+        for (id, method) in [(1, "tools/list"), (2, "server/discover"), (3, "tools/call")] {
+            let params = json!({ "name": "run_command", "arguments": { "server": "xyz", "command": "x" }, "_meta": meta("1900-01-01") });
+            let a = call(&mut w, &mut r, id, method, params).await;
+            assert_eq!(a["error"]["code"], -32022, "{a}");
+            assert_eq!(a["error"]["data"], json!({ "supported": VERSIONS, "requested": "1900-01-01" }));
+        }
+        assert!(s.snapshot().pending.is_empty() && s.snapshot().running.is_empty());
+    }
+
+    /// A 2026-07-28 request missing what it must carry, or carrying it
+    /// wrong, is invalid params; a long version is never echoed back.
+    #[tokio::test]
+    async fn a_request_s_own_version_is_checked() {
+        let (s, mut w, mut r, _t) = connection(1 << 20);
+        let v = PROTOCOL_VERSION;
+        let caps = CLIENT_CAPABILITIES;
+        let long = "2026-07-28".repeat(1000);
+        let bad = [
+            json!({ caps: {} }),
+            json!({ CLIENT_INFO: { "name": "test", "version": "1" } }),
+            json!({ v: "2026-07-28" }),
+            json!({ v: "2026-07-28", caps: [] }),
+            json!({ v: "2026-07-28", caps: {}, CLIENT_INFO: "test" }),
+            json!({ v: 20260728, caps: {} }),
+            json!({ v: long, caps: {} }),
+        ];
+        for (n, m) in bad.into_iter().enumerate() {
+            let a = call(&mut w, &mut r, n as u64, "tools/call", json!({ "name": "run_command", "arguments": { "server": "xyz", "command": "x" }, "_meta": m })).await;
+            assert_eq!(a["error"]["code"], -32602, "{a}");
+            assert!(a.to_string().len() < 300);
+        }
+        assert!(s.snapshot().pending.is_empty());
+        // A handshake version on the request is served as before.
+        let listed = call(&mut w, &mut r, 99, "tools/list", json!({ "_meta": { v: "2025-11-25" } })).await;
+        assert_eq!(listed["result"], json!({ "tools": tools() }));
+    }
+
+    /// A 2026-07-28 tools/call is held to the same limits, and its cancel
+    /// leaves it unanswered, as before.
+    #[tokio::test]
+    async fn a_2026_call_can_be_cancelled() {
+        let (s, mut w, mut r, _t) = connection(1 << 20);
+        let call_msg = json!({ "jsonrpc": "2.0", "id": "c1", "method": "tools/call", "params": { "name": "run_command", "arguments": { "server": "xyz", "command": "x" }, "_meta": meta("2026-07-28") } });
+        send(&mut w, call_msg.clone()).await;
+        until("the request", || s.snapshot().pending.len() == 1).await;
+        send(&mut w, call_msg).await;
+        assert_eq!(recv(&mut r).await["error"]["code"], -32600, "a reused id");
+        send(&mut w, json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": "c1" } })).await;
+        until("the cancel", || s.snapshot().pending.is_empty()).await;
+        // The next answer is the next request's, not the cancelled one's.
+        let found = call(&mut w, &mut r, 2, "server/discover", json!({ "_meta": meta("2026-07-28") })).await;
+        assert_eq!(found["result"]["resultType"], "complete");
     }
 
     /// A client that sends without reading is made to wait, rather than
