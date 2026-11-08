@@ -196,7 +196,17 @@ pub async fn write_terminals_data(state: tauri::State<'_, crate::ssh_manager::Ss
         let map = state.terminal_txs.lock().await;
         terminal_ids.iter().filter_map(|id| map.get(id).cloned()).collect()
     };
-    futures::future::join_all(txs.iter().map(|tx| tx.send(crate::ssh_manager::TerminalCommand::Data(data.clone())))).await;
+    // Each write a task of its own; the call ends once all of them have,
+    // and the page sends the next keystroke only then, so each terminal
+    // gets its keys in order.
+    let mut writes = tokio::task::JoinSet::new();
+    for tx in txs {
+        let data = data.clone();
+        writes.spawn(async move {
+            let _ = tx.send(crate::ssh_manager::TerminalCommand::Data(data)).await;
+        });
+    }
+    while writes.join_next().await.is_some() {}
     Ok(())
 }
 
