@@ -1138,8 +1138,7 @@ impl AiState {
             let decision = if looked_up == Some((found.server_id, found.allow_all)) { early } else { trust::Decision::Ask { rule: None } };
             let held_for_group = group.ask && decision.approved_by().is_some();
             let auto = if group.ask { None } else { decision.approved_by() };
-            let running_there = s.running.iter().filter(|r| r.tab_id == tab_id && r.session_id == found.session_id).count();
-            if running_there >= MAX_RUNNING {
+            if running_on(&s, tab_id, &found.session_id) >= MAX_RUNNING {
                 drop(s);
                 return self.copy_refused(&label, &summary, format!("{MAX_RUNNING} of your requests are already running on {name}. Wait for one to finish."));
             }
@@ -1165,6 +1164,7 @@ impl AiState {
                 note: force_ask.or_else(|| held_for_group.then(|| "This server's settings would copy it, but others in this request ask, so it asks with them.".to_string())),
                 group: Some(GroupView { id: group.id, size: group.size }),
                 copy: Some(plan.view(into.clone())),
+                follow: false,
             };
             let rx = match &auto {
                 Some(by) => {
@@ -1179,10 +1179,12 @@ impl AiState {
                             ran_without_asking: Some(by.clone()),
                             as_root: false,
                             root_via: None,
+                            follow: None,
                         },
                         tab_id: tab_id.to_string(),
                         session_id: found.session_id.clone(),
                         stop: stop_tx.clone(),
+                        feed: None,
                     });
                     None
                 }
@@ -1225,6 +1227,7 @@ impl AiState {
                 error: None,
                 at: now(),
                 ran_without_asking: None,
+                follow: None,
             },
             output: Zeroizing::new(text.to_string()),
             ai_output: Zeroizing::new(text.to_string()),

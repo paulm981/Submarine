@@ -37,7 +37,7 @@ pub(crate) struct ServerText {
 }
 
 /// A fresh id: 128 bits from the system's random source, as 32 hex digits.
-fn fresh_id() -> Result<String, ()> {
+pub(crate) fn fresh_id() -> Result<String, ()> {
     use rand::TryRng;
     let mut b = [0u8; 16];
     rand::rngs::SysRng.try_fill_bytes(&mut b).map_err(|_| ())?;

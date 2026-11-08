@@ -6,9 +6,11 @@
 //!   (`top`, `vim`, a password prompt) end or wait, and pagers (`less`,
 //!   `git`'s, `systemctl`'s) don't start. PAGER and its kin are set to `cat`
 //!   too, where the server accepts them.
-//! - **An output cap:** past `cap` bytes the command is stopped.
+//! - **An output cap:** past `cap` bytes the command is stopped. A follow
+//!   (`follow`, #179) has none: its output goes to a sink as it comes, and
+//!   the sink bounds what it keeps.
 //! - **A timeout:** past it the command is stopped. It counts from the start,
-//!   opening the channel included.
+//!   opening the channel included. A follow's is its whole life's cap.
 //! - **Stop:** a stop signal (Stop, unsharing, the AI tab closing, AI tools
 //!   turned off) stops it at once.
 //!
@@ -69,7 +71,48 @@ pub(crate) async fn run<H: client::Handler>(
     command: &str,
     limit: Duration,
     cap: usize,
+    stop: watch::Receiver<bool>,
+) -> Result<Exec, String> {
+    stream(handle, command, limit, stop, capped(cap)).await
+}
+
+/// Run `command` as `run` does, handing its output to `sink` as it comes
+/// (#179), with no output cap: whoever keeps it bounds it (follow.rs's
+/// ring). `Exec::output` stays empty. The same channel, signal and close as
+/// `run`: no terminal, nothing on stdin, PAGER=cat, and KILL and a close on
+/// any stop, before it returns.
+pub(crate) async fn follow<H: client::Handler>(
+    handle: &tokio::sync::RwLock<client::Handle<H>>,
+    command: &str,
+    limit: Duration,
+    stop: watch::Receiver<bool>,
+    mut sink: impl FnMut(&[u8]) + Send,
+) -> Result<Exec, String> {
+    stream(handle, command, limit, stop, move |_: &mut Vec<u8>, data: &[u8]| {
+        sink(data);
+        true
+    })
+    .await
+}
+
+/// What `run` keeps of the output: up to `cap` bytes, and false (stop it)
+/// past them.
+fn capped(cap: usize) -> impl FnMut(&mut Vec<u8>, &[u8]) -> bool + Send {
+    move |output: &mut Vec<u8>, data: &[u8]| {
+        let room = cap.saturating_sub(output.len());
+        output.extend_from_slice(&data[..data.len().min(room)]);
+        data.len() <= room
+    }
+}
+
+/// The run itself: `take` is given each piece of output as it comes (and
+/// `Exec::output` to keep it in), and says false to stop the command (cut).
+async fn stream<H: client::Handler>(
+    handle: &tokio::sync::RwLock<client::Handle<H>>,
+    command: &str,
+    limit: Duration,
     mut stop: watch::Receiver<bool>,
+    mut take: impl FnMut(&mut Vec<u8>, &[u8]) -> bool + Send,
 ) -> Result<Exec, String> {
     let deadline = tokio::time::Instant::now() + limit;
     let mut out = Exec::default();
@@ -117,7 +160,7 @@ pub(crate) async fn run<H: client::Handler>(
         Ok(()) => tokio::select! {
             biased;
             _ = stop_asked(&mut stop) => End::Stopped,
-            r = tokio::time::timeout_at(deadline, collect(&mut channel, &mut out, cap)) => r.unwrap_or(End::TimedOut),
+            r = tokio::time::timeout_at(deadline, collect(&mut channel, &mut out, &mut take)) => r.unwrap_or(End::TimedOut),
         },
     };
     if !matches!(end, End::Finished) {
@@ -136,13 +179,11 @@ pub(crate) async fn run<H: client::Handler>(
     Ok(out)
 }
 
-async fn collect(channel: &mut russh::Channel<client::Msg>, out: &mut Exec, cap: usize) -> End {
+async fn collect(channel: &mut russh::Channel<client::Msg>, out: &mut Exec, take: &mut impl FnMut(&mut Vec<u8>, &[u8]) -> bool) -> End {
     while let Some(msg) = channel.wait().await {
         match msg {
             ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
-                let room = cap.saturating_sub(out.output.len());
-                out.output.extend_from_slice(&data[..data.len().min(room)]);
-                if data.len() > room {
+                if !take(&mut out.output, data) {
                     return End::Cut;
                 }
             }
@@ -356,13 +397,14 @@ pub(crate) async fn run_root<H: client::Handler + 'static>(
             }
             let room = cap.min(early.len());
             out.output.extend_from_slice(&early[..room]);
+            let mut take = capped(cap);
             let end = if early.len() > cap {
                 End::Cut
             } else {
                 tokio::select! {
                     biased;
                     _ = stop_asked(&mut stop) => End::Stopped,
-                    r = tokio::time::timeout_at(deadline, collect(&mut channel, &mut out, cap)) => r.unwrap_or(End::TimedOut),
+                    r = tokio::time::timeout_at(deadline, collect(&mut channel, &mut out, &mut take)) => r.unwrap_or(End::TimedOut),
                 }
             };
             (end, marker)
@@ -532,5 +574,36 @@ pub(crate) mod tests {
         drop(stop_tx);
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(running.load(Ordering::SeqCst), 0);
+    }
+
+    /// A follow (#179) hands its output over as it comes, while it runs,
+    /// with no cap; Stop ends it on the server, as it does a command.
+    #[tokio::test]
+    async fn a_follow_streams_with_no_cap_and_stop_ends_it_on_the_server() {
+        for keep_running_on_close in [false, true] {
+            let (h, running) = server_with(ShellOpts { keep_running_on_close, ..ShellOpts::default() }).await;
+            let (stop_tx, stop) = watch::channel(false);
+            let got = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+            let (h2, g) = (h.clone(), got.clone());
+            let cmd = "echo first; yes 0123456789 | head -c 2000000; echo; echo last; exec sleep 30";
+            let task = tokio::spawn(async move { follow(&h2, cmd, Duration::from_secs(60), stop, move |d| g.lock().unwrap().extend_from_slice(d)).await });
+            wait_until("the output, while it runs", || got.lock().unwrap().ends_with(b"last\n")).await;
+            assert!(got.lock().unwrap().starts_with(b"first\n"));
+            assert!(got.lock().unwrap().len() > 2_000_000, "past any cap");
+            assert_eq!(running.load(Ordering::SeqCst), 1, "still running");
+            stop_tx.send(true).unwrap();
+            let r = tokio::time::timeout(Duration::from_secs(5), task).await.expect("follow returned").unwrap().unwrap();
+            assert!(r.stopped && !r.cut && !r.timed_out && r.output.is_empty());
+            wait_until("the command to end on the server", || running.load(Ordering::SeqCst) == 0).await;
+        }
+    }
+
+    /// A follow's limit ends it too, on the server.
+    #[tokio::test]
+    async fn a_follow_ends_at_its_limit() {
+        let (h, running) = server_with(ShellOpts::default()).await;
+        let r = follow(&h, "echo started; exec sleep 30", Duration::from_millis(800), no_stop(), |_| {}).await.unwrap();
+        assert!(r.timed_out);
+        wait_until("the command to end on the server", || running.load(Ordering::SeqCst) == 0).await;
     }
 }

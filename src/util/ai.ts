@@ -57,6 +57,9 @@ export interface AiPending {
   /// A copy_files request (#159): what it copies, where. `command` is then
   /// a one-line summary of it.
   copy: AiCopy | null;
+  /// A follow request (#179): it keeps running until stopped, at most
+  /// `timeout_secs`.
+  follow: boolean;
 }
 
 /// What a copy_files request copies (src-tauri/src/ai/copy.rs, CopyView).
@@ -109,6 +112,20 @@ export const copyCard = (c: AiCopy): { wants: string; rows: { label: string; val
 };
 
 
+/// A follow's card line (#179): it keeps running.
+export const followLimit = (p: Pick<AiPending, "timeout_secs">): string => {
+  const hours = p.timeout_secs / 3600;
+  return `until stopped (at most ${Number.isInteger(hours) ? `${hours} h` : `${Math.round(p.timeout_secs / 60)} min`})`;
+};
+
+/// How long a follow has run, and what it's seen, for the panel.
+export const followSoFar = (startedAt: string, bytesSeen: number, now: number): string => {
+  const since = new Date(startedAt).getTime();
+  const mins = isNaN(since) ? 0 : Math.max(0, Math.floor((now - since) / 60000));
+  const age = mins < 1 ? "under a minute" : mins < 60 ? `${mins} min` : `${Math.floor(mins / 60)} h ${mins % 60} min`;
+  return `${age} · ${formatBytes(bytesSeen)} seen`;
+};
+
 /// The cards to show for `pending`: one per request, a request on several
 /// servers (#158) as one card with its servers as `members`, where its
 /// first is.
@@ -128,6 +145,8 @@ export interface AiRunning {
   ran_without_asking: string | null;
   /// It runs as root at the AI's asking, and through what.
   as_root: boolean; root_via: string | null;
+  /// A follow (#179): what it's seen so far. Stopped with `ai_stop_follow`.
+  follow: { bytes_seen: number } | null;
 }
 export interface AiDone {
   id: number; tab_label: string; server: string; command: string; root: boolean;
@@ -138,6 +157,8 @@ export interface AiDone {
   cut: boolean; timed_out: boolean; error: string | null; at: string;
   /// It ran without asking you, and why.
   ran_without_asking: string | null;
+  /// A follow (#179): how it ended and what it saw. Its output isn't kept.
+  follow: { ended: string; bytes_seen: number } | null;
 }
 export interface AiSnapshot {
   enabled: boolean; tabs: AiTab[]; pending: AiPending[]; running: AiRunning[]; history: AiDone[];
