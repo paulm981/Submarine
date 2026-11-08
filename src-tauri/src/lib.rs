@@ -98,6 +98,7 @@ mod keep_session;
 mod bulk_pick;
 mod vault_schema;
 mod sync_merge;
+mod profile_create;
 #[cfg(windows)]
 mod windows_clipboard;
 mod clipboard_read;
@@ -1425,7 +1426,7 @@ fn apply_remote_inner(
     // sync from corrupting local data.
     let tx = conn.unchecked_transaction().map_err(|e| format!("[SYNC] TX_BEGIN: {e}"))?;
     let size_before = vault_bytes(&tx)?;
-    let skipped = merge_batch(&tx, key, &records, refused.len(), true)?;
+    let skipped = sync_merge::merge_batch(&tx, key, &records, refused.len(), true)?;
     // Not toward the size the vault can no longer be saved or opened at. An
     // honest server never sends that much, so none of it lands.
     let size_after = vault_bytes(&tx)?;
@@ -1438,115 +1439,6 @@ fn apply_remote_inner(
     tx.commit().map_err(|e| format!("[SYNC] TX_COMMIT: {e}"))?;
     if skipped > 0 {
         eprintln!("[SYNC] merge committed with {skipped} record(s) skipped");
-    }
-    Ok(skipped)
-}
-
-/// One sync batch, inside the merge's transaction `tx`: the records, then the
-/// deletions, then everything that's checked once they're all in (links, the
-/// holds of a shared profile). Returns `skipped` plus the records that didn't
-/// apply. With `hold` false the records are ones held before (a wipe, a big
-/// deletion) that this device's user said yes to: those aren't held again,
-/// but whatever else in them runs by itself, or lets the AI do more, still is.
-fn merge_batch(tx: &Connection, key: &[u8; 32], records: &[&SyncRecord], mut skipped: usize, hold: bool) -> Result<usize, String> {
-    // FKs to re-resolve once the whole batch has landed. `ref_table` has to ride
-    // along: the lookup used to read `SELECT id FROM {table}` — the row's OWN
-    // table — which was only ever correct because the sole queued FKs were the
-    // self-referential ones (folders.parent_id, servers.jump_host_id), where the
-    // two tables happen to be the same. Any cross-table FK looked up the uuid in
-    // entirely the wrong table, found nothing, and NULLed a perfectly good link.
-    let mut fk_fixups: Vec<FkFixup> = Vec::new();
-    // Per-record application is best-effort: a single record that won't decrypt
-    // or parse — a corrupt or hostile blob from a broken/compromised server — is
-    // logged and skipped, never aborting the merge. One poison record must not be
-    // able to block every OTHER record (or every future sync) from applying;
-    // each one counts in `skipped`.
-    //
-    // In a shared profile, whatever a record newly sets running by itself
-    // (commands on connect, autostart, forwards, monitor commands) is held
-    // until this device's user allows it — see approvals.rs. Holding is part
-    // of the merge's transaction: if it can't be recorded, nothing lands. It's
-    // done once the batch is in: a server's jump host lands in the repair pass.
-    let approvals_ready = approvals::ready(tx);
-    let shared = approvals_ready && approvals::profile_is_shared(tx);
-    let mut watched = Vec::new();
-    // A viewer's rows go nowhere, so a password they saved here is theirs alone
-    // (each person typing their own is a normal way to share a server list),
-    // and a record with none says nothing about it. The record lands, without
-    // emptying anything (`apply_entity`): held whole, the owner's new address
-    // would stop at this device.
-    let viewer = shared && approvals::is_viewer(tx);
-    // And a move (a server's folder, a folder's parent) that lets the AI do
-    // more on a server here is held too (ai/trust.rs): each server's AI
-    // policy as it is before the merge, to compare with after it.
-    let ai_before = if shared { ai::trust::before_sync(tx) } else { None };
-    // Each server's jump host before the merge: one the merge deletes leaves
-    // the servers behind it refusing to go direct (jump_gone.rs).
-    let jumps_before = jump_gone::links_before(tx);
-    for spec in ENTITIES {
-        let watch = shared && approvals::watches(spec.table);
-        for rec in records.iter().filter(|r| !r.deleted && r.entity_type == spec.table) {
-            // In a shared profile, a record that empties a saved key or
-            // password waits for this device's user, like an SSH key's
-            // deletion (approvals::hold_wipe). A personal profile takes it.
-            if hold && shared && !viewer && empties_a_secret(tx, key, rec) {
-                approvals::hold_wipe(tx, rec)?;
-                continue;
-            }
-            // A server's held switch to telnet or VNC stays held after the
-            // share is left, like everything else held: outside a share, only
-            // that part runs, for a server that has one.
-            let held_switch = !watch
-                && approvals_ready
-                && spec.table == "servers"
-                && approvals::held_switch(tx, &rec.uuid).is_some();
-            // A held switch's protocol and port go back in the row for the
-            // record to merge over, and hold_switch keeps this device's again
-            // after it, whether the record applied or not.
-            let before = if watch || held_switch { approvals::before_merge(tx, spec.table, &rec.uuid)? } else { None };
-            let tunnels_before = if spec.table == "servers" { stored_tunnels(tx, &rec.uuid) } else { None };
-            let applied = apply_entity(tx, key, spec, rec, viewer, &mut fk_fixups);
-            if let Some(old) = tunnels_before {
-                note_synced_tunnels(tx, &rec.uuid, &old)?;
-            }
-            // Held once the batch is in (below), applied or not: a held
-            // switch's row has to get this device's values back either way.
-            if watch {
-                watched.push((spec.table, &rec.uuid, before));
-            } else if held_switch {
-                approvals::hold_switch(tx, &rec.uuid, before.as_ref())?;
-            }
-            if let Err(e) = applied {
-                skipped += 1;
-                eprintln!("[SYNC] skipped record uuid={} type={}: {}", rec.uuid, rec.entity_type, e);
-                continue;
-            }
-            if shared {
-                approvals::release_wipe(tx, rec)?;
-            }
-        }
-    }
-    // In a shared profile, a sync that would delete much of it at once, or an
-    // SSH key, waits for this device's user (approvals::hold_deletions).
-    let tombstones: Vec<&SyncRecord> = records.iter().filter(|r| r.deleted).copied().collect();
-    let held = if hold && shared { approvals::hold_deletions(tx, &tombstones)? } else { Default::default() };
-    for rec in tombstones.iter().filter(|r| !held.contains(&r.uuid)) {
-        if let Err(e) = in_savepoint(tx, || apply_tombstone(tx, rec))? {
-            skipped += 1;
-            eprintln!("[SYNC] skipped tombstone uuid={} type={}: {}", rec.uuid, rec.entity_type, e);
-        }
-    }
-    // Re-resolve every optional FK against the FINAL state of the batch, now that
-    // both the entities and the tombstones have landed.
-    repair_links(tx, fk_fixups);
-    for (table, uuid, before) in &watched {
-        approvals::hold_changes(tx, table, uuid, before.as_ref())?;
-    }
-    jump_gone::note_lost(tx, &jumps_before).map_err(|e| format!("[SYNC] JUMP_GONE: {e}"))?;
-    // Everything in place: hold each server whose AI policy the merge
-    // loosened, until this device's user allows it.
-    if let Some(before) = ai_before {
-        ai::trust::hold_loosened(tx, before)?;
     }
     Ok(skipped)
 }
@@ -3434,18 +3326,10 @@ async fn import_shared_profile(
 /// `opened` is the generation the half-built profile was opened at (None when
 /// opening it is what failed). If another profile has been opened since, that
 /// one stays open; only the half-built file goes.
-///
-/// Only a file this call made goes: the callers open with `must_create`, so
-/// it's this call's when the profile was opened (`opened`), or when opening
-/// got as far as setting it up here (its last step, the first save, failed).
-/// A profile that another window made or opened meanwhile stays, and so does
-/// one open in another window now.
 fn discard_half_built_profile(app: &tauri::AppHandle, name: &str, opened: Option<u64>) {
     use tauri::Manager as _;
     let state = app.state::<DbState>();
-    let path = profile_path(app, name).ok();
-    let made_here = opened.is_some()
-        || path.is_some() && state.db_path.lock().ok().is_some_and(|g| g.as_ref() == path.as_ref());
+    let made_here = profile_create::made_here(app, &state, name, opened); // before the state below goes
     // Under the connection's lock when it can be had, as in close_profile.
     let mut conn = state.conn.lock().ok();
     let ours = opened.is_none_or(|g| state.generation_now() == g);
@@ -3461,26 +3345,9 @@ fn discard_half_built_profile(app: &tauri::AppHandle, name: &str, opened: Option
     if ours {
         if let Ok(mut g) = state.active_profile.lock() { *g = None; }
     }
-    let Some(p) = path.filter(|_| made_here) else { return };
-    let lock_path = p.with_extension("submarine.lock");
-    // Its one-window lock (#204) goes with it, or the name would stay "open in
-    // another window" in this one until it quit. Not held here any more
-    // (another profile opened here since): only when no other window has it.
-    let ours = state
-        .profile_lock
-        .lock()
-        .ok()
-        .and_then(|mut held| if held.as_ref().is_some_and(|(locked, _)| *locked == p) { held.take() } else { None });
-    let lock = match ours {
-        Some((_, file)) => ProfileLock::New(file),
-        None => match try_lock_file(&lock_path) {
-            Ok(lock) => lock,
-            Err(_) => return,
-        },
-    };
-    let _ = fs::remove_file(&p);
-    drop(lock);
-    let _ = fs::remove_file(lock_path);
+    if let Some(p) = made_here {
+        profile_create::remove_profile_file(&state, &p);
+    }
 }
 
 /// New device: restore one of YOUR OWN personal cloud profiles using nothing but
@@ -4139,7 +4006,7 @@ fn resolve_held(conn: &Connection, key: &[u8; 32], hlc: &hlc::Hlc, delete_them: 
             // held again, but whatever else the records change that runs by
             // itself, or lets the AI do more, still is (merge_batch).
             let records: Vec<&SyncRecord> = wipes.iter().chain(&deletions).collect();
-            let skipped = merge_batch(&tx, key, &records, 0, false)?;
+            let skipped = sync_merge::merge_batch(&tx, key, &records, 0, false)?;
             if skipped > 0 {
                 eprintln!("[SYNC] {skipped} held record(s) not applied");
             }
@@ -4778,7 +4645,7 @@ mod sync_engine_tests {
         assert_eq!(parent_of(&b, "child"), None, "a move to the top level reaches B");
         assert_eq!(parent_of(&b, "grandchild").as_deref(), Some("child"));
 
-        delete_folder_tree(&a, &folder_subtree(&a, id(&a, "child")).unwrap()).unwrap();
+        crate::tree_moves::delete_folder_tree(&a, &crate::tree_moves::folder_subtree(&a, id(&a, "child")).unwrap()).unwrap();
         apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
         let left: Vec<String> = b
             .prepare("SELECT name FROM folders ORDER BY name").unwrap()
@@ -9197,7 +9064,7 @@ async fn delete_folder(
         // inside this one are the ones the page shows inside it.
         tree_moves::break_folder_loops(conn)
             .map_err(|e| format!("[DATABASE] FOLDER_LOOP_REPAIR_FAILED: {}", e))?;
-        let folder_ids = folder_subtree(conn, id as i64)
+        let folder_ids = tree_moves::folder_subtree(conn, id as i64)
             .map_err(|e| format!("[DATABASE] FOLDER_TREE_QUERY_FAILED: {}", e))?;
         let mut doomed = Vec::new();
         let mut stmt = conn
@@ -9218,56 +9085,10 @@ async fn delete_folder(
     {
         let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-        delete_folder_tree(conn, &folder_ids)?;
+        tree_moves::delete_folder_tree(conn, &folder_ids)?;
     }
     save_vault_internal(&state)?;
     Ok(())
-}
-
-/// Delete the given folders (a folder and its subtree) and every server and
-/// Remote Desktop link in them, all or nothing: a folder left behind would
-/// lose its parent and turn up at the top level. Each row goes through the
-/// sync delete trigger, so the deletions reach the profile's other devices.
-fn delete_folder_tree(conn: &rusqlite::Connection, folder_ids: &[i64]) -> Result<(), String> {
-    let tx = conn.unchecked_transaction().map_err(|e| format!("[DATABASE] TX_BEGIN: {}", e))?;
-    for fid in folder_ids {
-        // The servers that went through one of these as their jump host let go of it.
-        let doomed: Vec<i64> = tx
-            .prepare("SELECT id FROM servers WHERE folder_id=?1")
-            .and_then(|mut stmt| stmt.query_map(rusqlite::params![fid], |r| r.get(0))?.collect())
-            .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_QUERY_FAILED: {}", e))?;
-        tree_moves::unlink_jump_hosts(&tx, &doomed)?;
-        tx.execute("DELETE FROM servers WHERE folder_id=?1", rusqlite::params![fid])
-            .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_DELETE_FAILED: {}", e))?;
-        tx.execute("DELETE FROM rdp_links WHERE folder_id=?1", rusqlite::params![fid])
-            .map_err(|e| format!("[DATABASE] FOLDER_RDP_DELETE_FAILED: {}", e))?;
-    }
-    for fid in folder_ids {
-        tx.execute("DELETE FROM folders WHERE id=?1", rusqlite::params![fid])
-            .map_err(|e| format!("[DATABASE] FOLDER_DELETE_FAILED: {}", e))?;
-    }
-    tx.commit().map_err(|e| format!("[DATABASE] TX_COMMIT: {}", e))
-}
-
-/// A folder and every folder inside it, at any depth, the folder first.
-/// Guarded against a parent loop (which sync could in principle produce).
-pub(crate) fn folder_subtree(conn: &rusqlite::Connection, root: i64) -> rusqlite::Result<Vec<i64>> {
-    let mut stmt = conn.prepare("SELECT id FROM folders WHERE parent_id=?1")?;
-    let mut out = vec![root];
-    let mut i = 0;
-    while i < out.len() {
-        let children: Vec<i64> = stmt
-            .query_map(rusqlite::params![out[i]], |r| r.get::<_, i64>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-        for c in children {
-            if !out.contains(&c) {
-                out.push(c);
-            }
-        }
-        i += 1;
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -9305,48 +9126,6 @@ mod mirror_folder_guard_tests {
             assert!(err.contains("network share") || err.contains("MIRROR"), "{bad}: {err}");
             assert!(t.elapsed() < std::time::Duration::from_secs(1), "{bad} was looked up on the network");
         }
-    }
-}
-
-#[cfg(test)]
-mod folder_subtree_tests {
-    #[test]
-    fn a_folders_subtree_holds_every_level_and_survives_a_loop() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE folders(id INTEGER PRIMARY KEY, name TEXT, parent_id INTEGER);
-             INSERT INTO folders VALUES (1,'a',NULL),(2,'b',1),(3,'c',2),(4,'d',1),(5,'other',NULL),(6,'x',7),(7,'y',6);",
-        )
-        .unwrap();
-        assert_eq!(super::folder_subtree(&conn, 1).unwrap(), vec![1, 2, 4, 3]);
-        assert_eq!(super::folder_subtree(&conn, 5).unwrap(), vec![5]);
-        assert_eq!(super::folder_subtree(&conn, 6).unwrap(), vec![6, 7]);
-    }
-
-    #[test]
-    fn deleting_a_folder_takes_its_subfolders_servers_and_links() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "PRAGMA foreign_keys = ON;
-             CREATE TABLE folders(id INTEGER PRIMARY KEY, name TEXT, parent_id INTEGER);
-             CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, folder_id INTEGER, jump_host_id INTEGER, FOREIGN KEY(folder_id) REFERENCES folders(id));
-             CREATE TABLE rdp_links(id INTEGER PRIMARY KEY, name TEXT, folder_id INTEGER, FOREIGN KEY(folder_id) REFERENCES folders(id));
-             CREATE TABLE sync_flags(key TEXT PRIMARY KEY, val INTEGER NOT NULL);
-             INSERT INTO folders VALUES (1,'a',NULL),(2,'b',1),(3,'c',2),(4,'d',NULL);
-             INSERT INTO servers VALUES (10,'s10',1,NULL),(11,'s11',3,NULL),(12,'s12',4,11),(13,'s13',NULL,10);
-             INSERT INTO rdp_links VALUES (20,'r20',2),(21,'r21',4);",
-        )
-        .unwrap();
-        let ids = super::folder_subtree(&conn, 1).unwrap();
-        super::delete_folder_tree(&conn, &ids).unwrap();
-        let col = |sql: &str| -> Vec<i64> {
-            conn.prepare(sql).unwrap().query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
-        };
-        assert_eq!(col("SELECT id FROM folders ORDER BY id"), vec![4]);
-        assert_eq!(col("SELECT id FROM servers ORDER BY id"), vec![12, 13]);
-        assert_eq!(col("SELECT id FROM rdp_links ORDER BY id"), vec![21]);
-        // Their jump hosts went with the folder: not left pointing at nothing.
-        assert_eq!(col("SELECT COUNT(*) FROM servers WHERE jump_host_id IS NOT NULL"), vec![0]);
     }
 }
 
@@ -19977,22 +19756,8 @@ async fn sftp_set_elevated(
         Ok(found) => (found, None),
         Err(e) if e == SUDO_NEED_PASSWORD => {
             let Some(pw) = password else { return Err(e) };
-            // One typed password at a time per tab, and not one just turned
-            // down (typed_root_access).
-            let gate = root_gate(&state, &session_id).await;
-            let mut gate = gate.lock().await;
-            if just_rejected(&gate, &pw) {
-                return Err(SUDO_WRONG_PASSWORD.into());
-            }
-            match probe_sudo_files(&session_arc, Some(&pw)).await {
-                Ok(found) => (found, Some(pw)),
-                Err(e) => {
-                    if e == SUDO_WRONG_PASSWORD {
-                        gate.rejected = Some((password_digest(&pw), std::time::Instant::now()));
-                    }
-                    return Err(e);
-                }
-            }
+            let path = probe_with_typed_password(&state, &session_id, &session_arc, &pw).await?;
+            (path, Some(pw))
         }
         Err(e) => return Err(e),
     };
@@ -20052,37 +19817,10 @@ pub async fn get_sftp_session(
     let elevation = state.sftp_elevation.lock().await.get(session_id).cloned();
     let was_elevated = elevation.is_some();
     let (sftp, via_shell) = match elevation {
-        Some(elev) => {
-            // With a password, one open at a time per tab: parallel file
-            // actions don't each sign in, and after one is turned down the
-            // others find the password marked as failed (open_elevated).
-            let gate = match elev.password {
-                Some(_) => Some(root_gate(state, session_id).await),
-                None => None,
-            };
-            let _turn = match &gate {
-                Some(g) => Some(g.lock().await),
-                None => None,
-            };
-            let elev = match &gate {
-                Some(_) => {
-                    if let Some(s) = state.sftp_sessions.lock().await.get(session_id) {
-                        return Ok(Arc::clone(s));
-                    }
-                    state.sftp_elevation.lock().await.get(session_id).cloned().unwrap_or(elev)
-                }
-                None => elev,
-            };
-            match open_elevated(&session_arc, &elev).await {
-                Err(e) if e == SUDO_WRONG_PASSWORD => {
-                    if let Some(pw) = &elev.password {
-                        forget_root_password(state, session_id, pw).await;
-                    }
-                    return Err(e);
-                }
-                opened => opened?,
-            }
-        }
+        Some(elev) => match open_elevated_in_turn(state, session_id, &session_arc, elev).await? {
+            ElevatedOpen::Cached(s) => return Ok(s),
+            ElevatedOpen::Opened(sftp, via_shell) => (sftp, via_shell),
+        },
         None => open_sftp(&session_arc).await?,
     };
     let arc = Arc::new(sftp);
@@ -21001,14 +20739,7 @@ async fn upload_dir_file(
     if halted() {
         return Err(DirFileEnd::Stopped(None));
     }
-    let Some((_write_turn, waited)) = remote_write_locks().acquire(&session_id, &remote_full, &cancel).await else {
-        return Err(DirFileEnd::Stopped(None));
-    };
-    if let Some(exists) = ask_first.filter(|_| waited) {
-        if sftp.metadata(&remote_full).await.is_ok() {
-            return Err(DirFileEnd::Failed(exists));
-        }
-    }
+    let _write_turn = dir_file_turn(&sftp, &session_id, &remote_full, &cancel, ask_first).await?; // remote_writes.rs
     // Whether each file was there isn't asked (a round trip per file):
     // EXCL alone tells a file this upload created.
     let (mut remote_file, created) = open_upload_target(&sftp, &remote_full, false).await
@@ -21570,42 +21301,13 @@ async fn sftp_download_dir(
     let DownloadTree { mut files, total_bytes, skipped_names } = tree;
 
     // Shown on the finished transfer card when the walk skipped names.
-    // The destination passed the policy, but the server names the folders
-    // inside it: a home-folder backup downloaded into C:\Users would put its
-    // AppData\…\Startup\x.bat in the real Startup folder. Files that would
-    // land in a folder the system runs things from at login are left out and
-    // counted on the card.
-    let login_folders = LoginFolders::new();
-    let dest_root = std::path::PathBuf::from(&local_path).join(&folder_name);
-    let before = files.len();
-    files.retain(|(_, rel, _)| login_folders.may_hold_server_file(&dest_root.join(rel)));
-    let skipped_autorun = (before - files.len()) as u64;
-    // Where upper and lower case are the same name (Windows, and macOS as
-    // usually set up), two files whose names differ only in case would land
-    // on one file, the second replacing the first. The second is left out.
-    let skipped_case = drop_case_twins(&mut files, cfg!(any(windows, target_os = "macos")));
-    // Files left out at the end because something of that name was there
-    // (another download finished first) are counted by the jobs: nothing is
-    // replaced unless the user chose to.
-    let replace = overwrite == Some(true);
-    let notes = |skipped_existing: u64| {
-        let notes: Vec<String> = [
-            skipped_names_note(skipped_names),
-            autorun_skipped_note(skipped_autorun),
-            case_twins_note(skipped_case),
-            existing_skipped_note(skipped_existing),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        (!notes.is_empty()).then(|| notes.join("; "))
-    };
+    let skipped_note = DownloadNotes::filter(&mut files, &local_path, &folder_name, skipped_names); // and the fork's
 
     if files.is_empty() {
         // Still create the (empty) destination folder so the UI sees the
         // shape — otherwise the user sees "done" with nothing to show for it.
         let _ = tokio::fs::create_dir_all(&local_root).await;
-        emit_progress(0, 0, "done", notes(0));
+        emit_progress(0, 0, "done", skipped_note.text(0));
         return Ok(());
     }
 
@@ -21633,7 +21335,7 @@ async fn sftp_download_dir(
             local_root.clone(),
             Arc::clone(&transferred),
             Arc::clone(&cancel),
-            replace,
+            overwrite == Some(true),
             Arc::clone(&skipped),
         ),
     });
@@ -21643,7 +21345,7 @@ async fn sftp_download_dir(
     let got = transferred.load(Ordering::Relaxed);
     match ended {
         DirFilesEnd::Done => {
-            emit_progress(got, total_bytes, "done", notes(skipped.load(Ordering::Relaxed)));
+            emit_progress(got, total_bytes, "done", skipped_note.text(skipped.load(Ordering::Relaxed)));
             Ok(())
         }
         DirFilesEnd::Stopped(_) => {
@@ -21726,20 +21428,7 @@ async fn sftp_upload_file(
 
     emit_progress(0, "progress", None);
 
-    // Another upload to this same remote file would interleave with ours, so
-    // wait for it to finish first (the card shows 0% meanwhile). What the file
-    // looks like is asked again: the upload ahead may have just created it.
-    let Some((_write_turn, _)) = remote_write_locks().acquire(&session_id, &remote_path, &cancel).await else {
-        emit_progress(0, "cancelled", None);
-        return Err("cancelled".into());
-    };
-    let existed = sftp.metadata(&remote_path).await.is_ok();
-    // The upload ahead may have made the file this one was told isn't there:
-    // ask first, as the check at the top would have.
-    if existed && overwrite != Some(true) {
-        emit_progress(0, "error", Some(format!("{name} is already on the server.")));
-        return Err(format!("EXISTS:{}", remote_path));
-    }
+    let (_write_turn, existed) = upload_turn(&sftp, &session_id, &remote_path, &cancel, overwrite, &name, &emit_progress).await?; // remote_writes.rs
 
     // Stream the file from disk in chunks rather than slurping the whole thing
     // into a Vec — keeps memory bounded for multi-GB transfers and lets us
@@ -23191,62 +22880,6 @@ async fn android_default_local_dir(app: tauri::AppHandle) -> Result<String, Stri
     Ok(dirs.into_iter().next().map(|d| d.path).unwrap_or_default())
 }
 
-/// One resolved entry from an OpenSSH client config `Host` block. The
-/// frontend picks a subset of these and turns each into a fresh server row
-/// via the existing `add_server` command. A host that named an `IdentityFile`
-/// gets that key registered and linked; everything else lands password-less
-/// for the user to finish.
-#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
-struct ImportedHost {
-    /// The alias the user actually types (`ssh <alias>`) — becomes the
-    /// server's display name after import.
-    host_alias: String,
-    /// Resolved `HostName`, or the alias itself if the block didn't set one
-    /// (matches OpenSSH's own behaviour when HostName is omitted).
-    hostname: String,
-    /// Resolved `Port`, defaulting to the standard SSH port.
-    port: u16,
-    /// Resolved `User`. Empty string when unset — the frontend can fall
-    /// back to whatever it uses elsewhere.
-    user: String,
-    /// Resolved `IdentityFile`, still in the config's own spelling (`~` and
-    /// all). The importer feeds it to `import_ssh_key_file`, which expands and
-    /// reads it, so a host that names a key comes in as a key-authenticated
-    /// row rather than one the user has to go back and finish.
-    identity_file: Option<String>,
-    /// Resolved `ProxyJump`: `[user@]host[:port]`, comma-separated hops.
-    /// The import links a single hop to a saved server (host_import.rs).
-    proxy_jump: Option<String>,
-    /// Unique within one parse; the picker keys its rows by it (MobaXterm's
-    /// folder and name, else the row's place in the list). Empty means
-    /// `host_alias`.
-    #[serde(default)]
-    key: String,
-    /// Folder path, outermost first (MobaXterm's session folders).
-    #[serde(default)]
-    folder: Vec<String>,
-    /// A MobaXterm saved login (`[name]` as the user name): the host signs in
-    /// with that Login rather than a user of its own.
-    #[serde(default)]
-    credential: Option<String>,
-    /// Typed into the first terminal on connect (MobaXterm's "Execute command").
-    #[serde(default)]
-    run_on_connect: Option<String>,
-    /// The key the jump host signs in with (MobaXterm's jump host key).
-    #[serde(default)]
-    jump_identity_file: Option<String>,
-    /// The saved login the jump host signs in with (MobaXterm `[name]`).
-    #[serde(default)]
-    jump_credential: Option<String>,
-    /// A Remote Desktop session (MobaXterm's RDP): imported as an RDP link
-    /// (rdp_links.rs), not a server.
-    #[serde(default)]
-    rdp: bool,
-    /// A telnet session (PuTTY's): imported as a telnet server.
-    #[serde(default)]
-    telnet: bool,
-}
-
 /// Read the user's OpenSSH client config (default `~/.ssh/config`) and
 /// return one `ImportedHost` per non-wildcard alias so the UI can offer a
 /// checkbox picker (`parse_ssh_config_text`). We deliberately keep the
@@ -23417,135 +23050,6 @@ fn parse_client_hosts(text: String) -> Result<Vec<ImportedHost>, String> {
     Err("Unrecognised format — paste a JSON array, a PuTTY .reg export, or a MobaXterm .mxtsessions block.".into())
 }
 
-fn is_putty_reg(trimmed: &str) -> bool {
-    trimmed.to_ascii_lowercase().contains("windows registry editor")
-        || trimmed.contains("[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions")
-        || trimmed.contains("[HKEY_USERS\\") && trimmed.contains("SimonTatham\\PuTTY\\Sessions")
-}
-
-/// Parse `regedit /e` output of PuTTY's session key: the SSH and telnet
-/// sessions (`putty_sessions`), or why there are none.
-fn parse_putty_reg(text: &str) -> Result<Vec<ImportedHost>, String> {
-    let (mut out, skipped) = putty_sessions(text);
-    // Names may repeat (two exports pasted together): the picker keys rows
-    // by this.
-    for (i, h) in out.iter_mut().enumerate() {
-        h.key = i.to_string();
-    }
-    if out.is_empty() {
-        return Err(match putty_skipped(&skipped) {
-            Some(why) => format!("No PuTTY SSH or telnet sessions found. {}", why),
-            None => "No PuTTY sessions found in the pasted text.".into(),
-        });
-    }
-    Ok(out)
-}
-
-/// The sessions in a PuTTY `.reg` export, and how many of each other kind
-/// (serial, raw, rlogin, …) were left out. The format is deterministic (one
-/// `[...]` header line per session, then `"key"=type:val` lines) so a
-/// line-oriented walk covers it. We pull the fields that translate to a
-/// Submarine row: HostName, PortNumber, UserName and Protocol. An SSH
-/// session becomes an SSH server, a telnet one a telnet server. A session
-/// with no host name ("Default Settings", say) isn't one to connect to and
-/// is left out. Session-name percent-escapes (%20 for space, etc.) are
-/// undone so the alias reads naturally.
-fn putty_sessions(text: &str) -> (Vec<ImportedHost>, std::collections::BTreeMap<String, usize>) {
-    struct Session {
-        name: String,
-        host: String,
-        port: u16,
-        user: String,
-        /// PuTTY's own word; a session without one is SSH, PuTTY's default.
-        protocol: String,
-    }
-    let mut out: Vec<ImportedHost> = Vec::new();
-    let mut skipped: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    let mut current: Option<Session> = None;
-    let mut close = |cur: &mut Option<Session>| {
-        let Some(s) = cur.take() else { return };
-        if s.host.trim().is_empty() {
-            return;
-        }
-        let telnet = match s.protocol.as_str() {
-            "" | "ssh" => false,
-            "telnet" => true,
-            other => {
-                *skipped.entry(other.to_string()).or_default() += 1;
-                return;
-            }
-        };
-        let usual = if telnet { 23 } else { 22 };
-        out.push(ImportedHost {
-            host_alias: s.name,
-            hostname: s.host.trim().to_string(),
-            port: if s.port == 0 { usual } else { s.port },
-            user: s.user,
-            identity_file: None,
-            proxy_jump: None,
-            telnet,
-            ..Default::default()
-        });
-    };
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() { continue; }
-        if line.starts_with('[') && line.ends_with(']') {
-            close(&mut current);
-            // Only sessions — skip other PuTTY keys (SshHostKeys, Jumplist).
-            let inner = &line[1..line.len() - 1];
-            let Some(idx) = inner.rfind("\\Sessions\\") else { continue; };
-            let name_raw = &inner[idx + "\\Sessions\\".len()..];
-            let name = putty_unescape(name_raw);
-            if name.is_empty() { continue; }
-            current = Some(Session { name, host: String::new(), port: 0, user: String::new(), protocol: String::new() });
-            continue;
-        }
-        let Some((key, val_raw)) = line.split_once('=') else { continue; };
-        let Some(cur) = current.as_mut() else { continue; };
-        let key = key.trim().trim_matches('"');
-        let val = val_raw.trim();
-        match key {
-            "HostName" => {
-                if let Some(v) = strip_reg_string(val) { cur.host = v; }
-            }
-            "PortNumber" => {
-                if let Some(n) = strip_reg_dword(val) {
-                    if let Ok(p) = u16::try_from(n) { cur.port = p; }
-                }
-            }
-            "UserName" => {
-                if let Some(v) = strip_reg_string(val) { cur.user = v; }
-            }
-            "Protocol" => {
-                if let Some(v) = strip_reg_string(val) { cur.protocol = v.trim().to_ascii_lowercase(); }
-            }
-            _ => {}
-        }
-    }
-    close(&mut current);
-    (out, skipped)
-}
-
-/// "Not imported: 2 serial and 1 raw sessions — …" for the PuTTY sessions
-/// `putty_sessions` left out; None when it left out none.
-fn putty_skipped(counts: &std::collections::BTreeMap<String, usize>) -> Option<String> {
-    if counts.is_empty() {
-        return None;
-    }
-    let parts: Vec<String> = counts.iter().map(|(k, n)| format!("{} {}", n, k)).collect();
-    let total: usize = counts.values().sum();
-    let list = match parts.len() {
-        1 => parts[0].clone(),
-        _ => format!("{} and {}", parts[..parts.len() - 1].join(", "), parts[parts.len() - 1]),
-    };
-    Some(format!(
-        "Not imported: {} {} — Submarine imports PuTTY's SSH and telnet sessions.",
-        list,
-        if total == 1 { "session" } else { "sessions" }
-    ))
-}
-
 /// PuTTY registry keys with special characters (space, backslash, non-
 /// ASCII) are percent-escaped in the exported name. `%20` → space,
 /// `%25` → `%`, and the bytes of a non-ASCII name (`%C3%A9` → é) are its
@@ -23607,146 +23111,6 @@ fn strip_reg_dword(val: &str) -> Option<u32> {
     let s = val.trim();
     let stripped = s.strip_prefix("dword:")?;
     u32::from_str_radix(stripped, 16).ok()
-}
-
-/// Parse a MobaXterm `.mxtsessions` export. It's an INI file: each section
-/// (`[Bookmarks]`, `[Bookmarks_1]`, …) is a folder, with `SubRep=` its path
-/// (`\`-separated) and `ImgNum=` its icon, and every other line is one
-/// session:
-///
-/// `<name>= #<icon>#<settings>#<terminal settings>#…`
-///
-/// `<settings>` is `%`-separated and starts with the session type (0 = SSH,
-/// 4 = RDP, 5 = VNC, 7 = SFTP, …). For SSH, field 1 is the host, 2 the port,
-/// 3 the user (`<default>` = none set, `[name]` = the saved login `name`),
-/// 7 the command run after login, 8/9/10 the jump hosts' names, ports and
-/// users (`__PIPE__` between hops), 14 the key file and 15 the jump host's
-/// key file. Paths use MobaXterm's placeholders (see
-/// `expand_mobaxterm_path`). The icon is the user's pick, so it says nothing
-/// about the type. SSH and RDP sessions are imported.
-fn parse_mobaxterm_sessions(text: &str) -> Result<Vec<ImportedHost>, String> {
-    let dirs = directories::UserDirs::new();
-    let home = dirs.as_ref().map(|d| d.home_dir().to_string_lossy().into_owned());
-    let docs = dirs.as_ref().and_then(|d| d.document_dir()).map(|p| p.to_string_lossy().into_owned());
-    parse_mobaxterm_sessions_in(text, home.as_deref(), docs.as_deref())
-}
-
-fn parse_mobaxterm_sessions_in(text: &str, profile_dir: Option<&str>, documents: Option<&str>) -> Result<Vec<ImportedHost>, String> {
-    const SSH: &str = "0";
-    const RDP: &str = "4";
-    let mut out: Vec<ImportedHost> = Vec::new();
-    // Session names repeat, within a folder too; the import list keys rows by
-    // folder and name.
-    let mut names: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-    // The next number to try for a name already taken in a folder.
-    let mut next_number: std::collections::HashMap<(String, String), u32> = std::collections::HashMap::new();
-    let mut in_bookmarks = false;
-    let mut folder: Vec<String> = Vec::new();
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with(';') { continue; }
-        if line.starts_with('[') {
-            in_bookmarks = line.starts_with("[Bookmarks");
-            folder.clear();
-            continue;
-        }
-        if !in_bookmarks { continue; }
-        let Some((name, value)) = line.split_once('=') else { continue; };
-        let name = name.trim();
-        if name == "SubRep" {
-            folder = value.split('\\').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
-            continue;
-        }
-        if name == "ImgNum" { continue; }
-        let mut blocks = value.trim().split('#');
-        let (Some(_reconnect), Some(_icon), Some(settings)) = (blocks.next(), blocks.next(), blocks.next()) else {
-            continue;
-        };
-        let fields: Vec<&str> = settings.split('%').map(str::trim).collect();
-        let field = |i: usize| fields.get(i).copied().unwrap_or("");
-        let rdp = match field(0) {
-            SSH => false,
-            RDP => true,
-            _ => continue,
-        };
-        let hostname = field(1);
-        if hostname.is_empty() { continue; }
-        let port = field(2).parse::<u16>().ok().filter(|p| *p != 0).unwrap_or(if rdp { 3389 } else { 22 });
-        // `[name]`: sign in with MobaXterm's saved login `name`.
-        let (user, credential) = match field(3) {
-            "<default>" => ("", None),
-            u => match u.strip_prefix('[').and_then(|u| u.strip_suffix(']')) {
-                Some(login) if !login.trim().is_empty() => ("", Some(login.trim().to_string())),
-                _ => (u, None),
-            },
-        };
-        let path = |i: usize| {
-            Some(field(i))
-                .filter(|p| !p.is_empty())
-                .map(|p| expand_mobaxterm_path(p, profile_dir, documents))
-        };
-        // RDP sessions keep only host, port, user and folder: their other
-        // fields mean something else.
-        let proxy_jump = (!rdp).then(|| mobaxterm_jump_hosts(field(8), field(9), field(10))).flatten();
-        let jump_identity_file = proxy_jump.as_ref().and_then(|_| path(15));
-        let jump_credential = proxy_jump.as_ref().and_then(|_| mobaxterm_jump_login(field(8), field(10)));
-        let folder_key = folder.join("\\");
-        let mut alias = name.to_string();
-        if !names.insert((folder_key.clone(), alias.clone())) {
-            // Go on from where this name left off in this folder, not from 2
-            // each time: a list of N sessions with one name must not cost N²
-            // tries (an export of 20,000 of them froze the window for a
-            // minute).
-            let next = next_number.entry((folder_key.clone(), name.to_string())).or_insert(2);
-            loop {
-                alias = format!("{} ({})", name, next);
-                *next += 1;
-                if names.insert((folder_key.clone(), alias.clone())) {
-                    break;
-                }
-            }
-        }
-        out.push(ImportedHost {
-            key: format!("{}\\{}", folder_key, alias),
-            host_alias: alias,
-            hostname: hostname.to_string(),
-            port,
-            user: user.to_string(),
-            identity_file: (!rdp).then(|| path(14)).flatten(),
-            proxy_jump,
-            folder: folder.clone(),
-            credential,
-            run_on_connect: (!rdp).then(|| Some(field(7)).filter(|c| !c.is_empty()).map(mobaxterm_unescape)).flatten(),
-            jump_identity_file,
-            jump_credential,
-            rdp,
-            telnet: false,
-        });
-    }
-    if out.is_empty() {
-        return Err("No MobaXterm SSH or RDP sessions found in the pasted text.".into());
-    }
-    Ok(out)
-}
-
-/// MobaXterm writes the characters its own format uses — `;`, `|`, `#`, `%`
-/// and `"` — as words in a setting's text: `cd /opt__PTVIRG__ ls`. Back to
-/// what the user typed.
-fn mobaxterm_unescape(text: &str) -> String {
-    text.replace("__PTVIRG__", ";")
-        .replace("__PIPE__", "|")
-        .replace("__DIEZE__", "#")
-        .replace("__PERCENT__", "%")
-        .replace("__DBLQUO__", "\"")
-}
-
-/// The saved login a MobaXterm jump host signs in with: `[name]` as the
-/// jump user, for a single jump host.
-fn mobaxterm_jump_login(hosts: &str, users: &str) -> Option<String> {
-    let hops = hosts.split("__PIPE__").filter(|h| !h.trim().is_empty()).count();
-    let user = users.split("__PIPE__").next().unwrap_or("").trim();
-    let login = user.strip_prefix('[')?.strip_suffix(']')?.trim();
-    (hops == 1 && !login.is_empty()).then(|| login.to_string())
 }
 
 /// MobaXterm's jump hosts (one `__PIPE__`-separated list each for names,

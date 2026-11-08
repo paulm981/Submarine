@@ -277,8 +277,6 @@ mod tests {
     fn the_hooks_are_in_place() {
         use crate::fork_hooks::assert_hooks;
         let mut lib = vec![
-            ("merge_batch", "jump_gone::links_before(", 1),
-            ("merge_batch", "jump_gone::note_lost(", 1),
             ("repair_links", "jump_gone::note_unresolved(", 1),
             ("set_server_jump_host", "jump_gone::clear(", 1),
             ("monitor_resume_all", "jump_gone::resume_skipped_line(&name, &e)", 1),
@@ -291,6 +289,12 @@ mod tests {
         }
         assert_hooks("lib.rs", include_str!("lib.rs"), &lib);
         assert_hooks("tree_moves.rs", include_str!("tree_moves.rs"), &[("unlink_jump_hosts", "jump_gone::note_behind(", 1)]);
+        // The sync merge's batch, out of lib.rs into a fork file (#163).
+        assert_hooks(
+            "sync_merge.rs",
+            include_str!("sync_merge.rs"),
+            &[("merge_batch", "jump_gone::links_before(", 1), ("merge_batch", "jump_gone::note_lost(", 1)],
+        );
         assert_hooks("monitor.rs", include_str!("monitor.rs"), &[("run_poller", "jump_gone::reason(", 1)]);
         assert_hooks("ping.rs", include_str!("ping.rs"), &[("read_server", "jump_gone::reason(", 1)]);
     }

@@ -233,6 +233,52 @@ pub(crate) fn resolved_on_a_drive(folder: &std::path::Path) -> bool {
     }
 }
 
+/// What a folder download (lib.rs, sftp_download_dir) leaves out, for the
+/// note on its finished card: names the walk skipped, files bound for a login
+/// folder, and names that differ only in case.
+pub(crate) struct DownloadNotes {
+    names: u64,
+    autorun: u64,
+    case: u64,
+}
+
+impl DownloadNotes {
+    /// Leaves out of `files` (bound for `local_path`/`folder_name`) what
+    /// mustn't be written. The destination passed the policy, but the server
+    /// names the folders inside it: a home-folder backup downloaded into
+    /// C:\Users would put its AppData\…\Startup\x.bat in the real Startup
+    /// folder. Files that would land in a folder the system runs things from
+    /// at login are left out and counted on the card. And where upper and
+    /// lower case are the same name (Windows, and macOS as usually set up),
+    /// two files whose names differ only in case would land on one file, the
+    /// second replacing the first. The second is left out.
+    pub(crate) fn filter(files: &mut Vec<(String, String, u64)>, local_path: &str, folder_name: &str, skipped_names: u64) -> Self {
+        let login_folders = LoginFolders::new();
+        let dest_root = std::path::PathBuf::from(local_path).join(folder_name);
+        let before = files.len();
+        files.retain(|(_, rel, _)| login_folders.may_hold_server_file(&dest_root.join(rel)));
+        let autorun = (before - files.len()) as u64;
+        let case = drop_case_twins(files, cfg!(any(windows, target_os = "macos")));
+        Self { names: skipped_names, autorun, case }
+    }
+
+    /// The card's note, with the files left out at the end because something
+    /// of that name was there (another download finished first), which the
+    /// jobs count: nothing is replaced unless the user chose to.
+    pub(crate) fn text(&self, skipped_existing: u64) -> Option<String> {
+        let notes: Vec<String> = [
+            skipped_names_note(self.names),
+            autorun_skipped_note(self.autorun),
+            case_twins_note(self.case),
+            existing_skipped_note(skipped_existing),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!notes.is_empty()).then(|| notes.join("; "))
+    }
+}
+
 #[cfg(test)]
 mod login_folder_tests {
     use super::*;
@@ -333,11 +379,8 @@ mod hook_tests {
                 ("", "use downloads::*;", 1),
                 ("sftp_download_file", "finalize_download(", 1),
                 ("download_dir_file", "finalize_download(", 1),
-                ("sftp_download_dir", "LoginFolders", 1),
-                ("sftp_download_dir", "drop_case_twins(", 1),
-                ("sftp_download_dir", "autorun_skipped_note(", 1),
-                ("sftp_download_dir", "case_twins_note(", 1),
-                ("sftp_download_dir", "existing_skipped_note(", 1),
+                ("sftp_download_dir", "DownloadNotes::filter(&mut files, &local_path, &folder_name, skipped_names)", 1),
+                ("sftp_download_dir", "skipped_note.text(", 2),
                 ("guard_mirror_folder", "windows_drive_path(local)", 1),
                 ("guard_mirror_folder", "resolved_on_a_drive(&folder)", 1),
             ],

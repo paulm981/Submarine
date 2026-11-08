@@ -87,14 +87,18 @@ mod hook_tests {
             &[
                 ("", "mod synced_tunnels;", 1),
                 ("", "use synced_tunnels::*;", 1),
-                ("merge_batch", "stored_tunnels(", 1),
-                ("merge_batch", "note_synced_tunnels(", 1),
                 ("persist_session_tunnels", "take_synced_tunnels_base(", 1),
                 ("ensure_session_rules", "refresh_synced_session_rules(", 1),
                 ("initiate_connection", "refresh_synced_session_rules(", 1),
                 ("list_tunnel_rules", "refresh_synced_session_rules(", 1),
                 ("restart_session_tunnels", "refresh_synced_session_rules(", 1),
             ],
+        );
+        // The sync merge's batch, out of lib.rs into a fork file (#163).
+        assert_hooks(
+            "sync_merge.rs",
+            include_str!("sync_merge.rs"),
+            &[("merge_batch", "stored_tunnels(", 1), ("merge_batch", "note_synced_tunnels(", 1)],
         );
     }
 }

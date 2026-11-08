@@ -191,14 +191,16 @@ mod hook_tests {
                 ("", "pub(crate) use held_switch::*;", 1),
             ],
         );
+        assert_hooks("lib.rs", include_str!("../lib.rs"), &[("run", "approvals::keep_server_ssh", 1)]);
+        // The sync merge's batch, out of lib.rs into a fork file (#163).
         assert_hooks(
-            "lib.rs",
-            include_str!("../lib.rs"),
+            "sync_merge.rs",
+            include_str!("../sync_merge.rs"),
             &[
                 ("merge_batch", "approvals::held_switch(", 1),
                 ("merge_batch", "approvals::before_merge(", 1),
                 ("merge_batch", "approvals::hold_switch(", 1),
-                ("run", "approvals::keep_server_ssh", 1),
+                ("outgoing", "approvals::held_switch(", 1),
             ],
         );
     }

@@ -84,7 +84,7 @@ pub(crate) fn move_folder_in(conn: &Connection, id: i64, parent_id: Option<i64>)
     check_folder(conn, Some(id))?;
     check_folder(conn, parent_id)?;
     if let Some(p) = parent_id {
-        let inside = crate::folder_subtree(conn, id).map_err(db("FOLDER_TREE_QUERY_FAILED"))?;
+        let inside = folder_subtree(conn, id).map_err(db("FOLDER_TREE_QUERY_FAILED"))?;
         if inside.contains(&p) {
             return Err("[VALIDATION] FOLDER_INTO_ITSELF: a folder can't go inside itself".into());
         }
@@ -105,7 +105,7 @@ pub(crate) fn delete_scope(conn: &Connection, servers: &[i64], folders: &[i64]) 
     break_folder_loops(conn).map_err(db("FOLDER_LOOP_REPAIR_FAILED"))?;
     let mut all_folders: Vec<i64> = Vec::new();
     for f in folders {
-        for id in crate::folder_subtree(conn, *f).map_err(db("FOLDER_TREE_QUERY_FAILED"))? {
+        for id in folder_subtree(conn, *f).map_err(db("FOLDER_TREE_QUERY_FAILED"))? {
             if !all_folders.contains(&id) {
                 all_folders.push(id);
             }
@@ -212,6 +212,52 @@ pub async fn delete_tree_items(
     with_vault(&state, |conn| delete_in(conn, &servers, &folders).map(|_| ((), true)))
 }
 
+/// Delete the given folders (a folder and its subtree) and every server and
+/// Remote Desktop link in them, all or nothing: a folder left behind would
+/// lose its parent and turn up at the top level. Each row goes through the
+/// sync delete trigger, so the deletions reach the profile's other devices.
+pub(crate) fn delete_folder_tree(conn: &rusqlite::Connection, folder_ids: &[i64]) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(|e| format!("[DATABASE] TX_BEGIN: {}", e))?;
+    for fid in folder_ids {
+        // The servers that went through one of these as their jump host let go of it.
+        let doomed: Vec<i64> = tx
+            .prepare("SELECT id FROM servers WHERE folder_id=?1")
+            .and_then(|mut stmt| stmt.query_map(rusqlite::params![fid], |r| r.get(0))?.collect())
+            .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_QUERY_FAILED: {}", e))?;
+        unlink_jump_hosts(&tx, &doomed)?;
+        tx.execute("DELETE FROM servers WHERE folder_id=?1", rusqlite::params![fid])
+            .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_DELETE_FAILED: {}", e))?;
+        tx.execute("DELETE FROM rdp_links WHERE folder_id=?1", rusqlite::params![fid])
+            .map_err(|e| format!("[DATABASE] FOLDER_RDP_DELETE_FAILED: {}", e))?;
+    }
+    for fid in folder_ids {
+        tx.execute("DELETE FROM folders WHERE id=?1", rusqlite::params![fid])
+            .map_err(|e| format!("[DATABASE] FOLDER_DELETE_FAILED: {}", e))?;
+    }
+    tx.commit().map_err(|e| format!("[DATABASE] TX_COMMIT: {}", e))
+}
+
+/// A folder and every folder inside it, at any depth, the folder first.
+/// Guarded against a parent loop (which sync could in principle produce).
+pub(crate) fn folder_subtree(conn: &rusqlite::Connection, root: i64) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM folders WHERE parent_id=?1")?;
+    let mut out = vec![root];
+    let mut i = 0;
+    while i < out.len() {
+        let children: Vec<i64> = stmt
+            .query_map(rusqlite::params![out[i]], |r| r.get::<_, i64>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for c in children {
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +359,71 @@ mod tests {
         assert!(move_folder_in(&conn, 2, None).unwrap(), "out to the top level");
         assert!(!move_folder_in(&conn, 2, None).unwrap(), "already there");
         assert_eq!(folder_of(&conn, "servers", 12), Some(2), "its servers stay in it");
+    }
+}
+
+#[cfg(test)]
+mod folder_subtree_tests {
+    #[test]
+    fn a_folders_subtree_holds_every_level_and_survives_a_loop() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE folders(id INTEGER PRIMARY KEY, name TEXT, parent_id INTEGER);
+             INSERT INTO folders VALUES (1,'a',NULL),(2,'b',1),(3,'c',2),(4,'d',1),(5,'other',NULL),(6,'x',7),(7,'y',6);",
+        )
+        .unwrap();
+        assert_eq!(super::folder_subtree(&conn, 1).unwrap(), vec![1, 2, 4, 3]);
+        assert_eq!(super::folder_subtree(&conn, 5).unwrap(), vec![5]);
+        assert_eq!(super::folder_subtree(&conn, 6).unwrap(), vec![6, 7]);
+    }
+
+    #[test]
+    fn deleting_a_folder_takes_its_subfolders_servers_and_links() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE folders(id INTEGER PRIMARY KEY, name TEXT, parent_id INTEGER);
+             CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, folder_id INTEGER, jump_host_id INTEGER, FOREIGN KEY(folder_id) REFERENCES folders(id));
+             CREATE TABLE rdp_links(id INTEGER PRIMARY KEY, name TEXT, folder_id INTEGER, FOREIGN KEY(folder_id) REFERENCES folders(id));
+             CREATE TABLE sync_flags(key TEXT PRIMARY KEY, val INTEGER NOT NULL);
+             INSERT INTO folders VALUES (1,'a',NULL),(2,'b',1),(3,'c',2),(4,'d',NULL);
+             INSERT INTO servers VALUES (10,'s10',1,NULL),(11,'s11',3,NULL),(12,'s12',4,11),(13,'s13',NULL,10);
+             INSERT INTO rdp_links VALUES (20,'r20',2),(21,'r21',4);",
+        )
+        .unwrap();
+        let ids = super::folder_subtree(&conn, 1).unwrap();
+        super::delete_folder_tree(&conn, &ids).unwrap();
+        let col = |sql: &str| -> Vec<i64> {
+            conn.prepare(sql).unwrap().query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(col("SELECT id FROM folders ORDER BY id"), vec![4]);
+        assert_eq!(col("SELECT id FROM servers ORDER BY id"), vec![12, 13]);
+        assert_eq!(col("SELECT id FROM rdp_links ORDER BY id"), vec![21]);
+        // Their jump hosts went with the folder: not left pointing at nothing.
+        assert_eq!(col("SELECT COUNT(*) FROM servers WHERE jump_host_id IS NOT NULL"), vec![0]);
+    }
+}
+
+// Every call from the original project's code into this file (fork_hooks.rs):
+// a sync that drops one, or the line that brings the file in, fails here.
+#[cfg(test)]
+mod hook_tests {
+    use crate::fork_hooks::assert_hooks;
+
+    #[test]
+    fn the_hooks_are_in_place() {
+        assert_hooks(
+            "lib.rs",
+            include_str!("lib.rs"),
+            &[
+                ("", "mod tree_moves;", 1),
+                ("delete_folder", "tree_moves::break_folder_loops(", 1),
+                ("delete_folder", "tree_moves::folder_subtree(", 1),
+                ("delete_folder", "tree_moves::delete_folder_tree(", 1),
+                ("delete_server", "tree_moves::unlink_jump_hosts(", 1),
+                ("resolve_held", "tree_moves::break_folder_loops(", 1),
+                ("run", "tree_moves::move_folder", 1),
+            ],
+        );
     }
 }

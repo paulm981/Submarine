@@ -1,5 +1,8 @@
 //! Reading other apps' session lists for the import: OpenSSH client
-//! config (`parse_ssh_config_text`) and MobaXterm's path placeholders.
+//! config (`parse_ssh_config_text`), PuTTY's `.reg` export
+//! (`parse_putty_reg`), MobaXterm's `.mxtsessions` export
+//! (`parse_mobaxterm_sessions`) and its path placeholders, and what each
+//! host comes in as (`ImportedHost`).
 //!
 //! The fork's own, moved here out of lib.rs (#136) so a sync with the
 //! original project doesn't conflict on it. lib.rs reaches it through
@@ -263,6 +266,331 @@ pub(crate) async fn import_hosts(
     Ok(report)
 }
 
+/// One resolved entry from an OpenSSH client config `Host` block. The
+/// frontend picks a subset of these and turns each into a fresh server row
+/// via the existing `add_server` command. A host that named an `IdentityFile`
+/// gets that key registered and linked; everything else lands password-less
+/// for the user to finish.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+pub(crate) struct ImportedHost {
+    /// The alias the user actually types (`ssh <alias>`) — becomes the
+    /// server's display name after import.
+    pub(crate) host_alias: String,
+    /// Resolved `HostName`, or the alias itself if the block didn't set one
+    /// (matches OpenSSH's own behaviour when HostName is omitted).
+    pub(crate) hostname: String,
+    /// Resolved `Port`, defaulting to the standard SSH port.
+    pub(crate) port: u16,
+    /// Resolved `User`. Empty string when unset — the frontend can fall
+    /// back to whatever it uses elsewhere.
+    pub(crate) user: String,
+    /// Resolved `IdentityFile`, still in the config's own spelling (`~` and
+    /// all). The importer feeds it to `import_ssh_key_file`, which expands and
+    /// reads it, so a host that names a key comes in as a key-authenticated
+    /// row rather than one the user has to go back and finish.
+    pub(crate) identity_file: Option<String>,
+    /// Resolved `ProxyJump`: `[user@]host[:port]`, comma-separated hops.
+    /// The import links a single hop to a saved server (host_import.rs).
+    pub(crate) proxy_jump: Option<String>,
+    /// Unique within one parse; the picker keys its rows by it (MobaXterm's
+    /// folder and name, else the row's place in the list). Empty means
+    /// `host_alias`.
+    #[serde(default)]
+    pub(crate) key: String,
+    /// Folder path, outermost first (MobaXterm's session folders).
+    #[serde(default)]
+    pub(crate) folder: Vec<String>,
+    /// A MobaXterm saved login (`[name]` as the user name): the host signs in
+    /// with that Login rather than a user of its own.
+    #[serde(default)]
+    pub(crate) credential: Option<String>,
+    /// Typed into the first terminal on connect (MobaXterm's "Execute command").
+    #[serde(default)]
+    pub(crate) run_on_connect: Option<String>,
+    /// The key the jump host signs in with (MobaXterm's jump host key).
+    #[serde(default)]
+    pub(crate) jump_identity_file: Option<String>,
+    /// The saved login the jump host signs in with (MobaXterm `[name]`).
+    #[serde(default)]
+    pub(crate) jump_credential: Option<String>,
+    /// A Remote Desktop session (MobaXterm's RDP): imported as an RDP link
+    /// (rdp_links.rs), not a server.
+    #[serde(default)]
+    pub(crate) rdp: bool,
+    /// A telnet session (PuTTY's): imported as a telnet server.
+    #[serde(default)]
+    pub(crate) telnet: bool,
+}
+
+pub(crate) fn is_putty_reg(trimmed: &str) -> bool {
+    trimmed.to_ascii_lowercase().contains("windows registry editor")
+        || trimmed.contains("[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions")
+        || trimmed.contains("[HKEY_USERS\\") && trimmed.contains("SimonTatham\\PuTTY\\Sessions")
+}
+
+/// Parse `regedit /e` output of PuTTY's session key: the SSH and telnet
+/// sessions (`putty_sessions`), or why there are none.
+pub(crate) fn parse_putty_reg(text: &str) -> Result<Vec<ImportedHost>, String> {
+    let (mut out, skipped) = putty_sessions(text);
+    // Names may repeat (two exports pasted together): the picker keys rows
+    // by this.
+    for (i, h) in out.iter_mut().enumerate() {
+        h.key = i.to_string();
+    }
+    if out.is_empty() {
+        return Err(match putty_skipped(&skipped) {
+            Some(why) => format!("No PuTTY SSH or telnet sessions found. {}", why),
+            None => "No PuTTY sessions found in the pasted text.".into(),
+        });
+    }
+    Ok(out)
+}
+
+/// The sessions in a PuTTY `.reg` export, and how many of each other kind
+/// (serial, raw, rlogin, …) were left out. The format is deterministic (one
+/// `[...]` header line per session, then `"key"=type:val` lines) so a
+/// line-oriented walk covers it. We pull the fields that translate to a
+/// Submarine row: HostName, PortNumber, UserName and Protocol. An SSH
+/// session becomes an SSH server, a telnet one a telnet server. A session
+/// with no host name ("Default Settings", say) isn't one to connect to and
+/// is left out. Session-name percent-escapes (%20 for space, etc.) are
+/// undone so the alias reads naturally.
+pub(crate) fn putty_sessions(text: &str) -> (Vec<ImportedHost>, std::collections::BTreeMap<String, usize>) {
+    struct Session {
+        name: String,
+        host: String,
+        port: u16,
+        user: String,
+        /// PuTTY's own word; a session without one is SSH, PuTTY's default.
+        protocol: String,
+    }
+    let mut out: Vec<ImportedHost> = Vec::new();
+    let mut skipped: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut current: Option<Session> = None;
+    let mut close = |cur: &mut Option<Session>| {
+        let Some(s) = cur.take() else { return };
+        if s.host.trim().is_empty() {
+            return;
+        }
+        let telnet = match s.protocol.as_str() {
+            "" | "ssh" => false,
+            "telnet" => true,
+            other => {
+                *skipped.entry(other.to_string()).or_default() += 1;
+                return;
+            }
+        };
+        let usual = if telnet { 23 } else { 22 };
+        out.push(ImportedHost {
+            host_alias: s.name,
+            hostname: s.host.trim().to_string(),
+            port: if s.port == 0 { usual } else { s.port },
+            user: s.user,
+            identity_file: None,
+            proxy_jump: None,
+            telnet,
+            ..Default::default()
+        });
+    };
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() { continue; }
+        if line.starts_with('[') && line.ends_with(']') {
+            close(&mut current);
+            // Only sessions — skip other PuTTY keys (SshHostKeys, Jumplist).
+            let inner = &line[1..line.len() - 1];
+            let Some(idx) = inner.rfind("\\Sessions\\") else { continue; };
+            let name_raw = &inner[idx + "\\Sessions\\".len()..];
+            let name = putty_unescape(name_raw);
+            if name.is_empty() { continue; }
+            current = Some(Session { name, host: String::new(), port: 0, user: String::new(), protocol: String::new() });
+            continue;
+        }
+        let Some((key, val_raw)) = line.split_once('=') else { continue; };
+        let Some(cur) = current.as_mut() else { continue; };
+        let key = key.trim().trim_matches('"');
+        let val = val_raw.trim();
+        match key {
+            "HostName" => {
+                if let Some(v) = strip_reg_string(val) { cur.host = v; }
+            }
+            "PortNumber" => {
+                if let Some(n) = strip_reg_dword(val) {
+                    if let Ok(p) = u16::try_from(n) { cur.port = p; }
+                }
+            }
+            "UserName" => {
+                if let Some(v) = strip_reg_string(val) { cur.user = v; }
+            }
+            "Protocol" => {
+                if let Some(v) = strip_reg_string(val) { cur.protocol = v.trim().to_ascii_lowercase(); }
+            }
+            _ => {}
+        }
+    }
+    close(&mut current);
+    (out, skipped)
+}
+
+/// "Not imported: 2 serial and 1 raw sessions — …" for the PuTTY sessions
+/// `putty_sessions` left out; None when it left out none.
+pub(crate) fn putty_skipped(counts: &std::collections::BTreeMap<String, usize>) -> Option<String> {
+    if counts.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = counts.iter().map(|(k, n)| format!("{} {}", n, k)).collect();
+    let total: usize = counts.values().sum();
+    let list = match parts.len() {
+        1 => parts[0].clone(),
+        _ => format!("{} and {}", parts[..parts.len() - 1].join(", "), parts[parts.len() - 1]),
+    };
+    Some(format!(
+        "Not imported: {} {} — Submarine imports PuTTY's SSH and telnet sessions.",
+        list,
+        if total == 1 { "session" } else { "sessions" }
+    ))
+}
+
+/// Parse a MobaXterm `.mxtsessions` export. It's an INI file: each section
+/// (`[Bookmarks]`, `[Bookmarks_1]`, …) is a folder, with `SubRep=` its path
+/// (`\`-separated) and `ImgNum=` its icon, and every other line is one
+/// session:
+///
+/// `<name>= #<icon>#<settings>#<terminal settings>#…`
+///
+/// `<settings>` is `%`-separated and starts with the session type (0 = SSH,
+/// 4 = RDP, 5 = VNC, 7 = SFTP, …). For SSH, field 1 is the host, 2 the port,
+/// 3 the user (`<default>` = none set, `[name]` = the saved login `name`),
+/// 7 the command run after login, 8/9/10 the jump hosts' names, ports and
+/// users (`__PIPE__` between hops), 14 the key file and 15 the jump host's
+/// key file. Paths use MobaXterm's placeholders (see
+/// `expand_mobaxterm_path`). The icon is the user's pick, so it says nothing
+/// about the type. SSH and RDP sessions are imported.
+pub(crate) fn parse_mobaxterm_sessions(text: &str) -> Result<Vec<ImportedHost>, String> {
+    let dirs = directories::UserDirs::new();
+    let home = dirs.as_ref().map(|d| d.home_dir().to_string_lossy().into_owned());
+    let docs = dirs.as_ref().and_then(|d| d.document_dir()).map(|p| p.to_string_lossy().into_owned());
+    parse_mobaxterm_sessions_in(text, home.as_deref(), docs.as_deref())
+}
+
+pub(crate) fn parse_mobaxterm_sessions_in(text: &str, profile_dir: Option<&str>, documents: Option<&str>) -> Result<Vec<ImportedHost>, String> {
+    const SSH: &str = "0";
+    const RDP: &str = "4";
+    let mut out: Vec<ImportedHost> = Vec::new();
+    // Session names repeat, within a folder too; the import list keys rows by
+    // folder and name.
+    let mut names: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    // The next number to try for a name already taken in a folder.
+    let mut next_number: std::collections::HashMap<(String, String), u32> = std::collections::HashMap::new();
+    let mut in_bookmarks = false;
+    let mut folder: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with(';') { continue; }
+        if line.starts_with('[') {
+            in_bookmarks = line.starts_with("[Bookmarks");
+            folder.clear();
+            continue;
+        }
+        if !in_bookmarks { continue; }
+        let Some((name, value)) = line.split_once('=') else { continue; };
+        let name = name.trim();
+        if name == "SubRep" {
+            folder = value.split('\\').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+            continue;
+        }
+        if name == "ImgNum" { continue; }
+        let mut blocks = value.trim().split('#');
+        let (Some(_reconnect), Some(_icon), Some(settings)) = (blocks.next(), blocks.next(), blocks.next()) else {
+            continue;
+        };
+        let fields: Vec<&str> = settings.split('%').map(str::trim).collect();
+        let field = |i: usize| fields.get(i).copied().unwrap_or("");
+        let rdp = match field(0) {
+            SSH => false,
+            RDP => true,
+            _ => continue,
+        };
+        let hostname = field(1);
+        if hostname.is_empty() { continue; }
+        let port = field(2).parse::<u16>().ok().filter(|p| *p != 0).unwrap_or(if rdp { 3389 } else { 22 });
+        // `[name]`: sign in with MobaXterm's saved login `name`.
+        let (user, credential) = match field(3) {
+            "<default>" => ("", None),
+            u => match u.strip_prefix('[').and_then(|u| u.strip_suffix(']')) {
+                Some(login) if !login.trim().is_empty() => ("", Some(login.trim().to_string())),
+                _ => (u, None),
+            },
+        };
+        let path = |i: usize| {
+            Some(field(i))
+                .filter(|p| !p.is_empty())
+                .map(|p| expand_mobaxterm_path(p, profile_dir, documents))
+        };
+        // RDP sessions keep only host, port, user and folder: their other
+        // fields mean something else.
+        let proxy_jump = (!rdp).then(|| mobaxterm_jump_hosts(field(8), field(9), field(10))).flatten();
+        let jump_identity_file = proxy_jump.as_ref().and_then(|_| path(15));
+        let jump_credential = proxy_jump.as_ref().and_then(|_| mobaxterm_jump_login(field(8), field(10)));
+        let folder_key = folder.join("\\");
+        let mut alias = name.to_string();
+        if !names.insert((folder_key.clone(), alias.clone())) {
+            // Go on from where this name left off in this folder, not from 2
+            // each time: a list of N sessions with one name must not cost N²
+            // tries (an export of 20,000 of them froze the window for a
+            // minute).
+            let next = next_number.entry((folder_key.clone(), name.to_string())).or_insert(2);
+            loop {
+                alias = format!("{} ({})", name, next);
+                *next += 1;
+                if names.insert((folder_key.clone(), alias.clone())) {
+                    break;
+                }
+            }
+        }
+        out.push(ImportedHost {
+            key: format!("{}\\{}", folder_key, alias),
+            host_alias: alias,
+            hostname: hostname.to_string(),
+            port,
+            user: user.to_string(),
+            identity_file: (!rdp).then(|| path(14)).flatten(),
+            proxy_jump,
+            folder: folder.clone(),
+            credential,
+            run_on_connect: (!rdp).then(|| Some(field(7)).filter(|c| !c.is_empty()).map(mobaxterm_unescape)).flatten(),
+            jump_identity_file,
+            jump_credential,
+            rdp,
+            telnet: false,
+        });
+    }
+    if out.is_empty() {
+        return Err("No MobaXterm SSH or RDP sessions found in the pasted text.".into());
+    }
+    Ok(out)
+}
+
+/// MobaXterm writes the characters its own format uses — `;`, `|`, `#`, `%`
+/// and `"` — as words in a setting's text: `cd /opt__PTVIRG__ ls`. Back to
+/// what the user typed.
+pub(crate) fn mobaxterm_unescape(text: &str) -> String {
+    text.replace("__PTVIRG__", ";")
+        .replace("__PIPE__", "|")
+        .replace("__DIEZE__", "#")
+        .replace("__PERCENT__", "%")
+        .replace("__DBLQUO__", "\"")
+}
+
+/// The saved login a MobaXterm jump host signs in with: `[name]` as the
+/// jump user, for a single jump host.
+pub(crate) fn mobaxterm_jump_login(hosts: &str, users: &str) -> Option<String> {
+    let hops = hosts.split("__PIPE__").filter(|h| !h.trim().is_empty()).count();
+    let user = users.split("__PIPE__").next().unwrap_or("").trim();
+    let login = user.strip_prefix('[')?.strip_suffix(']')?.trim();
+    (hops == 1 && !login.is_empty()).then(|| login.to_string())
+}
+
 // Every call from the original project's code into this file (fork_hooks.rs):
 // a sync that drops one, or the lines that bring the file in, fails here.
 #[cfg(test)]
@@ -279,7 +607,9 @@ mod hook_tests {
                 ("", "use session_import::*;", 1),
                 ("parse_ssh_config", "parse_ssh_config_text(", 1),
                 ("parse_client_import", "mobaxterm_skipped(", 1),
-                ("parse_mobaxterm_sessions_in", "expand_mobaxterm_path(", 1),
+                ("parse_client_import", "putty_skipped(", 1),
+                ("parse_client_hosts", "parse_putty_reg(", 1),
+                ("parse_client_hosts", "parse_mobaxterm_sessions(", 1),
                 ("run", "import_hosts", 1),
             ],
         );
