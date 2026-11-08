@@ -21,6 +21,26 @@ Every line the fork changes inside one of the original project's files can confl
 - **Every pull request says what it does to the footprint:** `scripts/upstream-footprint.sh` before and after (the lines the fork changes in the original project's files). It should only go down, or stay as it is.
 - **One pull request at a time,** its checks green before it merges.
 
+## How we work
+
+- **Start from the plan.** What's done and what's next is in [#163](https://github.com/paulm981/Submarine/issues/163)'s latest comment; read it first, and update it when a batch of work ends.
+- **What the owner cares about most:**
+  - the AI (Claude Code, Codex) working well, with as few approval prompts as safety allows;
+  - Broadcast to many servers;
+  - pushing and pulling files on many servers, by the owner and by the AI;
+  - sessions that come back after a reconnect, without ever asking "close session?" or "close connection?";
+  - Settings in categories;
+  - staying close to the original project, so syncs stay cheap.
+- **Decide, don't ask.** The owner can't weigh design options. Make the recommendation from these goals, act on it, and say why in the issue or pull request. Ask first only for:
+  - replacing one of the original project's features;
+  - a change in how the app behaves that the owner would notice (e.g. what "Run anything" allows);
+  - anything that can't be undone.
+- **Merge when green.** Once every check passes on the current head, merge; don't wait for the owner. Say plainly in each pull request what wasn't tried in the running app, and keep a short checklist for the owner to try.
+- **No custom Remote Desktop.** RDP is the original project's code. The only fork addition worth having there would be jump-host support, and that needs its own issue first.
+- **Security first, honestly.** The AI never gets keys or passwords, and the approval card is the real guard. Never claim prompt injection is solved: a model can be talked round by text it reads, so protections that matter are enforced by Submarine, not left to the model.
+- **Helpers' work is checked before it goes up.** Read the risky parts yourself: save payloads, path checks, anything security-related, effect order. Re-run every check. Look at screenshots. Code that only builds on Windows, macOS or Android is reviewed by eye, and only the CI job for that system proves it.
+- **The working branch.** After a squash merge, start the next branch from `origin/main`, then `git merge -s ours` the old tip of the working branch, so the push is a fast-forward. No force-push and no deleting remote branches. Each task gets its own worktree, removed once it's merged.
+
 ## Speed, security and Rust patterns
 
 Every change is held to these, in review and in the code itself:
