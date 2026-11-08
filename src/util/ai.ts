@@ -160,12 +160,25 @@ export interface AiDone {
   /// A follow (#179): how it ended and what it saw. Its output isn't kept.
   follow: { ended: string; bytes_seen: number } | null;
 }
+/// The AI asking for a server by name (src-tauri/src/ai/ask_server.rs): the
+/// saved server it found, if exactly one has that name.
+export interface AiServerAsk {
+  id: number; tab_id: string; tab_label: string; asked: string;
+  server_id: number | null; server_name: string | null; many: boolean; asked_at: string;
+}
+
 export interface AiSnapshot {
-  enabled: boolean; tabs: AiTab[]; pending: AiPending[]; running: AiRunning[]; history: AiDone[];
+  enabled: boolean; tabs: AiTab[]; pending: AiPending[]; server_asks: AiServerAsk[]; running: AiRunning[]; history: AiDone[];
   audit_log: string | null;
 }
 
-const EMPTY: AiSnapshot = { enabled: false, tabs: [], pending: [], running: [], history: [], audit_log: null };
+const EMPTY: AiSnapshot = { enabled: false, tabs: [], pending: [], server_asks: [], running: [], history: [], audit_log: null };
+
+/// Asks the session tree to open a saved server's tab (or show it, if it's
+/// open): Share on a request for a server. The tree's own opening holds
+/// back a server a teammate moved, as a click there would.
+export const OPEN_SERVER = "submarine-ai-open-server";
+export const openServerTab = (serverId: number) => window.dispatchEvent(new CustomEvent(OPEN_SERVER, { detail: serverId }));
 
 // One copy of the state for the whole page, however many components use it:
 // one `ai_state` call per change, not one per open server tab.

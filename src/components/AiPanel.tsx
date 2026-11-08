@@ -1,7 +1,7 @@
 import { ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Bot, Check, ChevronDown, ChevronRight, Loader2, ShieldAlert, Square, X, Zap } from "lucide-react";
-import { AiDone, AiPending, AiRunning, AiSnapshot, cardsOf, copyCard, followLimit, followSoFar, runnerWarning, STEERED_BY_OUTPUT } from "../util/ai";
+import { AiDone, AiPending, AiRunning, AiServerAsk, AiSnapshot, cardsOf, openServerTab, copyCard, followLimit, followSoFar, runnerWarning, STEERED_BY_OUTPUT } from "../util/ai";
 import { formatBytes } from "../fork/bulk/plan";
 import { HIDDEN_CONTROLS } from "../util/fileName";
 import { WILDCARD_WARNING } from "./AiTrust";
@@ -80,6 +80,107 @@ const NoFocusButton = ({ onPick, className, children, title, onDown, accept }: {
 /// How long a request's card ignores clicks after it appears or moves.
 const SETTLE_MS = 500;
 
+/// A card's clicks that count (SETTLE_MS): `down` as the button goes down,
+/// `accept` as the click comes. Only a single click, pressed and released
+/// on the card, and not within SETTLE_MS of it appearing or moving on the
+/// screen, by a render, scrolling, a resize or text above it wrapping.
+const useSettledClicks = (ref: React.RefObject<HTMLDivElement>) => {
+  const settledAt = useRef(0);
+  const lastTop = useRef<number | null>(null);
+  const downHere = useRef(false);
+  // Where it is on screen now, against where it was: moved, its clicks wait
+  // SETTLE_MS again. On the screen, not in its list (offsetTop), so
+  // scrolling counts too: the AI withdrawing a card above can make the
+  // panel scroll this one under the pointer without it moving in the list.
+  const moved = () => {
+    const el = ref.current;
+    if (!el) return false;
+    const top = el.getBoundingClientRect().top;
+    if (lastTop.current === top) return false;
+    lastTop.current = top;
+    settledAt.current = performance.now() + SETTLE_MS;
+    downHere.current = false;
+    return true;
+  };
+  // On every render (any change to the panel).
+  useLayoutEffect(() => { moved(); });
+  // And when it moves without a render: any scrolling (caught on the way
+  // down, so the panel's own counts), the window resizing, text above it
+  // wrapping differently.
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const check = () => { moved(); };
+    document.addEventListener("scroll", check, true);
+    window.addEventListener("resize", check);
+    const ro = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(check);
+    if (ro) {
+      ro.observe(el);
+      if (el.parentElement) ro.observe(el.parentElement);
+    }
+    return () => {
+      document.removeEventListener("scroll", check, true);
+      window.removeEventListener("resize", check);
+      ro?.disconnect();
+    };
+  }, []);
+  // Looked at again as the button goes down and as the click comes: a move
+  // nothing above reported still counts.
+  const accept = (e: React.MouseEvent) => {
+    const ok = !moved() && e.detail === 1 && downHere.current && performance.now() >= settledAt.current;
+    downHere.current = false;
+    return ok;
+  };
+  const down = () => { downHere.current = !moved() && performance.now() >= settledAt.current; };
+  return { down, accept };
+};
+
+/// The AI asking for a server by name (#32): Share opens its tab, if it
+/// isn't open, and shares it once it's connected; Don't share, or Dismiss
+/// where no saved server has the name, tells the AI the same either way.
+/// Its buttons take the same deliberate click as a request's.
+export const ServerAskCard = ({ a, act }: { a: AiServerAsk; act: (cmd: string, args: Record<string, unknown>) => void }) => {
+  const ref = useRef<HTMLDivElement>(null);
+  const { down, accept } = useSettledClicks(ref);
+  const found = a.server_id !== null && a.server_name !== null;
+  const share = () => {
+    if (!found) return;
+    openServerTab(a.server_id!);
+    act("ai_answer_server_ask", { id: a.id, share: true });
+  };
+  const button = "flex-1 h-8 rounded-lg text-[11px] font-bold uppercase tracking-wider flex items-center justify-center gap-1.5";
+  return (
+    <div ref={ref} className="mx-3 my-2 p-3 rounded-xl border border-primary/30 bg-primary/[0.04] space-y-2">
+      <p className="text-[12px] text-zinc-200 leading-snug">
+        <span className="font-semibold">{a.tab_label}</span>{" "}
+        {found
+          ? <>asks to use <span className="font-semibold text-white">{a.server_name}</span>. Share it?</>
+          : <>asked for a server named <span className="font-mono text-white">{showPlainly(a.asked)}</span>.</>}
+      </p>
+      <p className="text-[11px] text-zinc-400 leading-snug">
+        {found
+          ? "Its tab opens if it isn't open, and once it's connected the AI can ask to run commands there, under its own approval level."
+          : a.many
+            ? "More than one saved server has that name. Share the one you mean from its tab."
+            : "No saved server has that name."}
+        {!found && " The AI hears the same as when you say no to a server you have, so it can't learn which names you have."}
+      </p>
+      <div className="flex gap-2">
+        {found && (
+          <NoFocusButton onPick={share} onDown={down} accept={accept}
+            className={`${button} bg-primary/15 border border-primary/40 text-primary hover:bg-primary hover:text-zinc-950`}>
+            <Check size={13} /> Share
+          </NoFocusButton>
+        )}
+        <NoFocusButton onPick={() => act("ai_answer_server_ask", { id: a.id, share: false })} onDown={down} accept={accept}
+          className={`${button} bg-zinc-900 border border-white/10 text-zinc-300 hover:border-red-400/50 hover:text-red-300`}>
+          <X size={13} /> {found ? "Don't share" : "Dismiss"}
+        </NoFocusButton>
+      </div>
+    </div>
+  );
+};
+
 /// A request waiting for you. Its Allow and Deny only take a deliberate
 /// click: a single click (not a double-click's second), pressed and
 /// released on this card, and not within SETTLE_MS of the card appearing or
@@ -128,53 +229,7 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
   const [confirmed, setConfirmed] = useState<string | null>(null);
   // When it was asked for: the confirming click waits SETTLE_MS after it.
   const confirmedAt = useRef(0);
-  const settledAt = useRef(0);
-  const lastTop = useRef<number | null>(null);
-  const downHere = useRef(false);
-  // Where it is on screen now, against where it was: moved, its clicks wait
-  // SETTLE_MS again. On the screen, not in its list (offsetTop), so
-  // scrolling counts too: the AI withdrawing a card above can make the
-  // panel scroll this one under the pointer without it moving in the list.
-  const moved = () => {
-    const el = ref.current;
-    if (!el) return false;
-    const top = el.getBoundingClientRect().top;
-    if (lastTop.current === top) return false;
-    lastTop.current = top;
-    settledAt.current = performance.now() + SETTLE_MS;
-    downHere.current = false;
-    return true;
-  };
-  // On every render (any change to the panel).
-  useLayoutEffect(() => { moved(); });
-  // And when it moves without a render: any scrolling (caught on the way
-  // down, so the panel's own counts), the window resizing, text above it
-  // wrapping differently.
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const check = () => { moved(); };
-    document.addEventListener("scroll", check, true);
-    window.addEventListener("resize", check);
-    const ro = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(check);
-    if (ro) {
-      ro.observe(el);
-      if (el.parentElement) ro.observe(el.parentElement);
-    }
-    return () => {
-      document.removeEventListener("scroll", check, true);
-      window.removeEventListener("resize", check);
-      ro?.disconnect();
-    };
-  }, []);
-  // Looked at again as the button goes down and as the click comes: a move
-  // nothing above reported still counts.
-  const accept = (e: React.MouseEvent) => {
-    const ok = !moved() && e.detail === 1 && downHere.current && performance.now() >= settledAt.current;
-    downHere.current = false;
-    return ok;
-  };
-  const down = () => { downHere.current = !moved() && performance.now() >= settledAt.current; };
+  const { down, accept } = useSettledClicks(ref);
   const loginIsRoot = p.user === "root";
   const many = members && members.length > 1 ? members : null;
   // "Try one first" on a command for several servers: its first server
@@ -651,6 +706,7 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
         ))}
 
         {/* Waiting for you. */}
+        {(snap.server_asks ?? []).map((a) => <ServerAskCard key={a.id} a={a} act={run} />)}
         {cardsOf(snap.pending).map(({ p, members }) => (
           <PendingCard
             key={`${p.id}:${p.asked_at}`}

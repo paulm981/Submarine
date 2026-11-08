@@ -7,6 +7,7 @@ import { normalizeRules, onSlowRule, setCustomRules, setServerHighlights } from 
 import { reorderById, useTabDrag } from "../../ui/tabDrag";
 import { appHotkey } from "../../ui/terminalDock";
 import { setServerSchemes } from "../../ui/terminalThemes";
+import { OPEN_SERVER } from "../../util/ai";
 import { logLine } from "../../util/diagnostics";
 import { visibleName } from "../../util/fileName";
 import { folderTree } from "../../util/folderTree";
@@ -419,6 +420,19 @@ export const useSessionTree = (o: {
     });
     o.setActiveView(`session-${list[0].id}`);
   };
+  // Share on the AI's request for a server (OPEN_SERVER, #32): opened as a
+  // click here would open it, a server a teammate moved held back as here.
+  const opener = useRef({ openServers, servers: o.servers });
+  opener.current = { openServers, servers: o.servers };
+  useEffect(() => {
+    const open = (e: Event) => {
+      const id = (e as CustomEvent<unknown>).detail;
+      const server = opener.current.servers.find((x) => x.id === id);
+      if (server) void opener.current.openServers([server]);
+    };
+    window.addEventListener(OPEN_SERVER, open);
+    return () => window.removeEventListener(OPEN_SERVER, open);
+  }, []);
 
   return {
     open, side, setOpen,

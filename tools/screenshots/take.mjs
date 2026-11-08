@@ -179,6 +179,15 @@ Object.assign(shots, {
     await save(page, "troubleshooting", await spanning(heading, cardOf(page.getByRole("button", { name: /Copy diagnostics/i })), 12));
   },
 
+  // The AI asking for a server by name, on its card in the AI panel.
+  async "ai-server-ask"() {
+    const page = await open({ "mock-server-ask": "1" });
+    await page.getByRole("button", { name: "AI panel" }).click();
+    const card = page.getByText("asks to use").locator("xpath=ancestor::div[contains(@class, 'rounded-xl')][1]");
+    await card.waitFor();
+    await save(page, "ai-server-ask", await around(card, 12));
+  },
+
   // The Profile panel, syncing through a git repository of your own.
   async "own-storage-sync"() {
     const page = await open({}, { width: 1000, height: 1200 });

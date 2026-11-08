@@ -54,6 +54,11 @@ const aiState = {
   enabled: true,
   audit_log: "ai-audit.log",
   tabs: [{ id: "ai-1", label: "Claude Code", servers: [aiServer(byId(1)), aiServer(byId(2)), aiServer(byId(3))], intruder_at: null }],
+  // The AI asking for a server by name (ai-server-ask.png): with
+  // `mock-server-ask` in localStorage.
+  server_asks: localStorage.getItem("mock-server-ask")
+    ? [{ id: 21, tab_id: "ai-1", tab_label: "Claude Code", asked: "staging-api", server_id: 5, server_name: "staging-api", many: false, asked_at: ago(0) }]
+    : [],
   pending: [
     pending(11, byId(1), { command: groupCmd, group }),
     pending(12, byId(2), { command: groupCmd, group }),
