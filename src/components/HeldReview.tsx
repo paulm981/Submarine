@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { ShieldAlert, X } from "lucide-react";
 import { useFocusTrap } from "../ui/confirm";
+import { heldMay } from "../util/ai";
 
 // What this device holds back until its user allows it: a change someone else
 // made in a shared profile that would act on its own here, or what a profile
@@ -71,13 +72,7 @@ function describe(item: string, server: HeldServer): { what: string; detail?: st
   if (move) {
     const what = move.moved ? (move.moved_folder ? `the folder ${move.moved}` : move.moved) : "this server";
     const where = move.into ? `into ${move.into}` : "to the top level";
-    const may = move.level >= 3
-      ? "the AI may run anything without asking"
-      : move.change === "added"
-        ? "the AI may run your allowed commands without asking"
-        : move.allow > 0
-        ? `the AI may run ${move.allow} more allowed command${move.allow === 1 ? "" : "s"} without asking`
-        : "the AI may do more without asking";
+    const may = heldMay(move);
     const lost = move.lost.length > 0 ? `, and ${move.lost.map((r) => `“${r}”`).join(", ")} no longer always ${move.lost.length === 1 ? "asks" : "ask"}` : "";
     if (move.change === "pointed") {
       return {
