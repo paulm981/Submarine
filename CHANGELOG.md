@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.58
+
+- **Typing with Broadcast on to many servers sends each key once.** Every key you type went to the app's backend once per server: 36 servers, 36 calls for each key. Now each key goes once, to all of them together, in order, so typing keeps up on Windows. ([#127](https://github.com/paulm981/Submarine/issues/127))
+
 ## v0.4.0-fork.57
 
 - **Open terminal here.** Right-click a folder in SFTP to open a terminal in it: on the server, a new terminal that goes to that folder; on your computer, a Home terminal that starts there. ([#72](https://github.com/paulm981/Submarine/issues/72))
