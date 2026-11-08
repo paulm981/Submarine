@@ -124,6 +124,72 @@ const shots = {
   },
 };
 
+// The box around two elements and what's between them, with some room.
+const spanning = async (from, to, pad = 16) => {
+  const a = await from.boundingBox();
+  const b = await to.boundingBox();
+  const x = Math.min(a.x, b.x) - pad, y = Math.min(a.y, b.y) - pad;
+  return { x: Math.max(0, x), y: Math.max(0, y), width: Math.max(a.x + a.width, b.x + b.width) - x + pad, height: Math.max(a.y + a.height, b.y + b.height) - y + pad };
+};
+
+// The settings card a heading or text is in.
+const cardOf = (locator) => locator.locator("xpath=ancestor::div[contains(@class, 'rounded-2xl')][1]");
+
+Object.assign(shots, {
+  // The session tree beside a terminal whose output is highlighted.
+  async "highlighting-and-tree"() {
+    const page = await open({ "submarine-session-tree-open": "1", "submarine-session-tree-expanded-demo": "[1,2]" });
+    await page.getByRole("button", { name: "web2" }).first().click();
+    await page.getByText("CRITICAL").first().waitFor();
+    await save(page, "highlighting-and-tree");
+  },
+
+  // Home's shell menu: the login shell as the default, and the others.
+  async "home-shells"() {
+    const page = await open();
+    await page.getByRole("button", { name: "Home" }).first().click();
+    await page.getByTitle("Choose a shell").first().click();
+    await page.getByText("your login shell").waitFor();
+    await save(page, "home-shells", { x: 0, y: 0, width: 800, height: 420 });
+  },
+
+  // Settings › Terminal: the color schemes and their preview.
+  async "color-schemes"() {
+    const page = await open({}, { width: 1400, height: 1700 });
+    await page.getByTitle("Settings").first().click();
+    await page.getByRole("tab", { name: "Terminal" }).click();
+    await save(page, "color-schemes", await spanning(page.getByText("Colors", { exact: true }), page.getByRole("button", { name: "Use my own scheme…" })));
+  },
+
+  // Settings › Terminal: syntax highlighting.
+  async "highlight-settings"() {
+    const page = await open({}, { width: 1400, height: 2600 });
+    await page.getByTitle("Settings").first().click();
+    await page.getByRole("tab", { name: "Terminal" }).click();
+    const card = cardOf(page.getByText("Highlighting", { exact: true }).first());
+    await save(page, "highlight-settings", await around(card, 8));
+  },
+
+  // Settings › Help: Troubleshooting.
+  async troubleshooting() {
+    const page = await open();
+    await page.getByTitle("Settings").first().click();
+    await page.getByRole("tab", { name: "Help" }).click();
+    const heading = page.getByText("Troubleshooting", { exact: true });
+    await save(page, "troubleshooting", await spanning(heading, cardOf(page.getByRole("button", { name: /Copy diagnostics/i })), 12));
+  },
+
+  // The Profile panel, syncing through a git repository of your own.
+  async "own-storage-sync"() {
+    const page = await open({}, { width: 1000, height: 1200 });
+    await page.getByTitle(/^Profile/).first().click();
+    const sync = page.getByRole("button", { name: /Sync now/ });
+    await sync.click();
+    await page.getByText(/Last synced/).waitFor();
+    await save(page, "own-storage-sync", await spanning(page.getByText("git@git.example.com:team/submarine-profiles.git").first(), page.getByText("Computers syncing this profile").locator("xpath=..")));
+  },
+});
+
 const wanted = process.argv.slice(2);
 try {
   for (const [name, take] of Object.entries(shots)) {

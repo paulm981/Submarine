@@ -11,7 +11,7 @@ It needs the app's `npm ci` and Playwright with Chromium (`require("playwright")
 
 - `vite.config.mjs`: the app's own Vite config, with `mocks.js` loaded before `src/main.tsx`.
 - `mocks.js`: the canned answers. A call with none returns null, and `take.mjs` lists those calls after each picture.
-- `take.mjs`: opens the page at 1400×900 (2× pixels), clicks to each screen, and saves the picture.
+- `take.mjs`: opens the page at 1400×900 (2× pixels, larger where a screen needs it), clicks to each screen, and saves the picture. Every picture in `docs/screenshots/fork/` comes from here: a change to what the app shows retakes its pictures in the same pull request (CLAUDE.md).
 
 ## Timing many terminals (#127)
 

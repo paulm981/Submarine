@@ -200,13 +200,13 @@ Two more things wait for you:
       <br/><sub><b>Color schemes</b>: Campbell, One Half, Solarized, Dracula, Nord, Tokyo Night, Catppuccin, Gruvbox, with a preview, or one of your own from Windows Terminal. A server can have its own, and it syncs with it.</sub>
     </td>
     <td width="50%" valign="top" align="center">
-      <img src="docs/screenshots/fork/highlight-settings.png" alt="Syntax highlighting settings: sets, a preview, and a rule of your own" />
+      <img src="docs/screenshots/fork/highlight-settings.png" alt="Syntax highlighting settings: the sets, a preview, a box to try your own output, and your own rules" />
       <br/><sub><b>Syntax highlighting</b>: errors, warnings, OK, addresses, links and dates colored in the output. There are sets for shell scripts, network devices and SQL, a set per server, and rules of your own that sync with your profile.</sub>
     </td>
   </tr>
 </table>
 
-<img src="docs/screenshots/fork/home-shells.png" alt="The Home view's shell menu: the login shell marked as default, and the other installed shells" width="600" />
+<img src="docs/screenshots/fork/home-shells.png" alt="The Home view's shell menu: the login shell marked as default, the other installed shells, and the AI tools, Claude Code and Codex" width="600" />
 
 **A Home view** of terminals on your own computer:
 
