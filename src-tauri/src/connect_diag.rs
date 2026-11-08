@@ -7,6 +7,31 @@
 
 use crate::*;
 
+/// A saved port as one a connection can use. The form only takes 1 to 65535,
+/// but a synced or imported server may carry anything, and a plain cast would
+/// quietly dial another port.
+pub(crate) fn valid_port(port: i32) -> Result<u16, String> {
+    u16::try_from(port).map_err(|_| format!("Port {port} isn't a valid port"))
+}
+
+impl ConfigTarget {
+    /// A jump host as `connect_jump_host` reaches it, for the connect, the
+    /// check under a failed one and the monitor alike: its saved port
+    /// checked, `~/.ssh/config` applied, and the ProxyCommand or ProxyJump
+    /// the config gives it (a jump host is reached without its own proxy
+    /// setting, so the config's has nothing to give way to).
+    pub(crate) async fn resolve_jump_host(
+        host: &str,
+        port: i32,
+        user: &str,
+        name: Option<String>,
+    ) -> Result<(Self, Option<ssh_config::Proxy>), String> {
+        let mut target = Self::resolve(host, valid_port(port)?, user, name).await;
+        let proxy = target.proxy(None);
+        Ok((target, proxy))
+    }
+}
+
 /// How a connection reaches its target. Chosen in one place for the connect
 /// and for the check under a failed one (`diagnose_connect`), so the check
 /// looks at what the connect dials.
@@ -191,6 +216,15 @@ mod connect_route_tests {
     }
 
     #[test]
+    fn a_port_out_of_range_is_refused_not_cast() {
+        assert_eq!(valid_port(22), Ok(22));
+        assert_eq!(valid_port(65535), Ok(65535));
+        // 65558 as u16 would have dialled port 22.
+        assert_eq!(valid_port(65558), Err("Port 65558 isn't a valid port".to_string()));
+        assert_eq!(valid_port(-1), Err("Port -1 isn't a valid port".to_string()));
+    }
+
+    #[test]
     fn a_proxy_without_a_port_takes_the_usual_one() {
         let socks = connect_route(None, "socks5", Some("p".into()), None, &mut target(None));
         assert_eq!(socks, ConnectRoute::Proxy { socks5: true, host: Some("p".into()), port: 1080 });
@@ -246,6 +280,9 @@ mod hook_tests {
                 ("", "use connect_diag::*;", 1),
                 ("initiate_connection", "connect_route(", 1),
                 ("run", "diagnose_connect", 1),
+                ("initiate_connection", "valid_port(port)?", 1),
+                ("resolve_node_auth_row", "valid_port(port)?", 1),
+                ("connect_jump_host", "ConfigTarget::resolve_jump_host(", 1),
             ],
         );
     }

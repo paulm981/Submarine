@@ -464,7 +464,7 @@ pub fn allow(conn: &Connection, uuid: &str, items: &[String]) -> Result<usize, S
         .filter(|i| items.is_empty() || items.contains(i))
         .find_map(|i| HeldSwitch::parse(i));
     if let Some(switch) = switch {
-        crate::with_merge_flag(conn, |c| apply_switch(c, uuid, &switch))?;
+        crate::sync_merge::with_merge_flag(conn, |c| apply_switch(c, uuid, &switch))?;
     }
     if items.is_empty() {
         return conn

@@ -17,7 +17,7 @@ pub(crate) fn clean_scheme_id(raw: &str) -> Option<String> {
 /// NULL_IS_UNKNOWN). `None`, the app's default, is stored as "": a NULL
 /// there means "not known here", which isn't sent to the other devices.
 pub(crate) fn set_server_look(conn: &Connection, column: &str, id: i32, value: Option<&str>) -> rusqlite::Result<usize> {
-    debug_assert!(NULL_IS_UNKNOWN.contains(&column));
+    debug_assert!(crate::sync_merge::NULL_IS_UNKNOWN.contains(&column));
     let value = value.and_then(clean_scheme_id).unwrap_or_default();
     // No write when nothing changed: every save of the edit panel calls this,
     // and an UPDATE would restamp the row for sync even with the same value.

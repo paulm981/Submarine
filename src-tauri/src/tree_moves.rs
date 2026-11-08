@@ -142,7 +142,7 @@ pub(crate) fn unlink_jump_hosts(conn: &Connection, servers: &[i64]) -> Result<()
     for id in servers {
         crate::jump_gone::note_behind(conn, *id)?;
     }
-    crate::with_merge_flag(conn, |c| {
+    crate::sync_merge::with_merge_flag(conn, |c| {
         let mut stmt =
             c.prepare("UPDATE servers SET jump_host_id = NULL WHERE jump_host_id = ?1").map_err(db("JUMP_UNLINK_FAILED"))?;
         for id in servers {

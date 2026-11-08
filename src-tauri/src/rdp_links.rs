@@ -210,7 +210,7 @@ mod tests {
         // The older device takes what comes back by the merge alone, moving
         // nothing, as an older version does.
         let back = crate::collect_local_records(&new, &KEY, "").unwrap();
-        crate::with_merge_flag(&old, |c| crate::apply_remote_inner(c, &KEY, &back, &ho, usize::MAX)).unwrap();
+        crate::sync_merge::with_merge_flag(&old, |c| crate::apply_remote_inner(c, &KEY, &back, &ho, usize::MAX)).unwrap();
         assert_eq!(count(&old, "SELECT COUNT(*) FROM rdp_links"), 0, "the link's deletion reached it");
         assert_eq!(count(&old, "SELECT COUNT(*) FROM servers WHERE protocol='rdp'"), 1, "and the server");
 
