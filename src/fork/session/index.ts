@@ -8,3 +8,4 @@ export * from "./split";
 export * from "./parts";
 // Fork modules SessionView renders directly, through the same import.
 export { KeptSessions } from "../../components/KeptSessions";
+export { TerminalTurn } from "../terminal/turns";
