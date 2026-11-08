@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, Dispatch, MutableRefObject, SetStateAction } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { skipIfKept } from "../../components/KeptSessions";
+import { withCdHere } from "../terminal/here";
 import { useIsNarrow } from "../../hooks/useViewport";
 import { launchAiTool } from "../../ui/aiPane";
 import type { ConfirmOptions } from "../../ui/confirm";
@@ -87,7 +88,8 @@ export const useOnConnect = ({ session, terminals, connectionEpoch, confirmRef, 
     .split(/\r?\n/)
     .map((l: string) => l.trimEnd())
     .filter((l: string) => l.trim().length > 0);
-  return (terminalId: string) => {
+  return (terminalId: string) => withCdHere(terminalId, onConnectFor(terminalId));
+  function onConnectFor(terminalId: string) {
     const container = terminals.find(t => t.id === terminalId)?.container;
     const gets = terminalId === startupTerminalId || (!!session.runOnConnectEvery && !container);
     return gets && startupCommands.length > 0

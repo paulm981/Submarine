@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { claimGpu, gpuChanged, gpuSlotsInUse, MAX_GPU, releaseGpu, type GpuHolder } from "../../src/ui/gpuSlots";
 import { reorderById } from "../../src/ui/tabDrag";
 import { hasVisibleText } from "../../src/ui/terminalActivity";
+import { cdLine } from "../../src/fork/terminal/here";
 import { MOST_PER_FRAME, nextTurns, QUICK_FRAME_MS, SLOW_FRAME_MS } from "../../src/fork/terminal/turns";
 import { clearWidths, MAX_WIDTHS, sharedMeasure, widthKey } from "../../src/fork/terminal/widthCache";
 
@@ -129,5 +130,20 @@ describe("character widths shared by every terminal (#127)", () => {
     measured = 0;
     measure.call(cache(), "c0", 0);
     expect(measured).toBe(1);
+  });
+});
+
+describe("Open terminal here (#72)", () => {
+  it("goes to a server's folder, quoted", () => {
+    expect(cdLine("/var/log")).toBe("cd '/var/log'");
+    expect(cdLine("/srv/my app")).toBe("cd '/srv/my app'");
+    expect(cdLine("/srv/it's")).toBe("cd '/srv/it'\\''s'");
+    expect(cdLine("/srv/$(reboot);x`y`")).toBe("cd '/srv/$(reboot);x`y`'");
+  });
+
+  it("isn't offered where a shell could read the name as more", () => {
+    for (const path of ["relative", "/a\nreboot", "/a\rb", "/a\u001b[31m", "/a\u0085b", "/x!rm", "/a\\b", "/C:/Users", "/" + "x".repeat(5000)]) {
+      expect(cdLine(path), path).toBeNull();
+    }
   });
 });

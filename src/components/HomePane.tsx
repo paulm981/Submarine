@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
+import { useHomeHere } from "../fork/terminal/here";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { Bot, ChevronDown, Plus, TerminalSquare, X } from "lucide-react";
 import TerminalView from "./TerminalView";
@@ -53,6 +54,9 @@ interface HomeTab {
   shell: string | null;
   label: string;
   ended: boolean;
+  /** The folder it starts in ("Open terminal here", #72); its shell's own
+   *  otherwise. */
+  cwd?: string;
 }
 
 const newId = () => `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -70,14 +74,16 @@ export const HomePane = ({ visible, onLiveShells }: { visible: boolean; onLiveSh
   const loadShells = () =>
     invoke<LocalShells>("list_local_shells").then(setShells).catch(() => setShells(null));
 
-  const openShell = (shell: string | null, ask?: { id: string; label: string }) => {
+  const openShell = (shell: string | null, ask?: { id: string; label: string }, cwd?: string) => {
     const known = shell ? [...(shells?.shells ?? []), ...(shells?.ai_tools ?? [])].find((s) => s.id === shell) : undefined;
     const label = known?.label ?? ask?.label ?? "Terminal";
     const id = ask?.id ?? newId();
-    setTabs((prev) => [...prev, { id, shell, label, ended: false }]);
+    setTabs((prev) => [...prev, { id, shell, label, ended: false, cwd }]);
     setActive(id);
     setMenu(null);
   };
+  // "Open terminal here" on a folder in SFTP's local pane (#72).
+  useHomeHere((cwd) => openShell(null, undefined, cwd));
 
   // AI tools started from a server tab (src/ui/aiPane.ts): each opens here
   // like one picked from the menu, and is told once it has started.
@@ -239,6 +245,7 @@ export const HomePane = ({ visible, onLiveShells }: { visible: boolean; onLiveSh
               focusSignal={focusTick}
               local={{
                 shell: t.shell,
+                cwd: t.cwd,
                 onOpened: (label) => {
                   setTabs((prev) => prev.map((x) => (x.id === t.id ? { ...x, label } : x)));
                   const started = onAiStarted.current.get(t.id);

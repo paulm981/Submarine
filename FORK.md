@@ -166,6 +166,7 @@ The AI's root requests use it too, with a password of their own, kept for the AI
 
 ### Files
 
+- **Open terminal here.** Right-click a folder in SFTP: in the server pane, a new terminal opens on that server and goes to the folder (`cd '…'`, typed once its shell is ready); in the local pane, a Home terminal starts in it ([#72](https://github.com/paulm981/Submarine/issues/72)). A folder whose name holds a control character, `!` or `\` isn't offered on a server, as a shell could read it as more than a name, nor is a Windows server's folder yet. In SFTP root mode the terminal is your login's, not root's.
 - **Live Edit keeps your unsent changes.** If a copy on this computer has changes that never reached the server, it's kept in **Submarine unsent edits** in your Downloads folder when you open the file again, disconnect, lock the profile or quit. The window says so. On macOS and Linux, only you can read that folder.
 - **Live Edit opens a file in an editor and never runs it:** the one picked under Live Edit in **Settings › General**, or else Notepad on Windows, the default text editor on macOS, and on Linux the text editor set for plain text.
 - **Downloads never replace each other.** If a file of the same name appears while a download runs, you're asked before it's replaced. In a folder download it's left as it was, and the card says how many. On Windows and macOS, which treat `Readme.md` and `README.md` as one name, the second of two such files is left out too, rather than replacing the first.

@@ -55,7 +55,7 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
     ],
   },
   { file: "src/components/DockerTab.tsx", imports: ["../ui/rootInvoke", "../util/infoFont"] },
-  { file: "src/components/FilePanel.tsx", imports: ["../util/fileName"] },
+  { file: "src/components/FilePanel.tsx", imports: ["../util/fileName", "../fork/terminal/here"], uses: ["TerminalHereItem"] },
   { file: "src/components/HeldReview.tsx", imports: ["../util/ai"] },
   { file: "src/components/InfoPanel.tsx", imports: ["../ui/rootInvoke", "../util/infoFont"] },
   {
@@ -88,7 +88,7 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
       "Fork.termCloseLook", "Fork.paneLook", "Fork.TermTabLabel", "Fork.SplitButton", "Fork.ShareWithAiButton",
       "Fork.SplitBesideItems", "Fork.AiBesideItems", "Fork.KeptSessions", "Fork.TermMoveItems", "Fork.ShareWithAiMenu",
       "Fork.JumpGoneChoices", "jumpGone.refused", "jumpGone.clear", "split.closeTerminal", "split.splitWithNew",
-      "split.splitWith", "split.removeFromSplit", "onShellReadyFor", "Fork.TerminalTurn",
+      "split.splitWith", "split.removeFromSplit", "onShellReadyFor", "Fork.TerminalTurn", "Fork.TerminalHereListener",
     ],
   },
   { file: "src/components/SettingsPanel.tsx", imports: ["./settings"] },

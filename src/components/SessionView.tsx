@@ -1954,6 +1954,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
       )}
 
       <Fork.KeptSessions session={session} terminals={terminals} openTerminal={(id: string) => { setTerminals(prev => [...prev, { id, title: nextTerminalNumber(prev) }]); setActiveTab(id); }} />
+      <Fork.TerminalHereListener sessionId={session.id} openTerminal={(id: string) => { setTerminals(prev => [...prev, { id, title: nextTerminalNumber(prev) }]); setActiveTab(id); }} />
       {/* A terminal tab's menu: its name, edited in place. Enter keeps it
           (an empty one brings back the tab's first title), Esc goes back
           to the menu. */}

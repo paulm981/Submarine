@@ -8,6 +8,7 @@ import { reorderById, useTabDrag } from "../../ui/tabDrag";
 import { appHotkey } from "../../ui/terminalDock";
 import { setServerSchemes } from "../../ui/terminalThemes";
 import { OPEN_SERVER } from "../../util/ai";
+import { HOME_HERE } from "../terminal/here";
 import { logLine } from "../../util/diagnostics";
 import { visibleName } from "../../util/fileName";
 import { folderTree } from "../../util/folderTree";
@@ -431,7 +432,13 @@ export const useSessionTree = (o: {
       if (server) void opener.current.openServers([server]);
     };
     window.addEventListener(OPEN_SERVER, open);
-    return () => window.removeEventListener(OPEN_SERVER, open);
+    // "Open terminal here" on a local folder (#72): Home, where it opens.
+    const home = () => o.setActiveView("home");
+    window.addEventListener(HOME_HERE, home);
+    return () => {
+      window.removeEventListener(OPEN_SERVER, open);
+      window.removeEventListener(HOME_HERE, home);
+    };
   }, []);
 
   return {
