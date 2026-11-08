@@ -347,23 +347,164 @@ async fn a_partial_line_is_held_back_and_a_split_secret_still_hidden() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A private key whose block a read ends inside stays hidden in the next
-/// reads, up to its END line.
+/// A private key whose block a read ends inside is held back until its END
+/// line, then filtered whole.
 #[tokio::test(start_paused = true)]
 async fn a_private_key_split_across_reads_stays_hidden() {
     let (s, fake, dir) = state(trust::RUN_ANYTHING);
     let id = start(&s, "journalctl -f").await;
     let feed = fake.feed(0);
     feed.push(b"before\n-----BEGIN OPENSSH PRIVATE KEY-----\nAAAAsecretpartone\n");
-    let (_, one) = parts(read(&s, &id).await);
-    assert!(one.starts_with("before\n") && !one.contains("secretpartone"), "{one}");
+    let (ours, one) = parts(read(&s, &id).await);
+    assert_eq!(one, "before\n");
+    assert!(ours.contains("held back until it ends"), "{ours}");
     feed.push(b"BBBBsecretparttwo\n");
     let (_, two) = parts(read(&s, &id).await);
-    assert!(!two.contains("secretparttwo"), "{two}");
+    assert_eq!(two, "");
     feed.push(b"CCCCsecretpartthree\n-----END OPENSSH PRIVATE KEY-----\nafter\n");
     let (_, three) = parts(read(&s, &id).await);
     assert_eq!(three, format!("{}\nafter\n", filter::HIDDEN));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The three kinds of block, each with its secret lines, in some output.
+fn blocks() -> Vec<(&'static str, String, Vec<String>)> {
+    use base64::Engine;
+    let pem_body = ["b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW", "QyNTUxOQAAACBsecretpemlinetwoAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"];
+    let pem = format!("-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n{}\n-----END OPENSSH PRIVATE KEY-----\n", pem_body[0], pem_body[1]);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("-----BEGIN RSA PRIVATE KEY-----\nMIIEsecretb64keymaterial{}\n-----END RSA PRIVATE KEY-----\n", "Q".repeat(120)));
+    let wrapped: Vec<String> = encoded.as_bytes().chunks(64).map(|c| String::from_utf8_lossy(c).into_owned()).collect();
+    let b64 = format!("tls.key: {}\n", wrapped.join("\n"));
+    let putty = "PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: none\nComment: me@host\nPublic-Lines: 1\nAAAAC3NzaC1lZDI1NTE5AAAAIpublicpart\nPrivate-Lines: 1\nAAAAIPrivatePartSECRETxyz0123456789\nPrivate-MAC: 0123abcd\n";
+    vec![
+        ("pem", pem, pem_body.iter().map(|l| l.to_string()).collect()),
+        ("base64", b64, wrapped),
+        ("putty", putty.to_string(), vec!["AAAAIPrivatePartSECRETxyz0123456789".to_string()]),
+    ]
+}
+
+/// Each kind of block, split at every line and in the middle of every line
+/// across two reads: none of its secret lines reach the AI, and the output
+/// around it does.
+#[tokio::test(start_paused = true)]
+async fn a_key_block_split_anywhere_never_reaches_the_ai() {
+    for (kind, block, secrets) in blocks() {
+        let text = format!("before\n{block}after\n");
+        let mut points: Vec<usize> = Vec::new();
+        for (i, c) in text.char_indices() {
+            if c == '\n' {
+                points.push(i + 1);
+            }
+        }
+        let starts: Vec<usize> = std::iter::once(0).chain(points.iter().copied()).collect();
+        for w in starts.windows(2) {
+            points.push((w[0] + w[1]) / 2);
+        }
+        // Right after the start marker, and inside the base64 marker.
+        points.push(text.find("-----\n").map_or(10, |i| i + 6));
+        points.push(text.find("LS0tLS1C").map_or(12, |i| i + 5));
+        points.sort();
+        points.dedup();
+        points.retain(|p| *p > 0 && *p < text.len());
+        for split in points {
+            let (s, fake, dir) = state(trust::RUN_ANYTHING);
+            let id = start(&s, "journalctl -f").await;
+            let feed = fake.feed(0);
+            let mut got = String::new();
+            feed.push(&text.as_bytes()[..split]);
+            got.push_str(&parts(read(&s, &id).await).1);
+            got.push_str(&parts(read(&s, &id).await).1);
+            feed.push(&text.as_bytes()[split..]);
+            got.push_str(&parts(read(&s, &id).await).1);
+            for secret in &secrets {
+                assert!(!got.contains(secret.as_str()), "{kind} split at {split}: {secret} in {got:?}");
+            }
+            // (Each read's closing tag goes on a line of its own.)
+            let joined = got.replace('\n', "");
+            assert!(joined.starts_with("before") && joined.ends_with("after"), "{kind} split at {split}: {got:?}");
+            assert!(got.contains(filter::HIDDEN), "{kind} split at {split}: {got:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// A block that doesn't end is held back up to the ring's size, then given
+/// hidden, and so is the rest of it after; what follows it comes through.
+#[tokio::test(start_paused = true)]
+async fn an_unfinished_block_held_past_the_ring_comes_out_hidden() {
+    let (s, fake, dir) = state(trust::RUN_ANYTHING);
+    let id = start(&s, "journalctl -f").await;
+    let feed = fake.feed(0);
+    feed.push(b"before\n-----BEGIN RSA PRIVATE KEY-----\n");
+    let mut got = String::new();
+    let mut hidden_said = false;
+    // 400 KB of key lines, a read's worth at a time: past the ring before
+    // its END line comes.
+    for _ in 0..400 {
+        feed.push(format!("{}\n", "K".repeat(1023)).as_bytes());
+        if feed.lock().ring.len >= READ_MAX {
+            let (ours, printed) = parts(read(&s, &id).await);
+            hidden_said |= ours.contains("Submarine hid");
+            got.push_str(&printed);
+        }
+    }
+    feed.push(b"KKKK\n-----END RSA PRIVATE KEY-----\nafter\n");
+    loop {
+        let (ours, printed) = parts(read(&s, &id).await);
+        got.push_str(&printed);
+        if !ours.contains("More is waiting") {
+            break;
+        }
+    }
+    assert!(hidden_said, "hidden before its end came");
+    assert!(!got.contains("KKKK"), "{}", &got[..got.len().min(300)]);
+    assert!(got.starts_with("before\n") && got.ends_with("after\n"), "{got:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A block still held when the follow ends comes out hidden.
+#[tokio::test(start_paused = true)]
+async fn a_block_held_when_the_follow_ends_comes_out_hidden() {
+    for block in ["-----BEGIN EC PRIVATE KEY-----\nSECRETline1\nSECRETline2", "key: LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQ\nU0VDUkVUc2VjcmV0U0VDUkVU\n", "PuTTY-User-Key-File-3: ssh-rsa\nPrivate-Lines: 1\nSECRETprivate\n"] {
+        let (s, fake, dir) = state(trust::RUN_ANYTHING);
+        let id = start(&s, "journalctl -f").await;
+        let feed = fake.feed(0);
+        feed.push(format!("before\n{block}").as_bytes());
+        let (_, one) = parts(read(&s, &id).await);
+        assert_eq!(one, "before\n", "{block}");
+        fake.exit(0, 0);
+        until_ended(&feed).await;
+        let (ours, last) = parts(read(&s, &id).await);
+        assert!(ours.starts_with("Ended: exit code 0."), "{ours}");
+        assert_eq!(last.trim_end(), filter::HIDDEN, "{block}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A line still coming that may be a block's first line isn't given after a
+/// quiet wait, as a prompt is: a marker split there would let the block by.
+#[tokio::test(start_paused = true)]
+async fn a_line_that_may_start_a_block_waits_for_its_end() {
+    let (s, fake, dir) = state(trust::RUN_ANYTHING);
+    let id = start(&s, "journalctl -f").await;
+    let feed = fake.feed(0);
+    feed.push(b"-----BEGIN OPENSSH PRIV");
+    assert_eq!(parts(read(&s, &id).await).1, "");
+    assert_eq!(parts(read(&s, &id).await).1, "");
+    feed.push(b"ATE KEY-----\nSECRETbody\n-----END OPENSSH PRIVATE KEY-----\nok\n");
+    let got = parts(read(&s, &id).await).1;
+    assert_eq!(got, format!("{}\nok\n", filter::HIDDEN));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hints_of_a_block_start() {
+    for yes in [&b"x -----BEGIN"[..], b"abc --", b"key: LS0", b"PuT", b"--"] {
+        assert!(may_start_block(yes), "{}", String::from_utf8_lossy(yes));
+    }
+    for no in [&b"Continue? "[..], b"progress 42%", b"a - b"] {
+        assert!(!may_start_block(no), "{}", String::from_utf8_lossy(no));
+    }
 }
 
 // -- Limits and ids -------------------------------------------------------------
@@ -552,5 +693,30 @@ async fn withdrawn_while_it_waits_it_never_starts() {
     cancel_tx.send(true).unwrap();
     assert!(req.await.unwrap().is_error);
     assert_eq!(fake.count(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An ended follow nobody reads to the end goes UNREAD after it ended:
+/// its slot is free again, and the log says so once.
+#[tokio::test(start_paused = true)]
+async fn an_ended_follow_nobody_reads_is_removed() {
+    let (s, fake, dir) = state(trust::RUN_ANYTHING);
+    let id = start(&s, "journalctl -f").await;
+    fake.feed(0).push(b"never read\n");
+    tokio::time::sleep(Duration::from_secs(10 * 60)).await;
+    fake.exit(0, 0);
+    until_ended(&fake.feed(0)).await;
+    // Still there just short of UNREAD after it ended, though it last
+    // started a read longer ago than that.
+    tokio::time::sleep(UNREAD - Duration::from_secs(60)).await;
+    assert!(s.follow_of("local-1", &id).is_some());
+    assert_eq!(open_in(&s.lock(), "local-1"), 1);
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert!(s.follow_of("local-1", &id).is_none());
+    assert_eq!(open_in(&s.lock(), "local-1"), 0);
+    assert!(read(&s, &id).await.text.starts_with("No follow with that id"));
+    let removed: Vec<Value> = audit_lines(&dir).into_iter().filter(|l| l["event"] == "follow_removed").collect();
+    assert_eq!(removed.len(), 1, "{removed:?}");
+    assert!(removed[0]["note"].as_str().unwrap().contains("not read to the end"));
     let _ = std::fs::remove_dir_all(&dir);
 }

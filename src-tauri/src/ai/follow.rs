@@ -17,12 +17,14 @@
 //!   since the last. A read gives at most READ_MAX, waits at most READ_WAIT
 //!   for something new, and only one read of a follow waits at a time.
 //! - **Filtered whole lines at a time.** A read gives whole lines: a line
-//!   still coming is held back (never more than RING) until a later read
-//!   finds it ended, or one hears nothing new for READ_WAIT, or the follow
-//!   ends. So a secret split between two pieces of output is filtered whole.
-//!   A private key block a read ends inside is hidden in the next reads up
-//!   to its END line. Then it's marked as the server's (boundary.rs), after
-//!   Submarine's own lines.
+//!   still coming is held back until a later read finds it ended, or one
+//!   hears nothing new for READ_WAIT (unless it may be a key's first line),
+//!   or the follow ends. So a secret split between two pieces of output is
+//!   filtered whole. A secret of several lines (a private key block, the
+//!   same in base64, a PuTTY key: `Block`) is held back from its first line
+//!   until it ends, and filtered whole; held past RING, or when the follow
+//!   ends, it's given as [hidden by Submarine], never in clear. Then it's
+//!   marked as the server's (boundary.rs), after Submarine's own lines.
 //! - **Ends** with stop_follow, Stop in the AI panel, UNREAD without a read,
 //!   LIFE, the command ending, or access ending (the server unshared, the AI
 //!   tab closed, AI tools turned off): while it runs it's a running request,
@@ -30,13 +32,14 @@
 //! - **Ids** are 128 random bits (boundary::fresh_id), looked up only in the
 //!   asking AI tab's own list. An AI tab has at most MAX_FOLLOWS open,
 //!   counting those that ended and weren't read to the end; after the last
-//!   read, the id is gone.
+//!   read, the id is gone, and an ended one nobody reads to the end goes
+//!   UNREAD after it ended (logged).
 //! - **Logged** once as it's allowed and once as it ends; the AI panel
 //!   shows it while it runs, with Stop.
 
 use super::boundary::ServerText;
 use super::*;
-use regex::Regex;
+use regex::bytes::Regex as BytesRegex;
 use serde_json::Value;
 use std::sync::LazyLock;
 use tokio::sync::Notify;
@@ -323,8 +326,12 @@ impl Feed {
         self.lock().why
     }
 
+    /// It ended: the wait for its last read starts now.
     fn end(&self, ending: Ending) {
-        self.lock().end = Some(ending);
+        let mut st = self.lock();
+        st.end = Some(ending);
+        st.last_read = tokio::time::Instant::now();
+        drop(st);
         self.news.notify_one();
     }
 
@@ -357,10 +364,12 @@ impl Feed {
 /// What the reads of one follow carry from one to the next.
 #[derive(Default)]
 struct Reader {
-    /// A line still coming, held back. Wiped when dropped.
+    /// A line still coming, or a key block not finished yet, held back.
+    /// Wiped when dropped.
     carry: Zeroizing<Vec<u8>>,
-    /// The last read ended inside a private key block.
-    in_key: bool,
+    /// A key block held back past RING was given hidden: the rest of it is
+    /// hidden too, up to its end.
+    hiding: Option<Block>,
 }
 
 /// A follow in its AI tab's list (Tab::follows).
@@ -394,44 +403,160 @@ pub(super) fn running_view(r: &Running) -> RunningView {
     v
 }
 
-static KEY_BEGIN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----").expect("key rule"));
-static KEY_END: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----").expect("key rule"));
-
-/// What a read gives, filtered.
-struct Screened {
-    text: Zeroizing<String>,
-    hidden: usize,
-    /// It ends inside a private key block.
-    in_key: bool,
+/// A secret that takes several lines: a private key block (PEM, OpenSSH,
+/// PGP), the same in base64 (as Kubernetes secrets hold it), or a PuTTY key
+/// file. A read never gives one in pieces: it's held back until it ends,
+/// then filtered whole, or given hidden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Block {
+    Pem,
+    Base64,
+    Putty,
 }
 
-/// `bytes` (whole lines) through the filter, `in_key` saying the last read
-/// ended inside a private key block: all of it up to the block's END line
-/// is hidden too.
-fn screen(bytes: &[u8], in_key: bool) -> Screened {
-    let text = Zeroizing::new(String::from_utf8_lossy(bytes).into_owned());
-    let mut out = Zeroizing::new(String::new());
-    let mut hidden = 0;
-    let mut rest: &str = &text;
-    if in_key && !rest.is_empty() {
-        hidden += 1;
-        out.push_str(filter::HIDDEN);
-        match KEY_END.find(rest) {
-            Some(m) => rest = &rest[m.end()..],
-            None => {
-                if rest.ends_with('\n') {
-                    out.push('\n');
+static PEM_BEGIN: LazyLock<BytesRegex> = LazyLock::new(|| BytesRegex::new(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----").expect("key rule"));
+static PEM_END: LazyLock<BytesRegex> = LazyLock::new(|| BytesRegex::new(r"-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----").expect("key rule"));
+/// "-----BEGIN" in base64, as filter.rs looks for it.
+static B64_BEGIN: LazyLock<BytesRegex> = LazyLock::new(|| BytesRegex::new(r"LS0tLS1CRUdJTi").expect("key rule"));
+/// A wrapped line of it, as filter.rs takes one.
+static B64_LINE: LazyLock<BytesRegex> = LazyLock::new(|| BytesRegex::new(r"^[A-Za-z0-9+/]{16,}={0,2}\r?$").expect("key rule"));
+static PUTTY_BEGIN: LazyLock<BytesRegex> = LazyLock::new(|| BytesRegex::new(r"PuTTY-User-Key-File-").expect("key rule"));
+static PUTTY_END: LazyLock<BytesRegex> = LazyLock::new(|| BytesRegex::new(r"Private-MAC:").expect("key rule"));
+
+/// What the start of a block can look like, in part: a line still coming
+/// that holds one of these, or ends with the start of one, isn't given
+/// before its line ends, as it may be a block's first line.
+static BLOCK_HINTS: [&[u8]; 3] = [b"-----", b"LS0t", b"PuTTY"];
+
+fn line_end(text: &[u8], from: usize) -> Option<usize> {
+    text[from..].iter().position(|c| *c == b'\n').map(|i| from + i + 1)
+}
+
+/// Where a block of `kind` ends in `text`, looking from `from` (the end of
+/// its start, or 0 for the rest of one): after its END line's marker, its
+/// `Private-MAC:` line, or (base64) before the first whole line that isn't
+/// base64 after its first line (`first_line`: `from` is on it). None: not
+/// in `text`.
+fn block_end(kind: Block, text: &[u8], from: usize, first_line: bool) -> Option<usize> {
+    match kind {
+        Block::Pem => PEM_END.find_at(text, from).map(|m| m.end()),
+        Block::Putty => line_end(text, PUTTY_END.find_at(text, from)?.end()),
+        Block::Base64 => {
+            let mut at = if first_line { line_end(text, from)? } else { from };
+            loop {
+                let next = line_end(text, at)?;
+                if !B64_LINE.is_match(&text[at..next - 1]) {
+                    return Some(at);
                 }
-                return Screened { text: out, hidden, in_key };
+                at = next;
             }
         }
     }
-    let f = filter::filter(rest);
-    out.push_str(&f.text);
+}
+
+/// The first block in `text` from `from` that doesn't end in it: where it
+/// starts, and what it is.
+fn unfinished(text: &[u8], from: usize) -> Option<(usize, Block)> {
+    let mut first: Option<(usize, Block)> = None;
+    for (kind, start) in [(Block::Pem, &*PEM_BEGIN), (Block::Base64, &*B64_BEGIN), (Block::Putty, &*PUTTY_BEGIN)] {
+        for m in start.find_iter(&text[from..]) {
+            let at = from + m.start();
+            if first.is_some_and(|(f, _)| f <= at) {
+                break;
+            }
+            if block_end(kind, text, from + m.end(), kind == Block::Base64).is_none() {
+                first = Some((at, kind));
+                break;
+            }
+        }
+    }
+    first
+}
+
+/// A line still coming that may be (or become) a block's first line.
+fn may_start_block(partial: &[u8]) -> bool {
+    BLOCK_HINTS.iter().any(|h| partial.windows(h.len()).any(|w| w == *h) || (1..h.len()).any(|k| partial.ends_with(&h[..k])))
+}
+
+/// What a read gives, filtered, and what it holds back for the next.
+struct Prepared {
+    text: Zeroizing<String>,
+    hidden: usize,
+    carry: Zeroizing<Vec<u8>>,
+    hiding: Option<Block>,
+    /// A key block is held back, waiting for its end.
+    holding: bool,
+}
+
+/// `buf` (what was held back, then what's new) as a read gives it:
+/// everything before `cut` (whole lines, or all of it when `last` or after
+/// a quiet wait), less any key block that doesn't end there, which is held
+/// back from its first line; through the filter, a block whole. A block
+/// held past RING, or when the follow has ended (`last`), is given as
+/// [hidden by Submarine], and (past RING) the rest of it after it too
+/// (`hiding`), never in clear.
+fn prepare(buf: &[u8], mut cut: usize, last: bool, mut hiding: Option<Block>) -> Prepared {
+    let mut hidden = 0;
+    // The rest of a block given hidden before.
+    let mut hide_to = 0;
+    if let Some(kind) = hiding {
+        match block_end(kind, &buf[..cut], 0, false) {
+            Some(end) => {
+                hide_to = end;
+                hiding = None;
+            }
+            None => hide_to = cut,
+        }
+    }
+    // A block that doesn't end in what's to be given: held back from the
+    // start of its line.
+    let mut holding = None;
+    if hiding.is_none() {
+        if let Some((start, kind)) = unfinished(&buf[..cut], hide_to) {
+            cut = buf[..start].iter().rposition(|c| *c == b'\n').map_or(0, |i| i + 1).max(hide_to);
+            holding = Some(kind);
+        }
+    }
+    let mut hide_held = false;
+    if let Some(kind) = holding {
+        if last || buf.len() - cut > RING {
+            hide_held = true;
+            hiding = (!last).then_some(kind);
+            holding = None;
+        }
+    } else if buf.len() - cut > RING {
+        // A line longer than the ring: given as it is (shortened below).
+        cut = buf.len();
+        if hiding.is_some() {
+            hide_to = cut;
+        }
+    }
+    let mut text = Zeroizing::new(String::new());
+    let hidden_part = |text: &mut String, part: &[u8]| {
+        text.push_str(filter::HIDDEN);
+        if part.ends_with(b"\n") {
+            text.push('\n');
+        }
+    };
+    if hide_to > 0 {
+        hidden += 1;
+        hidden_part(&mut text, &buf[..hide_to]);
+    }
+    let plain = Zeroizing::new(String::from_utf8_lossy(&buf[hide_to..cut]).into_owned());
+    let f = filter::filter(&plain);
+    text.push_str(&f.text);
     hidden += f.hidden;
-    let begin = KEY_BEGIN.find_iter(rest).last().map(|m| m.start());
-    let end = KEY_END.find_iter(rest).last().map(|m| m.start());
-    Screened { text: out, hidden, in_key: begin.is_some_and(|b| end.is_none_or(|e| e < b)) }
+    let carry = if hide_held {
+        hidden += 1;
+        hidden_part(&mut text, &buf[cut..]);
+        Zeroizing::new(Vec::new())
+    } else {
+        Zeroizing::new(buf[cut..].to_vec())
+    };
+    if text.len() > READ_MAX {
+        text = Zeroizing::new(shorten_for_ai(&text));
+    }
+    Prepared { text, hidden, carry, hiding, holding: holding.is_some() }
 }
 
 fn unknown_id() -> ToolResult {
@@ -554,17 +679,20 @@ impl AiState {
         // whatever happens to the call that started it.
         let task = tokio::spawn(follower(req.session_id.clone(), req.command.clone(), LIFE, stop_rx, feed.clone()));
         let me = self.clone();
-        tokio::spawn(async move { me.watch_follow(req, ran_without_asking, feed, task, stop_tx).await });
+        tokio::spawn(async move { me.watch_follow(req, id, ran_without_asking, feed, task, stop_tx).await });
         self.changed();
         ToolResult::ok(said)
     }
 
     /// While a follow runs: stopped after UNREAD without a read, the panel
     /// told every PANEL_TICK that it saw more; once it ends, how it ended
-    /// goes to its feed (for the last read), the log and the history.
+    /// goes to its feed (for the last read), the log and the history. Ended
+    /// and not read to the end for UNREAD, it's taken off its AI tab's list,
+    /// with what it still held.
     async fn watch_follow(
         &self,
         req: Req,
+        id: String,
         ran_without_asking: Option<String>,
         feed: Arc<Feed>,
         mut task: tokio::task::JoinHandle<Result<exec::Exec, String>>,
@@ -611,6 +739,33 @@ impl AiState {
         feed.end(ending.clone());
         drop(stop_tx);
         self.finish(&req, ran_without_asking, &ending, Some(&feed));
+        // Held only weakly from here: read to the end (or its AI tab gone),
+        // its buffer goes at once.
+        let feed = Arc::downgrade(&feed);
+        loop {
+            let Some(at) = feed.upgrade().map(|f| f.last_read() + UNREAD) else { return };
+            tokio::time::sleep_until(at).await;
+            let Some(f) = feed.upgrade() else { return };
+            if f.last_read() + UNREAD > tokio::time::Instant::now() {
+                continue;
+            }
+            let removed = {
+                let mut s = self.lock();
+                let tab = s.tabs.iter_mut().find(|t| t.id == req.tab_id);
+                tab.is_some_and(|t| {
+                    let before = t.follows.len();
+                    t.follows.retain(|e| e.id != id);
+                    before != t.follows.len()
+                })
+            };
+            if removed {
+                let mut e = req.entry("follow_removed");
+                e.note = Some(format!("ended and not read to the end for {} minutes: what it still held was dropped", UNREAD.as_secs() / 60));
+                self.audit(e);
+                self.changed();
+            }
+            return;
+        }
     }
 
     /// A follow's end: off the running list, its "finished" line in the
@@ -717,28 +872,17 @@ impl AiState {
         }
         buf.extend_from_slice(&taken.bytes);
         let last = taken.end.is_some() && !taken.more;
-        let whole = last || (quiet && taken.bytes.is_empty());
-        let mut cut = if whole { buf.len() } else { buf.iter().rposition(|c| matches!(c, b'\n' | b'\r')).map_or(0, |i| i + 1) };
-        // Never more held back than the ring holds.
-        if buf.len() - cut > RING {
-            cut = buf.len();
-        }
-        reader.carry = Zeroizing::new(buf[cut..].to_vec());
-        buf.truncate(cut);
-        let in_key = reader.in_key;
-        // A line longer than the ring, given at once, is shortened in the
-        // middle as a command's output is.
-        let read = tokio::task::spawn_blocking(move || {
-            let mut screened = screen(&buf, in_key);
-            if screened.text.len() > READ_MAX {
-                screened.text = Zeroizing::new(shorten_for_ai(&screened.text));
-            }
-            screened
-        });
-        let Ok(screened) = read.await else {
+        // After a wait with nothing new, a line still coming is given too,
+        // unless it may be the first line of a key block.
+        let quiet = quiet && taken.bytes.is_empty() && !may_start_block(&buf);
+        let cut = if last || quiet { buf.len() } else { buf.iter().rposition(|c| matches!(c, b'\n' | b'\r')).map_or(0, |i| i + 1) };
+        let hiding = reader.hiding;
+        let read = tokio::task::spawn_blocking(move || prepare(&buf, cut, last, hiding));
+        let Ok(mut screened) = read.await else {
             return ToolResult::err("Submarine couldn't filter the output, so it isn't given.");
         };
-        reader.in_key = screened.in_key;
+        reader.carry = std::mem::take(&mut screened.carry);
+        reader.hiding = screened.hiding;
         feed.count(screened.text.len(), screened.hidden);
         if last {
             self.remove_follow(tab_id, id);
@@ -763,6 +907,9 @@ impl AiState {
                 if screened.hidden == 1 { "" } else { "s" },
                 filter::HIDDEN
             ));
+        }
+        if screened.holding {
+            head.push_str("Output that looks like a private key is held back until it ends; then it's given filtered.\n");
         }
         if screened.text.is_empty() && taken.end.is_none() {
             head.push_str("Nothing new.");
