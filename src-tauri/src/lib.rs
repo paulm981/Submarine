@@ -32,29 +32,12 @@ mod fonts;
 mod webkit_sandbox;
 mod sftp_listing;
 mod sftp_remove;
-mod local_open;
-mod host_import;
-mod rdp_links;
-mod highlight;
-mod server_os;
-mod local_term;
-mod tree_moves;
-mod multiexec;
-mod store_sync;
 mod shell_sftp;
-mod remote_sh;
 mod archive;
 mod approvals;
 mod agent_auth;
 mod ssh_config;
-mod applog;
-mod term_output;
 mod proxy_command;
-mod diagnose;
-mod jump_gone;
-mod ping;
-mod hop_policy;
-mod ai;
 mod child_env;
 mod open_policy;
 mod known_hosts;
@@ -64,44 +47,28 @@ mod rdp_client;
 mod rdp_share;
 mod term_filter;
 mod vault_backup;
-mod trust_policy;
-mod secret_policy;
-// Root over SSH (sudo / dzdo), the fork's own: root_ssh.rs. Its macro
-// (`root_tool_find!`) is used here too.
+// The fork's own modules, each in a file of its own (#136, #163).
+mod local_open; mod host_import; mod rdp_links; mod highlight; mod server_os; mod local_term; mod tree_moves; mod multiexec; mod store_sync;
+mod remote_sh; mod applog; mod term_output; mod diagnose; mod jump_gone; mod ping; mod hop_policy; mod ai; mod trust_policy; mod secret_policy;
+// Root over SSH (sudo / dzdo): root_ssh.rs. Its macro (`root_tool_find!`) is
+// used here too.
 #[macro_use]
 mod root_ssh;
 use root_ssh::*;
-// More of the fork's own, each in a file of its own (#136).
-mod live_edit;
-use live_edit::*;
-mod connect_diag;
-use connect_diag::*;
-mod downloads;
-use downloads::*;
-mod session_import;
-use session_import::*;
-mod firewall;
-use firewall::*;
-mod remote_writes;
-use remote_writes::*;
-mod diagnostics;
-use diagnostics::*;
-mod synced_tunnels;
-use synced_tunnels::*;
-mod sync_diff;
-use sync_diff::*;
-mod server_look;
-use server_look::*;
-mod clone_server;
-use clone_server::*;
-mod keep_session;
-mod bulk_pick;
-mod vault_schema;
-mod sync_merge;
-mod profile_create;
+mod live_edit; use live_edit::*;
+mod connect_diag; use connect_diag::*;
+mod downloads; use downloads::*;
+mod session_import; use session_import::*;
+mod firewall; use firewall::*;
+mod remote_writes; use remote_writes::*;
+mod diagnostics; use diagnostics::*;
+mod synced_tunnels; use synced_tunnels::*;
+mod sync_diff; use sync_diff::*;
+mod server_look; use server_look::*;
+mod clone_server; use clone_server::*;
+mod keep_session; mod bulk_pick; mod vault_schema; mod sync_merge; mod profile_create; mod clipboard_read;
 #[cfg(windows)]
 mod windows_clipboard;
-mod clipboard_read;
 #[cfg(test)]
 mod fork_hooks;
 #[cfg(target_os = "android")]
