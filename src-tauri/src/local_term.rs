@@ -904,29 +904,34 @@ pub async fn local_terminal_open(
     app: tauri::AppHandle,
     terms: tauri::State<'_, LocalTerms>,
     terminal_id: String,
-    shell: Option<String>,
+    start: StartAt,
     cols: u16,
     rows: u16,
     on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Result<String, String> {
     #[cfg(target_os = "android")]
     {
-        let _ = (&app, &terms, terminal_id, shell, cols, rows, on_output);
+        let _ = (&app, &terms, terminal_id, start, cols, rows, on_output);
         Err("Local terminals aren't available on Android.".into())
     }
     #[cfg(not(target_os = "android"))]
     {
         let terms = terms.inner().clone();
+        let StartAt { shell, cwd } = start;
         tauri::async_runtime::spawn_blocking(move || {
             if let Some(tool) = shell.as_deref().filter(|id| id.starts_with("ai:")) {
                 return open_ai_tool(&app, &terms, &terminal_id, tool, cols, rows, on_output);
             }
             let config = read_config(&app);
-            let chosen = match shell {
+            let mut chosen = match shell {
                 Some(id) => find_shell(&config, &id),
                 None => default_shell(&config),
             }
             .ok_or("That shell isn't on this computer.")?;
+            // "Open terminal here" (#72): a folder on this computer to start in.
+            if let Some(dir) = cwd {
+                chosen.cwd = Some(start_folder(&dir)?);
+            }
             pty::open(&app, &terms, &terminal_id, &chosen, cols, rows, on_output)?;
             Ok(chosen.label)
         })
@@ -960,6 +965,30 @@ fn open_ai_tool(
         return Err(e);
     }
     Ok(label)
+}
+
+/// What a Home terminal starts: a shell from the list (None: the default),
+/// and the folder it starts in ("Open terminal here", #72; None: the
+/// shell's own).
+#[derive(serde::Deserialize, Debug, Default)]
+pub struct StartAt {
+    pub shell: Option<String>,
+    pub cwd: Option<String>,
+}
+
+/// A folder a Home terminal is asked to start in (#72), checked: an
+/// absolute path, not too long, with no NUL, that is a folder now.
+#[cfg(not(target_os = "android"))]
+pub(crate) fn start_folder(dir: &str) -> Result<PathBuf, String> {
+    const MAX_PATH: usize = 4096;
+    let path = PathBuf::from(dir);
+    if dir.len() > MAX_PATH || dir.contains('\0') || !path.is_absolute() {
+        return Err("That isn't a folder on this computer.".into());
+    }
+    match std::fs::metadata(&path) {
+        Ok(m) if m.is_dir() => Ok(path),
+        _ => Err(format!("{dir} isn't a folder on this computer any more.")),
+    }
 }
 
 /// Where a shell starts: an AI tool in its own folder, the rest in your
@@ -1047,6 +1076,22 @@ pub async fn local_terminal_close(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "Open terminal here" (#72): only a folder that is one, now.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn a_start_folder_must_be_a_folder() {
+        let dir = std::env::temp_dir();
+        assert_eq!(start_folder(dir.to_str().unwrap()).unwrap(), dir);
+        let file = dir.join("submarine-start-folder-test.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(start_folder(file.to_str().unwrap()).is_err(), "a file");
+        let _ = std::fs::remove_file(&file);
+        for bad in ["relative/dir", "", "/no/such/folder/here", "/tmp/a\0b"] {
+            assert!(start_folder(bad).is_err(), "{bad:?}");
+        }
+        assert!(start_folder(&format!("/{}", "x".repeat(5000))).is_err());
+    }
 
     #[test]
     fn wsl_list_is_utf16_and_skips_docker() {

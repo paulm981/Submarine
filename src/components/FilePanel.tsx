@@ -17,6 +17,7 @@ import { localDir, localJoin, pathCrumbs } from "../fs/localPath";
 import { COMPARE_LABEL, CompareMark, compareListings } from "../fs/compare";
 import { useConfirm, useOverwritePrompt, OverwriteChoice } from "../ui/confirm";
 import { visibleName } from "../util/fileName";
+import { TerminalHereItem } from "../fork/terminal/here";
 import { IS_ANDROID, IS_IOS, IS_MOBILE, IS_WINDOWS } from "../util/platform";
 import { nameFilterMatcher } from "../util/nameFilter";
 import { BOOKMARKS_MAX, readBookmarks, writeBookmarks } from "../util/sftpBookmarks";
@@ -2531,6 +2532,7 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
               <Folder size={11} className="text-indigo-400" /><span>Open</span>
             </button>
           )}
+          {!multi && contextMenu.entry.isDir && <TerminalHereItem path={contextMenu.entry.path} sessionId={isRemote ? sessionId : undefined} done={() => setContextMenu(null)} />}
           {!multi && !contextMenu.entry.isDir && !isRemote && !IS_MOBILE && (
             <button onClick={() => { setContextMenu(null); openLocalEntry(contextMenu.entry); }}
               className="w-full flex items-center gap-2 p-1.5 rounded hover:bg-white/10 text-left hover:text-white">

@@ -25,7 +25,7 @@ export type TerminalProps = {
   /// the label of the shell that started. A local terminal is never pinned
   /// to the Wall or broadcast to, and keeps no command history — it isn't a
   /// server session. An AI tab's can be moved into the AI side pane.
-  local?: { shell: string | null; onOpened?: (label: string) => void; onFailed?: () => void };
+  local?: { shell: string | null; cwd?: string; onOpened?: (label: string) => void; onFailed?: () => void };
   /// Called each time this terminal's SSH shell has been opened (first
   /// connect and every reconnect) and has printed what it prints on login,
   /// so typed-in commands land at its prompt (SessionView's run-on-connect).
