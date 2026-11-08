@@ -31,6 +31,12 @@ const servers = [
   server(4, "build", "203.0.113.5", null, { os: "rocky" }),
   server(5, "staging-api", "203.0.113.40", 2),
 ];
+// For timing many terminals at once (perf.mjs): `mock-servers` in
+// localStorage adds that many more servers, each opening by itself.
+const extra = Number(localStorage.getItem("mock-servers") ?? 0);
+for (let i = 0; i < Math.min(extra, 200); i++) {
+  servers.push(server(100 + i, `node${String(i + 1).padStart(2, "0")}`, `198.51.100.${(i % 250) + 1}`, 2, { autostart: true }));
+}
 const byId = (id) => servers.find((s) => s.id === id);
 const sessionServer = (sid) => byId(Number(String(sid).replace(/^session-/, "").split("::")[0]));
 

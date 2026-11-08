@@ -5,6 +5,8 @@ import { describe, expect, it } from "vitest";
 import { claimGpu, gpuChanged, gpuSlotsInUse, MAX_GPU, releaseGpu, type GpuHolder } from "../../src/ui/gpuSlots";
 import { reorderById } from "../../src/ui/tabDrag";
 import { hasVisibleText } from "../../src/ui/terminalActivity";
+import { MOST_PER_FRAME, nextTurns, QUICK_FRAME_MS, SLOW_FRAME_MS } from "../../src/fork/terminal/turns";
+import { clearWidths, MAX_WIDTHS, sharedMeasure, widthKey } from "../../src/fork/terminal/widthCache";
 
 describe("hasVisibleText", () => {
   it("ignores control codes: colours, a title change, cursor moves", () => {
@@ -71,5 +73,61 @@ describe("gpuSlots", () => {
     expect(late.retried).toBe(1);
     for (const h of [...held, late, next]) releaseGpu(h);
     expect(gpuSlotsInUse()).toEqual({ holding: 0, waiting: 0 });
+  });
+});
+
+describe("terminals opened a few at a time (#127)", () => {
+  it("halves the turns after a slow frame and adds one after a quick one, within bounds", () => {
+    expect(nextTurns(4, SLOW_FRAME_MS + 1)).toBe(2);
+    expect(nextTurns(1, 500)).toBe(1);
+    expect(nextTurns(2, QUICK_FRAME_MS - 1)).toBe(3);
+    expect(nextTurns(MOST_PER_FRAME, 1)).toBe(MOST_PER_FRAME);
+    expect(nextTurns(3, (SLOW_FRAME_MS + QUICK_FRAME_MS) / 2)).toBe(3);
+  });
+});
+
+describe("character widths shared by every terminal (#127)", () => {
+  const cache = (over: Partial<{ _font: string; _fontSize: number; _weight: string; _weightBold: string }> = {}) =>
+    ({ _font: "mono", _fontSize: 14, _weight: "normal", _weightBold: "bold", ...over });
+  (globalThis as { window?: unknown }).window = { devicePixelRatio: 1 };
+
+  it("measures a character once for every terminal in the same font", () => {
+    clearWidths();
+    let measured = 0;
+    const measure = sharedMeasure(() => { measured++; return 8.4; });
+    expect(measure.call(cache(), "W", 0)).toBe(8.4);
+    expect(measure.call(cache(), "W", 0)).toBe(8.4);
+    expect(measured).toBe(1);
+    // Another size, weight or style is measured on its own.
+    measure.call(cache({ _fontSize: 16 }), "W", 0);
+    measure.call(cache(), "W", 1);
+    measure.call(cache(), "W", 2);
+    expect(measured).toBe(4);
+  });
+
+  it("keeps no width of 0, from a terminal that isn't shown", () => {
+    clearWidths();
+    let width = 0;
+    const measure = sharedMeasure(() => width);
+    expect(measure.call(cache(), "x", 0)).toBe(0);
+    width = 7;
+    expect(measure.call(cache(), "x", 0)).toBe(7);
+  });
+
+  it("tells bold from regular by the cache's own weights, and italic apart", () => {
+    const c = cache({ _weight: "400", _weightBold: "700" });
+    expect(widthKey(c, "a", 0, 1)).not.toBe(widthKey(c, "a", 1, 1));
+    expect(widthKey(c, "a", 1, 1)).not.toBe(widthKey(c, "a", 3, 1));
+    expect(widthKey(c, "a", 0, 1)).not.toBe(widthKey(c, "a", 0, 2));
+  });
+
+  it("starts again past its limit rather than growing", () => {
+    clearWidths();
+    let measured = 0;
+    const measure = sharedMeasure(() => { measured++; return 1; });
+    for (let i = 0; i <= MAX_WIDTHS; i++) measure.call(cache(), `c${i}`, 0);
+    measured = 0;
+    measure.call(cache(), "c0", 0);
+    expect(measured).toBe(1);
   });
 });

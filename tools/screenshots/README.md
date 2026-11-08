@@ -12,3 +12,11 @@ It needs the app's `npm ci` and Playwright with Chromium (`require("playwright")
 - `vite.config.mjs`: the app's own Vite config, with `mocks.js` loaded before `src/main.tsx`.
 - `mocks.js`: the canned answers. A call with none returns null, and `take.mjs` lists those calls after each picture.
 - `take.mjs`: opens the page at 1400×900 (2× pixels), clicks to each screen, and saves the picture.
+
+## Timing many terminals (#127)
+
+```sh
+node tools/screenshots/perf.mjs [servers=36]
+```
+
+The same page and mocks, with that many more servers opening by themselves (`mock-servers` in localStorage). It opens them, pins each to the Wall, switches between the Wall and a tab, turns Broadcast on and closes every tab, and prints, for each step, how long the page was busy in long tasks (50 ms or more) and the longest one. `PROFILE=1` adds where the time went when the Wall opens; `SHOT=<file>.png` saves the Wall and a tab. The numbers are this machine's headless Chromium, not a user's webview: compare a run before a change with one after, on the same machine.

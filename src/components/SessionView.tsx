@@ -2159,6 +2159,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                 }`}
                 {...Fork.paneLook(inSplit, inView, isFocused)}
               >
+                <Fork.TerminalTurn now={isActiveView}>
                 <TerminalView
                   sessionId={session.id}
                   terminalId={t.id}
@@ -2177,6 +2178,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                   quickAuth={session.quickAuth}
                   onFolder={t.container ? undefined : onTerminalFolder}
                 />
+                </Fork.TerminalTurn>
                 {/* Per-pane detach affordance — pulls the pane out of
                     the split without killing the underlying terminal.
                     Positioned top-right so it doesn't fight the

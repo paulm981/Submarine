@@ -8,6 +8,7 @@ export * from "./hooks";
 export * from "./parts";
 // Fork modules DesktopApp renders or reads directly, through the same import.
 export { AiTrustModal } from "../../components/AiTrust";
+export { TerminalTurn } from "../terminal/turns";
 export { default as PingPanel } from "../../components/PingPanel";
 // Bulk push and pull (#159): the dialog, and its items in a tab's menu.
 export { BulkTransfer } from "../bulk/BulkDialog";

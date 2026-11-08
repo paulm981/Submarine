@@ -15,6 +15,7 @@ import { withoutPasteControls } from '../../util/pasteText';
 import { IS_WINDOWS } from '../../util/platform';
 import type { TerminalFork, TerminalProps } from './hooks';
 import { CHAR_BUDGET, COUNTED_FINALS, LINE_BUDGET, LINE_FINALS, ROOT_CANCELLED, SHELL_QUIET_MS } from './rules';
+import { shareWidths } from './widthCache';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The fork's part of a terminal's xterm, from TerminalView's mount effect
@@ -251,8 +252,10 @@ export const mountTerminal = (
   let unwatch: (() => void) | null = null;
 
   return {
-    /** Once xterm is open: the GPU, as Settings and the screen allow. */
+    /** Once xterm is open: the GPU, as Settings and the screen allow; and
+     *  the DOM renderer's character widths shared with every terminal's. */
     startGpu: () => {
+      shareWidths(term);
       fork.gpuUpdateRef.current = updateGpu;
       updateGpu();
     },
@@ -401,6 +404,10 @@ export const mountTerminal = (
       webgl?.dispose();
       releaseGpu(gpuSlot);
       fork.gpuUpdateRef.current = () => {};
+      // TerminalView scrolls to the bottom two frames after a resize, and
+      // keeps xtermRef after xterm has gone: one that opened and closed in
+      // between (a Wall left while its tiles still open, #127) would throw.
+      term.scrollToBottom = () => {};
     },
     /** After xterm has gone: the div it drew into, and terminalRef back to
      *  TerminalView's own. */

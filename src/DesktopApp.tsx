@@ -2524,6 +2524,7 @@ function DesktopApp() {
                             {sessionStatuses[item.sessionId] === 'connected' ? (
                               <div className="flex-1 min-h-0 relative">
                                 <ErrorBoundary label={tabLabel(sess)}>
+                                  <Fork.TerminalTurn>
                                   <TerminalView
                                     sessionId={item.sessionId}
                                     terminalId={item.terminalId}
@@ -2533,6 +2534,7 @@ function DesktopApp() {
                                     serverId={sess.serverId}
                                     serverName={sess.serverName}
                                   />
+                                  </Fork.TerminalTurn>
                                 </ErrorBoundary>
                               </div>
                             ) : (
