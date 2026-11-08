@@ -57,6 +57,7 @@ mod filter;
 mod follow;
 pub mod helper;
 mod mcp;
+mod read_only;
 pub(crate) mod tools;
 pub(crate) mod trust;
 
@@ -2730,11 +2731,13 @@ fn with_vault<T>(db: &crate::DbState, f: impl FnOnce(&rusqlite::Connection) -> R
     f(conn)
 }
 
-const LEVEL_NAMES: [&str; 3] = ["ask every time", "run my allowed commands, ask for the rest", "run anything, just log it"];
+/// Each level's name for the audit log, by its stored number less one.
+const LEVEL_NAMES: [&str; 4] =
+    ["ask every time", "run my allowed commands, ask for the rest", "run anything, just log it", "run commands that only read, ask before changes"];
 
 fn level_name(level: Option<u8>) -> &'static str {
     match level {
-        Some(l @ 1..=3) => LEVEL_NAMES[l as usize - 1],
+        Some(l @ 1..=4) => LEVEL_NAMES[l as usize - 1],
         _ => "follows its folder or the default",
     }
 }

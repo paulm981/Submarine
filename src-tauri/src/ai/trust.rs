@@ -1,8 +1,11 @@
 //! Approval levels and rules (#115): how much the AI may run on a server
 //! without asking you.
 //!
-//! - **Three levels:** 1 asks every time (the default), 2 runs the commands
-//!   you've allowed and asks for the rest, 3 runs anything and logs it.
+//! - **Four levels** (`Level`): asks every time (the default), runs the
+//!   commands you've allowed and asks for the rest, also runs the commands
+//!   that only read (#190, read_only.rs), and runs anything and logs it.
+//!   Stored as 1, 2, 4 and 3: the read-only level came last, and an older
+//!   Submarine reads a 4 as "Ask every time", the safe way to fail.
 //! - **Set on a server, a folder or as the default.** A server's own level
 //!   wins, then the nearest folder above it that has one, then the default,
 //!   then 1.
@@ -26,6 +29,38 @@ use std::sync::LazyLock;
 pub(crate) const ASK_EVERY_TIME: u8 = 1;
 pub(crate) const ALLOWED_COMMANDS: u8 = 2;
 pub(crate) const RUN_ANYTHING: u8 = 3;
+/// "Run commands that only read, ask before changes" (#190).
+pub(crate) const READ_ONLY: u8 = 4;
+
+/// A level, least allowed first: the order a change is "more" in
+/// (`loosened`). The vault keeps its number (`stored`), which isn't that
+/// order: the read-only level is 4, between 2 and 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Level {
+    AskEveryTime,
+    AllowedCommands,
+    ReadOnly,
+    Anything,
+}
+
+impl Level {
+    /// The level a stored number is; None for one that isn't a level.
+    pub(crate) fn stored(n: u8) -> Option<Level> {
+        match n {
+            ASK_EVERY_TIME => Some(Level::AskEveryTime),
+            ALLOWED_COMMANDS => Some(Level::AllowedCommands),
+            READ_ONLY => Some(Level::ReadOnly),
+            RUN_ANYTHING => Some(Level::Anything),
+            _ => None,
+        }
+    }
+
+    /// The level a stored number is, or "Ask every time" for one that
+    /// isn't a level.
+    pub(crate) fn of(n: u8) -> Level {
+        Level::stored(n).unwrap_or(Level::AskEveryTime)
+    }
+}
 
 /// What a rule may be at most, in bytes.
 pub(crate) const MAX_RULE: usize = 1024;
@@ -759,6 +794,9 @@ pub(crate) enum Decision {
     Rule(String),
     /// It runs now: the server is at "Run anything".
     Anything,
+    /// It runs now: the server is at "Run commands that only read", and it
+    /// only reads (read_only.rs).
+    ReadOnly,
     /// It runs now: you allowed everything on this server until the AI tab
     /// closes.
     Session,
@@ -772,6 +810,7 @@ impl Decision {
             Decision::Ask { .. } => None,
             Decision::Rule(r) => Some(format!("rule: {r}")),
             Decision::Anything => Some("level: run anything".into()),
+            Decision::ReadOnly => Some("level: only reads".into()),
             Decision::Session => Some("session: allow everything".into()),
         }
     }
@@ -783,9 +822,12 @@ impl Decision {
 /// - "Allow everything here until this AI tab closes" (`session_allow`)
 ///   runs the rest, as level 3 does.
 /// - A policy that couldn't be read, or is on hold, asks.
-/// - At level 2, a command that asks for root (asks_for_root: sudo, dzdo,
-///   su, doas, pkexec and the like) asks; otherwise an allow rule that
-///   matches runs it.
+/// - At "Run my allowed commands" and "Run commands that only read", a
+///   command that asks for root (asks_for_root: sudo, dzdo, su, doas,
+///   pkexec and the like) asks; otherwise an allow rule that matches runs
+///   it.
+/// - At "Run commands that only read", a command that only reads runs
+///   (read_only::only_reads), except on a Windows server.
 /// - Anything else asks.
 ///
 /// The app decides through decide_parsed, with the command read once.
@@ -818,12 +860,19 @@ pub(crate) fn decide_parsed(policy: &Policy, session_allow: bool, command: &Pars
     if policy.force_ask.is_some() {
         return Decision::Ask { rule: None };
     }
-    if session_allow || policy.level == RUN_ANYTHING {
-        return if session_allow { Decision::Session } else { Decision::Anything };
+    if session_allow {
+        return Decision::Session;
     }
-    if policy.level == ALLOWED_COMMANDS && !command.root && !as_root {
+    let level = Level::of(policy.level);
+    if level == Level::Anything {
+        return Decision::Anything;
+    }
+    if level >= Level::AllowedCommands && !command.root && !as_root {
         if let Some(rule) = policy.allow.iter().find(|r| allow_matches_on(r, &command.command, policy.windows)) {
             return Decision::Rule(rule.clone());
+        }
+        if level == Level::ReadOnly && !policy.windows && super::read_only::only_reads(&command.command) {
+            return Decision::ReadOnly;
         }
     }
     Decision::Ask { rule: None }
@@ -834,12 +883,14 @@ pub(crate) fn decide_parsed(policy: &Policy, session_allow: bool, command: &Pars
 /// decide_parsed and copy::decision do, and never says less asking than
 /// they would: settings that can't be read or are held (`force_ask`) ask
 /// each time, "allow everything here" (`allow_all`) runs anything, and
-/// level 2 with no allow rules asks each time. The always-ask list and
-/// root still ask where they do, which list_shared's description says.
+/// level 2 with no allow rules asks each time, and so does the read-only
+/// level on a Windows server with none. The always-ask list and root still
+/// ask where they do, which list_shared's description says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Requests {
     AskEachTime,
     AllowedCommands,
+    ReadOnly,
     Anything,
 }
 
@@ -847,9 +898,11 @@ impl Requests {
     pub(crate) fn of(policy: &Policy, allow_all: bool) -> Requests {
         if policy.force_ask.is_some() {
             Requests::AskEachTime
-        } else if allow_all || policy.level == RUN_ANYTHING {
+        } else if allow_all || Level::of(policy.level) == Level::Anything {
             Requests::Anything
-        } else if policy.level == ALLOWED_COMMANDS && !policy.allow.is_empty() {
+        } else if Level::of(policy.level) == Level::ReadOnly && !policy.windows {
+            Requests::ReadOnly
+        } else if Level::of(policy.level) >= Level::AllowedCommands && !policy.allow.is_empty() {
             Requests::AllowedCommands
         } else {
             Requests::AskEachTime
@@ -861,6 +914,7 @@ impl Requests {
         match self {
             Requests::AskEachTime => "asks the user each time",
             Requests::AllowedCommands => "runs the user's allowed commands, asks for the rest",
+            Requests::ReadOnly => "runs commands that only read and the user's allowed commands, asks for the rest",
             Requests::Anything => "runs anything",
         }
     }
@@ -905,7 +959,7 @@ pub(crate) fn check_rule(kind: &str, pattern: &str) -> Result<String, String> {
 pub(crate) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ai_levels (
     scope TEXT NOT NULL CHECK (scope IN ('server', 'folder', 'default')),
     scope_id INTEGER NOT NULL,
-    level INTEGER NOT NULL CHECK (level BETWEEN 1 AND 3),
+    level INTEGER NOT NULL CHECK (level BETWEEN 1 AND 4),
     PRIMARY KEY (scope, scope_id)
 );
 CREATE TABLE IF NOT EXISTS ai_rules (
@@ -987,8 +1041,8 @@ pub(crate) fn create_schema(conn: &Connection, install: &str) -> Result<bool, St
         .optional()
         .map_err(db("AI_TRUST_SCHEMA"))?
         .is_some();
+    let mut changed = had && widen_levels(conn)?;
     conn.execute_batch(SCHEMA).map_err(db("AI_TRUST_SCHEMA"))?;
-    let mut changed = false;
     if !had {
         seed_defaults(conn)?;
         changed = true;
@@ -1016,6 +1070,36 @@ pub(crate) fn create_schema(conn: &Connection, install: &str) -> Result<bool, St
         params![DEVICE_KEY, install],
     )
     .map_err(db("AI_TRUST_DEVICE"))?;
+    Ok(true)
+}
+
+/// A vault from before the read-only level (#190) has `ai_levels` with
+/// `level BETWEEN 1 AND 3`, which refuses a 4: the table is made again
+/// from SCHEMA, with every level kept, all or nothing. Its triggers go
+/// first, so renaming it touches none, and SCHEMA makes them again.
+/// Returns whether it did.
+fn widen_levels(conn: &Connection) -> Result<bool, String> {
+    let sql: Option<String> = conn
+        .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ai_levels'", [], |r| r.get(0))
+        .optional()
+        .map_err(db("AI_LEVELS_WIDEN"))?;
+    if !sql.is_some_and(|s| s.contains("BETWEEN 1 AND 3")) {
+        return Ok(false);
+    }
+    let steps = format!(
+        "SAVEPOINT ai_levels_widen;
+        DROP TRIGGER IF EXISTS ai_trust_server_gone;
+        DROP TRIGGER IF EXISTS ai_trust_folder_gone;
+        ALTER TABLE ai_levels RENAME TO ai_levels_narrow;
+        {SCHEMA}
+        INSERT INTO ai_levels (scope, scope_id, level) SELECT scope, scope_id, level FROM ai_levels_narrow;
+        DROP TABLE ai_levels_narrow;
+        RELEASE ai_levels_widen;"
+    );
+    if let Err(e) = conn.execute_batch(&steps) {
+        let _ = conn.execute_batch("ROLLBACK TO ai_levels_widen; RELEASE ai_levels_widen;");
+        return Err(db("AI_LEVELS_WIDEN")(e));
+    }
     Ok(true)
 }
 
@@ -1088,7 +1172,7 @@ fn try_policy(conn: &Connection, server_id: Option<i64>) -> rusqlite::Result<Pol
             if kind == "allow" { &mut p.allow } else { &mut p.ask }.push(pattern);
         }
     }
-    p.level = level.filter(|l| (1..=3).contains(l)).unwrap_or(ASK_EVERY_TIME);
+    p.level = level.filter(|l| Level::stored(*l).is_some()).unwrap_or(ASK_EVERY_TIME);
     // Read leniently: a vault without the column has no OS saved.
     p.windows = server_id.is_some_and(|id| {
         conn.query_row("SELECT os FROM servers WHERE id = ?1", [id], |r| r.get::<_, Option<String>>(0))
@@ -1263,12 +1347,14 @@ pub(crate) fn before_sync(conn: &Connection) -> Option<TreeBefore> {
 }
 
 /// Whether going from `old` to `new` lets the AI do more: a higher level,
-/// allow rules that count (at level 2 or above) it didn't have, or
-/// always-ask rules it lost. The lost ones, and how many allow rules it got.
+/// allow rules that count (at "Run my allowed commands" or above) it didn't
+/// have, or always-ask rules it lost. The lost ones, and how many allow
+/// rules it got. Levels compare in Level's order, not as stored.
 fn loosened(old: &Policy, new: &Policy) -> Option<(usize, Vec<String>)> {
-    let gained = if new.level >= ALLOWED_COMMANDS { new.allow.iter().filter(|r| !old.allow.contains(r)).count() } else { 0 };
+    let (old_level, new_level) = (Level::of(old.level), Level::of(new.level));
+    let gained = if new_level >= Level::AllowedCommands { new.allow.iter().filter(|r| !old.allow.contains(r)).count() } else { 0 };
     let lost: Vec<String> = old.ask.iter().filter(|r| !new.ask.contains(r)).cloned().collect();
-    (new.level > old.level || gained > 0 || !lost.is_empty()).then_some((gained, lost))
+    (new_level > old_level || gained > 0 || !lost.is_empty()).then_some((gained, lost))
 }
 
 fn name_of(conn: &Connection, table: &str, id: Option<i64>) -> String {
@@ -1524,13 +1610,13 @@ pub(crate) fn set_level(conn: &Connection, scope: &str, id: i64, level: Option<u
     }
     let id = if scope == "default" { 0 } else { id };
     match level {
-        Some(l) if (1..=3).contains(&l) => conn
+        Some(l) if Level::stored(l).is_some() => conn
             .execute(
                 "INSERT INTO ai_levels (scope, scope_id, level) VALUES (?1, ?2, ?3) ON CONFLICT (scope, scope_id) DO UPDATE SET level = excluded.level",
                 params![scope, id, l],
             )
             .map(|_| ()),
-        Some(_) => return Err("A level is 1, 2 or 3.".into()),
+        Some(_) => return Err("A level is 1, 2, 3 or 4.".into()),
         None => conn.execute("DELETE FROM ai_levels WHERE scope = ?1 AND scope_id = ?2", params![scope, id]).map(|_| ()),
     }
     .map_err(db("AI_LEVEL_SET"))

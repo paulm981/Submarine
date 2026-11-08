@@ -227,12 +227,22 @@ export const findAiTools = (): Promise<{ id: string; label: string }[]> =>
 export const STEERED_BY_OUTPUT =
   "Anything a server prints can steer the AI, and this runs what that text talks it into without asking you.";
 
+/// The levels as stored (src-tauri/src/ai/trust.rs, Level): "Run commands
+/// that only read" (#190) is 4, though it sits between 2 and 3.
+export const READ_ONLY_LEVEL = 4;
+
+/// The levels in the order they're shown, least allowed first.
 export const AI_LEVELS: { level: number; title: string; text: string }[] = [
   { level: 1, title: "Ask every time", text: "Every command waits for your Allow." },
   {
     level: 2,
     title: "Run my allowed commands, ask for the rest",
     text: "Commands on your allow list run straight away. Anything else waits for your Allow, and so does a command with sudo, su, doas, dzdo or pkexec, and every request to run something as root.",
+  },
+  {
+    level: READ_ONLY_LEVEL,
+    title: "Run commands that only read, ask before changes",
+    text: "Commands that only look run straight away: ls, cat, grep, ps, df, journalctl, systemctl status, docker ps and logs, and others Submarine knows only read, also joined with |. So do the commands on your allow list. Anything else waits for your Allow: changes, anything that reaches out (curl, ping), redirection, root, copies, and reading files that usually hold secrets, such as .env or .ssh. On a Windows server, only your allow list runs. Anything a server prints can still steer what the AI reads.",
   },
   {
     level: 3,
@@ -246,7 +256,36 @@ export const levelTitle = (level: number) => AI_LEVELS.find((l) => l.level === l
 /// What a shared server's tab and the AI pane say about it: nothing at
 /// "Ask every time".
 export const aiMarker = (s: Pick<AiServer, "level" | "allow_all">): string | null =>
-  s.allow_all || s.level >= 3 ? "AI: runs without asking" : s.level === 2 ? "AI: allowed commands run" : null;
+  s.allow_all || s.level === 3
+    ? "AI: runs without asking"
+    : s.level === READ_ONLY_LEVEL
+      ? "AI: read-only commands run"
+      : s.level === 2
+        ? "AI: allowed commands run"
+        : null;
+
+/// What a teammate's move held for your OK lets the AI do here, for Waiting
+/// for your OK (HeldReview.tsx; src-tauri/src/ai/trust.rs, HeldPolicy).
+export const heldMay = (move: { level: number; allow: number; change?: string }): string =>
+  move.level === 3
+    ? "the AI may run anything without asking"
+    : move.level === READ_ONLY_LEVEL
+      ? "the AI may run commands that only read without asking"
+      : move.change === "added"
+        ? "the AI may run your allowed commands without asking"
+        : move.allow > 0
+          ? `the AI may run ${move.allow} more allowed command${move.allow === 1 ? "" : "s"} without asking`
+          : "the AI may do more without asking";
+
+/// How much a share lets the AI run without asking: higher is more. A
+/// level it doesn't know counts as "Ask every time".
+const looseness = (s: Pick<AiServer, "level" | "allow_all">): number =>
+  s.allow_all ? 4 : Math.max(0, AI_LEVELS.findIndex((l) => l.level === s.level));
+
+/// Of a server's shares with AI tabs, the one that lets the AI run the most
+/// without asking; null when none runs anything without asking.
+export const loosestShare = <T extends Pick<AiServer, "level" | "allow_all">>(shares: T[]): T | null =>
+  shares.reduce<T | null>((best, s) => (looseness(s) > (best ? looseness(best) : 0) ? s : best), null);
 
 /// What the editor is for: a saved server, a folder, or every server.
 export interface AiTrustTarget { scope: "server" | "folder" | "default"; id: number; name: string }

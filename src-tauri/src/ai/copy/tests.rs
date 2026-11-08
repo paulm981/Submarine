@@ -375,6 +375,9 @@ fn a_copy_runs_without_asking_only_at_run_anything() {
     // An allow rule can't match a copy: "Run my allowed commands" asks.
     let rules = trust::Policy { level: trust::ALLOWED_COMMANDS, allow: vec!["*".into()], ..trust::Policy::default() };
     assert!(decision(&rules, false).approved_by().is_none());
+    // Nor "Run commands that only read" (#190): a folder pulled could hold
+    // keys, and what's in it is only found out as it's copied.
+    assert!(decision(&trust::Policy { allow: vec!["*".into()], ..level(trust::READ_ONLY) }, false).approved_by().is_none());
     assert_eq!(decision(&level(trust::RUN_ANYTHING), false).approved_by().as_deref(), Some("level: run anything"));
     assert_eq!(decision(&level(trust::ASK_EVERY_TIME), true).approved_by().as_deref(), Some("session: allow everything"));
     // Unreadable settings ask, whatever else holds.

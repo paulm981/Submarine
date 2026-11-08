@@ -10,7 +10,7 @@ import { SessionTree } from "../../components/SessionTree";
 import { useAiPane } from "../../ui/aiPane";
 import { titleTabClass } from "../../ui/tabStyle";
 import { reorderById } from "../../ui/tabDrag";
-import { aiMarker, cardsOf, openAiTrust, sharedWith, trustTargetFor, useAi } from "../../util/ai";
+import { aiMarker, cardsOf, loosestShare, openAiTrust, sharedWith, trustTargetFor, useAi } from "../../util/ai";
 import { type CloseWhich, HAS_HOME, closeCounts } from "./rules";
 import type { SessionTreeState } from "./hooks";
 
@@ -87,7 +87,7 @@ export const TabAiMarker = ({ sessionId }: { sessionId: string }) => {
   if (with_.length === 0) return null;
   const busy = ai.running.some(r => r.session_id === sessionId) || ai.pending.some(p => p.session_id === sessionId);
   const entries = with_.flatMap(t => t.servers.filter(x => x.session_id === sessionId));
-  const loosest = entries.find(x => x.allow_all || x.level >= 3) ?? entries.find(x => x.level === 2);
+  const loosest = loosestShare(entries);
   const marker = loosest ? aiMarker(loosest) : null;
   if (loosest && marker) {
     return (

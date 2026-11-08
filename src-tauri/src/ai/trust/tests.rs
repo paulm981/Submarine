@@ -381,7 +381,7 @@ fn the_level_comes_from_the_server_then_its_folders_then_the_default() {
     set_level(&conn, "folder", 11, None).unwrap();
     assert_eq!(level(1), 3);
     assert!(set_level(&conn, "server", 99, Some(3)).is_err(), "no such server");
-    assert!(set_level(&conn, "server", 1, Some(4)).is_err());
+    assert!(set_level(&conn, "server", 1, Some(5)).is_err());
     assert!(set_level(&conn, "tab", 1, Some(2)).is_err());
 }
 
@@ -921,4 +921,130 @@ fn plain_commands_run_as_their_words() {
     ] {
         assert_eq!(plain_words(cmd), None, "{cmd:?}");
     }
+}
+
+// -- "Run commands that only read" (#190) ---------------------------------------
+
+#[test]
+fn levels_go_in_order_of_how_much_they_allow_not_as_stored() {
+    assert_eq!(Level::stored(1), Some(Level::AskEveryTime));
+    assert_eq!(Level::stored(2), Some(Level::AllowedCommands));
+    assert_eq!(Level::stored(4), Some(Level::ReadOnly));
+    assert_eq!(Level::stored(3), Some(Level::Anything));
+    for n in [0, 5, 255] {
+        assert_eq!(Level::stored(n), None);
+        assert_eq!(Level::of(n), Level::AskEveryTime, "{n} isn't a level: it asks");
+    }
+    assert!(Level::AskEveryTime < Level::AllowedCommands && Level::AllowedCommands < Level::ReadOnly && Level::ReadOnly < Level::Anything);
+}
+
+#[test]
+fn at_the_read_only_level_what_only_reads_runs_and_the_rest_asks() {
+    let p = Policy { level: READ_ONLY, allow: rules(&["apt update"]), ask: rules(DEFAULT_ASK), windows: false, force_ask: None };
+    assert_eq!(decide(&p, false, "ps aux | grep nginx"), Decision::ReadOnly);
+    assert_eq!(decide(&p, false, "journalctl -u nginx -n 50"), Decision::ReadOnly);
+    assert_eq!(Decision::ReadOnly.approved_by().as_deref(), Some("level: only reads"));
+    // An allow rule still runs what it allows.
+    assert_eq!(decide(&p, false, "apt update"), Decision::Rule("apt update".into()));
+    for cmd in ["systemctl restart nginx", "rm /tmp/x", "ls > /tmp/x", "cat .env", "curl example.com", "sed -n 1p x"] {
+        assert_eq!(decide(&p, false, cmd), ask(), "{cmd}");
+    }
+    // Root asks, however it's asked for.
+    assert_eq!(decide(&p, false, "sudo cat /var/log/syslog"), ask());
+    assert_eq!(decide_as(&p, false, "cat /var/log/syslog", true), ask());
+    // The always-ask list wins: its rule is on the card.
+    let strict = Policy { ask: rules(&["journalctl *"]), ..p.clone() };
+    assert_eq!(decide(&strict, false, "journalctl -n 5"), Decision::Ask { rule: Some("journalctl *".into()) });
+    // Settings that can't be read, or are held, ask.
+    assert_eq!(decide(&Policy { force_ask: Some(UNREADABLE.into()), ..p.clone() }, false, "uptime"), ask());
+    // On Windows, only the allow list runs.
+    let windows = Policy { windows: true, allow: rules(&["hostname"]), ..p.clone() };
+    assert_eq!(decide(&windows, false, "uptime"), ask());
+    assert_eq!(decide(&windows, false, "hostname"), Decision::Rule("hostname".into()));
+    // Below it, nothing runs for only reading.
+    for level in [ASK_EVERY_TIME, ALLOWED_COMMANDS] {
+        assert_eq!(decide(&Policy { level, ..p.clone() }, false, "uptime"), ask(), "level {level}");
+    }
+    // "Run anything" is as it was.
+    assert_eq!(decide(&Policy { level: RUN_ANYTHING, ..p.clone() }, false, "rm /tmp/x"), Decision::Anything);
+}
+
+#[test]
+fn the_ai_is_told_what_the_read_only_level_does() {
+    let p = |level, allow: &[&str], windows| Policy { level, allow: rules(allow), ask: vec![], windows, force_ask: None };
+    assert_eq!(Requests::of(&p(READ_ONLY, &[], false), false), Requests::ReadOnly);
+    assert!(Requests::ReadOnly.phrase().contains("only read"));
+    // On Windows it never says more runs than does.
+    assert_eq!(Requests::of(&p(READ_ONLY, &[], true), false), Requests::AskEachTime);
+    assert_eq!(Requests::of(&p(READ_ONLY, &["dir"], true), false), Requests::AllowedCommands);
+    assert_eq!(Requests::of(&p(READ_ONLY, &[], false), true), Requests::Anything);
+    assert_eq!(Requests::of(&Policy { force_ask: Some(UNREADABLE.into()), ..p(READ_ONLY, &[], false) }, false), Requests::AskEachTime);
+}
+
+#[test]
+fn moving_into_the_read_only_level_is_more_and_out_of_run_anything_is_less() {
+    let p = |level: u8, allow: &[&str]| Policy { level, allow: rules(allow), ask: vec![], windows: false, force_ask: None };
+    assert!(loosened(&p(ALLOWED_COMMANDS, &[]), &p(READ_ONLY, &[])).is_some());
+    assert!(loosened(&p(ASK_EVERY_TIME, &[]), &p(READ_ONLY, &[])).is_some());
+    assert!(loosened(&p(READ_ONLY, &[]), &p(RUN_ANYTHING, &[])).is_some());
+    assert!(loosened(&p(RUN_ANYTHING, &[]), &p(READ_ONLY, &[])).is_none(), "4 is less than 3");
+    assert!(loosened(&p(READ_ONLY, &[]), &p(ALLOWED_COMMANDS, &[])).is_none());
+    // Allow rules count at the read-only level as at level 2.
+    assert_eq!(loosened(&p(READ_ONLY, &[]), &p(READ_ONLY, &["uptime"])), Some((1, vec![])));
+}
+
+#[test]
+fn the_read_only_level_is_kept_and_nothing_else_is() {
+    let conn = vault();
+    set_level(&conn, "server", 1, Some(READ_ONLY)).unwrap();
+    assert_eq!(policy_for(&conn, Some(1)).level, READ_ONLY);
+    assert!(set_level(&conn, "server", 1, Some(5)).is_err());
+    assert!(set_level(&conn, "server", 1, Some(0)).is_err());
+    // One put there some other way reads as "Ask every time".
+    conn.execute_batch("PRAGMA ignore_check_constraints = ON; UPDATE ai_levels SET level = 9; PRAGMA ignore_check_constraints = OFF;").unwrap();
+    assert_eq!(policy_for(&conn, Some(1)).level, ASK_EVERY_TIME);
+}
+
+/// A vault from before #190: its levels table refuses a 4. Opened now, it's
+/// made again, every level and rule kept, and its triggers still work.
+#[test]
+fn a_vault_from_before_takes_the_read_only_level_and_keeps_its_levels() {
+    let conn = Connection::open_in_memory().unwrap();
+    let old = SCHEMA.replace("BETWEEN 1 AND 4", "BETWEEN 1 AND 3");
+    conn.execute_batch(
+        "CREATE TABLE folders (id INTEGER PRIMARY KEY, name TEXT, parent_id INTEGER);
+         CREATE TABLE servers (id INTEGER PRIMARY KEY, name TEXT, folder_id INTEGER);
+         INSERT INTO folders VALUES (10, 'Test', NULL);
+         INSERT INTO servers VALUES (1, 'web-01', 10), (2, 'db-01', NULL), (3, 'lab-01', NULL);",
+    )
+    .unwrap();
+    conn.execute_batch(&old).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TABLE sync_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO sync_meta VALUES ('ai_trust_device', '{HERE}');
+         INSERT INTO ai_levels VALUES ('server', 1, 2), ('server', 3, 3), ('folder', 10, 2), ('default', 0, 1);
+         INSERT INTO ai_rules (scope, scope_id, kind, pattern) VALUES ('server', 1, 'allow', 'uptime'), ('default', 0, 'ask', 'reboot');"
+    ))
+    .unwrap();
+    assert!(conn.execute("INSERT INTO ai_levels VALUES ('server', 2, 4)", []).is_err(), "the old table refuses a 4");
+
+    assert!(create_schema(&conn, HERE).unwrap(), "made again: the vault is saved");
+    let levels: Vec<(String, i64, u8)> = conn
+        .prepare("SELECT scope, scope_id, level FROM ai_levels ORDER BY scope, scope_id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(levels, vec![("default".into(), 0, 1), ("folder".into(), 10, 2), ("server".into(), 1, 2), ("server".into(), 3, 3)]);
+    assert_eq!(policy_for(&conn, Some(1)).allow, rules(&["uptime"]));
+    set_level(&conn, "server", 2, Some(READ_ONLY)).unwrap();
+    assert_eq!(policy_for(&conn, Some(2)).level, READ_ONLY);
+    // Only once, and the leftover table is gone.
+    assert!(!create_schema(&conn, HERE).unwrap());
+    assert!(!has_table(&conn, "ai_levels_narrow").unwrap());
+    // The triggers came back: deleting a server or folder deletes its rows.
+    conn.execute_batch("DELETE FROM servers WHERE id = 2; DELETE FROM folders WHERE id = 10;").unwrap();
+    let left: i64 = conn.query_row("SELECT COUNT(*) FROM ai_levels WHERE (scope = 'server' AND scope_id = 2) OR scope = 'folder'", [], |r| r.get(0)).unwrap();
+    assert_eq!(left, 0);
 }

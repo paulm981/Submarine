@@ -65,8 +65,11 @@ pub(crate) fn tools() -> Value {
             "name": "list_shared",
             "description": "What you can use in Submarine, as compact JSON. servers: each server the user shared with you (only these \
 work with run_command, run_on_servers and copy_files), with requests saying what happens to your requests there: \"asks the user \
-each time\", \"runs the user's allowed commands, asks for the rest\" or \"runs anything\". Whatever it says, some commands, and \
-root, may still ask. copy_into: the folders on this computer a pull may copy into (none: ask the user to add one). limits: files and \
+each time\", \"runs the user's allowed commands, asks for the rest\", \"runs commands that only read and the user's allowed \
+commands, asks for the rest\" or \"runs anything\". Whatever it says, some commands, and root, may still ask. Where commands that \
+only read run, Submarine decides by a list: one program such as cat, grep, ls, ps, df, du, journalctl, systemctl status or docker ps, \
+or several joined with |, in plain words and quotes; redirection, ;, &&, $, backticks, sed, awk, git, network tools, sudo and files \
+that usually hold secrets (.env, .ssh) ask. copy_into: the folders on this computer a pull may copy into (none: ask the user to add one). limits: files and \
 bytes per copy, servers per request, the command timeout's default and maximum in seconds, and how much of a command's output \
 you get. The user can change any of it while you work, so call it again after a refusal.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },

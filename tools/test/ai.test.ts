@@ -2,7 +2,7 @@
 // then npm --prefix tools/test test (type check, then vitest).
 
 import { describe, expect, it } from "vitest";
-import { aiMarker, cardsOf, copyCard, followLimit, followSoFar, levelTitle, runnerWarning, sharedWith, trustTargetFor, type AiCopy, type AiPending, type AiServer, type AiSnapshot } from "../../src/util/ai";
+import { AI_LEVELS, aiMarker, cardsOf, heldMay, loosestShare, copyCard, followLimit, followSoFar, levelTitle, runnerWarning, sharedWith, trustTargetFor, type AiCopy, type AiPending, type AiServer, type AiSnapshot } from "../../src/util/ai";
 
 const pending = (id: number, group: { id: number; size: number } | null = null): AiPending => ({
   id, tab_id: "t", tab_label: "AI", session_id: `s${id}`, server: `srv${id}`, user: null, command: "uptime",
@@ -107,8 +107,33 @@ describe("approval levels", () => {
     expect(aiMarker({ level: 1, allow_all: false })).toBeNull();
     expect(aiMarker({ level: 2, allow_all: false })).toBe("AI: allowed commands run");
     expect(aiMarker({ level: 3, allow_all: false })).toBe("AI: runs without asking");
+    expect(aiMarker({ level: 4, allow_all: false })).toBe("AI: read-only commands run");
     // "Allow everything here" outranks the level.
     expect(aiMarker({ level: 1, allow_all: true })).toBe("AI: runs without asking");
+  });
+
+  it("shows the read-only level (stored as 4) between the allowed commands and run anything", () => {
+    expect(AI_LEVELS.map((l) => l.level)).toEqual([1, 2, 4, 3]);
+    expect(levelTitle(4)).toBe("Run commands that only read, ask before changes");
+  });
+
+  it("says what a held move lets the AI do, the read-only level as itself", () => {
+    expect(heldMay({ level: 3, allow: 2 })).toBe("the AI may run anything without asking");
+    expect(heldMay({ level: 4, allow: 0 })).toBe("the AI may run commands that only read without asking");
+    expect(heldMay({ level: 2, allow: 0, change: "added" })).toBe("the AI may run your allowed commands without asking");
+    expect(heldMay({ level: 2, allow: 1 })).toBe("the AI may run 1 more allowed command without asking");
+    expect(heldMay({ level: 2, allow: 0 })).toBe("the AI may do more without asking");
+  });
+
+  it("marks a tab by the share that runs the most without asking", () => {
+    const at = (level: number, allow_all = false) => ({ level, allow_all });
+    expect(loosestShare([at(1), at(1)])).toBeNull();
+    expect(loosestShare([at(1), at(2)])).toEqual(at(2));
+    expect(loosestShare([at(2), at(4), at(1)])).toEqual(at(4));
+    expect(loosestShare([at(4), at(3)])).toEqual(at(3));
+    expect(loosestShare([at(3), at(1, true)])).toEqual(at(1, true));
+    // A level this page doesn't know runs nothing without asking.
+    expect(loosestShare([at(9)])).toBeNull();
   });
 
   it("names a level, and an unknown one as the safest", () => {
