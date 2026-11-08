@@ -50,6 +50,24 @@ pub(crate) fn take_synced_tunnels_base(conn: &Connection, server_id: i32) -> Opt
     Some(before.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default())
 }
 
+/// initiate_connection's start (lib.rs). A reconnect replays the session's
+/// forward list. When sync changed this server's saved forwards since the
+/// session read them (another computer deleted one, say), the list starts
+/// again from the saved ones first, so the reconnect doesn't bring back a
+/// forward that's gone. The list is kept under the base session id, which
+/// the `::fwd` connection replays too. A first connect (no list yet) reads
+/// the saved ones anyway, and other connections (`::sftp`) have none:
+/// neither may use up the change, which another tab on this server may
+/// still need.
+pub(crate) async fn refresh_rules_for_reconnect(state: &SshState, db_state: &DbState, session_id: &str, role: &str, server_id: i32) {
+    let rules_key = session_id.strip_suffix("::fwd").unwrap_or(session_id);
+    if (role == "primary" || role == "forward") && state.session_tunnel_specs.lock().await.contains_key(rules_key) {
+        if let Err(e) = refresh_synced_session_rules(state, db_state, rules_key, Some(server_id)).await {
+            println!("[BACKEND] {}: the saved forwards weren't read again: {}", session_id, e);
+        }
+    }
+}
+
 /// A session whose server's saved forwards changed by sync since it read them
 /// starts again from the saved ones (with this device's holds), before the
 /// user sees or changes its rules. The session saves after every change, so
@@ -87,14 +105,18 @@ mod hook_tests {
             &[
                 ("", "mod synced_tunnels;", 1),
                 ("", "use synced_tunnels::*;", 1),
-                ("merge_batch", "stored_tunnels(", 1),
-                ("merge_batch", "note_synced_tunnels(", 1),
                 ("persist_session_tunnels", "take_synced_tunnels_base(", 1),
                 ("ensure_session_rules", "refresh_synced_session_rules(", 1),
-                ("initiate_connection", "refresh_synced_session_rules(", 1),
+                ("initiate_connection", "refresh_rules_for_reconnect(", 1),
                 ("list_tunnel_rules", "refresh_synced_session_rules(", 1),
                 ("restart_session_tunnels", "refresh_synced_session_rules(", 1),
             ],
+        );
+        // The sync merge's batch, out of lib.rs into a fork file (#163).
+        assert_hooks(
+            "sync_merge.rs",
+            include_str!("sync_merge.rs"),
+            &[("merge_batch", "stored_tunnels(", 1), ("merge_batch", "note_synced_tunnels(", 1)],
         );
     }
 }

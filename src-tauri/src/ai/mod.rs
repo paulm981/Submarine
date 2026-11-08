@@ -2956,5 +2956,36 @@ pub(crate) fn home_launch(app: &tauri::AppHandle, state: &AiState, id: &str, tab
     Ok(HomeLaunch { program: launch.program, args: launch.args, env, env_remove: launch.env_remove, cwd, label })
 }
 
+/// A server's tab closed, or connects again (lib.rs, disconnect_session and
+/// initiate_connection): no AI tab can reach it any more. A tab that
+/// connects again is shared again by hand (#32, open question 11).
+pub(crate) fn tab_gone(app: &tauri::AppHandle, session_id: &str, why: &str) {
+    use tauri::Manager as _;
+    if let Some(ai) = app.try_state::<AiState>() {
+        ai.session_gone(session_id, why);
+    }
+}
+
+// Every call from the original project's code into this file (fork_hooks.rs):
+// a sync that drops one fails here.
+#[cfg(test)]
+mod hook_tests {
+    use crate::fork_hooks::assert_hooks;
+
+    #[test]
+    fn the_hooks_are_in_place() {
+        assert_hooks(
+            "lib.rs",
+            include_str!("../lib.rs"),
+            &[
+                ("", "mod ai;", 1),
+                ("initiate_connection", "ai::tab_gone(&app, &session_id, \"reconnected\")", 1),
+                ("disconnect_session", "ai::tab_gone(&app, &session_id, \"tab closed\")", 1),
+                ("teardown_profile", "ai.end_all_tabs()", 1),
+            ],
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests;

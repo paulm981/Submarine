@@ -100,6 +100,29 @@ impl RootAccess {
 }
 
 // Every call from the original project's code into this file (fork_hooks.rs):
+impl SshState {
+    /// What the fork keeps for a tab, forgotten with it (lib.rs,
+    /// disconnect_session and teardown_profile): its root access and root
+    /// gate, its containers' root, and who it logged in as.
+    pub(crate) async fn forget_fork_session(&self, session_id: &str) {
+        self.root_access.lock().await.remove(session_id);
+        self.root_gates.lock().await.remove(session_id);
+        self.docker_root.lock().await.remove(session_id);
+        self.session_users.lock().await.remove(session_id);
+    }
+
+    /// The same for every tab, when the profile closes (lib.rs,
+    /// teardown_profile), and which saved server each tab and terminal is for.
+    pub(crate) async fn forget_fork_sessions(&self) {
+        self.root_access.lock().await.clear();
+        self.root_gates.lock().await.clear();
+        self.docker_root.lock().await.clear();
+        self.session_servers.lock().await.clear();
+        self.session_users.lock().await.clear();
+        self.terminal_servers.lock().await.clear();
+    }
+}
+
 // a sync that drops one, or the lines that bring the file in, fails here.
 #[cfg(test)]
 mod hook_tests {
@@ -113,6 +136,15 @@ mod hook_tests {
             &[
                 ("", "mod root_state;", 1),
                 ("", "pub(crate) use root_state::*;", 1),
+            ],
+        );
+        assert_hooks(
+            "lib.rs",
+            include_str!("../lib.rs"),
+            &[
+                ("teardown_profile", "ssh.forget_fork_session(sid)", 1),
+                ("teardown_profile", "ssh.forget_fork_sessions()", 1),
+                ("disconnect_session", "state.forget_fork_session(&session_id)", 1),
             ],
         );
     }

@@ -59,6 +59,54 @@ pub(crate) fn remote_write_locks() -> &'static RemoteWriteLocks {
     REMOTE_WRITE_LOCKS.get_or_init(RemoteWriteLocks::default)
 }
 
+/// sftp_upload_file's turn at the remote file (lib.rs). Another upload to
+/// this same remote file would interleave with ours, so it waits for it to
+/// finish first (the card shows 0% meanwhile). What the file looks like is
+/// asked again: the upload ahead may have just created it, which this one
+/// was told isn't there; then it asks first, as the check at the top would
+/// have. The turn, held for the upload, and whether the file is there.
+pub(crate) async fn upload_turn(
+    sftp: &russh_sftp::client::SftpSession,
+    session_id: &str,
+    remote_path: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+    overwrite: Option<bool>,
+    name: &str,
+    emit_progress: &(dyn Fn(u64, &str, Option<String>) + Sync),
+) -> Result<(tokio::sync::OwnedMutexGuard<()>, bool), String> {
+    let Some((write_turn, _)) = remote_write_locks().acquire(session_id, remote_path, cancel).await else {
+        emit_progress(0, "cancelled", None);
+        return Err("cancelled".into());
+    };
+    let existed = sftp.metadata(remote_path).await.is_ok();
+    if existed && overwrite != Some(true) {
+        emit_progress(0, "error", Some(format!("{name} is already on the server.")));
+        return Err(format!("EXISTS:{}", remote_path));
+    }
+    Ok((write_turn, existed))
+}
+
+/// upload_dir_file's turn at the remote file (lib.rs): it waits while
+/// another upload writes it, and then `ask_first`, the folder's `EXISTS:`
+/// answer, is given if that other upload left a file there.
+pub(crate) async fn dir_file_turn(
+    sftp: &russh_sftp::client::SftpSession,
+    session_id: &str,
+    remote_full: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+    ask_first: Option<String>,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, DirFileEnd> {
+    let Some((write_turn, waited)) = remote_write_locks().acquire(session_id, remote_full, cancel).await else {
+        return Err(DirFileEnd::Stopped(None));
+    };
+    if let Some(exists) = ask_first.filter(|_| waited) {
+        if sftp.metadata(remote_full).await.is_ok() {
+            return Err(DirFileEnd::Failed(exists));
+        }
+    }
+    Ok(write_turn)
+}
+
 #[cfg(test)]
 mod remote_write_lock_tests {
     use super::*;
@@ -135,8 +183,8 @@ mod hook_tests {
             &[
                 ("", "mod remote_writes;", 1),
                 ("", "use remote_writes::*;", 1),
-                ("upload_dir_file", "remote_write_locks(", 1),
-                ("sftp_upload_file", "remote_write_locks(", 1),
+                ("upload_dir_file", "dir_file_turn(&sftp, &session_id, &remote_full, &cancel, ask_first)", 1),
+                ("sftp_upload_file", "upload_turn(&sftp, &session_id, &remote_path, &cancel, overwrite, &name, &emit_progress)", 1),
                 ("sftp_open_remote_file", "remote_write_locks(", 1),
             ],
         );

@@ -390,85 +390,171 @@ fn scheme_ids_are_cleaned() {
     assert_eq!(clean_scheme_id(&"a".repeat(100)).unwrap().len(), 64);
 }
 
-// Regression for the UPDATE-arm half of the 0.3.5 position shim. The INSERT
-// case above lands a missing position as 0; here the row ALREADY EXISTS with
-// a manual drag-rank when a pre-0.3.5 peer (payload omits `position`) syncs a
-// winning edit to some OTHER field. The merge must apply the edit but KEEP
-// the local rank — binding the coerced 0 into `position=excluded.position`
-// would silently reset a deliberate ordering on every cross-version edit.
+// A server's terminal scheme syncs like its other fields — and an edit
+// from a peer on a build without the column (the key absent from its
+// record) changes what it changed but keeps the scheme, both on a row
+// that exists and on one it inserts (NULL there).
 #[test]
-fn a_pre_0_3_5_peer_edit_preserves_local_drag_position() {
-    let (a, _ha) = device("A");
-    a.execute("INSERT INTO servers(name, host, port, password) VALUES('prod','h1',22,'SECRET')", []).unwrap();
-
-    // B receives the server, then the user drags it to rank 5.
+fn terminal_theme_syncs_and_an_older_peer_keeps_it() {
+    let (a, ha) = device("A");
+    a.execute("INSERT INTO servers(name, host, port, terminal_theme) VALUES('prod','h1',22,'nord')", []).unwrap();
     let (b, hb) = device("B");
     apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
-    b.execute("UPDATE servers SET position=5 WHERE name='prod'", []).unwrap();
-    let pos_before: i64 = b.query_row("SELECT position FROM servers WHERE name='prod'", [], |r| r.get(0)).unwrap();
-    assert_eq!(pos_before, 5, "test setup: B's local rank is 5");
+    let theme: Option<String> = b.query_row("SELECT terminal_theme FROM servers WHERE name='prod'", [], |r| r.get(0)).unwrap();
+    assert_eq!(theme.as_deref(), Some("nord"), "the scheme must sync");
 
-    // A (an old peer) edits the host. Strip `position` from the blob and
-    // stamp it a minute ahead of now (still a stamp the merge accepts), so
-    // the record deterministically WINS LWW on B and reaches the UPDATE
-    // arm — the case this fix guards.
+    // An older peer edits the host: its record has no terminal_theme key.
     a.execute("UPDATE servers SET host='h2' WHERE name='prod'", []).unwrap();
     let mut recs = collect_local_records(&a, &KEY, "").unwrap();
-    let ahead = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 60_000;
     for r in recs.iter_mut() {
         if r.entity_type == "servers" {
             let plain = decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap();
             let mut obj: serde_json::Value = serde_json::from_slice(&plain).unwrap();
-            obj.as_object_mut().unwrap().remove("position");
+            obj.as_object_mut().unwrap().remove("terminal_theme");
             r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
-            r.updated_at = format!("{ahead:015}:00000:zzz");
+            r.updated_at = ha.tick();
         }
     }
     apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
-
-    let (host, pos): (String, i64) = b
-        .query_row("SELECT host, position FROM servers WHERE name='prod'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+    let (host, theme): (String, Option<String>) = b
+        .query_row("SELECT host, terminal_theme FROM servers WHERE name='prod'", [], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap();
-    assert_eq!(host, "h2", "the newer remote field edit must apply");
-    assert_eq!(pos, 5, "a pre-0.3.5 peer edit must NOT reset the local drag position to 0");
+    assert_eq!(host, "h2", "the older peer's edit must apply");
+    assert_eq!(theme.as_deref(), Some("nord"), "an absent key must keep the local scheme");
+
+    // A new device inserting the older peer's record gets no scheme.
+    let (c, hc) = device("C");
+    apply_remote_records(&c, &KEY, &recs, &hc).unwrap();
+    let theme: Option<String> = c.query_row("SELECT terminal_theme FROM servers WHERE name='prod'", [], |r| r.get(0)).unwrap();
+    assert_eq!(theme, None);
+
+    // An explicit null, from a peer that knows the column but stores the
+    // app's default as NULL (a build from before NULL_IS_UNKNOWN), still
+    // clears it.
+    let mut recs = collect_local_records(&a, &KEY, "").unwrap();
+    for r in recs.iter_mut() {
+        if r.entity_type == "servers" {
+            let plain = decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap();
+            let mut obj: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+            obj["terminal_theme"] = serde_json::Value::Null;
+            r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
+            r.updated_at = ha.tick();
+        }
+    }
+    apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+    let theme: Option<String> = b.query_row("SELECT terminal_theme FROM servers WHERE name='prod'", [], |r| r.get(0)).unwrap();
+    assert_eq!(theme, None, "a null from a peer that knows the column clears it");
 }
 
-// RDP servers (issue #3): `protocol` travels with the server; an RDP node
-// edited by a peer from before RDP (its payload has no `protocol` key)
-// stays an RDP node, while a newer peer's explicit NULL makes it SSH.
+// A device that got a server from an older peer (whose record has no
+// scheme and no highlight set) holds both as NULL: not known here. Its
+// copy of that record, passed on, must not clear them where they're set:
+// the store sync sends every row each time, and a merge can pick that
+// copy. The app's default, chosen here, is "" and does travel.
 #[test]
-fn protocol_syncs_and_an_older_peers_edit_keeps_it() {
-    let (a, _ha) = device("A");
-    a.execute("INSERT INTO servers(name, host, port, protocol) VALUES('win','w1',3389,'rdp')", []).unwrap();
+fn a_scheme_not_known_here_is_not_passed_on_as_cleared() {
+    let (a, ha) = device("A");
+    a.execute("INSERT INTO servers(name, host, port) VALUES('prod','h1',22)", []).unwrap();
+    let id: i32 = a.query_row("SELECT id FROM servers", [], |r| r.get(0)).unwrap();
+    set_server_look(&a, "terminal_theme", id, Some("nord")).unwrap();
+    set_server_look(&a, "highlight", id, Some("network")).unwrap();
     let (b, hb) = device("B");
     apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
-    let proto = |c: &Connection| -> Option<String> { c.query_row("SELECT protocol FROM servers WHERE name='win'", [], |r| r.get(0)).unwrap() };
-    assert_eq!(proto(&b).as_deref(), Some("rdp"), "the protocol syncs");
 
-    // A peer from before RDP edits the host: no `protocol` key, newer stamp.
-    a.execute("UPDATE servers SET host='w2' WHERE name='win'", []).unwrap();
-    let ahead = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 60_000;
-    let mut recs = collect_local_records(&a, &KEY, "").unwrap();
-    for r in recs.iter_mut().filter(|r| r.entity_type == "servers") {
-        let mut obj: serde_json::Value = serde_json::from_slice(&decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap()).unwrap();
-        assert!(obj.as_object_mut().unwrap().remove("protocol").is_some(), "a current peer always sends the key");
+    // An older peer edits the host: its record has neither key.
+    a.execute("UPDATE servers SET host='h2'", []).unwrap();
+    let mut older = collect_local_records(&a, &KEY, "").unwrap();
+    for r in older.iter_mut().filter(|r| r.entity_type == "servers") {
+        let plain = decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap();
+        let mut obj: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+        obj.as_object_mut().unwrap().remove("terminal_theme");
+        obj.as_object_mut().unwrap().remove("highlight");
         r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
-        r.updated_at = format!("{ahead:015}:00000:zzz");
+        r.updated_at = ha.tick();
     }
-    apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
-    let host: String = b.query_row("SELECT host FROM servers WHERE name='win'", [], |r| r.get(0)).unwrap();
-    assert_eq!(host, "w2", "the edit applies");
-    assert_eq!(proto(&b).as_deref(), Some("rdp"), "and the node stays an RDP server");
+    // C, new, gets the server from it, and passes its copy on to B,
+    // which hasn't seen the older peer's edit yet.
+    let (c, hc) = device("C");
+    apply_remote_records(&c, &KEY, &older, &hc).unwrap();
+    apply_remote_records(&b, &KEY, &collect_local_records(&c, &KEY, "").unwrap(), &hb).unwrap();
+    let row: (String, Option<String>, Option<String>) = b
+        .query_row("SELECT host, terminal_theme, highlight FROM servers", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap();
+    assert_eq!(row, ("h2".into(), Some("nord".into()), Some("network".into())), "the edit applies, the look stays");
 
-    // A current peer turns it back into an SSH server: an explicit NULL.
-    a.execute("UPDATE servers SET protocol=NULL, host='w3' WHERE name='win'", []).unwrap();
-    let later = ahead + 60_000;
+    // Saving the default over a NULL on C isn't a change.
+    let cid: i32 = c.query_row("SELECT id FROM servers", [], |r| r.get(0)).unwrap();
+    assert_eq!(set_server_look(&c, "terminal_theme", cid, None).unwrap(), 0);
+
+    // The app's default chosen on A reaches B.
+    set_server_look(&a, "terminal_theme", id, None).unwrap();
+    apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+    let theme: Option<String> = b.query_row("SELECT terminal_theme FROM servers", [], |r| r.get(0)).unwrap();
+    assert_eq!(theme.as_deref(), Some(""), "the app's default is a value that travels");
+}
+
+#[test]
+fn a_servers_highlight_set_syncs_and_an_older_peer_keeps_it() {
+    let (a, ha) = device("A");
+    a.execute("INSERT INTO servers(name, host, port, highlight) VALUES('core','h1',22,'network')", []).unwrap();
+    let (b, hb) = device("B");
+    apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+    let set: Option<String> = b.query_row("SELECT highlight FROM servers WHERE name='core'", [], |r| r.get(0)).unwrap();
+    assert_eq!(set.as_deref(), Some("network"));
+
+    // An older peer's edit has no highlight key: the choice stays.
+    a.execute("UPDATE servers SET host='h2' WHERE name='core'", []).unwrap();
     let mut recs = collect_local_records(&a, &KEY, "").unwrap();
     for r in recs.iter_mut().filter(|r| r.entity_type == "servers") {
-        r.updated_at = format!("{later:015}:00000:zzz");
+        let plain = decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap();
+        let mut obj: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+        obj.as_object_mut().unwrap().remove("highlight");
+        r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
+        r.updated_at = ha.tick();
     }
     apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
-    assert_eq!(proto(&b), None, "NULL from a current peer makes it SSH again");
+    let (host, set): (String, Option<String>) = b
+        .query_row("SELECT host, highlight FROM servers WHERE name='core'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!(host, "h2");
+    assert_eq!(set.as_deref(), Some("network"));
+}
+
+#[test]
+fn highlight_rules_sync_edit_and_delete() {
+    let (a, ha) = device("A");
+    let rule = |pattern: &str| highlight::HighlightRule {
+        id: None,
+        pattern: pattern.into(),
+        kind: "word".into(),
+        match_case: false,
+        color: "magenta".into(),
+        bold: true,
+        underline: false,
+        enabled: true,
+    };
+    let id = highlight::save(&a, &rule("deploy")).unwrap();
+    highlight::save(&a, &rule("rollback")).unwrap();
+    let (b, hb) = device("B");
+    apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+    let got = highlight::list(&b).unwrap();
+    assert_eq!(got.iter().map(|r| r.pattern.as_str()).collect::<Vec<_>>(), ["deploy", "rollback"]);
+    assert!(got[0].bold && got[0].color == "magenta");
+
+    // An edit, then a deletion, on A reach B.
+    let mut edited = rule("deployed");
+    edited.id = Some(id);
+    edited.underline = true;
+    highlight::save(&a, &edited).unwrap();
+    a.execute("DELETE FROM highlight_rules WHERE pattern='rollback'", []).unwrap();
+    let mut recs = collect_local_records(&a, &KEY, "").unwrap();
+    for r in recs.iter_mut().filter(|r| r.entity_type == "highlight_rules") {
+        r.updated_at = ha.tick();
+    }
+    apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+    let got = highlight::list(&b).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!((got[0].pattern.as_str(), got[0].underline), ("deployed", true));
 }
 
 // Nor to the move in it: a record held for its emptied password that also
@@ -521,4 +607,43 @@ fn a_yes_to_a_held_deletion_of_a_jump_host_notes_the_servers_behind_it() {
     resolve_held(&b, &KEY, &hb, true).unwrap();
     assert_eq!(count(&b, "servers"), 3);
     assert!(jump_gone::reason(&b, s00).is_some(), "it won't go direct without asking");
+}
+
+// `a_referent_deleted_in_the_same_batch_clears_the_link`, and then: a server
+// whose jump host a sync deleted isn't connected directly without asking
+// (jump_gone.rs), on a device that had the jump host or one that never did.
+#[test]
+fn a_jump_host_deleted_by_a_sync_leaves_its_servers_refusing_to_go_direct() {
+    let (a, _ha) = device("A");
+    a.execute("INSERT INTO servers(name,host,port) VALUES('bastion','b',22)", []).unwrap();
+    a.execute(
+        "INSERT INTO servers(name,host,port,jump_host_id) VALUES('app','a',22,(SELECT id FROM servers WHERE name='bastion'))",
+        [],
+    )
+    .unwrap();
+    let seed = collect_local_records(&a, &KEY, "").unwrap();
+    let (c, hc) = device("C");
+    apply_remote_records(&c, &KEY, &seed, &hc).unwrap();
+    a.execute("UPDATE servers SET host='a2' WHERE name='app'", []).unwrap();
+    a.execute("DELETE FROM servers WHERE name='bastion'", []).unwrap();
+    let batch = collect_local_records(&a, &KEY, "").unwrap();
+    assert!(batch.iter().any(|r| r.deleted), "batch must carry the tombstone");
+    apply_remote_records(&c, &KEY, &batch, &hc).unwrap();
+    let dangling: Option<i64> = c
+        .query_row("SELECT jump_host_id FROM servers WHERE name='app'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(dangling, None, "the link must be cleared, not left dangling");
+    // ...and C won't connect it directly without asking (jump_gone.rs).
+    let app_id: i64 = c.query_row("SELECT id FROM servers WHERE name='app'", [], |r| r.get(0)).unwrap();
+    let refused = crate::jump_gone::refuse(&c, app_id).unwrap_err();
+    assert!(refused.starts_with("[JUMP_GONE] app's jump host (bastion) was deleted"), "{refused}");
+    // A device that never had the bastion gets 'app' with a jump host it
+    // can't find: refused too, without the name.
+    let (d, hd) = device("D");
+    let app_uuid: String = a.query_row("SELECT uuid FROM servers WHERE name='app'", [], |r| r.get(0)).unwrap();
+    let app_only: Vec<SyncRecord> = seed.iter().filter(|r| r.uuid == app_uuid).cloned().collect();
+    assert_eq!(app_only.len(), 1);
+    apply_remote_records(&d, &KEY, &app_only, &hd).unwrap();
+    let d_app: i64 = d.query_row("SELECT id FROM servers WHERE name='app'", [], |r| r.get(0)).unwrap();
+    assert!(crate::jump_gone::refuse(&d, d_app).is_err(), "no jump host it can find: refused");
 }

@@ -152,6 +152,32 @@ fn too_many_hops() -> String {
     format!("ProxyJump in ~/.ssh/config: more than {} hops — a loop between its Host blocks?", crate::MAX_JUMP_HOPS)
 }
 
+/// How long a jump host's login may take, prompts included (login_hop).
+pub(crate) const JUMP_LOGIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// How long a jump host may take to open the channel to the next hop or the
+/// server behind it (hop_channel), as for telnet through an SSH server.
+pub(crate) const JUMP_CHANNEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// A `::sftp` / `::fwd` connection's jump host asked for a code (or a password
+/// that isn't saved) that only the server's own tab can ask for.
+pub(crate) const JUMP_ASKS_UNASKED: &str =
+    "the jump host asks for a code or a password, and only the server's own tab can ask you for it";
+
+/// `hop_channel`, given `limit` to open the channel in.
+pub(crate) async fn hop_channel_within<H: russh::client::Handler>(
+    via: &russh::client::Handle<H>,
+    host: &str,
+    port: u16,
+    limit: std::time::Duration,
+) -> Result<crate::tunnel::DrainedChannelStream, String> {
+    let open = via.channel_open_direct_tcpip(host.to_string(), u32::from(port), "127.0.0.1", 0);
+    match tokio::time::timeout(limit, open).await {
+        Ok(Ok(channel)) => Ok(crate::tunnel::drained_stream(channel)),
+        Ok(Err(e)) => Err(format!("could not open a channel to {host}:{port} through the jump host: {e}")),
+        Err(_) => Err(format!("the jump host didn't open a channel to {host}:{port} within {} seconds", limit.as_secs())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,7 +356,7 @@ mod tests {
             .await
             .unwrap();
         let started = std::time::Instant::now();
-        let err = match crate::hop_channel_within(&hop, "target", 22, Duration::from_millis(300)).await {
+        let err = match super::hop_channel_within(&hop, "target", 22, Duration::from_millis(300)).await {
             Ok(_) => panic!("the channel can't open"),
             Err(e) => e,
         };
@@ -351,6 +377,9 @@ mod tests {
                 ("config_jump_chain", "hop_policy::refuse_tokens(", 1),
                 ("config_jump_chain", "hop_policy::hop_turn(", 1),
                 ("reach_hop", "hop_policy::hop_turn(", 3),
+                ("hop_channel", "hop_policy::hop_channel_within(", 1),
+                ("login_hop", "hop_policy::JUMP_LOGIN_DEADLINE", 2),
+                ("login_hop", "hop_policy::JUMP_ASKS_UNASKED", 1),
             ],
         );
         assert_hooks("monitor.rs", include_str!("monitor.rs"), &[("run_poller", "hop_policy::queue_key(", 1)]);

@@ -79,3 +79,34 @@ fn root_scripts_run_under_any_login_shell() {
         }
     }
 }
+
+/// The shells a server may run the app's commands with: its login
+/// shell (sshd runs `<shell> -c <command>`) or root's (a root shell
+/// reads its line). sh always; tcsh and csh where this machine has them.
+#[cfg(unix)]
+fn shells() -> Vec<&'static str> {
+    ["sh", "tcsh", "csh"]
+        .into_iter()
+        .filter(|s| std::process::Command::new(s).arg("-c").arg("true").output().is_ok_and(|o| o.status.success()))
+        .collect()
+}
+
+#[test]
+fn a_root_shell_gets_one_line_of_posix_sh() {
+    let script = format!("echo __SUB_ROOT_OUT__; printf '%s|' {}; echo", remote_sh::quote_words(&["it's".into(), "a b".into()]));
+    let line = root_shell_line(&script);
+    assert!(line.ends_with('\n') && line.matches('\n').count() == 1 && !line.contains('!'), "{line:?}");
+    for form in ROOT_SHELL_FORMS {
+        assert!(form.chars().all(|c| c.is_ascii_lowercase() || c == ' ' || c == '-'), "{form}");
+    }
+    // What root's shell makes of it, whichever it is.
+    #[cfg(unix)]
+    for shell in shells() {
+        let out = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(line.trim_end().strip_prefix("exec ").unwrap())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "__SUB_ROOT_OUT__\nit's|a b|\n", "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}

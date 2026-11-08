@@ -1204,6 +1204,36 @@ pub(crate) struct Peek {
     pub unreadable: usize,
 }
 
+/// Drops the open profile's delta-sync cursor: the next round is a full one.
+pub(crate) fn forget_sync_cursor(db_state: &DbState) -> Result<(), String> {
+    *db_state.sync_cursor.lock().map_err(|_| "[STATE] LOCK_SYNC_CURSOR")? = None;
+    Ok(())
+}
+
+/// sync_now's first step (lib.rs): a profile that syncs through the user's
+/// own folder or repository syncs there, and never with the cloud; one that
+/// syncs nowhere yet is told so. None: it syncs with the cloud.
+pub(crate) async fn sync_elsewhere(app: &tauri::AppHandle, db_state: &DbState, cloud: &crate::cloud::CloudState) -> Result<Option<SyncReport>, String> {
+    if let Some(report) = sync_if_linked(app, db_state).await? {
+        return Ok(Some(report));
+    }
+    if !cloud.enabled() {
+        return Err("[SYNC] NOT_SET_UP: this profile doesn't sync anywhere yet — set that up on its Profile tab.".into());
+    }
+    Ok(None)
+}
+
+/// share_current_profile's check (lib.rs): a profile that syncs through the
+/// user's own storage, never the cloud, isn't shared, as a share would never
+/// see its changes; and revoking a member rotates the key, which would split
+/// the store in two.
+pub(crate) fn refuse_share(conn: &Connection) -> Result<(), String> {
+    if is_linked(conn) {
+        return Err("[SHARE] STORE_SYNC: this profile syncs through your own storage — stop that on the Profile tab before sharing it.".into());
+    }
+    Ok(())
+}
+
 pub(crate) async fn peek(app: &tauri::AppHandle, db: &DbState) -> Result<Option<Peek>, String> {
     let _turn = store_turn(app).await?;
     let Some(open) = open_profile(db, None)? else { return Ok(None) };
@@ -1987,5 +2017,29 @@ mod tests {
         let mine = Mine { node: "aaaaaaaaaaaaaaaa", device: "A", profile: "p", records: &recs, key_file: None };
         assert!(write_profile(&linked, &KEY, &seen, &mine).is_err());
         assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+}
+
+// Every call from the original project's code into this file (fork_hooks.rs):
+// a sync that drops one, or the line that brings the file in, fails here.
+#[cfg(test)]
+mod hook_tests {
+    use crate::fork_hooks::assert_hooks;
+
+    #[test]
+    fn the_hooks_are_in_place() {
+        assert_hooks(
+            "lib.rs",
+            include_str!("lib.rs"),
+            &[
+                ("", "mod store_sync;", 1),
+                ("sync_now", "store_sync::sync_elsewhere(&app, &db_state, &cloud)", 1),
+                ("share_current_profile", "store_sync::refuse_share(conn)?", 1),
+                ("profile_sync_stats", "store_sync::is_linked(conn)", 1),
+                ("profile_sync_stats", "store_sync::peek(", 1),
+                ("force_push_profile", "store_sync::forget_sync_cursor(&db_state)", 1),
+                ("run", "store_sync::store_status", 1),
+            ],
+        );
     }
 }

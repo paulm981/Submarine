@@ -158,6 +158,24 @@ pub fn check_seen_run_on_connect(
 }
 
 // Every call from the original project's code into this file (fork_hooks.rs):
+/// "Keep it SSH" (or RDP) for a server whose switch to telnet or VNC is held:
+/// it stays as it was on its old port, saved as this device's own edit, so the
+/// next sync takes it back to that everywhere (approvals::keep_ssh). False
+/// when no switch was held.
+#[tauri::command]
+pub(crate) async fn keep_server_ssh(db_state: tauri::State<'_, crate::DbState>, server_id: i32) -> Result<bool, String> {
+    let kept = {
+        let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+        let conn = guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        let uuid = server_uuid(conn, server_id as i64).ok_or("[SYNC] NO_SUCH_SERVER")?;
+        keep_ssh(conn, &uuid)?
+    };
+    if kept {
+        crate::save_vault_internal(&db_state)?;
+    }
+    Ok(kept)
+}
+
 // a sync that drops one, or the lines that bring the file in, fails here.
 #[cfg(test)]
 mod hook_tests {
@@ -173,13 +191,16 @@ mod hook_tests {
                 ("", "pub(crate) use held_switch::*;", 1),
             ],
         );
+        assert_hooks("lib.rs", include_str!("../lib.rs"), &[("run", "approvals::keep_server_ssh", 1)]);
+        // The sync merge's batch, out of lib.rs into a fork file (#163).
         assert_hooks(
-            "lib.rs",
-            include_str!("../lib.rs"),
+            "sync_merge.rs",
+            include_str!("../sync_merge.rs"),
             &[
                 ("merge_batch", "approvals::held_switch(", 1),
                 ("merge_batch", "approvals::before_merge(", 1),
                 ("merge_batch", "approvals::hold_switch(", 1),
+                ("outgoing", "approvals::held_switch(", 1),
             ],
         );
     }

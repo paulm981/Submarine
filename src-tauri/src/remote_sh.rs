@@ -210,7 +210,6 @@ mod tests {
                 ("server_runs_login_shell", "remote_sh::quote(", 1),
                 ("ssh_iptables_chain", "remote_sh::quote_words(", 1),
                 ("ssh_nft_chain", "remote_sh::quote_words(", 1),
-                ("sh_user_command", "remote_sh::sh_command(", 1),
                 ("probe_sudo_files", "remote_sh::sh_command(", 1),
             ],
         );
@@ -226,6 +225,7 @@ mod tests {
                 ("root_channel_start", "remote_sh::quote_words(", 2),
                 ("sftp_probe_command", "remote_sh::sh_command_with(", 1),
                 ("find_sftp_server", "remote_sh::sh_command(", 1),
+                ("sh_user_command", "remote_sh::sh_command(", 1),
             ],
         );
         assert_hooks(

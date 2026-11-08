@@ -32,74 +32,48 @@ mod fonts;
 mod webkit_sandbox;
 mod sftp_listing;
 mod sftp_remove;
-mod local_open;
-mod host_import;
-mod rdp_links;
-mod highlight;
-mod server_os;
-mod local_term;
-mod tree_moves;
-mod multiexec;
-mod store_sync;
 mod shell_sftp;
-mod remote_sh;
 mod archive;
 mod approvals;
 mod agent_auth;
 mod ssh_config;
-mod applog;
-mod term_output;
 mod proxy_command;
-mod diagnose;
-mod jump_gone;
-mod ping;
-mod hop_policy;
-mod ai;
 mod child_env;
 mod open_policy;
+mod known_hosts;
 mod rdp;
 mod quick_unlock;
 mod rdp_client;
 mod rdp_share;
 mod term_filter;
 mod vault_backup;
-mod known_hosts;
-mod trust_policy;
-mod secret_policy;
-// Root over SSH (sudo / dzdo), the fork's own: root_ssh.rs. Its macro
-// (`root_tool_find!`) is used here too.
+// The fork's own modules, each in a file of its own (#136, #163).
+mod local_open; mod host_import; mod rdp_links; mod highlight; mod server_os; mod local_term; mod tree_moves; mod multiexec; mod store_sync;
+mod remote_sh; mod applog; mod term_output; mod diagnose; mod jump_gone; mod ping; mod hop_policy; mod ai; mod trust_policy; mod secret_policy;
+// Root over SSH (sudo / dzdo): root_ssh.rs. Its macro (`root_tool_find!`) is
+// used here too.
 #[macro_use]
 mod root_ssh;
 use root_ssh::*;
-// More of the fork's own, each in a file of its own (#136).
-mod live_edit;
-use live_edit::*;
-mod connect_diag;
-use connect_diag::*;
-mod downloads;
-use downloads::*;
-mod session_import;
-use session_import::*;
-mod firewall;
-use firewall::*;
-mod remote_writes;
-use remote_writes::*;
-mod diagnostics;
-use diagnostics::*;
-mod synced_tunnels;
-use synced_tunnels::*;
-mod sync_diff;
-use sync_diff::*;
-mod server_look;
-use server_look::*;
-mod clone_server;
-use clone_server::*;
+mod live_edit; use live_edit::*;
+mod connect_diag; use connect_diag::*;
+mod downloads; use downloads::*;
+mod session_import; use session_import::*;
+mod firewall; use firewall::*;
+mod remote_writes; use remote_writes::*;
+mod diagnostics; use diagnostics::*;
+mod synced_tunnels; use synced_tunnels::*;
+mod sync_diff; use sync_diff::*;
+mod server_look; use server_look::*;
+mod clone_server; use clone_server::*;
 mod keep_session;
 mod bulk_pick;
+mod vault_schema;
+mod sync_merge;
+mod profile_create;
+mod clipboard_read;
 #[cfg(windows)]
 mod windows_clipboard;
-#[cfg(windows)]
-use windows_clipboard::*;
 #[cfg(test)]
 mod fork_hooks;
 #[cfg(target_os = "android")]
@@ -1044,24 +1018,6 @@ struct EntitySpec {
     fks: &'static [Fk],
 }
 
-/// Nullable synced columns added after their entity already synced. A peer on
-/// an older build sends records without the key, which means "this build
-/// doesn't know the field", not "clear it" — so the merge keeps this device's
-/// value then (and leaves it NULL on a fresh insert). `position` has its own
-/// shim in apply_entity, as it is NOT NULL. `scope` is a command's (#185).
-/// `protocol` is a server's type (#173: NULL for SSH, "rdp", "telnet",
-/// "vnc"): a peer from before it doesn't turn this device's RDP, telnet or
-/// VNC server back into an SSH one.
-const LATE_COLS: &[&str] = &["terminal_theme", "highlight", "scope", "protocol", "run_on_connect_every"];
-
-/// LATE_COLS whose NULL means "not known here", and so is left out of what
-/// this device sends, as an older peer leaves it out. A server's row inserted
-/// from an older peer's record has them NULL; sent on as null (the store sync
-/// sends every row each time, and a merge may pick that copy), it would
-/// clear the scheme or highlight set on a device that has one. The app's
-/// default is stored as "" instead (`set_server_look`), which is sent.
-const NULL_IS_UNKNOWN: &[&str] = &["terminal_theme", "highlight"];
-
 /// Applied in this order so most FK referents already exist on merge; the two
 /// self-referential FKs (folders.parent_id, servers.jump_host_id) are resolved
 /// in a deferred fixup pass afterwards.
@@ -1243,24 +1199,8 @@ fn collect_local_records(conn: &Connection, key: &[u8; 32], since: &str) -> Resu
             .query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
             .map_err(|e| format!("[SYNC] SER_QUERY {}: {e}", spec.table))?;
         for row in rows {
-            let (uuid, updated_at, mut payload) = row.map_err(|e| format!("[SYNC] SER_ROW {}: {e}", spec.table))?;
-            if spec.table == "servers" {
-                let mut obj: serde_json::Value = serde_json::from_str(&payload).map_err(|e| format!("[SYNC] SER_ROW {}: {e}", spec.table))?;
-                // A server whose switch to telnet or VNC this device holds still
-                // has that protocol and port everywhere else: an edit here mustn't
-                // undo it (approvals::held_switch).
-                if let Some(switch) = approvals::held_switch(conn, &uuid) {
-                    obj["protocol"] = serde_json::Value::String(switch.protocol);
-                    if let Some(port) = switch.port {
-                        obj["port"] = serde_json::Value::from(port);
-                    }
-                }
-                // What this device doesn't know, it doesn't send (NULL_IS_UNKNOWN).
-                if let Some(o) = obj.as_object_mut() {
-                    o.retain(|k, v| !(v.is_null() && NULL_IS_UNKNOWN.contains(&k.as_str())));
-                }
-                payload = obj.to_string();
-            }
+            let (uuid, updated_at, payload) = row.map_err(|e| format!("[SYNC] SER_ROW {}: {e}", spec.table))?;
+            let payload = sync_merge::outgoing(conn, spec.table, &uuid, payload)?; // the fork's changes to a server's
             out.push(SyncRecord {
                 uuid,
                 entity_type: spec.table.to_string(),
@@ -1294,25 +1234,11 @@ fn apply_remote_records(conn: &Connection, key: &[u8; 32], records: &[SyncRecord
     if records.is_empty() {
         return Ok(0);
     }
-    let skipped = with_merge_flag(conn, |c| apply_remote_inner(c, key, records, hlc, MERGE_MAX_BYTES))?;
-    // Folder moves made on two devices can merge into a loop; undone here, as
-    // this device's edit, which the next push carries back (tree_moves.rs).
-    tree_moves::break_folder_loops(conn).map_err(|e| format!("[SYNC] FOLDER_LOOP: {e}"))?;
-    // A Remote Desktop link from a device on an older version becomes an RDP
-    // server here, as this device's own did (rdp_links.rs).
-    rdp_links::move_into_servers(conn)?;
-    Ok(skipped)
-}
-
-/// Run `f` with the sync auto-stamp triggers held back (the `merge` flag the
-/// triggers' GUARD reads), so what it writes isn't stamped as a local edit to
-/// push: a sync merge, or a value only this device keeps (server_os.rs).
-pub(crate) fn with_merge_flag<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
     conn.execute("INSERT INTO sync_flags(key,val) VALUES('merge',1) ON CONFLICT(key) DO UPDATE SET val=1", [])
         .map_err(|e| format!("[SYNC] MERGE_ON: {e}"))?;
-    let r = f(conn);
+    let r = apply_remote_inner(conn, key, records, hlc, MERGE_MAX_BYTES);
     let _ = conn.execute("UPDATE sync_flags SET val=0 WHERE key='merge'", []);
-    r
+    sync_merge::after_merge(conn, r)
 }
 
 /// The id and stamp a record needs before the merge looks at it, by the
@@ -1472,7 +1398,7 @@ fn apply_remote_inner(
     // sync from corrupting local data.
     let tx = conn.unchecked_transaction().map_err(|e| format!("[SYNC] TX_BEGIN: {e}"))?;
     let size_before = vault_bytes(&tx)?;
-    let skipped = merge_batch(&tx, key, &records, refused.len(), true)?;
+    let skipped = sync_merge::merge_batch(&tx, key, &records, refused.len(), true)?;
     // Not toward the size the vault can no longer be saved or opened at. An
     // honest server never sends that much, so none of it lands.
     let size_after = vault_bytes(&tx)?;
@@ -1485,115 +1411,6 @@ fn apply_remote_inner(
     tx.commit().map_err(|e| format!("[SYNC] TX_COMMIT: {e}"))?;
     if skipped > 0 {
         eprintln!("[SYNC] merge committed with {skipped} record(s) skipped");
-    }
-    Ok(skipped)
-}
-
-/// One sync batch, inside the merge's transaction `tx`: the records, then the
-/// deletions, then everything that's checked once they're all in (links, the
-/// holds of a shared profile). Returns `skipped` plus the records that didn't
-/// apply. With `hold` false the records are ones held before (a wipe, a big
-/// deletion) that this device's user said yes to: those aren't held again,
-/// but whatever else in them runs by itself, or lets the AI do more, still is.
-fn merge_batch(tx: &Connection, key: &[u8; 32], records: &[&SyncRecord], mut skipped: usize, hold: bool) -> Result<usize, String> {
-    // FKs to re-resolve once the whole batch has landed. `ref_table` has to ride
-    // along: the lookup used to read `SELECT id FROM {table}` — the row's OWN
-    // table — which was only ever correct because the sole queued FKs were the
-    // self-referential ones (folders.parent_id, servers.jump_host_id), where the
-    // two tables happen to be the same. Any cross-table FK looked up the uuid in
-    // entirely the wrong table, found nothing, and NULLed a perfectly good link.
-    let mut fk_fixups: Vec<FkFixup> = Vec::new();
-    // Per-record application is best-effort: a single record that won't decrypt
-    // or parse — a corrupt or hostile blob from a broken/compromised server — is
-    // logged and skipped, never aborting the merge. One poison record must not be
-    // able to block every OTHER record (or every future sync) from applying;
-    // each one counts in `skipped`.
-    //
-    // In a shared profile, whatever a record newly sets running by itself
-    // (commands on connect, autostart, forwards, monitor commands) is held
-    // until this device's user allows it — see approvals.rs. Holding is part
-    // of the merge's transaction: if it can't be recorded, nothing lands. It's
-    // done once the batch is in: a server's jump host lands in the repair pass.
-    let approvals_ready = approvals::ready(tx);
-    let shared = approvals_ready && approvals::profile_is_shared(tx);
-    let mut watched = Vec::new();
-    // A viewer's rows go nowhere, so a password they saved here is theirs alone
-    // (each person typing their own is a normal way to share a server list),
-    // and a record with none says nothing about it. The record lands, without
-    // emptying anything (`apply_entity`): held whole, the owner's new address
-    // would stop at this device.
-    let viewer = shared && approvals::is_viewer(tx);
-    // And a move (a server's folder, a folder's parent) that lets the AI do
-    // more on a server here is held too (ai/trust.rs): each server's AI
-    // policy as it is before the merge, to compare with after it.
-    let ai_before = if shared { ai::trust::before_sync(tx) } else { None };
-    // Each server's jump host before the merge: one the merge deletes leaves
-    // the servers behind it refusing to go direct (jump_gone.rs).
-    let jumps_before = jump_gone::links_before(tx);
-    for spec in ENTITIES {
-        let watch = shared && approvals::watches(spec.table);
-        for rec in records.iter().filter(|r| !r.deleted && r.entity_type == spec.table) {
-            // In a shared profile, a record that empties a saved key or
-            // password waits for this device's user, like an SSH key's
-            // deletion (approvals::hold_wipe). A personal profile takes it.
-            if hold && shared && !viewer && empties_a_secret(tx, key, rec) {
-                approvals::hold_wipe(tx, rec)?;
-                continue;
-            }
-            // A server's held switch to telnet or VNC stays held after the
-            // share is left, like everything else held: outside a share, only
-            // that part runs, for a server that has one.
-            let held_switch = !watch
-                && approvals_ready
-                && spec.table == "servers"
-                && approvals::held_switch(tx, &rec.uuid).is_some();
-            // A held switch's protocol and port go back in the row for the
-            // record to merge over, and hold_switch keeps this device's again
-            // after it, whether the record applied or not.
-            let before = if watch || held_switch { approvals::before_merge(tx, spec.table, &rec.uuid)? } else { None };
-            let tunnels_before = if spec.table == "servers" { stored_tunnels(tx, &rec.uuid) } else { None };
-            let applied = apply_entity(tx, key, spec, rec, viewer, &mut fk_fixups);
-            if let Some(old) = tunnels_before {
-                note_synced_tunnels(tx, &rec.uuid, &old)?;
-            }
-            // Held once the batch is in (below), applied or not: a held
-            // switch's row has to get this device's values back either way.
-            if watch {
-                watched.push((spec.table, &rec.uuid, before));
-            } else if held_switch {
-                approvals::hold_switch(tx, &rec.uuid, before.as_ref())?;
-            }
-            if let Err(e) = applied {
-                skipped += 1;
-                eprintln!("[SYNC] skipped record uuid={} type={}: {}", rec.uuid, rec.entity_type, e);
-                continue;
-            }
-            if shared {
-                approvals::release_wipe(tx, rec)?;
-            }
-        }
-    }
-    // In a shared profile, a sync that would delete much of it at once, or an
-    // SSH key, waits for this device's user (approvals::hold_deletions).
-    let tombstones: Vec<&SyncRecord> = records.iter().filter(|r| r.deleted).copied().collect();
-    let held = if hold && shared { approvals::hold_deletions(tx, &tombstones)? } else { Default::default() };
-    for rec in tombstones.iter().filter(|r| !held.contains(&r.uuid)) {
-        if let Err(e) = in_savepoint(tx, || apply_tombstone(tx, rec))? {
-            skipped += 1;
-            eprintln!("[SYNC] skipped tombstone uuid={} type={}: {}", rec.uuid, rec.entity_type, e);
-        }
-    }
-    // Re-resolve every optional FK against the FINAL state of the batch, now that
-    // both the entities and the tombstones have landed.
-    repair_links(tx, fk_fixups);
-    for (table, uuid, before) in &watched {
-        approvals::hold_changes(tx, table, uuid, before.as_ref())?;
-    }
-    jump_gone::note_lost(tx, &jumps_before).map_err(|e| format!("[SYNC] JUMP_GONE: {e}"))?;
-    // Everything in place: hold each server whose AI policy the merge
-    // loosened, until this device's user allows it.
-    if let Some(before) = ai_before {
-        ai::trust::hold_loosened(tx, before)?;
     }
     Ok(skipped)
 }
@@ -1612,12 +1429,8 @@ fn repair_links(conn: &Connection, fixups: Vec<FkFixup>) {
             rusqlite::params![id, f.uuid],
         ) {
             eprintln!("[SYNC] fk fixup skipped {}.{} uuid={}: {}", f.table, f.fk_col, f.uuid, e);
-        } else if id.is_none() && f.table == "servers" && f.fk_col == "jump_host_id" {
-            // It came with a jump host this device doesn't have: it isn't
-            // connected directly without asking (jump_gone.rs).
-            if let Err(e) = jump_gone::note_unresolved(conn, &f.uuid) {
-                eprintln!("[SYNC] jump host note skipped uuid={}: {}", f.uuid, e);
-            }
+        } else {
+            jump_gone::after_fixup(conn, id.is_none(), &f.table, &f.fk_col, &f.uuid);
         }
     }
 }
@@ -1673,7 +1486,7 @@ fn apply_entity(conn: &Connection, key: &[u8; 32], spec: &EntitySpec, rec: &Sync
     for c in spec.cols {
         columns.push((*c).into());
         let val = obj.get(*c);
-        if val.is_none() && LATE_COLS.contains(c) {
+        if val.is_none() && sync_merge::LATE_COLS.contains(c) {
             keep_local.push(c);
         }
         // Backward-compat shim: `position` was added to servers' synced cols in
@@ -2179,13 +1992,8 @@ async fn sync_now(
     db_state: tauri::State<'_, DbState>,
     cloud: tauri::State<'_, std::sync::Arc<cloud::CloudState>>,
 ) -> Result<SyncReport, String> {
-    // A profile that syncs through the user's own folder or repository syncs
-    // there, and never with the cloud (store_sync.rs).
-    if let Some(report) = store_sync::sync_if_linked(&app, &db_state).await? {
+    if let Some(report) = store_sync::sync_elsewhere(&app, &db_state, &cloud).await? {
         return Ok(report);
-    }
-    if !cloud.enabled() {
-        return Err("[SYNC] NOT_SET_UP: this profile doesn't sync anywhere yet — set that up on its Profile tab.".into());
     }
     let session = cloud.session().await?;
     sync_with(&app, &db_state, &cloud, &session, None).await
@@ -3204,12 +3012,7 @@ async fn share_current_profile(
         if already.is_some() {
             return Err("[SHARE] ALREADY_SHARED: this profile is already shared — stop sharing first if you want a new share.".into());
         }
-        // It syncs through the user's own storage, never the cloud, so a
-        // share would never see its changes; and revoking a member rotates
-        // the key, which would split the store in two.
-        if store_sync::is_linked(conn) {
-            return Err("[SHARE] STORE_SYNC: this profile syncs through your own storage — stop that on the Profile tab before sharing it.".into());
-        }
+        store_sync::refuse_share(conn)?;
         (get_or_create_dek(conn)?.0, unlinked, db_state.generation_now())
     };
     let sealed_self = hex::encode(identity::seal_to(&my_pub, &dek)?);
@@ -3481,18 +3284,10 @@ async fn import_shared_profile(
 /// `opened` is the generation the half-built profile was opened at (None when
 /// opening it is what failed). If another profile has been opened since, that
 /// one stays open; only the half-built file goes.
-///
-/// Only a file this call made goes: the callers open with `must_create`, so
-/// it's this call's when the profile was opened (`opened`), or when opening
-/// got as far as setting it up here (its last step, the first save, failed).
-/// A profile that another window made or opened meanwhile stays, and so does
-/// one open in another window now.
 fn discard_half_built_profile(app: &tauri::AppHandle, name: &str, opened: Option<u64>) {
     use tauri::Manager as _;
     let state = app.state::<DbState>();
-    let path = profile_path(app, name).ok();
-    let made_here = opened.is_some()
-        || path.is_some() && state.db_path.lock().ok().is_some_and(|g| g.as_ref() == path.as_ref());
+    let made_here = profile_create::made_here(app, &state, name, opened); // before the state below goes
     // Under the connection's lock when it can be had, as in close_profile.
     let mut conn = state.conn.lock().ok();
     let ours = opened.is_none_or(|g| state.generation_now() == g);
@@ -3508,26 +3303,9 @@ fn discard_half_built_profile(app: &tauri::AppHandle, name: &str, opened: Option
     if ours {
         if let Ok(mut g) = state.active_profile.lock() { *g = None; }
     }
-    let Some(p) = path.filter(|_| made_here) else { return };
-    let lock_path = p.with_extension("submarine.lock");
-    // Its one-window lock (#204) goes with it, or the name would stay "open in
-    // another window" in this one until it quit. Not held here any more
-    // (another profile opened here since): only when no other window has it.
-    let ours = state
-        .profile_lock
-        .lock()
-        .ok()
-        .and_then(|mut held| if held.as_ref().is_some_and(|(locked, _)| *locked == p) { held.take() } else { None });
-    let lock = match ours {
-        Some((_, file)) => ProfileLock::New(file),
-        None => match try_lock_file(&lock_path) {
-            Ok(lock) => lock,
-            Err(_) => return,
-        },
-    };
-    let _ = fs::remove_file(&p);
-    drop(lock);
-    let _ = fs::remove_file(lock_path);
+    if let Some(p) = made_here {
+        profile_create::remove_profile_file(&state, &p);
+    }
 }
 
 /// New device: restore one of YOUR OWN personal cloud profiles using nothing but
@@ -4186,7 +3964,7 @@ fn resolve_held(conn: &Connection, key: &[u8; 32], hlc: &hlc::Hlc, delete_them: 
             // held again, but whatever else the records change that runs by
             // itself, or lets the AI do more, still is (merge_batch).
             let records: Vec<&SyncRecord> = wipes.iter().chain(&deletions).collect();
-            let skipped = merge_batch(&tx, key, &records, 0, false)?;
+            let skipped = sync_merge::merge_batch(&tx, key, &records, 0, false)?;
             if skipped > 0 {
                 eprintln!("[SYNC] {skipped} held record(s) not applied");
             }
@@ -4680,19 +4458,6 @@ mod sync_engine_tests {
             .query_row("SELECT jump_host_id FROM servers WHERE name='app'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(dangling, None, "the link must be cleared, not left dangling");
-        // ...and C won't connect it directly without asking (jump_gone.rs).
-        let app_id: i64 = c.query_row("SELECT id FROM servers WHERE name='app'", [], |r| r.get(0)).unwrap();
-        let refused = crate::jump_gone::refuse(&c, app_id).unwrap_err();
-        assert!(refused.starts_with("[JUMP_GONE] app's jump host (bastion) was deleted"), "{refused}");
-        // A device that never had the bastion gets 'app' with a jump host it
-        // can't find: refused too, without the name.
-        let (d, hd) = device("D");
-        let app_uuid: String = a.query_row("SELECT uuid FROM servers WHERE name='app'", [], |r| r.get(0)).unwrap();
-        let app_only: Vec<SyncRecord> = seed.iter().filter(|r| r.uuid == app_uuid).cloned().collect();
-        assert_eq!(app_only.len(), 1);
-        apply_remote_records(&d, &KEY, &app_only, &hd).unwrap();
-        let d_app: i64 = d.query_row("SELECT id FROM servers WHERE name='app'", [], |r| r.get(0)).unwrap();
-        assert!(crate::jump_gone::refuse(&d, d_app).is_err(), "no jump host it can find: refused");
     }
 
     #[test]
@@ -4838,7 +4603,7 @@ mod sync_engine_tests {
         assert_eq!(parent_of(&b, "child"), None, "a move to the top level reaches B");
         assert_eq!(parent_of(&b, "grandchild").as_deref(), Some("child"));
 
-        delete_folder_tree(&a, &folder_subtree(&a, id(&a, "child")).unwrap()).unwrap();
+        crate::tree_moves::delete_folder_tree(&a, &crate::tree_moves::folder_subtree(&a, id(&a, "child")).unwrap()).unwrap();
         apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
         let left: Vec<String> = b
             .prepare("SELECT name FROM folders ORDER BY name").unwrap()
@@ -4882,171 +4647,85 @@ mod sync_engine_tests {
         assert_eq!(pos, 0, "a missing position must default to 0");
     }
 
-    // A server's terminal scheme syncs like its other fields — and an edit
-    // from a peer on a build without the column (the key absent from its
-    // record) changes what it changed but keeps the scheme, both on a row
-    // that exists and on one it inserts (NULL there).
+    // Regression for the UPDATE-arm half of the 0.3.5 position shim. The INSERT
+    // case above lands a missing position as 0; here the row ALREADY EXISTS with
+    // a manual drag-rank when a pre-0.3.5 peer (payload omits `position`) syncs a
+    // winning edit to some OTHER field. The merge must apply the edit but KEEP
+    // the local rank — binding the coerced 0 into `position=excluded.position`
+    // would silently reset a deliberate ordering on every cross-version edit.
     #[test]
-    fn terminal_theme_syncs_and_an_older_peer_keeps_it() {
-        let (a, ha) = device("A");
-        a.execute("INSERT INTO servers(name, host, port, terminal_theme) VALUES('prod','h1',22,'nord')", []).unwrap();
+    fn a_pre_0_3_5_peer_edit_preserves_local_drag_position() {
+        let (a, _ha) = device("A");
+        a.execute("INSERT INTO servers(name, host, port, password) VALUES('prod','h1',22,'SECRET')", []).unwrap();
+
+        // B receives the server, then the user drags it to rank 5.
         let (b, hb) = device("B");
         apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
-        let theme: Option<String> = b.query_row("SELECT terminal_theme FROM servers WHERE name='prod'", [], |r| r.get(0)).unwrap();
-        assert_eq!(theme.as_deref(), Some("nord"), "the scheme must sync");
+        b.execute("UPDATE servers SET position=5 WHERE name='prod'", []).unwrap();
+        let pos_before: i64 = b.query_row("SELECT position FROM servers WHERE name='prod'", [], |r| r.get(0)).unwrap();
+        assert_eq!(pos_before, 5, "test setup: B's local rank is 5");
 
-        // An older peer edits the host: its record has no terminal_theme key.
+        // A (an old peer) edits the host. Strip `position` from the blob and
+        // stamp it a minute ahead of now (still a stamp the merge accepts), so
+        // the record deterministically WINS LWW on B and reaches the UPDATE
+        // arm — the case this fix guards.
         a.execute("UPDATE servers SET host='h2' WHERE name='prod'", []).unwrap();
         let mut recs = collect_local_records(&a, &KEY, "").unwrap();
+        let ahead = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 60_000;
         for r in recs.iter_mut() {
             if r.entity_type == "servers" {
                 let plain = decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap();
                 let mut obj: serde_json::Value = serde_json::from_slice(&plain).unwrap();
-                obj.as_object_mut().unwrap().remove("terminal_theme");
+                obj.as_object_mut().unwrap().remove("position");
                 r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
-                r.updated_at = ha.tick();
+                r.updated_at = format!("{ahead:015}:00000:zzz");
             }
         }
         apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
-        let (host, theme): (String, Option<String>) = b
-            .query_row("SELECT host, terminal_theme FROM servers WHERE name='prod'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+
+        let (host, pos): (String, i64) = b
+            .query_row("SELECT host, position FROM servers WHERE name='prod'", [], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
-        assert_eq!(host, "h2", "the older peer's edit must apply");
-        assert_eq!(theme.as_deref(), Some("nord"), "an absent key must keep the local scheme");
-
-        // A new device inserting the older peer's record gets no scheme.
-        let (c, hc) = device("C");
-        apply_remote_records(&c, &KEY, &recs, &hc).unwrap();
-        let theme: Option<String> = c.query_row("SELECT terminal_theme FROM servers WHERE name='prod'", [], |r| r.get(0)).unwrap();
-        assert_eq!(theme, None);
-
-        // An explicit null, from a peer that knows the column but stores the
-        // app's default as NULL (a build from before NULL_IS_UNKNOWN), still
-        // clears it.
-        let mut recs = collect_local_records(&a, &KEY, "").unwrap();
-        for r in recs.iter_mut() {
-            if r.entity_type == "servers" {
-                let plain = decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap();
-                let mut obj: serde_json::Value = serde_json::from_slice(&plain).unwrap();
-                obj["terminal_theme"] = serde_json::Value::Null;
-                r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
-                r.updated_at = ha.tick();
-            }
-        }
-        apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
-        let theme: Option<String> = b.query_row("SELECT terminal_theme FROM servers WHERE name='prod'", [], |r| r.get(0)).unwrap();
-        assert_eq!(theme, None, "a null from a peer that knows the column clears it");
+        assert_eq!(host, "h2", "the newer remote field edit must apply");
+        assert_eq!(pos, 5, "a pre-0.3.5 peer edit must NOT reset the local drag position to 0");
     }
 
-    // A device that got a server from an older peer (whose record has no
-    // scheme and no highlight set) holds both as NULL: not known here. Its
-    // copy of that record, passed on, must not clear them where they're set:
-    // the store sync sends every row each time, and a merge can pick that
-    // copy. The app's default, chosen here, is "" and does travel.
+    // RDP servers (issue #3): `protocol` travels with the server; an RDP node
+    // edited by a peer from before RDP (its payload has no `protocol` key)
+    // stays an RDP node, while a newer peer's explicit NULL makes it SSH.
     #[test]
-    fn a_scheme_not_known_here_is_not_passed_on_as_cleared() {
-        let (a, ha) = device("A");
-        a.execute("INSERT INTO servers(name, host, port) VALUES('prod','h1',22)", []).unwrap();
-        let id: i32 = a.query_row("SELECT id FROM servers", [], |r| r.get(0)).unwrap();
-        set_server_look(&a, "terminal_theme", id, Some("nord")).unwrap();
-        set_server_look(&a, "highlight", id, Some("network")).unwrap();
+    fn protocol_syncs_and_an_older_peers_edit_keeps_it() {
+        let (a, _ha) = device("A");
+        a.execute("INSERT INTO servers(name, host, port, protocol) VALUES('win','w1',3389,'rdp')", []).unwrap();
         let (b, hb) = device("B");
         apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let proto = |c: &Connection| -> Option<String> { c.query_row("SELECT protocol FROM servers WHERE name='win'", [], |r| r.get(0)).unwrap() };
+        assert_eq!(proto(&b).as_deref(), Some("rdp"), "the protocol syncs");
 
-        // An older peer edits the host: its record has neither key.
-        a.execute("UPDATE servers SET host='h2'", []).unwrap();
-        let mut older = collect_local_records(&a, &KEY, "").unwrap();
-        for r in older.iter_mut().filter(|r| r.entity_type == "servers") {
-            let plain = decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap();
-            let mut obj: serde_json::Value = serde_json::from_slice(&plain).unwrap();
-            obj.as_object_mut().unwrap().remove("terminal_theme");
-            obj.as_object_mut().unwrap().remove("highlight");
-            r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
-            r.updated_at = ha.tick();
-        }
-        // C, new, gets the server from it, and passes its copy on to B,
-        // which hasn't seen the older peer's edit yet.
-        let (c, hc) = device("C");
-        apply_remote_records(&c, &KEY, &older, &hc).unwrap();
-        apply_remote_records(&b, &KEY, &collect_local_records(&c, &KEY, "").unwrap(), &hb).unwrap();
-        let row: (String, Option<String>, Option<String>) = b
-            .query_row("SELECT host, terminal_theme, highlight FROM servers", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .unwrap();
-        assert_eq!(row, ("h2".into(), Some("nord".into()), Some("network".into())), "the edit applies, the look stays");
-
-        // Saving the default over a NULL on C isn't a change.
-        let cid: i32 = c.query_row("SELECT id FROM servers", [], |r| r.get(0)).unwrap();
-        assert_eq!(set_server_look(&c, "terminal_theme", cid, None).unwrap(), 0);
-
-        // The app's default chosen on A reaches B.
-        set_server_look(&a, "terminal_theme", id, None).unwrap();
-        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
-        let theme: Option<String> = b.query_row("SELECT terminal_theme FROM servers", [], |r| r.get(0)).unwrap();
-        assert_eq!(theme.as_deref(), Some(""), "the app's default is a value that travels");
-    }
-
-    #[test]
-    fn a_servers_highlight_set_syncs_and_an_older_peer_keeps_it() {
-        let (a, ha) = device("A");
-        a.execute("INSERT INTO servers(name, host, port, highlight) VALUES('core','h1',22,'network')", []).unwrap();
-        let (b, hb) = device("B");
-        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
-        let set: Option<String> = b.query_row("SELECT highlight FROM servers WHERE name='core'", [], |r| r.get(0)).unwrap();
-        assert_eq!(set.as_deref(), Some("network"));
-
-        // An older peer's edit has no highlight key: the choice stays.
-        a.execute("UPDATE servers SET host='h2' WHERE name='core'", []).unwrap();
+        // A peer from before RDP edits the host: no `protocol` key, newer stamp.
+        a.execute("UPDATE servers SET host='w2' WHERE name='win'", []).unwrap();
+        let ahead = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 60_000;
         let mut recs = collect_local_records(&a, &KEY, "").unwrap();
         for r in recs.iter_mut().filter(|r| r.entity_type == "servers") {
-            let plain = decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap();
-            let mut obj: serde_json::Value = serde_json::from_slice(&plain).unwrap();
-            obj.as_object_mut().unwrap().remove("highlight");
+            let mut obj: serde_json::Value = serde_json::from_slice(&decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap()).unwrap();
+            assert!(obj.as_object_mut().unwrap().remove("protocol").is_some(), "a current peer always sends the key");
             r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
-            r.updated_at = ha.tick();
+            r.updated_at = format!("{ahead:015}:00000:zzz");
         }
         apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
-        let (host, set): (String, Option<String>) = b
-            .query_row("SELECT host, highlight FROM servers WHERE name='core'", [], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap();
-        assert_eq!(host, "h2");
-        assert_eq!(set.as_deref(), Some("network"));
-    }
+        let host: String = b.query_row("SELECT host FROM servers WHERE name='win'", [], |r| r.get(0)).unwrap();
+        assert_eq!(host, "w2", "the edit applies");
+        assert_eq!(proto(&b).as_deref(), Some("rdp"), "and the node stays an RDP server");
 
-    #[test]
-    fn highlight_rules_sync_edit_and_delete() {
-        let (a, ha) = device("A");
-        let rule = |pattern: &str| highlight::HighlightRule {
-            id: None,
-            pattern: pattern.into(),
-            kind: "word".into(),
-            match_case: false,
-            color: "magenta".into(),
-            bold: true,
-            underline: false,
-            enabled: true,
-        };
-        let id = highlight::save(&a, &rule("deploy")).unwrap();
-        highlight::save(&a, &rule("rollback")).unwrap();
-        let (b, hb) = device("B");
-        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
-        let got = highlight::list(&b).unwrap();
-        assert_eq!(got.iter().map(|r| r.pattern.as_str()).collect::<Vec<_>>(), ["deploy", "rollback"]);
-        assert!(got[0].bold && got[0].color == "magenta");
-
-        // An edit, then a deletion, on A reach B.
-        let mut edited = rule("deployed");
-        edited.id = Some(id);
-        edited.underline = true;
-        highlight::save(&a, &edited).unwrap();
-        a.execute("DELETE FROM highlight_rules WHERE pattern='rollback'", []).unwrap();
+        // A current peer turns it back into an SSH server: an explicit NULL.
+        a.execute("UPDATE servers SET protocol=NULL, host='w3' WHERE name='win'", []).unwrap();
+        let later = ahead + 60_000;
         let mut recs = collect_local_records(&a, &KEY, "").unwrap();
-        for r in recs.iter_mut().filter(|r| r.entity_type == "highlight_rules") {
-            r.updated_at = ha.tick();
+        for r in recs.iter_mut().filter(|r| r.entity_type == "servers") {
+            r.updated_at = format!("{later:015}:00000:zzz");
         }
         apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
-        let got = highlight::list(&b).unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!((got[0].pattern.as_str(), got[0].underline), ("deployed", true));
+        assert_eq!(proto(&b), None, "NULL from a current peer makes it SSH again");
     }
 
     // #22: which servers a command is for syncs, and a peer from before it
@@ -6650,14 +6329,8 @@ async fn force_push_profile(
     // sync fills the partition from this vault, DEK escrow record included.
     // Only this profile's, though: if another opened meanwhile, the sync
     // refuses, and with no cursor this profile's next sync is a full one.
-    forget_sync_cursor(&db_state)?;
+    store_sync::forget_sync_cursor(&db_state)?;
     sync_with_from(&app, &db_state, &cloud, &session, Some(generation), false).await
-}
-
-/// Drops the open profile's delta-sync cursor: the next round is a full one.
-fn forget_sync_cursor(db_state: &DbState) -> Result<(), String> {
-    *db_state.sync_cursor.lock().map_err(|_| "[STATE] LOCK_SYNC_CURSOR")? = None;
-    Ok(())
 }
 
 /// Mark a profile as the active one. Subsequent `check_db_exists` /
@@ -6793,11 +6466,8 @@ async fn teardown_profile(
         ssh.forwarded_targets.lock().await.remove(sid);
         ssh.sftp_sessions.lock().await.remove(sid);
         ssh.sftp_elevation.lock().await.remove(sid);
-        ssh.root_access.lock().await.remove(sid);
-        ssh.root_gates.lock().await.remove(sid);
-        ssh.docker_root.lock().await.remove(sid);
+        ssh.forget_fork_session(sid).await; // ssh_manager/root_state.rs
         ssh.sftp_shell.lock().await.remove(sid);
-        ssh.session_users.lock().await.remove(sid);
         ssh.connections.lock().await.remove(sid);
         sweep_session_temp(sid);
     }
@@ -6832,13 +6502,8 @@ async fn teardown_profile(
     ssh.forwarded_targets.lock().await.clear();
     ssh.sftp_sessions.lock().await.clear();
     ssh.sftp_elevation.lock().await.clear();
-    ssh.root_access.lock().await.clear();
-    ssh.root_gates.lock().await.clear();
-    ssh.docker_root.lock().await.clear();
+    ssh.forget_fork_sessions().await; // ssh_manager/root_state.rs
     ssh.sftp_shell.lock().await.clear();
-    ssh.session_servers.lock().await.clear();
-    ssh.session_users.lock().await.clear();
-    ssh.terminal_servers.lock().await.clear();
     // Wipe every connect-time secret the user typed this profile (issue #30).
     ssh.prompted_secrets.lock().await.clear();
     ssh.connections.lock().await.clear();
@@ -7807,67 +7472,7 @@ async fn setup_master_db_with(
         ).map_err(|e| format!("[DATABASE] SCHEMA_CREATION_FAILED: {}", e))?;
     }
 
-    // Remote Desktop links (rdp_links.rs), for existing and fresh vaults alike: one
-    // `CREATE TABLE IF NOT EXISTS` here instead of a copy in each branch
-    // above, which is how a fresh vault once went without it. Additive, like
-    // run_on_connect: an older build simply doesn't see it.
-    conn.execute(rdp_links::SCHEMA, []).map_err(|e| format!("[DATABASE] RDP_TABLE_FAILED: {}", e))?;
-    // Its sync columns came later (links sync like servers do); links made
-    // before them get their ids from the backfill below.
-    for stmt in [
-        "ALTER TABLE rdp_links ADD COLUMN uuid TEXT",
-        "ALTER TABLE rdp_links ADD COLUMN updated_at TEXT",
-        "ALTER TABLE rdp_links ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE rdp_links ADD COLUMN edited_by TEXT",
-    ] {
-        if let Err(e) = conn.execute(stmt, []) {
-            let s = e.to_string();
-            if !s.contains("duplicate column name") {
-                return Err(format!("[DATABASE] RDP_SYNC_MIGRATION_FAILED: {}", s));
-            }
-        }
-    }
-    // The user's own highlight rules (highlight.rs): synced, made with their
-    // sync columns, before the backfill and triggers below.
-    conn.execute(highlight::SCHEMA, []).map_err(|e| format!("[DATABASE] HIGHLIGHT_TABLE_FAILED: {}", e))?;
-    // Saved walls (multiexec.rs): device-local too, added the same way. No
-    // longer used, but kept, so a profile's saved walls aren't lost.
-    conn.execute(multiexec::SCHEMA, []).map_err(|e| format!("[DATABASE] WALLS_TABLE_FAILED: {}", e))?;
-    // The AI's approval levels and rules (ai/trust.rs, #115): device-local
-    // too, so a shared profile never changes how much the AI may do here,
-    // and tied to this install, so a copy of the vault doesn't carry them.
-    if ai::trust::create_schema(&conn, &ai::trust::install_id(&app_handle))? {
-        needs_resave = true;
-    }
-    // The OS each server last reported (server_os.rs), for its badge.
-    // Device-local, not a synced column. Added here for both vault paths too;
-    // on a vault that has it already this answers "duplicate column".
-    if let Err(e) = conn.execute("ALTER TABLE servers ADD COLUMN os TEXT", []) {
-        let s = e.to_string();
-        if !s.contains("duplicate column name") {
-            return Err(format!("[DATABASE] SERVER_OS_MIGRATION_FAILED: {}", s));
-        }
-    }
-    conn.execute_batch(server_os::RESET_TRIGGER)
-        .map_err(|e| format!("[DATABASE] SERVER_OS_TRIGGER_FAILED: {}", e))?;
-    // The server's own terminal color scheme (an id from
-    // src/ui/terminalThemes.ts); "" = the app's default, NULL = never set
-    // (or set on an older peer only). Synced, and in LATE_COLS and
-    // NULL_IS_UNKNOWN, so an older peer's edit doesn't clear it.
-    if let Err(e) = conn.execute("ALTER TABLE servers ADD COLUMN terminal_theme TEXT", []) {
-        let s = e.to_string();
-        if !s.contains("duplicate column name") {
-            return Err(format!("[DATABASE] SERVER_THEME_MIGRATION_FAILED: {}", s));
-        }
-    }
-    // The server's own highlight set (an id from src/ui/highlight.ts); "" or
-    // NULL = this device's. Synced and in LATE_COLS, like terminal_theme.
-    if let Err(e) = conn.execute("ALTER TABLE servers ADD COLUMN highlight TEXT", []) {
-        let s = e.to_string();
-        if !s.contains("duplicate column name") {
-            return Err(format!("[DATABASE] SERVER_HIGHLIGHT_MIGRATION_FAILED: {}", s));
-        }
-    }
+    needs_resave |= vault_schema::add_fork_schema(&conn, &app_handle)?; // the fork's tables and columns
 
     conn.execute("PRAGMA foreign_keys = ON", []).map_err(|e| format!("[DATABASE] PRAGMA_FAILED: {}", e))?;
 
@@ -7943,10 +7548,7 @@ async fn setup_master_db_with(
     // this device's OK (see approvals.rs).
     approvals::create_schema(&conn)?;
     create_share_pins(&conn)?;
-    // Remote Desktop links are RDP servers now (issue #42, rdp_links.rs).
-    if rdp_links::move_into_servers(&conn)? > 0 {
-        needs_resave = true;
-    }
+    needs_resave |= rdp_links::move_into_servers(&conn)? > 0; // RDP links are RDP servers now (#42, rdp_links.rs)
 
     // Per-profile sync metadata (the DEK, and later the identity/grant state).
     // Created here so an existing vault gains it on first open under a v6 build.
@@ -9192,24 +8794,6 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
     Ok(list)
 }
 
-/// "Keep it SSH" (or RDP) for a server whose switch to telnet or VNC is held:
-/// it stays as it was on its old port, saved as this device's own edit, so the
-/// next sync takes it back to that everywhere (approvals::keep_ssh). False
-/// when no switch was held.
-#[tauri::command]
-async fn keep_server_ssh(db_state: tauri::State<'_, DbState>, server_id: i32) -> Result<bool, String> {
-    let kept = {
-        let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
-        let conn = guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-        let uuid = approvals::server_uuid(conn, server_id as i64).ok_or("[SYNC] NO_SUCH_SERVER")?;
-        approvals::keep_ssh(conn, &uuid)?
-    };
-    if kept {
-        save_vault_internal(&db_state)?;
-    }
-    Ok(kept)
-}
-
 /// Allow what this device held back for one server (see approvals.rs): the
 /// given items, or all of its items when `items` is empty. A monitor already
 /// polling that server picks up allowed commands at once, and allowed
@@ -9420,29 +9004,12 @@ async fn delete_folder(
     id: i32,
 ) -> Result<(), String> {
     // Same orphaned-poller problem as delete_server, one level up: this deletes
-    // every server in the folder and the folders inside it, so every one of
-    // their monitors has to be stopped first. Collect the ids while the rows
-    // still exist.
+    // every server in the folder and its subfolders, so every one of their
+    // monitors has to be stopped first. Collect the ids while the rows exist.
     let (folder_ids, doomed): (Vec<i64>, Vec<i32>) = {
         let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-        // A loop from sync is broken first (tree_moves.rs), so the folders
-        // inside this one are the ones the page shows inside it.
-        tree_moves::break_folder_loops(conn)
-            .map_err(|e| format!("[DATABASE] FOLDER_LOOP_REPAIR_FAILED: {}", e))?;
-        let folder_ids = folder_subtree(conn, id as i64)
-            .map_err(|e| format!("[DATABASE] FOLDER_TREE_QUERY_FAILED: {}", e))?;
-        let mut doomed = Vec::new();
-        let mut stmt = conn
-            .prepare("SELECT id FROM servers WHERE folder_id=?1")
-            .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_QUERY_FAILED: {}", e))?;
-        for fid in &folder_ids {
-            let rows = stmt
-                .query_map(rusqlite::params![fid], |r| r.get::<_, i32>(0))
-                .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_QUERY_FAILED: {}", e))?;
-            doomed.extend(rows.filter_map(|r| r.ok()));
-        }
-        (folder_ids, doomed)
+        tree_moves::folders_and_servers_in(conn, id)?
     };
     for node_id in doomed {
         monitor::stop_monitor(map.inner().clone(), node_id).await;
@@ -9451,56 +9018,10 @@ async fn delete_folder(
     {
         let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-        delete_folder_tree(conn, &folder_ids)?;
+        tree_moves::delete_folder_tree(conn, &folder_ids)?;
     }
     save_vault_internal(&state)?;
     Ok(())
-}
-
-/// Delete the given folders (a folder and its subtree) and every server and
-/// Remote Desktop link in them, all or nothing: a folder left behind would
-/// lose its parent and turn up at the top level. Each row goes through the
-/// sync delete trigger, so the deletions reach the profile's other devices.
-fn delete_folder_tree(conn: &rusqlite::Connection, folder_ids: &[i64]) -> Result<(), String> {
-    let tx = conn.unchecked_transaction().map_err(|e| format!("[DATABASE] TX_BEGIN: {}", e))?;
-    for fid in folder_ids {
-        // The servers that went through one of these as their jump host let go of it.
-        let doomed: Vec<i64> = tx
-            .prepare("SELECT id FROM servers WHERE folder_id=?1")
-            .and_then(|mut stmt| stmt.query_map(rusqlite::params![fid], |r| r.get(0))?.collect())
-            .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_QUERY_FAILED: {}", e))?;
-        tree_moves::unlink_jump_hosts(&tx, &doomed)?;
-        tx.execute("DELETE FROM servers WHERE folder_id=?1", rusqlite::params![fid])
-            .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_DELETE_FAILED: {}", e))?;
-        tx.execute("DELETE FROM rdp_links WHERE folder_id=?1", rusqlite::params![fid])
-            .map_err(|e| format!("[DATABASE] FOLDER_RDP_DELETE_FAILED: {}", e))?;
-    }
-    for fid in folder_ids {
-        tx.execute("DELETE FROM folders WHERE id=?1", rusqlite::params![fid])
-            .map_err(|e| format!("[DATABASE] FOLDER_DELETE_FAILED: {}", e))?;
-    }
-    tx.commit().map_err(|e| format!("[DATABASE] TX_COMMIT: {}", e))
-}
-
-/// A folder and every folder inside it, at any depth, the folder first.
-/// Guarded against a parent loop (which sync could in principle produce).
-pub(crate) fn folder_subtree(conn: &rusqlite::Connection, root: i64) -> rusqlite::Result<Vec<i64>> {
-    let mut stmt = conn.prepare("SELECT id FROM folders WHERE parent_id=?1")?;
-    let mut out = vec![root];
-    let mut i = 0;
-    while i < out.len() {
-        let children: Vec<i64> = stmt
-            .query_map(rusqlite::params![out[i]], |r| r.get::<_, i64>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-        for c in children {
-            if !out.contains(&c) {
-                out.push(c);
-            }
-        }
-        i += 1;
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -9529,89 +9050,15 @@ mod mirror_folder_guard_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn only_a_folder_on_a_drive_letter_passes_as_text() {
-        use super::windows_drive_path;
-        for ok in [r"C:\Users\me\site", "d:/work", r"\\?\C:\Users\me", r"\\?\c:\x", "C:\\"] {
-            assert!(windows_drive_path(ok), "{ok}");
-        }
-        for bad in [
-            r"\\attacker.example\share\dir",
-            "//attacker.example/share",
-            r"\\?\UNC\attacker.example\share",
-            r"\\?\unc\attacker.example\share",
-            r"\\?\GLOBALROOT\Device\Mup\attacker.example\share",
-            r"\\.\pipe\x",
-            r"\\.\C:\x",
-            r"\??\UNC\host\share",
-            r"\Users\me",
-            "C:relative",
-            "C:",
-            "",
-            "folder",
-            "/home/me",
-        ] {
-            assert!(!windows_drive_path(bad), "{bad}");
-        }
-    }
-
     #[cfg(windows)]
     #[test]
     fn a_network_share_is_refused_before_anything_is_looked_at() {
-        for bad in [
-            r"\\attacker.example\share\dir",
-            r"\\?\UNC\attacker.example\share",
-            r"\\?\unc\attacker.example\share",
-            r"\\?\GLOBALROOT\Device\Mup\attacker.example\share",
-            r"\\.\pipe\x",
-        ] {
+        for bad in [r"\\attacker.example\share\dir", r"\\?\UNC\attacker.example\share", r"\\.\pipe\x"] {
             let t = std::time::Instant::now();
             let err = guard_mirror_folder(bad).unwrap_err();
             assert!(err.contains("network share") || err.contains("MIRROR"), "{bad}: {err}");
             assert!(t.elapsed() < std::time::Duration::from_secs(1), "{bad} was looked up on the network");
         }
-    }
-}
-
-#[cfg(test)]
-mod folder_subtree_tests {
-    #[test]
-    fn a_folders_subtree_holds_every_level_and_survives_a_loop() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE folders(id INTEGER PRIMARY KEY, name TEXT, parent_id INTEGER);
-             INSERT INTO folders VALUES (1,'a',NULL),(2,'b',1),(3,'c',2),(4,'d',1),(5,'other',NULL),(6,'x',7),(7,'y',6);",
-        )
-        .unwrap();
-        assert_eq!(super::folder_subtree(&conn, 1).unwrap(), vec![1, 2, 4, 3]);
-        assert_eq!(super::folder_subtree(&conn, 5).unwrap(), vec![5]);
-        assert_eq!(super::folder_subtree(&conn, 6).unwrap(), vec![6, 7]);
-    }
-
-    #[test]
-    fn deleting_a_folder_takes_its_subfolders_servers_and_links() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "PRAGMA foreign_keys = ON;
-             CREATE TABLE folders(id INTEGER PRIMARY KEY, name TEXT, parent_id INTEGER);
-             CREATE TABLE servers(id INTEGER PRIMARY KEY, name TEXT, folder_id INTEGER, jump_host_id INTEGER, FOREIGN KEY(folder_id) REFERENCES folders(id));
-             CREATE TABLE rdp_links(id INTEGER PRIMARY KEY, name TEXT, folder_id INTEGER, FOREIGN KEY(folder_id) REFERENCES folders(id));
-             CREATE TABLE sync_flags(key TEXT PRIMARY KEY, val INTEGER NOT NULL);
-             INSERT INTO folders VALUES (1,'a',NULL),(2,'b',1),(3,'c',2),(4,'d',NULL);
-             INSERT INTO servers VALUES (10,'s10',1,NULL),(11,'s11',3,NULL),(12,'s12',4,11),(13,'s13',NULL,10);
-             INSERT INTO rdp_links VALUES (20,'r20',2),(21,'r21',4);",
-        )
-        .unwrap();
-        let ids = super::folder_subtree(&conn, 1).unwrap();
-        super::delete_folder_tree(&conn, &ids).unwrap();
-        let col = |sql: &str| -> Vec<i64> {
-            conn.prepare(sql).unwrap().query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
-        };
-        assert_eq!(col("SELECT id FROM folders ORDER BY id"), vec![4]);
-        assert_eq!(col("SELECT id FROM servers ORDER BY id"), vec![12, 13]);
-        assert_eq!(col("SELECT id FROM rdp_links ORDER BY id"), vec![21]);
-        // Their jump hosts went with the folder: not left pointing at nothing.
-        assert_eq!(col("SELECT COUNT(*) FROM servers WHERE jump_host_id IS NOT NULL"), vec![0]);
     }
 }
 
@@ -10597,13 +10044,6 @@ struct ConfigIdentities {
 
 /// A node's display name. An imported node keeps its `~/.ssh/config` alias as
 /// its name, so `Host` patterns are matched against it as well as the address.
-/// A saved port as one a connection can use. The form only takes 1 to 65535,
-/// but a synced or imported server may carry anything, and a plain cast would
-/// quietly dial another port.
-fn valid_port(port: i32) -> Result<u16, String> {
-    u16::try_from(port).map_err(|_| format!("Port {port} isn't a valid port"))
-}
-
 fn server_display_name(conn: &rusqlite::Connection, server_id: i32) -> Option<String> {
     conn.query_row("SELECT name FROM servers WHERE id = ?1", [server_id], |row| row.get::<_, Option<String>>(0))
         .ok()
@@ -10638,22 +10078,6 @@ impl ConfigTarget {
         };
         let config = ssh_config::for_host(lookup).await;
         Self::apply(host, port, user, config)
-    }
-
-    /// A jump host as `connect_jump_host` reaches it, for the connect, the
-    /// check under a failed one and the monitor alike: its saved port
-    /// checked, `~/.ssh/config` applied, and the ProxyCommand or ProxyJump
-    /// the config gives it (a jump host is reached without its own proxy
-    /// setting, so the config's has nothing to give way to).
-    async fn resolve_jump_host(
-        host: &str,
-        port: i32,
-        user: &str,
-        name: Option<String>,
-    ) -> Result<(Self, Option<ssh_config::Proxy>), String> {
-        let mut target = Self::resolve(host, valid_port(port)?, user, name).await;
-        let proxy = target.proxy(None);
-        Ok((target, proxy))
     }
 
     fn apply(host: &str, port: u16, user: &str, config: Option<ssh_config::HostConfig>) -> Self {
@@ -11520,6 +10944,8 @@ async fn authenticate_key_prompting<H: russh::client::Handler>(
 #[cfg(test)]
 mod key_format_tests {
     use super::*;
+    // The fork's own tests of this, in a file of their own (#136).
+    mod fork;
 
     // Throwaway ECDSA P-521 key (`openssl ecparam -name secp521r1 -genkey
     // -noout`) in SEC1 PEM; the same key as PKCS#8 (`openssl pkcs8 -topk8
@@ -11678,15 +11104,6 @@ mod key_format_tests {
     // ~/.ssh/config: an alias address takes HostName and Port; User only
     // fills a blank username; every change is logged.
     #[test]
-    fn a_port_out_of_range_is_refused_not_cast() {
-        assert_eq!(valid_port(22), Ok(22));
-        assert_eq!(valid_port(65535), Ok(65535));
-        // 65558 as u16 would have dialled port 22.
-        assert_eq!(valid_port(65558), Err("Port 65558 isn't a valid port".to_string()));
-        assert_eq!(valid_port(-1), Err("Port -1 isn't a valid port".to_string()));
-    }
-
-    #[test]
     fn a_config_alias_changes_where_to_connect() {
         let c = host_config(|c| {
             c.hostname = Some("10.0.0.5".into());
@@ -11747,30 +11164,6 @@ mod key_format_tests {
         // An unencrypted key (no KDF) is untouched.
         let plain = kp.to_openssh(ssh_key::LineEnding::LF).unwrap().to_string();
         assert!(guard_key_kdf_cost(&plain).is_ok());
-    }
-
-    // An IdentityFile from ~/.ssh/config takes the same road as a saved key
-    // (#170, #43): read with read_small_file, then decoded by
-    // decode_private_key (in decode_identity_file), whose KDF cap refuses an
-    // absurd cost before any derivation runs, passphrase or not.
-    #[test]
-    fn an_identity_file_with_an_absurd_kdf_cost_is_refused() {
-        use ssh_key::private::{Ed25519Keypair, Ed25519PrivateKey};
-        let kp = ssh_key::PrivateKey::from(Ed25519Keypair::from(Ed25519PrivateKey::from_bytes(&[9u8; 32])));
-        let pem = kp.encrypt(&mut rand::rng(), "pw").unwrap().to_openssh(ssh_key::LineEnding::LF).unwrap().to_string();
-        let dir = std::env::temp_dir().join(format!("submarine-idfile-{}", rand::random::<u64>()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("id_ed25519");
-        std::fs::write(&path, patch_bcrypt_rounds(&pem, u32::MAX)).unwrap();
-        let text = read_small_file(&path.to_string_lossy()).unwrap();
-        let started = std::time::Instant::now();
-        assert!(matches!(decode_private_key(&text, Some("pw")), Err(KeyDecodeError::Malformed(_))));
-        assert!(matches!(decode_private_key(&text, None), Err(KeyDecodeError::Malformed(_))), "refused before asking for a passphrase");
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
-        // A file too large to be a key isn't read at all.
-        std::fs::write(&path, vec![b'a'; (MAX_KEY_FILE_BYTES + 1) as usize]).unwrap();
-        assert!(read_small_file(&path.to_string_lossy()).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // What russh's decoder skips doesn't hide a key's cost from the guard: each
@@ -13204,27 +12597,6 @@ mod connect_timeout_tests {
         hard: Duration::from_secs(110),
     };
 
-    // A session that waited on another's prompt and then asks itself gets its
-    // own full window, not what is left of the connect's first 110s.
-    #[tokio::test]
-    async fn a_prompt_taken_over_gets_a_fresh_window() {
-        use super::{drive_connect_with_prompt_timeout, ConnectTimeout};
-        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-        let caps = ConnectTimeoutCaps { handshake: Duration::from_millis(100), hard: Duration::from_millis(500) };
-        let pending = AtomicBool::new(true);
-        let epoch = AtomicU32::new(0);
-        let start = std::time::Instant::now();
-        let bump = async {
-            tokio::time::sleep(Duration::from_millis(350)).await;
-            epoch.fetch_add(1, Ordering::SeqCst);
-        };
-        let driven = drive_connect_with_prompt_timeout(std::future::pending::<()>(), &pending, &epoch, caps);
-        let (res, _) = tokio::join!(driven, bump);
-        assert!(matches!(res, Err(ConnectTimeout::PromptHardCap)));
-        // Counted from the takeover (350ms) plus the window (400ms), not from the start.
-        assert!(start.elapsed() >= Duration::from_millis(700), "cut short after {:?}", start.elapsed());
-    }
-
     #[test]
     fn no_prompt_holds_the_handshake_cap() {
         // Before 15s: keep waiting when no prompt has shown.
@@ -13626,11 +12998,6 @@ impl HopCtx<'_> {
     }
 }
 
-/// How long a jump host's login may take, prompts included (login_hop).
-const JUMP_LOGIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-/// How long a jump host may take to open the channel to the next hop or the
-/// server behind it (hop_channel), as for telnet through an SSH server.
-const JUMP_CHANNEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// One jump host to log in to.
 struct Hop {
     /// Where it is and who logs in, after its own `~/.ssh/config`.
@@ -13732,8 +13099,7 @@ mod proxy_jump_tests {
 }
 
 /// A `direct-tcpip` channel through `via` to `host:port`, as a transport.
-/// Within JUMP_CHANNEL_TIMEOUT: russh waits for the jump host's answer with
-/// no limit. Any handler: the app's own, or a test's.
+/// Within 15 seconds: russh waits for the jump host's answer with no limit.
 async fn hop_channel<H: russh::client::Handler>(
     via: &russh::client::Handle<H>,
     host: &str,
@@ -13743,22 +13109,7 @@ async fn hop_channel<H: russh::client::Handler>(
     // could fill this channel's queue while the next session waits for a
     // window, block the previous hop's protocol task — which is what delivers
     // that window — and deadlock the route.
-    hop_channel_within(via, host, port, JUMP_CHANNEL_TIMEOUT).await
-}
-
-/// `hop_channel`, given `limit` to open the channel in.
-async fn hop_channel_within<H: russh::client::Handler>(
-    via: &russh::client::Handle<H>,
-    host: &str,
-    port: u16,
-    limit: std::time::Duration,
-) -> Result<tunnel::DrainedChannelStream, String> {
-    let open = via.channel_open_direct_tcpip(host.to_string(), u32::from(port), "127.0.0.1", 0);
-    match tokio::time::timeout(limit, open).await {
-        Ok(Ok(channel)) => Ok(tunnel::drained_stream(channel)),
-        Ok(Err(e)) => Err(format!("could not open a channel to {host}:{port} through the jump host: {e}")),
-        Err(_) => Err(format!("the jump host didn't open a channel to {host}:{port} within {} seconds", limit.as_secs())),
-    }
+    hop_policy::hop_channel_within(via, host, port, hop_policy::JUMP_CHANNEL_TIMEOUT).await // the fork's
 }
 
 #[cfg(test)]
@@ -14162,7 +13513,7 @@ async fn login_hop(
         }
         auth_res
     };
-    let ladder_res = tokio::time::timeout(JUMP_LOGIN_DEADLINE, ladder).await;
+    let ladder_res = tokio::time::timeout(hop_policy::JUMP_LOGIN_DEADLINE, ladder).await;
     release_agent(&prompt_ctx).await;
     // Belt-and-suspenders: no dangling interactive sender for this hop.
     ctx.kbi_txs.lock().await.remove(&jump_nonce);
@@ -14171,7 +13522,7 @@ async fn login_hop(
             "jump host {}:{} didn't finish the login within {} minutes",
             host,
             port,
-            JUMP_LOGIN_DEADLINE.as_secs() / 60
+            hop_policy::JUMP_LOGIN_DEADLINE.as_secs() / 60
         )));
     };
 
@@ -14190,7 +13541,7 @@ async fn login_hop(
         }
         Ok(false) if kbi_unasked.load(std::sync::atomic::Ordering::Relaxed) => {
             ctx.auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
-            Err(JUMP_ASKS_UNASKED.into())
+            Err(hop_policy::JUMP_ASKS_UNASKED.into())
         }
         Ok(false) => {
             ctx.auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -14213,11 +13564,6 @@ async fn login_hop(
         }
     }
 }
-
-/// A `::sftp` / `::fwd` connection's jump host asked for a code (or a password
-/// that isn't saved) that only the server's own tab can ask for.
-const JUMP_ASKS_UNASKED: &str =
-    "the jump host asks for a code or a password, and only the server's own tab can ask you for it";
 
 /// Shown when an ssh-agent didn't sign a login it was asked to (a declined
 /// confirmation, a removed card, a PIN or touch not given in time).
@@ -14302,13 +13648,7 @@ async fn initiate_connection(
         .unwrap_or_else(|| "primary".to_string());
     let is_secondary = role != "primary";
     let separate = separate_sessions.unwrap_or(false);
-    // A tab that connects again (a reconnect) is no longer shared with an AI
-    // tab: it's shared again by hand (#32, open question 11).
-    if !is_secondary {
-        if let Some(ai) = app.try_state::<ai::AiState>() {
-            ai.session_gone(&session_id, "reconnected");
-        }
-    }
+    if !is_secondary { ai::tab_gone(&app, &session_id, "reconnected"); } // no longer shared with an AI tab
     // Only the PRIMARY drives interactive keyboard-interactive (2FA) auth. A
     // secondary connection that hit a 2FA challenge would emit a `kbi-prompt`
     // the UI isn't wired to answer for the suffixed session id, so it would just
@@ -14372,20 +13712,7 @@ async fn initiate_connection(
     let term_prefix = format!("{}-term-", session_id);
     state.terminal_txs.lock().await.retain(|k, _| !k.starts_with(&term_prefix));
     state.resize_txs.lock().await.retain(|k, _| !k.starts_with(&term_prefix));
-    // A reconnect replays the session's forward list. When sync changed this
-    // server's saved forwards since the session read them (another computer
-    // deleted one, say), the list starts again from the saved ones first, so
-    // the reconnect doesn't bring back a forward that's gone. The list is
-    // kept under the base session id, which the `::fwd` connection replays
-    // too. A first connect (no list yet) reads the saved ones anyway, and
-    // other connections (`::sftp`) have none: neither may use up the change,
-    // which another tab on this server may still need.
-    let rules_key = session_id.strip_suffix("::fwd").unwrap_or(&session_id);
-    if (role == "primary" || role == "forward") && state.session_tunnel_specs.lock().await.contains_key(rules_key) {
-        if let Err(e) = refresh_synced_session_rules(state.inner(), db_state.inner(), rules_key, Some(server_id)).await {
-            println!("[BACKEND] {}: the saved forwards weren't read again: {}", session_id, e);
-        }
-    }
+    refresh_rules_for_reconnect(state.inner(), db_state.inner(), &session_id, &role, server_id).await; // synced_tunnels.rs
     // This attempt, as its prompts and failure report see it: once a newer
     // attempt starts (or the tab disconnects) they stay quiet.
     let attempt = ssh_manager::ConnectAttempt::new(
@@ -15899,15 +15226,8 @@ async fn kbi_save_choice(state: tauri::State<'_, SshState>, nonce: String, save:
     Ok(())
 }
 
-/// `save_prompted_password`'s database step, once the profile is known to be
-/// the one the login started in: the fork's checks (secret_policy), then the
-/// save itself.
-fn save_typed_password(conn: &rusqlite::Connection, to: &SaveTarget, password: &str) -> Result<String, String> {
-    secret_policy::may_save_now(conn, to.server_id, to.fingerprint, to.vnc)?;
-    store_prompted_password(conn, to.server_id, password)
-}
-
-/// Where a typed password goes, and the words for where it went.
+/// `save_prompted_password`'s database step: where the password goes, and the
+/// words for where it went.
 fn store_prompted_password(conn: &rusqlite::Connection, server_id: i32, password: &str) -> Result<String, String> {
     // The server's saved login, when it has one that is still there.
     let (auth_type, credential_id, login_name, login_type): (Option<String>, Option<i32>, Option<String>, Option<String>) = conn
@@ -16027,7 +15347,7 @@ async fn save_prompted_password(app: &tauri::AppHandle, to: SaveTarget, password
         // Not into a profile opened since the login started (its server with
         // the same id is another one).
         db_state.still_open(to.generation)?;
-        save_typed_password(conn, &to, password)?
+        secret_policy::save_typed_password(conn, &to, password)?
     };
     save_vault_async(&db_state).await?;
     let _ = app.emit("server-password-saved", serde_json::json!({ "serverId": to.server_id }));
@@ -16069,16 +15389,6 @@ impl SaveTarget {
         let shared = secret_policy::saving_reaches_others(conn);
         let fingerprint = secret_policy::save_fingerprint(conn, server_id)?;
         Some(Self { server_id, generation: db_state.generation_now(), ticked: !shared, keys: false, shared, fingerprint, vnc: false })
-    }
-
-    /// The same for a VNC server, unless it has a saved login: a VNC password
-    /// is saved into the server only (secret_policy E3).
-    fn for_vnc_server(app: &tauri::AppHandle, server_id: i32) -> Option<Self> {
-        use tauri::Manager;
-        let to = Self::for_server(app, server_id)?;
-        let db_state = app.state::<DbState>();
-        let guard = db_state.conn.lock().ok()?;
-        secret_policy::vnc_may_save(guard.as_ref()?, server_id).then_some(Self { vnc: true, ..to })
     }
 
     /// The "Save password" tick's JSON for a prompt, with a line under it when
@@ -18124,7 +17434,7 @@ async fn telnet_open_terminal(
     // when it loses its sender, and must know then that it was replaced.
     let page = ssh_manager::page_start(&terminal_id);
     state.terminal_txs.lock().await.insert(terminal_id.clone(), tx);
-    note_terminal_server(&state, &session_id, &terminal_id).await;
+    secret_policy::note_terminal_server(&state, &session_id, &terminal_id).await;
     state.resize_txs.lock().await.insert(terminal_id.clone(), resize_tx);
     // The output goes to the page's channel, paced like an SSH terminal's
     // (term_output.rs).
@@ -18244,12 +17554,7 @@ async fn vnc_open(
         };
         let target = telnet::address(&host, port);
         log(&format!("Opening the VNC server {target} in this tab..."), "info");
-        if uses_saved_login {
-            log(
-                "A VNC server doesn't use saved logins: VNC sends its password with weak protection and doesn't check the server's identity. Type the VNC password when asked, or save it on the server.",
-                "warning",
-            );
-        }
+        if uses_saved_login { log(secret_policy::VNC_NO_SAVED_LOGIN, "warning"); }
         if let Some(chosen) = options.describe() {
             log(&chosen, "info");
         }
@@ -18593,11 +17898,8 @@ async fn disconnect_session(
     // the in-memory sudo password.
     state.sftp_sessions.lock().await.remove(&session_id);
     state.sftp_elevation.lock().await.remove(&session_id);
-    state.root_access.lock().await.remove(&session_id);
-    state.root_gates.lock().await.remove(&session_id);
-    state.docker_root.lock().await.remove(&session_id);
+    state.forget_fork_session(&session_id).await; // ssh_manager/root_state.rs
     state.sftp_shell.lock().await.remove(&session_id);
-    state.session_users.lock().await.remove(&session_id);
     state.connections.lock().await.remove(&session_id);
     // Drop any ProxyJump bastion handle for this session — closes the jump
     // connection once the target it was carrying is gone.
@@ -18642,10 +17944,7 @@ async fn disconnect_session(
     // this IS a primary id (no `::` suffix) — a direct disconnect of a secondary
     // must not recurse into non-existent grandchildren.
     if !session_id.contains("::") {
-        // The tab is gone: no AI tab can reach it any more.
-        if let Some(ai) = app.try_state::<ai::AiState>() {
-            ai.session_gone(&session_id, "tab closed");
-        }
+        ai::tab_gone(&app, &session_id, "tab closed"); // no AI tab can reach it any more
         teardown_connection_key(state.inner(), mirrors.inner(), &format!("{}::sftp", session_id)).await;
         teardown_connection_key(state.inner(), mirrors.inner(), &format!("{}::fwd", session_id)).await;
         // Explicitly disconnecting a whole tab also forgets any connect-time
@@ -18788,7 +18087,7 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
         crate::ssh_manager::PtySize { cols, rows },
     );
     state.terminal_txs.lock().await.insert(terminal_id.clone(), tx);
-    note_terminal_server(&state, &session_id, &terminal_id).await;
+    secret_policy::note_terminal_server(&state, &session_id, &terminal_id).await;
     state.resize_txs.lock().await.insert(terminal_id.clone(), resize_tx);
     drop(openings);
 
@@ -18826,24 +18125,11 @@ async fn write_terminal_data(state: tauri::State<'_, SshState>, terminal_id: Str
     Ok(())
 }
 
-/// The saved server a shell terminal's session was opened for, kept for
-/// type_saved_password. A container's terminal isn't the server's shell and
-/// isn't noted.
-async fn note_terminal_server(state: &SshState, session_id: &str, terminal_id: &str) {
-    let server = state.session_servers.lock().await.get(session_id).copied();
-    let mut terminals = state.terminal_servers.lock().await;
-    match server {
-        Some(id) => terminals.insert(terminal_id.to_string(), id),
-        None => terminals.remove(terminal_id),
-    };
-}
-
 /// Types a saved password into a terminal, for a password prompt there (sudo,
 /// su, …) that the user picked it for (#28): a server's own saved password
-/// (`server_id`), only into one of that server's own terminals, or a saved
-/// login's (`credential_id`). It goes from the profile to the terminal and
-/// never reaches the webview. No Enter after it: the user sees where it went
-/// and presses Enter themselves.
+/// (`server_id`) or a saved login's (`credential_id`). It goes from the
+/// profile to the terminal and never reaches the webview. No Enter after it:
+/// the user sees where it went and presses Enter themselves.
 #[tauri::command]
 async fn type_saved_password(
     ssh: tauri::State<'_, SshState>,
@@ -18853,11 +18139,7 @@ async fn type_saved_password(
     credential_id: Option<i32>,
 ) -> Result<(), String> {
     use crate::ssh_manager::TerminalCommand;
-    if let Some(id) = server_id {
-        if ssh.terminal_servers.lock().await.get(&terminal_id) != Some(&id) {
-            return Err("That's another server's password: it's only typed into that server's own terminals".into());
-        }
-    }
+    secret_policy::check_terminal_server(&ssh, &terminal_id, server_id).await?; // only into that server's own terminals
     let saved = {
         let conn_guard = db.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
@@ -19464,15 +18746,6 @@ struct SystemctlActionResult {
     root_tool: Option<String>,
 }
 
-/// The user's own try at an Info panel action before root (a service
-/// action, a kill, a firewall read), run by sh whatever the login shell is:
-/// csh and tcsh read `2>&1` and `$?` their own way (remote_sh), and the
-/// answer decides whether root is asked for. Not for what must also work
-/// on Windows (server_os's probe runs in cmd.exe there).
-fn sh_user_command(cmd: &str) -> String {
-    remote_sh::sh_command(&[], cmd, &[])
-}
-
 async fn run_exec_capture(
     state: &SshState,
     session_id: &str,
@@ -19723,29 +18996,6 @@ fn classify_sudo_failure(msg: &str) -> String {
     } else {
         format!("{}: {}", SUDO_FAILED, msg.trim())
     }
-}
-
-/// Is this line of output one of sudo's, dzdo's or sudo-rs's own? Those
-/// start with the tool's name, or are its refusals ("Sorry, try again.",
-/// "Sorry, user bob may not run sudo", "bob is not in the sudoers file").
-fn is_tool_line(line: &str) -> bool {
-    let l = line.trim().to_ascii_lowercase();
-    ["sudo:", "dzdo:", "sudo-rs:", "sorry, try again", "sorry, user "].iter().any(|p| l.starts_with(p))
-        || l.contains(" is not in the sudoers file")
-}
-
-/// classify_sudo_failure for output that also holds what the command (or a
-/// root shell's start-up) printed: only the tool's own lines (is_tool_line)
-/// are read, so a command that prints "incorrect password" is never taken
-/// for the tool turning the password down.
-fn classify_tool_output(out: &str) -> String {
-    tool_answer(out).unwrap_or_else(|| SUDO_NOT_ALLOWED.into())
-}
-
-/// classify_sudo_failure of the tool's own lines in `out`, if it has any.
-fn tool_answer(out: &str) -> Option<String> {
-    let lines: Vec<&str> = out.lines().map(str::trim).filter(|l| is_tool_line(l)).collect();
-    (!lines.is_empty()).then(|| classify_sudo_failure(&lines.join(" ")))
 }
 
 /// Run a command on its own exec channel, optionally feeding stdin, and
@@ -20188,38 +19438,6 @@ mod elevated_sftp_tests {
         assert!(!is_safe_remote_exec_path("/opt/my sftp/sftp-server"));
         assert!(!is_safe_remote_exec_path("/usr/lib/$(id)/sftp-server"));
     }
-
-    /// The shells a server may run the app's commands with: its login
-    /// shell (sshd runs `<shell> -c <command>`) or root's (a root shell
-    /// reads its line). sh always; tcsh and csh where this machine has them.
-    #[cfg(unix)]
-    fn shells() -> Vec<&'static str> {
-        ["sh", "tcsh", "csh"]
-            .into_iter()
-            .filter(|s| std::process::Command::new(s).arg("-c").arg("true").output().is_ok_and(|o| o.status.success()))
-            .collect()
-    }
-
-    #[test]
-    fn a_root_shell_gets_one_line_of_posix_sh() {
-        let script = format!("echo __SUB_ROOT_OUT__; printf '%s|' {}; echo", remote_sh::quote_words(&["it's".into(), "a b".into()]));
-        let line = root_shell_line(&script);
-        assert!(line.ends_with('\n') && line.matches('\n').count() == 1 && !line.contains('!'), "{line:?}");
-        for form in ROOT_SHELL_FORMS {
-            assert!(form.chars().all(|c| c.is_ascii_lowercase() || c == ' ' || c == '-'), "{form}");
-        }
-        // What root's shell makes of it, whichever it is.
-        #[cfg(unix)]
-        for shell in shells() {
-            let out = std::process::Command::new(shell)
-                .arg("-c")
-                .arg(line.trim_end().strip_prefix("exec ").unwrap())
-                .output()
-                .unwrap();
-            assert_eq!(String::from_utf8_lossy(&out.stdout), "__SUB_ROOT_OUT__\nit's|a b|\n", "{shell}: {}", String::from_utf8_lossy(&out.stderr));
-        }
-    }
-
 }
 
 #[cfg(test)]
@@ -20441,22 +19659,8 @@ async fn sftp_set_elevated(
         Ok(found) => (found, None),
         Err(e) if e == SUDO_NEED_PASSWORD => {
             let Some(pw) = password else { return Err(e) };
-            // One typed password at a time per tab, and not one just turned
-            // down (typed_root_access).
-            let gate = root_gate(&state, &session_id).await;
-            let mut gate = gate.lock().await;
-            if just_rejected(&gate, &pw) {
-                return Err(SUDO_WRONG_PASSWORD.into());
-            }
-            match probe_sudo_files(&session_arc, Some(&pw)).await {
-                Ok(found) => (found, Some(pw)),
-                Err(e) => {
-                    if e == SUDO_WRONG_PASSWORD {
-                        gate.rejected = Some((password_digest(&pw), std::time::Instant::now()));
-                    }
-                    return Err(e);
-                }
-            }
+            let path = probe_with_typed_password(&state, &session_id, &session_arc, &pw).await?;
+            (path, Some(pw))
         }
         Err(e) => return Err(e),
     };
@@ -20516,37 +19720,10 @@ pub async fn get_sftp_session(
     let elevation = state.sftp_elevation.lock().await.get(session_id).cloned();
     let was_elevated = elevation.is_some();
     let (sftp, via_shell) = match elevation {
-        Some(elev) => {
-            // With a password, one open at a time per tab: parallel file
-            // actions don't each sign in, and after one is turned down the
-            // others find the password marked as failed (open_elevated).
-            let gate = match elev.password {
-                Some(_) => Some(root_gate(state, session_id).await),
-                None => None,
-            };
-            let _turn = match &gate {
-                Some(g) => Some(g.lock().await),
-                None => None,
-            };
-            let elev = match &gate {
-                Some(_) => {
-                    if let Some(s) = state.sftp_sessions.lock().await.get(session_id) {
-                        return Ok(Arc::clone(s));
-                    }
-                    state.sftp_elevation.lock().await.get(session_id).cloned().unwrap_or(elev)
-                }
-                None => elev,
-            };
-            match open_elevated(&session_arc, &elev).await {
-                Err(e) if e == SUDO_WRONG_PASSWORD => {
-                    if let Some(pw) = &elev.password {
-                        forget_root_password(state, session_id, pw).await;
-                    }
-                    return Err(e);
-                }
-                opened => opened?,
-            }
-        }
+        Some(elev) => match open_elevated_in_turn(state, session_id, &session_arc, elev).await? {
+            ElevatedOpen::Cached(s) => return Ok(s),
+            ElevatedOpen::Opened(sftp, via_shell) => (sftp, via_shell),
+        },
         None => open_sftp(&session_arc).await?,
     };
     let arc = Arc::new(sftp);
@@ -21465,14 +20642,7 @@ async fn upload_dir_file(
     if halted() {
         return Err(DirFileEnd::Stopped(None));
     }
-    let Some((_write_turn, waited)) = remote_write_locks().acquire(&session_id, &remote_full, &cancel).await else {
-        return Err(DirFileEnd::Stopped(None));
-    };
-    if let Some(exists) = ask_first.filter(|_| waited) {
-        if sftp.metadata(&remote_full).await.is_ok() {
-            return Err(DirFileEnd::Failed(exists));
-        }
-    }
+    let _write_turn = dir_file_turn(&sftp, &session_id, &remote_full, &cancel, ask_first).await?; // remote_writes.rs
     // Whether each file was there isn't asked (a round trip per file):
     // EXCL alone tells a file this upload created.
     let (mut remote_file, created) = open_upload_target(&sftp, &remote_full, false).await
@@ -22034,42 +21204,13 @@ async fn sftp_download_dir(
     let DownloadTree { mut files, total_bytes, skipped_names } = tree;
 
     // Shown on the finished transfer card when the walk skipped names.
-    // The destination passed the policy, but the server names the folders
-    // inside it: a home-folder backup downloaded into C:\Users would put its
-    // AppData\…\Startup\x.bat in the real Startup folder. Files that would
-    // land in a folder the system runs things from at login are left out and
-    // counted on the card.
-    let login_folders = LoginFolders::new();
-    let dest_root = std::path::PathBuf::from(&local_path).join(&folder_name);
-    let before = files.len();
-    files.retain(|(_, rel, _)| login_folders.may_hold_server_file(&dest_root.join(rel)));
-    let skipped_autorun = (before - files.len()) as u64;
-    // Where upper and lower case are the same name (Windows, and macOS as
-    // usually set up), two files whose names differ only in case would land
-    // on one file, the second replacing the first. The second is left out.
-    let skipped_case = drop_case_twins(&mut files, cfg!(any(windows, target_os = "macos")));
-    // Files left out at the end because something of that name was there
-    // (another download finished first) are counted by the jobs: nothing is
-    // replaced unless the user chose to.
-    let replace = overwrite == Some(true);
-    let notes = |skipped_existing: u64| {
-        let notes: Vec<String> = [
-            skipped_names_note(skipped_names),
-            autorun_skipped_note(skipped_autorun),
-            case_twins_note(skipped_case),
-            existing_skipped_note(skipped_existing),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        (!notes.is_empty()).then(|| notes.join("; "))
-    };
+    let skipped_note = DownloadNotes::filter(&mut files, &local_path, &folder_name, skipped_names); // and the fork's
 
     if files.is_empty() {
         // Still create the (empty) destination folder so the UI sees the
         // shape — otherwise the user sees "done" with nothing to show for it.
         let _ = tokio::fs::create_dir_all(&local_root).await;
-        emit_progress(0, 0, "done", notes(0));
+        emit_progress(0, 0, "done", skipped_note.text(0));
         return Ok(());
     }
 
@@ -22097,7 +21238,7 @@ async fn sftp_download_dir(
             local_root.clone(),
             Arc::clone(&transferred),
             Arc::clone(&cancel),
-            replace,
+            overwrite == Some(true),
             Arc::clone(&skipped),
         ),
     });
@@ -22107,7 +21248,7 @@ async fn sftp_download_dir(
     let got = transferred.load(Ordering::Relaxed);
     match ended {
         DirFilesEnd::Done => {
-            emit_progress(got, total_bytes, "done", notes(skipped.load(Ordering::Relaxed)));
+            emit_progress(got, total_bytes, "done", skipped_note.text(skipped.load(Ordering::Relaxed)));
             Ok(())
         }
         DirFilesEnd::Stopped(_) => {
@@ -22190,20 +21331,7 @@ async fn sftp_upload_file(
 
     emit_progress(0, "progress", None);
 
-    // Another upload to this same remote file would interleave with ours, so
-    // wait for it to finish first (the card shows 0% meanwhile). What the file
-    // looks like is asked again: the upload ahead may have just created it.
-    let Some((_write_turn, _)) = remote_write_locks().acquire(&session_id, &remote_path, &cancel).await else {
-        emit_progress(0, "cancelled", None);
-        return Err("cancelled".into());
-    };
-    let existed = sftp.metadata(&remote_path).await.is_ok();
-    // The upload ahead may have made the file this one was told isn't there:
-    // ask first, as the check at the top would have.
-    if existed && overwrite != Some(true) {
-        emit_progress(0, "error", Some(format!("{name} is already on the server.")));
-        return Err(format!("EXISTS:{}", remote_path));
-    }
+    let (_write_turn, existed) = upload_turn(&sftp, &session_id, &remote_path, &cancel, overwrite, &name, &emit_progress).await?; // remote_writes.rs
 
     // Stream the file from disk in chunks rather than slurping the whole thing
     // into a Vec — keeps memory bounded for multi-GB transfers and lets us
@@ -22737,21 +21865,6 @@ fn transfer_id() -> String {
     format!("{}-{}", ts, seq)
 }
 
-/// Removes this run's temp root, keeping Live Edit copies with edits that
-/// never reached the server first, as a disconnect does (keep_unsent_edits).
-fn remove_own_temp(root: &Path) {
-    keep_unsent_edits(root, true);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// Whether a name in the system's temp folder is one of this app's temp
-/// roots: `submarine-` and the hex app_temp_root mints (24 digits; 32 is
-/// accepted too). Nothing else there is swept.
-fn is_app_temp_name(name: &str) -> bool {
-    name.strip_prefix("submarine-")
-        .is_some_and(|h| (h.len() == 24 || h.len() == 32) && h.bytes().all(|b| b.is_ascii_hexdigit()))
-}
-
 /// A transfer's id. It starts with its session, so a session's transfers can
 /// be found in `transfer_cancels` (cancel_session_transfers): each holds its
 /// own SFTP session, and would go on after a Disconnect or a closed tab, with
@@ -22805,76 +21918,14 @@ mod transfer_cancel_tests {
 /// one, as a root's time only moves when a session's folder comes or goes, so
 /// a copy also holds a lock in its root for as long as it runs.
 fn sweep_app_temp(include_own: bool) {
-    if include_own {
-        // Let go of this run's lock first: on Windows a file held open
-        // keeps its folder from being removed.
-        drop(APP_TEMP_LOCK.lock().unwrap_or_else(|e| e.into_inner()).take());
-        remove_own_temp(app_temp_root());
-    }
-    sweep_old_temp_roots(&std::env::temp_dir(), std::time::Duration::from_secs(24 * 60 * 60));
+    sweep_temp_roots(include_own); // the fork's (live_edit.rs)
 }
 
-/// The file in each run's temp root that the run holds locked for as long
-/// as it lives (lock_temp_root). The system lets go of it when the process
-/// ends, however it ends.
-const TEMP_ROOT_LOCK: &str = ".submarine-run.lock";
-
-/// This run's lock on its temp root, taken when the root is made.
-static APP_TEMP_LOCK: StdMutex<Option<std::fs::File>> = StdMutex::new(None);
-
-/// Makes the lock file in `root` and locks it; None where that can't be done.
-fn lock_temp_root(root: &Path) -> Option<std::fs::File> {
-    let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(root.join(TEMP_ROOT_LOCK)).ok()?;
-    file.try_lock().ok()?;
-    Some(file)
-}
-
-/// Removes the temp roots in `temp` that other runs left: ones older than
-/// `age` whose run is over. A run that's still going holds its root's lock
-/// (another copy of the app beside this one), and its root is left alone;
-/// so is one whose lock can't be looked at, or that isn't this user's. A
-/// root from before the lock (no lock file) goes by its age only. Live Edit
-/// copies in a root are kept in `unsent_edits_dir` before it goes: which of
-/// them had edits that never reached the server isn't known any more.
-fn sweep_old_temp_roots(temp: &Path, age: std::time::Duration) {
-    let Ok(entries) = std::fs::read_dir(temp) else { return };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !is_app_temp_name(name) {
-            continue;
-        }
-        // The folder itself, never what a link leads to.
-        let Ok(meta) = std::fs::symlink_metadata(e.path()) else { continue };
-        if !meta.is_dir() {
-            continue;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            // SAFETY: geteuid has no preconditions and can't fail.
-            if meta.uid() != unsafe { libc::geteuid() } {
-                continue;
-            }
-        }
-        let old = meta.modified().map(|t| t.elapsed().map(|a| a > age).unwrap_or(false)).unwrap_or(false);
-        if !old {
-            continue;
-        }
-        let lock = match std::fs::OpenOptions::new().read(true).open(e.path().join(TEMP_ROOT_LOCK)) {
-            Ok(file) => match file.try_lock() {
-                Ok(()) => Some(file),
-                // Held: that run is still going. Or locks don't work there,
-                // and nothing says it's over.
-                Err(_) => continue,
-            },
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => continue,
-        };
-        keep_live_edit_copies_of(&e.path());
-        drop(lock);
-        let _ = std::fs::remove_dir_all(e.path());
-    }
+/// `submarine-<hex>` in the shape app_temp_root mints: 24 digits, or 32 as the
+/// sweep has always looked for. Nothing else in temp is ours to delete.
+fn is_app_temp_name(name: &str) -> bool {
+    name.strip_prefix("submarine-")
+        .is_some_and(|h| (h.len() == 24 || h.len() == 32) && h.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// The most a remote file read whole into memory may be: live-edit opens the
@@ -22965,11 +22016,6 @@ async fn read_remote_capped(
         data.extend_from_slice(&buf[..n]);
     }
     Ok(data)
-}
-
-/// The name of a temp root: `submarine-` and its random bytes in hex.
-fn app_temp_name(bytes: &[u8]) -> String {
-    format!("submarine-{}", hex::encode(bytes))
 }
 
 /// Process-global, UNPREDICTABLE temp root for SFTP live-edit / drag staging,
@@ -23150,19 +22196,6 @@ mod live_edit_tests {
         // A device on Windows, an ordinary (odd) name anywhere else.
         for name in ["COM3", "PRN", "nul.txt", "AUX .c"] {
             assert_eq!(safe_temp_leaf_name(&format!("/srv/{name}")).is_ok(), !cfg!(windows), "{name}");
-        }
-    }
-
-    /// The startup sweep recognises the temp roots this app makes (it used
-    /// to look for 32 hex digits where 24 are made, and swept nothing), and
-    /// nothing else.
-    #[test]
-    fn the_startup_sweep_knows_its_own_temp_folders() {
-        use super::{app_temp_name, is_app_temp_name};
-        assert!(is_app_temp_name(&app_temp_name(&[0xab; 12])));
-        assert!(is_app_temp_name(&format!("submarine-{}", "0f".repeat(16))));
-        for other in ["submarine-", "submarine-xyz", "submarine-liveedit-test-1", "submarine-0123456789abcdef0123456", "other-abababababababababababab", "submarine-abababababababababababab/x"] {
-            assert!(!is_app_temp_name(other), "{other}");
         }
     }
 
@@ -23750,62 +22783,6 @@ async fn android_default_local_dir(app: tauri::AppHandle) -> Result<String, Stri
     Ok(dirs.into_iter().next().map(|d| d.path).unwrap_or_default())
 }
 
-/// One resolved entry from an OpenSSH client config `Host` block. The
-/// frontend picks a subset of these and turns each into a fresh server row
-/// via the existing `add_server` command. A host that named an `IdentityFile`
-/// gets that key registered and linked; everything else lands password-less
-/// for the user to finish.
-#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
-struct ImportedHost {
-    /// The alias the user actually types (`ssh <alias>`) — becomes the
-    /// server's display name after import.
-    host_alias: String,
-    /// Resolved `HostName`, or the alias itself if the block didn't set one
-    /// (matches OpenSSH's own behaviour when HostName is omitted).
-    hostname: String,
-    /// Resolved `Port`, defaulting to the standard SSH port.
-    port: u16,
-    /// Resolved `User`. Empty string when unset — the frontend can fall
-    /// back to whatever it uses elsewhere.
-    user: String,
-    /// Resolved `IdentityFile`, still in the config's own spelling (`~` and
-    /// all). The importer feeds it to `import_ssh_key_file`, which expands and
-    /// reads it, so a host that names a key comes in as a key-authenticated
-    /// row rather than one the user has to go back and finish.
-    identity_file: Option<String>,
-    /// Resolved `ProxyJump`: `[user@]host[:port]`, comma-separated hops.
-    /// The import links a single hop to a saved server (host_import.rs).
-    proxy_jump: Option<String>,
-    /// Unique within one parse; the picker keys its rows by it (MobaXterm's
-    /// folder and name, else the row's place in the list). Empty means
-    /// `host_alias`.
-    #[serde(default)]
-    key: String,
-    /// Folder path, outermost first (MobaXterm's session folders).
-    #[serde(default)]
-    folder: Vec<String>,
-    /// A MobaXterm saved login (`[name]` as the user name): the host signs in
-    /// with that Login rather than a user of its own.
-    #[serde(default)]
-    credential: Option<String>,
-    /// Typed into the first terminal on connect (MobaXterm's "Execute command").
-    #[serde(default)]
-    run_on_connect: Option<String>,
-    /// The key the jump host signs in with (MobaXterm's jump host key).
-    #[serde(default)]
-    jump_identity_file: Option<String>,
-    /// The saved login the jump host signs in with (MobaXterm `[name]`).
-    #[serde(default)]
-    jump_credential: Option<String>,
-    /// A Remote Desktop session (MobaXterm's RDP): imported as an RDP link
-    /// (rdp_links.rs), not a server.
-    #[serde(default)]
-    rdp: bool,
-    /// A telnet session (PuTTY's): imported as a telnet server.
-    #[serde(default)]
-    telnet: bool,
-}
-
 /// Read the user's OpenSSH client config (default `~/.ssh/config`) and
 /// return one `ImportedHost` per non-wildcard alias so the UI can offer a
 /// checkbox picker (`parse_ssh_config_text`). We deliberately keep the
@@ -23976,135 +22953,6 @@ fn parse_client_hosts(text: String) -> Result<Vec<ImportedHost>, String> {
     Err("Unrecognised format — paste a JSON array, a PuTTY .reg export, or a MobaXterm .mxtsessions block.".into())
 }
 
-fn is_putty_reg(trimmed: &str) -> bool {
-    trimmed.to_ascii_lowercase().contains("windows registry editor")
-        || trimmed.contains("[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions")
-        || trimmed.contains("[HKEY_USERS\\") && trimmed.contains("SimonTatham\\PuTTY\\Sessions")
-}
-
-/// Parse `regedit /e` output of PuTTY's session key: the SSH and telnet
-/// sessions (`putty_sessions`), or why there are none.
-fn parse_putty_reg(text: &str) -> Result<Vec<ImportedHost>, String> {
-    let (mut out, skipped) = putty_sessions(text);
-    // Names may repeat (two exports pasted together): the picker keys rows
-    // by this.
-    for (i, h) in out.iter_mut().enumerate() {
-        h.key = i.to_string();
-    }
-    if out.is_empty() {
-        return Err(match putty_skipped(&skipped) {
-            Some(why) => format!("No PuTTY SSH or telnet sessions found. {}", why),
-            None => "No PuTTY sessions found in the pasted text.".into(),
-        });
-    }
-    Ok(out)
-}
-
-/// The sessions in a PuTTY `.reg` export, and how many of each other kind
-/// (serial, raw, rlogin, …) were left out. The format is deterministic (one
-/// `[...]` header line per session, then `"key"=type:val` lines) so a
-/// line-oriented walk covers it. We pull the fields that translate to a
-/// Submarine row: HostName, PortNumber, UserName and Protocol. An SSH
-/// session becomes an SSH server, a telnet one a telnet server. A session
-/// with no host name ("Default Settings", say) isn't one to connect to and
-/// is left out. Session-name percent-escapes (%20 for space, etc.) are
-/// undone so the alias reads naturally.
-fn putty_sessions(text: &str) -> (Vec<ImportedHost>, std::collections::BTreeMap<String, usize>) {
-    struct Session {
-        name: String,
-        host: String,
-        port: u16,
-        user: String,
-        /// PuTTY's own word; a session without one is SSH, PuTTY's default.
-        protocol: String,
-    }
-    let mut out: Vec<ImportedHost> = Vec::new();
-    let mut skipped: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    let mut current: Option<Session> = None;
-    let mut close = |cur: &mut Option<Session>| {
-        let Some(s) = cur.take() else { return };
-        if s.host.trim().is_empty() {
-            return;
-        }
-        let telnet = match s.protocol.as_str() {
-            "" | "ssh" => false,
-            "telnet" => true,
-            other => {
-                *skipped.entry(other.to_string()).or_default() += 1;
-                return;
-            }
-        };
-        let usual = if telnet { 23 } else { 22 };
-        out.push(ImportedHost {
-            host_alias: s.name,
-            hostname: s.host.trim().to_string(),
-            port: if s.port == 0 { usual } else { s.port },
-            user: s.user,
-            identity_file: None,
-            proxy_jump: None,
-            telnet,
-            ..Default::default()
-        });
-    };
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() { continue; }
-        if line.starts_with('[') && line.ends_with(']') {
-            close(&mut current);
-            // Only sessions — skip other PuTTY keys (SshHostKeys, Jumplist).
-            let inner = &line[1..line.len() - 1];
-            let Some(idx) = inner.rfind("\\Sessions\\") else { continue; };
-            let name_raw = &inner[idx + "\\Sessions\\".len()..];
-            let name = putty_unescape(name_raw);
-            if name.is_empty() { continue; }
-            current = Some(Session { name, host: String::new(), port: 0, user: String::new(), protocol: String::new() });
-            continue;
-        }
-        let Some((key, val_raw)) = line.split_once('=') else { continue; };
-        let Some(cur) = current.as_mut() else { continue; };
-        let key = key.trim().trim_matches('"');
-        let val = val_raw.trim();
-        match key {
-            "HostName" => {
-                if let Some(v) = strip_reg_string(val) { cur.host = v; }
-            }
-            "PortNumber" => {
-                if let Some(n) = strip_reg_dword(val) {
-                    if let Ok(p) = u16::try_from(n) { cur.port = p; }
-                }
-            }
-            "UserName" => {
-                if let Some(v) = strip_reg_string(val) { cur.user = v; }
-            }
-            "Protocol" => {
-                if let Some(v) = strip_reg_string(val) { cur.protocol = v.trim().to_ascii_lowercase(); }
-            }
-            _ => {}
-        }
-    }
-    close(&mut current);
-    (out, skipped)
-}
-
-/// "Not imported: 2 serial and 1 raw sessions — …" for the PuTTY sessions
-/// `putty_sessions` left out; None when it left out none.
-fn putty_skipped(counts: &std::collections::BTreeMap<String, usize>) -> Option<String> {
-    if counts.is_empty() {
-        return None;
-    }
-    let parts: Vec<String> = counts.iter().map(|(k, n)| format!("{} {}", n, k)).collect();
-    let total: usize = counts.values().sum();
-    let list = match parts.len() {
-        1 => parts[0].clone(),
-        _ => format!("{} and {}", parts[..parts.len() - 1].join(", "), parts[parts.len() - 1]),
-    };
-    Some(format!(
-        "Not imported: {} {} — Submarine imports PuTTY's SSH and telnet sessions.",
-        list,
-        if total == 1 { "session" } else { "sessions" }
-    ))
-}
-
 /// PuTTY registry keys with special characters (space, backslash, non-
 /// ASCII) are percent-escaped in the exported name. `%20` → space,
 /// `%25` → `%`, and the bytes of a non-ASCII name (`%C3%A9` → é) are its
@@ -24166,146 +23014,6 @@ fn strip_reg_dword(val: &str) -> Option<u32> {
     let s = val.trim();
     let stripped = s.strip_prefix("dword:")?;
     u32::from_str_radix(stripped, 16).ok()
-}
-
-/// Parse a MobaXterm `.mxtsessions` export. It's an INI file: each section
-/// (`[Bookmarks]`, `[Bookmarks_1]`, …) is a folder, with `SubRep=` its path
-/// (`\`-separated) and `ImgNum=` its icon, and every other line is one
-/// session:
-///
-/// `<name>= #<icon>#<settings>#<terminal settings>#…`
-///
-/// `<settings>` is `%`-separated and starts with the session type (0 = SSH,
-/// 4 = RDP, 5 = VNC, 7 = SFTP, …). For SSH, field 1 is the host, 2 the port,
-/// 3 the user (`<default>` = none set, `[name]` = the saved login `name`),
-/// 7 the command run after login, 8/9/10 the jump hosts' names, ports and
-/// users (`__PIPE__` between hops), 14 the key file and 15 the jump host's
-/// key file. Paths use MobaXterm's placeholders (see
-/// `expand_mobaxterm_path`). The icon is the user's pick, so it says nothing
-/// about the type. SSH and RDP sessions are imported.
-fn parse_mobaxterm_sessions(text: &str) -> Result<Vec<ImportedHost>, String> {
-    let dirs = directories::UserDirs::new();
-    let home = dirs.as_ref().map(|d| d.home_dir().to_string_lossy().into_owned());
-    let docs = dirs.as_ref().and_then(|d| d.document_dir()).map(|p| p.to_string_lossy().into_owned());
-    parse_mobaxterm_sessions_in(text, home.as_deref(), docs.as_deref())
-}
-
-fn parse_mobaxterm_sessions_in(text: &str, profile_dir: Option<&str>, documents: Option<&str>) -> Result<Vec<ImportedHost>, String> {
-    const SSH: &str = "0";
-    const RDP: &str = "4";
-    let mut out: Vec<ImportedHost> = Vec::new();
-    // Session names repeat, within a folder too; the import list keys rows by
-    // folder and name.
-    let mut names: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-    // The next number to try for a name already taken in a folder.
-    let mut next_number: std::collections::HashMap<(String, String), u32> = std::collections::HashMap::new();
-    let mut in_bookmarks = false;
-    let mut folder: Vec<String> = Vec::new();
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with(';') { continue; }
-        if line.starts_with('[') {
-            in_bookmarks = line.starts_with("[Bookmarks");
-            folder.clear();
-            continue;
-        }
-        if !in_bookmarks { continue; }
-        let Some((name, value)) = line.split_once('=') else { continue; };
-        let name = name.trim();
-        if name == "SubRep" {
-            folder = value.split('\\').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
-            continue;
-        }
-        if name == "ImgNum" { continue; }
-        let mut blocks = value.trim().split('#');
-        let (Some(_reconnect), Some(_icon), Some(settings)) = (blocks.next(), blocks.next(), blocks.next()) else {
-            continue;
-        };
-        let fields: Vec<&str> = settings.split('%').map(str::trim).collect();
-        let field = |i: usize| fields.get(i).copied().unwrap_or("");
-        let rdp = match field(0) {
-            SSH => false,
-            RDP => true,
-            _ => continue,
-        };
-        let hostname = field(1);
-        if hostname.is_empty() { continue; }
-        let port = field(2).parse::<u16>().ok().filter(|p| *p != 0).unwrap_or(if rdp { 3389 } else { 22 });
-        // `[name]`: sign in with MobaXterm's saved login `name`.
-        let (user, credential) = match field(3) {
-            "<default>" => ("", None),
-            u => match u.strip_prefix('[').and_then(|u| u.strip_suffix(']')) {
-                Some(login) if !login.trim().is_empty() => ("", Some(login.trim().to_string())),
-                _ => (u, None),
-            },
-        };
-        let path = |i: usize| {
-            Some(field(i))
-                .filter(|p| !p.is_empty())
-                .map(|p| expand_mobaxterm_path(p, profile_dir, documents))
-        };
-        // RDP sessions keep only host, port, user and folder: their other
-        // fields mean something else.
-        let proxy_jump = (!rdp).then(|| mobaxterm_jump_hosts(field(8), field(9), field(10))).flatten();
-        let jump_identity_file = proxy_jump.as_ref().and_then(|_| path(15));
-        let jump_credential = proxy_jump.as_ref().and_then(|_| mobaxterm_jump_login(field(8), field(10)));
-        let folder_key = folder.join("\\");
-        let mut alias = name.to_string();
-        if !names.insert((folder_key.clone(), alias.clone())) {
-            // Go on from where this name left off in this folder, not from 2
-            // each time: a list of N sessions with one name must not cost N²
-            // tries (an export of 20,000 of them froze the window for a
-            // minute).
-            let next = next_number.entry((folder_key.clone(), name.to_string())).or_insert(2);
-            loop {
-                alias = format!("{} ({})", name, next);
-                *next += 1;
-                if names.insert((folder_key.clone(), alias.clone())) {
-                    break;
-                }
-            }
-        }
-        out.push(ImportedHost {
-            key: format!("{}\\{}", folder_key, alias),
-            host_alias: alias,
-            hostname: hostname.to_string(),
-            port,
-            user: user.to_string(),
-            identity_file: (!rdp).then(|| path(14)).flatten(),
-            proxy_jump,
-            folder: folder.clone(),
-            credential,
-            run_on_connect: (!rdp).then(|| Some(field(7)).filter(|c| !c.is_empty()).map(mobaxterm_unescape)).flatten(),
-            jump_identity_file,
-            jump_credential,
-            rdp,
-            telnet: false,
-        });
-    }
-    if out.is_empty() {
-        return Err("No MobaXterm SSH or RDP sessions found in the pasted text.".into());
-    }
-    Ok(out)
-}
-
-/// MobaXterm writes the characters its own format uses — `;`, `|`, `#`, `%`
-/// and `"` — as words in a setting's text: `cd /opt__PTVIRG__ ls`. Back to
-/// what the user typed.
-fn mobaxterm_unescape(text: &str) -> String {
-    text.replace("__PTVIRG__", ";")
-        .replace("__PIPE__", "|")
-        .replace("__DIEZE__", "#")
-        .replace("__PERCENT__", "%")
-        .replace("__DBLQUO__", "\"")
-}
-
-/// The saved login a MobaXterm jump host signs in with: `[name]` as the
-/// jump user, for a single jump host.
-fn mobaxterm_jump_login(hosts: &str, users: &str) -> Option<String> {
-    let hops = hosts.split("__PIPE__").filter(|h| !h.trim().is_empty()).count();
-    let user = users.split("__PIPE__").next().unwrap_or("").trim();
-    let login = user.strip_prefix('[')?.strip_suffix(']')?.trim();
-    (hops == 1 && !login.is_empty()).then(|| login.to_string())
 }
 
 /// MobaXterm's jump hosts (one `__PIPE__`-separated list each for names,
@@ -24742,28 +23450,6 @@ fn guard_mirror_folder(local: &str) -> Result<String, String> {
         return Err(format!("[MIRROR] The local folder isn't a folder: {local}"));
     }
     Ok(folder.to_string_lossy().into_owned())
-}
-
-/// Whether a Windows path, as text, is a folder on a drive letter: `C:\…`,
-/// `C:/…`, or the same behind `\\?\` (`\\?\C:\…`). Anything else that starts
-/// with a slash is a share, a device or a path relative to the drive, and is
-/// refused. Written over the text, not `Path`, so it means the same on every
-/// system it's tested on.
-fn windows_drive_path(path: &str) -> bool {
-    let p = path.replace('/', "\\");
-    let rest = p.strip_prefix("\\\\?\\").unwrap_or(&p);
-    let b = rest.as_bytes();
-    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\'
-}
-
-/// The resolved folder is on a drive (Windows: a `Disk` or `VerbatimDisk`
-/// prefix), or has no prefix at all (other systems).
-fn resolved_on_a_drive(folder: &std::path::Path) -> bool {
-    use std::path::{Component, Prefix};
-    match folder.components().next() {
-        Some(Component::Prefix(prefix)) => matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)),
-        _ => !cfg!(windows),
-    }
 }
 
 /// The system folders `check_local_path_policy` refuses, as lowercase paths
@@ -25493,16 +24179,6 @@ fn resolve_node_auth_for_monitor(
     Ok(auth)
 }
 
-/// The app log's line for a server "Resume all" couldn't start, which it
-/// skips to go on with the rest: "db-01's jump host (web-gw) was deleted, so
-/// Submarine won't connect it directly without asking. Skipped."
-fn resume_skipped_line(name: &str, why: &str) -> String {
-    match why.strip_prefix(jump_gone::CODE) {
-        Some(said) => format!("{} Skipped.", said.trim()),
-        None => format!("{name}: {why}. Skipped."),
-    }
-}
-
 fn resolve_node_auth_row(
     conn: &rusqlite::Connection,
     node_id: i32,
@@ -25984,7 +24660,7 @@ async fn monitor_resume_all(
                 match resolve_node_auth_for_monitor(conn, node_id) {
                     Ok(auth) => (auth, metrics, customs, name),
                     Err(e) => {
-                        crate::applog::write_line("monitor", &resume_skipped_line(&name, &e));
+                        crate::applog::write_line("monitor", &jump_gone::resume_skipped_line(&name, &e));
                         skipped.push((node_id, name));
                         continue;
                     }
@@ -26006,43 +24682,19 @@ async fn monitor_resume_all(
             ).await;
         }
     }
-    if skipped.is_empty() {
-        return Ok(());
-    }
-    {
-        let guard = db_state.conn.lock().map_err(|_| "lock")?;
-        let conn = guard.as_ref().ok_or("db not ready")?;
-        for (node_id, _) in &skipped {
-            conn.execute("UPDATE monitor_configs SET paused = 1 WHERE node_id = ?1", [node_id])
-                .map_err(|e| e.to_string())?;
-        }
-    }
-    save_vault_internal(&db_state)?;
-    let names: Vec<&str> = skipped.iter().map(|(_, name)| name.as_str()).collect();
-    Err(format!(
-        "Couldn't start monitoring {}: check how {} reached (the app log says why).",
-        names.join(", "),
-        if names.len() == 1 { "it's" } else { "they're" }
-    ))
+    jump_gone::resume_skipped(&db_state, skipped)
 }
 
-/// The clipboard's text, for a paste into the terminal (a right-click). The
-/// desktop frontends all ask here; Android reads it in the page.
+/// The clipboard's text, for a paste into the terminal. Only the Linux
+/// frontend asks; the others read it in the page.
 ///
 /// WebKitGTK refuses the page's `navigator.clipboard.readText()` (#89). And
 /// where the webview reads the clipboard itself (a keyboard paste, or the
 /// page API once it is allowed), it crashes the whole app when nothing owns
 /// the clipboard (seen with WebKitGTK 2.54). So on Linux the page asks here
-/// and GTK is asked directly.
-///
-/// On Windows the page's read is WebView2's to allow, behind a permission
-/// prompt: blocked or dismissed once, every right-click paste failed with
-/// "Clipboard read denied". The Win32 clipboard is read directly instead.
-///
-/// On macOS, WKWebView refuses the page's read outright ("Clipboard read
-/// denied"), so `pbpaste` reads the general pasteboard.
-///
-/// A clipboard that is empty or holds no text gives an empty string.
+/// and GTK is asked directly. A clipboard that is empty or holds no text
+/// gives an empty string. The fork reads it here on Windows and macOS too
+/// (clipboard_read.rs).
 #[tauri::command]
 async fn clipboard_read_text(app: tauri::AppHandle) -> Result<String, String> {
     #[cfg(target_os = "linux")]
@@ -26060,42 +24712,13 @@ async fn clipboard_read_text(app: tauri::AppHandle) -> Result<String, String> {
             _ => Err("The clipboard did not answer.".to_string()),
         }
     }
-    #[cfg(windows)]
+    #[cfg(not(target_os = "linux"))]
     {
         let _ = app;
-        tokio::task::spawn_blocking(windows_clipboard_text)
-            .await
-            .map_err(|e| e.to_string())?
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = app;
-        let read = tokio::process::Command::new("/usr/bin/pbpaste")
-            // It writes the text in the encoding these name, and an app
-            // opened from the Finder or the Dock may have none set.
-            .env("LANG", "en_US.UTF-8")
-            .env("LC_ALL", "en_US.UTF-8")
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output();
-        match tokio::time::timeout(std::time::Duration::from_secs(5), read).await {
-            Ok(Ok(out)) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
-            Ok(Ok(out)) => Err(format!("The clipboard could not be read (pbpaste: {}).", out.status)),
-            Ok(Err(e)) => Err(format!("The clipboard could not be read: {}", e)),
-            Err(_) => Err("The clipboard did not answer.".to_string()),
-        }
-    }
-    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
-    {
-        let _ = app;
-        Err("Reading the clipboard here is only for Linux, Windows and macOS.".to_string())
+        clipboard_read::read_text().await
     }
 }
 
-/// `submarine --mcp`: the helper an AI tool started from Home runs as its
-/// MCP server (ai/helper.rs). main.rs calls it before anything else and exits
-/// with what it returns.
 pub fn mcp_helper() -> i32 {
     ai::helper::main()
 }
@@ -26309,7 +24932,6 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            diagnose_connect,
             check_db_exists, setup_master_db, persist_vault,
             quick_unlock::quick_unlock_support, quick_unlock::quick_unlock_status, quick_unlock::quick_unlock_enable,
             quick_unlock::quick_unlock_disable, quick_unlock::quick_unlock,
@@ -26323,14 +24945,13 @@ pub fn run() {
             cloud::get_cloud_enabled, cloud::set_cloud_enabled,
             cloud_config::cloud_get_config, cloud_config::cloud_set_config, cloud_config::cloud_test_connection,
             sync_now, move_profile_to_current_server,
-            store_sync::store_status, store_sync::store_setup, store_sync::store_disconnect,
-            store_sync::store_find_profiles, store_sync::store_restore_profile,
+            store_sync::store_status, store_sync::store_setup, store_sync::store_disconnect, store_sync::store_find_profiles, store_sync::store_restore_profile,
             identity_status, setup_identity, reset_identity,
             share_current_profile, invite_to_share, list_shares, share_member_list,
             accept_share, import_shared_profile, restore_personal_profile, share_set_role, share_revoke, share_leave, share_delete,
             profile_share_status, stop_sharing, profile_sync_stats, share_key_state, accept_share_key, share_replace_key, held_deletions_list, resolve_held_deletions, cloud_resume_profile, profile_copies, restore_profile_copy,
             set_editor_label,
-            add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, allow_held, keep_server_ssh, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_terminal_theme, set_server_highlight, set_server_jump_host, set_server_protocol, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
+            add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, allow_held, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_jump_host, set_server_protocol, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
             get_credentials, generate_ssh_key,
             add_folder, rename_folder, delete_folder, get_folders,
             tree_moves::move_servers, tree_moves::move_folder, tree_moves::delete_tree_items,
@@ -26349,16 +24970,14 @@ pub fn run() {
             list_tunnel_rules, remove_tunnel_rule, rename_tunnel_rule,
             open_terminal, local_shell, write_terminal_data, type_saved_password, terminal_drawn, resize_terminal, close_terminal,
             keep_session::keep_session_tab, keep_session::keep_session_open, keep_session::keep_session_state, keep_session::keep_session_list, keep_session::keep_session_end,
-            local_term::list_local_shells, local_term::local_shell_set_default,
-            local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
-            local_term::local_terminal_open, local_term::local_terminal_write, local_term::local_windows_build,
-            local_term::local_terminal_resize, local_term::local_terminal_close,
-            ping::ping_server, jump_gone::jump_host_connect_directly,
+            local_term::list_local_shells, local_term::local_shell_set_default, local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
+            local_term::local_terminal_open, local_term::local_terminal_write, local_term::local_windows_build, local_term::local_terminal_resize, local_term::local_terminal_close,
+            ping::ping_server, jump_gone::jump_host_connect_directly, diagnose_connect, ssh_firewall_as_root,
             ai::ai_settings, ai::ai_set_enabled, ai::ai_state, ai::ai_share, ai::ai_unshare, ai::ai_stop, ai::ai_decide, ai::ai_output,
             ai::ai_set_flash, ai::ai_allow_session, ai::ai_decide_group, ai::ai_allow_session_group, ai::ai_allow_always, ai::ai_trust_view, ai::ai_trust_scope,
             ai::ai_trust_set_level, ai::ai_trust_add_rule, ai::ai_trust_remove_rule, ai::ai_end_allow_all, ai::ai_keep_policy, ai::ai_add_pull_folder, ai::ai_remove_pull_folder, ai::ai_stop_follow,
             ssh_info_probe_section, ssh_systemctl_action, ssh_kill_process,
-            ssh_iptables_chain, ssh_nft_chain, ssh_firewall_as_root,
+            ssh_iptables_chain, ssh_nft_chain,
             applog::app_log, applog::ui_heartbeat, applog::open_log_folder, diagnostics_report,
             highlight::highlight_rules_list, highlight::highlight_rule_save, highlight::highlight_rule_delete, highlight::highlight_rules_reorder,
             docker::ssh_docker_container_action,
@@ -26383,7 +25002,6 @@ pub fn run() {
             android_quick_dirs, android_default_local_dir,
             parse_ssh_config,
             parse_client_import,
-            import_hosts, host_import::pick_client_import_file,
             sftp_list_dir, sftp_create_dir, sftp_remove_file, sftp_remove_dir,
             sftp_rename, sftp_set_permissions, sftp_set_owner, sftp_stat,
             sftp_download_file, sftp_download_dir, sftp_upload_file, sftp_upload_dir, sftp_cancel_transfer, sftp_batch_limits, sftp_open_remote_file,
@@ -26395,10 +25013,8 @@ pub fn run() {
             monitor_get_settings, monitor_set_settings,
             about::app_info, about::check_for_updates, about::open_external_url,
             portable::get_storage_info,
-            local_open::live_edit_editor_get, local_open::live_edit_editor_pick, local_open::live_edit_editor_reset,
-            bulk_pick::bulk_pick_files,
-            multiexec::get_jump_login_limit, multiexec::set_jump_login_limit,
-            server_os::detect_server_os,
+            local_open::live_edit_editor_get, local_open::live_edit_editor_pick, local_open::live_edit_editor_reset, bulk_pick::bulk_pick_files, import_hosts, host_import::pick_client_import_file,
+            multiexec::get_jump_login_limit, multiexec::set_jump_login_limit, server_os::detect_server_os, approvals::keep_server_ssh, set_server_terminal_theme, set_server_highlight,
             fonts::list_system_fonts,
             clipboard_read_text
         ]);
@@ -26654,39 +25270,6 @@ mod tests {
         assert!(!webview_data_folder_busy(
             "failed to create webview: WebView2 error: WindowsError(Error { code: HRESULT(0x80070002), message: \"The system cannot find the file specified.\" })"
         ));
-    }
-
-    #[test]
-    fn files_bound_for_a_login_folder_are_caught() {
-        let dirs = vec![std::path::PathBuf::from("/home/me/.config/autostart")];
-        assert!(lands_in(std::path::Path::new("/home/me/.config/autostart/x.desktop"), &dirs));
-        assert!(lands_in(std::path::Path::new("/home/me/.config/autostart"), &dirs));
-        assert!(!lands_in(std::path::Path::new("/home/me/Downloads/alice/.config/autostart/x.desktop"), &dirs));
-        assert!(!lands_in(std::path::Path::new("/home/me/.config/autostart-old/x"), &dirs));
-        assert!(!lands_in(std::path::Path::new("/anything"), &[std::path::PathBuf::new()]));
-        assert_eq!(autorun_skipped_note(0), None);
-        let folders = LoginFolders::of(dirs.clone());
-        assert!(!folders.may_hold_server_file(std::path::Path::new("/home/me/.config/autostart/x.desktop")));
-        assert!(folders.may_hold_server_file(std::path::Path::new("/home/me/Downloads/alice/.config/autostart/x.desktop")));
-    }
-
-    /// A link to a login folder, below the folder a download or a mirror
-    /// writes into, is seen through.
-    #[cfg(unix)]
-    #[test]
-    fn a_link_to_a_login_folder_is_caught_too() {
-        let root = std::env::temp_dir().join(format!("submarine-login-link-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let autostart = root.join("home/.config/autostart");
-        std::fs::create_dir_all(&autostart).unwrap();
-        std::fs::create_dir_all(root.join("mirror")).unwrap();
-        std::os::unix::fs::symlink(&autostart, root.join("mirror/startup")).unwrap();
-        let folders = LoginFolders::of(vec![autostart.clone()]);
-        assert!(!folders.may_hold_server_file(&root.join("mirror/startup/x.desktop")));
-        assert!(!folders.may_hold_server_file(&root.join("mirror/startup/new/deeper/x.desktop")));
-        assert!(folders.may_hold_server_file(&root.join("mirror/other/x.desktop")));
-        let _ = std::fs::remove_dir_all(&root);
-        assert!(autorun_skipped_note(2).unwrap().starts_with("2 files skipped"));
     }
 
     #[test]

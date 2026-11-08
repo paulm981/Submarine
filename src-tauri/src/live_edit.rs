@@ -304,6 +304,94 @@ pub(crate) fn end_live_edit_watch(
     None
 }
 
+/// lib.rs's sweep_app_temp, the fork's way: this run's temp root goes
+/// (`include_own`, keeping unsent Live Edit copies), and so do the roots
+/// other runs left (sweep_old_temp_roots).
+pub(crate) fn sweep_temp_roots(include_own: bool) {
+    if include_own {
+        // Let go of this run's lock first: on Windows a file held open
+        // keeps its folder from being removed.
+        drop(APP_TEMP_LOCK.lock().unwrap_or_else(|e| e.into_inner()).take());
+        remove_own_temp(app_temp_root());
+    }
+    sweep_old_temp_roots(&std::env::temp_dir(), std::time::Duration::from_secs(24 * 60 * 60));
+}
+
+/// Removes this run's temp root, keeping Live Edit copies with edits that
+/// never reached the server first, as a disconnect does (keep_unsent_edits).
+pub(crate) fn remove_own_temp(root: &Path) {
+    keep_unsent_edits(root, true);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The file in each run's temp root that the run holds locked for as long
+/// as it lives (lock_temp_root). The system lets go of it when the process
+/// ends, however it ends.
+pub(crate) const TEMP_ROOT_LOCK: &str = ".submarine-run.lock";
+
+/// This run's lock on its temp root, taken when the root is made.
+pub(crate) static APP_TEMP_LOCK: StdMutex<Option<std::fs::File>> = StdMutex::new(None);
+
+/// Makes the lock file in `root` and locks it; None where that can't be done.
+pub(crate) fn lock_temp_root(root: &Path) -> Option<std::fs::File> {
+    let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(root.join(TEMP_ROOT_LOCK)).ok()?;
+    file.try_lock().ok()?;
+    Some(file)
+}
+
+/// Removes the temp roots in `temp` that other runs left: ones older than
+/// `age` whose run is over. A run that's still going holds its root's lock
+/// (another copy of the app beside this one), and its root is left alone;
+/// so is one whose lock can't be looked at, or that isn't this user's. A
+/// root from before the lock (no lock file) goes by its age only. Live Edit
+/// copies in a root are kept in `unsent_edits_dir` before it goes: which of
+/// them had edits that never reached the server isn't known any more.
+pub(crate) fn sweep_old_temp_roots(temp: &Path, age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(temp) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_app_temp_name(name) {
+            continue;
+        }
+        // The folder itself, never what a link leads to.
+        let Ok(meta) = std::fs::symlink_metadata(e.path()) else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid has no preconditions and can't fail.
+            if meta.uid() != unsafe { libc::geteuid() } {
+                continue;
+            }
+        }
+        let old = meta.modified().map(|t| t.elapsed().map(|a| a > age).unwrap_or(false)).unwrap_or(false);
+        if !old {
+            continue;
+        }
+        let lock = match std::fs::OpenOptions::new().read(true).open(e.path().join(TEMP_ROOT_LOCK)) {
+            Ok(file) => match file.try_lock() {
+                Ok(()) => Some(file),
+                // Held: that run is still going. Or locks don't work there,
+                // and nothing says it's over.
+                Err(_) => continue,
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => continue,
+        };
+        keep_live_edit_copies_of(&e.path());
+        drop(lock);
+        let _ = std::fs::remove_dir_all(e.path());
+    }
+}
+
+/// The name of a temp root: `submarine-` and its random bytes in hex.
+pub(crate) fn app_temp_name(bytes: &[u8]) -> String {
+    format!("submarine-{}", hex::encode(bytes))
+}
+
 #[cfg(test)]
 mod unsent_edits_tests {
     use super::{kept_names, move_to_free_name};
@@ -524,6 +612,22 @@ pub(crate) fn keep_live_edit_copies_of(root: &Path) {
     }
 }
 
+#[cfg(test)]
+mod temp_root_tests {
+    /// The startup sweep recognises the temp roots this app makes (it used
+    /// to look for 32 hex digits where 24 are made, and swept nothing), and
+    /// nothing else.
+    #[test]
+    fn the_startup_sweep_knows_its_own_temp_folders() {
+        use crate::{app_temp_name, is_app_temp_name};
+        assert!(is_app_temp_name(&app_temp_name(&[0xab; 12])));
+        assert!(is_app_temp_name(&format!("submarine-{}", "0f".repeat(16))));
+        for other in ["submarine-", "submarine-xyz", "submarine-liveedit-test-1", "submarine-0123456789abcdef0123456", "other-abababababababababababab", "submarine-abababababababababababab/x"] {
+            assert!(!is_app_temp_name(other), "{other}");
+        }
+    }
+}
+
 // Every call from the original project's code into this file (fork_hooks.rs):
 // a sync that drops one, or the lines that bring the file in, fails here.
 #[cfg(test)]
@@ -541,8 +645,10 @@ mod hook_tests {
                 ("disconnect_session", "sweep_session_temp(", 1),
                 ("teardown_connection_key", "sweep_session_temp(", 1),
                 ("teardown_profile", "sweep_session_temp(", 1),
-                ("remove_own_temp", "keep_unsent_edits(", 1),
-                ("sweep_old_temp_roots", "keep_live_edit_copies_of(", 1),
+                ("sweep_app_temp", "sweep_temp_roots(include_own)", 1),
+                ("app_temp_root", "app_temp_name(&bytes)", 1),
+                ("app_temp_root", "APP_TEMP_LOCK.lock()", 1),
+                ("app_temp_root", "lock_temp_root(&root)", 1),
                 ("sftp_open_remote_file", "live_edit_copies(", 3),
                 ("sftp_open_remote_file", "live_edit_watchers(", 2),
                 ("sftp_open_remote_file", "sha256_of(", 2),

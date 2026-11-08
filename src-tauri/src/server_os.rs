@@ -80,7 +80,7 @@ fn store_os(conn: &rusqlite::Connection, server_id: i32, host: &str, port: i64, 
         Some(_) => {
             // Held back from the sync triggers: what the server reports
             // is not an edit to push.
-            crate::with_merge_flag(conn, |c| {
+            crate::sync_merge::with_merge_flag(conn, |c| {
                 c.execute("UPDATE servers SET os=?1 WHERE id=?2", params![os, server_id])
                     .map_err(|e| format!("[DATABASE] SERVER_OS_UPDATE_FAILED: {}", e))
             })?;

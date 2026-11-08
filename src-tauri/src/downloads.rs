@@ -1,6 +1,8 @@
 //! Finishing a download: what's there already is replaced only when asked,
 //! names that differ only in case are kept apart, and nothing lands in a
-//! folder this system runs programs from at login (`LoginFolders`).
+//! folder this system runs programs from at login (`LoginFolders`). And a
+//! mirror's local folder is one on a drive, not a network share
+//! (`windows_drive_path`, `resolved_on_a_drive`; lib.rs, guard_mirror_folder).
 //!
 //! The fork's own, moved here out of lib.rs (#136) so a sync with the
 //! original project doesn't conflict on it. lib.rs reaches it through
@@ -209,6 +211,158 @@ pub(crate) fn autorun_skipped_note(skipped: u64) -> Option<String> {
     }
 }
 
+/// Whether a Windows path, as text, is a folder on a drive letter: `C:\…`,
+/// `C:/…`, or the same behind `\\?\` (`\\?\C:\…`). Anything else that starts
+/// with a slash is a share, a device or a path relative to the drive, and is
+/// refused. Written over the text, not `Path`, so it means the same on every
+/// system it's tested on.
+pub(crate) fn windows_drive_path(path: &str) -> bool {
+    let p = path.replace('/', "\\");
+    let rest = p.strip_prefix("\\\\?\\").unwrap_or(&p);
+    let b = rest.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\'
+}
+
+/// The resolved folder is on a drive (Windows: a `Disk` or `VerbatimDisk`
+/// prefix), or has no prefix at all (other systems).
+pub(crate) fn resolved_on_a_drive(folder: &std::path::Path) -> bool {
+    use std::path::{Component, Prefix};
+    match folder.components().next() {
+        Some(Component::Prefix(prefix)) => matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)),
+        _ => !cfg!(windows),
+    }
+}
+
+/// What a folder download (lib.rs, sftp_download_dir) leaves out, for the
+/// note on its finished card: names the walk skipped, files bound for a login
+/// folder, and names that differ only in case.
+pub(crate) struct DownloadNotes {
+    names: u64,
+    autorun: u64,
+    case: u64,
+}
+
+impl DownloadNotes {
+    /// Leaves out of `files` (bound for `local_path`/`folder_name`) what
+    /// mustn't be written. The destination passed the policy, but the server
+    /// names the folders inside it: a home-folder backup downloaded into
+    /// C:\Users would put its AppData\…\Startup\x.bat in the real Startup
+    /// folder. Files that would land in a folder the system runs things from
+    /// at login are left out and counted on the card. And where upper and
+    /// lower case are the same name (Windows, and macOS as usually set up),
+    /// two files whose names differ only in case would land on one file, the
+    /// second replacing the first. The second is left out.
+    pub(crate) fn filter(files: &mut Vec<(String, String, u64)>, local_path: &str, folder_name: &str, skipped_names: u64) -> Self {
+        let login_folders = LoginFolders::new();
+        let dest_root = std::path::PathBuf::from(local_path).join(folder_name);
+        let before = files.len();
+        files.retain(|(_, rel, _)| login_folders.may_hold_server_file(&dest_root.join(rel)));
+        let autorun = (before - files.len()) as u64;
+        let case = drop_case_twins(files, cfg!(any(windows, target_os = "macos")));
+        Self { names: skipped_names, autorun, case }
+    }
+
+    /// The card's note, with the files left out at the end because something
+    /// of that name was there (another download finished first), which the
+    /// jobs count: nothing is replaced unless the user chose to.
+    pub(crate) fn text(&self, skipped_existing: u64) -> Option<String> {
+        let notes: Vec<String> = [
+            skipped_names_note(self.names),
+            autorun_skipped_note(self.autorun),
+            case_twins_note(self.case),
+            existing_skipped_note(skipped_existing),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!notes.is_empty()).then(|| notes.join("; "))
+    }
+}
+
+#[cfg(test)]
+mod login_folder_tests {
+    use super::*;
+
+    #[test]
+    fn files_bound_for_a_login_folder_are_caught() {
+        let dirs = vec![std::path::PathBuf::from("/home/me/.config/autostart")];
+        assert!(lands_in(std::path::Path::new("/home/me/.config/autostart/x.desktop"), &dirs));
+        assert!(lands_in(std::path::Path::new("/home/me/.config/autostart"), &dirs));
+        assert!(!lands_in(std::path::Path::new("/home/me/Downloads/alice/.config/autostart/x.desktop"), &dirs));
+        assert!(!lands_in(std::path::Path::new("/home/me/.config/autostart-old/x"), &dirs));
+        assert!(!lands_in(std::path::Path::new("/anything"), &[std::path::PathBuf::new()]));
+        assert_eq!(autorun_skipped_note(0), None);
+        let folders = LoginFolders::of(dirs.clone());
+        assert!(!folders.may_hold_server_file(std::path::Path::new("/home/me/.config/autostart/x.desktop")));
+        assert!(folders.may_hold_server_file(std::path::Path::new("/home/me/Downloads/alice/.config/autostart/x.desktop")));
+    }
+
+    /// A link to a login folder, below the folder a download or a mirror
+    /// writes into, is seen through.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_login_folder_is_caught_too() {
+        let root = std::env::temp_dir().join(format!("submarine-login-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let autostart = root.join("home/.config/autostart");
+        std::fs::create_dir_all(&autostart).unwrap();
+        std::fs::create_dir_all(root.join("mirror")).unwrap();
+        std::os::unix::fs::symlink(&autostart, root.join("mirror/startup")).unwrap();
+        let folders = LoginFolders::of(vec![autostart.clone()]);
+        assert!(!folders.may_hold_server_file(&root.join("mirror/startup/x.desktop")));
+        assert!(!folders.may_hold_server_file(&root.join("mirror/startup/new/deeper/x.desktop")));
+        assert!(folders.may_hold_server_file(&root.join("mirror/other/x.desktop")));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(autorun_skipped_note(2).unwrap().starts_with("2 files skipped"));
+    }
+}
+
+#[cfg(test)]
+mod mirror_folder_tests {
+    #[test]
+    fn only_a_folder_on_a_drive_letter_passes_as_text() {
+        use super::windows_drive_path;
+        for ok in [r"C:\Users\me\site", "d:/work", r"\\?\C:\Users\me", r"\\?\c:\x", "C:\\"] {
+            assert!(windows_drive_path(ok), "{ok}");
+        }
+        for bad in [
+            r"\\attacker.example\share\dir",
+            "//attacker.example/share",
+            r"\\?\UNC\attacker.example\share",
+            r"\\?\unc\attacker.example\share",
+            r"\\?\GLOBALROOT\Device\Mup\attacker.example\share",
+            r"\\.\pipe\x",
+            r"\\.\C:\x",
+            r"\??\UNC\host\share",
+            r"\Users\me",
+            "C:relative",
+            "C:",
+            "",
+            "folder",
+            "/home/me",
+        ] {
+            assert!(!windows_drive_path(bad), "{bad}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_network_share_is_refused_before_anything_is_looked_at() {
+        for bad in [
+            r"\\attacker.example\share\dir",
+            r"\\?\UNC\attacker.example\share",
+            r"\\?\unc\attacker.example\share",
+            r"\\?\GLOBALROOT\Device\Mup\attacker.example\share",
+            r"\\.\pipe\x",
+        ] {
+            let t = std::time::Instant::now();
+            let err = crate::guard_mirror_folder(bad).unwrap_err();
+            assert!(err.contains("network share") || err.contains("MIRROR"), "{bad}: {err}");
+            assert!(t.elapsed() < std::time::Duration::from_secs(1), "{bad} was looked up on the network");
+        }
+    }
+}
+
 // Every call from the original project's code into this file (fork_hooks.rs):
 // a sync that drops one, or the lines that bring the file in, fails here.
 #[cfg(test)]
@@ -225,11 +379,10 @@ mod hook_tests {
                 ("", "use downloads::*;", 1),
                 ("sftp_download_file", "finalize_download(", 1),
                 ("download_dir_file", "finalize_download(", 1),
-                ("sftp_download_dir", "LoginFolders", 1),
-                ("sftp_download_dir", "drop_case_twins(", 1),
-                ("sftp_download_dir", "autorun_skipped_note(", 1),
-                ("sftp_download_dir", "case_twins_note(", 1),
-                ("sftp_download_dir", "existing_skipped_note(", 1),
+                ("sftp_download_dir", "DownloadNotes::filter(&mut files, &local_path, &folder_name, skipped_names)", 1),
+                ("sftp_download_dir", "skipped_note.text(", 2),
+                ("guard_mirror_folder", "windows_drive_path(local)", 1),
+                ("guard_mirror_folder", "resolved_on_a_drive(&folder)", 1),
             ],
         );
     }
