@@ -13,11 +13,11 @@
   </p>
 </div>
 
-> **This is a fork.** [paulm981/Submarine](https://github.com/paulm981/Submarine) builds on [Submarine](https://github.com/sinaxhpm/submarine) by Sina. It adds what a team needs to run a large, shared set of servers from one SSH client that works the same on Windows, macOS and Linux, and an easy way in for anyone coming from MobaXterm, PuTTY or an OpenSSH config. **Download** the [latest release](https://github.com/paulm981/Submarine/releases/latest) (on Windows, [`Submarine-windows-x64-setup.exe`](https://github.com/paulm981/Submarine/releases/latest/download/Submarine-windows-x64-setup.exe); see [Install](#install)). Releases, updates and issues for this fork live here.
+> **This is a fork.** [paulm981/Submarine](https://github.com/paulm981/Submarine) builds on [Submarine](https://github.com/sinaxhpm/submarine) by Sina. It adds what a team needs to run a large, shared set of servers from one SSH client that works the same on Windows, macOS and Linux: AI tools that can work on your servers without ever getting a key, files pushed to or pulled from many servers at once, sessions that survive a dropped connection, and an easy way in for anyone coming from MobaXterm, PuTTY or an OpenSSH config. **Download** the [latest release](https://github.com/paulm981/Submarine/releases/latest) (on Windows, [`Submarine-windows-x64-setup.exe`](https://github.com/paulm981/Submarine/releases/latest/download/Submarine-windows-x64-setup.exe); see [Install](#install)). Releases, updates and issues for this fork live here.
 
 ## What this fork adds
 
-The tour with more pictures is in [FORK.md](FORK.md), along with where the fork differs from the original project and how it keeps up with it. What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
+[FORK.md](FORK.md) has more on each feature below, with pictures, along with where the fork differs from the original project and how it keeps up with it. What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
 <table>
   <tr>
@@ -42,23 +42,37 @@ The tour with more pictures is in [FORK.md](FORK.md), along with where the fork 
   </tr>
 </table>
 
-**Bring your sessions with you**
-- **Session import that keeps your setup**: from MobaXterm, nested folders, saved logins, jump hosts and their keys, startup commands such as `dzdo su -`, and Remote Desktop sessions come over as they were, and a result screen says what came in. PuTTY and OpenSSH config imports are there too.
+**AI tools on your servers, without sharing keys** (a first test, off by default)
+- **Claude Code or Codex from Home's menu.** Install one, turn on **Settings › AI tools**, then start it from Home's menu (the arrow beside **+**, then **AI tools**). It opens already connected to Submarine, through a local channel only your account can use.
+- **Share with AI** on a server's tab, and the AI can ask to run commands there. Each request waits in the **AI panel** until you click Allow or Deny, on a card that says which server it runs on and as whom. **Ctrl+Shift+L** shows the AI beside the tab.
+- **How much it may run without asking is up to you, per server or folder:** **Ask every time** (the default), **Run my allowed commands, ask for the rest**, or **Run anything, just log it**. An always-ask list (`reboot`, `rm -rf *` and more) asks at every level. Your levels and rules stay on this computer and never sync.
+- **One card for many servers.** The same command on 12 shared servers is one request: **Allow on 12 servers**.
+- **Root through Submarine.** The AI asks Submarine for root instead of typing sudo. Submarine runs the command through sudo or dzdo, and where a password is needed, you type it into Submarine. The AI never sees it.
+- **Copying files.** The AI can push files to shared servers, or pull them from each, as one request on one card. Files come to this computer only into folders you add under **Settings › AI tools**, and never replace what's there.
+- **Following a log.** It can follow a command such as `journalctl -u nginx -f` and read what's new every few seconds. The AI panel shows each follow, with **Stop**.
+- **What a server prints is marked as the server's words.** The AI gets it between tags the server can't fake, with a line saying it's data, not instructions. That's a strong hint to the AI, not a guarantee.
+- **The AI never gets a key or password.** Commands run on Submarine's own connection. Known secrets are hidden from the output the AI gets, and every request and decision goes in an audit log, `ai-audit.log`.
+- **What it doesn't stop:** the AI tool still runs as you, so it could use keys it finds by itself, and a hostile program running as you could get round all of this. [FORK.md](FORK.md#ai-help-without-sharing-keys) says how to keep Claude Code out of your keys. What comes next is in [#32](https://github.com/paulm981/Submarine/issues/32).
 
 **Work on many servers at once**
+- **Broadcast and the Wall**, as the original project has them: tick the sessions, turn Broadcast on, and what you type in one goes to all of them. Right-click a tab to pin its terminal to the Wall, to watch terminals from many servers side by side.
+- **Push and pull files on many servers.** Right-click a tab, or servers in the session tree, and pick **Push files to servers…** or **Pull files from servers…**. Before anything moves, a summary shows what goes where and what's already there. Four servers copy at a time, and **Stop** stops them all.
 - **Many tabs, easily**: **Ctrl+Shift+K** jumps to a tab by typing part of its name, **Ctrl+Tab** moves between tabs, and a tab's right-click menu closes the others, those to the right, the disconnected ones, or all of them.
 - **Jump hosts at scale**: a hundred servers behind one jump host log in a few at a time (the limit is a setting), and Monitoring reaches servers through their jump host too. **Jump via** in the server form is a search box.
 - **Your `~/.ssh/config`**: ProxyJump chains, IdentityFile keys and certificates (Teleport included), and your known_hosts. Submarine's own trusted host keys always come first, so a changed key always gets the warning. [More in FORK.md](FORK.md#jump-hosts-and-your-ssh-config).
 - **Split**: a second shell on the same server beside the first, to watch a log in one and work in the other.
 
+**Sessions that survive a reconnect**
+- Turn on **Keep sessions between connections** in **Settings › Servers & sessions**, or for one server in its form. Terminals then run in tmux, or screen, on the server. After a dropped connection, a sleep or a closed tab, you're back in the same shell, with what was running still running.
+- Nothing asks when you close a tab: the session just keeps running. Type `exit` to end it, or use **Sessions…** in the server's right-click menu. Nothing is installed on a server; one without tmux or screen gets a plain shell.
+
 **Organize them**
 - **A session tree** beside the terminal, with search: folders and servers (SSH, Remote Desktop, VNC and telnet), managed by drag and drop, rename, move and delete. **Show only open** narrows it to the servers you have open.
 - **OS badges** on servers, and a badge for each server that isn't SSH.
+- **Ping** a server from its right-click menu, while it reboots, say: a small panel shows when it stopped answering, when it came back, and when its port takes a connection again.
 
-**AI help, without sharing keys** (a first test, off by default)
-- **Turn it on** in **Settings › AI tools**, then start **Claude Code** or **Codex** from Home's menu (the arrow beside **+**, then **AI tools**). It opens already connected to Submarine, through a local channel only your account can use.
-- **Share with AI** on a server's tab, and it can ask to run commands there. Each one waits in the **AI panel** until you click Allow. **Ctrl+Shift+L** shows the AI beside the tab.
-- **How it stays safe**: Submarine runs each command on its own connection, so the AI never gets a key or password, and the AI tool starts in a folder of its own, without your SSH agent or cloud logins in its environment. The output it gets has known secrets hidden, each request's card says who the command runs as, and every request is logged. It still runs as you, so it could use keys it finds by itself, and a hostile program running as you could get round all of it. [FORK.md](FORK.md#ai-help-without-sharing-keys) says how to keep Claude Code out of your keys; what comes next is in [#32](https://github.com/paulm981/Submarine/issues/32).
+**Bring your sessions with you**
+- **Session import that keeps your setup**: from MobaXterm, nested folders, saved logins, jump hosts and their keys, and startup commands such as `dzdo su -` come over as they were. Remote Desktop sessions come in as RDP servers, without their saved login. A result screen says what came in. PuTTY and OpenSSH config imports are there too.
 
 **Root when you need it**
 - **SFTP root mode, Info panel actions and Docker as root** through `sudo` or `dzdo` (Centrify / Delinea): without a password where the server allows it, including servers that only allow `dzdo su -`, and with csh or tcsh logins. A password you type goes only to sudo or dzdo, and a wrong one costs a single failed attempt, so it can't lock your account.
@@ -70,11 +84,14 @@ The tour with more pictures is in [FORK.md](FORK.md), along with where the fork 
 - **A Home view** of terminals on your own computer: PowerShell, Command Prompt, Git Bash and each WSL distribution by name on Windows (the default one marked); the login shell and every other installed shell on macOS and Linux.
 - The app's own dark right-click menus everywhere, and no right-click or F5 that reloads the app.
 
+**Settings in categories**
+- Tabs across the top: General, Terminal, Servers & sessions, AI tools, Sync and Help. Settings opens on the one you used last. Each setting says what it does in one line, with the longer explanation behind **Learn more**.
+
 **Your data, your storage**
-- **Sync through storage you own**: a folder that OneDrive, Dropbox, Nextcloud, Syncthing or a network share keeps the same on your computers, or a private git repository, with no third-party service. Profiles are encrypted with their password first, and Remote Desktop links sync too. The original project's hosted cloud stays off unless you turn it on.
+- **Sync through storage you own**: a folder that OneDrive, Dropbox, Nextcloud, Syncthing or a network share keeps the same on your computers, or a private git repository, with no third-party service. Profiles are encrypted with their password first. The original project's hosted cloud stays off unless you turn it on.
 
 **Ready to roll out to a team**
-- **A release from every change**, numbered like `v0.4.0-fork.8` and shown in the title bar, with a notice when there's a newer one.
+- **A release from every change**, numbered like `v0.4.0-fork.N` and shown in the title bar, with a notice when there's a newer one.
 - **Shared profiles that can't act behind your back**: when someone you share a profile with changes on-connect commands, autostart, forwards or monitor commands, or switches a server to telnet or VNC, it waits for your OK on your computer. [More in FORK.md](FORK.md#shared-profiles).
 - **Troubleshooting**: a log on your computer, a watchdog that notes when the window froze and why, and **Copy diagnostics** with server, user and host names replaced, ready to send to whoever is helping. When a connect fails, Submarine says whether the name resolved and the port answered.
 - **Hardening**: characters that disguise a file name are shown plainly, and a trusted server that shows a different kind of key is a warning, not a silent change. Live Edit opens a file in an editor and never runs it, and keeps changes that didn't reach the server in **Submarine unsent edits** in your Downloads folder. The Local pane asks before it opens a file that would run, on Windows, macOS and Linux. Downloads never replace each other, and are marked as from the internet on Windows and macOS. A mirror keeps a file's permissions on the server. As in the original project, a program on a server isn't opened from the file pane at all.
@@ -190,7 +207,7 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 - **Per-pane filter input** — type to filter the listing live with an N/M counter, Esc to clear
 - **Multi-select with Ctrl/Shift-click** plus **Select-All button and Ctrl+A** for bulk download, move, or delete
 - **Overwrite confirmation** before clobbering an existing file (both uploads AND downloads — no more silent drag-drop clobber), with "apply to all" for batches
-- **Live edit** — double-click any remote file to open it in an editor (the one picked in Settings › Live Edit, or the system's text editor; it's never run); saves auto-upload back to the server
+- **Live edit** — double-click any remote file to open it in an editor (the one picked under Live Edit in Settings › General, or the system's text editor; it's never run); saves auto-upload back to the server
 - **Direct download** to the local folder you already have open — no folder picker every time
 - Permissions editor with a checkbox grid (chmod / chown)
 - Drag files in from your OS file manager to upload
@@ -266,7 +283,7 @@ Download from the **[latest release](https://github.com/paulm981/Submarine/relea
 | Arch / Manjaro / EndeavourOS | `Submarine-linux-x86_64.pkg.tar.zst` — `sudo pacman -U Submarine-linux-x86_64.pkg.tar.zst` |
 | Any Linux | `Submarine-linux-x86_64.AppImage` — `chmod +x` and double-click |
 
-To update, run the newer setup `.exe` over the installed one. Submarine tells you when there is one: the profile screen shows *"New version v0.4.0-fork.9 available"*. Each release has the original project's version and the fork's count, `v0.4.0-fork.1`, `v0.4.0-fork.2` and so on, in the title bar and at the bottom of the profile screen. To install on many PCs, the setup `.exe` runs silently with `/S`.
+To update, run the newer setup `.exe` over the installed one. Submarine tells you when there is one: the profile screen shows *"New version v0.4.0-fork.N available"*. Each release has the original project's version and the fork's count, `v0.4.0-fork.1`, `v0.4.0-fork.2` and so on, in the title bar and at the bottom of the profile screen. To install on many PCs, the setup `.exe` runs silently with `/S`.
 
 Every release is on the [releases page](https://github.com/paulm981/Submarine/releases). The Android `.apk` comes from the [original project's releases](https://github.com/sinaxhpm/submarine/releases).
 
@@ -290,7 +307,7 @@ If macOS says the app *is damaged*, sign it again on your Mac and open it: `code
 
 ### Portable mode (Windows)
 
-Submarine can keep all of its data next to the executable instead of in your user profile — on a USB stick, say. Create an empty folder named `submarine-data` beside `submarine.exe` and start the app; the `-portable.zip` download is already laid out that way. Profiles, the cloud sign-in, the window position and the UI preferences then live in `submarine-data`, and **Settings → Maintenance** shows the folder in use.
+Submarine can keep all of its data next to the executable instead of in your user profile — on a USB stick, say. Create an empty folder named `submarine-data` beside `submarine.exe` and start the app; the `-portable.zip` download is already laid out that way. Profiles, the cloud sign-in, the window position and the UI preferences then live in `submarine-data`, and **Settings › General**, under Maintenance, shows the folder in use.
 
 A first portable launch starts with no profiles. To carry existing data over, close Submarine and copy two things into `submarine-data`:
 
@@ -400,7 +417,7 @@ In a single encrypted file under your OS app-data directory — or in the `subma
 
 ### Something went wrong — how do I find out what?
 
-Settings → **Troubleshooting**. Submarine keeps a log on your computer (`submarine.log` in its log folder, at most 4 MB): connection steps, errors, crashes, and when the window froze, for how long and which terminal was receiving the most output then. **Copy diagnostics** puts the build, the system and the end of the log on the clipboard with server, folder and user names, host names and addresses replaced by placeholders, ready to paste to whoever is helping. **Open log folder** shows the files themselves.
+**Settings › Help**, under **Troubleshooting**. Submarine keeps a log on your computer (`submarine.log` in its log folder, at most 4 MB): connection steps, errors, crashes, and when the window froze, for how long and which terminal was receiving the most output then. **Copy diagnostics** puts the build, the system and the end of the log on the clipboard with server, folder and user names, host names and addresses replaced by placeholders, ready to paste to whoever is helping. **Open log folder** shows the files themselves.
 
 ### Does Submarine collect telemetry or analytics?
 
@@ -473,7 +490,7 @@ Designed and built by [Sina](https://sinaxhpm.com) in collaboration with [Claude
 
 MIT — see [LICENSE](LICENSE).
 
-The app ships with the licences of everything in it: every build lists the JavaScript packages and Rust crates it includes, with their licence texts (`scripts/notices.mjs`), and the fonts' and color schemes' licences are in `public/licenses/`. In the app: Settings › Open-source licenses.
+The app ships with the licences of everything in it: every build lists the JavaScript packages and Rust crates it includes, with their licence texts (`scripts/notices.mjs`), and the fonts' and color schemes' licences are in `public/licenses/`. In the app: Settings › Help, under Open-source licenses.
 
 ## Also by the author: Echoes — network & developer toolkit
 
