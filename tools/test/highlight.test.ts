@@ -2,7 +2,7 @@
 // then npm --prefix tools/test test (type check, then vitest).
 
 import { describe, expect, it } from "vitest";
-import { buildMatcher, HIGHLIGHT_MINE, HIGHLIGHT_NONE, normalizeRules, ruleProblem, type CustomRule } from "../../src/ui/highlight";
+import { buildMatcher, grayBrights, HighlightStream, HIGHLIGHT_MINE, HIGHLIGHT_NONE, normalizeRules, ruleProblem, type CustomRule } from "../../src/ui/highlight";
 
 const rule = (over: Partial<CustomRule>): CustomRule => ({
   pattern: "error", kind: "word", matchCase: false, color: "blue", bold: false, underline: false, enabled: true, ...over,
@@ -71,5 +71,61 @@ describe("buildMatcher", () => {
     const m = buildMatcher("standard", [rule({ pattern: "error", color: "cyan" })])!;
     const spans = m.find("an error and a warning");
     expect(spans.map(([s, e, st]) => [s, e, st.color])).toEqual([[3, 8, "cyan"], [15, 22, "bright-yellow"]]);
+  });
+});
+
+describe("the stream follows what programs set (#49)", () => {
+  // How many times `fail` comes out highlighted, from `text` in one batch.
+  const lit = (text: string): number => {
+    const st = new HighlightStream(() => {});
+    st.setMatcher(buildMatcher(HIGHLIGHT_MINE, [rule({ pattern: "fail" })]), false);
+    const out = st.push(new TextEncoder().encode(text));
+    return (out.match(/\x1b\[[0-9;]+mfail\x1b\[39/g) ?? []).length;
+  };
+
+  it("highlights plain text", () => {
+    expect(lit("fail")).toBe(1);
+    expect(lit("\x1b[31mfail")).toBe(0);
+  });
+
+  it("ends an OSC with BEL, and a DCS, SOS, PM or APC only with ST", () => {
+    expect(lit("\x1b]0;title\x07fail")).toBe(1);
+    expect(lit("\x1bPq data\x07fail")).toBe(0);
+    expect(lit("\x1bPq data\x07fail\x1b\\fail")).toBe(1);
+    expect(lit("\x1b_apc\x07fail\x1b\\ fail")).toBe(1);
+    expect(lit("\x9d0;t\x07fail")).toBe(1);
+    expect(lit("\x90q\x07fail\x9cfail")).toBe(1);
+  });
+
+  it("lets a C1 control inside a sequence act as it does anywhere", () => {
+    // ST inside a CSI ends it: the colour it was setting never applies.
+    expect(lit("\x1b[31\x9cfail")).toBe(1);
+    // A C1 CSI inside an escape starts a new sequence.
+    expect(lit("\x1b(\x9b31mfail")).toBe(0);
+  });
+
+  it("puts attributes back with ESC 8, CSI u and on leaving the alternate screen", () => {
+    expect(lit("\x1b[31m\x1b7\x1b[0mfail\x1b8fail")).toBe(1);
+    expect(lit("\x1b[31m\x1b[s\x1b[0mfail\x1b[ufail")).toBe(1);
+    expect(lit("\x1b[31m\x1b[?1049h\x1b[0mtop\x1b[?1049lfail")).toBe(0);
+    // ESC 8 with nothing saved: the defaults.
+    expect(lit("\x1b[31m\x1b8fail")).toBe(1);
+  });
+});
+
+describe("schemes whose bright colors are grays (#49)", () => {
+  const solarized = { brightRed: "#cb4b16", brightGreen: "#586e75", brightYellow: "#657b83", brightBlue: "#839496", brightMagenta: "#6c71c4", brightCyan: "#93a1a1" };
+  it("finds Solarized's gray brights, and none in a colorful scheme", () => {
+    expect([...grayBrights(solarized)].sort()).toEqual(["bright-blue", "bright-cyan", "bright-green", "bright-yellow"]);
+    expect(grayBrights({ brightRed: "#e06c75", brightGreen: "#98c379", brightYellow: "#e5c07b", brightBlue: "#61afef", brightMagenta: "#c678dd", brightCyan: "#56b6c2" }).size).toBe(0);
+    expect(grayBrights({}).size).toBe(0);
+  });
+
+  it("draws a gray bright in its normal color", () => {
+    const st = new HighlightStream(() => {});
+    st.setMatcher(buildMatcher(HIGHLIGHT_MINE, [rule({ pattern: "ok", color: "bright-green" })]), false);
+    expect(st.push(new TextEncoder().encode("ok"))).toContain("\x1b[92mok");
+    st.setScheme(solarized);
+    expect(st.push(new TextEncoder().encode("ok"))).toContain("\x1b[32mok");
   });
 });

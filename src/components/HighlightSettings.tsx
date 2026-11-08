@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ChevronDown, ChevronUp, Pencil, Plus, Trash2 } from "lucide-react";
 import {
@@ -8,7 +8,9 @@ import {
   HIGHLIGHT_NONE,
   HIGHLIGHT_SETS,
   REGEX_RULES_ON,
+  ansiFor,
   buildMatcher,
+  grayBrights,
   highlightSetById,
   normalizeRules,
   ruleProblem,
@@ -94,6 +96,7 @@ const Switch = ({ on, label, onToggle }: { on: boolean; label: string; onToggle:
 function Preview({ text, setId, rules, scheme, fontFamily }: { text: string; setId: string; rules: CustomRule[]; scheme: string; fontFamily: string }) {
   const s = schemeById(scheme || DEFAULT_SCHEME);
   const ansi = ansiOf(s);
+  const grays = grayBrights(s.theme);
   const fg = s.theme.foreground || "#e4e4e7";
   const matcher = useMemo(() => buildMatcher(setId, rules), [setId, rules]);
   const lines = text.split("\n").map((line, i) => {
@@ -107,7 +110,7 @@ function Preview({ text, setId, rules, scheme, fontFamily }: { text: string; set
         <span
           key={start}
           style={{
-            color: color ? ansi[color.ansi] : undefined,
+            color: color ? ansi[ansiFor(color, grays)] : undefined,
             fontWeight: style.bold ? 700 : undefined,
             textDecoration: style.underline ? "underline" : undefined,
           }}
@@ -146,14 +149,19 @@ function RuleEditor({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const ansi = ansiOf(schemeById(scheme || DEFAULT_SCHEME));
+  const grays = grayBrights(schemeById(scheme || DEFAULT_SCHEME).theme);
   const problem = useMemo(() => (rule.pattern ? ruleProblem(rule) : null), [rule]);
   const set = (patch: Partial<CustomRule>) => {
     const next = { ...rule, ...patch };
     setRule(next);
     onDraft(next);
   };
+  // A second Enter before the first save is back adds nothing (#49): a ref,
+  // as two key presses can come before the state that says it's saving.
+  const savingRef = useRef(false);
   const save = async () => {
-    if (ruleProblem(rule)) return;
+    if (savingRef.current || ruleProblem(rule)) return;
+    savingRef.current = true;
     setSaving(true);
     setError("");
     try {
@@ -161,6 +169,7 @@ function RuleEditor({
     } catch (e) {
       setError(String(e));
       setSaving(false);
+      savingRef.current = false;
     }
   };
   return (
@@ -200,7 +209,7 @@ function RuleEditor({
             title={c.name}
             onClick={() => set({ color: c.id as HighlightColor })}
             className={`w-5 h-5 rounded-full border-2 transition-transform ${rule.color === c.id ? "border-white scale-110" : "border-transparent hover:scale-110"}`}
-            style={{ background: ansi[c.ansi] }}
+            style={{ background: ansi[ansiFor(c, grays)] }}
           />
         ))}
       </div>
@@ -268,7 +277,9 @@ export function HighlightSettings({ settings, setSettings, onRulesChanged }: any
   };
   const toggle = async (r: CustomRule) => {
     try {
-      await invoke("highlight_rule_save", { rule: { ...r, enabled: !r.enabled } });
+      // Only whether it's on: the whole rule as this card read it could put
+      // back an edit synced since, or a colour this build doesn't know (#49).
+      await invoke("highlight_rule_set_enabled", { id: r.id, enabled: !r.enabled });
     } finally {
       await changed();
     }
@@ -301,6 +312,7 @@ export function HighlightSettings({ settings, setSettings, onRulesChanged }: any
   const previewSet = setId === HIGHLIGHT_NONE && draft ? HIGHLIGHT_MINE : setId;
   const sample = tryText || SAMPLES[setId] || SAMPLES.standard;
   const ansi = ansiOf(schemeById(settings.terminalScheme || DEFAULT_SCHEME));
+  const grays = grayBrights(schemeById(settings.terminalScheme || DEFAULT_SCHEME).theme);
 
   return (
     <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-5 shadow-xl">
@@ -393,7 +405,7 @@ export function HighlightSettings({ settings, setSettings, onRulesChanged }: any
                   <span
                     className="truncate font-mono text-[12px]"
                     style={{
-                      color: ansi[HIGHLIGHT_COLORS.find((c) => c.id === r.color)?.ansi ?? 1],
+                      color: ansi[ansiFor(HIGHLIGHT_COLORS.find((c) => c.id === r.color) ?? HIGHLIGHT_COLORS[0], grays)],
                       fontWeight: r.bold ? 700 : undefined,
                       textDecoration: r.underline ? "underline" : undefined,
                     }}

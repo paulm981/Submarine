@@ -24979,7 +24979,7 @@ pub fn run() {
             ssh_info_probe_section, ssh_systemctl_action, ssh_kill_process,
             ssh_iptables_chain, ssh_nft_chain,
             applog::app_log, applog::ui_heartbeat, applog::open_log_folder, diagnostics_report,
-            highlight::highlight_rules_list, highlight::highlight_rule_save, highlight::highlight_rule_delete, highlight::highlight_rules_reorder,
+            highlight::highlight_rules_list, highlight::highlight_rule_save, highlight::highlight_rule_set_enabled, highlight::highlight_rule_delete, highlight::highlight_rules_reorder,
             docker::ssh_docker_container_action,
             docker::ssh_docker_inspect,
             docker::ssh_docker_stats,

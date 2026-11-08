@@ -281,6 +281,7 @@ export const mountTerminal = (
       fork.highlightRef.current = stream;
       matcher = matcherForServer(serverId);
       stream.setMatcher(matcher, false);
+      stream.setScheme(schemeForServer(serverId).theme);
       fork.outputRef.current = (data: Uint8Array) => {
         const w = fork.readyWatchRef.current;
         if (w) { window.clearTimeout(w.quiet); w.quiet = window.setTimeout(fork.shellReady, SHELL_QUIET_MS); }
@@ -327,6 +328,7 @@ export const mountTerminal = (
       const boldBright = readBoldBright();
       if (term.options.drawBoldTextInBrightColors !== boldBright) term.options.drawBoldTextInBrightColors = boldBright;
       updateGpu();
+      highlighter?.setScheme(theme);
       const next = matcherForServer(serverId);
       if (next !== matcher && highlighter) {
         matcher = next;
