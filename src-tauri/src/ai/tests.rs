@@ -668,8 +668,8 @@ async fn list_shared_says_what_each_server_does_with_requests() {
 async fn list_shared_reads_each_server_s_settings() {
     let exec: Executor = Arc::new(|_, _, _, _| Box::pin(async { Err("no servers in this test".to_string()) }));
     let lookup: PolicyLookup = Arc::new(|id| match id {
-        Some(1) => policy(1, &[], &[]),
-        Some(2) => policy(2, &["systemctl status *"], &[]),
+        Some(1) => trust::Policy { os: Some("debian".into()), ..policy(1, &[], &[]) },
+        Some(2) => trust::Policy { os: Some("Not an ID <x>".into()), ..policy(2, &["systemctl status *"], &[]) },
         Some(3) => policy(3, &[], &[]),
         _ => trust::Policy::unreadable(),
     });
@@ -686,7 +686,8 @@ async fn list_shared_reads_each_server_s_settings() {
     assert_eq!(
         l["servers"],
         json!([
-            { "name": "db1", "requests": ASKS },
+            { "name": "db1", "os": "debian", "requests": ASKS },
+            // An OS that isn't an ID's shape isn't passed on.
             { "name": "web1", "requests": ALLOWED },
             { "name": "build", "requests": ANYTHING },
             { "name": "quick", "requests": ASKS },
