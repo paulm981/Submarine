@@ -177,6 +177,10 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
   const down = () => { downHere.current = !moved() && performance.now() >= settledAt.current; };
   const loginIsRoot = p.user === "root";
   const many = members && members.length > 1 ? members : null;
+  // "Try one first" on a command for several servers: its first server
+  // alone, the rest left waiting. Not for a copy, nor where a root password
+  // would be typed on the card.
+  const tryFirst = many && !p.copy && !many.some((m) => m.as_root && m.password !== "none") ? many[0] : null;
   // A copy_files request (#159): its own words in place of a command.
   const copy = p.copy ? copyCard(p.copy) : null;
   // The fields: Enter does nothing, and no key in them reaches the app.
@@ -351,6 +355,17 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
         </NoFocusButton>
       </div>
       <div className="flex flex-col items-start gap-1">
+        {tryFirst && (
+          <NoFocusButton
+            onPick={() => act("ai_decide", { id: tryFirst.id, allow: true, note: null, password: null })}
+            onDown={down}
+            accept={accept}
+            title={`Runs it on ${tryFirst.server} only. Its result shows in this panel, and the other servers keep waiting here for your Allow or Deny. The AI hears back once you've answered for all of them.`}
+            className={`${link} flex items-center gap-1`}
+          >
+            <Check size={11} className="shrink-0" /> Try on {tryFirst.server} first, then decide on the other {many!.length - 1}
+          </NoFocusButton>
+        )}
         {!many && p.can_allow_always && extra !== "rule" && (
           <NoFocusButton onPick={() => setExtra("rule")} className={link}>Always allow this command here…</NoFocusButton>
         )}
