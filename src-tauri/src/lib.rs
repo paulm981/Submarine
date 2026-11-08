@@ -66,7 +66,12 @@ mod synced_tunnels; use synced_tunnels::*;
 mod sync_diff; use sync_diff::*;
 mod server_look; use server_look::*;
 mod clone_server; use clone_server::*;
-mod keep_session; mod bulk_pick; mod vault_schema; mod sync_merge; mod profile_create; mod clipboard_read;
+mod keep_session;
+mod bulk_pick;
+mod vault_schema;
+mod sync_merge;
+mod profile_create;
+mod clipboard_read;
 #[cfg(windows)]
 mod windows_clipboard;
 #[cfg(test)]
