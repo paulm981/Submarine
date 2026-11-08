@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.59
+
+- **Right-click a file name in a terminal** to copy its path or edit it in your editor (Live Edit). Paste is still the first entry, and right-click anywhere else pastes as before. ([#40](https://github.com/paulm981/Submarine/issues/40))
+
 ## v0.4.0-fork.58
 
 - **Typing with Broadcast on to many servers sends each key once.** Every key you type went to the app's backend once per server: 36 servers, 36 calls for each key. Now each key goes once, to all of them together, in order, so typing keeps up on Windows. ([#127](https://github.com/paulm981/Submarine/issues/127))
