@@ -1457,12 +1457,8 @@ fn repair_links(conn: &Connection, fixups: Vec<FkFixup>) {
             rusqlite::params![id, f.uuid],
         ) {
             eprintln!("[SYNC] fk fixup skipped {}.{} uuid={}: {}", f.table, f.fk_col, f.uuid, e);
-        } else if id.is_none() && f.table == "servers" && f.fk_col == "jump_host_id" {
-            // It came with a jump host this device doesn't have: it isn't
-            // connected directly without asking (jump_gone.rs).
-            if let Err(e) = jump_gone::note_unresolved(conn, &f.uuid) {
-                eprintln!("[SYNC] jump host note skipped uuid={}: {}", f.uuid, e);
-            }
+        } else {
+            jump_gone::after_fixup(conn, id.is_none(), &f.table, &f.fk_col, &f.uuid);
         }
     }
 }
@@ -2024,13 +2020,8 @@ async fn sync_now(
     db_state: tauri::State<'_, DbState>,
     cloud: tauri::State<'_, std::sync::Arc<cloud::CloudState>>,
 ) -> Result<SyncReport, String> {
-    // A profile that syncs through the user's own folder or repository syncs
-    // there, and never with the cloud (store_sync.rs).
-    if let Some(report) = store_sync::sync_if_linked(&app, &db_state).await? {
+    if let Some(report) = store_sync::sync_elsewhere(&app, &db_state, &cloud).await? {
         return Ok(report);
-    }
-    if !cloud.enabled() {
-        return Err("[SYNC] NOT_SET_UP: this profile doesn't sync anywhere yet — set that up on its Profile tab.".into());
     }
     let session = cloud.session().await?;
     sync_with(&app, &db_state, &cloud, &session, None).await
@@ -3049,12 +3040,7 @@ async fn share_current_profile(
         if already.is_some() {
             return Err("[SHARE] ALREADY_SHARED: this profile is already shared — stop sharing first if you want a new share.".into());
         }
-        // It syncs through the user's own storage, never the cloud, so a
-        // share would never see its changes; and revoking a member rotates
-        // the key, which would split the store in two.
-        if store_sync::is_linked(conn) {
-            return Err("[SHARE] STORE_SYNC: this profile syncs through your own storage — stop that on the Profile tab before sharing it.".into());
-        }
+        store_sync::refuse_share(conn)?;
         (get_or_create_dek(conn)?.0, unlinked, db_state.generation_now())
     };
     let sealed_self = hex::encode(identity::seal_to(&my_pub, &dek)?);
@@ -9046,29 +9032,12 @@ async fn delete_folder(
     id: i32,
 ) -> Result<(), String> {
     // Same orphaned-poller problem as delete_server, one level up: this deletes
-    // every server in the folder and the folders inside it, so every one of
-    // their monitors has to be stopped first. Collect the ids while the rows
-    // still exist.
+    // every server in the folder and its subfolders, so every one of their
+    // monitors has to be stopped first. Collect the ids while the rows exist.
     let (folder_ids, doomed): (Vec<i64>, Vec<i32>) = {
         let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-        // A loop from sync is broken first (tree_moves.rs), so the folders
-        // inside this one are the ones the page shows inside it.
-        tree_moves::break_folder_loops(conn)
-            .map_err(|e| format!("[DATABASE] FOLDER_LOOP_REPAIR_FAILED: {}", e))?;
-        let folder_ids = tree_moves::folder_subtree(conn, id as i64)
-            .map_err(|e| format!("[DATABASE] FOLDER_TREE_QUERY_FAILED: {}", e))?;
-        let mut doomed = Vec::new();
-        let mut stmt = conn
-            .prepare("SELECT id FROM servers WHERE folder_id=?1")
-            .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_QUERY_FAILED: {}", e))?;
-        for fid in &folder_ids {
-            let rows = stmt
-                .query_map(rusqlite::params![fid], |r| r.get::<_, i32>(0))
-                .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_QUERY_FAILED: {}", e))?;
-            doomed.extend(rows.filter_map(|r| r.ok()));
-        }
-        (folder_ids, doomed)
+        tree_moves::folders_and_servers_in(conn, id)?
     };
     for node_id in doomed {
         monitor::stop_monitor(map.inner().clone(), node_id).await;

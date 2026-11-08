@@ -212,6 +212,28 @@ pub async fn delete_tree_items(
     with_vault(&state, |conn| delete_in(conn, &servers, &folders).map(|_| ((), true)))
 }
 
+/// delete_folder's first step (lib.rs): the folder `id` and every folder
+/// inside it, and the servers in them, whose monitors are stopped before the
+/// rows go. A loop from sync is broken first, so the folders inside this one
+/// are the ones the page shows inside it.
+pub(crate) fn folders_and_servers_in(conn: &Connection, id: i32) -> Result<(Vec<i64>, Vec<i32>), String> {
+    break_folder_loops(conn)
+        .map_err(|e| format!("[DATABASE] FOLDER_LOOP_REPAIR_FAILED: {}", e))?;
+    let folder_ids = folder_subtree(conn, id as i64)
+        .map_err(|e| format!("[DATABASE] FOLDER_TREE_QUERY_FAILED: {}", e))?;
+    let mut doomed = Vec::new();
+    let mut stmt = conn
+        .prepare("SELECT id FROM servers WHERE folder_id=?1")
+        .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_QUERY_FAILED: {}", e))?;
+    for fid in &folder_ids {
+        let rows = stmt
+            .query_map(rusqlite::params![fid], |r| r.get::<_, i32>(0))
+            .map_err(|e| format!("[DATABASE] FOLDER_SERVERS_QUERY_FAILED: {}", e))?;
+        doomed.extend(rows.filter_map(|r| r.ok()));
+    }
+    Ok((folder_ids, doomed))
+}
+
 /// Delete the given folders (a folder and its subtree) and every server and
 /// Remote Desktop link in them, all or nothing: a folder left behind would
 /// lose its parent and turn up at the top level. Each row goes through the
@@ -417,8 +439,7 @@ mod hook_tests {
             include_str!("lib.rs"),
             &[
                 ("", "mod tree_moves;", 1),
-                ("delete_folder", "tree_moves::break_folder_loops(", 1),
-                ("delete_folder", "tree_moves::folder_subtree(", 1),
+                ("delete_folder", "tree_moves::folders_and_servers_in(conn, id)?", 1),
                 ("delete_folder", "tree_moves::delete_folder_tree(", 1),
                 ("delete_server", "tree_moves::unlink_jump_hosts(", 1),
                 ("resolve_held", "tree_moves::break_folder_loops(", 1),

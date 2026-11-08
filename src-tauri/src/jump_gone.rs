@@ -173,6 +173,17 @@ fn connect_directly(conn: &Connection, server_id: i64) -> Result<(), String> {
     .map_err(db("JUMP_GONE_DIRECT_FAILED"))
 }
 
+/// After the sync's repair pass set a link (lib.rs, repair_links):
+/// a server that came with a jump host this device doesn't have
+/// (`unresolved`) isn't connected directly without asking.
+pub(crate) fn after_fixup(conn: &Connection, unresolved: bool, table: &str, fk_col: &str, uuid: &str) {
+    if unresolved && table == "servers" && fk_col == "jump_host_id" {
+        if let Err(e) = note_unresolved(conn, uuid) {
+            eprintln!("[SYNC] jump host note skipped uuid={}: {}", uuid, e);
+        }
+    }
+}
+
 /// "Resume all"'s answer (lib.rs, monitor_resume_all) once it has started
 /// what it could: the servers it `skipped` (id, name), which couldn't be
 /// reached as set up, stay paused and are named.
@@ -277,7 +288,7 @@ mod tests {
     fn the_hooks_are_in_place() {
         use crate::fork_hooks::assert_hooks;
         let mut lib = vec![
-            ("repair_links", "jump_gone::note_unresolved(", 1),
+            ("repair_links", "jump_gone::after_fixup(conn, id.is_none(), &f.table, &f.fk_col, &f.uuid)", 1),
             ("set_server_jump_host", "jump_gone::clear(", 1),
             ("monitor_resume_all", "jump_gone::resume_skipped_line(&name, &e)", 1),
             ("monitor_resume_all", "jump_gone::resume_skipped(&db_state, skipped)", 1),
