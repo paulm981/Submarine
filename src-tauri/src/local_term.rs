@@ -904,20 +904,20 @@ pub async fn local_terminal_open(
     app: tauri::AppHandle,
     terms: tauri::State<'_, LocalTerms>,
     terminal_id: String,
-    shell: Option<String>,
-    cwd: Option<String>,
+    start: StartAt,
     cols: u16,
     rows: u16,
     on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Result<String, String> {
     #[cfg(target_os = "android")]
     {
-        let _ = (&app, &terms, terminal_id, shell, cwd, cols, rows, on_output);
+        let _ = (&app, &terms, terminal_id, start, cols, rows, on_output);
         Err("Local terminals aren't available on Android.".into())
     }
     #[cfg(not(target_os = "android"))]
     {
         let terms = terms.inner().clone();
+        let StartAt { shell, cwd } = start;
         tauri::async_runtime::spawn_blocking(move || {
             if let Some(tool) = shell.as_deref().filter(|id| id.starts_with("ai:")) {
                 return open_ai_tool(&app, &terms, &terminal_id, tool, cols, rows, on_output);
@@ -965,6 +965,15 @@ fn open_ai_tool(
         return Err(e);
     }
     Ok(label)
+}
+
+/// What a Home terminal starts: a shell from the list (None: the default),
+/// and the folder it starts in ("Open terminal here", #72; None: the
+/// shell's own).
+#[derive(serde::Deserialize, Debug, Default)]
+pub struct StartAt {
+    pub shell: Option<String>,
+    pub cwd: Option<String>,
 }
 
 /// A folder a Home terminal is asked to start in (#72), checked: an

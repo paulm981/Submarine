@@ -336,8 +336,7 @@ export const mountTerminal = (
       if (!local) return;
       invoke<string>('local_terminal_open', {
         terminalId,
-        shell: local.shell,
-        cwd: local.cwd ?? null,
+        start: { shell: local.shell, cwd: local.cwd ?? null },
         cols: term.cols || 80,
         rows: term.rows || 24,
         onOutput: fork.outputChannel(),
