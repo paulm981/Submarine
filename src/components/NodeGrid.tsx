@@ -1,13 +1,10 @@
-import { Activity, Play, Search, Plus, Server, Globe, Folder, FolderPlus, ChevronLeft, ChevronRight, Trash2, Edit2, Zap, Check, X, Copy, GripVertical, ShieldAlert, KeyRound } from "lucide-react";
+import { Search, Plus, Server, Globe, Folder, FolderPlus, ChevronLeft, ChevronRight, Trash2, Edit2, Zap, Check, X, Copy, GripVertical, ShieldAlert, KeyRound } from "lucide-react";
 import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { useConfirm } from "../ui/confirm";
-import { FolderRow, childFolders, folderPath, indexFolders, subtreeCounts, subtreeIds } from "../util/folderPath";
-import { OsBadge } from "./OsBadge";
 import { HeldReview } from "./HeldReview";
 import { HeldDeletions } from "./HeldDeletions";
-import { pingServers } from "../ui/ping";
-import { jumpHostNote } from "../util/jumpHostNote";
+import * as Fork from "../fork/grid";
 
 export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp, onActiveFolderChange, onOpenServer, onEditServer, onAddClick, onQuickConnect, onRemoveServer, onRemoveFolder, onRenameFolder, onCreateFolder, onCloneServer, onReorderServers, onAllowHeld, onKeepSsh, onKeepAi, keyChange, onAcceptKey, shareGrant, onUnlockSharing, heldDeletions, onResolveDeletions, isMobile }: any) => {
   const [search, setSearch] = useState("");
@@ -66,6 +63,14 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
     setRenaming(null);
   };
 
+  // Folders nest (see util/folderTree): the grid shows the folders and
+  // servers directly inside the open folder (or the top level).
+  const tree = Fork.useFolderTree(folders, servers);
+  // The open folder was deleted (here or on another device): back to the top.
+  useEffect(() => {
+    if (activeFolderId !== null && folders && !tree.has(activeFolderId)) setActiveFolderId(null);
+  }, [activeFolderId, folders]);
+
   // "Add folder": the name of the folder being made inside the open folder,
   // typed into a draft card at the head of the grid. null when none is open;
   // closed when another folder is opened.
@@ -85,24 +90,7 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
     s.host.includes(search)
   ) || [];
 
-  // Folders nest (parent_id): the grid shows the folders directly inside the
-  // open one, and the header the path to it. The index and the counts are
-  // built once per change, not per card: an import brings hundreds.
-  const allFolders: FolderRow[] = folders || [];
-  const folderIndex = useMemo(() => indexFolders(allFolders), [folders]);
-  const serverCounts = useMemo(() => subtreeCounts(folderIndex, (servers || []).map((s: any) => s.folder_id)), [folderIndex, servers]);
-  // The open folder was deleted (here, or by a sync from another device):
-  // back to the top level instead of an empty grid inside a folder that isn't
-  // there. The list starts out empty, not unknown, so a folder still open
-  // while it loads is left too.
-  useEffect(() => {
-    if (activeFolderId != null && !folderIndex.byId.has(activeFolderId)) setActiveFolderId(null);
-  }, [folders, activeFolderId]);
-  const crumbs = folderPath(folderIndex, activeFolderId);
-  const parentFolderId = activeFolderId != null ? (folderIndex.parent.get(activeFolderId) ?? null) : null;
-  // A server whose folder is gone shows at the top level.
-  const inFolder = (folderId: number | null | undefined) =>
-    (folderId != null && folderIndex.byId.has(folderId) ? folderId : null) === activeFolderId;
+  const currentFolder = folders?.find((f: any) => f.id === activeFolderId);
 
   // If search is active, we might want to just show all matching servers flat,
   // or still respect the folder. Let's just show them flat if searching.
@@ -110,12 +98,9 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
 
   const displayedServers = isSearching
     ? filteredServers
-    : filteredServers.filter((s: any) => inFolder(s.folder_id));
-
-  const displayedFolders = isSearching ? [] : childFolders(folderIndex, activeFolderId);
-
-  // A server card's right-click menu.
-  const [cardMenu, setCardMenu] = useState<{ x: number; y: number; server: any } | null>(null);
+    : filteredServers.filter((s: any) => tree.serverFolder(s) === activeFolderId);
+  const displayedFolders = isSearching ? [] : tree.childrenOf(activeFolderId);
+  const cardMenu = Fork.useCardMenu();
 
   // ── Modern floating drag-to-reorder (pointer-based: mouse AND touch) ────────
   // Grabbing the grip lifts the node out of the grid: a fixed-position clone
@@ -334,11 +319,7 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
         key={`server-${s.id}`}
         data-sid={s.id}
         onClick={() => { if (draggedRef.current) return; onOpenServer(s); }}
-        onContextMenu={(e) => {
-          e.preventDefault();
-          if (draggedRef.current) return;
-          setCardMenu({ x: e.clientX, y: e.clientY, server: s });
-        }}
+        onContextMenu={(e) => cardMenu.open(e, s, draggedRef.current)}
         className="group relative flex items-center gap-3 h-16 pl-3.5 pr-2 rounded-xl bg-gradient-to-br from-[#17171c] to-[#121216] border border-white/5 hover:border-primary/40 hover:bg-white/[0.015] transition-colors duration-150 cursor-pointer overflow-hidden"
       >
         {/* Per-server colour accent: a crisp left bar. */}
@@ -359,16 +340,13 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
           </button>
         )}
 
-        {/* OS badge once the server has reported its OS (server_os.rs),
-            the monogram until then. */}
-        {s.os ? (
-          <div className="w-9 h-9 flex items-center justify-center shrink-0"><OsBadge os={s.os} size={30} /></div>
-        ) : (
-          <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-primary/25 to-primary/[0.03] border border-primary/20 flex items-center justify-center text-primary shadow-inner shrink-0">
-            {monogram
-              ? <span className="font-black text-[14px] leading-none">{monogram}</span>
-              : <Server size={14} />}
-          </div>
+        {/* Monogram avatar. */}
+        {s.os ? <Fork.OsAvatar os={s.os} /> : (
+        <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-primary/25 to-primary/[0.03] border border-primary/20 flex items-center justify-center text-primary shadow-inner shrink-0">
+          {monogram
+            ? <span className="font-black text-[14px] leading-none">{monogram}</span>
+            : <Server size={14} />}
+        </div>
         )}
 
         {/* Name + host — flex-1 + min-w-0 so long values truncate cleanly. */}
@@ -408,8 +386,7 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
           <button
             onClick={async (e) => {
               e.stopPropagation();
-              const note = jumpHostNote(servers, new Set([s.id]));
-              if (await confirm({ title: 'Delete server?', message: `“${s.name}” will be removed from this profile.${note}`, destructive: true })) {
+              if (await confirm({ title: 'Delete server?', message: `“${s.name}” will be removed from this profile.${Fork.jumpHostNote(servers, new Set([s.id]))}`, destructive: true })) {
                 onRemoveServer(s.id);
               }
             }}
@@ -427,11 +404,14 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
   // surface: a tinted folder glyph, name + server count, inline rename in
   // place, and the same hover lift as server cards.
   const FolderCard = ({ f }: { f: any }) => {
-    // Everything inside, at any depth, so a folder of folders isn't "0".
-    const serverCount = serverCounts.get(f.id) ?? 0;
-    const subfolderCount = childFolders(folderIndex, f.id).length;
+    const serverCount = tree.serverCount(f.id);
+    const folderCount = tree.childrenOf(f.id).length;
     const isRenaming = renaming?.id === f.id;
     const accent = f.color || 'rgb(var(--primary))';
+    const contents = [
+      folderCount > 0 ? (folderCount === 1 ? '1 folder' : `${folderCount} folders`) : null,
+      serverCount === 1 ? '1 server' : `${serverCount} servers`,
+    ].filter(Boolean).join(' · ');
     return (
       <div
         onClick={() => { if (!isRenaming) setActiveFolderId(f.id); }}
@@ -465,8 +445,7 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
             <>
               <h3 className="font-bold text-zinc-100 text-[13px] truncate tracking-tight leading-tight">{f.name}</h3>
               <span className="text-[10px] text-zinc-500 font-bold uppercase tracking-[0.12em]">
-                {subfolderCount > 0 && (subfolderCount === 1 ? '1 folder · ' : `${subfolderCount} folders · `)}
-                {serverCount === 1 ? '1 server' : `${serverCount} servers`}
+                {contents}
               </span>
             </>
           )}
@@ -504,11 +483,9 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
               <button
                 onClick={async (e) => {
                   e.stopPropagation();
-                  // Servers elsewhere that go through one inside it as their jump host.
-                  const inside = new Set(subtreeIds(folderIndex, f.id));
-                  const gone = new Set<number>((servers || []).filter((x: any) => x.folder_id != null && inside.has(x.folder_id)).map((x: any) => x.id));
-                  const note = jumpHostNote(servers, gone);
-                  if (await confirm({ title: 'Delete folder?', message: `“${f.name}” and every folder and server inside it will be removed.${note}`, destructive: true })) {
+                  const inside = tree.subtreeOf(f.id);
+                  const message = Fork.deleteFolderMessage(f, inside, servers);
+                  if (await confirm({ title: 'Delete folder?', message, destructive: true })) {
                     onRemoveFolder(f.id);
                   }
                 }}
@@ -617,24 +594,13 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
         {!isSearching && activeFolderId !== null && (
           <div className="flex items-center gap-3 mb-6">
             <button
-              onClick={() => setActiveFolderId(parentFolderId)}
               title="Up one folder"
-              className="w-8 h-8 shrink-0 bg-black rounded-xl border border-white/5 flex items-center justify-center hover:bg-white/10 hover:text-white text-zinc-500 transition-all shadow-inner"
+              onClick={() => setActiveFolderId(tree.parentOf(activeFolderId))}
+              className="w-8 h-8 bg-black rounded-xl border border-white/5 flex items-center justify-center hover:bg-white/10 hover:text-white text-zinc-500 transition-all shadow-inner shrink-0"
             >
               <ChevronLeft size={16} />
             </button>
-            <h2 className="text-[15px] font-bold text-primary tracking-tight flex items-center gap-1.5 flex-1 min-w-0 flex-wrap">
-              <Folder size={16} className="shrink-0" />
-              <button onClick={() => setActiveFolderId(null)} className="text-zinc-500 hover:text-zinc-200 font-semibold">All</button>
-              {crumbs.map((c, i) => (
-                <span key={c.id} className="flex items-center gap-1.5 min-w-0">
-                  <ChevronRight size={12} className="text-zinc-600 shrink-0" />
-                  {i === crumbs.length - 1
-                    ? <span className="truncate">{c.name}</span>
-                    : <button onClick={() => setActiveFolderId(c.id)} className="text-zinc-400 hover:text-zinc-100 font-semibold truncate">{c.name}</button>}
-                </span>
-              ))}
-            </h2>
+            <Fork.FolderPath path={tree.pathOf(activeFolderId)} setActiveFolderId={setActiveFolderId} />
             {onCreateFolder && (
               <button
                 onClick={() => setNewFolder((v) => v ?? "")}
@@ -747,16 +713,14 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
               </div>
             )}
 
-            {/* The folders directly inside the open one (none while searching). */}
-            {displayedFolders.map((f) => (
-              <FolderCard key={`folder-${f.id}`} f={f} />
-            ))}
+            {/* The folders inside the open one (or the top level); none while searching. */}
+            {displayedFolders.map((f: any) => <FolderCard key={`folder-${f.id}`} f={f} />)}
 
             {/* Render Servers — honours the live drag order while reordering. */}
             {orderedServers.map((s: any) => renderServer(s))}
 
             {/* Empty Folder State */}
-            {!isSearching && activeFolderId !== null && newFolder === null && displayedServers.length === 0 && displayedFolders.length === 0 && (
+            {!isSearching && activeFolderId !== null && displayedServers.length === 0 && displayedFolders.length === 0 && newFolder === null && (
               <div className="col-span-full py-10 text-center text-zinc-600 text-xs italic">
                 Nothing in this folder yet.
               </div>
@@ -773,37 +737,7 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
           </>
         )}
       </div>
-
-      {/* A server card's menu. The layer under it takes the click that
-          closes it, so that click doesn't also open the card beneath. */}
-      {cardMenu && createPortal(
-        <>
-          <div
-            className="fixed inset-0 z-[9998]"
-            onClick={() => setCardMenu(null)}
-            onContextMenu={(e) => { e.preventDefault(); setCardMenu(null); }}
-          />
-          <div
-            className="fixed z-[9999] w-[200px] py-1 bg-[#15151a] border border-white/10 rounded-lg shadow-2xl text-[11.5px]"
-            style={{ left: Math.min(cardMenu.x, window.innerWidth - 220), top: Math.min(cardMenu.y, window.innerHeight - 120) }}
-          >
-            {([
-              { icon: Play, label: "Open", act: () => onOpenServer(cardMenu.server) },
-              { icon: Activity, label: "Ping", act: () => pingServers([cardMenu.server]) },
-              { icon: Edit2, label: "Edit…", act: () => onEditServer(cardMenu.server) },
-            ] as const).map(({ icon: Icon, label, act }) => (
-              <button
-                key={label}
-                onClick={() => { setCardMenu(null); act(); }}
-                className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left"
-              >
-                <Icon size={13} className="text-zinc-500" /> {label}
-              </button>
-            ))}
-          </div>
-        </>,
-        document.body
-      )}
+      <Fork.CardMenu menu={cardMenu.cardMenu} close={cardMenu.close} onOpenServer={onOpenServer} onEditServer={onEditServer} />
 
       {/* Floating drag clone — a fixed-position copy of the node that the
           pointer carries while the grid reflows underneath. pointer-events:none

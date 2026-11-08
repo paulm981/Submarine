@@ -1,23 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { folderOptions } from "../util/folderPath";
-import { JumpHostPicker } from "./JumpHostPicker";
-import { IS_ANDROID, IS_MOBILE, IS_WINDOWS } from "../util/platform";
 import { Cpu, X, Link2, ArrowLeftRight, Shield, ShieldAlert, Key, User, FolderPlus, Download, CheckSquare, Square, History, Plus, Copy, Play, FlaskConical } from "lucide-react";
 import PasswordField from "./PasswordField";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
 import { useSlideOverFocus } from "../ui/slideOverFocus";
-import { SCHEMES, readSchemeId, schemeById } from "../ui/terminalThemes";
-import { HIGHLIGHT_SETS, highlightSetById, readHighlightId } from "../ui/highlight";
-import { SchemeSwatch } from "./TerminalSchemes";
+import * as Fork from "../fork/server-form";
 import { DEFAULT_RDP_OPTIONS, RDP_BUILTIN_EXPERIMENTAL, RDP_WINDOW_SIZES, type RdpOptions } from "../util/rdpOptions";
 import { SwitchRow } from "./FormRows";
 import { RdpShareFields, RdpSpeedFields } from "./RdpOptionFields";
 import { VncSpeedFields } from "./VncOptionFields";
 import { DEFAULT_VNC_OPTIONS, normalizeVncOptions, type VncOptions } from "../util/vncOptions";
+import { IS_MOBILE, IS_WINDOWS } from "../util/platform";
 import { TAG_COLOURS, customTagColour, pickerValue } from "../util/tagColours";
-import { KeepSessionOverride } from "./KeptSessions";
 
 // Compact "2h ago" style relative time for the attribution line.
 function relTime(d: Date): string {
@@ -46,45 +41,7 @@ type ImportedHost = {
   user: string;
   identity_file: string | null;
   proxy_jump: string | null;
-  // Unique within one parse, as names can repeat: MobaXterm's folder and
-  // name, else the row's place in the list. Empty means host_alias is.
-  key?: string;
-  folder?: string[];
-  // MobaXterm saved login (`[name]` as the user): becomes a shared Login.
-  credential?: string | null;
-  run_on_connect?: string | null;
-  jump_identity_file?: string | null;
-  // The jump host's MobaXterm saved login, if it signs in with one.
-  jump_credential?: string | null;
-  // A Remote Desktop session: becomes an RDP server.
-  rdp?: boolean;
-  // A PuTTY telnet session: becomes a telnet server.
-  telnet?: boolean;
-};
-
-// What `parse_client_import` hands back: the hosts, and a line about the
-// sessions it can't import (MobaXterm VNC, serial…).
-type ClientImport = { hosts: ImportedHost[]; skipped: string | null };
-
-// One picked host for `import_hosts`, with the vault ids of its keys.
-type ImportRow = { host: ImportedHost; key_id: number | null; jump_key_id: number | null };
-
-// What `import_hosts` reports back (src-tauri/src/host_import.rs).
-type ImportReport = {
-  added: number;
-  already_there: number;
-  folders_created: number;
-  logins_created: string[];
-  jump_hosts_created: string[];
-  jump_linked: number;
-  multi_hop: string[];
-  rdp_added: number;
-  rdp_skipped: string[];
-};
-
-const rowKey = (h: ImportedHost) => h.key || h.host_alias;
-
-const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+} & Fork.ImportedHostExtra;
 
 // What `import_ssh_key_file` hands back after putting a key file in the vault.
 type ImportedSshKey = {
@@ -95,18 +52,7 @@ type ImportedSshKey = {
 };
 
 const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credentials, refreshCredentials, sshKeys, refreshSshKeys, folders, refreshFolders, refreshServers, servers, isEditMode, formError, isMobile, onImported, focusJump }: any) => {
-  // Opened from "Pick a jump host" (a server whose jump host was deleted,
-  // see SessionView): Jump via is brought into view and focused.
-  const jumpRowRef = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    if (!isOpen || !focusJump) return;
-    const t = window.setTimeout(() => {
-      const row = jumpRowRef.current;
-      row?.scrollIntoView({ block: "center" });
-      row?.querySelector<HTMLElement>("input, button")?.focus();
-    }, 150);
-    return () => window.clearTimeout(t);
-  }, [isOpen, focusJump]);
+  const jumpRowRef = Fork.useFocusJump(isOpen, focusJump);
   const [isCreatingFolder, setIsCreatingFolder] = useState(false);
   // An RDP (issue #3), telnet (#179) or VNC server has a host, port, login
   // and maybe an SSH server to go through; the SSH-only parts of the form
@@ -125,37 +71,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     // The usual port of the new kind, unless another was typed.
     const usual: Record<string, number> = { ssh: 22, rdp: 3389, telnet: 23, vnc: 5900 };
     const port = !newNode.port || Object.values(usual).includes(newNode.port) ? usual[protocol] : newNode.port;
-    // No SSH key outside SSH, and no saved login for VNC: VNC sends its
-    // password with weak protection and doesn't check the server's identity,
-    // so a shared login's password would be open to anyone on the path.
-    const dropsLogin = (protocol !== "ssh" && newNode.authType === "custom_key") || (protocol === "vnc" && newNode.authType === "vault");
-    const authType = dropsLogin ? "custom_pass" : newNode.authType;
-    const credentialId = protocol === "vnc" ? "" : newNode.credentialId;
-    // An SSH or RDP password isn't sent over VNC (weakly protected) or
-    // telnet (not protected at all): switching into either from another kind
-    // empties the field, and the save clears the saved one too. It's held
-    // here, so switching out again before saving (to SSH or RDP) brings it
-    // back as it was.
-    const weak = (p: string | undefined) => p === "vnc" || p === "telnet";
-    let password = {};
-    if (!weak(newNode.protocol) && weak(protocol)) {
-      password = {
-        password: "",
-        password_dirty: true,
-        heldPassword: {
-          from: newNode.protocol === "rdp" ? "RDP" : "SSH",
-          password: newNode.password || "",
-          dirty: !!newNode.password_dirty,
-        },
-      };
-    } else if (weak(newNode.protocol) && !weak(protocol) && newNode.heldPassword) {
-      password = {
-        password: newNode.heldPassword.password,
-        password_dirty: newNode.heldPassword.dirty,
-        heldPassword: undefined,
-      };
-    }
-    setNewNode({ ...newNode, protocol, port, authType, credentialId, ...password });
+    setNewNode({ ...newNode, protocol, port, ...Fork.protocolSwitch(newNode, protocol) });
   };
   const [newFolderName, setNewFolderName] = useState("");
   // Set while the native key picker is open so the Browse button can't be
@@ -232,11 +148,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
   const [importLoading, setImportLoading] = useState(false);
   const [importBusy, setImportBusy] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
-  // Sessions the pasted export holds that can't be imported (MobaXterm VNC…).
-  const [importSkipped, setImportSkipped] = useState<string | null>(null);
-  // What the finished import did and what's left to do; while set, the modal
-  // shows it with a Done button instead of the host list.
-  const [importDone, setImportDone] = useState<string | null>(null);
+  const forkImport = Fork.useImportResult();
   const [importHosts, setImportHosts] = useState<ImportedHost[]>([]);
   const [importSelected, setImportSelected] = useState<Set<string>>(new Set());
   // Source selector for the import modal. `ssh` = the on-disk OpenSSH
@@ -259,7 +171,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     setImportSource("ssh");
     setImportPasteText("");
     setImportError(null);
-    setImportSkipped(null);
+    forkImport.setSkipped(null);
     setImportHosts([]);
     setImportSelected(new Set());
     setImportLoading(true);
@@ -278,39 +190,23 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
   const parsePastedImport = async (text: string = importPasteText) => {
     setImportLoading(true);
     setImportError(null);
-    setImportSkipped(null);
+    forkImport.setSkipped(null);
     setImportHosts([]);
     setImportSelected(new Set());
     try {
-      const res = await invoke<ClientImport>("parse_client_import", { text });
-      setImportHosts(res.hosts);
-      setImportSkipped(res.skipped);
+      await Fork.parseClientImport(text, setImportHosts, forkImport.setSkipped);
     } catch (e: any) {
       setImportError(typeof e === "string" ? e : (e?.message || String(e)));
     } finally {
       setImportLoading(false);
     }
   };
-  // Read an export file (MobaXterm .mxtsessions, PuTTY .reg, JSON) through
-  // the native dialog and parse it straight away, as if it had been pasted.
-  const chooseImportFile = async () => {
-    setImportError(null);
-    try {
-      const text = await invoke<string | null>("pick_client_import_file");
-      if (text == null) return;
-      setImportPasteText(text);
-      await parsePastedImport(text);
-    } catch (e: any) {
-      setImportError(typeof e === "string" ? e : (e?.message || String(e)));
-    }
-  };
-
 
   const switchImportSource = async (next: "ssh" | "paste") => {
     if (importBusy || importSource === next) return;
     setImportSource(next);
     setImportError(null);
-    setImportSkipped(null);
+    forkImport.setSkipped(null);
     setImportHosts([]);
     setImportSelected(new Set());
     if (next === "ssh") {
@@ -330,8 +226,8 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     if (importBusy) return;
     setImportOpen(false);
     setImportError(null);
-    setImportSkipped(null);
-    setImportDone(null);
+    forkImport.setSkipped(null);
+    forkImport.setDone(null);
     setImportHosts([]);
     setImportSelected(new Set());
     setImportPasteText("");
@@ -341,7 +237,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     if (importSelected.size === importHosts.length) {
       setImportSelected(new Set());
     } else {
-      setImportSelected(new Set(importHosts.map(rowKey)));
+      setImportSelected(new Set(importHosts.map(Fork.rowKey)));
     }
   };
 
@@ -354,18 +250,17 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     });
   };
 
-  // Load each distinct key file into the vault (import_ssh_key_file dedupes
-  // by content), then hand every picked host to `import_hosts`, which writes
-  // folders, Logins, jump hosts and servers in one transaction. A host whose
-  // key can't be read still imports, signing in without it; the summary says
-  // which key and why (a PuTTY .ppk, say, needs exporting as OpenSSH first).
   const importSelectedHosts = async () => {
     if (importSelected.size === 0 || importBusy) return;
     setImportBusy(true);
     setImportError(null);
-    const picked = importHosts.filter((h) => importSelected.has(rowKey(h)));
+    const picked = importHosts.filter((h) => importSelected.has(Fork.rowKey(h)));
+    // Several hosts routinely point at the same `~/.ssh/id_ed25519`. The Rust
+    // side already dedupes by key content, but caching here means one read and
+    // one vault write for the whole batch instead of one per host. `null`
+    // records a path we already tried and couldn't use, so we don't retry a
+    // missing file once per host that mentions it.
     const keysByPath = new Map<string, ImportedSshKey | null>();
-    const keyFailures = new Map<string, string>();
     // Key files from this computer, going into a shared profile, would sync
     // to everyone it's shared with: ask first. The safe answer (Escape, or
     // the focused button) imports the hosts without them.
@@ -389,85 +284,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
         });
       }
     }
-    const loadKey = async (path: string | null | undefined): Promise<ImportedSshKey | null> => {
-      if (!path || !withKeys) return null;
-      if (keysByPath.has(path)) return keysByPath.get(path) ?? null;
-      let key: ImportedSshKey | null = null;
-      try {
-        key = await invoke<ImportedSshKey>("import_ssh_key_file", { path, name: null });
-      } catch (e: any) {
-        keyFailures.set(path, typeof e === "string" ? e : (e?.message || String(e)));
-      }
-      keysByPath.set(path, key);
-      return key;
-    };
-    const rows: ImportRow[] = [];
-    for (const host of picked) {
-      const key = await loadKey(host.identity_file);
-      const jumpKey = await loadKey(host.jump_identity_file);
-      rows.push({ host, key_id: key ? key.id : null, jump_key_id: jumpKey ? jumpKey.id : null });
-    }
-    let report: ImportReport | null = null;
-    try {
-      report = await invoke<ImportReport>("import_hosts", { rows });
-    } catch (e: any) {
-      setImportError(typeof e === "string" ? e : (e?.message || String(e)));
-    }
-    setImportBusy(false);
-    if (refreshServers) {
-      try { await refreshServers(); } catch { /* refresh failure isn't fatal */ }
-    }
-    if (refreshFolders) {
-      try { await refreshFolders(); } catch { /* same */ }
-    }
-    if (refreshCredentials) {
-      try { await refreshCredentials(); } catch { /* same */ }
-    }
-    if (keysByPath.size > 0 && refreshSshKeys) {
-      try { await refreshSshKeys(); } catch { /* same — the list refreshes on next open */ }
-    }
-    if (!report) return;
-    // Lets the app sync what came in (DesktopApp's bumpSync).
-    onImported?.();
-
-    // Anything the user has to finish goes in the summary the modal shows
-    // until Done.
-    const todo: string[] = [];
-    const loaded = [...keysByPath.values()].filter((k): k is ImportedSshKey => !!k);
-    const needPassphrase = loaded.filter((k) => k.encrypted).length;
-    if (report.logins_created.length > 0) {
-      todo.push(
-        `${plural(report.logins_created.length, "Login")} created (${report.logins_created.join(", ")}). ` +
-        `Fill in each one's user name and password once under Logins, or leave them empty to be asked when connecting.`,
-      );
-    }
-    if (report.jump_hosts_created.length > 0) {
-      todo.push(`Jump ${report.jump_hosts_created.length === 1 ? "host" : "hosts"} saved: ${report.jump_hosts_created.join(", ")}.`);
-    }
-    if (report.multi_hop.length > 0) {
-      todo.push(
-        `${plural(report.multi_hop.length, "host")} use a chain of jump hosts, which Submarine can't do (one jump host per server): ` +
-        `${report.multi_hop.slice(0, 5).join(", ")}${report.multi_hop.length > 5 ? "…" : ""}. They were imported without one.`,
-      );
-    }
-    if (report.rdp_skipped.length > 0) {
-      todo.push(`${plural(report.rdp_skipped.length, "Remote Desktop session")} not imported: ${report.rdp_skipped.join("; ")}`);
-    }
-    for (const [path, why] of keyFailures) {
-      const ppk = /\.ppk$/i.test(path) ? " PuTTY .ppk keys need converting first: PuTTYgen › Conversions › Export OpenSSH key (force new file format) — the older format can't be read with a passphrase." : "";
-      todo.push(`Couldn't load the key ${path}: ${why}.${ppk} Hosts using it were imported without it.`);
-    }
-    if (needPassphrase > 0) {
-      todo.push(`${plural(needPassphrase, "key")} need a passphrase — add it under Settings › SSH keys, or leave it empty to be asked when connecting.`);
-    }
-    const summary =
-      `${plural(report.added, "server")} imported` +
-      (report.folders_created ? `, ${plural(report.folders_created, "folder")} created` : "") +
-      (report.jump_linked ? `, ${report.jump_linked} linked to a jump host` : "") +
-      (report.rdp_added ? `, ${plural(report.rdp_added, "RDP server")} added` : "") +
-      (report.already_there ? `; ${report.already_there} already saved, left as they were` : "") +
-      ".";
-    setImportDone([summary, ...todo].join("\n\n"));
+    await Fork.importPicked({ picked, withKeys, keysByPath, setImportBusy, setImportError, setImportDone: forkImport.setDone, refreshServers, refreshFolders, refreshCredentials, refreshSshKeys, onImported });
   };
 
   // Browse to a key on disk and select it on this server in one step. The key
@@ -540,9 +357,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
   const handleCreateFolder = async () => {
     if (!newFolderName.trim()) return;
     try {
-      // Inside the folder picked above, so folders can nest; at the top level
-      // when that's Root.
-      await invoke("add_folder", { name: newFolderName, parentId: newNode.folderId ? parseInt(newNode.folderId) : null });
+      await invoke("add_folder", { name: newFolderName, parentId: Fork.folderParentId(newNode) });
       setNewFolderName("");
       setIsCreatingFolder(false);
       refreshFolders();
@@ -642,7 +457,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 <div className="flex gap-2">
                   <select className="flex-1 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" value={newNode.folderId} onChange={e => setNewNode({ ...newNode, folderId: e.target.value })}>
                     <option value="" className="bg-[#1a1a1e] text-zinc-500">-- Root --</option>
-                    {folderOptions(folders || []).map((f) => <option key={f.id} value={f.id.toString()} className="bg-[#1a1a1e] text-white">{f.label}</option>)}
+                    <Fork.FolderOptions folders={folders} />
                   </select>
                   <button aria-label="New folder" onClick={() => setIsCreatingFolder(true)} className="w-9 h-9 bg-white/5 border border-white/10 rounded-lg text-primary hover:bg-white/10 transition-all flex items-center justify-center shrink-0">
                     <FolderPlus size={14} />
@@ -782,13 +597,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                     className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner"
                     placeholder="••••••"
                   />
-                  {(isTelnet || isVnc) && newNode.heldPassword?.password && !newNode.password && (
-                    <p className="text-[10px] text-amber-300/90 ml-1">
-                      {isVnc
-                        ? `The ${newNode.heldPassword.from} password was taken out, so it isn't sent over VNC. VNC servers have a password of their own: type it here.`
-                        : `The ${newNode.heldPassword.from} password was taken out, so it isn't sent over telnet, which doesn't protect it. Type one here if you want it saved.`}
-                    </p>
-                  )}
+                  <Fork.HeldPasswordNote newNode={newNode} isTelnet={isTelnet} isVnc={isVnc} />
                   <p className="text-[10px] text-zinc-500 ml-1">
                     {isTelnet
                       ? "A telnet server asks for the login in the terminal. Type it there; at the password prompt, the terminal's key button types the saved one."
@@ -905,15 +714,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 out so a node can't jump through itself. */}
             <div ref={jumpRowRef} className="flex justify-between items-center gap-3">
               <label className="text-[11px] font-bold text-zinc-400 shrink-0">{isSsh ? "Jump via" : "Through SSH server"}</label>
-              <JumpHostPicker
-                label={isSsh ? "Jump via" : "Through SSH server"}
-                directLabel={isSsh ? "Direct — no jump host" : "Direct — no SSH server"}
-                value={newNode.jumpHostId || ""}
-                onChange={(id) => setNewNode({ ...newNode, jumpHostId: id })}
-                servers={servers || []}
-                folders={folders || []}
-                selfId={newNode.id}
-              />
+              <Fork.JumpVia isSsh={isSsh} newNode={newNode} setNewNode={setNewNode} servers={servers} folders={folders} />
             </div>
 
             {/* RDP options: this device's own (util/rdpOptions), not synced. */}
@@ -1343,54 +1144,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               </label>
             </div>
             )}
-            {isSsh && isEditMode && <KeepSessionOverride uuid={servers?.find((s: any) => s.id === newNode.id)?.uuid} />}
-
-            {/* A telnet server's tab is a terminal too, so it takes its own
-                colors and highlighting like an SSH server's. */}
-            {(isSsh || isTelnet) && (<>
-            {/* Its own terminal colors (synced with the server), e.g. a light
-                scheme for production so it's never mistaken for the rest. */}
-            <div className="space-y-1.5 pt-1">
-              <label htmlFor="node-terminal-colors" className="text-[11px] font-bold text-zinc-400 ml-1 flex items-center gap-2">
-                <span>Terminal colors</span>
-                <span className="text-[10px] text-zinc-600 font-normal normal-case tracking-normal">
-                  Its own, so it stands out. Applies to its open terminals too.
-                </span>
-              </label>
-              <div className="flex items-center gap-2">
-                <select
-                  id="node-terminal-colors"
-                  value={newNode.terminalTheme || ""}
-                  onChange={(e) => setNewNode({ ...newNode, terminalTheme: e.target.value })}
-                  className="flex-1 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner"
-                >
-                  <option value="">Same as Settings ({schemeById(readSchemeId()).name})</option>
-                  {SCHEMES.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-                </select>
-                <SchemeSwatch scheme={schemeById(newNode.terminalTheme || readSchemeId())} className="shrink-0 h-9" />
-              </div>
-            </div>
-
-            {/* Its own highlight set (synced with the server), e.g. Network
-                devices for a switch. */}
-            <div className="space-y-1.5 pt-1">
-              <label htmlFor="node-highlight" className="text-[11px] font-bold text-zinc-400 ml-1 flex items-center gap-2">
-                <span>Highlighting</span>
-                <span className="text-[10px] text-zinc-600 font-normal normal-case tracking-normal">
-                  Words and addresses colored in its output. Applies to its open terminals too.
-                </span>
-              </label>
-              <select
-                id="node-highlight"
-                value={newNode.highlight || ""}
-                onChange={(e) => setNewNode({ ...newNode, highlight: e.target.value })}
-                className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner"
-              >
-                <option value="">Same as Settings ({highlightSetById(readHighlightId()).name})</option>
-                {HIGHLIGHT_SETS.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-              </select>
-            </div>
-            </>)}
+            <Fork.MoreFields isSsh={isSsh} isTelnet={isTelnet} isEditMode={isEditMode} newNode={newNode} setNewNode={setNewNode} servers={servers} />
           </div>
         </div>
 
@@ -1440,8 +1194,8 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                     paste  → drop text from PuTTY, MobaXterm, or a JSON
                              export; Rust auto-detects the format so the
                              user doesn't need to say which client it came
-                             from. Gone once the import is done. */}
-            {!importDone && (
+                             from. */}
+            {!forkImport.done && (
             <div className="px-4 py-2 border-b border-white/5 flex items-center gap-1 shrink-0">
               <button
                 onClick={() => switchImportSource("ssh")}
@@ -1468,14 +1222,10 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
             </div>
             )}
 
-            {/* Body — one of loading / error / empty / list, or the result. */}
+            {/* Body — one of loading / error / empty / list. */}
             <div className="flex-1 overflow-y-auto custom-scrollbar p-3">
-              {importDone && (
-                <div className="m-1 p-3 bg-emerald-500/[0.06] border border-emerald-500/20 rounded-lg text-zinc-200 text-[12px] leading-relaxed whitespace-pre-line">
-                  {importDone}
-                </div>
-              )}
-              {!importDone && (<>
+              <Fork.ImportDone text={forkImport.done} />
+              {!forkImport.done && (<>
               {importSource === "paste" && importHosts.length === 0 && !importLoading && (
                 <div className="space-y-2 mb-2">
                   <div className="text-[11px] text-zinc-400 leading-relaxed px-1">
@@ -1494,14 +1244,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                     className="w-full bg-black/40 border border-white/10 rounded-lg p-3 text-[11px] font-mono text-zinc-200 placeholder:text-zinc-600 focus:border-primary/40 focus:outline-none resize-none custom-scrollbar"
                   />
                   <div className="flex justify-end gap-2">
-                    {!IS_ANDROID && (
-                      <button
-                        onClick={chooseImportFile}
-                        className="h-8 px-3 rounded-lg text-[11px] font-bold uppercase tracking-wider bg-white/[0.04] text-zinc-300 border border-white/10 hover:bg-white/[0.08] hover:text-white transition-all"
-                      >
-                        Choose file…
-                      </button>
-                    )}
+                    <Fork.ChooseImportFile setError={setImportError} setText={setImportPasteText} parse={parsePastedImport} />
                     <button
                       onClick={() => parsePastedImport()}
                       disabled={!importPasteText.trim()}
@@ -1552,10 +1295,10 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
 
                   <div className="space-y-1.5">
                     {importHosts.map((h) => {
-                      const isSel = importSelected.has(rowKey(h));
+                      const isSel = importSelected.has(Fork.rowKey(h));
                       return (
                         <label
-                          key={rowKey(h)}
+                          key={Fork.rowKey(h)}
                           className={`flex items-start gap-3 p-2.5 rounded-lg border cursor-pointer transition-all ${
                             isSel
                               ? "bg-primary/10 border-primary/40"
@@ -1565,29 +1308,18 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                           <input
                             type="checkbox"
                             checked={isSel}
-                            onChange={() => toggleOne(rowKey(h))}
+                            onChange={() => toggleOne(Fork.rowKey(h))}
                             className="mt-0.5 accent-primary shrink-0"
                           />
                           <div className="flex-1 min-w-0">
                             <div className="text-[12.5px] font-bold text-white truncate">
-                              {h.rdp && <span className="mr-1.5 px-1 py-px rounded text-[9.5px] font-black tracking-wider bg-sky-500/15 text-sky-300 border border-sky-500/30 align-middle">RDP</span>}
-                              {h.telnet && <span className="mr-1.5 px-1 py-px rounded text-[9.5px] font-black tracking-wider bg-amber-500/15 text-amber-300 border border-amber-500/30 align-middle">TELNET</span>}
+                              <Fork.HostBadges h={h} />
                               {h.host_alias}
                             </div>
                             <div className="text-[11px] font-mono text-zinc-400 truncate">
                               {h.user ? `${h.user}@` : ""}{h.hostname}:{h.port}
                             </div>
-                            {h.folder && h.folder.length > 0 && (
-                              <div className="text-[10.5px] text-zinc-500 truncate">{h.folder.join(" › ")}</div>
-                            )}
-                            {(h.credential || h.identity_file || h.proxy_jump || h.run_on_connect) && (
-                              <div className="mt-0.5 text-[10.5px] text-zinc-600 truncate">
-                                {h.credential && <span className="mr-2">login: {h.credential}</span>}
-                                {h.identity_file && <span className="mr-2">key: {h.identity_file}</span>}
-                                {h.proxy_jump && <span className="mr-2">jump: {h.proxy_jump}</span>}
-                                {h.run_on_connect && <span>runs: {h.run_on_connect}</span>}
-                              </div>
-                            )}
+                            <Fork.HostDetails h={h} />
                           </div>
                         </label>
                       );
@@ -1600,12 +1332,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                     </div>
                   )}
 
-                  {importSkipped && (
-                    <div className="mt-3 p-2 bg-white/[0.03] border border-white/10 rounded-lg text-zinc-400 text-[11px]">
-                      {importSkipped}
-                    </div>
-                  )}
-
+                  <Fork.ImportSkipped text={forkImport.skipped} />
                 </>
               )}
               </>)}
@@ -1613,16 +1340,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
 
             {/* Modal footer */}
             <div className="p-3 border-t border-white/5 shrink-0 flex items-center justify-end gap-2">
-              {importDone ? (
-                // The import was the point of opening the panel, so Done
-                // closes it as well, not just the import.
-                <button
-                  onClick={() => { closeImportModal(); onClose(); }}
-                  className="px-4 h-8 rounded-lg text-[11px] font-bold uppercase tracking-wider bg-primary/15 border border-primary/40 text-primary hover:bg-primary/25"
-                >
-                  Done
-                </button>
-              ) : (<>
+              {forkImport.done ? <Fork.ImportDoneButton onDone={() => { closeImportModal(); onClose(); }} /> : (<>
               <button
                 onClick={closeImportModal}
                 disabled={importBusy}

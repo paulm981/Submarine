@@ -19,8 +19,9 @@
 //
 // A file that reaches many of the fork's hooks through one import (DesktopApp,
 // through src/fork/desktop; TerminalView, through src/fork/terminal;
-// SessionView, through src/fork/session) also
-// lists them under `uses`, as written there:
+// SessionView, through src/fork/session; AddNodePanel, through
+// src/fork/server-form; NodeGrid, through src/fork/grid; ProfilePanel, through
+// src/fork/profile) also lists them under `uses`, as written there:
 // each must still be in the file's code, so a merge that drops one fails too.
 
 import { describe, expect, it } from "vitest";
@@ -42,13 +43,38 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
   },
   {
     file: "src/components/AddNodePanel.tsx",
-    imports: ["../ui/highlight", "../ui/terminalThemes", "../util/folderPath", "./JumpHostPicker", "./KeptSessions", "./TerminalSchemes"],
+    // Everything of the fork's in the server form comes through src/fork/server-form:
+    // `Fork.…`, and what its hooks give (`forkImport.…`, jumpRowRef).
+    imports: ["../fork/server-form"],
+    uses: [
+      "Fork.ImportedHostExtra", "Fork.useFocusJump", "Fork.protocolSwitch", "Fork.useImportResult", "Fork.parseClientImport",
+      "Fork.rowKey", "Fork.importPicked", "Fork.folderParentId", "Fork.FolderOptions", "Fork.HeldPasswordNote", "Fork.JumpVia",
+      "Fork.MoreFields", "Fork.ImportDone", "Fork.ChooseImportFile", "Fork.HostBadges", "Fork.HostDetails", "Fork.ImportSkipped",
+      "Fork.ImportDoneButton", "forkImport.setSkipped", "forkImport.setDone", "forkImport.done", "forkImport.skipped",
+      "jumpRowRef",
+    ],
   },
   { file: "src/components/DockerTab.tsx", imports: ["../ui/rootInvoke", "../util/infoFont"] },
   { file: "src/components/FilePanel.tsx", imports: ["../util/fileName"] },
   { file: "src/components/InfoPanel.tsx", imports: ["../ui/rootInvoke", "../util/infoFont"] },
-  { file: "src/components/NodeGrid.tsx", imports: ["../ui/ping", "../util/folderPath", "../util/jumpHostNote", "./OsBadge"] },
-  { file: "src/components/ProfilePanel.tsx", imports: ["./StoreSync"] },
+  {
+    file: "src/components/NodeGrid.tsx",
+    // Everything of the fork's in the server grid comes through src/fork/grid:
+    // `Fork.…`, and what its hooks give (`tree.…`, the fork's folders in the
+    // original project's shape, and `cardMenu.…`).
+    imports: ["../fork/grid"],
+    uses: [
+      "Fork.useFolderTree", "Fork.useCardMenu", "Fork.OsAvatar", "Fork.jumpHostNote", "Fork.deleteFolderMessage",
+      "Fork.FolderPath", "Fork.CardMenu", "tree.serverCount", "cardMenu.open", "cardMenu.close",
+    ],
+  },
+  {
+    file: "src/components/ProfilePanel.tsx",
+    // Everything of the fork's in the Profile panel comes through src/fork/profile:
+    // `Fork.…`, and what its hook gives (`ownStore.…`).
+    imports: ["../fork/profile"],
+    uses: ["Fork.StoreStats", "Fork.useStoreSync", "Fork.StoreSection", "ownStore.read", "ownStore.store", "ownStore.cloudOn"],
+  },
   { file: "src/components/ProfileSelectPage.tsx", imports: ["./StoreSync"] },
   {
     file: "src/components/SessionView.tsx",
