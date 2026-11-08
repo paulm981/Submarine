@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.48
+
+- **The AI can follow a log while it works.** It asks once to follow a command such as `journalctl -u nginx -f`, on the same card as any command, and then reads what's new every few seconds instead of waiting for the command to time out. The AI panel shows each follow while it runs, with Stop. It also stops after 30 minutes the AI doesn't read it, after 2 hours, or when access ends, and the AI gets the output with known secrets hidden. ([#179](https://github.com/paulm981/Submarine/issues/179))
+
 ## v0.4.0-fork.47
 
 - **The AI knows up front what it may do on each server.** When it asks Submarine what's shared, it now hears, for each server, whether you're asked each time, only your allowed commands run, or anything runs, along with the folders it may copy into and the limits. It no longer has to find out by being refused, and it's told to ask again after a refusal, since you can change settings while it works. It never hears your allow rules. ([#176](https://github.com/paulm981/Submarine/issues/176))
