@@ -40,6 +40,26 @@
       <br/><sub><b>Sync through storage you own</b>: a synced folder or a private git repository</sub>
     </td>
   </tr>
+  <tr>
+    <td width="50%" valign="top" align="center">
+      <a href="FORK.md#ai-help-without-sharing-keys"><img src="docs/screenshots/fork/ai-card-group.png" alt="The AI panel: one request to run a command on web1, web2 and db1 with Allow on 3 servers, a file copy request, and a log being followed with Stop" /></a>
+      <br/><sub><b>AI tools</b>: every command waits for your Allow, one card for many servers</sub>
+    </td>
+    <td width="50%" valign="top" align="center">
+      <a href="FORK.md#ai-help-without-sharing-keys"><img src="docs/screenshots/fork/ai-levels.png" alt="A server's AI approval levels: Ask every time, Run my allowed commands, ask for the rest, and Run anything, just log it with its warning" /></a>
+      <br/><sub><b>How much the AI may run without asking</b>, per server</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top" align="center">
+      <a href="FORK.md#work-on-many-servers-at-once"><img src="docs/screenshots/fork/bulk-push.png" alt="Push files to servers at its summary: what goes to which servers, one server left out, and the files already there to skip or replace" /></a>
+      <br/><sub><b>Push files to many servers</b>, with a summary before anything moves</sub>
+    </td>
+    <td width="50%" valign="top" align="center">
+      <a href="FORK.md#a-better-terminal"><img src="docs/screenshots/fork/kept-sessions.png" alt="A server's kept sessions: two tmux sessions on web1, each with Open and End" /></a>
+      <br/><sub><b>Sessions that survive a reconnect</b>, listed per server</sub>
+    </td>
+  </tr>
 </table>
 
 **AI tools on your servers, without sharing keys** (a first test, off by default)
