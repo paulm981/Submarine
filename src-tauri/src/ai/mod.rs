@@ -55,6 +55,8 @@ mod copy;
 mod exec;
 mod filter;
 mod follow;
+#[cfg(test)]
+mod fuzz_tests;
 pub mod helper;
 mod mcp;
 mod read_only;
