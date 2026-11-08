@@ -117,7 +117,7 @@ try {
     await page.locator(".xterm-screen:visible").first().click();
     await page.keyboard.type("echo hello from submarine on every server", { delay: 15 });
   });
-  console.log(`writes to servers while typing: ${await page.evaluate(() => window.__writes ?? 0)}`);
+  console.log(`while typing: ${await page.evaluate(() => window.__writes ?? 0)} writes to servers, in ${await page.evaluate(() => window.__calls ?? 0)} calls across the bridge`);
   await step(page, "Wall: to a tab and back x3", async () => {
     for (let i = 0; i < 3; i++) { await tab("node02").click(); await wall.click(); }
   });

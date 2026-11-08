@@ -177,6 +177,50 @@ pub(crate) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS walls (
     cols INTEGER NOT NULL DEFAULT 0
 )";
 
+// -- Broadcast's typing (#127) ------------------------------------------------
+
+/// The most terminals one Broadcast write goes to (src/fork/terminal/broadcast.ts).
+pub(crate) static MAX_TARGETS: usize = 512;
+/// The most bytes one Broadcast write carries: a large paste is many.
+pub(crate) static MAX_DATA: usize = 1024 * 1024;
+
+/// Broadcast's typing: the same bytes to each of `terminal_ids`, in one call
+/// from the page instead of one per terminal, as `write_terminal_data`
+/// writes them (lib.rs). Each terminal's queue is found under the map's lock,
+/// then written to with the lock let go, all at once, so a slow server's
+/// full queue holds up only its own. A terminal that's gone is skipped.
+#[tauri::command]
+pub async fn write_terminals_data(state: tauri::State<'_, crate::ssh_manager::SshState>, terminal_ids: Vec<String>, data: Vec<u8>) -> Result<(), String> {
+    check_targets(&terminal_ids, &data)?;
+    let txs: Vec<_> = {
+        let map = state.terminal_txs.lock().await;
+        terminal_ids.iter().filter_map(|id| map.get(id).cloned()).collect()
+    };
+    // Each write a task of its own; the call ends once all of them have,
+    // and the page sends the next keystroke only then, so each terminal
+    // gets its keys in order.
+    let mut writes = tokio::task::JoinSet::new();
+    for tx in txs {
+        let data = data.clone();
+        writes.spawn(async move {
+            let _ = tx.send(crate::ssh_manager::TerminalCommand::Data(data)).await;
+        });
+    }
+    while writes.join_next().await.is_some() {}
+    Ok(())
+}
+
+/// A Broadcast write's size, checked at the edge.
+pub(crate) fn check_targets(terminal_ids: &[String], data: &[u8]) -> Result<(), String> {
+    if terminal_ids.len() > MAX_TARGETS {
+        return Err(format!("Broadcast writes to at most {MAX_TARGETS} terminals at once."));
+    }
+    if data.len() > MAX_DATA {
+        return Err("That's too much to type at once.".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +345,14 @@ mod tests {
         };
         let both = async { tokio::join!(route(vec![a.clone(), b.clone()]), route(vec![b, a])) };
         tokio::time::timeout(std::time::Duration::from_secs(5), both).await.expect("no deadlock between the routes");
+    }
+
+    #[test]
+    fn a_broadcast_write_has_bounds() {
+        let ids = |n: usize| (0..n).map(|i| format!("t{i}")).collect::<Vec<_>>();
+        assert!(check_targets(&ids(36), b"ls\n").is_ok());
+        assert!(check_targets(&ids(MAX_TARGETS), &vec![0; MAX_DATA]).is_ok());
+        assert!(check_targets(&ids(MAX_TARGETS + 1), b"x").is_err());
+        assert!(check_targets(&ids(1), &vec![0; MAX_DATA + 1]).is_err());
     }
 }

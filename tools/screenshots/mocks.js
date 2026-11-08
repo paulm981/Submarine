@@ -209,8 +209,19 @@ mockIPC((cmd, args = {}) => {
     case "local_terminal_open":
       later(() => args.onOutput?.onmessage?.(new TextEncoder().encode("\x1b[1;32mme@laptop\x1b[0m:\x1b[1;34m~\x1b[0m$ ").buffer), 150);
       return "bash";
+    // Broadcast's typing, one call for every target (#127).
+    case "write_terminals_data": {
+      window.__calls = (window.__calls ?? 0) + 1;
+      for (const id of args.terminalIds) {
+        window.__writes = (window.__writes ?? 0) + 1;
+        const out = outputs.get(id);
+        later(() => out?.onmessage?.(new Uint8Array(args.data).buffer), 5);
+      }
+      return null;
+    }
     // A shell echoes what's typed, as a real one does.
     case "write_terminal_data": {
+      window.__calls = (window.__calls ?? 0) + 1;
       window.__writes = (window.__writes ?? 0) + 1;
       const out = outputs.get(args.terminalId);
       later(() => out?.onmessage?.(new Uint8Array(args.data).buffer), 5);

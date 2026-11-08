@@ -100,7 +100,7 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
     // (`forkTerm.…`).
     imports: ["../fork/terminal"],
     uses: [
-      "Fork.TerminalProps", "Fork.useTerminal", "Fork.rootOpened", "Fork.schemeForServer", "Fork.savedPasswords",
+      "Fork.TerminalProps", "Fork.broadcastWrite", "Fork.useTerminal", "Fork.rootOpened", "Fork.schemeForServer", "Fork.savedPasswords",
       "Fork.xtermLook", "Fork.mountTerminal", "Fork.readClipboardText", "Fork.appHotkey", "Fork.pasteClean",
       "Fork.TerminalOverlay", "fork.commands.write", "fork.commands.resize", "fork.commands.close", "fork.resetHighlight",
       "fork.outputChannel", "fork.rootInvoke", "fork.watchForShellReady", "fork.dockElRef", "fork.dockEl", "fork.onScreen",

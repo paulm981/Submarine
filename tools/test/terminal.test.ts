@@ -6,6 +6,7 @@ import { claimGpu, gpuChanged, gpuSlotsInUse, MAX_GPU, releaseGpu, type GpuHolde
 import { reorderById } from "../../src/ui/tabDrag";
 import { hasVisibleText } from "../../src/ui/terminalActivity";
 import { cdLine } from "../../src/fork/terminal/here";
+import { callsFor, MAX_TARGETS } from "../../src/fork/terminal/broadcast";
 import { MOST_PER_FRAME, nextTurns, QUICK_FRAME_MS, SLOW_FRAME_MS } from "../../src/fork/terminal/turns";
 import { clearWidths, MAX_WIDTHS, sharedMeasure, widthKey } from "../../src/fork/terminal/widthCache";
 
@@ -145,5 +146,24 @@ describe("Open terminal here (#72)", () => {
     for (const path of ["relative", "/a\nreboot", "/a\rb", "/a\u001b[31m", "/a\u0085b", "/x!rm", "/a\\b", "/C:/Users", "/" + "x".repeat(5000)]) {
       expect(cdLine(path), path).toBeNull();
     }
+  });
+});
+
+describe("Broadcast's typing in one call (#127)", () => {
+  it("sends a keystroke's writes to every target as one call, in order", () => {
+    const key = [108];
+    const next = [115];
+    const writes = ["a", "b", "c"].map((terminalId) => ({ terminalId, data: key }));
+    expect(callsFor(writes)).toEqual([{ terminalIds: ["a", "b", "c"], data: key }]);
+    // Another key typed in the same turn: a call of its own, after the first.
+    const two = callsFor([...writes, { terminalId: "a", data: next }, { terminalId: "b", data: next }]);
+    expect(two.map((c) => c.terminalIds)).toEqual([["a", "b", "c"], ["a", "b"]]);
+    expect(two[1].data).toBe(next);
+  });
+
+  it("splits past the backend's limit", () => {
+    const key = [1];
+    const many = Array.from({ length: MAX_TARGETS + 3 }, (_, i) => ({ terminalId: `t${i}`, data: key }));
+    expect(callsFor(many).map((c) => c.terminalIds.length)).toEqual([MAX_TARGETS, 3]);
   });
 });
