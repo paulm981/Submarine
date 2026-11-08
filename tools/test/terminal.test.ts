@@ -6,6 +6,7 @@ import { claimGpu, gpuChanged, gpuSlotsInUse, MAX_GPU, releaseGpu, type GpuHolde
 import { reorderById } from "../../src/ui/tabDrag";
 import { hasVisibleText } from "../../src/ui/terminalActivity";
 import { cdLine } from "../../src/fork/terminal/here";
+import { pathLike, resolvePath, wordAt } from "../../src/fork/terminal/fileMenu";
 import { callsFor, MAX_TARGETS } from "../../src/fork/terminal/broadcast";
 import { MOST_PER_FRAME, nextTurns, QUICK_FRAME_MS, SLOW_FRAME_MS } from "../../src/fork/terminal/turns";
 import { clearWidths, MAX_WIDTHS, sharedMeasure, widthKey } from "../../src/fork/terminal/widthCache";
@@ -165,5 +166,31 @@ describe("Broadcast's typing in one call (#127)", () => {
     const key = [1];
     const many = Array.from({ length: MAX_TARGETS + 3 }, (_, i) => ({ terminalId: `t${i}`, data: key }));
     expect(callsFor(many).map((c) => c.terminalIds.length)).toEqual([MAX_TARGETS, 3]);
+  });
+});
+
+describe("right-click on a file name (#40)", () => {
+  const at = (line: string, needle: string) => wordAt(line, line.indexOf(needle) + 1);
+  it("takes the word under the pointer, without quotes, brackets or a line number", () => {
+    expect(at("-rw-r--r-- 1 root root 812 nginx.conf", "nginx.conf")).toBe("nginx.conf");
+    expect(at("error in src/main.rs:12:5: oops", "src/main.rs")).toBe("src/main.rs");
+    expect(at('open("/etc/hosts") failed', "/etc/hosts")).toBe("/etc/hosts");
+    expect(at("see (logs/app.log).", "logs/app.log")).toBe("logs/app.log");
+    expect(wordAt("a  b", 1)).toBe("");
+  });
+
+  it("knows a path or a file name from other words", () => {
+    for (const w of ["/var/log/syslog", "nginx.conf", "./run.sh", "app.log", "logs/", ".env", "README.md"]) expect(pathLike(w), w).toBe(true);
+    for (const w of ["uptime", "1.2.3.4", "0.21", "3.14", "https://example.com/a", "", "-", "x".repeat(5000)]) expect(pathLike(w), w).toBe(false);
+  });
+
+  it("resolves a name against the shell's folder, only when it can be sure", () => {
+    expect(resolvePath("/etc/nginx/nginx.conf", undefined)).toBe("/etc/nginx/nginx.conf");
+    expect(resolvePath("nginx.conf", "/etc/nginx")).toBe("/etc/nginx/nginx.conf");
+    expect(resolvePath("./conf.d/a.conf", "/etc/nginx/")).toBe("/etc/nginx/conf.d/a.conf");
+    expect(resolvePath("//etc//./hosts", undefined)).toBe("/etc/hosts");
+    for (const [w, f] of [["nginx.conf", undefined], ["~/.bashrc", "/home/u"], ["../x.conf", "/etc/nginx"], ["/etc/a\nb", undefined]] as const) {
+      expect(resolvePath(w, f), w).toBeNull();
+    }
   });
 });
