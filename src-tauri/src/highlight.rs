@@ -72,7 +72,11 @@ pub(crate) fn validate(rule: &HighlightRule) -> Result<(), String> {
 
 pub(crate) fn list(conn: &Connection) -> rusqlite::Result<Vec<HighlightRule>> {
     let mut stmt = conn.prepare(
-        "SELECT id, pattern, kind, match_case, color, bold, underline, enabled FROM highlight_rules ORDER BY position, id",
+        // Not one deleted on another computer (a sync leaves it marked), and
+        // in the same order on every computer: a tie in position goes by the
+        // synced uuid, not this vault's own id (#49).
+        "SELECT id, pattern, kind, match_case, color, bold, underline, enabled FROM highlight_rules
+         WHERE deleted = 0 ORDER BY position, uuid IS NULL, uuid, id",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(HighlightRule {
@@ -95,6 +99,14 @@ pub(crate) fn save(conn: &Connection, rule: &HighlightRule) -> Result<i64, Strin
     let db = |e: rusqlite::Error| format!("[DATABASE] HIGHLIGHT_SAVE_FAILED: {}", e);
     match rule.id {
         Some(id) => {
+            // A rule deleted meanwhile, here or on another computer: said, not
+            // lost without a word (#49).
+            let live: bool = conn
+                .query_row("SELECT EXISTS (SELECT 1 FROM highlight_rules WHERE id=?1 AND deleted = 0)", params![id], |r| r.get(0))
+                .map_err(db)?;
+            if !live {
+                return Err("This rule was deleted, here or on another computer you sync with. Add it again if you still want it.".into());
+            }
             // Only when something changed: an update restamps the row for sync.
             conn.execute(
                 "UPDATE highlight_rules SET pattern=?1, kind=?2, match_case=?3, color=?4, bold=?5, underline=?6, enabled=?7
@@ -115,6 +127,22 @@ pub(crate) fn save(conn: &Connection, rule: &HighlightRule) -> Result<i64, Strin
             Ok(conn.last_insert_rowid())
         }
     }
+}
+
+/// Turn a rule on or off, and nothing else: the Settings card's switch
+/// (#49). Saving the card's whole copy instead could put back an edit made
+/// on another computer since it was read, or turn a colour this build
+/// doesn't know into red. A rule deleted meanwhile says so.
+pub(crate) fn set_enabled(conn: &Connection, id: i64, enabled: bool) -> Result<(), String> {
+    let db = |e: rusqlite::Error| format!("[DATABASE] HIGHLIGHT_SAVE_FAILED: {}", e);
+    let live: bool = conn
+        .query_row("SELECT EXISTS (SELECT 1 FROM highlight_rules WHERE id=?1 AND deleted = 0)", params![id], |r| r.get(0))
+        .map_err(db)?;
+    if !live {
+        return Err("This rule was deleted, here or on another computer you sync with.".into());
+    }
+    conn.execute("UPDATE highlight_rules SET enabled=?1 WHERE id=?2 AND enabled IS NOT ?1", params![enabled, id]).map_err(db)?;
+    Ok(())
 }
 
 /// The rules in this order (the first wins where two match the same text).
@@ -158,6 +186,11 @@ pub async fn highlight_rules_list(state: tauri::State<'_, DbState>) -> Result<Ve
 #[tauri::command]
 pub async fn highlight_rule_save(state: tauri::State<'_, DbState>, rule: HighlightRule) -> Result<i64, String> {
     with_conn(&state, |conn| save(conn, &rule).map(|id| (id, true)))
+}
+
+#[tauri::command]
+pub async fn highlight_rule_set_enabled(state: tauri::State<'_, DbState>, id: i64, enabled: bool) -> Result<(), String> {
+    with_conn(&state, |conn| set_enabled(conn, id, enabled).map(|()| ((), true)))
 }
 
 #[tauri::command]
@@ -217,5 +250,41 @@ mod tests {
         bad_color.color = "red; DROP".into();
         assert!(validate(&bad_color).is_err());
         assert!(validate(&rule("a\tb", "text")).is_ok());
+    }
+
+    /// A rule deleted on another computer (a sync leaves it marked deleted)
+    /// isn't listed, and saving it says so; a tie in position goes by uuid,
+    /// the same on every computer (#49).
+    #[test]
+    fn deleted_rules_and_ties() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let a = save(&conn, &rule("alpha", "word")).unwrap();
+        let b = save(&conn, &rule("beta", "word")).unwrap();
+        conn.execute("UPDATE highlight_rules SET position = 0, uuid = CASE id WHEN ?1 THEN 'zz' ELSE 'aa' END", params![a]).unwrap();
+        assert_eq!(list(&conn).unwrap().iter().map(|r| r.id.unwrap()).collect::<Vec<_>>(), vec![b, a], "by uuid, not id");
+        conn.execute("UPDATE highlight_rules SET deleted = 1 WHERE id = ?1", params![b]).unwrap();
+        assert_eq!(list(&conn).unwrap().iter().map(|r| r.id.unwrap()).collect::<Vec<_>>(), vec![a]);
+        let mut gone = rule("beta2", "word");
+        gone.id = Some(b);
+        assert!(save(&conn, &gone).unwrap_err().contains("deleted"));
+        gone.id = Some(9999);
+        assert!(save(&conn, &gone).is_err());
+    }
+
+    /// The switch changes only whether a rule is on (#49).
+    #[test]
+    fn the_switch_changes_only_enabled() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let a = save(&conn, &rule("alpha", "word")).unwrap();
+        // Edited on another computer, in a colour this build doesn't know.
+        conn.execute("UPDATE highlight_rules SET pattern = 'alpha2', color = 'teal-9' WHERE id = ?1", params![a]).unwrap();
+        set_enabled(&conn, a, false).unwrap();
+        let (p, c, on): (String, String, bool) =
+            conn.query_row("SELECT pattern, color, enabled FROM highlight_rules WHERE id = ?1", params![a], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!((p.as_str(), c.as_str(), on), ("alpha2", "teal-9", false));
+        conn.execute("UPDATE highlight_rules SET deleted = 1 WHERE id = ?1", params![a]).unwrap();
+        assert!(set_enabled(&conn, a, true).is_err());
     }
 }

@@ -43,6 +43,38 @@ export const HIGHLIGHT_COLORS: readonly { id: HighlightColor; name: string; sgr:
 ];
 const colorById = new Map(HIGHLIGHT_COLORS.map((c) => [c.id, c]));
 
+/** The bright highlight colors a scheme draws as grays (Solarized's bright
+ *  green, yellow, blue and cyan are its grays): those are drawn in their
+ *  normal color there, so a highlight keeps its meaning (#49). `theme` is the
+ *  scheme's xterm theme. */
+export function grayBrights(theme: object): Set<HighlightColor> {
+  const out = new Set<HighlightColor>();
+  for (const c of HIGHLIGHT_COLORS) {
+    if (!c.id.startsWith("bright-")) continue;
+    const name = c.id.slice("bright-".length);
+    const hex = (theme as Record<string, unknown>)[`bright${name[0].toUpperCase()}${name.slice(1)}`];
+    if (typeof hex === "string" && saturation(hex) < 0.25) out.add(c.id);
+  }
+  return out;
+}
+
+/** The palette slot (0–15) a highlight color is drawn in with a scheme
+ *  whose gray brights are `grays`: a gray bright's normal one. */
+export const ansiFor = (c: { id: HighlightColor; ansi: number }, grays: ReadonlySet<HighlightColor>): number =>
+  grays.has(c.id) ? c.ansi - 8 : c.ansi;
+
+/** HSL saturation of `#rrggbb`, 0 to 1; 1 for anything else, so it's left. */
+function saturation(hex: string): number {
+  const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
+  if (!m) return 1;
+  const [r, g, b] = [m[1], m[2], m[3]].map((x) => parseInt(x, 16) / 255);
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  if (max === min) return 0;
+  return (max - min) / (1 - Math.abs(2 * l - 1));
+}
+
 export const isHighlightColor = (v: unknown): v is HighlightColor => typeof v === "string" && colorById.has(v as HighlightColor);
 
 export interface HighlightStyle {
@@ -582,6 +614,11 @@ class Attrs {
     this.fg = this.bg = this.inverse = this.hidden = this.bold = this.dim = this.underline = false;
   }
 
+  /** A copy, for ESC 7 and its kin to put back later. */
+  copy(): Attrs {
+    return Object.assign(new Attrs(), this);
+  }
+
   /** Text nobody colored: the only kind that's highlighted. */
   get plain(): boolean {
     return !this.fg && !this.bg && !this.inverse && !this.hidden;
@@ -670,8 +707,17 @@ export class HighlightStream {
   private decoder = new TextDecoder();
   private st = St.Ground;
   private csi = "";
+  /** The string being read (OSC, or DCS, SOS, PM and APC): a BEL ends only
+   *  an OSC; the others end only with ST. */
+  private strOsc = false;
   private attrs = new Attrs();
   private alt = false;
+  /** Bright colors this terminal's scheme draws as grays (grayBrights). */
+  private grays: ReadonlySet<HighlightColor> = new Set();
+  /** What ESC 7 (and CSI s) saved, on each screen, and what `?1049h` saved
+   *  of the main screen; null: nothing saved, which ESC 8 reads as the
+   *  defaults. */
+  private saved: { main: Attrs | null; alt: Attrs | null } = { main: null, alt: null };
   /** The end of the last batch, waiting for the rest of its line. */
   private held: Plain | null = null;
   private timer = 0;
@@ -692,6 +738,7 @@ export class HighlightStream {
     if (!this.matcher && m) {
       this.st = St.Ground;
       this.attrs.reset();
+      this.saved = { main: null, alt: null };
       this.alt = onAltScreen;
       this.decoder = new TextDecoder();
     }
@@ -699,11 +746,17 @@ export class HighlightStream {
     return held;
   }
 
+  /** The terminal's scheme: its gray brights are drawn in normal colors. */
+  setScheme(theme: object) {
+    this.grays = grayBrights(theme);
+  }
+
   /** The shell was replaced (a reconnect): what the old one set is gone. */
   reset(): string {
     const held = this.takeHeld();
     this.st = St.Ground;
     this.attrs.reset();
+    this.saved = { main: null, alt: null };
     this.alt = false;
     this.decoder = new TextDecoder();
     return held;
@@ -777,7 +830,7 @@ export class HighlightStream {
       let at = 0;
       while (k < spans.length && spans[k][0] < end) {
         const sp = spans[k++];
-        out += p.text.slice(at, sp[0] - base) + wrap(p.text.slice(sp[0] - base, sp[1] - base), sp[2], p);
+        out += p.text.slice(at, sp[0] - base) + wrap(p.text.slice(sp[0] - base, sp[1] - base), sp[2], p, this.grays);
         at = sp[1] - base;
       }
       out += at ? p.text.slice(at) : p.text;
@@ -817,8 +870,7 @@ export class HighlightStream {
         const c = text.charCodeAt(j);
         i = j + 1;
         if (c === 0x1b) this.st = St.Esc;
-        else if (c === 0x9b) this.enterCsi();
-        else if (c === 0x9d || c === 0x90 || c === 0x98 || c === 0x9e || c === 0x9f) this.st = St.Str;
+        else this.c1(c);
         continue;
       }
       const c = text.charCodeAt(i);
@@ -827,15 +879,28 @@ export class HighlightStream {
         this.st = St.Ground;
         continue;
       }
+      // A C1 control inside a sequence acts as it does anywhere: ST ends a
+      // string, CSI and the string starts begin anew, any other ends it.
+      if (c >= 0x80 && c <= 0x9f) {
+        this.st = St.Ground;
+        this.c1(c);
+        continue;
+      }
       switch (this.st) {
         case St.Esc:
           if (c === 0x5b) this.enterCsi();
-          else if (c === 0x5d || c === 0x50 || c === 0x58 || c === 0x5e || c === 0x5f) this.st = St.Str;
+          else if (c === 0x5d || c === 0x50 || c === 0x58 || c === 0x5e || c === 0x5f) this.enterStr(c === 0x5d);
           else if (c >= 0x20 && c <= 0x2f) this.st = St.EscInter;
           else if (c === 0x63) {
             // ESC c: a full reset.
             this.attrs.reset();
             this.alt = false;
+            this.saved = { main: null, alt: null };
+            this.st = St.Ground;
+          } else if (c === 0x37 || c === 0x38) {
+            // ESC 7 saves the attributes, ESC 8 puts them back.
+            if (c === 0x37) this.save();
+            else this.restore();
             this.st = St.Ground;
           } else if (c >= 0x30 && c <= 0x7e) this.st = St.Ground;
           break;
@@ -854,7 +919,7 @@ export class HighlightStream {
           break;
         case St.Str:
           if (c === 0x1b) this.st = St.StrEsc;
-          else if (c === 0x07 || c === 0x9c) this.st = St.Ground;
+          else if (c === 0x07 && this.strOsc) this.st = St.Ground;
           break;
         case St.StrEsc:
           if (c === 0x5c) this.st = St.Ground;
@@ -876,14 +941,45 @@ export class HighlightStream {
     this.csi = "";
   }
 
+  private enterStr(osc: boolean) {
+    this.st = St.Str;
+    this.strOsc = osc;
+  }
+
+  /** A C1 control (`c`, 0x80–0x9f) where a sequence may start. */
+  private c1(c: number) {
+    if (c === 0x9b) this.enterCsi();
+    else if (c === 0x9d || c === 0x90 || c === 0x98 || c === 0x9e || c === 0x9f) this.enterStr(c === 0x9d);
+  }
+
+  private save() {
+    this.saved[this.alt ? "alt" : "main"] = this.attrs.copy();
+  }
+
+  private restore() {
+    const s = this.saved[this.alt ? "alt" : "main"];
+    if (s) this.attrs = s.copy();
+    else this.attrs.reset();
+  }
+
   private endCsi(final: number) {
     const p = this.csi;
     if (final === 0x6d) {
       // SGR, unless it's a private or intermediate form (`ESC [ > 4 ; 2 m`).
       if (!/[<=>?\x20-\x2f]/.test(p)) this.attrs.apply(p);
     } else if ((final === 0x68 || final === 0x6c) && p.startsWith("?")) {
-      // The alternate screen: on with `ESC [ ? 1049 h`, off with `l`.
-      if (p.slice(1).split(";").some((x) => x === "1049" || x === "1047" || x === "47")) this.alt = final === 0x68;
+      // The alternate screen: on with `ESC [ ? 1049 h`, off with `l`. 1049
+      // also saves the main screen's attributes as it goes, and puts them
+      // back as it comes back.
+      const modes = p.slice(1).split(";");
+      const on = final === 0x68;
+      if (modes.includes("1049") && on && !this.alt) this.save();
+      if (modes.some((x) => x === "1049" || x === "1047" || x === "47")) this.alt = on;
+      if (modes.includes("1049") && !on) this.restore();
+    } else if ((final === 0x73 || final === 0x75) && p === "") {
+      // CSI s and CSI u: ESC 7 and ESC 8 as other terminals have them.
+      if (final === 0x73) this.save();
+      else this.restore();
     } else if (final === 0x70 && p === "!") {
       // ESC [ ! p: a soft reset, attributes included.
       this.attrs.reset();
@@ -904,8 +1000,10 @@ function tailStart(parts: (string | Plain)[]): number {
 }
 
 /** `text` in `style`, then back to `at`'s attributes. */
-function wrap(text: string, style: HighlightStyle, at: Plain): string {
-  let on = String(colorById.get(style.color)?.sgr ?? 39);
+function wrap(text: string, style: HighlightStyle, at: Plain, grays: ReadonlySet<HighlightColor>): string {
+  const sgr = colorById.get(style.color)?.sgr;
+  // A bright color the scheme draws as a gray: its normal one (91 → 31).
+  let on = String(sgr === undefined ? 39 : grays.has(style.color) ? sgr - 60 : sgr);
   let off = "39";
   if (style.bold && !at.bold) {
     on += ";1";
