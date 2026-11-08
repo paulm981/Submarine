@@ -21,7 +21,7 @@ The fork is based on the original project's **0.4.0**, with every change up to [
 
 ### Work on many servers at once
 
-**Broadcast and the Wall are the original project's**, as it has them: turn Broadcast on, pick the sessions, and what you type in one of them goes to all of them; right-click a tab to pin its terminal to the Wall and watch terminals from many servers side by side. The fork's own Walls are gone (saved walls, pausing a server, Send to all), so this stays easy to sync. Walls saved by an older version stay in the profile, unused ([#162](https://github.com/paulm981/Submarine/issues/162)).
+**Broadcast and the Wall are the original project's**, as it has them: turn Broadcast on, pick the sessions, and what you type in one of them goes to all of them; right-click a tab to pin its terminal to the Wall and watch terminals from many servers side by side. The fork's own Walls are gone (saved walls, pausing a server, Send to all), so this stays easy to sync. Walls saved by an older version stay in the profile, unused ([#162](https://github.com/paulm981/Submarine/issues/162)). One line differs: what you type goes to every target in one call to the app's backend, not one call per server, so typing to 36 servers keeps up ([#127](https://github.com/paulm981/Submarine/issues/127)).
 
 <img src="docs/screenshots/fork/broadcast.png" alt="Broadcast turned on for three server tabs, web1, web2 and db1, each ticked in the Broadcast menu and marked with an orange dot on its tab" width="900" />
 

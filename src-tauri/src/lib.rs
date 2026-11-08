@@ -25014,7 +25014,7 @@ pub fn run() {
             about::app_info, about::check_for_updates, about::open_external_url,
             portable::get_storage_info,
             local_open::live_edit_editor_get, local_open::live_edit_editor_pick, local_open::live_edit_editor_reset, bulk_pick::bulk_pick_files, import_hosts, host_import::pick_client_import_file,
-            multiexec::get_jump_login_limit, multiexec::set_jump_login_limit, server_os::detect_server_os, approvals::keep_server_ssh, set_server_terminal_theme, set_server_highlight,
+            multiexec::get_jump_login_limit, multiexec::set_jump_login_limit, multiexec::write_terminals_data, server_os::detect_server_os, approvals::keep_server_ssh, set_server_terminal_theme, set_server_highlight,
             fonts::list_system_fonts,
             clipboard_read_text
         ]);
