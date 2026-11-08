@@ -116,7 +116,20 @@ const remoteListing = (sid, path) => {
 
 // What each terminal shows: a login, a prompt and a command.
 const prompt = (name) => `\x1b[1;32mdeploy@${name}\x1b[0m:\x1b[1;34m~\x1b[0m$ `;
-const terminalText = (name) => [
+// web2's shows the end of a log, for the highlighting picture.
+const logText = (name) => [
+  `${prompt(name)}tail -n 8 /var/log/app.log\r\n`,
+  "2026-11-07 10:41:02 INFO    api   Connected to 192.0.2.21:5432 (database primary)\r\n",
+  "2026-11-07 10:41:05 WARNING api   Slow query took 2350 ms, see https://wiki.example.com/slow-queries\r\n",
+  "2026-11-07 10:41:09 ERROR   api   Connection refused by 192.0.2.30:6379, retrying in 5s\r\n",
+  "2026-11-07 10:41:14 OK      cache reconnected\r\n",
+  "2026-11-07 10:41:20 INFO    net   eth0 is up, MAC 52:54:00:12:34:56, fe80::5054:ff:fe12:3456\r\n",
+  "2026-11-07 10:41:31 FAILED  api   Health check /api/status returned 503\r\n",
+  "2026-11-07 10:41:40 SUCCESS ci    Deploy 2.4.1 finished\r\n",
+  "2026-11-07 10:41:52 CRITICAL db1  Disk /var is 97% full\r\n",
+  prompt(name),
+].join("");
+const terminalText = (name) => name === "web2" ? logText(name) : [
   "Welcome to Ubuntu 24.04.1 LTS (GNU/Linux 6.8.0-45-generic x86_64)\r\n\r\n",
   "Last login: Sat Nov  7 09:12:44 2026 from 198.51.100.7\r\n",
   `${prompt(name)}uptime\r\n 10:42:17 up 23 days,  4:11,  1 user,  load average: 0.21, 0.18, 0.12\r\n`,
@@ -151,8 +164,30 @@ mockIPC((cmd, args = {}) => {
     case "get_commands": return [];
     case "get_notes": return [];
     case "highlight_rules_list": return [];
+    case "list_system_fonts": return [];
     case "list_local_shells":
-      return { shells: [], notes: [], default_id: "", custom: null, custom_missing: false, ai_tools: [{ id: "claude", label: "Claude Code", group: "AI tools", detail: null }] };
+      return {
+        shells: [
+          { id: "login", label: "bash", group: "", detail: "your login shell" },
+          { id: "zsh", label: "zsh", group: "", detail: "/usr/bin/zsh" },
+          { id: "sh", label: "sh", group: "", detail: "/bin/sh" },
+          { id: "tmux", label: "tmux", group: "", detail: "/usr/bin/tmux" },
+        ],
+        notes: [], default_id: "login", custom: null, custom_missing: false,
+        ai_tools: [{ id: "claude", label: "Claude Code", group: "AI tools", detail: null }, { id: "codex", label: "Codex", group: "AI tools", detail: null }],
+      };
+
+    // The profile syncs through a git repository of the user's own.
+    case "store_status": return { kind: "git", location: "git@git.example.com:team/submarine-profiles.git", branch: "submarine-sync" };
+    case "sync_now": return { pushed: 0, pulled: 0 };
+    case "profile_share_status":
+      return { profile: "demo", share_id: null, role: null, identity_unlocked: false, signed_in: false, email: null, cloud_server: null, current_server: "", custom_server: false, cloud_deleted: false };
+    case "profile_sync_stats":
+      return {
+        total_records: 42, vault_bytes: 81920, recent_edits: [], unreadable: 0,
+        diff: { in_sync: 42, needs_push: 0, needs_pull: 0, out_of_sync_nodes: [] },
+        devices: [{ name: "laptop", written: now - 4 * 3600_000, this_one: true }, { name: "desktop", written: now - 3 * 86400_000, this_one: false }],
+      };
 
     // A server tab connects at once, and its terminal shows a prompt.
     case "initiate_connection":
@@ -165,6 +200,10 @@ mockIPC((cmd, args = {}) => {
       return null;
     }
     case "sftp_list_dir": return remoteListing(args.sessionId, args.path);
+    // A shell on this computer, in Home.
+    case "local_terminal_open":
+      later(() => args.onOutput?.onmessage?.(new TextEncoder().encode("\x1b[1;32mme@laptop\x1b[0m:\x1b[1;34m~\x1b[0m$ ").buffer), 150);
+      return "bash";
     // A shell echoes what's typed, as a real one does.
     case "write_terminal_data": {
       window.__writes = (window.__writes ?? 0) + 1;

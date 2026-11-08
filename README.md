@@ -22,7 +22,7 @@
 <table>
   <tr>
     <td width="50%" valign="top" align="center">
-      <a href="FORK.md#a-better-terminal"><img src="docs/screenshots/fork/home-shells.png" alt="The Home view's shell menu: the login shell marked as default, and the other installed shells" /></a>
+      <a href="FORK.md#a-better-terminal"><img src="docs/screenshots/fork/home-shells.png" alt="The Home view's shell menu: the login shell marked as default, the other installed shells, and the AI tools, Claude Code and Codex" /></a>
       <br/><sub><b>Home</b>: terminals on this computer, beside your servers</sub>
     </td>
     <td width="50%" valign="top" align="center">
