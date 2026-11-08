@@ -16,6 +16,7 @@ import { IS_WINDOWS } from '../../util/platform';
 import type { TerminalFork, TerminalProps } from './hooks';
 import { CHAR_BUDGET, COUNTED_FINALS, LINE_BUDGET, LINE_FINALS, ROOT_CANCELLED, SHELL_QUIET_MS } from './rules';
 import { shareWidths } from './widthCache';
+import { forgetFolder, trackFolder } from './fileMenu';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The fork's part of a terminal's xterm, from TerminalView's mount effect
@@ -256,6 +257,8 @@ export const mountTerminal = (
      *  the DOM renderer's character widths shared with every terminal's. */
     startGpu: () => {
       shareWidths(term);
+      // The folder its shell reports, for right-click on a file name (#40).
+      trackFolder(term, terminalId);
       fork.gpuUpdateRef.current = updateGpu;
       updateGpu();
     },
@@ -408,6 +411,9 @@ export const mountTerminal = (
       // keeps xtermRef after xterm has gone: one that opened and closed in
       // between (a Wall left while its tiles still open, #127) would throw.
       term.scrollToBottom = () => {};
+      // A Wall tile shares its terminal's id: only the terminal's own end
+      // forgets its folder.
+      if (!attachOnly) forgetFolder(terminalId);
     },
     /** After xterm has gone: the div it drew into, and terminalRef back to
      *  TerminalView's own. */

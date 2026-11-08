@@ -1309,6 +1309,7 @@ const TerminalView = ({
     // so the user gets the terminal-style behavior they asked for.
     const onContextMenu = (ev: MouseEvent) => {
       ev.preventDefault();
+      if (Fork.fileMenuAt(ev, term, fork, () => void pasteClipboard(true))) return;
       void pasteClipboard(true);
     };
     // Ctrl+Shift+A / Ctrl+Shift+C / Ctrl+Shift+V — Warp/GNOME-Terminal-style

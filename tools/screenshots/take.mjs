@@ -179,6 +179,23 @@ Object.assign(shots, {
     await save(page, "troubleshooting", await spanning(heading, cardOf(page.getByRole("button", { name: /Copy diagnostics/i })), 12));
   },
 
+  // Right-click on a file name in a terminal: Paste, Copy path, Edit locally.
+  async "terminal-file-menu"() {
+    const page = await open();
+    await page.getByRole("button", { name: "web2" }).first().click();
+    const word = page.locator(".xterm-rows").getByText("/var/log/app.log").first();
+    await word.waitFor();
+    const b = await word.boundingBox();
+    // The middle of the path, not the middle of the line it's in.
+    const line = await word.textContent();
+    const at = line.indexOf("/var/log/app.log") + 8;
+    await page.mouse.click(b.x + (b.width * at) / line.length, b.y + b.height / 2, { button: "right" });
+    const menu = page.locator("[data-file-menu]");
+    await menu.waitFor();
+    const rows = await word.locator("xpath=ancestor::div[contains(@class, 'xterm-rows')][1]").boundingBox();
+    await save(page, "terminal-file-menu", { x: Math.max(0, rows.x - 12), y: Math.max(0, b.y - 16), width: 760, height: 260 });
+  },
+
   // The AI asking for a server by name, on its card in the AI panel.
   async "ai-server-ask"() {
     const page = await open({ "mock-server-ask": "1" });

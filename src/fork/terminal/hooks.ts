@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { MutableRefObject } from 'react';
 import type { Terminal } from '@xterm/xterm';
 import { Channel } from '@tauri-apps/api/core';
@@ -6,6 +6,7 @@ import type { HighlightStream } from '../../ui/highlight';
 import { useRootInvoke } from '../../ui/rootInvoke';
 import { setLooking } from '../../ui/terminalActivity';
 import { LOCAL_COMMANDS, SHELL_FIRST_OUTPUT_MS, SHELL_READY_CAP_MS, SSH_COMMANDS } from './rules';
+import { markContainer } from './fileMenu';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The fork's state in a terminal, as one hook TerminalView calls in one line
@@ -92,7 +93,12 @@ export const useTerminal = ({
   };
 
   // A container's terminal may need root (open_container_terminal).
-  const rootInvoke = useRootInvoke();
+  const invokeAsRoot = useRootInvoke();
+  // A container's shell opening here (#40): its paths aren't the server's.
+  const rootInvoke = useCallback((cmd: string, args: Record<string, unknown>, what: string) => {
+    if (cmd === "open_container_terminal") markContainer(terminalId);
+    return invokeAsRoot(cmd, args, what);
+  }, [invokeAsRoot, terminalId]) as typeof invokeAsRoot;
 
   // What the AI side pane moves beside a server tab (terminalDock): the div
   // xterm draws into, and over it this terminal's search box, Saved password

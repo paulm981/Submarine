@@ -211,6 +211,10 @@ Two more things wait for you:
   </tr>
 </table>
 
+**Right-click a file name in a terminal** ([#40](https://github.com/paulm981/Submarine/issues/40)): on a name that looks like a path (`/etc/nginx/nginx.conf`, `app.log`, `src/main.rs:12`), a menu offers **Paste** first, then **Copy path** and **Edit locally**, which opens it in your editor with Live Edit and saves it back. A relative name is found from the folder your shell reports (the same report SFTP's Follow uses); without one, only a full path can be edited. Anywhere else, or with text selected, right-click pastes as before. Not in a Home terminal or a container's, and it edits as your login, not as root after `sudo -i`. **Show in SFTP** is still to come.
+
+<img src="docs/screenshots/fork/terminal-file-menu.png" width="560" alt="A terminal on web2 with a right-click menu on /var/log/app.log: Paste, Copy path, Edit locally" />
+
 <img src="docs/screenshots/fork/home-shells.png" alt="The Home view's shell menu: the login shell marked as default, the other installed shells, and the AI tools, Claude Code and Codex" width="600" />
 
 **A Home view** of terminals on your own computer:
