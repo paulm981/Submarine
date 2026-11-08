@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.53
+
+- **A new AI level: Run commands that only read, ask before changes.** The AI can look around a server without asking: `ps aux | grep nginx`, `df -h`, `journalctl -u nginx`, `systemctl status`, `docker logs`. Anything that changes things still asks, and so do root, copies, anything that reaches out (`curl`, `ping`) and reading files that usually hold secrets, such as `.env` or `.ssh`. Submarine decides from a list of programs it knows only read, never the AI. **Run anything** stays as it is, for lab servers. ([#190](https://github.com/paulm981/Submarine/issues/190))
+
 ## v0.4.0-fork.49
 
 - **The AI tools' connection speaks the newest version of MCP, the protocol AI tools use (2026-07-28), and still the older ones.** Nothing changes in how you use it: AI tools built for the new version connect without the old opening exchange, and get the same tools and guidance. ([#177](https://github.com/paulm981/Submarine/issues/177))
