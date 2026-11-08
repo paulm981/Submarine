@@ -28,6 +28,8 @@ on:
     paths-ignore:
       - "**/*.md"
       - "LICENSE"
+      - "docs/**"
+      - "tools/screenshots/**"
       - ".github/workflows/check.yml"
   workflow_dispatch:
     inputs:

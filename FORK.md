@@ -17,14 +17,20 @@ The fork is based on the original project's **0.4.0**, with every change up to [
 
 **Settings in categories.** Settings has tabs across the top: General, Terminal, Servers & sessions, AI tools, Sync and Help. It opens on the one you used last. Each setting says what it does in one line, with the longer explanation behind **Learn more**. **Settings › Terminal** below means that tab ([#168](https://github.com/paulm981/Submarine/issues/168)).
 
+<img src="docs/screenshots/fork/settings-tabs.png" alt="Settings with its tabs across the top, open on AI tools: AI tools turned on, Claude Code installed, and two folders the AI may copy into" width="700" />
+
 ### Work on many servers at once
 
 **Broadcast and the Wall are the original project's**, as it has them: turn Broadcast on, pick the sessions, and what you type in one of them goes to all of them; right-click a tab to pin its terminal to the Wall and watch terminals from many servers side by side. The fork's own Walls are gone (saved walls, pausing a server, Send to all), so this stays easy to sync. Walls saved by an older version stay in the profile, unused ([#162](https://github.com/paulm981/Submarine/issues/162)).
+
+<img src="docs/screenshots/fork/broadcast.png" alt="Broadcast turned on for three server tabs, web1, web2 and db1, each ticked in the Broadcast menu and marked with an orange dot on its tab" width="900" />
 
 - **Jump hosts at scale.** A hundred servers behind one jump host log in a few at a time, in terminals and in Monitoring; the number is a setting. Monitoring reaches servers through their jump host too, by the same `~/.ssh/config` name as the terminal.
 - **Split.** A second shell on the same server opens beside the first, so you can watch a log in one and work in the other.
 - **Push and pull files on many servers.** Right-click a tab, or servers in the session tree, and pick **Push files to servers…** or **Pull files from servers…**. Tick the servers; with Broadcast on, its targets come ticked. A push sends files (pick several at once) or a whole folder from this computer into the same folder on each server. A pull fetches a file or folder from each server into a folder of its own here, named after the server. Before anything moves, a summary says how much goes where and what's already there: skip those (the default) or replace them, once for the whole run. Four servers copy at a time, each with its own row; one that fails doesn't stop the others, and **Stop** stops them all. It uses the SFTP pane's own transfers and their checks ([#159](https://github.com/paulm981/Submarine/issues/159)).
 - **Many tabs.** **Ctrl+Shift+K** opens All tabs with its search ready: type part of a name and press Enter. **Ctrl+Tab** and **Ctrl+Shift+Tab** move between tabs. A tab's right-click menu closes the other tabs, the ones to its right, the disconnected ones, or all of them.
+
+<img src="docs/screenshots/fork/bulk-push.png" alt="Push files to servers at its summary: 3 files, 18 MB, going to 2 servers into ~/releases; db1 left out because the folder isn't there; 3 files already there, with Skip those or Replace them" width="600" />
 
 ### Organize them
 
@@ -64,6 +70,19 @@ The details, and where this differs from the original project, are in the [table
 ### AI help, without sharing keys
 
 A first test, off by default. To try it, install Claude Code or Codex, turn on **Settings › AI tools**, then start it from Home's menu (the arrow beside **+**, then **AI tools**).
+
+<table>
+  <tr>
+    <td width="50%" valign="top" align="center">
+      <img src="docs/screenshots/fork/ai-card-group.png" alt="The AI panel beside a server tab: one request to run systemctl status nginx on web1, web2 and db1 with Allow on 3 servers, a request to copy a log from web2 to this computer, and a log being followed on db1 with Stop" />
+      <br/><sub><b>The AI panel</b>: one card for a command on three servers, a copy, and a log being followed</sub>
+    </td>
+    <td width="50%" valign="top" align="center">
+      <img src="docs/screenshots/fork/ai-levels.png" alt="AI approval for the server web1: the three levels, Ask every time, Run my allowed commands, ask for the rest (chosen), and Run anything, just log it with its warning, then the always-allow and always-ask lists" />
+      <br/><sub><b>How much the AI may run without asking</b>, per server, folder or every server</sub>
+    </td>
+  </tr>
+</table>
 
 - **Claude Code or Codex from Home's menu** opens already connected to Submarine through a local channel only your account can use. Nothing listens on the network. Each AI tool is an entry in a list, given Submarine's MCP server the way that tool takes one, so adding another is little code ([#117](https://github.com/paulm981/Submarine/issues/117)).
 - **Share with AI** on a server's tab lets that AI tab ask to run commands there. Unless you've said otherwise (below), each one waits in the **AI panel** (the title bar's AI button) until you click Allow or Deny; typing can't approve anything. Its card says which server it runs on and as whom ("on **web-01** as **root**"). A tab logged in as root, or a command with sudo, dzdo, su, doas or pkexec, is marked as root. Where those need no password, nothing asks first, and Submarine can't always tell. **Deny with a note** tells the AI why, so it can try another way. When a command waits for you and Submarine isn't in front, its taskbar button flashes (you can turn that off).
@@ -194,6 +213,19 @@ Also:
 - **Fast output never freezes the window.** Output is paced by what the screen has drawn, and floods of escape sequences that would lock it up are ignored.
 - **The app's own dark right-click menus** everywhere. No right-click or F5 reloads the app.
 - **Sessions that survive a reconnect** ([#126](https://github.com/paulm981/Submarine/issues/126)). Turn on **Keep sessions between connections** in Settings › Servers & sessions (off until you do), or for one server in its settings (Use the default, Always, Never), and new terminals run in tmux on the server, or in screen where there's no tmux. Nothing ever asks: a dropped connection, sleep or a closed tab leaves the session running, and connecting again takes you back to the same shell, with what was running still running. Type `exit` to end one. A kept terminal's tab has a small mark. **Sessions…** in a server's right-click menu lists them, to open one or end it. On-connect commands go only into a new session. It's this computer's choice and never synced, nothing is installed on a server, and a server with neither gets a plain shell and a one-line note. The work is in `keep_session.rs` and `KeptSessions.tsx`.
+
+<table>
+  <tr>
+    <td width="50%" valign="top" align="center">
+      <img src="docs/screenshots/fork/keep-sessions-setting.png" alt="Settings, Servers and sessions tab: Keep sessions between connections turned on" />
+      <br/><sub><b>Keep sessions between connections</b>, in Settings › Servers & sessions</sub>
+    </td>
+    <td width="50%" valign="top" align="center">
+      <img src="docs/screenshots/fork/kept-sessions.png" alt="Sessions on web1: two kept sessions in tmux, one open now and one waiting, each with Open and End" />
+      <br/><sub><b>Sessions…</b> in the session tree lists a server's kept sessions</sub>
+    </td>
+  </tr>
+</table>
 
 ### Your data, your storage
 
