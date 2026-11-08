@@ -46,6 +46,7 @@
 //!   shared with the server tab's own root access, either way. It's never in
 //!   the output, the AI's answer, the audit log, the app log or an error.
 
+mod ask_server;
 mod audit;
 mod boundary;
 mod channel;
@@ -649,6 +650,8 @@ pub(crate) struct Snapshot {
     enabled: bool,
     tabs: Vec<TabView>,
     pending: Vec<PendingView>,
+    /// The AI's requests for a server by name, waiting for you (ask_server).
+    server_asks: Vec<ask_server::AskView>,
     running: Vec<RunningView>,
     history: Vec<DoneView>,
     audit_log: Option<String>,
@@ -659,6 +662,8 @@ struct Shared {
     enabled: bool,
     tabs: Vec<Tab>,
     pending: Vec<Pending>,
+    /// Requests for a server by name, waiting for you (ask_server).
+    server_asks: Vec<ask_server::Ask>,
     running: Vec<Running>,
     history: VecDeque<Done>,
     next_id: u64,
@@ -692,6 +697,9 @@ struct Inner {
     /// Runs a follow (#179): the app's SSH connections, or a test's. None:
     /// following isn't available.
     follower: Mutex<Option<follow::Follower>>,
+    /// Finds a saved server by name for `request_server`: the vault, or a
+    /// test's list. None: no server is found.
+    server_lookup: Mutex<Option<ask_server::Lookup>>,
 }
 
 #[derive(Clone)]
@@ -844,6 +852,7 @@ impl AiState {
             pull_folders: Mutex::new(Vec::new()),
             copier: Mutex::new(None),
             follower: Mutex::new(None),
+            server_lookup: Mutex::new(None),
         }))
     }
 
@@ -888,6 +897,14 @@ impl AiState {
             let guard = db.conn.lock().unwrap_or_else(|e| e.into_inner());
             guard.as_ref().map(|conn| trust::policy_for(conn, server_id)).unwrap_or_else(trust::Policy::unreadable)
         });
+        // A saved server by its name, for request_server: none without a
+        // profile open.
+        let names_app = app.clone();
+        let server_lookup: ask_server::Lookup = Arc::new(move |name| {
+            let db = names_app.state::<crate::DbState>();
+            let guard = db.conn.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().map(|conn| ask_server::find(conn, name)).unwrap_or(ask_server::Found::None)
+        });
         let attention_app = app.clone();
         let attention = Box::new(move || {
             #[cfg(not(target_os = "android"))]
@@ -906,6 +923,7 @@ impl AiState {
         let state = AiState::with(exec, root_exec, changed, app.path().app_log_dir().ok(), policy, attention);
         let settings: Settings = crate::local_open::read_setting(app, SETTINGS_FILE).unwrap_or_default();
         state.0.flash.store(settings.flash, Ordering::Relaxed);
+        state.set_server_lookup(server_lookup);
         state.set_pull_folders(copy::kept_folders(&settings.pull_folders));
         state.set_copier(copy::app_copier(app.clone()));
         state.set_follower(follow::app_follower(app.clone()));
@@ -1218,8 +1236,10 @@ impl AiState {
     /// (waiting, or running with its stop signal) and none slips between.
     fn cancel_where(&self, which: impl Fn(&str, &str) -> bool) {
         let mut s = self.lock();
-        // Dropping a request's sender is what cancels it.
+        // Dropping a request's sender is what cancels it. A request for a
+        // server has no server tab yet: it goes with its AI tab.
         s.pending.retain(|p| !which(&p.view.tab_id, &p.view.session_id));
+        s.server_asks.retain(|a| !which(&a.view.tab_id, ""));
         s.running.retain(|r| {
             let stop = which(&r.tab_id, &r.session_id);
             if stop {
@@ -1606,6 +1626,7 @@ impl AiState {
                 })
                 .collect(),
             running: s.running.iter().map(follow::running_view).collect(),
+            server_asks: s.server_asks.iter().map(|a| a.view.clone()).collect(),
             history: s.history.iter().rev().map(|d| d.view.clone()).collect(),
             audit_log: self.0.audit.path().map(|p| p.to_string_lossy().into_owned()),
         }
@@ -1700,6 +1721,7 @@ impl AiState {
                 self.run_on_servers(tab_id, servers, all, command, timeout, cancel).await
             }
             "copy_files" => self.copy_files(tab_id, args, cancel).await,
+            "request_server" => self.request_server(tab_id, args, cancel).await,
             "follow" | "read_follow" | "stop_follow" => self.follow_tool(tab_id, name, args, cancel).await,
             _ => ToolResult::err(format!("Submarine has no tool called {name}.")),
         }
@@ -2649,6 +2671,13 @@ pub async fn ai_share(state: tauri::State<'_, AiState>, ssh: tauri::State<'_, cr
 pub async fn ai_unshare(state: tauri::State<'_, AiState>, session_id: String, tab_id: Option<String>) -> Result<(), String> {
     state.unshare(&session_id, tab_id.as_deref(), "stopped sharing");
     Ok(())
+}
+
+/// Your answer on the AI's request for a server by name (ask_server): share
+/// it, once the page has opened its tab and it's connected, or not.
+#[tauri::command]
+pub async fn ai_answer_server_ask(state: tauri::State<'_, AiState>, ssh: tauri::State<'_, crate::ssh_manager::SshState>, id: u64, share: bool) -> Result<(), String> {
+    ask_server::answer(&state, &ssh, id, share).await
 }
 
 /// The panel's Stop for an AI tab.
