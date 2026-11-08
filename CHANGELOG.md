@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.57
+
+- **Open terminal here.** Right-click a folder in SFTP to open a terminal in it: on the server, a new terminal that goes to that folder; on your computer, a Home terminal that starts there. ([#72](https://github.com/paulm981/Submarine/issues/72))
+
 ## v0.4.0-fork.56
 
 - **The AI can ask for a server by name.** Say "check staging-api" while it isn't shared, and a card asks you **Share it?**: Share opens its tab and shares it once it's connected, under its own approval level. The AI never gets a list of your servers, and can't tell a name you don't have from one you said no to. ([#196](https://github.com/paulm981/Submarine/issues/196))
