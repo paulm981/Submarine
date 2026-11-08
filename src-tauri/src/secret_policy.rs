@@ -123,6 +123,10 @@ pub fn saving_reaches_others(conn: &Connection) -> bool {
     crate::approvals::profile_is_shared(conn)
 }
 
+/// E3: what vnc_open (lib.rs) logs for a VNC server with a saved login chosen,
+/// whose password it never uses.
+pub(crate) const VNC_NO_SAVED_LOGIN: &str = "A VNC server doesn't use saved logins: VNC sends its password with weak protection and doesn't check the server's identity. Type the VNC password when asked, or save it on the server.";
+
 /// `save_prompted_password`'s database step (lib.rs), once the profile is
 /// known to be the one the login started in: these checks (may_save_now),
 /// then the save itself (lib.rs, store_prompted_password).
@@ -355,6 +359,7 @@ mod tests {
         let lib = include_str!("lib.rs");
         for (hook, times, place) in [
             ("SaveTarget::for_vnc_server(", 1, "vnc_open's save target (E3)"),
+            ("secret_policy::VNC_NO_SAVED_LOGIN", 1, "vnc_open's log (E3)"),
             ("secret_policy::saving_reaches_others(", 1, "SaveTarget::for_server (E4)"),
             ("secret_policy::SHARED_PROFILE_NOTE", 1, "SaveTarget::offer (E4)"),
             ("secret_policy::save_fingerprint(", 1, "SaveTarget::for_server"),

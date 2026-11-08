@@ -17549,12 +17549,7 @@ async fn vnc_open(
         };
         let target = telnet::address(&host, port);
         log(&format!("Opening the VNC server {target} in this tab..."), "info");
-        if uses_saved_login {
-            log(
-                "A VNC server doesn't use saved logins: VNC sends its password with weak protection and doesn't check the server's identity. Type the VNC password when asked, or save it on the server.",
-                "warning",
-            );
-        }
+        if uses_saved_login { log(secret_policy::VNC_NO_SAVED_LOGIN, "warning"); }
         if let Some(chosen) = options.describe() {
             log(&chosen, "info");
         }
@@ -24945,8 +24940,7 @@ pub fn run() {
             cloud::get_cloud_enabled, cloud::set_cloud_enabled,
             cloud_config::cloud_get_config, cloud_config::cloud_set_config, cloud_config::cloud_test_connection,
             sync_now, move_profile_to_current_server,
-            store_sync::store_status, store_sync::store_setup, store_sync::store_disconnect,
-            store_sync::store_find_profiles, store_sync::store_restore_profile,
+            store_sync::store_status, store_sync::store_setup, store_sync::store_disconnect, store_sync::store_find_profiles, store_sync::store_restore_profile,
             identity_status, setup_identity, reset_identity,
             share_current_profile, invite_to_share, list_shares, share_member_list,
             accept_share, import_shared_profile, restore_personal_profile, share_set_role, share_revoke, share_leave, share_delete,
@@ -24971,10 +24965,8 @@ pub fn run() {
             list_tunnel_rules, remove_tunnel_rule, rename_tunnel_rule,
             open_terminal, local_shell, write_terminal_data, type_saved_password, terminal_drawn, resize_terminal, close_terminal,
             keep_session::keep_session_tab, keep_session::keep_session_open, keep_session::keep_session_state, keep_session::keep_session_list, keep_session::keep_session_end,
-            local_term::list_local_shells, local_term::local_shell_set_default,
-            local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
-            local_term::local_terminal_open, local_term::local_terminal_write, local_term::local_windows_build,
-            local_term::local_terminal_resize, local_term::local_terminal_close,
+            local_term::list_local_shells, local_term::local_shell_set_default, local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
+            local_term::local_terminal_open, local_term::local_terminal_write, local_term::local_windows_build, local_term::local_terminal_resize, local_term::local_terminal_close,
             ping::ping_server, jump_gone::jump_host_connect_directly, diagnose_connect, ssh_firewall_as_root,
             ai::ai_settings, ai::ai_set_enabled, ai::ai_state, ai::ai_share, ai::ai_unshare, ai::ai_stop, ai::ai_decide, ai::ai_output,
             ai::ai_set_flash, ai::ai_allow_session, ai::ai_decide_group, ai::ai_allow_session_group, ai::ai_allow_always, ai::ai_trust_view, ai::ai_trust_scope,
@@ -25016,10 +25008,8 @@ pub fn run() {
             monitor_get_settings, monitor_set_settings,
             about::app_info, about::check_for_updates, about::open_external_url,
             portable::get_storage_info,
-            local_open::live_edit_editor_get, local_open::live_edit_editor_pick, local_open::live_edit_editor_reset,
-            bulk_pick::bulk_pick_files, import_hosts, host_import::pick_client_import_file,
-            multiexec::get_jump_login_limit, multiexec::set_jump_login_limit,
-            server_os::detect_server_os, approvals::keep_server_ssh, set_server_terminal_theme, set_server_highlight,
+            local_open::live_edit_editor_get, local_open::live_edit_editor_pick, local_open::live_edit_editor_reset, bulk_pick::bulk_pick_files, import_hosts, host_import::pick_client_import_file,
+            multiexec::get_jump_login_limit, multiexec::set_jump_login_limit, server_os::detect_server_os, approvals::keep_server_ssh, set_server_terminal_theme, set_server_highlight,
             fonts::list_system_fonts,
             clipboard_read_text
         ]);
