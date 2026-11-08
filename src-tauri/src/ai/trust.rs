@@ -1116,6 +1116,9 @@ pub(crate) struct Policy {
     /// policy couldn't be read, or a change to it waits for your OK. Why,
     /// in words for the request's card.
     pub force_ask: Option<String>,
+    /// The OS the server reported (server_os.rs: an ID such as `ubuntu` or
+    /// `windows`), for list_shared; None when it isn't known.
+    pub os: Option<String>,
 }
 
 /// What the card says when the settings can't be read.
@@ -1131,7 +1134,7 @@ impl Policy {
 impl Default for Policy {
     /// Ask every time: what holds when nothing can be read.
     fn default() -> Self {
-        Policy { level: ASK_EVERY_TIME, allow: Vec::new(), ask: Vec::new(), windows: false, force_ask: None }
+        Policy { level: ASK_EVERY_TIME, allow: Vec::new(), ask: Vec::new(), windows: false, force_ask: None, os: None }
     }
 }
 
@@ -1174,13 +1177,16 @@ fn try_policy(conn: &Connection, server_id: Option<i64>) -> rusqlite::Result<Pol
     }
     p.level = level.filter(|l| Level::stored(*l).is_some()).unwrap_or(ASK_EVERY_TIME);
     // Read leniently: a vault without the column has no OS saved.
-    p.windows = server_id.is_some_and(|id| {
-        conn.query_row("SELECT os FROM servers WHERE id = ?1", [id], |r| r.get::<_, Option<String>>(0))
-            .ok()
-            .flatten()
-            .is_some_and(|os| os == "windows")
-    });
+    let os = server_id.and_then(|id| conn.query_row("SELECT os FROM servers WHERE id = ?1", [id], |r| r.get::<_, Option<String>>(0)).ok().flatten());
+    p.windows = os.as_deref() == Some("windows");
+    p.os = os.filter(|os| is_os_id(os));
     Ok(p)
+}
+
+/// An OS ID as server_os.rs keeps one: lower-case letters, digits, `.`, `_`
+/// and `-`, at most 32 of them. Anything else isn't passed on to the AI.
+pub(crate) fn is_os_id(os: &str) -> bool {
+    !os.is_empty() && os.len() <= 32 && os.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c))
 }
 
 /// What holds for `server_id`. Anything that can't be read asks every time,

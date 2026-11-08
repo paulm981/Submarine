@@ -64,7 +64,8 @@ pub(crate) fn tools() -> Value {
         {
             "name": "list_shared",
             "description": "What you can use in Submarine, as compact JSON. servers: each server the user shared with you (only these \
-work with run_command, run_on_servers and copy_files), with requests saying what happens to your requests there: \"asks the user \
+work with run_command, run_on_servers and copy_files), with os (the OS ID it reported, such as ubuntu, rocky, alpine, freebsd or \
+windows, when known: write commands for it) and requests saying what happens to your requests there: \"asks the user \
 each time\", \"runs the user's allowed commands, asks for the rest\", \"runs commands that only read and the user's allowed \
 commands, asks for the rest\" or \"runs anything\". Whatever it says, some commands, and root, may still ask. Where commands that \
 only read run, Submarine decides by a list: one program such as cat, grep, ls, ps, df, du, journalctl, systemctl status or docker ps, \

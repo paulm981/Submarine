@@ -35,6 +35,7 @@ Every line the fork changes inside one of the original project's files can confl
   - replacing one of the original project's features;
   - a change in how the app behaves that the owner would notice (e.g. what "Run anything" allows);
   - anything that can't be undone.
+- **Pictures and words follow the app.** A pull request that changes what someone sees retakes its screenshots in the same pull request (`node tools/screenshots/take.mjs <name>`, which every picture in `docs/screenshots/fork/` comes from) and updates README and FORK.md, alt text included. Look at each retaken picture before it goes up.
 - **Merge when green.** Once every check passes on the current head, merge; don't wait for the owner. Say plainly in each pull request what wasn't tried in the running app, and keep a short checklist for the owner to try.
 - **No custom Remote Desktop.** RDP is the original project's code. The only fork addition worth having there would be jump-host support, and that needs its own issue first.
 - **Security first, honestly.** The AI never gets keys or passwords, and the approval card is the real guard. Never claim prompt injection is solved: a model can be talked round by text it reads, so protections that matter are enforced by Submarine, not left to the model.

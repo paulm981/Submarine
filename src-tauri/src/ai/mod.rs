@@ -55,6 +55,8 @@ mod copy;
 mod exec;
 mod filter;
 mod follow;
+#[cfg(test)]
+mod fuzz_tests;
 pub mod helper;
 mod mcp;
 mod read_only;
@@ -269,6 +271,9 @@ struct Listed<'a> {
 #[derive(Serialize)]
 struct ListedServer<'a> {
     name: &'a str,
+    /// The OS it reported (trust::Policy's `os`), when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    os: Option<String>,
     /// trust::Requests::phrase.
     requests: &'static str,
 }
@@ -1721,7 +1726,7 @@ impl AiState {
         // Each saved server's settings read once, as early_decision reads
         // them: off the async workers, as the vault has a lock of its own.
         // Should that fail, every server asks.
-        let requests: Vec<trust::Requests> = {
+        let requests: Vec<(trust::Requests, Option<String>)> = {
             let lookup = self.0.policy.clone();
             let each: Vec<(Option<i64>, bool)> = shared.iter().map(|(_, id, all)| (*id, *all)).collect();
             let n = each.len();
@@ -1736,14 +1741,14 @@ impl AiState {
                                 read.len() - 1
                             }
                         };
-                        trust::Requests::of(&read[at].1, allow_all)
+                        (trust::Requests::of(&read[at].1, allow_all), read[at].1.os.clone().filter(|os| trust::is_os_id(os)))
                     })
                     .collect()
             })
             .await
-            .unwrap_or_else(|_| vec![trust::Requests::AskEachTime; n])
+            .unwrap_or_else(|_| vec![(trust::Requests::AskEachTime, None); n])
         };
-        let servers = shared.iter().zip(requests).map(|((name, _, _), r)| ListedServer { name, requests: r.phrase() }).collect();
+        let servers = shared.iter().zip(requests).map(|((name, _, _), (r, os))| ListedServer { name, os, requests: r.phrase() }).collect();
         let copy_into = self.pull_folders().iter().map(|p| p.to_string_lossy().into_owned()).collect();
         let listed = Listed {
             servers,

@@ -42,11 +42,11 @@
   </tr>
   <tr>
     <td width="50%" valign="top" align="center">
-      <a href="FORK.md#ai-help-without-sharing-keys"><img src="docs/screenshots/fork/ai-card-group.png" alt="The AI panel: one request to run a command on web1, web2 and db1 with Allow on 3 servers, a file copy request, and a log being followed with Stop" /></a>
+      <a href="FORK.md#ai-help-without-sharing-keys"><img src="docs/screenshots/fork/ai-card-group.png" alt="The AI panel: one request to run a command on web1, web2 and db1 with Allow on 3 servers and Try on web1 first, a file copy request, and a log being followed with Stop" /></a>
       <br/><sub><b>AI tools</b>: every command waits for your Allow, one card for many servers</sub>
     </td>
     <td width="50%" valign="top" align="center">
-      <a href="FORK.md#ai-help-without-sharing-keys"><img src="docs/screenshots/fork/ai-levels.png" alt="A server's AI approval levels: Ask every time, Run my allowed commands, ask for the rest, and Run anything, just log it with its warning" /></a>
+      <a href="FORK.md#ai-help-without-sharing-keys"><img src="docs/screenshots/fork/ai-levels.png" alt="A server's AI approval levels: Ask every time, Run my allowed commands, ask for the rest, Run commands that only read, ask before changes, and Run anything, just log it with its warning" /></a>
       <br/><sub><b>How much the AI may run without asking</b>, per server</sub>
     </td>
   </tr>
@@ -66,7 +66,7 @@
 - **Claude Code or Codex from Home's menu.** Install one, turn on **Settings › AI tools**, then start it from Home's menu (the arrow beside **+**, then **AI tools**). It opens already connected to Submarine, through a local channel only your account can use.
 - **Share with AI** on a server's tab, and the AI can ask to run commands there. Each request waits in the **AI panel** until you click Allow or Deny, on a card that says which server it runs on and as whom. **Ctrl+Shift+L** shows the AI beside the tab.
 - **How much it may run without asking is up to you, per server or folder:** **Ask every time** (the default), **Run my allowed commands, ask for the rest**, **Run commands that only read, ask before changes**, or **Run anything, just log it** for lab servers. An always-ask list (`reboot`, `rm -rf *` and more) asks at every level. Your levels and rules stay on this computer and never sync.
-- **One card for many servers.** The same command on 12 shared servers is one request: **Allow on 12 servers**.
+- **One card for many servers.** The same command on 12 shared servers is one request: **Allow on 12 servers**, or **Try on web1 first** and see its result before the rest.
 - **Root through Submarine.** The AI asks Submarine for root instead of typing sudo. Submarine runs the command through sudo or dzdo, and where a password is needed, you type it into Submarine. The AI never sees it.
 - **Copying files.** The AI can push files to shared servers, or pull them from each, as one request on one card. Files come to this computer only into folders you add under **Settings › AI tools**, and never replace what's there.
 - **Following a log.** It can follow a command such as `journalctl -u nginx -f` and read what's new every few seconds. The AI panel shows each follow, with **Stop**.
