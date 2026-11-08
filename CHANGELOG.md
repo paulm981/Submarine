@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.49
+
+- **The AI tools' connection speaks the newest version of MCP, the protocol AI tools use (2026-07-28), and still the older ones.** Nothing changes in how you use it: AI tools built for the new version connect without the old opening exchange, and get the same tools and guidance. ([#177](https://github.com/paulm981/Submarine/issues/177))
+
 ## v0.4.0-fork.48
 
 - **The AI can follow a log while it works.** It asks once to follow a command such as `journalctl -u nginx -f`, on the same card as any command, and then reads what's new every few seconds instead of waiting for the command to time out. The AI panel shows each follow while it runs, with Stop. It also stops after 30 minutes the AI doesn't read it, after 2 hours, or when access ends, and the AI gets the output with known secrets hidden. ([#179](https://github.com/paulm981/Submarine/issues/179))
