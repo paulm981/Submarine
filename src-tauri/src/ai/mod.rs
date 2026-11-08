@@ -10,7 +10,9 @@
 //!
 //! The AI never gets a key or a password, and never connects to a server.
 //! It can also ask to copy files between this computer and its servers
-//! (`copy_files`, copy.rs, #159), on one card, with the app's own transfers.
+//! (`copy_files`, copy.rs, #159), on one card, with the app's own transfers,
+//! and to follow a log as it grows (`follow`, follow.rs, #179): allowed
+//! once, then read a little at a time.
 //!
 //! - **Off by default** (Settings › AI tools). Off, nothing listens, Home
 //!   lists no AI tools, and turning it off ends every AI tab's access.
@@ -52,6 +54,7 @@ mod codex;
 mod copy;
 mod exec;
 mod filter;
+mod follow;
 pub mod helper;
 mod mcp;
 pub(crate) mod tools;
@@ -277,6 +280,10 @@ struct ListedLimits {
     timeout_seconds: ListedTimeout,
     /// What the AI gets of one command's output at most.
     output_bytes_to_you: usize,
+    /// Follows (#179) an AI tab may have open at once, and what each keeps
+    /// between reads.
+    follows_per_tab: usize,
+    follow_buffer_bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -327,6 +334,8 @@ struct Tab {
     live: watch::Sender<u64>,
     /// When another connection with its token was refused, for the panel.
     intruder_at: Option<String>,
+    /// Its follows (#179), running or ended and not read to the end yet.
+    follows: Vec<follow::Entry>,
 }
 
 #[derive(Serialize, Clone)]
@@ -367,6 +376,9 @@ struct PendingView {
     /// For a `copy_files` request (#159): what it copies, where. Its
     /// `command` is then a one-line summary of it, for the lists and the log.
     copy: Option<copy::CopyView>,
+    /// A `follow` request (#179): it keeps running until it's stopped, at
+    /// most `timeout_secs`.
+    follow: bool,
 }
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq)]
@@ -374,6 +386,93 @@ struct GroupView {
     id: u64,
     /// How many servers the request named.
     size: usize,
+}
+
+/// What a request is (#179): run once, or followed until it's stopped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Once,
+    Follow,
+}
+
+/// A request that passed its checks (AiState::admit), waiting for you or,
+/// allowed by your settings, in the running list: what the rest needs.
+struct Admitted {
+    req: Req,
+    /// Your answer, while it waits for you.
+    rx: Option<oneshot::Receiver<Answer>>,
+    /// How it was allowed at once, by your settings.
+    auto: Option<String>,
+    stop_tx: watch::Sender<bool>,
+    stop_rx: watch::Receiver<bool>,
+    /// Its card, as it's shown now or if it comes back to ask for the root
+    /// password.
+    card: PendingView,
+}
+
+/// Who asked for what, where: for the log and the panel's history.
+struct Req {
+    tab_id: String,
+    session_id: String,
+    label: String,
+    server: String,
+    user: Option<String>,
+    command: String,
+    id: u64,
+    /// The history it was asked in (Shared::epoch).
+    epoch: u64,
+    /// The tool, as the log names it.
+    request: &'static str,
+    root: bool,
+    as_root: bool,
+}
+
+impl Req {
+    /// Its line in the audit log, for `event`.
+    fn entry(&self, event: &'static str) -> audit::Entry {
+        let mut e = audit::Entry::new(event, &self.label);
+        e.id = Some(self.id);
+        e.request = Some(self.request);
+        e.server = Some(self.server.clone());
+        e.user = self.user.clone();
+        e.command = Some(for_log(&self.command, MAX_LOGGED_COMMAND));
+        e.root = self.root;
+        e.as_root = self.as_root;
+        e
+    }
+
+    /// Its row in the panel's history, ended as `outcome`.
+    fn done(&self, outcome: &'static str) -> Done {
+        Done {
+            view: DoneView {
+                id: self.id,
+                tab_label: self.label.clone(),
+                server: self.server.clone(),
+                command: self.command.clone(),
+                root: self.root,
+                as_root: self.as_root,
+                root_via: None,
+                outcome,
+                exit_code: None,
+                output_bytes: 0,
+                hidden: 0,
+                cut: false,
+                timed_out: false,
+                error: None,
+                at: now(),
+                ran_without_asking: None,
+                follow: None,
+            },
+            output: Zeroizing::default(),
+            ai_output: Zeroizing::default(),
+        }
+    }
+}
+
+/// Commands of AI tab `tab_id` running on `session_id`, for MAX_RUNNING:
+/// follows (#179) have a limit of their own.
+fn running_on(s: &Shared, tab_id: &str, session_id: &str) -> usize {
+    s.running.iter().filter(|r| r.tab_id == tab_id && r.session_id == session_id && r.view.follow.is_none()).count()
 }
 
 /// What `early_decision` found.
@@ -475,6 +574,8 @@ struct RunningView {
     /// known.
     as_root: bool,
     root_via: Option<&'static str>,
+    /// A follow (#179): what it's seen so far. Filled in by `snapshot`.
+    follow: Option<follow::FollowView>,
 }
 
 struct Running {
@@ -483,6 +584,8 @@ struct Running {
     session_id: String,
     /// Stops it, on the server too (exec::run).
     stop: watch::Sender<bool>,
+    /// A follow's output, once it's started (#179).
+    feed: Option<Arc<follow::Feed>>,
 }
 
 /// A finished request's row in the panel. Its outputs are kept beside it
@@ -510,6 +613,9 @@ struct DoneView {
     /// It ran without asking you, and why: `rule: <pattern>`, `level: run
     /// anything` or `session: allow everything`.
     ran_without_asking: Option<String>,
+    /// A follow (#179): how it ended and what it saw. Its output isn't
+    /// kept: it went to the AI a read at a time.
+    follow: Option<follow::FollowDone>,
 }
 
 /// A finished request: its row, everything you see, and what the AI was
@@ -577,6 +683,9 @@ struct Inner {
     /// Does a `copy_files` request's copying on one server: the app's own
     /// SFTP transfers, or a test's. None: copying isn't available.
     copier: Mutex<Option<copy::Copier>>,
+    /// Runs a follow (#179): the app's SSH connections, or a test's. None:
+    /// following isn't available.
+    follower: Mutex<Option<follow::Follower>>,
 }
 
 #[derive(Clone)]
@@ -728,6 +837,7 @@ impl AiState {
             flash: AtomicBool::new(true),
             pull_folders: Mutex::new(Vec::new()),
             copier: Mutex::new(None),
+            follower: Mutex::new(None),
         }))
     }
 
@@ -792,6 +902,7 @@ impl AiState {
         state.0.flash.store(settings.flash, Ordering::Relaxed);
         state.set_pull_folders(copy::kept_folders(&settings.pull_folders));
         state.set_copier(copy::app_copier(app.clone()));
+        state.set_follower(follow::app_follower(app.clone()));
         if settings.enabled {
             let s = state.clone();
             tauri::async_runtime::spawn(async move {
@@ -896,6 +1007,7 @@ impl AiState {
             closed: watch::channel(false).0,
             live: watch::channel(0).0,
             intruder_at: None,
+            follows: Vec::new(),
         });
         drop(s);
         self.audit(audit::Entry::new("ai_tab_started", &label));
@@ -1135,8 +1247,7 @@ impl AiState {
             let at = s.pending.iter().position(|p| p.view.id == id).ok_or("That request isn't waiting any more.")?;
             if matches!(answer, Answer::Allow { .. }) {
                 let v = &s.pending[at].view;
-                let running_there = s.running.iter().filter(|r| r.tab_id == v.tab_id && r.session_id == v.session_id).count();
-                if running_there >= MAX_RUNNING {
+                if running_on(&s, &v.tab_id, &v.session_id) >= MAX_RUNNING {
                     return Err(format!("{MAX_RUNNING} commands from this AI tab are already running on {}. Allow this one once one of them ends.", v.server));
                 }
             }
@@ -1164,10 +1275,12 @@ impl AiState {
                             ran_without_asking: Some(by.clone()).filter(|b| b != BY_YOU),
                             as_root: v.as_root,
                             root_via: v.root_via,
+                            follow: v.follow.then(follow::FollowView::default),
                         },
                         tab_id: v.tab_id.clone(),
                         session_id: v.session_id.clone(),
                         stop: p.stop.clone(),
+                        feed: None,
                     });
                     if p.decide.send(Answer::Allow { by, password }).is_err() {
                         // Nobody is waiting for the answer any more.
@@ -1486,7 +1599,7 @@ impl AiState {
                     v
                 })
                 .collect(),
-            running: s.running.iter().map(|r| r.view.clone()).collect(),
+            running: s.running.iter().map(follow::running_view).collect(),
             history: s.history.iter().rev().map(|d| d.view.clone()).collect(),
             audit_log: self.0.audit.path().map(|p| p.to_string_lossy().into_owned()),
         }
@@ -1581,6 +1694,7 @@ impl AiState {
                 self.run_on_servers(tab_id, servers, all, command, timeout, cancel).await
             }
             "copy_files" => self.copy_files(tab_id, args, cancel).await,
+            "follow" | "read_follow" | "stop_follow" => self.follow_tool(tab_id, name, args, cancel).await,
             _ => ToolResult::err(format!("Submarine has no tool called {name}.")),
         }
     }
@@ -1639,6 +1753,8 @@ impl AiState {
                 servers_per_request: MAX_GROUP,
                 timeout_seconds: ListedTimeout { default: DEFAULT_TIMEOUT, max: MAX_TIMEOUT },
                 output_bytes_to_you: AI_HEAD + AI_TAIL,
+                follows_per_tab: follow::MAX_FOLLOWS,
+                follow_buffer_bytes: follow::RING,
             },
         };
         match serde_json::to_string(&listed) {
@@ -1649,8 +1765,13 @@ impl AiState {
 
     /// Refused before it reaches you: logged, and the AI told why.
     fn refuse(&self, label: &str, server: &str, command: &str, why: String) -> ToolResult {
+        self.refuse_as("run_command", label, server, command, why)
+    }
+
+    /// The same, for the tool `request`.
+    fn refuse_as(&self, request: &'static str, label: &str, server: &str, command: &str, why: String) -> ToolResult {
         let mut e = audit::Entry::new("request", label);
-        e.request = Some("run_command");
+        e.request = Some(request);
         e.server = Some(for_log(server, MAX_LOGGED_NAME)).filter(|s| !s.is_empty());
         e.command = Some(for_log(command, MAX_LOGGED_COMMAND));
         e.decision = Some("refused");
@@ -1705,28 +1826,44 @@ impl AiState {
         Early { looked_up, root_cmd, opens_shell, policy, decision: early }
     }
 
-    /// `run_command`, or one server's part of a `run_on_servers` request
-    /// (`group`), which was counted against the limits as a whole.
+    /// A request's checks, before anything is shown to you or runs: the
+    /// rate, its arguments, the server, root, how many run or wait, and
+    /// for a follow (#179) how many are open. Passed, it's on the waiting
+    /// list with its card, or (allowed by your settings) on the running
+    /// list with its stop signal, in the same step. `run_command`, each
+    /// server of `run_on_servers` (`group`, counted against the limits as a
+    /// whole) and `follow` all come through here.
     #[allow(clippy::too_many_arguments)]
-    async fn run_command_in(
+    async fn admit(
         &self,
         tab_id: &str,
         server: &str,
         command: &str,
         timeout: Option<u64>,
         as_root: bool,
-        mut cancel: watch::Receiver<bool>,
         group: Option<GroupRef>,
-    ) -> ToolResult {
+        kind: Kind,
+    ) -> Result<Admitted, ToolResult> {
         let Early { looked_up, root_cmd, opens_shell, policy, decision: early } = self.early_decision(tab_id, server, command, as_root).await;
-        // Checked before anything is shown to you or runs.
-        let (label, session_id, server, user, id, epoch, rx, stop_tx, stop_rx, auto, card) = {
+        let follows = kind == Kind::Follow;
+        // How the log names it: refused, it's named as before (#179 adds
+        // `follow`).
+        let request = if follows {
+            "follow"
+        } else if group.is_some() {
+            "run_on_servers"
+        } else {
+            "run_command"
+        };
+        let refused_as = if follows { "follow" } else { "run_command" };
+        let admitted = {
             let mut s = self.lock();
             let next_id = s.next_id + 1;
             let epoch = s.epoch;
             let waiting = waiting_requests(&s, tab_id);
+            let open_follows = follow::open_in(&s, tab_id);
             let Some(tab) = s.tabs.iter_mut().find(|t| t.id == tab_id) else {
-                return ToolResult::err("This AI tab's access has ended.");
+                return Err(ToolResult::err("This AI tab's access has ended."));
             };
             let label = tab.label.clone();
             // Every call counts toward the rate limit, refused or not; past
@@ -1745,9 +1882,9 @@ impl AiState {
                 drop(s);
                 let why = format!("Too many requests: at most {RATE_MAX} a minute. Wait a moment.");
                 if !log {
-                    return ToolResult::err(why);
+                    return Err(ToolResult::err(why));
                 }
-                return self.refuse(&label, server, command, why);
+                return Err(self.refuse_as(refused_as, &label, server, command, why));
             }
             if group.is_none() {
                 tab.asked.push_back(Instant::now());
@@ -1783,13 +1920,19 @@ impl AiState {
                 if as_root && policy.as_ref().is_some_and(|p| p.windows) {
                     return Err(refuse(format!("{} is a Windows server: as_root works with sudo or dzdo, on Linux and other Unix servers.", found.name)));
                 }
+                if follows && open_follows >= follow::MAX_FOLLOWS {
+                    return Err(refuse(format!(
+                        "{} follows are already open in this AI tab. Stop one with stop_follow, or read an ended one to the end, first.",
+                        follow::MAX_FOLLOWS
+                    )));
+                }
                 Ok(found.clone())
             })();
             let found = match checked {
                 Ok(f) => f,
                 Err((label, why)) => {
                     drop(s);
-                    return self.refuse(&label, server, command, why);
+                    return Err(self.refuse_as(refused_as, &label, server, command, why));
                 }
             };
             // Whether it waits for you (trust.rs), decided for this same
@@ -1800,19 +1943,25 @@ impl AiState {
             let held_for_group = group.is_some_and(|g| g.ask) && decision.approved_by().is_some();
             let decision = if held_for_group { trust::Decision::Ask { rule: None } } else { decision };
             let auto = decision.approved_by();
-            let running_there = s.running.iter().filter(|r| r.tab_id == tab_id && r.session_id == found.session_id).count();
-            if running_there >= MAX_RUNNING {
+            if running_on(&s, tab_id, &found.session_id) >= MAX_RUNNING {
                 drop(s);
-                return self.refuse(
+                return Err(self.refuse_as(
+                    refused_as,
                     &label,
                     server,
                     command,
                     format!("{MAX_RUNNING} of your commands are already running on {}. Wait for one to finish.", found.name),
-                );
+                ));
             }
             if auto.is_none() && group.is_none() && waiting >= MAX_WAITING {
                 drop(s);
-                return self.refuse(&label, server, command, format!("{MAX_WAITING} requests are already waiting for the user. Wait for them first."));
+                return Err(self.refuse_as(
+                    refused_as,
+                    &label,
+                    server,
+                    command,
+                    format!("{MAX_WAITING} requests are already waiting for the user. Wait for them first."),
+                ));
             }
             s.next_id = next_id;
             let (stop_tx, stop_rx) = watch::channel(false);
@@ -1836,7 +1985,7 @@ impl AiState {
                 root_via: found.root.as_ref().map(|k| k.0.tool),
                 // A tab logged in as root runs it as it is: nothing to ask.
                 password: if as_root && !login_root && found.root.is_none() { PasswordAsk::Optional } else { PasswordAsk::None },
-                timeout_secs: timeout.unwrap_or(DEFAULT_TIMEOUT),
+                timeout_secs: if follows { follow::LIFE.as_secs() } else { timeout.unwrap_or(DEFAULT_TIMEOUT) },
                 asked_at: now(),
                 server_id: found.server_id,
                 can_allow_always: found.server_id.is_some()
@@ -1853,6 +2002,7 @@ impl AiState {
                 ask_rule,
                 group: group.map(|g| GroupView { id: g.id, size: g.size }),
                 copy: None,
+                follow: follows,
             };
             let rx = match &auto {
                 // Runs now: in the running list with its stop signal, in
@@ -1869,10 +2019,12 @@ impl AiState {
                             ran_without_asking: Some(by.clone()),
                             as_root,
                             root_via: card.root_via,
+                            follow: follows.then(follow::FollowView::default),
                         },
                         tab_id: tab_id.to_string(),
                         session_id: found.session_id.clone(),
                         stop: stop_tx.clone(),
+                        feed: None,
                     });
                     None
                 }
@@ -1882,51 +2034,138 @@ impl AiState {
                     Some(rx)
                 }
             };
-            (label, found.session_id, found.name, found.user, next_id, epoch, rx, stop_tx, stop_rx, auto, card)
+            let req = Req {
+                tab_id: tab_id.to_string(),
+                session_id: found.session_id,
+                label,
+                server: found.name,
+                user: found.user,
+                command: command.to_string(),
+                id: next_id,
+                epoch,
+                request,
+                root: card.root,
+                as_root,
+            };
+            Admitted { req, rx, auto, stop_tx, stop_rx, card }
         };
         self.changed();
-        if rx.is_some() && self.0.flash.load(Ordering::Relaxed) {
+        if admitted.rx.is_some() && self.0.flash.load(Ordering::Relaxed) {
             (self.0.attention)();
         }
+        Ok(admitted)
+    }
+
+    /// Your answer to a request waiting for you: Allow (how, and a root
+    /// password you typed on its card), or what the AI is told when it's
+    /// denied, cancelled by an end of access, or withdrawn by the AI first,
+    /// each logged and kept in the history. `refused`: the last root
+    /// password typed for it was turned down.
+    async fn await_answer(
+        &self,
+        req: &Req,
+        mut rx: oneshot::Receiver<Answer>,
+        cancel: &mut watch::Receiver<bool>,
+        refused: bool,
+    ) -> Result<(String, Option<Zeroizing<String>>), ToolResult> {
+        // The answer: Some, or None when access ended first (the request
+        // dropped by cancel_where or answer).
+        let decision: Result<Option<Answer>, ()> = tokio::select! {
+            biased;
+            d = &mut rx => Ok(d.ok()),
+            _ = withdrawal(cancel) => Err(()),
+        };
+        let decision = match decision {
+            Ok(d) => d,
+            // The AI withdrew it: unless you or an end of access got to it
+            // first, it's taken off the waiting list here.
+            Err(()) => {
+                let was_waiting = {
+                    let mut s = self.lock();
+                    let before = s.pending.len();
+                    s.pending.retain(|p| p.view.id != req.id);
+                    before != s.pending.len()
+                };
+                if was_waiting {
+                    let mut e = req.entry("request");
+                    e.decision = Some("cancelled");
+                    e.note = Some("cancelled by the AI tool".into());
+                    self.audit(e);
+                    self.remember(req.epoch, req.done("cancelled"));
+                    self.changed();
+                    return Err(ToolResult::err("Cancelled before the user decided: the request was withdrawn."));
+                }
+                // Taken off under the same lock as the answer was given, so
+                // it's there now (or the request was dropped).
+                rx.try_recv().ok()
+            }
+        };
+        match decision {
+            None => {
+                let mut e = req.entry("request");
+                e.decision = Some("cancelled");
+                e.note = Some("access ended".into());
+                self.audit(e);
+                self.remember(req.epoch, req.done("cancelled"));
+                self.changed();
+                Err(ToolResult::err("Cancelled before the user decided: the server isn't shared any more."))
+            }
+            Some(Answer::Deny(note)) => {
+                let mut e = req.entry("request");
+                e.decision = Some("denied");
+                e.by = Some(BY_YOU);
+                e.note = note.as_ref().map(|n| format!("note: {n}"));
+                self.audit(e);
+                self.remember(req.epoch, req.done("denied"));
+                self.changed();
+                let after = if refused { " The root password typed for it was refused." } else { "" };
+                Err(ToolResult::err(match note {
+                    Some(n) => format!("Denied by the user: {n}{after}"),
+                    None => format!("Denied by the user.{after}"),
+                }))
+            }
+            Some(Answer::Allow { by, password }) => Ok((by, password)),
+        }
+    }
+
+    /// Logged as it's allowed: a long command, or one that hangs (or a
+    /// follow), is in the log while it runs, not only once it ends. Its
+    /// "finished" line follows, with the same id.
+    fn log_allowed(&self, req: &Req, approved_by: &str, round: u32) {
+        let mut e = req.entry("request");
+        e.decision = Some("allowed");
+        e.by = Some(if approved_by != BY_YOU { "your settings" } else { BY_YOU });
+        e.approved_by = Some(approved_by.to_string());
+        if round > 1 {
+            e.note = Some("allowed again, after the server asked for the root password".into());
+        }
+        self.audit(e);
+    }
+
+    /// `run_command`, or one server's part of a `run_on_servers` request
+    /// (`group`), which was counted against the limits as a whole.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_command_in(
+        &self,
+        tab_id: &str,
+        server: &str,
+        command: &str,
+        timeout: Option<u64>,
+        as_root: bool,
+        mut cancel: watch::Receiver<bool>,
+        group: Option<GroupRef>,
+    ) -> ToolResult {
+        let Admitted { req, rx, auto, stop_tx, stop_rx, card } = match self.admit(tab_id, server, command, timeout, as_root, group, Kind::Once).await {
+            Ok(a) => a,
+            Err(refused) => return refused,
+        };
+        let (session_id, server, user, id, epoch) = (&req.session_id, &req.server, &req.user, req.id, req.epoch);
         // As root: the login, the command (read above, not again), or the
         // AI's asking. Through sudo or dzdo only where the login isn't root.
-        let root = card.root;
         let via_tool = as_root && user.as_deref() != Some("root");
         let limit = Duration::from_secs(timeout.unwrap_or(DEFAULT_TIMEOUT));
-        let entry_for = |event: &'static str| {
-            let mut e = audit::Entry::new(event, &label);
-            e.id = Some(id);
-            e.request = Some(if group.is_some() { "run_on_servers" } else { "run_command" });
-            e.server = Some(server.clone());
-            e.user = user.clone();
-            e.command = Some(for_log(command, MAX_LOGGED_COMMAND));
-            e.root = root;
-            e.as_root = as_root;
-            e
-        };
-        let entry = || entry_for("request");
-        let done = |outcome: &'static str| Done {
-            view: DoneView {
-                id,
-                tab_label: label.clone(),
-                server: server.clone(),
-                command: command.to_string(),
-                root,
-                as_root,
-                root_via: None,
-                outcome,
-                exit_code: None,
-                output_bytes: 0,
-                hidden: 0,
-                cut: false,
-                timed_out: false,
-                error: None,
-                at: now(),
-                ran_without_asking: None,
-            },
-            output: Zeroizing::default(),
-            ai_output: Zeroizing::default(),
-        };
+        let entry_for = |event: &'static str| req.entry(event);
+        let done = |outcome: &'static str| req.done(outcome);
         let withdrawn = |c: &watch::Receiver<bool>| *c.borrow();
 
         // Allowed (at once, `auto`, or by your answer), then run. A request
@@ -1943,82 +2182,13 @@ impl AiState {
             round += 1;
             let (approved_by, typed) = match (auto.take(), rx.take()) {
                 (Some(by), _) => (by, None),
-                (None, None) => unreachable!("a request either runs now or waits"),
-                (None, Some(mut rx)) => {
-                    // Waiting for you. The answer: Some, or None when access
-                    // ended first (the request dropped by cancel_where or answer).
-                    let decision: Result<Option<Answer>, ()> = tokio::select! {
-                        biased;
-                        d = &mut rx => Ok(d.ok()),
-                        _ = withdrawal(&mut cancel) => Err(()),
-                    };
-                    let decision = match decision {
-                        Ok(d) => d,
-                        // The AI withdrew it: unless you or an end of access got
-                        // to it first, it's taken off the waiting list here.
-                        Err(()) => {
-                            let was_waiting = {
-                                let mut s = self.lock();
-                                let before = s.pending.len();
-                                s.pending.retain(|p| p.view.id != id);
-                                before != s.pending.len()
-                            };
-                            if was_waiting {
-                                let mut e = entry();
-                                e.decision = Some("cancelled");
-                                e.note = Some("cancelled by the AI tool".into());
-                                self.audit(e);
-                                self.remember(epoch, done("cancelled"));
-                                self.changed();
-                                return ToolResult::err("Cancelled before the user decided: the request was withdrawn.");
-                            }
-                            // Taken off under the same lock as the answer was
-                            // given, so it's there now (or the request was
-                            // dropped).
-                            rx.try_recv().ok()
-                        }
-                    };
-                    match decision {
-                        None => {
-                            let mut e = entry();
-                            e.decision = Some("cancelled");
-                            e.note = Some("access ended".into());
-                            self.audit(e);
-                            self.remember(epoch, done("cancelled"));
-                            self.changed();
-                            return ToolResult::err("Cancelled before the user decided: the server isn't shared any more.");
-                        }
-                        Some(Answer::Deny(note)) => {
-                            let mut e = entry();
-                            e.decision = Some("denied");
-                            e.by = Some(BY_YOU);
-                            e.note = note.as_ref().map(|n| format!("note: {n}"));
-                            self.audit(e);
-                            self.remember(epoch, done("denied"));
-                            self.changed();
-                            let after = if refused { " The root password typed for it was refused." } else { "" };
-                            return ToolResult::err(match note {
-                                Some(n) => format!("Denied by the user: {n}{after}"),
-                                None => format!("Denied by the user.{after}"),
-                            });
-                        }
-                        Some(Answer::Allow { by, password }) => (by, password),
-                    }
-                }
+                (None, None) => return ToolResult::err("It stopped unexpectedly."),
+                (None, Some(rx)) => match self.await_answer(&req, rx, &mut cancel, refused).await {
+                    Ok(answer) => answer,
+                    Err(answer) => return answer,
+                },
             };
-            let ran_without_asking = Some(approved_by.clone()).filter(|b| b != BY_YOU);
-
-            // Logged now, as it's allowed: a long command, or one that hangs,
-            // is in the log while it runs, not only once it ends. Its "finished"
-            // line follows, with the same id.
-            let mut e = entry();
-            e.decision = Some("allowed");
-            e.by = Some(if ran_without_asking.is_some() { "your settings" } else { BY_YOU });
-            e.approved_by = Some(approved_by.clone());
-            if round > 1 {
-                e.note = Some("allowed again, after the server asked for the root password".into());
-            }
-            self.audit(e);
+            self.log_allowed(&req, &approved_by, round);
 
             // Allowed: answer() (or the step above, when it runs without asking)
             // has put it in the running list with its stop signal, which an end
@@ -2044,7 +2214,7 @@ impl AiState {
             // As root (#120): with the password you just typed, else with
             // what this AI tab has for root there, else looking for root
             // that needs no password.
-            let kept = self.kept_root(tab_id, &session_id).filter(|_| typed.is_none());
+            let kept = self.kept_root(tab_id, session_id).filter(|_| typed.is_none());
             let how = match (typed, &kept) {
                 (Some(pw), _) => exec::RootHow::Typed(pw),
                 (None, Some(k)) => exec::RootHow::Kept(k.0.clone()),
@@ -2066,7 +2236,7 @@ impl AiState {
                         None
                     }
                 };
-                gone = turn.is_some() && !self.kept_root(tab_id, &session_id).is_some_and(|x| Arc::ptr_eq(&x.0, &k.0));
+                gone = turn.is_some() && !self.kept_root(tab_id, session_id).is_some_and(|x| Arc::ptr_eq(&x.0, &k.0));
             }
             let run = if kept.as_ref().is_some_and(|k| k.0.password.is_some()) && turn.is_none() {
                 exec::RootRun::Ran(exec::Exec { stopped: true, ..exec::Exec::default() }, None)
@@ -2105,7 +2275,7 @@ impl AiState {
                 exec::RootRun::Ran(out, new) => {
                     let tool = new.as_ref().map(|a| a.tool).or(kept_tool);
                     if let Some(a) = new {
-                        self.keep_root(id, tab_id, &session_id, a);
+                        self.keep_root(id, tab_id, session_id, a);
                     }
                     break (approved_by, Ok(out), tool);
                 }
@@ -2113,7 +2283,7 @@ impl AiState {
                     // A kept password is never left in place after a failure:
                     // the next request asks for it again rather than risk it.
                     if let Some(k) = kept.as_ref().filter(|k| k.0.password.is_some()) {
-                        self.forget_root(tab_id, &session_id, &k.0);
+                        self.forget_root(tab_id, session_id, &k.0);
                     }
                     break (approved_by, Err((you, ai)), kept_tool);
                 }
@@ -2133,7 +2303,7 @@ impl AiState {
                     // A kept one turned down is forgotten at once: no other
                     // request tries it.
                     if let Some(k) = &kept {
-                        self.forget_root(tab_id, &session_id, &k.0);
+                        self.forget_root(tab_id, session_id, &k.0);
                     }
                     drop(turn);
                     refused = true;
@@ -2480,6 +2650,13 @@ pub async fn ai_unshare(state: tauri::State<'_, AiState>, session_id: String, ta
 pub async fn ai_stop(state: tauri::State<'_, AiState>, tab_id: String) -> Result<(), String> {
     state.stop_tab(&tab_id);
     Ok(())
+}
+
+/// Stop in the AI panel, on a running follow (#179): ended on the server,
+/// and the AI's next read says you stopped it.
+#[tauri::command]
+pub async fn ai_stop_follow(state: tauri::State<'_, AiState>, id: u64) -> Result<(), String> {
+    state.stop_follow_by_you(id)
 }
 
 #[derive(Serialize)]

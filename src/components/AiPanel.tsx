@@ -1,7 +1,8 @@
 import { ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Bot, Check, ChevronDown, ChevronRight, Loader2, ShieldAlert, Square, X, Zap } from "lucide-react";
-import { AiDone, AiPending, AiSnapshot, cardsOf, copyCard, runnerWarning, STEERED_BY_OUTPUT } from "../util/ai";
+import { AiDone, AiPending, AiRunning, AiSnapshot, cardsOf, copyCard, followLimit, followSoFar, runnerWarning, STEERED_BY_OUTPUT } from "../util/ai";
+import { formatBytes } from "../fork/bulk/plan";
 import { HIDDEN_CONTROLS } from "../util/fileName";
 import { WILDCARD_WARNING } from "./AiTrust";
 
@@ -230,12 +231,14 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
         </div>
       ) : (
       <div className="text-[11.5px] text-zinc-300">
-        <span className="font-bold text-white">{p.tab_label}</span> wants to run on{" "}
+        <span className="font-bold text-white">{p.tab_label}</span> wants to {p.follow ? "follow" : "run"} on{" "}
         <NoFocusButton onPick={() => onGoToServer(p.session_id)} className="font-bold text-white hover:underline">{p.server}</NoFocusButton>
         {p.as_root ? (
           <> as <span className="font-bold text-amber-300">root</span>{!loginIsRoot && <span className="text-zinc-400"> (via {p.root_via ?? "sudo or dzdo"})</span>}</>
         ) : p.user && <> as <span className={`font-bold ${loginIsRoot ? "text-amber-300" : "text-white"}`}>{p.user}</span></>}
-        {p.timeout_secs !== 60 && <span className="text-zinc-500"> · stops after {p.timeout_secs}s</span>}
+        {p.follow
+          ? <span className="text-zinc-500"> · {followLimit(p)}</span>
+          : p.timeout_secs !== 60 && <span className="text-zinc-500"> · stops after {p.timeout_secs}s</span>}
       </div>
       )}
       {(many ? many.some((m) => m.root) : p.root) && (
@@ -291,8 +294,14 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
       ) : (
       /* The whole command, never cut off. */
       <pre className="whitespace-pre-wrap break-all rounded-lg bg-black/50 border border-white/10 p-2 font-mono text-[11.5px] text-zinc-100 select-text">
-        {showPlainly(p.command)}
+        {p.follow && <span className="font-sans font-bold text-primary">Follow: </span>}{showPlainly(p.command)}
       </pre>
+      )}
+      {p.follow && (
+        <p className="text-[11px] text-zinc-400 leading-snug">
+          It keeps running {followLimit(p)}, and the AI reads its output as it grows. It also stops after 30 minutes the AI doesn't read it,
+          or when you press Stop on it below.
+        </p>
       )}
       {asksPassword && (
         <div className="space-y-1">
@@ -449,6 +458,35 @@ const outcomeLabel = (d: AiDone) => {
   }
 };
 
+/// A follow running now (#179): its server, command, how long and what
+/// it's seen, with Stop. How long is counted here, every 15 seconds.
+const FollowRow = ({ r, act }: { r: AiRunning; act: (cmd: string, args: Record<string, unknown>) => void }) => {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = window.setInterval(() => setNow(Date.now()), 15000);
+    return () => window.clearInterval(t);
+  }, []);
+  return (
+    <div className="px-3 py-2 border-t border-white/5 flex items-start gap-2">
+      <Loader2 size={12} className="mt-0.5 shrink-0 animate-spin text-primary" />
+      <span className="flex-1 min-w-0">
+        <span className="block text-[10.5px] text-zinc-500">
+          <span className="font-semibold text-zinc-300">{r.tab_label}</span> {r.server} · following · {followSoFar(r.started_at, r.follow?.bytes_seen ?? 0, now)}
+          {r.ran_without_asking && <> · {ranWithoutAsking(r.ran_without_asking)}</>}
+        </span>
+        <span className="block font-mono text-[11px] text-zinc-200 truncate">{showPlainly(r.command)}</span>
+      </span>
+      <NoFocusButton
+        onPick={() => act("ai_stop_follow", { id: r.id })}
+        title="Stop following: end it on the server. The AI is told you stopped it."
+        className="shrink-0 h-6 px-2 rounded border border-white/10 text-[10px] font-bold uppercase tracking-wider text-zinc-300 hover:border-red-400/50 hover:text-red-300 flex items-center gap-1"
+      >
+        <Square size={9} /> Stop
+      </NoFocusButton>
+    </div>
+  );
+};
+
 const DoneRow = ({ d }: { d: AiDone }) => {
   const [open, setOpen] = useState(false);
   const [aiView, setAiView] = useState(false);
@@ -462,7 +500,8 @@ const DoneRow = ({ d }: { d: AiDone }) => {
     setOpen((o) => !o);
   };
   const ok = d.outcome === "done" && d.exit_code === 0;
-  const ran = d.outcome === "done";
+  // A follow's output went to the AI a read at a time, and isn't kept.
+  const ran = d.outcome === "done" && !d.follow;
   return (
     <div className="border-t border-white/5">
       <NoFocusButton
@@ -478,7 +517,7 @@ const DoneRow = ({ d }: { d: AiDone }) => {
           </span>
           <span className="block font-mono text-[11px] text-zinc-200 truncate">{showPlainly(d.command)}</span>
           <span className={`block text-[10.5px] ${ok ? "text-emerald-400" : ran ? "text-amber-300" : "text-zinc-500"}`}>
-            {outcomeLabel(d)}
+            {d.follow ? `followed · ${d.follow.ended} · ${formatBytes(d.follow.bytes_seen)} seen` : outcomeLabel(d)}
             {d.as_root && <span className="text-amber-300"> · as root{d.root_via && ` via ${d.root_via}`}</span>}
             {d.ran_without_asking && <> · {ranWithoutAsking(d.ran_without_asking)}</>}
             {d.hidden > 0 && <span className="text-sky-300"> · {d.hidden} hidden from the AI</span>}
@@ -612,7 +651,7 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
         ))}
 
         {/* Running now. */}
-        {snap.running.map((r) => (
+        {snap.running.map((r) => r.follow ? <FollowRow key={r.id} r={r} act={run} /> : (
           <div key={r.id} className="px-3 py-2 border-t border-white/5 flex items-start gap-2">
             <Loader2 size={12} className="mt-0.5 shrink-0 animate-spin text-primary" />
             <span className="flex-1 min-w-0">

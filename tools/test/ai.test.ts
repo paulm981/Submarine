@@ -2,12 +2,12 @@
 // then npm --prefix tools/test test (type check, then vitest).
 
 import { describe, expect, it } from "vitest";
-import { aiMarker, cardsOf, copyCard, levelTitle, runnerWarning, sharedWith, trustTargetFor, type AiCopy, type AiPending, type AiServer, type AiSnapshot } from "../../src/util/ai";
+import { aiMarker, cardsOf, copyCard, followLimit, followSoFar, levelTitle, runnerWarning, sharedWith, trustTargetFor, type AiCopy, type AiPending, type AiServer, type AiSnapshot } from "../../src/util/ai";
 
 const pending = (id: number, group: { id: number; size: number } | null = null): AiPending => ({
   id, tab_id: "t", tab_label: "AI", session_id: `s${id}`, server: `srv${id}`, user: null, command: "uptime",
   root: false, as_root: false, root_via: null, password: "none", timeout_secs: 60, asked_at: "", server_id: null,
-  ask_rule: null, can_allow_always: true, note: null, group, copy: null,
+  ask_rule: null, can_allow_always: true, note: null, group, copy: null, follow: false,
 });
 
 const server = (over: Partial<AiServer> = {}): AiServer => ({
@@ -135,5 +135,22 @@ describe("sharedWith", () => {
     };
     expect(sharedWith(snap, "s1").map((t) => t.id)).toEqual(["a", "c"]);
     expect(sharedWith(snap, "s3")).toEqual([]);
+  });
+});
+
+// A follow (#179): its card says it keeps running, and the panel how long
+// it's run and what it's seen.
+describe("follows", () => {
+  it("says it keeps running, at most its life", () => {
+    expect(followLimit({ timeout_secs: 7200 })).toBe("until stopped (at most 2 h)");
+    expect(followLimit({ timeout_secs: 5400 })).toBe("until stopped (at most 90 min)");
+  });
+  it("says how long it has run and what it has seen", () => {
+    const start = "2026-01-01T10:00:00Z";
+    const at = (mins: number) => new Date(start).getTime() + mins * 60000;
+    expect(followSoFar(start, 0, at(0.5))).toMatch(/^under a minute · /);
+    expect(followSoFar(start, 2048, at(12))).toMatch(/^12 min · .+ seen$/);
+    expect(followSoFar(start, 0, at(75))).toMatch(/^1 h 15 min · /);
+    expect(followSoFar("not a date", 0, at(5))).toMatch(/^under a minute/);
   });
 });
