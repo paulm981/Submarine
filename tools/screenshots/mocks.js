@@ -124,6 +124,8 @@ const terminalText = (name) => [
 ].join("");
 
 const later = (fn, ms = 60) => setTimeout(fn, ms);
+// Each terminal's output channel, for the echo of what's typed.
+const outputs = new Map();
 
 // Commands the page asked for that have no answer here (take.mjs prints them).
 window.__unhandled = new Set();
@@ -157,11 +159,19 @@ mockIPC((cmd, args = {}) => {
       later(() => emit(`connection-success-${args.sessionId}`, {}));
       return null;
     case "open_terminal": {
+      outputs.set(args.terminalId, args.onOutput);
       const name = sessionServer(args.sessionId)?.name ?? "server";
       later(() => args.onOutput?.onmessage?.(new TextEncoder().encode(terminalText(name)).buffer), 150);
       return null;
     }
     case "sftp_list_dir": return remoteListing(args.sessionId, args.path);
+    // A shell echoes what's typed, as a real one does.
+    case "write_terminal_data": {
+      window.__writes = (window.__writes ?? 0) + 1;
+      const out = outputs.get(args.terminalId);
+      later(() => out?.onmessage?.(new Uint8Array(args.data).buffer), 5);
+      return null;
+    }
 
     // Kept sessions: web1 has two in tmux, one of them open in its tab.
     case "keep_session_state": return { kept: true, running: false };
