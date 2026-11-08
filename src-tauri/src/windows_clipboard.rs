@@ -1,8 +1,7 @@
 //! The Windows clipboard's text, read through Win32.
 //!
 //! The fork's own, moved here out of lib.rs (#136) so a sync with the
-//! original project doesn't conflict on it. lib.rs reaches it through
-//! `use windows_clipboard::*`.
+//! original project doesn't conflict on it. clipboard_read.rs calls it.
 
 /// The Win32 clipboard's text (CF_UNICODETEXT).
 #[cfg(windows)]
@@ -69,14 +68,11 @@ mod hook_tests {
 
     #[test]
     fn the_hooks_are_in_place() {
+        assert_hooks("lib.rs", include_str!("lib.rs"), &[("", "mod windows_clipboard;", 1)]);
         assert_hooks(
-            "lib.rs",
-            include_str!("lib.rs"),
-            &[
-                ("", "mod windows_clipboard;", 1),
-                ("", "use windows_clipboard::*;", 1),
-                ("clipboard_read_text", "windows_clipboard_text", 1),
-            ],
+            "clipboard_read.rs",
+            include_str!("clipboard_read.rs"),
+            &[("read_text", "windows_clipboard::windows_clipboard_text", 1)],
         );
     }
 }

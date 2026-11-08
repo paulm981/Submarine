@@ -1775,6 +1775,38 @@ pub(crate) async fn find_sftp_server<H: russh::client::Handler>(session_arc: &Ha
 
 // Every way the original project's code reaches root goes through here
 // (fork_hooks.rs): a sync that drops one of these calls, or the lines that
+/// The user's own try at an Info panel action before root (a service
+/// action, a kill, a firewall read), run by sh whatever the login shell is:
+/// csh and tcsh read `2>&1` and `$?` their own way (remote_sh), and the
+/// answer decides whether root is asked for. Not for what must also work
+/// on Windows (server_os's probe runs in cmd.exe there).
+pub(crate) fn sh_user_command(cmd: &str) -> String {
+    remote_sh::sh_command(&[], cmd, &[])
+}
+
+/// Is this line of output one of sudo's, dzdo's or sudo-rs's own? Those
+/// start with the tool's name, or are its refusals ("Sorry, try again.",
+/// "Sorry, user bob may not run sudo", "bob is not in the sudoers file").
+pub(crate) fn is_tool_line(line: &str) -> bool {
+    let l = line.trim().to_ascii_lowercase();
+    ["sudo:", "dzdo:", "sudo-rs:", "sorry, try again", "sorry, user "].iter().any(|p| l.starts_with(p))
+        || l.contains(" is not in the sudoers file")
+}
+
+/// classify_sudo_failure for output that also holds what the command (or a
+/// root shell's start-up) printed: only the tool's own lines (is_tool_line)
+/// are read, so a command that prints "incorrect password" is never taken
+/// for the tool turning the password down.
+pub(crate) fn classify_tool_output(out: &str) -> String {
+    tool_answer(out).unwrap_or_else(|| SUDO_NOT_ALLOWED.into())
+}
+
+/// classify_sudo_failure of the tool's own lines in `out`, if it has any.
+pub(crate) fn tool_answer(out: &str) -> Option<String> {
+    let lines: Vec<&str> = out.lines().map(str::trim).filter(|l| is_tool_line(l)).collect();
+    (!lines.is_empty()).then(|| classify_sudo_failure(&lines.join(" ")))
+}
+
 // bring this file in, fails here.
 #[cfg(test)]
 mod hook_tests {
@@ -1800,6 +1832,10 @@ mod hook_tests {
                 ("open_elevated_sftp", "root_feed(", 1),
                 ("sftp_set_elevated", "just_rejected(", 1),
                 ("get_sftp_session", "forget_root_password(", 1),
+                ("ssh_systemctl_action", "sh_user_command(", 1),
+                ("ssh_kill_process", "sh_user_command(", 1),
+                ("ssh_iptables_chain", "sh_user_command(", 1),
+                ("ssh_nft_chain", "sh_user_command(", 1),
             ],
         );
         assert_hooks(

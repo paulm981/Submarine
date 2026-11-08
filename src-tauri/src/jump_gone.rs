@@ -173,6 +173,40 @@ fn connect_directly(conn: &Connection, server_id: i64) -> Result<(), String> {
     .map_err(db("JUMP_GONE_DIRECT_FAILED"))
 }
 
+/// "Resume all"'s answer (lib.rs, monitor_resume_all) once it has started
+/// what it could: the servers it `skipped` (id, name), which couldn't be
+/// reached as set up, stay paused and are named.
+pub(crate) fn resume_skipped(db_state: &crate::DbState, skipped: Vec<(i32, String)>) -> Result<(), String> {
+    if skipped.is_empty() {
+        return Ok(());
+    }
+    {
+        let guard = db_state.conn.lock().map_err(|_| "lock")?;
+        let conn = guard.as_ref().ok_or("db not ready")?;
+        for (node_id, _) in &skipped {
+            conn.execute("UPDATE monitor_configs SET paused = 1 WHERE node_id = ?1", [node_id])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    crate::save_vault_internal(db_state)?;
+    let names: Vec<&str> = skipped.iter().map(|(_, name)| name.as_str()).collect();
+    Err(format!(
+        "Couldn't start monitoring {}: check how {} reached (the app log says why).",
+        names.join(", "),
+        if names.len() == 1 { "it's" } else { "they're" }
+    ))
+}
+
+/// The app log's line for a server "Resume all" couldn't start, which it
+/// skips to go on with the rest: "db-01's jump host (web-gw) was deleted, so
+/// Submarine won't connect it directly without asking. Skipped."
+pub(crate) fn resume_skipped_line(name: &str, why: &str) -> String {
+    match why.strip_prefix(CODE) {
+        Some(said) => format!("{} Skipped.", said.trim()),
+        None => format!("{name}: {why}. Skipped."),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,7 +281,8 @@ mod tests {
             ("merge_batch", "jump_gone::note_lost(", 1),
             ("repair_links", "jump_gone::note_unresolved(", 1),
             ("set_server_jump_host", "jump_gone::clear(", 1),
-            ("resume_skipped_line", "jump_gone::CODE", 1),
+            ("monitor_resume_all", "jump_gone::resume_skipped_line(&name, &e)", 1),
+            ("monitor_resume_all", "jump_gone::resume_skipped(&db_state, skipped)", 1),
             ("run", "jump_gone::jump_host_connect_directly", 1),
         ];
         // Every way of connecting to a saved server asks first.

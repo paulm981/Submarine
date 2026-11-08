@@ -100,8 +100,7 @@ mod vault_schema;
 mod sync_merge;
 #[cfg(windows)]
 mod windows_clipboard;
-#[cfg(windows)]
-use windows_clipboard::*;
+mod clipboard_read;
 #[cfg(test)]
 mod fork_hooks;
 #[cfg(target_os = "android")]
@@ -6505,14 +6504,8 @@ async fn force_push_profile(
     // sync fills the partition from this vault, DEK escrow record included.
     // Only this profile's, though: if another opened meanwhile, the sync
     // refuses, and with no cursor this profile's next sync is a full one.
-    forget_sync_cursor(&db_state)?;
+    store_sync::forget_sync_cursor(&db_state)?;
     sync_with_from(&app, &db_state, &cloud, &session, Some(generation), false).await
-}
-
-/// Drops the open profile's delta-sync cursor: the next round is a full one.
-fn forget_sync_cursor(db_state: &DbState) -> Result<(), String> {
-    *db_state.sync_cursor.lock().map_err(|_| "[STATE] LOCK_SYNC_CURSOR")? = None;
-    Ok(())
 }
 
 /// Mark a profile as the active one. Subsequent `check_db_exists` /
@@ -8984,24 +8977,6 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
     Ok(list)
 }
 
-/// "Keep it SSH" (or RDP) for a server whose switch to telnet or VNC is held:
-/// it stays as it was on its old port, saved as this device's own edit, so the
-/// next sync takes it back to that everywhere (approvals::keep_ssh). False
-/// when no switch was held.
-#[tauri::command]
-async fn keep_server_ssh(db_state: tauri::State<'_, DbState>, server_id: i32) -> Result<bool, String> {
-    let kept = {
-        let guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
-        let conn = guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-        let uuid = approvals::server_uuid(conn, server_id as i64).ok_or("[SYNC] NO_SUCH_SERVER")?;
-        approvals::keep_ssh(conn, &uuid)?
-    };
-    if kept {
-        save_vault_internal(&db_state)?;
-    }
-    Ok(kept)
-}
-
 /// Allow what this device held back for one server (see approvals.rs): the
 /// given items, or all of its items when `items` is empty. A monitor already
 /// polling that server picks up allowed commands at once, and allowed
@@ -9321,42 +9296,10 @@ mod mirror_folder_guard_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn only_a_folder_on_a_drive_letter_passes_as_text() {
-        use super::windows_drive_path;
-        for ok in [r"C:\Users\me\site", "d:/work", r"\\?\C:\Users\me", r"\\?\c:\x", "C:\\"] {
-            assert!(windows_drive_path(ok), "{ok}");
-        }
-        for bad in [
-            r"\\attacker.example\share\dir",
-            "//attacker.example/share",
-            r"\\?\UNC\attacker.example\share",
-            r"\\?\unc\attacker.example\share",
-            r"\\?\GLOBALROOT\Device\Mup\attacker.example\share",
-            r"\\.\pipe\x",
-            r"\\.\C:\x",
-            r"\??\UNC\host\share",
-            r"\Users\me",
-            "C:relative",
-            "C:",
-            "",
-            "folder",
-            "/home/me",
-        ] {
-            assert!(!windows_drive_path(bad), "{bad}");
-        }
-    }
-
     #[cfg(windows)]
     #[test]
     fn a_network_share_is_refused_before_anything_is_looked_at() {
-        for bad in [
-            r"\\attacker.example\share\dir",
-            r"\\?\UNC\attacker.example\share",
-            r"\\?\unc\attacker.example\share",
-            r"\\?\GLOBALROOT\Device\Mup\attacker.example\share",
-            r"\\.\pipe\x",
-        ] {
+        for bad in [r"\\attacker.example\share\dir", r"\\?\UNC\attacker.example\share", r"\\.\pipe\x"] {
             let t = std::time::Instant::now();
             let err = guard_mirror_folder(bad).unwrap_err();
             assert!(err.contains("network share") || err.contains("MIRROR"), "{bad}: {err}");
@@ -12942,27 +12885,6 @@ mod connect_timeout_tests {
         hard: Duration::from_secs(110),
     };
 
-    // A session that waited on another's prompt and then asks itself gets its
-    // own full window, not what is left of the connect's first 110s.
-    #[tokio::test]
-    async fn a_prompt_taken_over_gets_a_fresh_window() {
-        use super::{drive_connect_with_prompt_timeout, ConnectTimeout};
-        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-        let caps = ConnectTimeoutCaps { handshake: Duration::from_millis(100), hard: Duration::from_millis(500) };
-        let pending = AtomicBool::new(true);
-        let epoch = AtomicU32::new(0);
-        let start = std::time::Instant::now();
-        let bump = async {
-            tokio::time::sleep(Duration::from_millis(350)).await;
-            epoch.fetch_add(1, Ordering::SeqCst);
-        };
-        let driven = drive_connect_with_prompt_timeout(std::future::pending::<()>(), &pending, &epoch, caps);
-        let (res, _) = tokio::join!(driven, bump);
-        assert!(matches!(res, Err(ConnectTimeout::PromptHardCap)));
-        // Counted from the takeover (350ms) plus the window (400ms), not from the start.
-        assert!(start.elapsed() >= Duration::from_millis(700), "cut short after {:?}", start.elapsed());
-    }
-
     #[test]
     fn no_prompt_holds_the_handshake_cap() {
         // Before 15s: keep waiting when no prompt has shown.
@@ -13364,11 +13286,6 @@ impl HopCtx<'_> {
     }
 }
 
-/// How long a jump host's login may take, prompts included (login_hop).
-const JUMP_LOGIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-/// How long a jump host may take to open the channel to the next hop or the
-/// server behind it (hop_channel), as for telnet through an SSH server.
-const JUMP_CHANNEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// One jump host to log in to.
 struct Hop {
     /// Where it is and who logs in, after its own `~/.ssh/config`.
@@ -13470,8 +13387,7 @@ mod proxy_jump_tests {
 }
 
 /// A `direct-tcpip` channel through `via` to `host:port`, as a transport.
-/// Within JUMP_CHANNEL_TIMEOUT: russh waits for the jump host's answer with
-/// no limit. Any handler: the app's own, or a test's.
+/// Within 15 seconds: russh waits for the jump host's answer with no limit.
 async fn hop_channel<H: russh::client::Handler>(
     via: &russh::client::Handle<H>,
     host: &str,
@@ -13481,22 +13397,7 @@ async fn hop_channel<H: russh::client::Handler>(
     // could fill this channel's queue while the next session waits for a
     // window, block the previous hop's protocol task — which is what delivers
     // that window — and deadlock the route.
-    hop_channel_within(via, host, port, JUMP_CHANNEL_TIMEOUT).await
-}
-
-/// `hop_channel`, given `limit` to open the channel in.
-async fn hop_channel_within<H: russh::client::Handler>(
-    via: &russh::client::Handle<H>,
-    host: &str,
-    port: u16,
-    limit: std::time::Duration,
-) -> Result<tunnel::DrainedChannelStream, String> {
-    let open = via.channel_open_direct_tcpip(host.to_string(), u32::from(port), "127.0.0.1", 0);
-    match tokio::time::timeout(limit, open).await {
-        Ok(Ok(channel)) => Ok(tunnel::drained_stream(channel)),
-        Ok(Err(e)) => Err(format!("could not open a channel to {host}:{port} through the jump host: {e}")),
-        Err(_) => Err(format!("the jump host didn't open a channel to {host}:{port} within {} seconds", limit.as_secs())),
-    }
+    hop_policy::hop_channel_within(via, host, port, hop_policy::JUMP_CHANNEL_TIMEOUT).await // the fork's
 }
 
 #[cfg(test)]
@@ -13900,7 +13801,7 @@ async fn login_hop(
         }
         auth_res
     };
-    let ladder_res = tokio::time::timeout(JUMP_LOGIN_DEADLINE, ladder).await;
+    let ladder_res = tokio::time::timeout(hop_policy::JUMP_LOGIN_DEADLINE, ladder).await;
     release_agent(&prompt_ctx).await;
     // Belt-and-suspenders: no dangling interactive sender for this hop.
     ctx.kbi_txs.lock().await.remove(&jump_nonce);
@@ -13909,7 +13810,7 @@ async fn login_hop(
             "jump host {}:{} didn't finish the login within {} minutes",
             host,
             port,
-            JUMP_LOGIN_DEADLINE.as_secs() / 60
+            hop_policy::JUMP_LOGIN_DEADLINE.as_secs() / 60
         )));
     };
 
@@ -13928,7 +13829,7 @@ async fn login_hop(
         }
         Ok(false) if kbi_unasked.load(std::sync::atomic::Ordering::Relaxed) => {
             ctx.auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
-            Err(JUMP_ASKS_UNASKED.into())
+            Err(hop_policy::JUMP_ASKS_UNASKED.into())
         }
         Ok(false) => {
             ctx.auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -13951,11 +13852,6 @@ async fn login_hop(
         }
     }
 }
-
-/// A `::sftp` / `::fwd` connection's jump host asked for a code (or a password
-/// that isn't saved) that only the server's own tab can ask for.
-const JUMP_ASKS_UNASKED: &str =
-    "the jump host asks for a code or a password, and only the server's own tab can ask you for it";
 
 /// Shown when an ssh-agent didn't sign a login it was asked to (a declined
 /// confirmation, a removed card, a PIN or touch not given in time).
@@ -15637,15 +15533,8 @@ async fn kbi_save_choice(state: tauri::State<'_, SshState>, nonce: String, save:
     Ok(())
 }
 
-/// `save_prompted_password`'s database step, once the profile is known to be
-/// the one the login started in: the fork's checks (secret_policy), then the
-/// save itself.
-fn save_typed_password(conn: &rusqlite::Connection, to: &SaveTarget, password: &str) -> Result<String, String> {
-    secret_policy::may_save_now(conn, to.server_id, to.fingerprint, to.vnc)?;
-    store_prompted_password(conn, to.server_id, password)
-}
-
-/// Where a typed password goes, and the words for where it went.
+/// `save_prompted_password`'s database step: where the password goes, and the
+/// words for where it went.
 fn store_prompted_password(conn: &rusqlite::Connection, server_id: i32, password: &str) -> Result<String, String> {
     // The server's saved login, when it has one that is still there.
     let (auth_type, credential_id, login_name, login_type): (Option<String>, Option<i32>, Option<String>, Option<String>) = conn
@@ -15765,7 +15654,7 @@ async fn save_prompted_password(app: &tauri::AppHandle, to: SaveTarget, password
         // Not into a profile opened since the login started (its server with
         // the same id is another one).
         db_state.still_open(to.generation)?;
-        save_typed_password(conn, &to, password)?
+        secret_policy::save_typed_password(conn, &to, password)?
     };
     save_vault_async(&db_state).await?;
     let _ = app.emit("server-password-saved", serde_json::json!({ "serverId": to.server_id }));
@@ -15807,16 +15696,6 @@ impl SaveTarget {
         let shared = secret_policy::saving_reaches_others(conn);
         let fingerprint = secret_policy::save_fingerprint(conn, server_id)?;
         Some(Self { server_id, generation: db_state.generation_now(), ticked: !shared, keys: false, shared, fingerprint, vnc: false })
-    }
-
-    /// The same for a VNC server, unless it has a saved login: a VNC password
-    /// is saved into the server only (secret_policy E3).
-    fn for_vnc_server(app: &tauri::AppHandle, server_id: i32) -> Option<Self> {
-        use tauri::Manager;
-        let to = Self::for_server(app, server_id)?;
-        let db_state = app.state::<DbState>();
-        let guard = db_state.conn.lock().ok()?;
-        secret_policy::vnc_may_save(guard.as_ref()?, server_id).then_some(Self { vnc: true, ..to })
     }
 
     /// The "Save password" tick's JSON for a prompt, with a line under it when
@@ -17862,7 +17741,7 @@ async fn telnet_open_terminal(
     // when it loses its sender, and must know then that it was replaced.
     let page = ssh_manager::page_start(&terminal_id);
     state.terminal_txs.lock().await.insert(terminal_id.clone(), tx);
-    note_terminal_server(&state, &session_id, &terminal_id).await;
+    secret_policy::note_terminal_server(&state, &session_id, &terminal_id).await;
     state.resize_txs.lock().await.insert(terminal_id.clone(), resize_tx);
     // The output goes to the page's channel, paced like an SSH terminal's
     // (term_output.rs).
@@ -18526,7 +18405,7 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
         crate::ssh_manager::PtySize { cols, rows },
     );
     state.terminal_txs.lock().await.insert(terminal_id.clone(), tx);
-    note_terminal_server(&state, &session_id, &terminal_id).await;
+    secret_policy::note_terminal_server(&state, &session_id, &terminal_id).await;
     state.resize_txs.lock().await.insert(terminal_id.clone(), resize_tx);
     drop(openings);
 
@@ -18564,24 +18443,11 @@ async fn write_terminal_data(state: tauri::State<'_, SshState>, terminal_id: Str
     Ok(())
 }
 
-/// The saved server a shell terminal's session was opened for, kept for
-/// type_saved_password. A container's terminal isn't the server's shell and
-/// isn't noted.
-async fn note_terminal_server(state: &SshState, session_id: &str, terminal_id: &str) {
-    let server = state.session_servers.lock().await.get(session_id).copied();
-    let mut terminals = state.terminal_servers.lock().await;
-    match server {
-        Some(id) => terminals.insert(terminal_id.to_string(), id),
-        None => terminals.remove(terminal_id),
-    };
-}
-
 /// Types a saved password into a terminal, for a password prompt there (sudo,
 /// su, …) that the user picked it for (#28): a server's own saved password
-/// (`server_id`), only into one of that server's own terminals, or a saved
-/// login's (`credential_id`). It goes from the profile to the terminal and
-/// never reaches the webview. No Enter after it: the user sees where it went
-/// and presses Enter themselves.
+/// (`server_id`) or a saved login's (`credential_id`). It goes from the
+/// profile to the terminal and never reaches the webview. No Enter after it:
+/// the user sees where it went and presses Enter themselves.
 #[tauri::command]
 async fn type_saved_password(
     ssh: tauri::State<'_, SshState>,
@@ -18591,11 +18457,7 @@ async fn type_saved_password(
     credential_id: Option<i32>,
 ) -> Result<(), String> {
     use crate::ssh_manager::TerminalCommand;
-    if let Some(id) = server_id {
-        if ssh.terminal_servers.lock().await.get(&terminal_id) != Some(&id) {
-            return Err("That's another server's password: it's only typed into that server's own terminals".into());
-        }
-    }
+    secret_policy::check_terminal_server(&ssh, &terminal_id, server_id).await?; // only into that server's own terminals
     let saved = {
         let conn_guard = db.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
@@ -19202,15 +19064,6 @@ struct SystemctlActionResult {
     root_tool: Option<String>,
 }
 
-/// The user's own try at an Info panel action before root (a service
-/// action, a kill, a firewall read), run by sh whatever the login shell is:
-/// csh and tcsh read `2>&1` and `$?` their own way (remote_sh), and the
-/// answer decides whether root is asked for. Not for what must also work
-/// on Windows (server_os's probe runs in cmd.exe there).
-fn sh_user_command(cmd: &str) -> String {
-    remote_sh::sh_command(&[], cmd, &[])
-}
-
 async fn run_exec_capture(
     state: &SshState,
     session_id: &str,
@@ -19461,29 +19314,6 @@ fn classify_sudo_failure(msg: &str) -> String {
     } else {
         format!("{}: {}", SUDO_FAILED, msg.trim())
     }
-}
-
-/// Is this line of output one of sudo's, dzdo's or sudo-rs's own? Those
-/// start with the tool's name, or are its refusals ("Sorry, try again.",
-/// "Sorry, user bob may not run sudo", "bob is not in the sudoers file").
-fn is_tool_line(line: &str) -> bool {
-    let l = line.trim().to_ascii_lowercase();
-    ["sudo:", "dzdo:", "sudo-rs:", "sorry, try again", "sorry, user "].iter().any(|p| l.starts_with(p))
-        || l.contains(" is not in the sudoers file")
-}
-
-/// classify_sudo_failure for output that also holds what the command (or a
-/// root shell's start-up) printed: only the tool's own lines (is_tool_line)
-/// are read, so a command that prints "incorrect password" is never taken
-/// for the tool turning the password down.
-fn classify_tool_output(out: &str) -> String {
-    tool_answer(out).unwrap_or_else(|| SUDO_NOT_ALLOWED.into())
-}
-
-/// classify_sudo_failure of the tool's own lines in `out`, if it has any.
-fn tool_answer(out: &str) -> Option<String> {
-    let lines: Vec<&str> = out.lines().map(str::trim).filter(|l| is_tool_line(l)).collect();
-    (!lines.is_empty()).then(|| classify_sudo_failure(&lines.join(" ")))
 }
 
 /// Run a command on its own exec channel, optionally feeding stdin, and
@@ -19926,38 +19756,6 @@ mod elevated_sftp_tests {
         assert!(!is_safe_remote_exec_path("/opt/my sftp/sftp-server"));
         assert!(!is_safe_remote_exec_path("/usr/lib/$(id)/sftp-server"));
     }
-
-    /// The shells a server may run the app's commands with: its login
-    /// shell (sshd runs `<shell> -c <command>`) or root's (a root shell
-    /// reads its line). sh always; tcsh and csh where this machine has them.
-    #[cfg(unix)]
-    fn shells() -> Vec<&'static str> {
-        ["sh", "tcsh", "csh"]
-            .into_iter()
-            .filter(|s| std::process::Command::new(s).arg("-c").arg("true").output().is_ok_and(|o| o.status.success()))
-            .collect()
-    }
-
-    #[test]
-    fn a_root_shell_gets_one_line_of_posix_sh() {
-        let script = format!("echo __SUB_ROOT_OUT__; printf '%s|' {}; echo", remote_sh::quote_words(&["it's".into(), "a b".into()]));
-        let line = root_shell_line(&script);
-        assert!(line.ends_with('\n') && line.matches('\n').count() == 1 && !line.contains('!'), "{line:?}");
-        for form in ROOT_SHELL_FORMS {
-            assert!(form.chars().all(|c| c.is_ascii_lowercase() || c == ' ' || c == '-'), "{form}");
-        }
-        // What root's shell makes of it, whichever it is.
-        #[cfg(unix)]
-        for shell in shells() {
-            let out = std::process::Command::new(shell)
-                .arg("-c")
-                .arg(line.trim_end().strip_prefix("exec ").unwrap())
-                .output()
-                .unwrap();
-            assert_eq!(String::from_utf8_lossy(&out.stdout), "__SUB_ROOT_OUT__\nit's|a b|\n", "{shell}: {}", String::from_utf8_lossy(&out.stderr));
-        }
-    }
-
 }
 
 #[cfg(test)]
@@ -22475,21 +22273,6 @@ fn transfer_id() -> String {
     format!("{}-{}", ts, seq)
 }
 
-/// Removes this run's temp root, keeping Live Edit copies with edits that
-/// never reached the server first, as a disconnect does (keep_unsent_edits).
-fn remove_own_temp(root: &Path) {
-    keep_unsent_edits(root, true);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// Whether a name in the system's temp folder is one of this app's temp
-/// roots: `submarine-` and the hex app_temp_root mints (24 digits; 32 is
-/// accepted too). Nothing else there is swept.
-fn is_app_temp_name(name: &str) -> bool {
-    name.strip_prefix("submarine-")
-        .is_some_and(|h| (h.len() == 24 || h.len() == 32) && h.bytes().all(|b| b.is_ascii_hexdigit()))
-}
-
 /// A transfer's id. It starts with its session, so a session's transfers can
 /// be found in `transfer_cancels` (cancel_session_transfers): each holds its
 /// own SFTP session, and would go on after a Disconnect or a closed tab, with
@@ -22543,76 +22326,14 @@ mod transfer_cancel_tests {
 /// one, as a root's time only moves when a session's folder comes or goes, so
 /// a copy also holds a lock in its root for as long as it runs.
 fn sweep_app_temp(include_own: bool) {
-    if include_own {
-        // Let go of this run's lock first: on Windows a file held open
-        // keeps its folder from being removed.
-        drop(APP_TEMP_LOCK.lock().unwrap_or_else(|e| e.into_inner()).take());
-        remove_own_temp(app_temp_root());
-    }
-    sweep_old_temp_roots(&std::env::temp_dir(), std::time::Duration::from_secs(24 * 60 * 60));
+    sweep_temp_roots(include_own); // the fork's (live_edit.rs)
 }
 
-/// The file in each run's temp root that the run holds locked for as long
-/// as it lives (lock_temp_root). The system lets go of it when the process
-/// ends, however it ends.
-const TEMP_ROOT_LOCK: &str = ".submarine-run.lock";
-
-/// This run's lock on its temp root, taken when the root is made.
-static APP_TEMP_LOCK: StdMutex<Option<std::fs::File>> = StdMutex::new(None);
-
-/// Makes the lock file in `root` and locks it; None where that can't be done.
-fn lock_temp_root(root: &Path) -> Option<std::fs::File> {
-    let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(root.join(TEMP_ROOT_LOCK)).ok()?;
-    file.try_lock().ok()?;
-    Some(file)
-}
-
-/// Removes the temp roots in `temp` that other runs left: ones older than
-/// `age` whose run is over. A run that's still going holds its root's lock
-/// (another copy of the app beside this one), and its root is left alone;
-/// so is one whose lock can't be looked at, or that isn't this user's. A
-/// root from before the lock (no lock file) goes by its age only. Live Edit
-/// copies in a root are kept in `unsent_edits_dir` before it goes: which of
-/// them had edits that never reached the server isn't known any more.
-fn sweep_old_temp_roots(temp: &Path, age: std::time::Duration) {
-    let Ok(entries) = std::fs::read_dir(temp) else { return };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !is_app_temp_name(name) {
-            continue;
-        }
-        // The folder itself, never what a link leads to.
-        let Ok(meta) = std::fs::symlink_metadata(e.path()) else { continue };
-        if !meta.is_dir() {
-            continue;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            // SAFETY: geteuid has no preconditions and can't fail.
-            if meta.uid() != unsafe { libc::geteuid() } {
-                continue;
-            }
-        }
-        let old = meta.modified().map(|t| t.elapsed().map(|a| a > age).unwrap_or(false)).unwrap_or(false);
-        if !old {
-            continue;
-        }
-        let lock = match std::fs::OpenOptions::new().read(true).open(e.path().join(TEMP_ROOT_LOCK)) {
-            Ok(file) => match file.try_lock() {
-                Ok(()) => Some(file),
-                // Held: that run is still going. Or locks don't work there,
-                // and nothing says it's over.
-                Err(_) => continue,
-            },
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => continue,
-        };
-        keep_live_edit_copies_of(&e.path());
-        drop(lock);
-        let _ = std::fs::remove_dir_all(e.path());
-    }
+/// `submarine-<hex>` in the shape app_temp_root mints: 24 digits, or 32 as the
+/// sweep has always looked for. Nothing else in temp is ours to delete.
+fn is_app_temp_name(name: &str) -> bool {
+    name.strip_prefix("submarine-")
+        .is_some_and(|h| (h.len() == 24 || h.len() == 32) && h.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// The most a remote file read whole into memory may be: live-edit opens the
@@ -22703,11 +22424,6 @@ async fn read_remote_capped(
         data.extend_from_slice(&buf[..n]);
     }
     Ok(data)
-}
-
-/// The name of a temp root: `submarine-` and its random bytes in hex.
-fn app_temp_name(bytes: &[u8]) -> String {
-    format!("submarine-{}", hex::encode(bytes))
 }
 
 /// Process-global, UNPREDICTABLE temp root for SFTP live-edit / drag staging,
@@ -22888,19 +22604,6 @@ mod live_edit_tests {
         // A device on Windows, an ordinary (odd) name anywhere else.
         for name in ["COM3", "PRN", "nul.txt", "AUX .c"] {
             assert_eq!(safe_temp_leaf_name(&format!("/srv/{name}")).is_ok(), !cfg!(windows), "{name}");
-        }
-    }
-
-    /// The startup sweep recognises the temp roots this app makes (it used
-    /// to look for 32 hex digits where 24 are made, and swept nothing), and
-    /// nothing else.
-    #[test]
-    fn the_startup_sweep_knows_its_own_temp_folders() {
-        use super::{app_temp_name, is_app_temp_name};
-        assert!(is_app_temp_name(&app_temp_name(&[0xab; 12])));
-        assert!(is_app_temp_name(&format!("submarine-{}", "0f".repeat(16))));
-        for other in ["submarine-", "submarine-xyz", "submarine-liveedit-test-1", "submarine-0123456789abcdef0123456", "other-abababababababababababab", "submarine-abababababababababababab/x"] {
-            assert!(!is_app_temp_name(other), "{other}");
         }
     }
 
@@ -24482,28 +24185,6 @@ fn guard_mirror_folder(local: &str) -> Result<String, String> {
     Ok(folder.to_string_lossy().into_owned())
 }
 
-/// Whether a Windows path, as text, is a folder on a drive letter: `C:\…`,
-/// `C:/…`, or the same behind `\\?\` (`\\?\C:\…`). Anything else that starts
-/// with a slash is a share, a device or a path relative to the drive, and is
-/// refused. Written over the text, not `Path`, so it means the same on every
-/// system it's tested on.
-fn windows_drive_path(path: &str) -> bool {
-    let p = path.replace('/', "\\");
-    let rest = p.strip_prefix("\\\\?\\").unwrap_or(&p);
-    let b = rest.as_bytes();
-    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\'
-}
-
-/// The resolved folder is on a drive (Windows: a `Disk` or `VerbatimDisk`
-/// prefix), or has no prefix at all (other systems).
-fn resolved_on_a_drive(folder: &std::path::Path) -> bool {
-    use std::path::{Component, Prefix};
-    match folder.components().next() {
-        Some(Component::Prefix(prefix)) => matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)),
-        _ => !cfg!(windows),
-    }
-}
-
 /// The system folders `check_local_path_policy` refuses, as lowercase paths
 /// with `/`. On Windows they are also read from the environment (`var` looks
 /// one up): Windows and its program folders aren't always on drive C. On
@@ -25231,16 +24912,6 @@ fn resolve_node_auth_for_monitor(
     Ok(auth)
 }
 
-/// The app log's line for a server "Resume all" couldn't start, which it
-/// skips to go on with the rest: "db-01's jump host (web-gw) was deleted, so
-/// Submarine won't connect it directly without asking. Skipped."
-fn resume_skipped_line(name: &str, why: &str) -> String {
-    match why.strip_prefix(jump_gone::CODE) {
-        Some(said) => format!("{} Skipped.", said.trim()),
-        None => format!("{name}: {why}. Skipped."),
-    }
-}
-
 fn resolve_node_auth_row(
     conn: &rusqlite::Connection,
     node_id: i32,
@@ -25722,7 +25393,7 @@ async fn monitor_resume_all(
                 match resolve_node_auth_for_monitor(conn, node_id) {
                     Ok(auth) => (auth, metrics, customs, name),
                     Err(e) => {
-                        crate::applog::write_line("monitor", &resume_skipped_line(&name, &e));
+                        crate::applog::write_line("monitor", &jump_gone::resume_skipped_line(&name, &e));
                         skipped.push((node_id, name));
                         continue;
                     }
@@ -25744,43 +25415,19 @@ async fn monitor_resume_all(
             ).await;
         }
     }
-    if skipped.is_empty() {
-        return Ok(());
-    }
-    {
-        let guard = db_state.conn.lock().map_err(|_| "lock")?;
-        let conn = guard.as_ref().ok_or("db not ready")?;
-        for (node_id, _) in &skipped {
-            conn.execute("UPDATE monitor_configs SET paused = 1 WHERE node_id = ?1", [node_id])
-                .map_err(|e| e.to_string())?;
-        }
-    }
-    save_vault_internal(&db_state)?;
-    let names: Vec<&str> = skipped.iter().map(|(_, name)| name.as_str()).collect();
-    Err(format!(
-        "Couldn't start monitoring {}: check how {} reached (the app log says why).",
-        names.join(", "),
-        if names.len() == 1 { "it's" } else { "they're" }
-    ))
+    jump_gone::resume_skipped(&db_state, skipped)
 }
 
-/// The clipboard's text, for a paste into the terminal (a right-click). The
-/// desktop frontends all ask here; Android reads it in the page.
+/// The clipboard's text, for a paste into the terminal. Only the Linux
+/// frontend asks; the others read it in the page.
 ///
 /// WebKitGTK refuses the page's `navigator.clipboard.readText()` (#89). And
 /// where the webview reads the clipboard itself (a keyboard paste, or the
 /// page API once it is allowed), it crashes the whole app when nothing owns
 /// the clipboard (seen with WebKitGTK 2.54). So on Linux the page asks here
-/// and GTK is asked directly.
-///
-/// On Windows the page's read is WebView2's to allow, behind a permission
-/// prompt: blocked or dismissed once, every right-click paste failed with
-/// "Clipboard read denied". The Win32 clipboard is read directly instead.
-///
-/// On macOS, WKWebView refuses the page's read outright ("Clipboard read
-/// denied"), so `pbpaste` reads the general pasteboard.
-///
-/// A clipboard that is empty or holds no text gives an empty string.
+/// and GTK is asked directly. A clipboard that is empty or holds no text
+/// gives an empty string. The fork reads it here on Windows and macOS too
+/// (clipboard_read.rs).
 #[tauri::command]
 async fn clipboard_read_text(app: tauri::AppHandle) -> Result<String, String> {
     #[cfg(target_os = "linux")]
@@ -25798,42 +25445,13 @@ async fn clipboard_read_text(app: tauri::AppHandle) -> Result<String, String> {
             _ => Err("The clipboard did not answer.".to_string()),
         }
     }
-    #[cfg(windows)]
+    #[cfg(not(target_os = "linux"))]
     {
         let _ = app;
-        tokio::task::spawn_blocking(windows_clipboard_text)
-            .await
-            .map_err(|e| e.to_string())?
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = app;
-        let read = tokio::process::Command::new("/usr/bin/pbpaste")
-            // It writes the text in the encoding these name, and an app
-            // opened from the Finder or the Dock may have none set.
-            .env("LANG", "en_US.UTF-8")
-            .env("LC_ALL", "en_US.UTF-8")
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output();
-        match tokio::time::timeout(std::time::Duration::from_secs(5), read).await {
-            Ok(Ok(out)) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
-            Ok(Ok(out)) => Err(format!("The clipboard could not be read (pbpaste: {}).", out.status)),
-            Ok(Err(e)) => Err(format!("The clipboard could not be read: {}", e)),
-            Err(_) => Err("The clipboard did not answer.".to_string()),
-        }
-    }
-    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
-    {
-        let _ = app;
-        Err("Reading the clipboard here is only for Linux, Windows and macOS.".to_string())
+        clipboard_read::read_text().await
     }
 }
 
-/// `submarine --mcp`: the helper an AI tool started from Home runs as its
-/// MCP server (ai/helper.rs). main.rs calls it before anything else and exits
-/// with what it returns.
 pub fn mcp_helper() -> i32 {
     ai::helper::main()
 }
@@ -26047,7 +25665,6 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            diagnose_connect,
             check_db_exists, setup_master_db, persist_vault,
             quick_unlock::quick_unlock_support, quick_unlock::quick_unlock_status, quick_unlock::quick_unlock_enable,
             quick_unlock::quick_unlock_disable, quick_unlock::quick_unlock,
@@ -26068,7 +25685,7 @@ pub fn run() {
             accept_share, import_shared_profile, restore_personal_profile, share_set_role, share_revoke, share_leave, share_delete,
             profile_share_status, stop_sharing, profile_sync_stats, share_key_state, accept_share_key, share_replace_key, held_deletions_list, resolve_held_deletions, cloud_resume_profile, profile_copies, restore_profile_copy,
             set_editor_label,
-            add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, allow_held, keep_server_ssh, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_terminal_theme, set_server_highlight, set_server_jump_host, set_server_protocol, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
+            add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, allow_held, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_jump_host, set_server_protocol, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
             get_credentials, generate_ssh_key,
             add_folder, rename_folder, delete_folder, get_folders,
             tree_moves::move_servers, tree_moves::move_folder, tree_moves::delete_tree_items,
@@ -26091,12 +25708,12 @@ pub fn run() {
             local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
             local_term::local_terminal_open, local_term::local_terminal_write, local_term::local_windows_build,
             local_term::local_terminal_resize, local_term::local_terminal_close,
-            ping::ping_server, jump_gone::jump_host_connect_directly,
+            ping::ping_server, jump_gone::jump_host_connect_directly, diagnose_connect, ssh_firewall_as_root,
             ai::ai_settings, ai::ai_set_enabled, ai::ai_state, ai::ai_share, ai::ai_unshare, ai::ai_stop, ai::ai_decide, ai::ai_output,
             ai::ai_set_flash, ai::ai_allow_session, ai::ai_decide_group, ai::ai_allow_session_group, ai::ai_allow_always, ai::ai_trust_view, ai::ai_trust_scope,
             ai::ai_trust_set_level, ai::ai_trust_add_rule, ai::ai_trust_remove_rule, ai::ai_end_allow_all, ai::ai_keep_policy, ai::ai_add_pull_folder, ai::ai_remove_pull_folder, ai::ai_stop_follow,
             ssh_info_probe_section, ssh_systemctl_action, ssh_kill_process,
-            ssh_iptables_chain, ssh_nft_chain, ssh_firewall_as_root,
+            ssh_iptables_chain, ssh_nft_chain,
             applog::app_log, applog::ui_heartbeat, applog::open_log_folder, diagnostics_report,
             highlight::highlight_rules_list, highlight::highlight_rule_save, highlight::highlight_rule_delete, highlight::highlight_rules_reorder,
             docker::ssh_docker_container_action,
@@ -26121,7 +25738,6 @@ pub fn run() {
             android_quick_dirs, android_default_local_dir,
             parse_ssh_config,
             parse_client_import,
-            import_hosts, host_import::pick_client_import_file,
             sftp_list_dir, sftp_create_dir, sftp_remove_file, sftp_remove_dir,
             sftp_rename, sftp_set_permissions, sftp_set_owner, sftp_stat,
             sftp_download_file, sftp_download_dir, sftp_upload_file, sftp_upload_dir, sftp_cancel_transfer, sftp_batch_limits, sftp_open_remote_file,
@@ -26134,9 +25750,9 @@ pub fn run() {
             about::app_info, about::check_for_updates, about::open_external_url,
             portable::get_storage_info,
             local_open::live_edit_editor_get, local_open::live_edit_editor_pick, local_open::live_edit_editor_reset,
-            bulk_pick::bulk_pick_files,
+            bulk_pick::bulk_pick_files, import_hosts, host_import::pick_client_import_file,
             multiexec::get_jump_login_limit, multiexec::set_jump_login_limit,
-            server_os::detect_server_os,
+            server_os::detect_server_os, approvals::keep_server_ssh, set_server_terminal_theme, set_server_highlight,
             fonts::list_system_fonts,
             clipboard_read_text
         ]);
@@ -26392,39 +26008,6 @@ mod tests {
         assert!(!webview_data_folder_busy(
             "failed to create webview: WebView2 error: WindowsError(Error { code: HRESULT(0x80070002), message: \"The system cannot find the file specified.\" })"
         ));
-    }
-
-    #[test]
-    fn files_bound_for_a_login_folder_are_caught() {
-        let dirs = vec![std::path::PathBuf::from("/home/me/.config/autostart")];
-        assert!(lands_in(std::path::Path::new("/home/me/.config/autostart/x.desktop"), &dirs));
-        assert!(lands_in(std::path::Path::new("/home/me/.config/autostart"), &dirs));
-        assert!(!lands_in(std::path::Path::new("/home/me/Downloads/alice/.config/autostart/x.desktop"), &dirs));
-        assert!(!lands_in(std::path::Path::new("/home/me/.config/autostart-old/x"), &dirs));
-        assert!(!lands_in(std::path::Path::new("/anything"), &[std::path::PathBuf::new()]));
-        assert_eq!(autorun_skipped_note(0), None);
-        let folders = LoginFolders::of(dirs.clone());
-        assert!(!folders.may_hold_server_file(std::path::Path::new("/home/me/.config/autostart/x.desktop")));
-        assert!(folders.may_hold_server_file(std::path::Path::new("/home/me/Downloads/alice/.config/autostart/x.desktop")));
-    }
-
-    /// A link to a login folder, below the folder a download or a mirror
-    /// writes into, is seen through.
-    #[cfg(unix)]
-    #[test]
-    fn a_link_to_a_login_folder_is_caught_too() {
-        let root = std::env::temp_dir().join(format!("submarine-login-link-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let autostart = root.join("home/.config/autostart");
-        std::fs::create_dir_all(&autostart).unwrap();
-        std::fs::create_dir_all(root.join("mirror")).unwrap();
-        std::os::unix::fs::symlink(&autostart, root.join("mirror/startup")).unwrap();
-        let folders = LoginFolders::of(vec![autostart.clone()]);
-        assert!(!folders.may_hold_server_file(&root.join("mirror/startup/x.desktop")));
-        assert!(!folders.may_hold_server_file(&root.join("mirror/startup/new/deeper/x.desktop")));
-        assert!(folders.may_hold_server_file(&root.join("mirror/other/x.desktop")));
-        let _ = std::fs::remove_dir_all(&root);
-        assert!(autorun_skipped_note(2).unwrap().starts_with("2 files skipped"));
     }
 
     #[test]

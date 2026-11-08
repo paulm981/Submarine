@@ -1204,6 +1204,12 @@ pub(crate) struct Peek {
     pub unreadable: usize,
 }
 
+/// Drops the open profile's delta-sync cursor: the next round is a full one.
+pub(crate) fn forget_sync_cursor(db_state: &DbState) -> Result<(), String> {
+    *db_state.sync_cursor.lock().map_err(|_| "[STATE] LOCK_SYNC_CURSOR")? = None;
+    Ok(())
+}
+
 pub(crate) async fn peek(app: &tauri::AppHandle, db: &DbState) -> Result<Option<Peek>, String> {
     let _turn = store_turn(app).await?;
     let Some(open) = open_profile(db, None)? else { return Ok(None) };

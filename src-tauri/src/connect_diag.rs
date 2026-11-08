@@ -264,6 +264,33 @@ mod connect_route_tests {
     }
 }
 
+// The fork's own test of lib.rs's drive_connect_with_prompt_timeout: the
+// window a prompt taken over from another session gets (prompt_epoch).
+#[cfg(test)]
+mod prompt_window_tests {
+    // A session that waited on another's prompt and then asks itself gets its
+    // own full window, not what is left of the connect's first 110s.
+    #[tokio::test]
+    async fn a_prompt_taken_over_gets_a_fresh_window() {
+        use crate::{drive_connect_with_prompt_timeout, ConnectTimeout, ConnectTimeoutCaps};
+        use std::time::Duration;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let caps = ConnectTimeoutCaps { handshake: Duration::from_millis(100), hard: Duration::from_millis(500) };
+        let pending = AtomicBool::new(true);
+        let epoch = AtomicU32::new(0);
+        let start = std::time::Instant::now();
+        let bump = async {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            epoch.fetch_add(1, Ordering::SeqCst);
+        };
+        let driven = drive_connect_with_prompt_timeout(std::future::pending::<()>(), &pending, &epoch, caps);
+        let (res, _) = tokio::join!(driven, bump);
+        assert!(matches!(res, Err(ConnectTimeout::PromptHardCap)));
+        // Counted from the takeover (350ms) plus the window (400ms), not from the start.
+        assert!(start.elapsed() >= Duration::from_millis(700), "cut short after {:?}", start.elapsed());
+    }
+}
+
 // Every call from the original project's code into this file (fork_hooks.rs):
 // a sync that drops one, or the lines that bring the file in, fails here.
 #[cfg(test)]

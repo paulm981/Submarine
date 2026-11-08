@@ -31,7 +31,7 @@ fn a_server_whose_jump_host_is_gone_is_skipped_and_said_so() {
         Err(e) => e,
     };
     assert_eq!(
-        resume_skipped_line("db-01", &why),
+        crate::jump_gone::resume_skipped_line("db-01", &why),
         "db-01's jump host was deleted, so Submarine won't connect it directly without asking. Skipped."
     );
     // Deleted here: noted with its name, the link cleared, and still skipped.
@@ -42,8 +42,8 @@ fn a_server_whose_jump_host_is_gone_is_skipped_and_said_so() {
         Err(e) => e,
     };
     assert_eq!(
-        resume_skipped_line("db-02", &why),
+        crate::jump_gone::resume_skipped_line("db-02", &why),
         "db-02's jump host (web-gw) was deleted, so Submarine won't connect it directly without asking. Skipped."
     );
-    assert_eq!(resume_skipped_line("rdp-01", "an RDP server can't be monitored"), "rdp-01: an RDP server can't be monitored. Skipped.");
+    assert_eq!(crate::jump_gone::resume_skipped_line("rdp-01", "an RDP server can't be monitored"), "rdp-01: an RDP server can't be monitored. Skipped.");
 }

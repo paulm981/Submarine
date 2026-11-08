@@ -123,6 +123,49 @@ pub fn saving_reaches_others(conn: &Connection) -> bool {
     crate::approvals::profile_is_shared(conn)
 }
 
+/// `save_prompted_password`'s database step (lib.rs), once the profile is
+/// known to be the one the login started in: these checks (may_save_now),
+/// then the save itself (lib.rs, store_prompted_password).
+pub(crate) fn save_typed_password(conn: &Connection, to: &crate::SaveTarget, password: &str) -> Result<String, String> {
+    may_save_now(conn, to.server_id, to.fingerprint, to.vnc)?;
+    crate::store_prompted_password(conn, to.server_id, password)
+}
+
+impl crate::SaveTarget {
+    /// The same for a VNC server, unless it has a saved login: a VNC password
+    /// is saved into the server only (secret_policy E3).
+    pub(crate) fn for_vnc_server(app: &tauri::AppHandle, server_id: i32) -> Option<Self> {
+        use tauri::Manager;
+        let to = Self::for_server(app, server_id)?;
+        let db_state = app.state::<crate::DbState>();
+        let guard = db_state.conn.lock().ok()?;
+        vnc_may_save(guard.as_ref()?, server_id).then_some(Self { vnc: true, ..to })
+    }
+}
+
+/// The saved server a shell terminal's session was opened for, kept for
+/// type_saved_password (lib.rs) and `check_terminal_server`. A container's
+/// terminal isn't the server's shell and isn't noted.
+pub(crate) async fn note_terminal_server(state: &crate::SshState, session_id: &str, terminal_id: &str) {
+    let server = state.session_servers.lock().await.get(session_id).copied();
+    let mut terminals = state.terminal_servers.lock().await;
+    match server {
+        Some(id) => terminals.insert(terminal_id.to_string(), id),
+        None => terminals.remove(terminal_id),
+    };
+}
+
+/// type_saved_password (lib.rs): a server's own saved password (`server_id`)
+/// is typed only into one of that server's own terminals.
+pub(crate) async fn check_terminal_server(ssh: &crate::SshState, terminal_id: &str, server_id: Option<i32>) -> Result<(), String> {
+    if let Some(id) = server_id {
+        if ssh.terminal_servers.lock().await.get(terminal_id) != Some(&id) {
+            return Err("That's another server's password: it's only typed into that server's own terminals".into());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,23 +292,23 @@ mod tests {
         let conn = app_db();
         // Unchanged: the server's own password is replaced.
         let to = target(&conn, 3, false);
-        assert_eq!(crate::save_typed_password(&conn, &to, "new-pw").unwrap(), "this server");
+        assert_eq!(save_typed_password(&conn, &to, "new-pw").unwrap(), "this server");
         assert_eq!(server_pw(&conn, 3).as_deref(), Some("new-pw"));
         // Linked to the shared saved login while the user typed: nothing is
         // saved, and the login keeps its password.
         let to = target(&conn, 3, false);
         conn.execute("UPDATE servers SET auth_type = 'vault', credential_id = 7 WHERE id = 3", []).unwrap();
-        assert!(crate::save_typed_password(&conn, &to, "typed-for-db").is_err());
+        assert!(save_typed_password(&conn, &to, "typed-for-db").is_err());
         assert_eq!(login_pw(&conn), "login-pw");
         // Pointed at another host while the user typed: nothing is saved.
         let to = target(&conn, 1, false);
         conn.execute("UPDATE servers SET host = 'elsewhere' WHERE id = 1", []).unwrap();
-        assert!(crate::save_typed_password(&conn, &to, "typed-for-web").is_err());
+        assert!(save_typed_password(&conn, &to, "typed-for-web").is_err());
         assert_eq!(login_pw(&conn), "login-pw");
         // Unchanged and using the saved login: the login's password, which the
         // prompt said.
         let to = target(&conn, 2, false);
-        assert!(crate::save_typed_password(&conn, &to, "new-login-pw").unwrap().contains("ops"));
+        assert!(save_typed_password(&conn, &to, "new-login-pw").unwrap().contains("ops"));
         assert_eq!(login_pw(&conn), "new-login-pw");
     }
 
@@ -273,14 +316,14 @@ mod tests {
     fn in_the_apps_tables_a_vnc_password_never_reaches_a_saved_login() {
         let conn = app_db();
         let to = target(&conn, 6, true);
-        assert_eq!(crate::save_typed_password(&conn, &to, "vnc-new").unwrap(), "this server");
+        assert_eq!(save_typed_password(&conn, &to, "vnc-new").unwrap(), "this server");
         assert_eq!(server_pw(&conn, 6).as_deref(), Some("vnc-new"));
         // Linked to the saved login since: refused, even with a fingerprint
         // taken after the link.
         conn.execute("UPDATE servers SET auth_type = 'vault', credential_id = 7 WHERE id = 6", []).unwrap();
         assert!(!vnc_may_save(&conn, 6));
         let to = target(&conn, 6, true);
-        assert!(crate::save_typed_password(&conn, &to, "vnc-pw-2").is_err());
+        assert!(save_typed_password(&conn, &to, "vnc-pw-2").is_err());
         assert_eq!(login_pw(&conn), "login-pw");
     }
 
@@ -315,8 +358,9 @@ mod tests {
             ("secret_policy::saving_reaches_others(", 1, "SaveTarget::for_server (E4)"),
             ("secret_policy::SHARED_PROFILE_NOTE", 1, "SaveTarget::offer (E4)"),
             ("secret_policy::save_fingerprint(", 1, "SaveTarget::for_server"),
-            ("secret_policy::may_save_now(", 1, "save_typed_password"),
-            ("save_typed_password(conn, &to, password)", 1, "save_prompted_password"),
+            ("secret_policy::save_typed_password(conn, &to, password)", 1, "save_prompted_password"),
+            ("secret_policy::note_terminal_server(&state, &session_id, &terminal_id)", 2, "open_terminal and telnet_open_terminal"),
+            ("secret_policy::check_terminal_server(&ssh, &terminal_id, server_id)", 1, "type_saved_password"),
             ("secret_policy::kbi_round(", 1, "run_keyboard_interactive"),
             ("secret_policy::may_save_for_login(", 2, "login_hop and initiate_connection"),
             ("secret_policy::stop_opening_by_itself(", 1, "share_current_profile (E5)"),
