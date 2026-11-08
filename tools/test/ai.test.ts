@@ -151,7 +151,7 @@ describe("approval levels", () => {
 describe("sharedWith", () => {
   it("lists the AI tabs a server's tab is shared with", () => {
     const snap: AiSnapshot = {
-      enabled: true, pending: [], running: [], history: [], audit_log: null,
+      enabled: true, pending: [], server_asks: [], running: [], history: [], audit_log: null,
       tabs: [
         { id: "a", label: "A", intruder_at: null, servers: [server({ session_id: "s1" })] },
         { id: "b", label: "B", intruder_at: null, servers: [server({ session_id: "s2" })] },

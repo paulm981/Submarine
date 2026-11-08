@@ -117,7 +117,7 @@ async fn the_helper_talks_mcp_over_stdin_and_stdout() {
     h.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await;
     let tools = h.call(2, "tools/list", json!({})).await;
     let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["list_shared", "run_command", "run_on_servers", "copy_files", "follow", "read_follow", "stop_follow"]);
+    assert_eq!(names, ["list_shared", "run_command", "run_on_servers", "copy_files", "follow", "read_follow", "stop_follow", "request_server"]);
     // MCP's standard hints.
     let listed_tools = &tools["result"]["tools"];
     assert_eq!(listed_tools[0]["annotations"], json!({ "readOnlyHint": true }));

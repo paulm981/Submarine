@@ -194,6 +194,22 @@ it ended, as read_follow does. Its id then stops working.",
                 "additionalProperties": false
             },
             "annotations": { "destructiveHint": false, "openWorldHint": true }
+        },
+        {
+            "name": "request_server",
+            "description": "Ask the user to share a server with you by its name, when the one you need isn't in list_shared. The user is \
+asked in Submarine and may say no; you get no list of their servers, and only a server's exact name (ignoring case) is found. \
+Once shared, it's in list_shared and its own approval settings apply. Wait for the answer before asking again: one request \
+for a server waits at a time.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "maxLength": 128, "description": "The server's name, as the user calls it." }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": false, "openWorldHint": false }
         }
     ])
 }

@@ -166,7 +166,7 @@ export const AiTitleButtons = ({ show, isMobile, v, open, onToggle }: {
 }) => {
   const ai = useAi();
   if (!show || !ai.enabled) return null;
-  const waiting = cardsOf(ai.pending).length;
+  const waiting = cardsOf(ai.pending).length + (ai.server_asks ?? []).length;
   return (
     <div className="relative no-drag shrink-0 mx-1 flex items-center gap-1">
       {HAS_HOME && !isMobile && <AiPaneButton v={v} />}
