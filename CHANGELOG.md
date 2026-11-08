@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.54
+
+- **Many terminals open without freezing the window.** Opening a Wall of 36 terminals, or starting a profile with many servers, held the window for seconds. Terminals now open a few at a time, the one you're looking at first, and share what they measure of the font, so the window keeps answering while the rest catch up. ([#127](https://github.com/paulm981/Submarine/issues/127))
+
 ## v0.4.0-fork.53
 
 - **A new AI level: Run commands that only read, ask before changes.** The AI can look around a server without asking: `ps aux | grep nginx`, `df -h`, `journalctl -u nginx`, `systemctl status`, `docker logs`. Anything that changes things still asks, and so do root, copies, anything that reaches out (`curl`, `ping`) and reading files that usually hold secrets, such as `.env` or `.ssh`. Submarine decides from a list of programs it knows only read, never the AI. **Run anything** stays as it is, for lab servers. ([#190](https://github.com/paulm981/Submarine/issues/190))
