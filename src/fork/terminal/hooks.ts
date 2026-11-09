@@ -34,9 +34,11 @@ export type TerminalProps = {
 };
 
 export const useTerminal = ({
-  sessionId, terminalId, local, attachOnly, serverId, onShellReady, shown, shownRef, isActive, isActiveRef, isActiveView, inView,
+  sessionId, terminalId, local, attachOnly, serverId, serverName = "", onShellReady, shown, shownRef, isActive, isActiveRef, isActiveView, inView,
 }: TerminalProps & {
   sessionId: string;
+  /// The server tab's name, for what the right-click menu says it edits on.
+  serverName?: string;
   terminalId: string;
   attachOnly: boolean;
   serverId: number;
@@ -131,7 +133,7 @@ export const useTerminal = ({
   const onScreen = () => isActiveRef.current || shownRef.current || dockedRef.current;
 
   return {
-    sessionId, terminalId, local, attachOnly, serverId, commands, outputRef, highlightRef, outputChannel, resetHighlight,
+    sessionId, terminalId, local, attachOnly, serverId, serverName, commands, outputRef, highlightRef, outputChannel, resetHighlight,
     readyWatchRef, stopReadyWatch, shellReady, watchForShellReady, rootInvoke, dockElRef, dockEl, setDockEl,
     gpuUpdateRef, dockedRef, lookingNow, onScreen,
   };

@@ -28,11 +28,15 @@ type Tab = { id: string; serverName: string; serverUuid?: string | null; protoco
 type KeptState = { kept: boolean; running: boolean };
 
 /** `run` (a terminal's on-connect commands), unless the terminal picked up a
- *  session that was still running: they're only for a new one. */
-export function skipIfKept(terminalId: string, run: () => void): () => void {
-  return () => {
-    invoke<KeptState>("keep_session_state", { terminalId }).then((s) => { if (!s.running) run(); }, run);
-  };
+ *  session that was still running: they're only for a new one. Done once
+ *  they've been typed, or left out (for "Open terminal here", whose `cd`
+ *  comes after them). */
+export function skipIfKept(terminalId: string, run: () => void | Promise<void>): () => Promise<void> {
+  return () =>
+    invoke<KeptState>("keep_session_state", { terminalId }).then(
+      (s) => (s.running ? undefined : run()),
+      () => run(),
+    );
 }
 
 /** Shows the sessions list of the server with sync id `uuid`, over one of its

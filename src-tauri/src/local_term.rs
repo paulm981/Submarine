@@ -930,7 +930,7 @@ pub async fn local_terminal_open(
             .ok_or("That shell isn't on this computer.")?;
             // "Open terminal here" (#72): a folder on this computer to start in.
             if let Some(dir) = cwd {
-                chosen.cwd = Some(start_folder(&dir)?);
+                start_in(&mut chosen, start_folder(&dir)?);
             }
             pty::open(&app, &terms, &terminal_id, &chosen, cols, rows, on_output)?;
             Ok(chosen.label)
@@ -989,6 +989,19 @@ pub(crate) fn start_folder(dir: &str) -> Result<PathBuf, String> {
         Ok(m) if m.is_dir() => Ok(path),
         _ => Err(format!("{dir} isn't a folder on this computer any more.")),
     }
+}
+
+/// Start `shell` in `dir`: its working folder, and for WSL, whose `--cd ~`
+/// would take it home whatever folder it was started in, `--cd` that folder
+/// (WSL takes a Windows path there).
+#[cfg(not(target_os = "android"))]
+fn start_in(shell: &mut Shell, dir: PathBuf) {
+    if let Some(at) = shell.args.iter().position(|a| a == "--cd") {
+        if let Some(to) = shell.args.get_mut(at + 1) {
+            *to = dir.to_string_lossy().into_owned();
+        }
+    }
+    shell.cwd = Some(dir);
 }
 
 /// Where a shell starts: an AI tool in its own folder, the rest in your
@@ -1091,6 +1104,30 @@ mod tests {
             assert!(start_folder(bad).is_err(), "{bad:?}");
         }
         assert!(start_folder(&format!("/{}", "x".repeat(5000))).is_err());
+        // Each check on its own, on a folder that is one (the tests run in
+        // src-tauri, which has `src`): relative, a NUL, too long.
+        let msg = "That isn't a folder on this computer.";
+        assert!(std::path::Path::new("src").is_dir());
+        assert_eq!(start_folder("src").unwrap_err(), msg, "relative, though it exists");
+        let tmp = dir.to_str().unwrap();
+        assert_eq!(start_folder(&format!("{tmp}\0")).unwrap_err(), msg);
+        assert_eq!(start_folder(&format!("{tmp}{}", "/.".repeat(2100))).unwrap_err(), msg);
+    }
+
+    /// "Open terminal here" with WSL as the shell: its `--cd ~` would take
+    /// it home, so the folder goes there instead.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn wsl_starts_in_the_folder_asked_for() {
+        // As wsl_shell (Windows only) makes them.
+        let mut wsl = shell("wsl:Ubuntu", "Ubuntu", "WSL", PathBuf::from("wsl.exe"), &["-d", "Ubuntu", "--cd", "~"]);
+        let dir = std::env::temp_dir();
+        start_in(&mut wsl, dir.clone());
+        assert_eq!(wsl.args, vec!["-d".to_string(), "Ubuntu".into(), "--cd".into(), dir.to_string_lossy().into_owned()]);
+        assert_eq!(wsl.cwd, Some(dir.clone()));
+        let mut plain = shell("wsl", "WSL (default)", "WSL", PathBuf::from("wsl.exe"), &["--cd", "~"]);
+        start_in(&mut plain, dir.clone());
+        assert_eq!(plain.args, vec!["--cd".to_string(), dir.to_string_lossy().into_owned()]);
     }
 
     #[test]
