@@ -19,6 +19,8 @@
 //   panel); a server's choice syncs with it, like its color scheme.
 // ─────────────────────────────────────────────────────────────────────────────
 
+import { RE2JS } from "../fork/vendor/re2js/index.js";
+
 export type HighlightColor =
   | "red" | "green" | "yellow" | "blue" | "magenta" | "cyan"
   | "bright-red" | "bright-green" | "bright-yellow" | "bright-blue" | "bright-magenta" | "bright-cyan"
@@ -359,76 +361,105 @@ function ruleSource(rule: SetRule): string {
   return [...(plain.length ? [`\\b(?:${plain.map(src).join("|")})\\b`] : []), ...other].join("|");
 }
 
-/** Why a rule can't be used, or null when it can. A regular expression is
- *  tried on text made to trip up slow ones first: one that takes too long
- *  there would freeze the window on real output. */
+/** The most instructions a user's expression may compile to. RE2's time is
+ *  the line's length times this, so it bounds how long one line takes: at
+ *  600, a 4096-character line takes tens of milliseconds at worst. A full
+ *  IPv6 address expression is about 500; most rules are under 50. */
+const MOST_INSTRUCTIONS = 600;
+
+/** Text with words, numbers, spaces and punctuation, for an expression that
+ *  only ever matches nothing (`\b`, `\b|foo`) to show itself on. */
+const EMPTY_PROBE = "Hello, world 42 a-b_c.d\tE!";
+
+/** Why a rule can't be used, or null when it can. */
 export function ruleProblem(rule: Pick<CustomRule, "pattern" | "kind" | "matchCase">): string | null {
   if (!rule.pattern.trim()) return "Type the text to highlight.";
   if (rule.pattern.length > 500) return "That's too long; keep it under 500 characters.";
   if (rule.kind !== "regex") return null;
-  let re: RegExp;
+  const re2 = compileRe2(rule.pattern, rule.matchCase);
+  if ("error" in re2) return re2.error;
+  return re2Problem(re2.re2);
+}
+
+function re2Problem(re2: RE2JS): string | null {
+  if (re2.programSize() > MOST_INSTRUCTIONS) {
+    return "That expression is too big to run on every line of output. Make its repeat counts ({…}) smaller, or split it into two rules.";
+  }
+  const m = re2.matcher(EMPTY_PROBE);
+  if (re2.matcher("").find() || (m.find() && m.start() === m.end())) {
+    return "That expression can match empty text, so it would highlight nothing. Make sure it always matches at least one character.";
+  }
+  return null;
+}
+
+/** RE2's complaint about an expression, in words someone can act on. */
+function re2Error(message: string, matchCase: boolean): string {
+  // Any case is RE2JS's `(?i)` in front: not what was typed.
+  const said = message.replace(/^error parsing regexp:\s*/, "");
+  const why = matchCase ? said : said.replace("`(?i)", "`");
+  if (/escape sequence: `\\[1-9]/.test(why)) return "Back-references (\\1) aren't supported.";
+  if (/`\(\?<?[=!]/.test(why)) return "Lookarounds ((?=…), (?!…), (?<=…), (?<!…)) aren't supported.";
+  if (/escape sequence: `\\u/.test(why)) return "Write a character by its code as \\x{2713}; \\u2713 isn't supported.";
+  return `That isn't a regular expression Submarine can use: ${why}`;
+}
+
+// A user's expressions, compiled: for the rule being typed, every few
+// keystrokes as well as the saved ones. Emptied when it's this full, so
+// typing a long expression can't keep every prefix.
+const MOST_KEPT = 64;
+const re2s = new Map<string, { re2: RE2JS } | { error: string }>();
+
+/** A user's regular expression, on RE2 (src/fork/vendor/re2js): its time
+ *  grows with the length of the line times the expression's size
+ *  (MOST_INSTRUCTIONS), never exponentially, as JavaScript's own engine can
+ *  (#49). */
+function compileRe2(pattern: string, matchCase: boolean): { re2: RE2JS } | { error: string } {
+  const key = `${matchCase ? 1 : 0}${pattern}`;
+  const kept = re2s.get(key);
+  if (kept) return kept;
+  let out: { re2: RE2JS } | { error: string };
   try {
-    re = new RegExp(rule.pattern, rule.matchCase ? "g" : "gi");
-  } catch {
-    return "That isn't a valid regular expression.";
+    out = { re2: RE2JS.compile(pattern, matchCase ? 0 : RE2JS.CASE_INSENSITIVE) };
+  } catch (e) {
+    out = { error: re2Error(e instanceof Error ? e.message : String(e), matchCase) };
   }
-  if (re.test("")) return "That expression matches empty text, so it would match everywhere.";
-  return slowPattern(re) ? "That expression is too slow on some text (it would freeze the window). Try a simpler one." : null;
+  if (re2s.size >= MOST_KEPT) re2s.clear();
+  re2s.set(key, out);
+  return out;
 }
 
-/** True when `re` takes more than a few ms on short text built from its own
- *  characters: the usual sign of one whose time grows exponentially with the
- *  length of a line. Lengths grow a little at a time, so the try that shows
- *  it is itself still short. */
-function slowPattern(re: RegExp): boolean {
-  const chars = new Set(["a", "0", " ", ".", "-", "_", "x"]);
-  for (const c of re.source) if (/[\w .:\/@-]/.test(c)) chars.add(c);
-  const tails = ["\u0001", "!", ""];
-  const probe = new RegExp(re.source, re.flags.replace("g", ""));
-  for (const n of [6, 10, 14, 18, 22, 26, 30, 36, 42, 50, 60]) {
-    for (const c of chars) {
-      for (const tail of tails) {
-        const text = c.repeat(n) + tail;
-        if (slowOn(probe, text) && slowOn(probe, text) && slowOn(probe, text)) return true;
-      }
-    }
-  }
-  return false;
-}
+// Compiled once per rule as it is; emptied as re2s is.
+const customRegexes = new Map<string, Compiled | null>();
 
-/** Over 3 ms on `text`. Asked three times before a pattern is called slow,
- *  so a pause for garbage collection can't make a good one look bad. */
-function slowOn(re: RegExp, text: string): boolean {
-  const t0 = performance.now();
-  re.test(text);
-  return performance.now() - t0 > 3;
-}
-
-// Checked once per rule as it is (the check runs the expression ~1000 times).
-const customRegexes = new Map<string, RegExp | null>();
+/** A user's rule, compiled: JavaScript's engine for words and text, RE2 for
+ *  regular expressions. */
+type Compiled = { re: RegExp } | { re2: RE2JS };
 
 /** A custom rule's regex, or null when it can't be used. */
-function customRegex(rule: CustomRule): RegExp | null {
+function customRegex(rule: CustomRule): Compiled | null {
   if (!rule.enabled) return null;
-  const key = JSON.stringify([rule.pattern, rule.kind, rule.matchCase]);
-  if (!customRegexes.has(key)) customRegexes.set(key, compileCustom(rule));
+  const key = ruleKey(rule);
+  if (!customRegexes.has(key)) {
+    if (customRegexes.size >= MOST_KEPT) customRegexes.clear();
+    customRegexes.set(key, compileCustom(rule));
+  }
   return customRegexes.get(key)!;
 }
 
-/** Regular-expression rules are off in this build: the speed check can be
- *  fooled (a fixed start, then a nested repeat), and one slow expression
- *  freezes the window on every device the rule syncs to. They're kept as
- *  they are, and come back once they can run where they can be stopped. */
-export const REGEX_RULES_ON = false;
+const ruleKey = (rule: Pick<CustomRule, "pattern" | "kind" | "matchCase">) => JSON.stringify([rule.pattern, rule.kind, rule.matchCase]);
 
-function compileCustom(rule: CustomRule): RegExp | null {
-  if (rule.kind === "regex" && !REGEX_RULES_ON) return null;
+function compileCustom(rule: CustomRule): Compiled | null {
+  if (rule.kind === "regex") {
+    if (!rule.pattern.trim() || rule.pattern.length > 500) return null;
+    const re2 = compileRe2(rule.pattern, rule.matchCase);
+    return "re2" in re2 && !re2Problem(re2.re2) ? re2 : null;
+  }
   if (ruleProblem(rule)) return null;
   const flags = rule.matchCase ? "g" : "gi";
   const escaped = escapeRegex(rule.pattern);
-  const source = rule.kind === "regex" ? rule.pattern : rule.kind === "word" ? wholeWord(escaped, rule.pattern) : escaped;
+  const source = rule.kind === "word" ? wholeWord(escaped, rule.pattern) : escaped;
   try {
-    return new RegExp(source, flags);
+    return { re: new RegExp(source, flags) };
   } catch {
     return null;
   }
@@ -460,16 +491,53 @@ function mergeSpans(taken: Span[], add: Span[]): Span[] {
 }
 
 interface Scanner {
-  re: RegExp;
-  /** The style of a match: by which capture group matched, for a set. */
-  styleOf: (m: RegExpExecArray) => HighlightStyle | null;
+  /** JavaScript's engine (a set's patterns, a user's words and text), or
+   *  RE2 (a user's regular expression). */
+  re?: RegExp;
+  re2?: RE2JS;
+  /** The style of a match: by which capture group matched, for a set; null
+   *  `m` for RE2's, whose style doesn't depend on it. */
+  styleOf: (m: RegExpExecArray | null) => HighlightStyle | null;
   /** A user's rule: watched for being slow, and dropped if it is. */
-  custom?: { label: string; off: boolean };
+  custom?: { label: string; key: string; off: boolean };
+}
+
+/** Where a line of text sits on the terminal's line: the character before
+ *  it ("" at the line's start) and after it ("" at its end, null when not
+ *  known yet). A program's colors cut a terminal line into several pieces;
+ *  these let `^`, `$` and `\b` in a user's expression mean the terminal
+ *  line's start, end and word edges, not the piece's. */
+export interface Edges {
+  before: string;
+  after: string | null;
+}
+
+/** Stands for what isn't known: a character no expression is likely to be
+ *  written for, and not a word character, so `\b` reads it as an edge. */
+const UNKNOWN = "\u0000";
+
+/** RE2's matches in `text`, with the characters around it as context; each
+ *  placed in `text` and cut to it. */
+function scanRe2(re2: RE2JS, style: HighlightStyle | null, text: string, edges?: Edges): Span[] {
+  const out: Span[] = [];
+  if (!style) return out;
+  const before = edges?.before ?? "";
+  const after = edges ? (edges.after ?? UNKNOWN) : "";
+  const at = before.length;
+  const m = re2.matcher(before + text + after);
+  for (let found = m.find(at); found; found = m.find()) {
+    const start = m.start() - at;
+    const end = Math.min(m.end() - at, text.length);
+    if (start >= text.length) break;
+    if (end > start) out.push([start, end, style]);
+  }
+  return out;
 }
 
 function scan(sc: Scanner, text: string): Span[] {
   const out: Span[] = [];
   const re = sc.re;
+  if (!re) return out;
   re.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text))) {
@@ -485,25 +553,37 @@ function scan(sc: Scanner, text: string): Span[] {
   return out;
 }
 
+/** The most time one rule may take on one batch. Past it, the rule stops
+ *  there and is off for the rest of the session. */
+const SLOW_RULE_MS = 50;
+/** Rules turned off for being slow, so a new matcher (a rule changed, or
+ *  another server's set) doesn't try them again. */
+const slowRules = new Set<string>();
+
 /** A user's rule, line by line (the lines of `text`, split at "\n"), its
- *  spans placed in `text`. */
-function scanLines(sc: Scanner, text: string): Span[] {
+ *  spans placed in `text`. `edges`: each line's, in order. */
+function scanLines(sc: Scanner, text: string, edges?: readonly Edges[]): Span[] {
   const custom = sc.custom!;
   const out: Span[] = [];
   const t0 = performance.now();
   let at = 0;
-  while (at <= text.length) {
+  for (let line = 0; at <= text.length; line++) {
     let nl = text.indexOf("\n", at);
     if (nl < 0) nl = text.length;
     if (nl - at <= CUSTOM_MAX_TEXT && nl > at) {
-      for (const [s, e, st] of scan(sc, text.slice(at, nl))) out.push([s + at, e + at, st]);
+      const piece = text.slice(at, nl);
+      const spans = sc.re2 ? scanRe2(sc.re2, sc.styleOf(null), piece, edges?.[line]) : scan(sc, piece);
+      for (const [s, e, st] of spans) out.push([s + at, e + at, st]);
+      // Slow on real output after all: off for the rest of the session,
+      // from here on.
+      if (performance.now() - t0 > SLOW_RULE_MS) {
+        custom.off = true;
+        slowRules.add(custom.key);
+        slowRuleListener?.(custom.label);
+        break;
+      }
     }
     at = nl + 1;
-  }
-  // Slow on real output after all: off for the rest of the session.
-  if (performance.now() - t0 > 50) {
-    custom.off = true;
-    slowRuleListener?.(custom.label);
   }
   return out;
 }
@@ -518,12 +598,13 @@ export class Matcher {
   /** The spans to color in `text`, sorted and not overlapping. `text` is
    *  lines joined by "\n"; no span crosses one. The set's rules scan it
    *  whole: one scan per rule per batch, where one per line cost more than
-   *  the matching. */
-  find(text: string): Span[] {
+   *  the matching. `edges`: where each line sits on the terminal's line;
+   *  without them, each is a whole line. */
+  find(text: string, edges?: readonly Edges[]): Span[] {
     let spans: Span[] = [];
     for (const sc of this.scanners) {
       if (sc.custom) {
-        if (!sc.custom.off) spans = mergeSpans(spans, scanLines(sc, text));
+        if (!sc.custom.off) spans = mergeSpans(spans, scanLines(sc, text, edges));
       } else {
         spans = mergeSpans(spans, scan(sc, text));
       }
@@ -570,7 +651,7 @@ function setScans(set: HighlightSet): Scanner[] {
         next += 1 + groupCount(src);
         return `(${src})`;
       });
-      add(parts.join("|"), (m) => groups.find((g) => m[g.index] !== undefined)?.style ?? null);
+      add(parts.join("|"), (m) => groups.find((g) => m?.[g.index] !== undefined)?.style ?? null);
     } else {
       const rule = layer as SetRule;
       const style = rule.style;
@@ -588,10 +669,11 @@ export function buildMatcher(setId: string, custom: readonly CustomRule[]): Matc
   if (setId === HIGHLIGHT_NONE) return null;
   const scanners: Scanner[] = [];
   for (const rule of custom) {
-    const re = customRegex(rule);
-    if (re) {
+    const compiled = customRegex(rule);
+    if (compiled) {
       const style: HighlightStyle = { color: rule.color, bold: rule.bold, underline: rule.underline };
-      scanners.push({ re, styleOf: () => style, custom: { label: rule.pattern, off: false } });
+      const key = ruleKey(rule);
+      scanners.push({ ...compiled, styleOf: () => style, custom: { label: rule.pattern, key, off: slowRules.has(key) } });
     }
   }
   scanners.push(...setScans(highlightSetById(setId)));
@@ -696,12 +778,23 @@ const budget = { start: 0, spent: 0 };
 
 /** Plain text that may be highlighted, with the attributes it's printed in
  *  (a highlight's codes put back what they change). */
-interface Plain {
+interface Plain extends Edges {
   text: string;
   bold: boolean;
   dim: boolean;
   underline: boolean;
 }
+
+/** The first and last character of `text`, a pair of surrogates whole. */
+const firstChar = (text: string) => String.fromCodePoint(text.codePointAt(0)!);
+const lastChar = (text: string) => {
+  const c = text.charCodeAt(text.length - 1);
+  return text.slice(c >= 0xdc00 && c <= 0xdfff && text.length > 1 ? -2 : -1);
+};
+
+/** CSI finals that move the cursor: what's printed next isn't known to
+ *  follow what was printed before (A–H, I, Z, `, a, d, e, f). */
+const MOVES = new Set([..."ABCDEFGHIZ`adef"].map((c) => c.charCodeAt(0)));
 
 export class HighlightStream {
   private decoder = new TextDecoder();
@@ -720,6 +813,12 @@ export class HighlightStream {
   private saved: { main: Attrs | null; alt: Attrs | null } = { main: null, alt: null };
   /** The end of the last batch, waiting for the rest of its line. */
   private held: Plain | null = null;
+  /** The last character printed on the cursor's line: "" at its start,
+   *  UNKNOWN after the cursor moved. */
+  private prev = "";
+  /** The last piece of plain text, while nothing has been printed after it:
+   *  what comes next tells it how its line goes on. */
+  private open: Plain | null = null;
   private timer = 0;
   private matcher: Matcher | null = null;
 
@@ -758,6 +857,8 @@ export class HighlightStream {
     this.attrs.reset();
     this.saved = { main: null, alt: null };
     this.alt = false;
+    this.prev = "";
+    this.open = null;
     this.decoder = new TextDecoder();
     return held;
   }
@@ -818,7 +919,7 @@ export class HighlightStream {
     const rest = from ? parts.slice(from) : parts;
     const plain = rest.filter((p): p is Plain => typeof p !== "string");
     if (!plain.length || !this.matcher) return out + rest.map((p) => (typeof p === "string" ? p : p.text)).join("");
-    const spans = this.matcher.find(plain.map((p) => p.text).join("\n"));
+    const spans = this.matcher.find(plain.map((p) => p.text).join("\n"), plain);
     let k = 0;
     let base = 0;
     for (const p of rest) {
@@ -849,17 +950,31 @@ export class HighlightStream {
     // What the last batch held back: the start of this batch's first line.
     let carry = this.held;
     this.held = null;
+    // Only this batch's pieces can still be told how their line goes on.
+    this.open = carry;
     while (i < n) {
       if (this.st === St.Ground) {
         CONTROL.lastIndex = i;
         const m = CONTROL.exec(text);
         const j = m ? m.index : n;
-        if (j > i && this.matcher && !this.alt && this.attrs.plain) {
-          if (i > copy) parts.push(text.slice(copy, i));
-          const a = this.attrs;
-          if (carry && i === 0) carry.text += text.slice(0, j);
-          else parts.push({ text: text.slice(i, j), bold: a.bold, dim: a.dim, underline: a.underline });
-          copy = j;
+        if (j > i) {
+          const piece = text.slice(i, j);
+          let next: Plain | null = null;
+          if (this.matcher && !this.alt && this.attrs.plain) {
+            if (i > copy) parts.push(text.slice(copy, i));
+            const a = this.attrs;
+            if (carry && i === 0) {
+              carry.text += piece;
+              next = carry;
+            } else {
+              next = { text: piece, bold: a.bold, dim: a.dim, underline: a.underline, before: this.prev, after: null };
+              parts.push(next);
+            }
+            copy = j;
+          }
+          if (this.open && this.open !== next) this.open.after = firstChar(piece);
+          this.open = next;
+          this.prev = lastChar(piece);
         }
         if (carry) {
           // Its line went on (it's first in this batch) or ended before.
@@ -870,6 +985,8 @@ export class HighlightStream {
         const c = text.charCodeAt(j);
         i = j + 1;
         if (c === 0x1b) this.st = St.Esc;
+        else if (c === 0x0a || c === 0x0d) this.lineEnds();
+        else if (c === 0x08) this.moved();
         else this.c1(c);
         continue;
       }
@@ -896,6 +1013,7 @@ export class HighlightStream {
             this.attrs.reset();
             this.alt = false;
             this.saved = { main: null, alt: null };
+            this.lineEnds();
             this.st = St.Ground;
           } else if (c === 0x37 || c === 0x38) {
             // ESC 7 saves the attributes, ESC 8 puts them back.
@@ -946,9 +1064,24 @@ export class HighlightStream {
     this.strOsc = osc;
   }
 
+  /** A carriage return or line feed: the line ends here, and what's printed
+   *  next starts one. */
+  private lineEnds() {
+    if (this.open) this.open.after = "";
+    this.open = null;
+    this.prev = "";
+  }
+
+  /** The cursor moved: what's printed next doesn't follow what came before. */
+  private moved() {
+    this.open = null;
+    this.prev = UNKNOWN;
+  }
+
   /** A C1 control (`c`, 0x80–0x9f) where a sequence may start. */
   private c1(c: number) {
-    if (c === 0x9b) this.enterCsi();
+    if (c === 0x85) this.lineEnds();
+    else if (c === 0x9b) this.enterCsi();
     else if (c === 0x9d || c === 0x90 || c === 0x98 || c === 0x9e || c === 0x9f) this.enterStr(c === 0x9d);
   }
 
@@ -983,6 +1116,8 @@ export class HighlightStream {
     } else if (final === 0x70 && p === "!") {
       // ESC [ ! p: a soft reset, attributes included.
       this.attrs.reset();
+    } else if (MOVES.has(final) && !/[<=>?\x20-\x2f]/.test(p)) {
+      this.moved();
     }
   }
 }

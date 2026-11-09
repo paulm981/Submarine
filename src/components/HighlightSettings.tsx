@@ -7,7 +7,6 @@ import {
   HIGHLIGHT_MINE,
   HIGHLIGHT_NONE,
   HIGHLIGHT_SETS,
-  REGEX_RULES_ON,
   ansiFor,
   buildMatcher,
   grayBrights,
@@ -66,8 +65,9 @@ const KINDS: { id: RuleKind; name: string }[] = [
   { id: "text", name: "Anywhere" },
   { id: "regex", name: "Regular expression" },
 ];
-// The kinds a rule can be given here (see REGEX_RULES_ON).
-const PICKABLE = KINDS.filter((k) => k.id !== "regex" || REGEX_RULES_ON);
+// The kinds a rule can be given here: all of them, regular expressions on
+// RE2 (#49).
+const PICKABLE = KINDS;
 
 const blankRule = (): CustomRule => ({
   pattern: "",
@@ -415,9 +415,11 @@ export function HighlightSettings({ settings, setSettings, onRulesChanged }: any
                   </span>
                   <span className="text-[10.5px] text-zinc-500">
                     {KINDS.find((k) => k.id === r.kind)?.name}
-                    {r.kind === "regex" && !REGEX_RULES_ON ? " (off in this build)" : ""}
                     {r.matchCase ? ", match case" : ""}
                   </span>
+                  {/* A rule from another computer or an older build that this
+                      one can't use is kept, and says why it does nothing. */}
+                  {ruleProblem(r) && <span className="text-[10.5px] text-amber-400/90 whitespace-normal">Not used: {ruleProblem(r)}</span>}
                 </span>
                 <button type="button" aria-label="Move up" title="Move up" disabled={i === 0} onClick={() => void move(i, -1)} className="p-1 text-zinc-500 hover:text-white disabled:opacity-30">
                   <ChevronUp size={14} />

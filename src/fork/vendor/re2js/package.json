@@ -1,0 +1,16 @@
+{
+  "name": "re2js",
+  "version": "2.9.1",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/le0pard/re2js.git"
+  },
+  "homepage": "https://github.com/le0pard/re2js#readme",
+  "author": "Oleksii Vasyliev",
+  "vendored": {
+    "from": "build/index.js and build/index.d.ts of the npm package re2js@2.9.1, unchanged",
+    "sha256": "4e31fa6284914b14a23cc677be509f7ad8e43c00ff8d48bbe3486a30e3120373"
+  }
+}
