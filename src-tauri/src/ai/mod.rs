@@ -315,6 +315,9 @@ struct SharedServer {
     allow_all: bool,
     /// Its level now, for the tab's marker: filled in by `snapshot`.
     level: u8,
+    /// At "Run commands that only read", whether they run by themselves
+    /// here (trust::Policy::reads_alone): filled in by `snapshot`.
+    reads_alone: bool,
     /// What this AI tab has for root there (#120), once a request as root
     /// worked: in memory only, gone when this goes (every end of access).
     /// Never in a snapshot.
@@ -1172,6 +1175,7 @@ impl AiState {
             server_id,
             allow_all: false,
             level: trust::ASK_EVERY_TIME,
+            reads_alone: false,
             root: None,
             root_via: None,
         });
@@ -1576,8 +1580,14 @@ impl AiState {
         let mut ids: Vec<Option<i64>> = self.lock().tabs.iter().flat_map(|t| t.servers.iter().map(|x| x.server_id)).collect();
         ids.sort();
         ids.dedup();
-        let levels: Vec<(Option<i64>, u8)> = ids.into_iter().map(|id| (id, (self.0.policy)(id).level)).collect();
-        let level_of = |id: Option<i64>| levels.iter().find(|(i, _)| *i == id).map(|(_, l)| *l).unwrap_or(trust::ASK_EVERY_TIME);
+        let levels: Vec<(Option<i64>, u8, bool)> = ids
+            .into_iter()
+            .map(|id| {
+                let p = (self.0.policy)(id);
+                (id, p.level, p.reads_alone())
+            })
+            .collect();
+        let level_of = |id: Option<i64>| levels.iter().find(|(i, ..)| *i == id).map(|(_, l, r)| (*l, *r)).unwrap_or((trust::ASK_EVERY_TIME, false));
         let s = self.lock();
         Snapshot {
             enabled: s.enabled,
@@ -1591,7 +1601,8 @@ impl AiState {
                         .servers
                         .iter()
                         .map(|x| SharedServer {
-                            level: level_of(x.server_id),
+                            level: level_of(x.server_id).0,
+                            reads_alone: level_of(x.server_id).1,
                             root_via: x.root.as_ref().map(|k| k.0.tool),
                             root: None,
                             ..x.clone()

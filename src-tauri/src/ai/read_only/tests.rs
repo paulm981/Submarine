@@ -347,7 +347,7 @@ fn devices_ask_however_they_re_spelled() {
         "grep --devices=read -r x /",
         "grep -rD read x /",
     ]);
-    runs(&["cat /proc/meminfo", "cat /sys/class/net/eth0/address", "grep -r listen /etc/nginx", "cat /var/log/*/error.log", "cat app*.log"]);
+    runs(&["cat /proc/meminfo", "cat /sys/class/net/eth0/address", "grep -r listen /etc/nginx", "cat /var/log/nginx/*.log", "cat app*.log"]);
 }
 
 #[test]
@@ -366,4 +366,83 @@ fn the_pipeline_is_read_as_the_shell_reads_it() {
     assert_eq!(pipeline("grep '' /x").unwrap()[0].len(), 3);
     assert!(pipeline("ls /a/*").unwrap()[0][1].glob);
     assert!(!pipeline("ls '/a/*'").unwrap()[0][1].glob);
+}
+
+// From an independent review of #191's tests: each of these ran at the
+// read-only level before.
+
+#[test]
+fn uniq_never_gets_an_output_file() {
+    // `-` is stdin, and every word after `--` is a file: `uniq - FILE` writes FILE.
+    asks(&[
+        "uniq - /etc/passwd",
+        "uniq -c - /tmp/out",
+        "uniq /etc/hosts -- -x",
+        "uniq -- - x",
+        "date '+* * * * * root touch /tmp/p' | uniq - /etc/cron.d/p",
+        "cat /etc/hosts | uniq - .bashrc",
+    ]);
+    runs(&["uniq", "uniq -c", "uniq /tmp/a", "sort x | uniq -c", "uniq -", "uniq -- x"]);
+}
+
+#[test]
+fn proc_has_no_way_back_to_a_device() {
+    asks(&[
+        "cat /proc/self/root/dev/watchdog",
+        "cat /proc/1/root/dev/sda",
+        "cat /proc/self/cwd/dev/watchdog",
+        "cat /proc/self/fd/0",
+        "cat /proc/thread-self/root/dev/watchdog",
+        "tail -f /proc/self/root/proc/kmsg",
+        "cat /proc/km*",
+        "head /proc/[k]msg",
+    ]);
+    runs(&["cat /proc/cpuinfo", "cat /proc/meminfo", "cat /proc/1/status", "cat /proc/self/status", "cat /proc/loadavg"]);
+}
+
+#[test]
+fn a_glob_that_could_name_a_secret_asks() {
+    asks(&[
+        "cat /etc/shado?",
+        "cat /etc/shado[w]",
+        "cat /etc/sudoer?",
+        "cat /srv/app/.en?",
+        "cat /srv/app/.e*",
+        "cat /home/u/.ss?/authorized_keys",
+        "cat /etc/ssh/*",
+        "cat /etc/ssl/private/*",
+        "cat /etc/ssl/private/*.p?m",
+        "cat /home/u/.ssh/id_*",
+        "cat /srv/*key",
+        // A folder could be one named `secrets`.
+        "cat /var/log/*/error.log",
+    ]);
+    // A glob that can't: a dotfile needs a glob that starts with `.`, and
+    // `.log` isn't how a key's name ends.
+    runs(&["cat /var/log/nginx/*.log", "ls -la /var/log/*.log", "tail -n 50 /var/log/app/*.txt", "wc -l /srv/data/part-?.csv"]);
+}
+
+#[test]
+fn date_never_sets_the_clock() {
+    // BSD's and busybox's -f / -D read the next word as an input format,
+    // and a `+` word after it as the date to set.
+    asks(&["date -f +%Y +%F +2020", "date -D +%Y +%F +2020", "date --file=x", "date +%F +2020", "date +%F -s 2020"]);
+    runs(&["date", "date +%F", "date -u +%s", "date -d yesterday +%F", "date -r /etc/hosts"]);
+}
+
+#[test]
+fn nothing_reaches_out_or_attaches_a_disk() {
+    asks(&[
+        "getent hosts data.attacker.example",
+        "getent ahosts x.example",
+        "getent ahostsv4 x.example",
+        "getent networks x",
+        "getent -s dns passwd",
+        "getent",
+        "rpm -qp https://x.example/a.rpm",
+        "rpm -qlp a.rpm",
+        "journalctl --image=/x.img",
+        "journalctl --ima=/x.img",
+    ]);
+    runs(&["getent passwd", "getent group docker", "getent services ssh", "rpm -qa", "rpm -qi bash", "journalctl -u nginx --root=/mnt"]);
 }

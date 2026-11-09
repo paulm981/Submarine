@@ -210,10 +210,13 @@ fn whatever_is_slipped_into_a_reading_command_asks() {
 /// test isn't only ever saying "asks".
 #[test]
 fn random_commands_run_only_when_every_part_reads() {
-    static PROGRAMS: &[&str] = &["cat", "ls", "grep", "sort", "find", "journalctl", "systemctl", "date", "rm", "sh", "tee", "curl", "sed", "awk", "xargs", "env", "sudo", "python3"];
+    static PROGRAMS: &[&str] = &["cat", "ls", "grep", "sort", "uniq", "find", "journalctl", "systemctl", "date", "rm", "sh", "tee", "curl", "sed", "awk", "xargs", "env", "sudo", "python3"];
     static ARGS: &[&str] = &[
         "-n", "5", "/var/log/syslog", "-o", "/etc/passwd", "-delete", "-exec", "--output=/x", "--out=/x", "--vacuum-size=1M", "--rot", "restart", "status",
         "stop", "nginx", "-r", "--since=today", "'x y'", "/var/log/*.log", "-uo", "-s", "+%F", "2020", ".env", "/dev/watchdog", "-l",
+        // A lone `-` is stdin or stdout, and what follows `--` is a file,
+        // whatever it starts with (`uniq - /etc/passwd`, #191's review).
+        "-", "--", "-c",
     ];
     static JOINS: &[&str] = &[" | ", " | ", " | ", "; ", " && ", " > "];
     static CHANGES: &[&str] = &["rm", "sh", "tee", "curl", "sed", "awk", "xargs", "env", "sudo", "python3"];
@@ -252,6 +255,18 @@ fn random_commands_run_only_when_every_part_reads() {
                 "find" => has(&["-delete", "-exec"]),
                 "journalctl" => has(&["--vacuum-size=1M", "--rot"]),
                 "date" => has(&["-s", "2020"]),
+                // `uniq IN OUT`: a second file is written.
+                "uniq" => {
+                    let mut after = false;
+                    let files = args.iter().filter(|a| {
+                        if after {
+                            return true;
+                        }
+                        after = **a == "--";
+                        !after && (**a == "-" || !a.starts_with('-'))
+                    });
+                    files.count() > 1
+                }
                 "systemctl" => args.first().is_none_or(|a| *a != "status"),
                 _ => false,
             };
