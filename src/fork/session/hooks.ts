@@ -100,7 +100,7 @@ export const useOnConnect = ({ session, terminals, connectionEpoch, confirmRef, 
           // characters (a tab stays): the commands can come from anyone the
           // profile is shared with, and one could press keys nobody saw in
           // the text (pasteText.ts). The terminal says when any were left out.
-          const typeThem = (text: string) => {
+          const typeThem = async (text: string): Promise<void> => {
             const asSet = text.split(/\r\n|\r|\n/);
             const lines = asSet
               .map((l: string) => withoutPasteControls(l).trimEnd())
@@ -114,12 +114,9 @@ export const useOnConnect = ({ session, terminals, connectionEpoch, confirmRef, 
             }
             if (lines.length === 0) return;
             const bytes = Array.from(new TextEncoder().encode(lines.join('\n') + '\n'));
-            invoke('write_terminal_data', { terminalId, data: bytes }).catch(() => {});
+            await invoke('write_terminal_data', { terminalId, data: bytes }).catch(() => {});
           };
-          if (!session.runOnConnectHeld) {
-            typeThem(session.runOnConnect || "");
-            return;
-          }
+          if (!session.runOnConnectHeld) return typeThem(session.runOnConnect || "");
           // Someone this profile is shared with set or changed these
           // commands and this device hasn't allowed them: ask, never type
           // them unasked. Cancel has the focus, so a stray Enter is a no.
@@ -169,7 +166,7 @@ export const useOnConnect = ({ session, terminals, connectionEpoch, confirmRef, 
             asked = { epoch: connectionEpoch, answer: ask(session.runOnConnect || "", !!session.runOnConnectEvery) };
             onConnectAskRef.current = asked;
           }
-          void asked.answer.then((text) => { if (text !== null) typeThem(text); });
+          return asked.answer.then((text) => (text !== null ? typeThem(text) : undefined));
         })
       : undefined;
   };

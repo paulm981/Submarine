@@ -35,20 +35,37 @@ export const cdLine = (path: string): string | null => {
 };
 
 // Terminals waiting for their shell, and the line to type once it's ready.
+// One whose shell never came (it failed to open, or was closed first) is
+// let go once MAX_WAITING more are waiting.
 const cdOnReady = new Map<string, string>();
+const MAX_WAITING = 32;
 
-/** useOnConnect's callback for a terminal, with a waiting `cd` typed after
- *  whatever it types itself. Once: a terminal mounting again doesn't type
- *  it twice. */
-export const withCdHere = (terminalId: string, ready: (() => void) | undefined): (() => void) | undefined => {
-  if (!cdOnReady.has(terminalId)) return ready;
-  return () => {
-    ready?.();
+/** A terminal opened for a folder: its `cd`, typed once its shell is ready.
+ *  Exported for the tests. */
+export const waitToCd = (terminalId: string, line: string) => {
+  if (cdOnReady.size >= MAX_WAITING) cdOnReady.delete(cdOnReady.keys().next().value!);
+  cdOnReady.set(terminalId, line);
+};
+
+/** useOnConnect's callback for a terminal, with a waiting `cd` typed once
+ *  whatever it types itself has gone (the on-connect commands, after their
+ *  check and any question about them): a `cd /app` among them would
+ *  otherwise take the terminal elsewhere, and a `sudo -i` would get the
+ *  `cd` as its password. Once: a terminal mounting again doesn't type it
+ *  twice. */
+export const withCdHere = (terminalId: string, ready: (() => void | Promise<void>) | undefined): (() => Promise<void>) | undefined => {
+  if (!cdOnReady.has(terminalId)) return ready && (async () => ready());
+  return async () => {
     const line = cdOnReady.get(terminalId);
     cdOnReady.delete(terminalId);
+    try {
+      await ready?.();
+    } catch {
+      // Typed what it could; the `cd` still goes.
+    }
     if (!line) return;
     const data = Array.from(new TextEncoder().encode(`${line}\n`));
-    invoke("write_terminal_data", { terminalId, data }).catch(() => {});
+    await invoke("write_terminal_data", { terminalId, data }).catch(() => {});
   };
 };
 
@@ -80,7 +97,7 @@ export const TerminalHereListener = ({ sessionId, openTerminal }: { sessionId: s
       const line = cdLine(d.path);
       if (!line) return;
       const id = `${sessionId}-term-${Date.now()}`;
-      cdOnReady.set(id, line);
+      waitToCd(id, line);
       opener.current(id);
     };
     window.addEventListener(TERMINAL_HERE, here);

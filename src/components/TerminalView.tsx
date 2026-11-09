@@ -314,7 +314,7 @@ const TerminalView = ({
   // from ever flipping. Set here, not in an effect: a change of layout reaches
   // the observer before an effect would run, and its size would be lost.
   const shownRef = useRef(shown);
-  const fork = Fork.useTerminal({ sessionId, terminalId, local, attachOnly, serverId, onShellReady, shown, shownRef, isActive, isActiveRef, isActiveView, inView }); // the fork's state; it sets shownRef in an effect
+  const fork = Fork.useTerminal({ sessionId, terminalId, local, attachOnly, serverId, serverName, onShellReady, shown, shownRef, isActive, isActiveRef, isActiveView, inView }); // the fork's state; it sets shownRef in an effect
   // Mirror of isActiveView, read inside focusTerminal's rAF / signal
   // callbacks (which would otherwise close over a stale value).
   const isActiveViewRef = useRef(isActiveView);
