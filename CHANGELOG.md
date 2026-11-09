@@ -9,6 +9,11 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.65
+
+- **When the AI asks for a server, Stop still wins while it connects.** After you click Share, the card stays and says it's connecting; Don't share, Stop, or the AI withdrawing before the tab is up means it isn't shared. The AI side pane shows these cards and counts them, and only SSH servers are offered (not RDP, VNC or telnet), found by name ignoring case in any alphabet. ([#210](https://github.com/paulm981/Submarine/issues/210))
+- **Editing a highlighting rule no longer turns it back on, or changes its color, behind your back.** A rule you turned off on another computer stays off when you edit it here, and a color from a newer version is kept unless you pick another. On Gruvbox Dark, "Bright blue" rules show in bright blue again. Highlighting also leaves alone a few more kinds of text a program colored itself. ([#211](https://github.com/paulm981/Submarine/issues/211))
+
 ## v0.4.0-fork.64
 
 - **Right-click on a file name in a terminal edits the file shown, on the server shown.** The name is read as the terminal shows it, past wide characters (CJK, emoji) and across a long path that wraps onto the next row. Once your shell has gone on to another host with `ssh`, Edit locally isn't offered until it's back, and the menu says which server it edits on. A right-click on your prompt pastes again, and names in any alphabet get the menu. ([#209](https://github.com/paulm981/Submarine/issues/209))
