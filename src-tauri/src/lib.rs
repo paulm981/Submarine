@@ -13601,7 +13601,7 @@ async fn teardown_connection_key(state: &SshState, mirrors: &MirrorMap, key: &st
     if let Some(base) = key.strip_suffix("::sftp") {
         state.sftp_sessions.lock().await.remove(base);
     }
-    state.session_users.lock().await.remove(key);
+    state.fork.session_users.lock().await.remove(key);
     state.connections.lock().await.remove(key);
     state.jump_connections.lock().await.remove(key);
     // Wipe temp files the secondary's SFTP downloads / drags left behind.
@@ -13670,7 +13670,7 @@ async fn initiate_connection(
     let start_tunnels_inline = role == "primary" && !separate;
 
     println!("[BACKEND] initiate_connection invoked for session_id: {} (role: {}, separate: {}), server_id: {}", session_id, role, separate, server_id);
-    state.session_servers.lock().await.insert(session_id.clone(), server_id);
+    state.fork.session_servers.lock().await.insert(session_id.clone(), server_id);
 
     // Reconnect path: if a previous session under this id is still registered,
     // tear it down before starting the fresh handshake. Without this, the
@@ -13698,7 +13698,7 @@ async fn initiate_connection(
             println!("[BACKEND] Tearing down stale session for reconnect: {}", session_id);
         }
     }
-    state.session_users.lock().await.remove(&session_id);
+    state.fork.session_users.lock().await.remove(&session_id);
     // Drop any ProxyJump bastion handle from a prior attempt — dropping it
     // closes the old jump connection so the reconnect opens a fresh one.
     state.jump_connections.lock().await.remove(&session_id);
@@ -14552,7 +14552,7 @@ async fn initiate_connection(
                                 // Who it logged in as, before the connection is
                                 // there to share: the AI panel's cards say who a
                                 // command runs as (#116).
-                                app.state::<SshState>().session_users.lock().await.insert(session_id_clone.clone(), effective_user.to_string());
+                                app.state::<SshState>().fork.session_users.lock().await.insert(session_id_clone.clone(), effective_user.to_string());
                                 state_connections
                                     .lock()
                                     .await
@@ -17272,7 +17272,7 @@ async fn telnet_connect(
     server_id: i32,
     use_ssh_agent: Option<bool>,
 ) -> Result<(), String> {
-    state.session_servers.lock().await.insert(session_id.clone(), server_id);
+    state.fork.session_servers.lock().await.insert(session_id.clone(), server_id);
     use std::sync::Arc;
     use tauri::Emitter;
 
@@ -17872,7 +17872,7 @@ async fn disconnect_session(
     // the dying transport after the purge (get_sftp_session's still-current
     // check would then see the transport gone and refuse to cache).
     if session_id.ends_with("::sftp") {
-        state.session_users.lock().await.remove(&session_id);
+        state.fork.session_users.lock().await.remove(&session_id);
         state.connections.lock().await.remove(&session_id);
         if let Some(base) = session_id.strip_suffix("::sftp") {
             state.sftp_sessions.lock().await.remove(base);
@@ -18035,7 +18035,7 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
     // tab closed as it opened): that close is kept (TerminalOpenings), and
     // then the shell is closed here rather than left running. First of all,
     // so a close that comes while this waits for a lock is kept too.
-    let opening = state.terminal_openings.lock().await.begin(&terminal_id);
+    let opening = state.fork.terminal_openings.lock().await.begin(&terminal_id);
     let opened = async {
         let session_arc = {
             let connections = state.connections.lock().await;
@@ -18069,7 +18069,7 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
     }
     .await;
 
-    let mut openings = state.terminal_openings.lock().await;
+    let mut openings = state.fork.terminal_openings.lock().await;
     let wanted = openings.finish(&terminal_id, opening);
     let channel = opened?;
     if !wanted {
@@ -18182,11 +18182,11 @@ async fn resize_terminal(state: tauri::State<'_, SshState>, terminal_id: String,
 async fn close_terminal(state: tauri::State<'_, SshState>, terminal_id: String) -> Result<(), String> {
     // Held throughout, so an open finishing now either sees this close or
     // has registered the terminal already (TerminalOpenings).
-    let mut openings = state.terminal_openings.lock().await;
+    let mut openings = state.fork.terminal_openings.lock().await;
     openings.close(&terminal_id);
     state.terminal_txs.lock().await.remove(&terminal_id);
     state.resize_txs.lock().await.remove(&terminal_id);
-    state.terminal_servers.lock().await.remove(&terminal_id);
+    state.fork.terminal_servers.lock().await.remove(&terminal_id);
     drop(openings);
     Ok(())
 }

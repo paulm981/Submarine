@@ -151,8 +151,8 @@ impl crate::SaveTarget {
 /// type_saved_password (lib.rs) and `check_terminal_server`. A container's
 /// terminal isn't the server's shell and isn't noted.
 pub(crate) async fn note_terminal_server(state: &crate::SshState, session_id: &str, terminal_id: &str) {
-    let server = state.session_servers.lock().await.get(session_id).copied();
-    let mut terminals = state.terminal_servers.lock().await;
+    let server = state.fork.session_servers.lock().await.get(session_id).copied();
+    let mut terminals = state.fork.terminal_servers.lock().await;
     match server {
         Some(id) => terminals.insert(terminal_id.to_string(), id),
         None => terminals.remove(terminal_id),
@@ -163,7 +163,7 @@ pub(crate) async fn note_terminal_server(state: &crate::SshState, session_id: &s
 /// is typed only into one of that server's own terminals.
 pub(crate) async fn check_terminal_server(ssh: &crate::SshState, terminal_id: &str, server_id: Option<i32>) -> Result<(), String> {
     if let Some(id) = server_id {
-        if ssh.terminal_servers.lock().await.get(terminal_id) != Some(&id) {
+        if ssh.fork.terminal_servers.lock().await.get(terminal_id) != Some(&id) {
             return Err("That's another server's password: it's only typed into that server's own terminals".into());
         }
     }

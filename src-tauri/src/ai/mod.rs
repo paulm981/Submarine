@@ -2672,10 +2672,10 @@ pub async fn ai_share(state: tauri::State<'_, AiState>, ssh: tauri::State<'_, cr
     if session_id.contains("::") || !ssh.connections.lock().await.contains_key(&session_id) {
         return Err("That server's tab isn't connected.".into());
     }
-    let user = ssh.session_users.lock().await.get(&session_id).cloned();
+    let user = ssh.fork.session_users.lock().await.get(&session_id).cloned();
     // A quick connect is server 0: no saved server, so no settings of its
     // own and no "Always allow" for it.
-    let server_id = ssh.session_servers.lock().await.get(&session_id).map(|&id| i64::from(id)).filter(|&id| id > 0);
+    let server_id = ssh.fork.session_servers.lock().await.get(&session_id).map(|&id| i64::from(id)).filter(|&id| id > 0);
     state.share_as(&tab_id, &session_id, &name, user, server_id)
 }
 

@@ -166,7 +166,7 @@ async fn run_docker_smart(
     timeout: u64,
     password: Option<String>,
 ) -> Result<(bool, String, bool), String> {
-    let as_root = password.is_some() || state.docker_root.lock().await.contains(session_id);
+    let as_root = password.is_some() || state.fork.docker_root.lock().await.contains(session_id);
     if !as_root {
         let (code, out) = run_capture(state, session_id, &format!("{} 2>&1", cmd.shell()), timeout).await?;
         if code == 0 || !daemon_refused(&out) {
@@ -189,7 +189,7 @@ async fn run_docker_smart(
             }
         }
     };
-    state.docker_root.lock().await.insert(session_id.to_string());
+    state.fork.docker_root.lock().await.insert(session_id.to_string());
     Ok((code == 0, out, true))
 }
 
@@ -568,7 +568,7 @@ pub async fn ssh_docker_logs_start(
     };
     // A stream can't switch to root partway, so whether it needs root is
     // known first: from this tab's other docker commands, or a quick look.
-    let mut as_root = password.is_some() || state.docker_root.lock().await.contains(&session_id);
+    let mut as_root = password.is_some() || state.fork.docker_root.lock().await.contains(&session_id);
     if !as_root {
         let probe = format!("docker inspect --type=container {} 2>&1", shq(&container));
         let (code, out) = run_capture(&state, &session_id, &probe, 10).await.unwrap_or((1, String::new()));
@@ -578,7 +578,7 @@ pub async fn ssh_docker_logs_start(
     // password was waited for (root_channel).
     let (channel, marker, early) = if as_root {
         let (channel, marker, early) = crate::root_channel(&state, &session_id, &args, password, None).await?;
-        state.docker_root.lock().await.insert(session_id.clone());
+        state.fork.docker_root.lock().await.insert(session_id.clone());
         (channel, marker, early)
     } else {
         let session_arc = {
@@ -605,7 +605,7 @@ pub async fn ssh_docker_logs_start(
     let streams_map = streams.streams.clone();
     // A root shell that no longer gives root is forgotten, so the next try
     // looks again (as run_as_root does).
-    let root_access = state.root_access.clone();
+    let root_access = state.fork.root_access.clone();
     let root_session = session_id.clone();
 
     // tokio::spawn (not tauri::async_runtime::spawn) so we get a native
@@ -776,9 +776,9 @@ pub async fn open_container_terminal(
     // A close while this waits (on a lock or on the server) is kept, and the
     // shell is then closed here rather than left running (TerminalOpenings,
     // ssh_manager.rs). First of all, so no wait comes before it.
-    let opening = state.terminal_openings.lock().await.begin(&terminal_id);
+    let opening = state.fork.terminal_openings.lock().await.begin(&terminal_id);
     if !is_safe_name(&container) {
-        state.terminal_openings.lock().await.finish(&terminal_id, opening);
+        state.fork.terminal_openings.lock().await.finish(&terminal_id, opening);
         return Err("invalid container name".into());
     }
     // Shell auto-detect runs inside the container: prefer bash, fall back to
@@ -790,7 +790,7 @@ pub async fn open_container_terminal(
     };
     // As root as this tab's other docker commands are (run_docker_smart).
     // `password`: the page asked for it when root wanted one (rootInvoke).
-    let as_root = use_sudo || password.is_some() || state.docker_root.lock().await.contains(&session_id);
+    let as_root = use_sudo || password.is_some() || state.fork.docker_root.lock().await.contains(&session_id);
     let opened = async {
         let opened = if as_root {
             let (channel, _, early) = crate::root_channel(&state, &session_id, &args, password, Some((cols, rows))).await?;
@@ -817,7 +817,7 @@ pub async fn open_container_terminal(
         Ok::<_, String>(opened)
     }
     .await;
-    let mut openings = state.terminal_openings.lock().await;
+    let mut openings = state.fork.terminal_openings.lock().await;
     let wanted = openings.finish(&terminal_id, opening);
     let (channel, early) = opened?;
     if !wanted {
