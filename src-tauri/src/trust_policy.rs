@@ -479,6 +479,7 @@ mod tests {
         let key_check = [("check_server_key", "trust_policy::decide_certificate(", 1), ("check_server_key", "trust_policy::decide_plain_key(", 1)];
         assert_hooks("ssh_manager.rs", include_str!("ssh_manager.rs"), &key_check);
         assert_hooks("monitor.rs", include_str!("monitor.rs"), &key_check);
-        assert_hooks("monitor.rs", include_str!("monitor.rs"), &[("with_ssh_config", "trust_policy::known_only_by_certificate(", 1)]);
+        // The node's and its jump host's certificates, in the fork's config_target (#215).
+        assert_hooks("monitor/fork.rs", include_str!("monitor/fork.rs"), &[("config_target", "trust_policy::known_only_by_certificate(", 1)]);
     }
 }
