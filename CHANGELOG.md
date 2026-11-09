@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.61
+
+- **Regular-expression highlighting rules work again.** Your own rules can be regular expressions once more, run on RE2, which doesn't backtrack: an expression too big to run on every line is refused when you add it, and one that's still slow on real output is turned off rather than freezing the window. `^` and `$` mean the start and end of the terminal's line, even where a program colors part of it. An expression RE2 can't run (with a back-reference `\1` or a lookaround) says why when you add it, and a synced rule this computer can't use says so in the list. ([#49](https://github.com/paulm981/Submarine/issues/49))
+
 ## v0.4.0-fork.60
 
 - **Highlighting follows terminal programs more closely, and keeps its colors on Solarized.** Text after a program saves and restores its colors (as `less` and `vim` do on exit), or after some rarer escape sequences, is highlighted or left alone correctly. On Solarized, whose bright colors are grays, bright highlights show in their normal color. ([#49](https://github.com/paulm981/Submarine/issues/49))
