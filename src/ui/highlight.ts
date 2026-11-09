@@ -54,8 +54,15 @@ export function grayBrights(theme: object): Set<HighlightColor> {
   for (const c of HIGHLIGHT_COLORS) {
     if (!c.id.startsWith("bright-")) continue;
     const name = c.id.slice("bright-".length);
-    const hex = (theme as Record<string, unknown>)[`bright${name[0].toUpperCase()}${name.slice(1)}`];
-    if (typeof hex === "string" && saturation(hex) < 0.25) out.add(c.id);
+    const t = theme as Record<string, unknown>;
+    const hex = t[`bright${name[0].toUpperCase()}${name.slice(1)}`];
+    const normal = t[name];
+    // A gray: nearly no color, where its normal one has plenty. Gruvbox's
+    // muted bright blue isn't one (its normal blue is only twice as
+    // colorful), nor is Nord's bright magenta, the same as its normal one.
+    if (typeof hex === "string" && typeof normal === "string" && saturation(hex) < 0.25 && saturation(normal) >= 3 * saturation(hex)) {
+      out.add(c.id);
+    }
   }
   return out;
 }
@@ -305,10 +312,14 @@ export interface CustomRule {
   bold: boolean;
   underline: boolean;
   enabled: boolean;
+  /** The color as saved, when it's one this build doesn't know (a newer
+   *  build's): shown as red, and saved back as it was unless another is
+   *  picked (ruleToSave). */
+  savedColor?: string;
 }
 
 /** Rules as highlight_rules_list returns them, minus any this build can't
- *  use (a kind from a newer one); a color it doesn't know becomes red. */
+ *  use (a kind from a newer one); a color it doesn't know shows as red. */
 export function normalizeRules(raw: unknown): CustomRule[] {
   if (!Array.isArray(raw)) return [];
   const out: CustomRule[] = [];
@@ -324,10 +335,18 @@ export function normalizeRules(raw: unknown): CustomRule[] {
       bold: !!r.bold,
       underline: !!r.underline,
       enabled: r.enabled !== false,
+      ...(!isHighlightColor(r.color) && typeof r.color === "string" && r.color ? { savedColor: r.color } : {}),
     });
   }
   return out;
 }
+
+/** A rule as highlight_rule_save takes it: a color this build doesn't
+ *  know goes back as it was saved, unless another was picked. */
+export const ruleToSave = ({ savedColor, ...rule }: CustomRule): Omit<CustomRule, "savedColor"> => ({
+  ...rule,
+  color: (savedColor ?? rule.color) as HighlightColor,
+});
 
 const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\\/]/g, "\\$&");
 
@@ -803,6 +822,8 @@ export class HighlightStream {
   /** The string being read (OSC, or DCS, SOS, PM and APC): a BEL ends only
    *  an OSC; the others end only with ST. */
   private strOsc = false;
+  /** The CSI being read ran past what's kept of it (128 characters). */
+  private csiLong = false;
   private attrs = new Attrs();
   private alt = false;
   /** Bright colors this terminal's scheme draws as grays (grayBrights). */
@@ -1003,6 +1024,13 @@ export class HighlightStream {
         this.c1(c);
         continue;
       }
+      // Any other character past ASCII ends an escape or CSI sequence
+      // unfinished, as xterm does, and is printed: it's read again as text.
+      if (c > 0x9f && (this.st === St.Esc || this.st === St.EscInter || this.st === St.Csi)) {
+        this.st = St.Ground;
+        i--;
+        continue;
+      }
       switch (this.st) {
         case St.Esc:
           if (c === 0x5b) this.enterCsi();
@@ -1030,6 +1058,7 @@ export class HighlightStream {
           if (c === 0x1b) this.st = St.Esc;
           else if (c >= 0x20 && c <= 0x3f) {
             if (this.csi.length < 128) this.csi += text[i - 1];
+            else this.csiLong = true;
           } else if (c >= 0x40 && c <= 0x7e) {
             this.endCsi(c);
             this.st = St.Ground;
@@ -1057,6 +1086,7 @@ export class HighlightStream {
   private enterCsi() {
     this.st = St.Csi;
     this.csi = "";
+    this.csiLong = false;
   }
 
   private enterStr(osc: boolean) {
@@ -1099,7 +1129,12 @@ export class HighlightStream {
     const p = this.csi;
     if (final === 0x6d) {
       // SGR, unless it's a private or intermediate form (`ESC [ > 4 ; 2 m`).
-      if (!/[<=>?\x20-\x2f]/.test(p)) this.attrs.apply(p);
+      // One longer than what's kept of it could set a color past the cut:
+      // the text after it counts as colored, so it's left alone.
+      if (!/[<=>?\x20-\x2f]/.test(p)) {
+        this.attrs.apply(p);
+        if (this.csiLong) this.attrs.fg = true;
+      }
     } else if ((final === 0x68 || final === 0x6c) && p.startsWith("?")) {
       // The alternate screen: on with `ESC [ ? 1049 h`, off with `l`. 1049
       // also saves the main screen's attributes as it goes, and puts them
@@ -1109,13 +1144,24 @@ export class HighlightStream {
       if (modes.includes("1049") && on && !this.alt) this.save();
       if (modes.some((x) => x === "1049" || x === "1047" || x === "47")) this.alt = on;
       if (modes.includes("1049") && !on) this.restore();
-    } else if ((final === 0x73 || final === 0x75) && p === "") {
-      // CSI s and CSI u: ESC 7 and ESC 8 as other terminals have them.
-      if (final === 0x73) this.save();
-      else this.restore();
+      // 1048 saves and restores the cursor, its attributes with it, as
+      // ESC 7 and ESC 8 do.
+      if (modes.includes("1048")) {
+        if (on) this.save();
+        else this.restore();
+      }
+    } else if (final === 0x73 && p === "") {
+      // CSI s and CSI u: ESC 7 and ESC 8 as other terminals have them. CSI u
+      // with a number restores too, in xterm; with `<`, `>`, `=` or `?` it's
+      // the kitty keyboard protocol's, which fish, neovim and helix send all
+      // the time, and isn't one.
+      this.save();
+    } else if (final === 0x75 && /^\d*$/.test(p)) {
+      this.restore();
     } else if (final === 0x70 && p === "!") {
-      // ESC [ ! p: a soft reset, attributes included.
+      // ESC [ ! p: a soft reset, attributes included, and what was saved.
       this.attrs.reset();
+      this.saved = { main: null, alt: null };
     } else if (MOVES.has(final) && !/[<=>?\x20-\x2f]/.test(p)) {
       this.moved();
     }

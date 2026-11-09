@@ -557,6 +557,39 @@ fn highlight_rules_sync_edit_and_delete() {
     assert_eq!((got[0].pattern.as_str(), got[0].underline), ("deployed", true));
 }
 
+// A rule another computer deleted goes as sync really deletes it, the row
+// gone (not marked): the list leaves it out, and a switch or an edit of it
+// on this one, from a card read before, says it was deleted (#203's review).
+#[test]
+fn a_rule_deleted_elsewhere_says_so_here() {
+    let (a, ha) = device("A");
+    let rule = |pattern: &str| highlight::HighlightRule {
+        id: None,
+        pattern: pattern.into(),
+        kind: "word".into(),
+        match_case: false,
+        color: "red".into(),
+        bold: false,
+        underline: false,
+        enabled: true,
+    };
+    highlight::save(&a, &rule("deploy")).unwrap();
+    let (b, hb) = device("B");
+    apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+    let id_b = highlight::list(&b).unwrap()[0].id.unwrap();
+    a.execute("DELETE FROM highlight_rules WHERE pattern='deploy'", []).unwrap();
+    let mut recs = collect_local_records(&a, &KEY, "").unwrap();
+    for r in recs.iter_mut().filter(|r| r.entity_type == "highlight_rules") {
+        r.updated_at = ha.tick();
+    }
+    apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+    assert!(highlight::list(&b).unwrap().is_empty());
+    assert!(highlight::set_enabled(&b, id_b, false).unwrap_err().contains("deleted"));
+    let mut edit = rule("deployed");
+    edit.id = Some(id_b);
+    assert!(highlight::save(&b, &edit).unwrap_err().contains("deleted"));
+}
+
 // Nor to the move in it: a record held for its emptied password that also
 // moves the server into a folder at "Run anything" here lands with the
 // AI's level held, as any other sync's move would.

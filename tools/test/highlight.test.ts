@@ -2,10 +2,23 @@
 // then npm --prefix tools/test test (type check, then vitest).
 
 import { describe, expect, it, vi } from "vitest";
-import { buildMatcher, grayBrights, HighlightStream, HIGHLIGHT_MINE, HIGHLIGHT_NONE, normalizeRules, onSlowRule, ruleProblem, type CustomRule } from "../../src/ui/highlight";
+import { buildMatcher, grayBrights, HighlightStream, HIGHLIGHT_MINE, HIGHLIGHT_NONE, normalizeRules, onSlowRule, ruleProblem, ruleToSave, type CustomRule } from "../../src/ui/highlight";
+import { SCHEMES } from "../../src/ui/terminalThemes";
 
 const rule = (over: Partial<CustomRule>): CustomRule => ({
   pattern: "error", kind: "word", matchCase: false, color: "blue", bold: false, underline: false, enabled: true, ...over,
+});
+
+describe("a color this build doesn't know (#203's review)", () => {
+  it("shows as red, and is saved back as it was unless another is picked", () => {
+    const [r] = normalizeRules([{ id: 1, pattern: "ok", kind: "word", color: "ultraviolet" }]);
+    expect(r.color).toBe("red");
+    // An edit to the pattern keeps the newer build's color.
+    expect(ruleToSave({ ...r, pattern: "okay" })).toEqual({ id: 1, pattern: "okay", kind: "word", matchCase: false, color: "ultraviolet", bold: false, underline: false, enabled: true });
+    // Picking a color (the editor drops savedColor) saves that one.
+    expect(ruleToSave({ ...r, color: "green", savedColor: undefined }).color).toBe("green");
+    expect(ruleToSave(normalizeRules([{ pattern: "x", kind: "word", color: "blue" }])[0]).color).toBe("blue");
+  });
 });
 
 describe("normalizeRules", () => {
@@ -16,7 +29,7 @@ describe("normalizeRules", () => {
     ]);
     expect(rules).toEqual([
       { id: 3, pattern: "boom", kind: "text", matchCase: false, color: "green", bold: true, underline: false, enabled: true },
-      { id: undefined, pattern: "ok", kind: "word", matchCase: false, color: "red", bold: false, underline: false, enabled: false },
+      { id: undefined, pattern: "ok", kind: "word", matchCase: false, color: "red", bold: false, underline: false, enabled: false, savedColor: "ultraviolet" },
     ]);
   });
 
@@ -231,7 +244,8 @@ describe("the stream follows what programs set (#49)", () => {
     // ST inside a CSI ends it: the colour it was setting never applies.
     expect(lit("\x1b[31\x9cfail")).toBe(1);
     // A C1 CSI inside an escape starts a new sequence.
-    expect(lit("\x1b(\x9b31mfail")).toBe(0);
+    // ESC ( then the C1 CSI: the CSI starts afresh, and colors what follows.
+    expect(lit("\x1b(\x9b31m fail")).toBe(0);
   });
 
   it("puts attributes back with ESC 8, CSI u and on leaving the alternate screen", () => {
@@ -241,13 +255,59 @@ describe("the stream follows what programs set (#49)", () => {
     // ESC 8 with nothing saved: the defaults.
     expect(lit("\x1b[31m\x1b8fail")).toBe(1);
   });
+
+  // From an independent review of #203's tests: guards nothing tested.
+  it("keeps what each screen saved apart", () => {
+    expect(lit("\x1b[?1049h\x1b[31m\x1b7\x1b[?1049lfail")).toBe(1);
+    // What the alternate screen saved doesn't come back on the main one:
+    // ESC 8 there puts back what ?1049h saved of the main screen.
+    expect(lit("\x1b[?1049h\x1b[32m\x1b7\x1b[?1049l\x1b8fail")).toBe(1);
+  });
+
+  it("doesn't take the kitty keyboard protocol's CSI u for a restore", () => {
+    for (const k of ["\x1b[<u", "\x1b[>1u", "\x1b[=5;1u", "\x1b[?u"]) expect(lit(`\x1b[31m\x1b7\x1b[0m${k}fail`), k).toBe(1);
+    // CSI u with a number does restore, as in xterm.
+    expect(lit("\x1b[31m\x1b[s\x1b[0m\x1b[1ufail")).toBe(0);
+  });
+
+  it("forgets what was saved on a full reset, a soft reset, and a new shell", () => {
+    expect(lit("\x1b[31m\x1b7\x1bc\x1b8fail")).toBe(1);
+    expect(lit("\x1b[31m\x1b7\x1b[!p\x1b8fail")).toBe(1);
+    const st = new HighlightStream(() => {});
+    st.setMatcher(buildMatcher(HIGHLIGHT_MINE, [rule({ pattern: "fail" })]), false);
+    st.push(new TextEncoder().encode("\x1b[31m\x1b7"));
+    st.reset();
+    const out = st.push(new TextEncoder().encode("\x1b8fail"));
+    expect(out).toMatch(/\x1b\[[0-9;]+mfail\x1b\[39/);
+  });
+
+  it("follows ?1048 saving and restoring colors, as xterm does", () => {
+    expect(lit("\x1b[31m\x1b[?1048h\x1b[0m\x1b[?1048lfail")).toBe(0);
+    expect(lit("\x1b[?1048h\x1b[31m\x1b[?1048lfail")).toBe(1);
+  });
+
+  it("leaves alone text after a color code too long to read whole", () => {
+    expect(lit("\x1b[" + "0000000000;".repeat(12) + "31mfail")).toBe(0);
+    // A long one that only resets is reset by the next plain SGR.
+    expect(lit("\x1b[" + "0000000000;".repeat(12) + "0m\x1b[0mfail")).toBe(1);
+  });
+
+  it("ends a sequence at a character past ASCII, as xterm does", () => {
+    // ESC é: not a sequence; é and what follows print, uncolored by the 0m
+    // the program meant to send.
+    expect(lit("\x1b[31m\x1bé[0mfail")).toBe(0);
+    expect(lit("\x1b[é fail")).toBe(1);
+  });
 });
 
 describe("schemes whose bright colors are grays (#49)", () => {
-  const solarized = { brightRed: "#cb4b16", brightGreen: "#586e75", brightYellow: "#657b83", brightBlue: "#839496", brightMagenta: "#6c71c4", brightCyan: "#93a1a1" };
-  it("finds Solarized's gray brights, and none in a colorful scheme", () => {
-    expect([...grayBrights(solarized)].sort()).toEqual(["bright-blue", "bright-cyan", "bright-green", "bright-yellow"]);
-    expect(grayBrights({ brightRed: "#e06c75", brightGreen: "#98c379", brightYellow: "#e5c07b", brightBlue: "#61afef", brightMagenta: "#c678dd", brightCyan: "#56b6c2" }).size).toBe(0);
+  const solarized = SCHEMES.find((s) => s.id === "solarized-dark")!.theme;
+  it("finds Solarized's gray brights, and none in any other scheme Submarine has", () => {
+    for (const s of SCHEMES) {
+      const grays = [...grayBrights(s.theme)].sort();
+      if (s.id.startsWith("solarized")) expect(grays, s.id).toEqual(["bright-blue", "bright-cyan", "bright-green", "bright-yellow"]);
+      else expect(grays, s.id).toEqual([]);
+    }
     expect(grayBrights({}).size).toBe(0);
   });
 
