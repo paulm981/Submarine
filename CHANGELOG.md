@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.63
+
+- **Broadcast: one slow server no longer holds up typing to the others, and a big paste reaches every server.** A server that falls behind, such as one still taking a large paste on a slow link, gets its keys on its own, in order, until it catches up, while the rest keep up. A paste over 1 MB used to reach only the server you were typing in; it now goes to all of them. Terminals waiting to open also open while the window is minimized. ([#205](https://github.com/paulm981/Submarine/issues/205))
+
 ## v0.4.0-fork.62
 
 - **"Run commands that only read" closes holes that let a command write or reach a device.** `uniq - FILE` could overwrite a file; a path through `/proc/…/root` could open a device; a glob such as `/etc/shado?` got past the check for files that hold secrets; and `date -f`, `getent hosts`, `rpm -qp` and `journalctl --image` could set the clock, reach out or attach a disk. Each of these now asks. The level also runs commands by itself only where Submarine knows the server's OS and it isn't Windows; elsewhere only your allow list runs, and the server's marker says "allowed commands run". ([#206](https://github.com/paulm981/Submarine/issues/206))
