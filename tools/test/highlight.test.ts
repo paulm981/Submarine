@@ -35,14 +35,17 @@ describe("ruleProblem", () => {
   });
 
   it("refuses an expression that doesn't compile, or matches empty text", () => {
-    expect(ruleProblem({ pattern: "(", kind: "regex", matchCase: false })).toBe("That isn't a valid regular expression.");
+    expect(ruleProblem({ pattern: "(", kind: "regex", matchCase: false })).toMatch(/isn't a regular expression/);
     expect(ruleProblem({ pattern: "x*", kind: "regex", matchCase: false })).toMatch(/matches empty text/);
     // Only as a regular expression: the same text as a word is fine.
     expect(ruleProblem({ pattern: "(", kind: "word", matchCase: false })).toBeNull();
   });
 
-  it("refuses an expression that takes exponential time, and accepts a plain one", () => {
-    expect(ruleProblem({ pattern: "^(a+)+$", kind: "regex", matchCase: false })).toMatch(/too slow/);
+  it("refuses back-references and lookarounds, which RE2 can't run, and accepts the rest", () => {
+    expect(ruleProblem({ pattern: "(a)\\1", kind: "regex", matchCase: false })).toMatch(/Back-references/);
+    expect(ruleProblem({ pattern: "foo(?=bar)", kind: "regex", matchCase: false })).toMatch(/lookarounds/);
+    // Nested repeats are fine: RE2 runs them in time that grows with the line, not exponentially.
+    expect(ruleProblem({ pattern: "^(a+)+$", kind: "regex", matchCase: false })).toBeNull();
     expect(ruleProblem({ pattern: "disk \\d+% full", kind: "regex", matchCase: false })).toBeNull();
   });
 });
@@ -51,8 +54,29 @@ describe("buildMatcher", () => {
   it("highlights nothing with the None set, or with only rules that are off", () => {
     expect(buildMatcher(HIGHLIGHT_NONE, [rule({})])).toBeNull();
     expect(buildMatcher(HIGHLIGHT_MINE, [rule({ enabled: false })])).toBeNull();
-    // Regular-expression rules are kept but not used in this build.
-    expect(buildMatcher(HIGHLIGHT_MINE, [rule({ kind: "regex", pattern: "err\\w+" })])).toBeNull();
+  });
+
+  it("matches a regular expression, in any case unless asked", () => {
+    const m = buildMatcher(HIGHLIGHT_MINE, [rule({ kind: "regex", pattern: "err\\w+" })])!;
+    expect(m.find("ERROR here err42").map(([s, e]) => [s, e])).toEqual([[0, 5], [11, 16]]);
+    const exact = buildMatcher(HIGHLIGHT_MINE, [rule({ kind: "regex", pattern: "err\\w+", matchCase: true })])!;
+    expect(exact.find("ERROR here err42").map(([s, e]) => [s, e])).toEqual([[11, 16]]);
+  });
+
+  it("counts a regular expression's places as the line's own, past an emoji", () => {
+    const m = buildMatcher(HIGHLIGHT_MINE, [rule({ kind: "regex", pattern: "err\\w+" })])!;
+    const line = "\u{1F600} x ERROR here err42";
+    expect(m.find(line).map(([s, e]) => line.slice(s, e))).toEqual(["ERROR", "err42"]);
+  });
+
+  it("runs an expression that would hang a backtracking engine in good time", () => {
+    const line = "a".repeat(4096) + "!";
+    for (const pattern of ["(a*)*b", "(a+)+$", "(.*a){12}x", "(\\w+\\s?)+=$"]) {
+      const m = buildMatcher(HIGHLIGHT_MINE, [rule({ kind: "regex", pattern })])!;
+      const t0 = performance.now();
+      m.find(line);
+      expect(performance.now() - t0, pattern).toBeLessThan(500);
+    }
   });
 
   it("matches a word whole, in any case unless asked", () => {

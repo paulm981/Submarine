@@ -19,6 +19,8 @@
 //   panel); a server's choice syncs with it, like its color scheme.
 // ─────────────────────────────────────────────────────────────────────────────
 
+import { RE2JS } from "../fork/vendor/re2js/index.js";
+
 export type HighlightColor =
   | "red" | "green" | "yellow" | "blue" | "magenta" | "cyan"
   | "bright-red" | "bright-green" | "bright-yellow" | "bright-blue" | "bright-magenta" | "bright-cyan"
@@ -366,69 +368,50 @@ export function ruleProblem(rule: Pick<CustomRule, "pattern" | "kind" | "matchCa
   if (!rule.pattern.trim()) return "Type the text to highlight.";
   if (rule.pattern.length > 500) return "That's too long; keep it under 500 characters.";
   if (rule.kind !== "regex") return null;
-  let re: RegExp;
+  const re2 = compileRe2(rule.pattern, rule.matchCase);
+  if (!re2) return "That isn't a regular expression Submarine can use. Back-references (\\1) and lookarounds ((?=…), (?<=…)) aren't supported.";
+  if (re2.matcher("").find()) return "That expression matches empty text, so it would match everywhere.";
+  return null;
+}
+
+/** A user's regular expression, on RE2 (src/fork/vendor/re2js): its time
+ *  grows with the length of the line, never faster, so no expression can
+ *  freeze the window, which JavaScript's own engine can't promise (#49).
+ *  Null when RE2 won't take it. */
+function compileRe2(pattern: string, matchCase: boolean): RE2JS | null {
   try {
-    re = new RegExp(rule.pattern, rule.matchCase ? "g" : "gi");
+    return RE2JS.compile(pattern, matchCase ? 0 : RE2JS.CASE_INSENSITIVE);
   } catch {
-    return "That isn't a valid regular expression.";
+    return null;
   }
-  if (re.test("")) return "That expression matches empty text, so it would match everywhere.";
-  return slowPattern(re) ? "That expression is too slow on some text (it would freeze the window). Try a simpler one." : null;
 }
 
-/** True when `re` takes more than a few ms on short text built from its own
- *  characters: the usual sign of one whose time grows exponentially with the
- *  length of a line. Lengths grow a little at a time, so the try that shows
- *  it is itself still short. */
-function slowPattern(re: RegExp): boolean {
-  const chars = new Set(["a", "0", " ", ".", "-", "_", "x"]);
-  for (const c of re.source) if (/[\w .:\/@-]/.test(c)) chars.add(c);
-  const tails = ["\u0001", "!", ""];
-  const probe = new RegExp(re.source, re.flags.replace("g", ""));
-  for (const n of [6, 10, 14, 18, 22, 26, 30, 36, 42, 50, 60]) {
-    for (const c of chars) {
-      for (const tail of tails) {
-        const text = c.repeat(n) + tail;
-        if (slowOn(probe, text) && slowOn(probe, text) && slowOn(probe, text)) return true;
-      }
-    }
-  }
-  return false;
-}
+// Compiled once per rule as it is.
+const customRegexes = new Map<string, Compiled | null>();
 
-/** Over 3 ms on `text`. Asked three times before a pattern is called slow,
- *  so a pause for garbage collection can't make a good one look bad. */
-function slowOn(re: RegExp, text: string): boolean {
-  const t0 = performance.now();
-  re.test(text);
-  return performance.now() - t0 > 3;
-}
-
-// Checked once per rule as it is (the check runs the expression ~1000 times).
-const customRegexes = new Map<string, RegExp | null>();
+/** A user's rule, compiled: JavaScript's engine for words and text, RE2 for
+ *  regular expressions. */
+type Compiled = { re: RegExp } | { re2: RE2JS };
 
 /** A custom rule's regex, or null when it can't be used. */
-function customRegex(rule: CustomRule): RegExp | null {
+function customRegex(rule: CustomRule): Compiled | null {
   if (!rule.enabled) return null;
   const key = JSON.stringify([rule.pattern, rule.kind, rule.matchCase]);
   if (!customRegexes.has(key)) customRegexes.set(key, compileCustom(rule));
   return customRegexes.get(key)!;
 }
 
-/** Regular-expression rules are off in this build: the speed check can be
- *  fooled (a fixed start, then a nested repeat), and one slow expression
- *  freezes the window on every device the rule syncs to. They're kept as
- *  they are, and come back once they can run where they can be stopped. */
-export const REGEX_RULES_ON = false;
-
-function compileCustom(rule: CustomRule): RegExp | null {
-  if (rule.kind === "regex" && !REGEX_RULES_ON) return null;
+function compileCustom(rule: CustomRule): Compiled | null {
   if (ruleProblem(rule)) return null;
+  if (rule.kind === "regex") {
+    const re2 = compileRe2(rule.pattern, rule.matchCase);
+    return re2 ? { re2 } : null;
+  }
   const flags = rule.matchCase ? "g" : "gi";
   const escaped = escapeRegex(rule.pattern);
-  const source = rule.kind === "regex" ? rule.pattern : rule.kind === "word" ? wholeWord(escaped, rule.pattern) : escaped;
+  const source = rule.kind === "word" ? wholeWord(escaped, rule.pattern) : escaped;
   try {
-    return new RegExp(source, flags);
+    return { re: new RegExp(source, flags) };
   } catch {
     return null;
   }
@@ -460,16 +443,30 @@ function mergeSpans(taken: Span[], add: Span[]): Span[] {
 }
 
 interface Scanner {
-  re: RegExp;
-  /** The style of a match: by which capture group matched, for a set. */
-  styleOf: (m: RegExpExecArray) => HighlightStyle | null;
+  /** JavaScript's engine (a set's patterns, a user's words and text), or
+   *  RE2 (a user's regular expression). */
+  re?: RegExp;
+  re2?: RE2JS;
+  /** The style of a match: by which capture group matched, for a set; null
+   *  `m` for RE2's, whose style doesn't depend on it. */
+  styleOf: (m: RegExpExecArray | null) => HighlightStyle | null;
   /** A user's rule: watched for being slow, and dropped if it is. */
   custom?: { label: string; off: boolean };
 }
 
 function scan(sc: Scanner, text: string): Span[] {
   const out: Span[] = [];
+  if (sc.re2) {
+    const style = sc.styleOf(null);
+    const m = sc.re2.matcher(text);
+    while (m.find()) {
+      const [start, end] = [m.start(), m.end()];
+      if (end > start && style) out.push([start, end, style]);
+    }
+    return out;
+  }
   const re = sc.re;
+  if (!re) return out;
   re.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text))) {
@@ -570,7 +567,7 @@ function setScans(set: HighlightSet): Scanner[] {
         next += 1 + groupCount(src);
         return `(${src})`;
       });
-      add(parts.join("|"), (m) => groups.find((g) => m[g.index] !== undefined)?.style ?? null);
+      add(parts.join("|"), (m) => groups.find((g) => m?.[g.index] !== undefined)?.style ?? null);
     } else {
       const rule = layer as SetRule;
       const style = rule.style;
@@ -588,10 +585,10 @@ export function buildMatcher(setId: string, custom: readonly CustomRule[]): Matc
   if (setId === HIGHLIGHT_NONE) return null;
   const scanners: Scanner[] = [];
   for (const rule of custom) {
-    const re = customRegex(rule);
-    if (re) {
+    const compiled = customRegex(rule);
+    if (compiled) {
       const style: HighlightStyle = { color: rule.color, bold: rule.bold, underline: rule.underline };
-      scanners.push({ re, styleOf: () => style, custom: { label: rule.pattern, off: false } });
+      scanners.push({ ...compiled, styleOf: () => style, custom: { label: rule.pattern, off: false } });
     }
   }
   scanners.push(...setScans(highlightSetById(setId)));

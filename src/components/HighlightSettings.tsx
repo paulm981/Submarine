@@ -7,7 +7,6 @@ import {
   HIGHLIGHT_MINE,
   HIGHLIGHT_NONE,
   HIGHLIGHT_SETS,
-  REGEX_RULES_ON,
   ansiFor,
   buildMatcher,
   grayBrights,
@@ -66,8 +65,9 @@ const KINDS: { id: RuleKind; name: string }[] = [
   { id: "text", name: "Anywhere" },
   { id: "regex", name: "Regular expression" },
 ];
-// The kinds a rule can be given here (see REGEX_RULES_ON).
-const PICKABLE = KINDS.filter((k) => k.id !== "regex" || REGEX_RULES_ON);
+// The kinds a rule can be given here: all of them, regular expressions on
+// RE2 (#49).
+const PICKABLE = KINDS;
 
 const blankRule = (): CustomRule => ({
   pattern: "",
@@ -415,7 +415,6 @@ export function HighlightSettings({ settings, setSettings, onRulesChanged }: any
                   </span>
                   <span className="text-[10.5px] text-zinc-500">
                     {KINDS.find((k) => k.id === r.kind)?.name}
-                    {r.kind === "regex" && !REGEX_RULES_ON ? " (off in this build)" : ""}
                     {r.matchCase ? ", match case" : ""}
                   </span>
                 </span>

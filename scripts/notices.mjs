@@ -81,6 +81,26 @@ function npmPackages() {
   return out;
 }
 
+// Libraries the fork keeps in its own files rather than in package.json
+// (src/fork/vendor/<name>/, each with its package.json and licence), so the
+// original project's package.json stays as it is (#49).
+function vendoredPackages() {
+  const root = join(ROOT, "src", "fork", "vendor");
+  if (!existsSync(root)) return [];
+  return readdirSync(root)
+    .filter((d) => existsSync(join(root, d, "package.json")))
+    .map((d) => {
+      const pkg = JSON.parse(readFileSync(join(root, d, "package.json"), "utf8"));
+      return {
+        name: pkg.name || d,
+        version: pkg.version || "",
+        license: pkg.license || "UNKNOWN",
+        url: repoUrl(pkg.repository) || pkg.homepage || "",
+        texts: licenseFilesIn(join(root, d)).map(addText).filter(Boolean),
+      };
+    });
+}
+
 // ── Rust crates ─────────────────────────────────────────────────────────────
 
 function cargoPackages() {
@@ -194,7 +214,7 @@ const groups = [
     license: "MIT", url: "https://github.com/SinaXhpm/Submarine",
     texts: [addText(readFileSync(join(ROOT, "LICENSE"), "utf8"))].filter(Boolean),
   }] },
-  { id: "npm", title: "JavaScript packages", packages: npmPackages().sort(byName) },
+  { id: "npm", title: "JavaScript packages", packages: [...npmPackages(), ...vendoredPackages()].sort(byName) },
 ];
 let cargoNote = null;
 try {
