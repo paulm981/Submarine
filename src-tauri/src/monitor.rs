@@ -205,21 +205,15 @@ pub struct NodeAuth {
     /// Host patterns, as the terminal matches it.
     #[serde(default)]
     pub name: Option<String>,
-    /// What the user's known_hosts says about this host (with_ssh_config):
+    /// What the user's known_hosts says about this host (config_target):
     /// a key marked `@revoked` there is refused (trust_policy.rs, #43).
     #[serde(skip)]
     pub known_hosts: KnownHosts,
 }
 
-/// A host's known_hosts entries, carried with its `NodeAuth`.
-#[derive(Clone, Default)]
-pub struct KnownHosts(Option<Arc<crate::known_hosts::HostTrust>>);
-
-impl std::fmt::Debug for KnownHosts {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_some() { "KnownHosts(read)" } else { "KnownHosts(none)" })
-    }
-}
+// The fork's own, in monitor/fork.rs (#215).
+mod fork;
+pub(crate) use fork::*;
 
 /// A user-defined metric. The probe loop wraps each command in BEGIN/END
 /// markers so we can carve its output back out of the composite script's
@@ -594,7 +588,7 @@ async fn run_poller(
                     }
                 }
             }
-            let target = match with_ssh_config(&db, &auth, &node_name).await {
+            let target = match config_target(&db, &auth, &node_name).await {
                 Ok(t) => t,
                 Err(why) => {
                     // Not a failure: no outage count, no alert. Looked at
@@ -818,100 +812,8 @@ impl client::Handler for MonitorHandler {
         }
     }
 
-    // A monitor connection only opens its own exec channels, so every
-    // channel the server tries to open is refused, as ClientHandler does
-    // (ssh_manager.rs). russh's defaults accept them.
-    async fn server_channel_open_session(
-        &mut self,
-        _channel: russh::Channel<client::Msg>,
-        reply: client::ChannelOpenHandle,
-        _session: &mut client::Session,
-    ) -> Result<(), Self::Error> {
-        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
-        Ok(())
-    }
-
-    async fn server_channel_open_direct_tcpip(
-        &mut self,
-        _channel: russh::Channel<client::Msg>,
-        _host_to_connect: &str,
-        _port_to_connect: u32,
-        _originator_address: &str,
-        _originator_port: u32,
-        reply: client::ChannelOpenHandle,
-        _session: &mut client::Session,
-    ) -> Result<(), Self::Error> {
-        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
-        Ok(())
-    }
-
-    async fn server_channel_open_forwarded_tcpip(
-        &mut self,
-        _channel: russh::Channel<client::Msg>,
-        _connected_address: &str,
-        _connected_port: u32,
-        _originator_address: &str,
-        _originator_port: u32,
-        reply: client::ChannelOpenHandle,
-        _session: &mut client::Session,
-    ) -> Result<(), Self::Error> {
-        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
-        Ok(())
-    }
-
-    async fn server_channel_open_direct_streamlocal(
-        &mut self,
-        _channel: russh::Channel<client::Msg>,
-        _socket_path: &str,
-        reply: client::ChannelOpenHandle,
-        _session: &mut client::Session,
-    ) -> Result<(), Self::Error> {
-        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
-        Ok(())
-    }
-
-    async fn server_channel_open_forwarded_streamlocal(
-        &mut self,
-        _channel: russh::Channel<client::Msg>,
-        _socket_path: &str,
-        reply: client::ChannelOpenHandle,
-        _session: &mut client::Session,
-    ) -> Result<(), Self::Error> {
-        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
-        Ok(())
-    }
-
-    async fn server_channel_open_agent_forward(
-        &mut self,
-        _channel: russh::Channel<client::Msg>,
-        reply: client::ChannelOpenHandle,
-        _session: &mut client::Session,
-    ) -> Result<(), Self::Error> {
-        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
-        Ok(())
-    }
-
-    async fn server_channel_open_x11(
-        &mut self,
-        _channel: russh::Channel<client::Msg>,
-        _originator_address: &str,
-        _originator_port: u32,
-        reply: client::ChannelOpenHandle,
-        _session: &mut client::Session,
-    ) -> Result<(), Self::Error> {
-        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
-        Ok(())
-    }
-
-    async fn server_channel_open_unknown(
-        &mut self,
-        _channel: russh::Channel<client::Msg>,
-        reply: client::ChannelOpenHandle,
-        _session: &mut client::Session,
-    ) -> Result<(), Self::Error> {
-        reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
-        Ok(())
-    }
+    // Every channel the server tries to open is refused (monitor/fork.rs).
+    refuse_server_channels!();
 }
 
 /// Trait-object wrapper so we can hand russh's `connect_stream` either a
@@ -1064,130 +966,32 @@ fn monitor_client_config() -> client::Config {
     config
 }
 
-/// A monitor's SSH connection, with the jump host's when it goes through one:
-/// that connection carries this one, so it has to stay open as long.
-struct MonitorSession {
-    session: russh::client::Handle<MonitorHandler>,
-    jump: Option<russh::client::Handle<MonitorHandler>>,
-}
-
-impl MonitorSession {
-    fn is_closed(&self) -> bool {
-        self.session.is_closed() || self.jump.as_ref().is_some_and(|j| j.is_closed())
-    }
-}
-
 /// The node as `~/.ssh/config` resolves it: an alias's HostName and Port, and
-/// its User when none is saved; its jump host's too, as the terminal resolves
-/// it (`ConfigTarget::resolve_jump_host`), so the monitor dials the address
-/// the terminal does and finds the host key the terminal stored under it.
-/// The monitor takes nothing else from the config (no ProxyCommand /
-/// ProxyJump, key files or agent): in the background it never runs commands
-/// or asks for anything. A node the config sends through a ProxyCommand or
-/// ProxyJump (and that has no proxy of its own), or a jump host it sends
-/// through either, isn't checked at all: `Err` says why. The terminal goes
-/// through them (#169), so dialling past them would check another path.
-///
-/// A server (or jump host) that proves who it is only with a certificate
-/// isn't checked either: the monitor trusts host keys the app has on file,
-/// and a certificate is never put there (trust_policy.rs, #43 D4).
-async fn with_ssh_config(
-    db: &Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
-    auth: &NodeAuth,
-    node_name: &str,
-) -> Result<NodeAuth, String> {
-    let mut target = crate::ConfigTarget::resolve(&auth.host, auth.port, &auth.username, Some(node_name.to_string())).await;
-    let node_trust = known_hosts_for(&mut target).await.map(Arc::new);
-    let mut jump = match auth.jump.as_deref() {
-        Some(j) => Some(
-            crate::ConfigTarget::resolve_jump_host(&j.host, i32::from(j.port), &j.username, j.name.clone())
-                .await
-                .map_err(|e| format!("jump host {}: {}", j.host, e))?,
-        ),
-        None => None,
-    };
-    let jump_trust = match jump.as_mut() {
-        Some((j, _)) => known_hosts_for(j).await.map(Arc::new),
-        None => None,
-    };
-    let mut resolved = apply_ssh_config(auth, target, jump)?;
-    resolved.known_hosts = KnownHosts(node_trust.clone());
-    if let Some(j) = resolved.jump.as_deref_mut() {
-        j.known_hosts = KnownHosts(jump_trust.clone());
-    }
-    if let Ok(guard) = db.lock() {
-        if let Some(conn) = guard.as_ref() {
-            let only_cert = |trust: &Option<Arc<crate::known_hosts::HostTrust>>, host: &str, port: u16| {
-                crate::trust_policy::known_only_by_certificate(trust.as_deref(), conn, host, port)
-            };
-            if only_cert(&node_trust, &resolved.host, resolved.port) {
-                return Err(NOT_CHECKED_CERTIFICATE.into());
-            }
-            if let Some(j) = resolved.jump.as_deref() {
-                if only_cert(&jump_trust, &j.host, j.port) {
-                    return Err(NOT_CHECKED_JUMP_CERTIFICATE.into());
-                }
-            }
-        }
-    }
-    Ok(resolved)
-}
-
-/// What the user's known_hosts files say about `t` (None with the
-/// ~/.ssh/config switch off).
-async fn known_hosts_for(t: &mut crate::ConfigTarget) -> Option<crate::known_hosts::HostTrust> {
-    let user = t.user.clone();
-    let files = t.known_hosts_files(&user);
-    crate::known_hosts::for_host(files, &t.host, t.port).await
-}
-
-/// `with_ssh_config` once the config is read: `t` is the node's, `jump` its
-/// jump host's, with the ProxyCommand or ProxyJump the config gives it.
-fn apply_ssh_config(
-    auth: &NodeAuth,
-    mut t: crate::ConfigTarget,
-    jump: Option<(crate::ConfigTarget, Option<crate::ssh_config::Proxy>)>,
-) -> Result<NodeAuth, String> {
+/// its User when none is saved. The monitor takes nothing else from the config
+/// (no ProxyCommand / ProxyJump, key files or agent): in the background it
+/// never runs commands or asks for anything. A node the config sends through
+/// a ProxyCommand or ProxyJump (and that has no proxy of its own) isn't
+/// checked at all: `Err` says why.
+// The fork resolves with monitor/fork.rs's config_target (#43, #215).
+#[allow(dead_code)]
+async fn with_ssh_config(auth: &NodeAuth, node_name: &str) -> Result<NodeAuth, String> {
+    let mut t = crate::ConfigTarget::resolve(&auth.host, auth.port, &auth.username, Some(node_name.to_string())).await;
     let own_route = match auth.proxy_type.as_str() {
         "socks5" => Some("SOCKS5 proxy"),
         "http" => Some("HTTP proxy"),
-        // Its saved jump host (connect_for_monitor goes through it).
-        _ if auth.jump.is_some() => Some("jump host"),
         _ => None,
     };
     match t.proxy(own_route) {
-        Some(crate::ssh_config::Proxy::Command(_)) => return Err(NOT_CHECKED_PROXY_COMMAND.into()),
-        Some(crate::ssh_config::Proxy::Jump(_)) => return Err(NOT_CHECKED_PROXY_JUMP.into()),
-        _ => {}
+        Some(crate::ssh_config::Proxy::Command(_)) => Err(NOT_CHECKED_PROXY_COMMAND.into()),
+        Some(crate::ssh_config::Proxy::Jump(_)) => Err(NOT_CHECKED_PROXY_JUMP.into()),
+        _ => Ok(NodeAuth { host: t.host, port: t.port, username: t.user, ..auth.clone() }),
     }
-    let jump = match (auth.jump.as_deref(), jump) {
-        (Some(saved), Some((j, proxy))) => {
-            // The terminal reaches the jump host through the ProxyCommand or
-            // ProxyJump the config gives it; the monitor runs neither (#43, D5).
-            match proxy {
-                Some(crate::ssh_config::Proxy::Command(_)) => return Err(NOT_CHECKED_JUMP_PROXY_COMMAND.into()),
-                Some(crate::ssh_config::Proxy::Jump(_)) => return Err(NOT_CHECKED_JUMP_PROXY_JUMP.into()),
-                _ => {}
-            }
-            Some(Box::new(NodeAuth { host: j.host, port: j.port, username: j.user, ..saved.clone() }))
-        }
-        _ => None,
-    };
-    Ok(NodeAuth { host: t.host, port: t.port, username: t.user, jump, ..auth.clone() })
 }
 
 const NOT_CHECKED_PROXY_COMMAND: &str =
     "Not checked: ~/.ssh/config reaches this server through a ProxyCommand, which status checks don't run.";
 const NOT_CHECKED_PROXY_JUMP: &str =
     "Not checked: ~/.ssh/config reaches this server through a ProxyJump, which status checks don't use.";
-const NOT_CHECKED_JUMP_PROXY_COMMAND: &str =
-    "Not checked: ~/.ssh/config reaches this server's jump host through a ProxyCommand, which status checks don't run.";
-const NOT_CHECKED_CERTIFICATE: &str =
-    "Not checked: this server proves who it is with a certificate (an @cert-authority line in your known_hosts), and status checks only trust host keys saved in the app.";
-const NOT_CHECKED_JUMP_CERTIFICATE: &str =
-    "Not checked: this server's jump host proves who it is with a certificate (an @cert-authority line in your known_hosts), and status checks only trust host keys saved in the app.";
-const NOT_CHECKED_JUMP_PROXY_JUMP: &str =
-    "Not checked: ~/.ssh/config reaches this server's jump host through a ProxyJump, which status checks don't use.";
 
 /// `jump_turn`: the turn in the jump host's login queue, let go once the jump
 /// host has logged this one in (or failed to).
