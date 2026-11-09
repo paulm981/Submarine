@@ -839,7 +839,7 @@ impl PasswordTurn {
 
 /// Is `access` still the one the tab keeps?
 pub(crate) async fn root_access_is_kept(state: &SshState, session_id: &str, access: &ssh_manager::RootAccess) -> bool {
-    state.root_access.lock().await.get(session_id).is_some_and(|a| Arc::ptr_eq(&a.checked, &access.checked))
+    state.fork.root_access.lock().await.get(session_id).is_some_and(|a| Arc::ptr_eq(&a.checked, &access.checked))
 }
 
 /// What the tab already has for root: its own, else its SFTP root mode's
@@ -847,7 +847,7 @@ pub(crate) async fn root_access_is_kept(state: &SshState, session_id: &str, acce
 /// whether its password still works). Not a password that stopped working.
 pub(crate) async fn known_root_access(state: &SshState, session_id: &str) -> Option<ssh_manager::RootAccess> {
     // Lock order: root_access, then sftp_elevation.
-    let mut own = state.root_access.lock().await;
+    let mut own = state.fork.root_access.lock().await;
     if let Some(a) = own.get(session_id) {
         return Some(a.clone());
     }
@@ -863,7 +863,7 @@ pub(crate) async fn known_root_access(state: &SshState, session_id: &str) -> Opt
 /// Forget `access` for the tab, if it's still the one kept (another call
 /// may have put a newer one there).
 pub(crate) async fn forget_root_access(state: &SshState, session_id: &str, access: &ssh_manager::RootAccess) {
-    let mut own = state.root_access.lock().await;
+    let mut own = state.fork.root_access.lock().await;
     if own.get(session_id).is_some_and(|a| Arc::ptr_eq(&a.checked, &access.checked)) {
         own.remove(session_id);
     }
@@ -875,7 +875,7 @@ pub(crate) async fn forget_root_access(state: &SshState, session_id: &str, acces
 pub(crate) async fn forget_root_password(state: &SshState, session_id: &str, pw: &str) {
     crate::applog::write_line("root", "the kept password was turned down; forgotten for this tab");
     {
-        let mut own = state.root_access.lock().await;
+        let mut own = state.fork.root_access.lock().await;
         if own.get(session_id).and_then(|a| a.password.as_ref()).is_some_and(|p| p.as_str() == pw) {
             own.remove(session_id);
         }
@@ -944,7 +944,7 @@ pub(crate) async fn root_access_for(
         }
     }
     let a = find_root_without_password(session_arc, args, false).await.map_err(|(e, _)| e)?;
-    state.root_access.lock().await.insert(session_id.to_string(), a.clone());
+    state.fork.root_access.lock().await.insert(session_id.to_string(), a.clone());
     Ok(a)
 }
 
@@ -992,7 +992,7 @@ pub(crate) async fn find_root_without_password<H: russh::client::Handler>(
 
 /// The tab's gate for passwords the user types (ssh_manager::RootGate).
 pub(crate) async fn root_gate(state: &SshState, session_id: &str) -> Arc<tokio::sync::Mutex<ssh_manager::RootGate>> {
-    Arc::clone(state.root_gates.lock().await.entry(session_id.to_string()).or_default())
+    Arc::clone(state.fork.root_gates.lock().await.entry(session_id.to_string()).or_default())
 }
 
 /// A digest of `password` with this run's own random salt, to tell a
@@ -1042,7 +1042,7 @@ pub(crate) async fn typed_root_access<H: russh::client::Handler>(
     if just_rejected(&gate, &pw) {
         return Err(SUDO_WRONG_PASSWORD.into());
     }
-    let kept = state.root_access.lock().await.get(session_id).cloned();
+    let kept = state.fork.root_access.lock().await.get(session_id).cloned();
     if let Some(a) = kept.filter(|a| a.password.as_ref().is_some_and(|p| p.as_str() == pw.as_str())) {
         return Ok(a);
     }
@@ -1051,7 +1051,7 @@ pub(crate) async fn typed_root_access<H: russh::client::Handler>(
         Ok((tool, shell)) => {
             gate.rejected = None;
             let a = RootAccess::new(tool, Some(pw), shell, Some(std::time::Instant::now()));
-            state.root_access.lock().await.insert(session_id.to_string(), a.clone());
+            state.fork.root_access.lock().await.insert(session_id.to_string(), a.clone());
             revive_sftp_password(state, session_id, &a).await;
             Ok(a)
         }
@@ -1592,7 +1592,7 @@ exec "$@"
     async fn a_kept_password_that_stopped_working_is_tried_once() {
         let state = SshState::new();
         let access = ssh_manager::RootAccess::new("dzdo", Some(pw("old")), None, None);
-        state.root_access.lock().await.insert("tab".into(), access.clone());
+        state.fork.root_access.lock().await.insert("tab".into(), access.clone());
         state.sftp_elevation.lock().await.insert(
             "tab".into(),
             ssh_manager::SftpElevation { server_path: None, tool: "dzdo", password: Some(pw("old")), shell: None, password_failed: false },
@@ -1614,7 +1614,7 @@ exec "$@"
             assert_eq!(call.await.unwrap(), Err(SUDO_WRONG_PASSWORD.to_string()));
         }
         assert_eq!(tries.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(state.root_access.lock().await.get("tab").is_none());
+        assert!(state.fork.root_access.lock().await.get("tab").is_none());
         assert!(state.sftp_elevation.lock().await.get("tab").unwrap().password_failed);
         assert!(known_root_access(&state, "tab").await.is_none());
     }
@@ -1624,7 +1624,7 @@ exec "$@"
     async fn a_kept_password_that_works_is_trusted_after_one_answer() {
         let state = SshState::new();
         let access = ssh_manager::RootAccess::new("sudo", Some(pw("ok")), None, None);
-        state.root_access.lock().await.insert("tab".into(), access.clone());
+        state.fork.root_access.lock().await.insert("tab".into(), access.clone());
         let first = password_turn(&state, "tab", &access, false).await.unwrap();
         assert!(first.held.is_some());
         first.finish(&state, "tab", &access, Some(true)).await;

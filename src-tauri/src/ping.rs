@@ -244,7 +244,7 @@ async fn check_through_jump(ssh: &SshState, server_id: i32, jump_id: i32, host: 
         return Some(open_shared(server_id, via, host, port, CHECK_TIMEOUT).await);
     }
     let sessions: Vec<String> =
-        ssh.session_servers.lock().await.iter().filter(|(_, id)| **id == jump_id).map(|(s, _)| s.clone()).collect();
+        ssh.fork.session_servers.lock().await.iter().filter(|(_, id)| **id == jump_id).map(|(s, _)| s.clone()).collect();
     let tabs: Vec<_> = {
         let conns = ssh.connections.lock().await;
         sessions.iter().filter_map(|s| conns.get(s).cloned()).collect()

@@ -1,6 +1,6 @@
 use russh::client;
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
@@ -35,6 +35,24 @@ pub(crate) fn key_type_family(key_type: &str) -> String {
     match base {
         "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => "ssh-rsa".to_string(),
         other => other.to_string(),
+    }
+}
+
+/// The plain host key offered by the server, or `None` for a host
+/// CERTIFICATE. Certificates are refused, fail-closed: there is no CA trust
+/// store yet (no `@cert-authority` equivalent), so a certificate's CA
+/// signature, principals and validity window can't be verified — and trusting
+/// the key embedded in it would answer a question russh never asked. In
+/// practice this never fires: `ssh_preferred_algorithms` leaves
+/// `host_key_certificates` empty, so no `*-cert-v01@openssh.com` host-key
+/// algorithm is advertised and a compliant server presents its plain host key
+/// (the TOFU path).
+// The fork decides in trust_policy.rs instead (#43).
+#[allow(dead_code)]
+pub fn plain_host_key(offered: &PublicKeyOrCertificate) -> Option<&PublicKey> {
+    match offered {
+        PublicKeyOrCertificate::PublicKey { key, .. } => Some(key),
+        PublicKeyOrCertificate::Certificate(_) => None,
     }
 }
 
@@ -367,15 +385,6 @@ pub(crate) fn page_drew(terminal_id: &str, bytes: u64) {
     let page = pages().lock().ok().and_then(|p| p.get(terminal_id).cloned());
     if let Some(page) = page {
         page.add(bytes);
-    }
-}
-
-/// Keys typed into `terminal_id`, for a terminal whose keys don't go through
-/// a pump here (the fork's Home terminals, term_output::pace).
-pub(crate) fn page_keys(terminal_id: &str, keys: &[u8]) {
-    let page = pages().lock().ok().and_then(|p| p.get(terminal_id).cloned());
-    if let Some(page) = page {
-        page.keys(keys);
     }
 }
 
@@ -898,16 +907,6 @@ where
     server_ended
 }
 
-/// A session's route through its jump hosts (`SshState::jump_connections`):
-/// their Handles, the last jump host last, each shared so a check through it
-/// (ping.rs) takes its own reference instead of holding the map; the
-/// connections close once the last reference goes. `jump_id`: the saved
-/// jump host it went through, None for a ProxyJump from ~/.ssh/config.
-pub struct JumpRoute {
-    pub jump_id: Option<i32>,
-    pub handles: Vec<Arc<client::Handle<ClientHandler>>>,
-}
-
 pub struct SshState {
     pub fp_txs: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     /// Pending keyboard-interactive (2FA / OTP) prompt responses, keyed by the
@@ -966,37 +965,16 @@ pub struct SshState {
     /// of the same tab (the next SFTP op re-elevates) and is dropped when the
     /// tab closes.
     pub sftp_elevation: Arc<Mutex<HashMap<String, SftpElevation>>>,
-    /// Per-tab root access for the Info panel's actions (services, kill,
-    /// firewall rules): what worked last time, so it isn't probed or asked
-    /// for again. Dropped when the tab closes, like `sftp_elevation`.
-    pub root_access: Arc<Mutex<HashMap<String, RootAccess>>>,
-    /// Tabs whose server refuses the user's own `docker` (not in the docker
-    /// group): the Docker tab's commands go straight to root there
-    /// (docker.rs). Dropped when the tab closes, like `root_access`.
-    pub docker_root: Arc<Mutex<HashSet<String>>>,
-    /// The saved server each session was opened for (initiate_connection,
-    /// telnet_connect), and the server of each of its shell terminals: a
-    /// server's own saved password is typed only into that server's
-    /// terminals (type_saved_password).
-    pub session_servers: Arc<Mutex<HashMap<String, i32>>>,
-    /// The user each session logged in as (initiate_connection): the AI
-    /// panel says who a command runs as (#116).
-    pub session_users: Arc<Mutex<HashMap<String, String>>>,
-    /// Per tab: one password the user typed is tried at a time, and one
-    /// just turned down isn't tried again (lib.rs, typed_root_access).
-    pub root_gates: Arc<Mutex<HashMap<String, Arc<Mutex<RootGate>>>>>,
-    pub terminal_servers: Arc<Mutex<HashMap<String, i32>>>,
     /// Tabs whose cached SFTP session is file access over shell commands (the
     /// server has no SFTP, see `shell_sftp`): the pane says so.
-    pub sftp_shell: Arc<Mutex<HashSet<String>>>,
+    pub sftp_shell: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Secrets the user typed at connect time when the saved node / login / key
     /// had none (issue #30), keyed by the BASE session id (the tab). A reconnect
     /// or a dedicated `::sftp` / `::fwd` secondary reuses what the user already
     /// supplied instead of prompting again. See `PromptedSecrets`.
     pub prompted_secrets: Arc<Mutex<HashMap<String, PromptedSecrets>>>,
-    /// Terminals whose shell is still opening (open_terminal,
-    /// open_container_terminal). Locked before `terminal_txs` when both are.
-    pub terminal_openings: Arc<Mutex<TerminalOpenings>>,
+    /// The fork's own (ssh_manager/root_state.rs, #215).
+    pub fork: ForkSsh,
     /// The "Save password" tick of a password prompt that offered one, by the
     /// prompt's nonce: the page records it (`kbi_save_choice`) just before it
     /// answers, and the prompt takes it with the answer. The password is saved
@@ -1072,15 +1050,9 @@ impl SshState {
             session_tunnel_specs: Arc::new(Mutex::new(HashMap::new())),
             session_generation: Arc::new(Mutex::new(HashMap::new())),
             sftp_elevation: Arc::new(Mutex::new(HashMap::new())),
-            root_access: Arc::new(Mutex::new(HashMap::new())),
-            docker_root: Arc::new(Mutex::new(HashSet::new())),
-            session_servers: Arc::new(Mutex::new(HashMap::new())),
-            session_users: Arc::new(Mutex::new(HashMap::new())),
-            root_gates: Arc::new(Mutex::new(HashMap::new())),
-            terminal_servers: Arc::new(Mutex::new(HashMap::new())),
-            sftp_shell: Arc::new(Mutex::new(HashSet::new())),
+            sftp_shell: Arc::new(Mutex::new(std::collections::HashSet::new())),
             prompted_secrets: Arc::new(Mutex::new(HashMap::new())),
-            terminal_openings: Arc::new(Mutex::new(TerminalOpenings::default())),
+            fork: ForkSsh::default(),
             kbi_save: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1116,6 +1088,8 @@ impl LastHeard {
 // The fork's own, in ssh_manager/host_key_asker.rs (#136).
 mod host_key_asker;
 pub(crate) use host_key_asker::*;
+#[cfg(test)]
+mod fork_tests;
 
 pub struct ClientHandler {
     pub app: AppHandle,
@@ -1258,28 +1232,6 @@ impl ConnectAttempt {
     }
 }
 
-impl ClientHandler {
-    fn keys_on_file(&self, fingerprint: &str) -> Result<HostKeyVerdict, String> {
-        keys_on_file(&self.db, &self.server_host, self.server_port, fingerprint)
-    }
-}
-
-/// What the app's trusted keys say about the key `fingerprint` for
-/// host:port (judge_host_key). Fails closed: a poisoned lock, a failed
-/// lookup, or no profile open (nothing to check against, and nowhere to
-/// save an answer) is an `Err` with the reason, never "first time". The
-/// std mutex guard is dropped before the caller's next `.await`.
-fn keys_on_file(
-    db: &std::sync::Mutex<Option<rusqlite::Connection>>,
-    host: &str,
-    port: u16,
-    fingerprint: &str,
-) -> Result<HostKeyVerdict, String> {
-    let guard = db.lock().map_err(|_| "the trusted host keys couldn't be read; restart the app".to_string())?;
-    let conn = guard.as_ref().ok_or("no profile is open, so the server's key can't be checked")?;
-    judge_host_key(conn, host, port, fingerprint).map_err(|_| "the trusted host keys couldn't be read; restart the app".to_string())
-}
-
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
 
@@ -1352,31 +1304,7 @@ impl client::Handler for ClientHandler {
         };
         let (mismatch, prior_fingerprints) =
             match decision {
-                crate::trust_policy::HostKeyDecision::Trusted { why, save } => {
-                    // Vouched for by known_hosts with nothing on file here:
-                    // saved as if approved, so Monitoring and the changed-key
-                    // warning know it from now on (#43, D4).
-                    if save {
-                        let saved = match self.db.lock() {
-                            Ok(guard) => match guard.as_ref() {
-                                Some(conn) => save_approved_host_key(conn, &self.server_host, self.server_port, &fp_str, key_type, false).is_ok(),
-                                None => false,
-                            },
-                            Err(_) => false,
-                        };
-                        log(&why, "success");
-                        if saved {
-                            log("Saved to this app's trusted host keys.", "info");
-                        }
-                    } else {
-                        log(&why, "success");
-                    }
-                    // Mark as auto-accepted (no prompt was shown) so the connect
-                    // driver knows host-key wasn't the failure mode for any
-                    // downstream error.
-                    self.fp_outcome.store(1, std::sync::atomic::Ordering::SeqCst);
-                    return Ok(true);
-                }
+                crate::trust_policy::HostKeyDecision::Trusted { why, save } => return trusted_key(self, &why, save, &fp_str, key_type),
                 crate::trust_policy::HostKeyDecision::Refused(why) => return refuse(why),
                 crate::trust_policy::HostKeyDecision::Ask { mismatch, prior, note } => {
                     if let Some(note) = note {
@@ -1426,51 +1354,10 @@ impl client::Handler for ClientHandler {
         }
 
         // The same question already on screen for another session: take its
-        // answer instead of asking again. If it goes unanswered, ask here.
-        let question: HostKeyQuestion = (self.server_host.clone(), self.server_port, fp_str.clone());
-        let asker = loop {
-            let rx = match host_key_turn(question.clone()) {
-                HostKeyTurn::Ask(a) => break a,
-                HostKeyTurn::Follow(rx) => rx,
-            };
-            let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
-                "msg": "Another session is asking about this same host key — waiting for that answer.",
-                "type": "info"
-            }));
-            // Waiting on a person, so the handshake timeout holds off (see below).
-            self.prompt_pending.store(true, std::sync::atomic::Ordering::SeqCst);
-            let wait = asked_answer(rx);
-            tokio::pin!(wait);
-            let answer = loop {
-                tokio::select! {
-                    a = &mut wait => break Some(a),
-                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(500)) => {
-                        if !self.attempt.may_prompt().await {
-                            break None;
-                        }
-                    }
-                }
-            };
-            self.prompt_pending.store(false, std::sync::atomic::Ordering::SeqCst);
-            let (msg, outcome) = match answer {
-                // This attempt was replaced or closed while waiting.
-                None => {
-                    self.fp_outcome.store(0, std::sync::atomic::Ordering::SeqCst);
-                    return Ok(false);
-                }
-                Some(None) => continue,
-                Some(Some(HostKeyAnswer::Accepted)) => ("Host key accepted (answered in another session).", 1),
-                Some(Some(HostKeyAnswer::Rejected)) => ("Host key rejected (answered in another session).", 0),
-                Some(Some(HostKeyAnswer::Unanswered)) => {
-                    ("Host key verification timed out (the prompt in another session wasn't answered).", 2)
-                }
-            };
-            let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
-                "msg": msg,
-                "type": if outcome == 1 { "success" } else { "error" }
-            }));
-            self.fp_outcome.store(outcome, std::sync::atomic::Ordering::SeqCst);
-            return Ok(outcome == 1);
+        // answer instead of asking again (host_key_asker.rs).
+        let asker = match ask_or_follow(self, (self.server_host.clone(), self.server_port, fp_str.clone())).await {
+            Ok(asker) => asker,
+            Err(answered) => return answered,
         };
 
         // Mark a prompt as pending BEFORE emitting it. The connect driver
@@ -1774,84 +1661,6 @@ impl client::Handler for ClientHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // No profile open: the key can't be checked, so it's refused with that
-    // reason, never asked about as if it were new.
-    #[test]
-    fn no_open_profile_means_the_key_cant_be_checked() {
-        let none = std::sync::Mutex::new(None);
-        assert_eq!(keys_on_file(&none, "h", 22, "FP").unwrap_err(), "no profile is open, so the server's key can't be checked");
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE known_hosts (id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT, port INTEGER, fingerprint TEXT, key_type TEXT);")
-            .unwrap();
-        let open = std::sync::Mutex::new(Some(conn));
-        assert_eq!(keys_on_file(&open, "h", 22, "FP").unwrap(), HostKeyVerdict::New);
-        // A broken table fails closed too.
-        open.lock().unwrap().as_ref().unwrap().execute_batch("DROP TABLE known_hosts;").unwrap();
-        assert!(keys_on_file(&open, "h", 22, "FP").is_err());
-    }
-
-    #[test]
-    fn a_terminal_closed_while_opening_is_not_registered() {
-        let mut t = TerminalOpenings::default();
-        let n = t.begin("s-term-0");
-        t.close("s-term-0");
-        assert!(!t.finish("s-term-0", n));
-        // Nothing left behind for the next open of that terminal.
-        let m = t.begin("s-term-0");
-        assert!(t.finish("s-term-0", m));
-        assert!(t.opening.is_empty());
-    }
-
-    #[test]
-    fn a_terminal_left_open_is_registered_once() {
-        let mut t = TerminalOpenings::default();
-        let n = t.begin("a");
-        let other = t.begin("b");
-        assert!(t.finish("a", n));
-        // A late close of another terminal, or a second finish, changes nothing.
-        t.close("c");
-        assert!(!t.finish("a", n));
-        assert!(t.finish("b", other));
-    }
-
-    #[test]
-    fn a_newer_open_of_the_same_terminal_wins() {
-        let mut t = TerminalOpenings::default();
-        let old = t.begin("a");
-        let new = t.begin("a");
-        assert!(!t.finish("a", old));
-        assert!(t.finish("a", new));
-        // Closed between two opens: only the open after the close counts.
-        let first = t.begin("a");
-        t.close("a");
-        let second = t.begin("a");
-        assert!(!t.finish("a", first));
-        assert!(t.finish("a", second));
-    }
-
-    #[tokio::test]
-    async fn one_host_key_question_at_a_time() {
-        let q = || ("hk-test.example".to_string(), 22u16, "SHA256:abc".to_string());
-        let HostKeyTurn::Ask(asker) = host_key_turn(q()) else { panic!("first one asks") };
-        let HostKeyTurn::Follow(rx) = host_key_turn(q()) else { panic!("second one follows") };
-        // Another key on the same host is its own question.
-        let HostKeyTurn::Ask(_other) = host_key_turn(("hk-test.example".into(), 22, "SHA256:xyz".into())) else {
-            panic!("a different key asks for itself")
-        };
-        let waiting = tokio::spawn(asked_answer(rx));
-        asker.answer(HostKeyAnswer::Accepted);
-        assert_eq!(waiting.await.unwrap(), Some(HostKeyAnswer::Accepted));
-        drop(asker);
-
-        // Gone without an answer: the follower hears None and asks itself.
-        let HostKeyTurn::Ask(asker) = host_key_turn(q()) else { panic!("asks again once the first is done") };
-        let HostKeyTurn::Follow(rx) = host_key_turn(q()) else { panic!("follows") };
-        let waiting = tokio::spawn(asked_answer(rx));
-        drop(asker);
-        assert_eq!(waiting.await.unwrap(), None);
-        assert!(matches!(host_key_turn(q()), HostKeyTurn::Ask(_)));
-    }
 
     fn sink(got: &std::cell::RefCell<Vec<u8>>) -> impl FnMut(&mut Vec<u8>) + '_ {
         move |b: &mut Vec<u8>| {
@@ -2225,6 +2034,9 @@ mod tests {
     const ECDSA_P256_FP_OLD_FORMAT: &str = "sv9PmqdzTou9hi/MJot5kkVRp1RlTzczpZBY9K1oNpY";
     const RSA_2048: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDV+BvzoBQWSFqUzFzroKlwFUmPsTDHZt3JKIX+S7eHR9CaLFSaUdxPgpf/s9BF5Ivm8sV4NiKGUbWzbwItcTzNk3JYEidewYxXb1B3drU7lt5aXWb2WkLQ3LNh+h7oyrJS9y6juLi4KYDceNwACb7gPJHiQYx187b9lfQhPr7YBAm6p17EQPp0p5mfdjXRR4fp/9bdGfjo32H+gdYlKUstcWM3h7/9t4D8DqVP+AGWdOav30dvqJkZecV81g7vCtFqGbpo6xw03yQ71BQJCcvaquptGtjJiA59iHql5D/KKM0zRN+r5lxNuduQIasBGc+GGdhioEqzmeYTI250PSAJ fixture";
     const RSA_2048_FP_OLD_FORMAT: &str = "nxrXMG0NyO+gdFkxT/vcYRg0no5urQPoiP7rc75QHow";
+    // `ssh-keygen -s ca -I fixture-host -h -n fixture.example` over ED25519:
+    // a host certificate whose embedded key IS the ED25519 fixture.
+    const ED25519_HOST_CERT: &str = "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAILjv1QmqwKn8aXSULcG7kSL388pMiSjUZFMt7oFciUGlAAAAIDUtueMG6aRvJ5KvL2MdRTSJvjovFlJSkevE6M2STKJoAAAAAAAAAAAAAAACAAAADGZpeHR1cmUtaG9zdAAAABMAAAAPZml4dHVyZS5leGFtcGxlAAAAAAAAAAD//////////wAAAAAAAAAAAAAAAAAAADMAAAALc3NoLWVkMjU1MTkAAAAgwN6B0Tf3VF3rFiFU8qAOsYLC4fwgl+GFWGKHkzLdHgEAAABTAAAAC3NzaC1lZDI1NTE5AAAAQMcDmzwGhVWC1D/LhuYLi21OWAuN+VB5BUziWq3uWh0onmWkyuDEw0FwWeTlwq0BexJbTIZr7bcNEBECVX71BQ0= fixture";
 
     fn key(openssh: &str) -> PublicKey {
         PublicKey::from_openssh(openssh).expect("fixture key parses")
@@ -2290,6 +2102,20 @@ mod tests {
             }
         }
         assert_eq!(key_type_family("ssh-ed25519-cert-v01@openssh.com"), all[0]);
+    }
+
+    #[test]
+    fn plain_keys_pass_through_and_certificates_are_refused() {
+        let k = key(ED25519);
+        let offered = PublicKeyOrCertificate::from(k.clone());
+        assert_eq!(plain_host_key(&offered).map(host_key_fingerprint), Some(host_key_fingerprint(&k)));
+
+        // Even though the certificate wraps an already-known key, it must NOT
+        // be reduced to that key: without a CA store it is refused.
+        let cert = russh::keys::Certificate::from_openssh(ED25519_HOST_CERT).expect("fixture cert parses");
+        assert_eq!(cert.public_key(), k.key_data());
+        let offered = PublicKeyOrCertificate::from(cert);
+        assert!(plain_host_key(&offered).is_none());
     }
 
     /// known_hosts exactly as `setup_master_db_inner` creates it.

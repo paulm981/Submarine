@@ -1,11 +1,61 @@
-//! A tab's root access as it was found (`RootAccess`, `RootGate`), and the
-//! terminals a tab is opening (`TerminalOpenings`).
+//! What the fork keeps on `SshState` (`ForkSsh`, its `fork` field): a tab's
+//! root access as it was found (`RootAccess`, `RootGate`), the terminals a
+//! tab is opening (`TerminalOpenings`), and each session's server and user.
 //!
 //! The fork's own, moved here out of ssh_manager.rs (#136) so a sync with the
 //! original project doesn't conflict on it. ssh_manager.rs brings it back in with
 //! `use root_state::*`.
 
 use super::*;
+
+/// The fork's part of `SshState`, as one field (`fork`), so a sync with the
+/// original project doesn't conflict on each of these (#215).
+/// A session's route through its jump hosts (`SshState::jump_connections`):
+/// their Handles, the last jump host last, each shared so a check through it
+/// (ping.rs) takes its own reference instead of holding the map; the
+/// connections close once the last reference goes. `jump_id`: the saved
+/// jump host it went through, None for a ProxyJump from ~/.ssh/config.
+pub struct JumpRoute {
+    pub jump_id: Option<i32>,
+    pub handles: Vec<Arc<client::Handle<ClientHandler>>>,
+}
+
+/// Keys typed into `terminal_id`, for a terminal whose keys don't go through
+/// a pump here (the fork's Home terminals, term_output::pace).
+pub(crate) fn page_keys(terminal_id: &str, keys: &[u8]) {
+    let page = pages().lock().ok().and_then(|p| p.get(terminal_id).cloned());
+    if let Some(page) = page {
+        page.keys(keys);
+    }
+}
+
+#[derive(Default)]
+pub struct ForkSsh {
+    /// Per-tab root access for the Info panel's actions (services, kill,
+    /// firewall rules): what worked last time, so it isn't probed or asked
+    /// for again. Dropped when the tab closes, like `sftp_elevation`.
+    pub root_access: Arc<Mutex<HashMap<String, RootAccess>>>,
+    /// Tabs whose server refuses the user's own `docker` (not in the docker
+    /// group): the Docker tab's commands go straight to root there
+    /// (docker.rs). Dropped when the tab closes, like `root_access`.
+    pub docker_root: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// The saved server each session was opened for (initiate_connection,
+    /// telnet_connect), and the server of each of its shell terminals: a
+    /// server's own saved password is typed only into that server's
+    /// terminals (type_saved_password).
+    pub session_servers: Arc<Mutex<HashMap<String, i32>>>,
+    /// The user each session logged in as (initiate_connection): the AI
+    /// panel says who a command runs as (#116).
+    pub session_users: Arc<Mutex<HashMap<String, String>>>,
+    /// Per tab: one password the user typed is tried at a time, and one
+    /// just turned down isn't tried again (lib.rs, typed_root_access).
+    pub root_gates: Arc<Mutex<HashMap<String, Arc<Mutex<RootGate>>>>>,
+    /// The saved server each shell terminal belongs to (secret_policy.rs).
+    pub terminal_servers: Arc<Mutex<HashMap<String, i32>>>,
+    /// Terminals whose shell is still opening (open_terminal,
+    /// open_container_terminal). Locked before `terminal_txs` when both are.
+    pub terminal_openings: Arc<Mutex<TerminalOpenings>>,
+}
 
 /// Which terminals are still opening, so a close that arrives while one is
 /// (the page closed the tab before the server answered) isn't lost: opening
@@ -105,21 +155,21 @@ impl SshState {
     /// disconnect_session and teardown_profile): its root access and root
     /// gate, its containers' root, and who it logged in as.
     pub(crate) async fn forget_fork_session(&self, session_id: &str) {
-        self.root_access.lock().await.remove(session_id);
-        self.root_gates.lock().await.remove(session_id);
-        self.docker_root.lock().await.remove(session_id);
-        self.session_users.lock().await.remove(session_id);
+        self.fork.root_access.lock().await.remove(session_id);
+        self.fork.root_gates.lock().await.remove(session_id);
+        self.fork.docker_root.lock().await.remove(session_id);
+        self.fork.session_users.lock().await.remove(session_id);
     }
 
     /// The same for every tab, when the profile closes (lib.rs,
     /// teardown_profile), and which saved server each tab and terminal is for.
     pub(crate) async fn forget_fork_sessions(&self) {
-        self.root_access.lock().await.clear();
-        self.root_gates.lock().await.clear();
-        self.docker_root.lock().await.clear();
-        self.session_servers.lock().await.clear();
-        self.session_users.lock().await.clear();
-        self.terminal_servers.lock().await.clear();
+        self.fork.root_access.lock().await.clear();
+        self.fork.root_gates.lock().await.clear();
+        self.fork.docker_root.lock().await.clear();
+        self.fork.session_servers.lock().await.clear();
+        self.fork.session_users.lock().await.clear();
+        self.fork.terminal_servers.lock().await.clear();
     }
 }
 
@@ -136,6 +186,9 @@ mod hook_tests {
             &[
                 ("", "mod root_state;", 1),
                 ("", "pub(crate) use root_state::*;", 1),
+                ("", "pub fork: ForkSsh,", 1),
+                ("", "fork: ForkSsh::default(),", 1),
+                ("", "mod fork_tests;", 1),
             ],
         );
         assert_hooks(

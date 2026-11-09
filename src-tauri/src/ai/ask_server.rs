@@ -343,13 +343,13 @@ pub(crate) async fn answer(state: &AiState, ssh: &crate::ssh_manager::SshState, 
     state
         .share_ask(id, |server_id| async move {
             // The tab opened for that saved server, once it's connected.
-            let sessions = ssh.session_servers.lock().await;
+            let sessions = ssh.fork.session_servers.lock().await;
             let session = sessions.iter().find(|(sid, &sv)| i64::from(sv) == server_id && !sid.contains("::")).map(|(sid, _)| sid.clone())?;
             drop(sessions);
             if !ssh.connections.lock().await.contains_key(&session) {
                 return None;
             }
-            let user = ssh.session_users.lock().await.get(&session).cloned();
+            let user = ssh.fork.session_users.lock().await.get(&session).cloned();
             Some((session, user))
         })
         .await
