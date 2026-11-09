@@ -417,6 +417,9 @@ export function HighlightSettings({ settings, setSettings, onRulesChanged }: any
                     {KINDS.find((k) => k.id === r.kind)?.name}
                     {r.matchCase ? ", match case" : ""}
                   </span>
+                  {/* A rule from another computer or an older build that this
+                      one can't use is kept, and says why it does nothing. */}
+                  {ruleProblem(r) && <span className="text-[10.5px] text-amber-400/90 whitespace-normal">Not used: {ruleProblem(r)}</span>}
                 </span>
                 <button type="button" aria-label="Move up" title="Move up" disabled={i === 0} onClick={() => void move(i, -1)} className="p-1 text-zinc-500 hover:text-white disabled:opacity-30">
                   <ChevronUp size={14} />
