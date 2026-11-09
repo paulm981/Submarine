@@ -186,28 +186,32 @@ pub(crate) static MAX_DATA: usize = 1024 * 1024;
 
 /// Broadcast's typing: the same bytes to each of `terminal_ids`, in one call
 /// from the page instead of one per terminal, as `write_terminal_data`
-/// writes them (lib.rs). Each terminal's queue is found under the map's lock,
-/// then written to with the lock let go, all at once, so a slow server's
-/// full queue holds up only its own. A terminal that's gone is skipped.
+/// writes them (lib.rs). It never waits on a terminal: one whose queue is
+/// full (a slow server still taking a paste) is left out and named in the
+/// answer, and the page sends that one its keys with `write_terminal_data`,
+/// in order, while the others carry on (#205). A terminal that's gone is
+/// skipped.
 #[tauri::command]
-pub async fn write_terminals_data(state: tauri::State<'_, crate::ssh_manager::SshState>, terminal_ids: Vec<String>, data: Vec<u8>) -> Result<(), String> {
+pub async fn write_terminals_data(state: tauri::State<'_, crate::ssh_manager::SshState>, terminal_ids: Vec<String>, data: Vec<u8>) -> Result<Vec<String>, String> {
     check_targets(&terminal_ids, &data)?;
     let txs: Vec<_> = {
         let map = state.terminal_txs.lock().await;
-        terminal_ids.iter().filter_map(|id| map.get(id).cloned()).collect()
+        terminal_ids.into_iter().filter_map(|id| map.get(&id).cloned().map(|tx| (id, tx))).collect()
     };
-    // Each write a task of its own; the call ends once all of them have,
-    // and the page sends the next keystroke only then, so each terminal
-    // gets its keys in order.
-    let mut writes = tokio::task::JoinSet::new();
-    for tx in txs {
-        let data = data.clone();
-        writes.spawn(async move {
-            let _ = tx.send(crate::ssh_manager::TerminalCommand::Data(data)).await;
-        });
+    Ok(send_all(&txs, &data))
+}
+
+/// `data` to each terminal's queue, without waiting: the ids of those whose
+/// queue was full. A closed one is skipped, as a gone one is.
+fn send_all(txs: &[(String, tokio::sync::mpsc::Sender<crate::ssh_manager::TerminalCommand>)], data: &[u8]) -> Vec<String> {
+    use tokio::sync::mpsc::error::TrySendError;
+    let mut full = Vec::new();
+    for (id, tx) in txs {
+        if let Err(TrySendError::Full(_)) = tx.try_send(crate::ssh_manager::TerminalCommand::Data(data.to_vec())) {
+            full.push(id.clone());
+        }
     }
-    while writes.join_next().await.is_some() {}
-    Ok(())
+    full
 }
 
 /// A Broadcast write's size, checked at the edge.
@@ -354,5 +358,28 @@ mod tests {
         assert!(check_targets(&ids(MAX_TARGETS), &vec![0; MAX_DATA]).is_ok());
         assert!(check_targets(&ids(MAX_TARGETS + 1), b"x").is_err());
         assert!(check_targets(&ids(1), &vec![0; MAX_DATA + 1]).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_full_terminal_doesnt_hold_up_the_others() {
+        use crate::ssh_manager::TerminalCommand;
+        let (slow, _never_read) = tokio::sync::mpsc::channel(1);
+        slow.try_send(TerminalCommand::Data(vec![0])).unwrap();
+        let (fast, mut fast_rx) = tokio::sync::mpsc::channel(32);
+        let (gone, gone_rx) = tokio::sync::mpsc::channel(32);
+        drop(gone_rx);
+        let txs = vec![("slow".to_string(), slow), ("fast".to_string(), fast), ("gone".to_string(), gone)];
+        // Returns at once, naming only the full one; the closed one is skipped.
+        assert_eq!(send_all(&txs, b"a"), vec!["slow".to_string()]);
+        let TerminalCommand::Data(got) = fast_rx.try_recv().unwrap();
+        assert_eq!(got, b"a");
+        assert_eq!(send_all(&txs, b"b"), vec!["slow".to_string()]);
+        let TerminalCommand::Data(got) = fast_rx.try_recv().unwrap();
+        assert_eq!(got, b"b");
+    }
+
+    #[test]
+    fn the_command_is_registered() {
+        crate::fork_hooks::assert_hooks("lib.rs", include_str!("lib.rs"), &[("run", "multiexec::write_terminals_data", 1)]);
     }
 }
