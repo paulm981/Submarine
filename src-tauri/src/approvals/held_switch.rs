@@ -1,5 +1,28 @@
-//! A shared server's held switch to telnet or VNC: held until this device's
-//! user allows it, and kept as SSH meanwhile.
+//! What the fork holds, besides what approvals.rs describes.
+//!
+//! **A server switched to telnet or VNC** from anything else (SSH, RDP) is held
+//! for what it would send rather than run. Telnet sends the password as plain
+//! text, and VNC answers its password check with weak protection and doesn't
+//! check the server's identity, so the switch could take the server's saved
+//! password somewhere it could be read. Unlike the others, this device keeps
+//! the old protocol and port in the row until it's allowed (`hold_switch` puts
+//! them back, and `before_merge` brings the synced ones back for the next
+//! record to merge over); what it pushes still carries the synced ones
+//! (`held_switch`), so the hold never undoes the change for everyone else. The
+//! user can also keep it as it was (`keep_ssh`), which is their own edit and
+//! goes to everyone. A switch to RDP isn't held: its password is only sent
+//! after the server's certificate is checked, as an SSH password is after its
+//! host key. But a switch from RDP to telnet or VNC is, or SSH to RDP to VNC
+//! would get round the hold in two steps. Its entry is
+//! `protocol:<telnet|vnc>|<port>`.
+//!
+//! **Entries made while a profile was shared** stay after it's left, like the
+//! rest of the device's state, until the user allows them; a held switch goes
+//! on being kept through the merges that follow.
+//!
+//! **A forward is held when a synced record makes it run:** a new one, or one
+//! this device's user stopped and someone else started again. One that comes
+//! in stopped, or is stopped again, runs nothing and isn't held.
 //!
 //! The fork's own, moved here out of approvals.rs (#136) so a sync with the
 //! original project doesn't conflict on it. approvals.rs brings it back in with
@@ -189,6 +212,8 @@ mod hook_tests {
             &[
                 ("", "mod held_switch;", 1),
                 ("", "pub(crate) use held_switch::*;", 1),
+                // The fork's tests, in approvals/tests/fork.rs (#215).
+                ("", "    mod fork;", 1),
             ],
         );
         assert_hooks("lib.rs", include_str!("../lib.rs"), &[("run", "approvals::keep_server_ssh", 1)]);
