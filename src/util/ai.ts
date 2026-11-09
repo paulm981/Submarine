@@ -168,7 +168,14 @@ export interface AiDone {
 export interface AiServerAsk {
   id: number; tab_id: string; tab_label: string; asked: string;
   server_id: number | null; server_name: string | null; many: boolean; asked_at: string;
+  /// You said Share, and its tab is connecting: shared once it's up.
+  connecting?: boolean;
 }
+
+/// What waits for you from AI tab `tabId`: its requests (one on several
+/// servers counts once, #158) and its requests for a server.
+export const waitingFor = (ai: Pick<AiSnapshot, "pending" | "server_asks">, tabId: string): number =>
+  cardsOf(ai.pending.filter((p) => p.tab_id === tabId)).length + (ai.server_asks ?? []).filter((a) => a.tab_id === tabId).length;
 
 export interface AiSnapshot {
   enabled: boolean; tabs: AiTab[]; pending: AiPending[]; server_asks: AiServerAsk[]; running: AiRunning[]; history: AiDone[];
