@@ -108,11 +108,13 @@ pub(crate) fn save(conn: &Connection, rule: &HighlightRule) -> Result<i64, Strin
                 return Err("This rule was deleted, here or on another computer you sync with. Add it again if you still want it.".into());
             }
             // Only when something changed: an update restamps the row for sync.
+            // Not whether it's on: that's the switch's (set_enabled), and the
+            // editor's copy of it could be older than one synced since.
             conn.execute(
-                "UPDATE highlight_rules SET pattern=?1, kind=?2, match_case=?3, color=?4, bold=?5, underline=?6, enabled=?7
-                 WHERE id=?8 AND (pattern IS NOT ?1 OR kind IS NOT ?2 OR match_case IS NOT ?3 OR color IS NOT ?4
-                                  OR bold IS NOT ?5 OR underline IS NOT ?6 OR enabled IS NOT ?7)",
-                params![rule.pattern, rule.kind, rule.match_case, rule.color, rule.bold, rule.underline, rule.enabled, id],
+                "UPDATE highlight_rules SET pattern=?1, kind=?2, match_case=?3, color=?4, bold=?5, underline=?6
+                 WHERE id=?7 AND (pattern IS NOT ?1 OR kind IS NOT ?2 OR match_case IS NOT ?3 OR color IS NOT ?4
+                                  OR bold IS NOT ?5 OR underline IS NOT ?6)",
+                params![rule.pattern, rule.kind, rule.match_case, rule.color, rule.bold, rule.underline, id],
             )
             .map_err(db)?;
             Ok(id)
@@ -132,8 +134,9 @@ pub(crate) fn save(conn: &Connection, rule: &HighlightRule) -> Result<i64, Strin
 /// Turn a rule on or off, and nothing else: the Settings card's switch
 /// (#49). Saving the card's whole copy instead could put back an edit made
 /// on another computer since it was read, or turn a colour this build
-/// doesn't know into red. A rule deleted meanwhile says so.
-pub(crate) fn set_enabled(conn: &Connection, id: i64, enabled: bool) -> Result<(), String> {
+/// doesn't know into red. A rule deleted meanwhile says so. Whether it
+/// changed anything, so a click that doesn't isn't saved and synced.
+pub(crate) fn set_enabled(conn: &Connection, id: i64, enabled: bool) -> Result<bool, String> {
     let db = |e: rusqlite::Error| format!("[DATABASE] HIGHLIGHT_SAVE_FAILED: {}", e);
     let live: bool = conn
         .query_row("SELECT EXISTS (SELECT 1 FROM highlight_rules WHERE id=?1 AND deleted = 0)", params![id], |r| r.get(0))
@@ -141,8 +144,8 @@ pub(crate) fn set_enabled(conn: &Connection, id: i64, enabled: bool) -> Result<(
     if !live {
         return Err("This rule was deleted, here or on another computer you sync with.".into());
     }
-    conn.execute("UPDATE highlight_rules SET enabled=?1 WHERE id=?2 AND enabled IS NOT ?1", params![enabled, id]).map_err(db)?;
-    Ok(())
+    let n = conn.execute("UPDATE highlight_rules SET enabled=?1 WHERE id=?2 AND enabled IS NOT ?1", params![enabled, id]).map_err(db)?;
+    Ok(n > 0)
 }
 
 /// The rules in this order (the first wins where two match the same text).
@@ -190,7 +193,7 @@ pub async fn highlight_rule_save(state: tauri::State<'_, DbState>, rule: Highlig
 
 #[tauri::command]
 pub async fn highlight_rule_set_enabled(state: tauri::State<'_, DbState>, id: i64, enabled: bool) -> Result<(), String> {
-    with_conn(&state, |conn| set_enabled(conn, id, enabled).map(|()| ((), true)))
+    with_conn(&state, |conn| set_enabled(conn, id, enabled).map(|changed| ((), changed)))
 }
 
 #[tauri::command]
@@ -286,5 +289,33 @@ mod tests {
         assert_eq!((p.as_str(), c.as_str(), on), ("alpha2", "teal-9", false));
         conn.execute("UPDATE highlight_rules SET deleted = 1 WHERE id = ?1", params![a]).unwrap();
         assert!(set_enabled(&conn, a, true).is_err());
+    }
+
+    /// A click that changes nothing isn't saved, nor sent to sync.
+    #[test]
+    fn the_switch_says_whether_it_changed_anything() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let a = save(&conn, &rule("alpha", "word")).unwrap();
+        assert!(set_enabled(&conn, a, false).unwrap());
+        assert!(!set_enabled(&conn, a, false).unwrap());
+        assert!(set_enabled(&conn, a, true).unwrap());
+    }
+
+    /// An edit keeps the switch as it is now: the editor's copy of it may be
+    /// older than one turned off on another computer and synced in since.
+    #[test]
+    fn an_edit_keeps_the_switch_set_elsewhere() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        let a = save(&conn, &rule("alpha", "word")).unwrap();
+        set_enabled(&conn, a, false).unwrap();
+        let mut edit = rule("alpha2", "word");
+        edit.id = Some(a);
+        assert!(edit.enabled, "the editor read it while it was on");
+        save(&conn, &edit).unwrap();
+        let (p, on): (String, bool) =
+            conn.query_row("SELECT pattern, enabled FROM highlight_rules WHERE id = ?1", params![a], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((p.as_str(), on), ("alpha2", false));
     }
 }

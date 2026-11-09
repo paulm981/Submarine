@@ -13,6 +13,7 @@ import {
   highlightSetById,
   normalizeRules,
   ruleProblem,
+  ruleToSave,
   type CustomRule,
   type HighlightColor,
   type RuleKind,
@@ -207,7 +208,7 @@ function RuleEditor({
             aria-checked={rule.color === c.id}
             aria-label={c.name}
             title={c.name}
-            onClick={() => set({ color: c.id as HighlightColor })}
+            onClick={() => set({ color: c.id as HighlightColor, savedColor: undefined })}
             className={`w-5 h-5 rounded-full border-2 transition-transform ${rule.color === c.id ? "border-white scale-110" : "border-transparent hover:scale-110"}`}
             style={{ background: ansi[ansiFor(c, grays)] }}
           />
@@ -270,7 +271,7 @@ export function HighlightSettings({ settings, setSettings, onRulesChanged }: any
     onRulesChanged?.();
   };
   const saveRule = async (r: CustomRule) => {
-    await invoke("highlight_rule_save", { rule: r });
+    await invoke("highlight_rule_save", { rule: ruleToSave(r) });
     setEditing(null);
     setDraft(null);
     await changed();
