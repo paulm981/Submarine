@@ -9,6 +9,11 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.64
+
+- **Right-click on a file name in a terminal edits the file shown, on the server shown.** The name is read as the terminal shows it, past wide characters (CJK, emoji) and across a long path that wraps onto the next row. Once your shell has gone on to another host with `ssh`, Edit locally isn't offered until it's back, and the menu says which server it edits on. A right-click on your prompt pastes again, and names in any alphabet get the menu. ([#209](https://github.com/paulm981/Submarine/issues/209))
+- **Open terminal here goes to the folder after the server's on-connect commands,** so a `cd` or `sudo -i` among them no longer takes the terminal elsewhere or gets the `cd` as a password; and with WSL as your Home shell, it opens in the folder you picked. ([#209](https://github.com/paulm981/Submarine/issues/209))
+
 ## v0.4.0-fork.63
 
 - **Broadcast: one slow server no longer holds up typing to the others, and a big paste reaches every server.** A server that falls behind, such as one still taking a large paste on a slow link, gets its keys on its own, in order, until it catches up, while the rest keep up. A paste over 1 MB used to reach only the server you were typing in; it now goes to all of them. Terminals waiting to open also open while the window is minimized. ([#205](https://github.com/paulm981/Submarine/issues/205))
