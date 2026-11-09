@@ -341,7 +341,7 @@ fn glob_match(pat: &[char], text: &[char]) -> bool {
 /// word starting with `name`: once all of `name` is read, any part of the
 /// glob still reachable can be finished by some ending. A glob longer than
 /// MAX_GLOB counts as one that could.
-fn glob_could_be(pat: &str, name: &str, prefix: bool) -> bool {
+pub(crate) fn glob_could_be(pat: &str, name: &str, prefix: bool) -> bool {
     let pat: Vec<char> = pat.chars().collect();
     if pat.len() > MAX_GLOB {
         return true;
@@ -871,7 +871,7 @@ pub(crate) fn decide_parsed(policy: &Policy, session_allow: bool, command: &Pars
         if let Some(rule) = policy.allow.iter().find(|r| allow_matches_on(r, &command.command, policy.windows)) {
             return Decision::Rule(rule.clone());
         }
-        if level == Level::ReadOnly && !policy.windows && super::read_only::only_reads(&command.command) {
+        if level == Level::ReadOnly && policy.reads_alone() && super::read_only::only_reads(&command.command) {
             return Decision::ReadOnly;
         }
     }
@@ -900,7 +900,7 @@ impl Requests {
             Requests::AskEachTime
         } else if allow_all || Level::of(policy.level) == Level::Anything {
             Requests::Anything
-        } else if Level::of(policy.level) == Level::ReadOnly && !policy.windows {
+        } else if Level::of(policy.level) == Level::ReadOnly && policy.reads_alone() {
             Requests::ReadOnly
         } else if Level::of(policy.level) >= Level::AllowedCommands && !policy.allow.is_empty() {
             Requests::AllowedCommands
@@ -1128,6 +1128,16 @@ impl Policy {
     /// What holds when the settings can't be read: every command asks.
     pub(crate) fn unreadable() -> Policy {
         Policy { force_ask: Some(UNREADABLE.into()), ..Policy::default() }
+    }
+    /// Whether "Run commands that only read" runs anything by itself here:
+    /// only on a server whose OS Submarine knows and isn't Windows. The
+    /// list is of Unix programs read by a Unix shell; on Windows, cmd and
+    /// PowerShell read the same words otherwise (single quotes aren't
+    /// quotes to cmd), and an OS that isn't known could be Windows: not
+    /// detected yet, detection off, a quick connect, or a PowerShell server
+    /// the check can't read. There it's as "Run my allowed commands".
+    pub(crate) fn reads_alone(&self) -> bool {
+        !self.windows && self.os.as_deref().is_some_and(|os| os != "windows")
     }
 }
 

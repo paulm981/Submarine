@@ -277,7 +277,7 @@ fn names_stay_unique_within_an_ai_tab() {
     let mut servers = Vec::new();
     for _ in 0..3 {
         let name = unique_name(&servers, "web");
-        servers.push(SharedServer { session_id: name.clone(), name, user: None, server_id: None, allow_all: false, level: 1, root: None, root_via: None });
+        servers.push(SharedServer { session_id: name.clone(), name, user: None, server_id: None, allow_all: false, level: 1, reads_alone: false, root: None, root_via: None });
     }
     let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, ["web", "web (2)", "web (3)"]);
@@ -2151,4 +2151,24 @@ async fn a_forged_exit_code_and_closing_tag_stay_inside_the_output() {
     let tagged = tagged_parts(&r.text);
     assert_eq!(tagged.len(), 2);
     assert!(tagged.iter().all(|(_, closed)| *closed) && tagged[0].0 != tagged[1].0, "{}", r.text);
+}
+
+/// "Try on … first" (#194): the card's button allows the first server's
+/// part alone. It runs, the others still wait, and the AI hears back once,
+/// when every server has been answered.
+#[tokio::test]
+async fn trying_one_server_first_runs_it_alone_and_answers_once_all_are_decided() {
+    let s = state_for_group(|_| 1);
+    let req = on_servers(&s, &["s7", "s8", "s9"], false, "uptime");
+    wait_for("the cards", || s.snapshot().pending.len() == 3).await;
+    let first = s.snapshot().pending.into_iter().find(|p| p.server == "s7").unwrap();
+    s.answer(first.id, Answer::Allow { by: BY_YOU.into(), password: None }).unwrap();
+    wait_for("s7 done", || s.snapshot().pending.len() == 2).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!req.is_finished(), "the AI hears back only once all are answered");
+    s.decide_group(first.group.unwrap().id, false, Some("not yet".into())).unwrap();
+    let r = req.await.unwrap();
+    assert!(r.text.contains("hello from sess-7"), "{}", r.text);
+    assert!(!r.text.contains("hello from sess-8") && !r.text.contains("hello from sess-9"), "{}", r.text);
+    assert_eq!(r.text.matches("Denied by the user: not yet").count(), 2, "{}", r.text);
 }

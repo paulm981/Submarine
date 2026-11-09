@@ -27,7 +27,7 @@
 //! - **Devices ask** (`reaches_a_device`): opening one can do something,
 //!   reading or not. `/dev/watchdog` reboots the server unless it's closed
 //!   just so, and reading `/proc/kmsg` takes the kernel's messages away.
-//! - **Files that usually hold secrets ask** (`names_secret`): a word naming
+//! - **Files that usually hold secrets ask** (`could_name_secret`): a word naming
 //!   `.env`, `.ssh/`, a private key and the like. A best effort, not a wall:
 //!   a secret in a file with another name, or found by `grep -r`, is read.
 //!
@@ -53,7 +53,7 @@ pub(crate) struct Word {
 /// anything not on it.
 pub(crate) fn only_reads(command: &str) -> bool {
     match pipeline(command) {
-        Some(stages) => stages.iter().all(|s| stage_reads(s)) && !stages.iter().flatten().any(|w| names_secret(&w.text) || reaches_a_device(w)),
+        Some(stages) => stages.iter().all(|s| stage_reads(s)) && !stages.iter().flatten().any(|w| could_name_secret(w) || reaches_a_device(w)),
         None => false,
     }
 }
@@ -132,12 +132,16 @@ fn stage_reads(words: &[Word]) -> bool {
         "cat" | "tac" | "head" | "tail" | "wc" | "nl" | "cut" | "tr" | "paste" | "join" | "comm" | "fold" | "fmt" | "expand" | "column"
         | "zcat" | "ls" | "stat" | "du" | "df" | "free" | "uptime" | "w" | "who" | "whoami" | "id" | "groups" | "uname" | "nproc" | "arch"
         | "ps" | "pgrep" | "pidof" | "lsblk" | "lscpu" | "lsmem" | "lspci" | "lsusb" | "lsof" | "lsmod" | "modinfo" | "findmnt" | "netstat" | "vmstat"
-        | "iostat" | "mpstat" | "getent" | "last" | "which" | "readlink" | "realpath" | "basename" | "dirname" | "pwd" | "md5sum" | "sha1sum"
+        | "iostat" | "mpstat" | "last" | "which" | "readlink" | "realpath" | "basename" | "dirname" | "pwd" | "md5sum" | "sha1sum"
         | "sha256sum" | "sha512sum" | "b2sum" | "cksum" | "strings" | "od" | "hexdump" | "diff" | "cmp" | "dpkg-query" | "getconf" | "locale" => true,
         // `-D read` reads the devices `-r` comes across.
         "grep" | "egrep" | "fgrep" => !short_has(args, "D") && !long_is(args, &["--devices"]),
-        // `uniq IN OUT` writes OUT.
-        "uniq" => positional(args).count() <= 1,
+        // `uniq IN OUT` writes OUT, `-` (stdin) and what follows `--`
+        // counting as files (`uniq - /etc/passwd`).
+        "uniq" => operands(args).count() <= 1,
+        // Hosts and networks are looked up in DNS, which can carry data out
+        // as a hostname can (`getent hosts data.example`).
+        "getent" => args.iter().all(|w| !w.text.starts_with('-')) && first_is(args, GETENT_SHOWS),
         "sort" => !short_has(args, "o") && !long_is(args, &["--output", "--compress-program"]),
         "ss" => !short_has(args, "KD") && !long_is(args, &["--kill", "--diag"]),
         "file" => !short_has(args, "C") && !long_is(args, &["--compile"]),
@@ -146,7 +150,7 @@ fn stage_reads(words: &[Word]) -> bool {
         "date" => date_shows(args),
         "hostname" => args.iter().all(|w| HOSTNAME_SHOWS.contains(&w.text.as_str())),
         "hostnamectl" | "timedatectl" => args.iter().all(|w| matches!(w.text.as_str(), "status" | "show" | "--no-pager")),
-        "ifconfig" => positional(args).count() <= 1 && args.iter().filter(|w| w.text.starts_with('-')).all(|w| matches!(w.text.as_str(), "-a" | "-s" | "-v")),
+        "ifconfig" => operands(args).count() <= 1 && args.iter().filter(|w| w.text.starts_with('-')).all(|w| matches!(w.text.as_str(), "-a" | "-s" | "-v")),
         "sysctl" => args.iter().all(|w| matches!(w.text.as_str(), "-a" | "-n" | "-e" | "-N" | "-A" | "-X") || (!w.text.starts_with('-') && !w.text.contains('='))),
         "crontab" => args.len() == 1 && args[0].text == "-l",
         "systemctl" => first_is(args, SYSTEMCTL_SHOWS) && !short_has(args, "HM") && !long_is(args, &["--host", "--machine"]),
@@ -199,12 +203,28 @@ static JOURNALCTL_CHANGES: &[&str] = &[
     "--setup-keys",
     "--update-catalog",
     "--cursor-file",
+    // Attaches a disk image as root, through a loop device.
+    "--image",
 ];
+/// getent's databases that are looked up on this server, not in DNS.
+static GETENT_SHOWS: &[&str] = &["passwd", "group", "services", "protocols", "shells", "rpc", "aliases", "initgroups"];
 static DPKG_SHOWS: &[&str] = &["-l", "-L", "-s", "-S", "--list", "--listfiles", "--status", "--search", "--get-selections", "--print-architecture"];
 
-/// The words that aren't options.
-fn positional(args: &[Word]) -> impl Iterator<Item = &Word> {
-    args.iter().filter(|w| !w.text.starts_with('-'))
+/// The words a program reads as files or other operands, not options: any
+/// that doesn't start with `-`, a lone `-` (stdin or stdout), and every
+/// word after `--`.
+fn operands(args: &[Word]) -> impl Iterator<Item = &Word> {
+    let mut after = false;
+    args.iter().filter(move |w| {
+        if after {
+            return true;
+        }
+        if w.text == "--" {
+            after = true;
+            return false;
+        }
+        w.text == "-" || !w.text.starts_with('-')
+    })
 }
 
 /// The first word is one of `subcommands`: no option before it, whose
@@ -230,13 +250,15 @@ fn long_is(args: &[Word], options: &[&str]) -> bool {
 }
 
 /// `date` showing a date: `-d`, `--date` and `-r` (a file's time) take the
-/// next word; any other word that isn't an option is a format (`+%F`).
-/// `-s`, `--set` and a bare date (`date 0101…`, which sets it) ask.
+/// next word; one format (`+%F`), last. `-s`, `--set` and a bare date
+/// (`date 0101…`, which sets it) ask, and so do `-f` and `-D`: on BSD and
+/// busybox they read the next word as an input format, and a `+` word after
+/// it as the date to set (`date -f +%Y +%F +2020`).
 fn date_shows(args: &[Word]) -> bool {
-    if short_has(args, "s") || long_is(args, &["--set"]) {
+    if short_has(args, "sfD") || long_is(args, &["--set", "--file"]) {
         return false;
     }
-    let mut words = args.iter();
+    let mut words = args.iter().peekable();
     while let Some(w) = words.next() {
         match w.text.as_str() {
             "-d" | "--date" | "-r" | "--reference" => {
@@ -244,7 +266,12 @@ fn date_shows(args: &[Word]) -> bool {
                     return false;
                 }
             }
-            t if t.starts_with('-') || t.starts_with('+') => {}
+            t if t.starts_with('+') => {
+                if words.peek().is_some() {
+                    return false;
+                }
+            }
+            t if t.starts_with('-') => {}
             _ => return false,
         }
     }
@@ -295,29 +322,46 @@ fn docker_shows(args: &[Word]) -> bool {
 /// `--query`, and nothing else that starts with `-`.
 fn rpm_queries(args: &[Word]) -> bool {
     let Some((first, rest)) = args.split_first() else { return false };
-    let query = first.text == "--query" || first.text.strip_prefix("-q").is_some_and(|l| l.chars().all(|c| "ailfcdRsp".contains(c)));
+    // Not `p`: a package file, which rpm downloads when it's a URL.
+    let query = first.text == "--query" || first.text.strip_prefix("-q").is_some_and(|l| l.chars().all(|c| "ailfcdRs".contains(c)));
     query && rest.iter().all(|w| !w.text.starts_with('-'))
 }
 
 /// Whether a word could name a device: a path into `/dev` or to
 /// `/proc/kmsg` (each part split at `=`, as `--file=/dev/x`), however it's
 /// spelled (`//dev`, `/./dev`), also from the home folder where that's `/`
-/// (`dev/x`, but not a bare `dev`, as in `ip addr show dev eth0`); a path with `..` in it; or a glob in its first folder, which
-/// could be `/dev` (`/d*/watchdog`).
+/// (`dev/x`, but not a bare `dev`, as in `ip addr show dev eth0`); a path
+/// with `..` in it; a glob in its first folder, which could be `/dev`
+/// (`/d*/watchdog`); and in `/proc`, a glob anywhere (`/proc/km*`) or a
+/// way back to `/` (`/proc/self/root/dev/watchdog`, `cwd`, `fd`,
+/// `map_files`).
 fn reaches_a_device(w: &Word) -> bool {
+    static PROC_WAYS_OUT: &[&str] = &["root", "cwd", "fd", "map_files"];
     w.text.split('=').any(|path| {
         let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty() && *p != ".").collect();
         let globbed = w.glob && parts.first().is_some_and(|p| p.contains(['*', '?', '['])) && (path.starts_with('/') || parts.len() > 1);
+        let in_proc = matches!(parts.first(), Some(&"proc")) && (path.starts_with('/') || parts.len() > 1);
         parts.contains(&"..")
             || (matches!(parts.first(), Some(&"dev")) && (path.starts_with('/') || parts.len() > 1))
-            || (matches!(parts.first(), Some(&"proc")) && parts.get(1).is_some_and(|p| p.starts_with("kmsg")))
+            || (in_proc && (w.glob || parts[1..].iter().any(|p| p.starts_with("kmsg") || PROC_WAYS_OUT.contains(p))))
             || globbed
     })
 }
 
 /// Whether a word names a file or folder that usually holds secrets: one
 /// of its parts, split at `/` and `=` (`--file=~/.env`), in any case.
-pub(crate) fn names_secret(word: &str) -> bool {
+#[cfg(test)]
+fn names_secret(word: &str) -> bool {
+    secret_in(word, false)
+}
+
+/// names_secret for a word the shell expands (`/etc/shado?`, `.e*`): a
+/// glob part counts if it could expand to one of those names.
+fn could_name_secret(w: &Word) -> bool {
+    secret_in(&w.text, w.glob)
+}
+
+fn secret_in(word: &str, glob: bool) -> bool {
     static NAMES: &[&str] = &[
         ".ssh",
         ".aws",
@@ -343,10 +387,28 @@ pub(crate) fn names_secret(word: &str) -> bool {
         "secrets",
     ];
     static ENDS: &[&str] = &[".pem", ".key", "_key", ".p12", ".pfx", ".kdbx", ".jks", ".keystore"];
+    static STARTS: &[&str] = &[".env.", "id_", "shadow"];
     let word = word.to_ascii_lowercase();
     word.split(['/', '=']).any(|part| {
-        NAMES.contains(&part) || part.starts_with(".env.") || part.starts_with("id_") || ENDS.iter().any(|e| part.ends_with(e)) || part.starts_with("shadow")
+        if glob && part.contains(['*', '?', '[']) {
+            return glob_could_name_secret(part, NAMES, ENDS);
+        }
+        NAMES.contains(&part) || STARTS.iter().any(|s| part.starts_with(s)) || ENDS.iter().any(|e| part.ends_with(e))
     })
+}
+
+/// Whether a glob part could expand to the name of a file that usually
+/// holds secrets: one of `names`, a name such files start with (by
+/// example: `.env.local`, `id_rsa`, `shadow-`), or one ending as `ends` do,
+/// judged by what follows its last wildcard, which is all an expansion is
+/// sure to end with (`*`, `x*m`, `*.p?m` could end in `.pem`; `*.log`
+/// can't). As the shell does, a glob that doesn't start with `.` never
+/// expands to a name that does (`*` isn't `.env`).
+fn glob_could_name_secret(part: &str, names: &[&str], ends: &[&str]) -> bool {
+    static EXAMPLES: &[&str] = &[".env.local", ".env.production", "id_rsa", "id_ed25519", "id_ecdsa", "shadow-", "shadow.bak"];
+    let could = |name: &&str| (part.starts_with('.') || !name.starts_with('.')) && super::trust::glob_could_be(part, name, false);
+    let tail = &part[part.rfind(['*', '?', ']']).map_or(0, |i| i + 1)..];
+    names.iter().any(could) || EXAMPLES.iter().any(could) || ends.iter().any(|e| e.ends_with(tail))
 }
 
 #[cfg(test)]

@@ -14,8 +14,11 @@ export interface AiServer {
   server_id: number | null;
   /// "Allow everything here until this AI tab closes" is on.
   allow_all: boolean;
-  /// Its approval level now (1, 2 or 3).
+  /// Its approval level now (1, 2, 4 or 3).
   level: number;
+  /// At "Run commands that only read" (4), whether they run by themselves
+  /// here: only where Submarine knows the OS and it isn't Windows.
+  reads_alone?: boolean;
   /// What root goes through there for this AI tab, once a request as root
   /// worked (#120): "sudo" or "dzdo".
   root_via: string | null;
@@ -255,7 +258,7 @@ export const AI_LEVELS: { level: number; title: string; text: string }[] = [
   {
     level: READ_ONLY_LEVEL,
     title: "Run commands that only read, ask before changes",
-    text: "Commands that only look run straight away: ls, cat, grep, ps, df, journalctl, systemctl status, docker ps and logs, and others Submarine knows only read, also joined with |. So do the commands on your allow list. Anything else waits for your Allow: changes, anything that reaches out (curl, ping), redirection, root, copies, and reading files that usually hold secrets, such as .env or .ssh. On a Windows server, only your allow list runs. Anything a server prints can still steer what the AI reads.",
+    text: "Commands that only look run straight away: ls, cat, grep, ps, df, journalctl, systemctl status, docker ps and logs, and others Submarine knows only read, also joined with |. So do the commands on your allow list. Anything else waits for your Allow: changes, anything that reaches out (curl, ping), redirection, root, copies, and reading files that usually hold secrets, such as .env or .ssh. On a Windows server, or one whose OS Submarine doesn't know yet, only your allow list runs. Anything a server prints can still steer what the AI reads.",
   },
   {
     level: 3,
@@ -268,12 +271,12 @@ export const levelTitle = (level: number) => AI_LEVELS.find((l) => l.level === l
 
 /// What a shared server's tab and the AI pane say about it: nothing at
 /// "Ask every time".
-export const aiMarker = (s: Pick<AiServer, "level" | "allow_all">): string | null =>
+export const aiMarker = (s: Pick<AiServer, "level" | "allow_all" | "reads_alone">): string | null =>
   s.allow_all || s.level === 3
     ? "AI: runs without asking"
-    : s.level === READ_ONLY_LEVEL
+    : s.level === READ_ONLY_LEVEL && s.reads_alone
       ? "AI: read-only commands run"
-      : s.level === 2
+      : s.level === 2 || s.level === READ_ONLY_LEVEL
         ? "AI: allowed commands run"
         : null;
 

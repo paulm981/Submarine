@@ -107,7 +107,10 @@ describe("approval levels", () => {
     expect(aiMarker({ level: 1, allow_all: false })).toBeNull();
     expect(aiMarker({ level: 2, allow_all: false })).toBe("AI: allowed commands run");
     expect(aiMarker({ level: 3, allow_all: false })).toBe("AI: runs without asking");
-    expect(aiMarker({ level: 4, allow_all: false })).toBe("AI: read-only commands run");
+    expect(aiMarker({ level: 4, allow_all: false, reads_alone: true })).toBe("AI: read-only commands run");
+    // Where the OS isn't known, or is Windows, only the allow list runs.
+    expect(aiMarker({ level: 4, allow_all: false, reads_alone: false })).toBe("AI: allowed commands run");
+    expect(aiMarker({ level: 4, allow_all: false })).toBe("AI: allowed commands run");
     // "Allow everything here" outranks the level.
     expect(aiMarker({ level: 1, allow_all: true })).toBe("AI: runs without asking");
   });

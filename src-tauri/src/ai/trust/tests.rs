@@ -940,7 +940,7 @@ fn levels_go_in_order_of_how_much_they_allow_not_as_stored() {
 
 #[test]
 fn at_the_read_only_level_what_only_reads_runs_and_the_rest_asks() {
-    let p = Policy { level: READ_ONLY, allow: rules(&["apt update"]), ask: rules(DEFAULT_ASK), windows: false, force_ask: None, os: None };
+    let p = Policy { level: READ_ONLY, allow: rules(&["apt update"]), ask: rules(DEFAULT_ASK), windows: false, force_ask: None, os: Some("debian".into()) };
     assert_eq!(decide(&p, false, "ps aux | grep nginx"), Decision::ReadOnly);
     assert_eq!(decide(&p, false, "journalctl -u nginx -n 50"), Decision::ReadOnly);
     assert_eq!(Decision::ReadOnly.approved_by().as_deref(), Some("level: only reads"));
@@ -949,16 +949,20 @@ fn at_the_read_only_level_what_only_reads_runs_and_the_rest_asks() {
     for cmd in ["systemctl restart nginx", "rm /tmp/x", "ls > /tmp/x", "cat .env", "curl example.com", "sed -n 1p x"] {
         assert_eq!(decide(&p, false, cmd), ask(), "{cmd}");
     }
-    // Root asks, however it's asked for.
-    assert_eq!(decide(&p, false, "sudo cat /var/log/syslog"), ask());
+    // Root asks, however it's asked for: a command that runs on its own
+    // asks once it's to run as root, and with sudo before it (which is
+    // read as asking for root, and isn't on the read-only list either).
+    assert_eq!(decide(&p, false, "cat /var/log/syslog"), Decision::ReadOnly);
     assert_eq!(decide_as(&p, false, "cat /var/log/syslog", true), ask());
+    assert!(Parsed::new("sudo cat /var/log/syslog").root);
+    assert_eq!(decide(&p, false, "sudo cat /var/log/syslog"), ask());
     // The always-ask list wins: its rule is on the card.
     let strict = Policy { ask: rules(&["journalctl *"]), ..p.clone() };
     assert_eq!(decide(&strict, false, "journalctl -n 5"), Decision::Ask { rule: Some("journalctl *".into()) });
     // Settings that can't be read, or are held, ask.
     assert_eq!(decide(&Policy { force_ask: Some(UNREADABLE.into()), ..p.clone() }, false, "uptime"), ask());
     // On Windows, only the allow list runs.
-    let windows = Policy { windows: true, allow: rules(&["hostname"]), ..p.clone() };
+    let windows = Policy { windows: true, os: Some("windows".into()), allow: rules(&["hostname"]), ..p.clone() };
     assert_eq!(decide(&windows, false, "uptime"), ask());
     assert_eq!(decide(&windows, false, "hostname"), Decision::Rule("hostname".into()));
     // Below it, nothing runs for only reading.
@@ -971,7 +975,14 @@ fn at_the_read_only_level_what_only_reads_runs_and_the_rest_asks() {
 
 #[test]
 fn the_ai_is_told_what_the_read_only_level_does() {
-    let p = |level, allow: &[&str], windows| Policy { level, allow: rules(allow), ask: vec![], windows, force_ask: None, os: None };
+    let p = |level, allow: &[&str], windows: bool| Policy {
+        level,
+        allow: rules(allow),
+        ask: vec![],
+        windows,
+        force_ask: None,
+        os: Some(if windows { "windows" } else { "ubuntu" }.into()),
+    };
     assert_eq!(Requests::of(&p(READ_ONLY, &[], false), false), Requests::ReadOnly);
     assert!(Requests::ReadOnly.phrase().contains("only read"));
     // On Windows it never says more runs than does.
@@ -1065,4 +1076,33 @@ fn a_server_s_os_comes_with_its_policy() {
     for (os, ok) in [("ubuntu", true), ("opensuse-leap", true), ("", false), ("UBUNTU", false), ("a b", false), (&"x".repeat(33) as &str, false)] {
         assert_eq!(is_os_id(os), ok, "{os}");
     }
+}
+
+/// From an independent review of #191: an OS that isn't known could be
+/// Windows (detection off, not yet run, a quick connect, a PowerShell
+/// server the check can't read), where cmd and PowerShell read a command
+/// otherwise: `'` isn't a quote to cmd.
+#[test]
+fn the_read_only_level_needs_an_os_known_not_to_be_windows() {
+    let p = |os: Option<&str>| Policy {
+        level: READ_ONLY,
+        allow: rules(&["hostname"]),
+        os: os.map(Into::into),
+        windows: os == Some("windows"),
+        ..Policy::default()
+    };
+    assert_eq!(decide(&p(Some("debian")), false, "uptime"), Decision::ReadOnly);
+    assert_eq!(Requests::of(&p(Some("debian")), false), Requests::ReadOnly);
+    for os in [None, Some("windows")] {
+        assert_eq!(decide(&p(os), false, "uptime"), ask(), "{os:?}");
+        assert_eq!(decide(&p(os), false, "whoami 'x & powershell -enc AA & rem '"), ask(), "{os:?}");
+        // The allow list still runs, as at "Run my allowed commands", and
+        // that's what the AI is told.
+        assert_eq!(decide(&p(os), false, "hostname"), Decision::Rule("hostname".into()), "{os:?}");
+        assert_eq!(Requests::of(&p(os), false), Requests::AllowedCommands, "{os:?}");
+        assert!(!p(os).reads_alone());
+    }
+    // A saved OS that isn't an OS ID is as one not known.
+    let odd = Policy { os: None, ..p(Some("debian")) };
+    assert_eq!(decide(&odd, false, "uptime"), ask());
 }
