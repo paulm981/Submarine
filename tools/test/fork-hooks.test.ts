@@ -33,7 +33,7 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
     imports: ["./fork/desktop"],
     uses: [
       "Fork.readForkSettings", "Fork.writeForkSettings", "Fork.useServerLooks", "Fork.useHighlightRules", "Fork.useHeldActions",
-      "Fork.useLiveEditKept", "Fork.wouldEnd", "Fork.useOsBadges", "Fork.useCloseSessions", "Fork.useTabKeys", "Fork.useTabStrip",
+      "Fork.useLiveEditKept", "Fork.useBroadcastWall", "Fork.broadcastSwitch", "Fork.wouldEnd", "Fork.useOsBadges", "Fork.useCloseSessions", "Fork.useTabKeys", "Fork.useTabStrip",
       "Fork.useJumpHostPick", "Fork.useSessionTree", "Fork.aiPaneViewOf", "Fork.saveServerLooks", "Fork.sessionPaneStyle",
       "Fork.tabMenuStyle", "Fork.titleTabClass", "Fork.AppVersion", "Fork.HomeTab", "Fork.HomeView", "Fork.NewsDot",
       "Fork.TabAiMarker", "Fork.AllTabsButton", "Fork.AiTitleButtons", "Fork.TabMoveItems", "Fork.TabCloseItems",
