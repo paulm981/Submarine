@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.62
+
+- **"Run commands that only read" closes holes that let a command write or reach a device.** `uniq - FILE` could overwrite a file; a path through `/proc/…/root` could open a device; a glob such as `/etc/shado?` got past the check for files that hold secrets; and `date -f`, `getent hosts`, `rpm -qp` and `journalctl --image` could set the clock, reach out or attach a disk. Each of these now asks. The level also runs commands by itself only where Submarine knows the server's OS and it isn't Windows; elsewhere only your allow list runs, and the server's marker says "allowed commands run". ([#206](https://github.com/paulm981/Submarine/issues/206))
+
 ## v0.4.0-fork.61
 
 - **Regular-expression highlighting rules work again.** Your own rules can be regular expressions once more, run on RE2, which doesn't backtrack: an expression too big to run on every line is refused when you add it, and one that's still slow on real output is turned off rather than freezing the window. `^` and `$` mean the start and end of the terminal's line, even where a program colors part of it. An expression RE2 can't run (with a back-reference `\1` or a lookaround) says why when you add it, and a synced rule this computer can't use says so in the list. ([#49](https://github.com/paulm981/Submarine/issues/49))
