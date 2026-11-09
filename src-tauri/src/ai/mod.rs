@@ -495,11 +495,13 @@ struct Early {
 }
 
 /// The requests of AI tab `tab_id` waiting for you: a `run_on_servers`
-/// request counts once, however many servers it names.
+/// request counts once, however many servers it names, and a request for a
+/// server (ask_server.rs) counts too.
 fn waiting_requests(s: &Shared, tab_id: &str) -> usize {
     let mine = s.pending.iter().filter(|p| p.view.tab_id == tab_id);
     let groups: std::collections::BTreeSet<u64> = mine.clone().filter_map(|p| p.view.group.map(|g| g.id)).collect();
-    mine.filter(|p| p.view.group.is_none()).count() + groups.len()
+    let servers = s.server_asks.iter().filter(|a| a.view.tab_id == tab_id).count();
+    mine.filter(|p| p.view.group.is_none()).count() + groups.len() + servers
 }
 
 /// One answer for the AI from a `run_on_servers` (or `copy_files`)

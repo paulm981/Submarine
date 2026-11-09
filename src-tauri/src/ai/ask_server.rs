@@ -1,9 +1,10 @@
 //! The AI asks for a server by name (#32, "asking for a server by name"):
 //! `request_server`, and the card in the AI panel that answers it.
 //!
-//! - **Only an exact name, ignoring case, finds a saved server** (`Lookup`),
-//!   read from the vault off the async workers. The AI never gets a list of
-//!   your servers, and there's no searching by part of a name.
+//! - **Only an exact name, ignoring case, finds a saved SSH server**
+//!   (`Lookup`), read from the vault off the async workers. The AI never
+//!   gets a list of your servers, and there's no searching by part of a
+//!   name. An RDP, VNC or telnet server isn't found: it can't be shared.
 //! - **Every name gets a card,** one that matches no server too ("no server
 //!   has that name"), and the AI hears back only once you've answered it,
 //!   in the same words whether you said no or there was nothing to share
@@ -12,7 +13,10 @@
 //! - **Share** opens the server's tab (the page does that, through the
 //!   session tree, which holds back a server a teammate moved), waits for it
 //!   to connect (CONNECT_WAIT), and shares it as Share with AI does: its
-//!   own approval level applies from then on.
+//!   own approval level applies from then on. While it connects, the card
+//!   stays, marked so (`connecting`), and Stop, Don't share, the AI
+//!   withdrawing or its access ending all still win: it's shared only if
+//!   the request is still there once the tab is up.
 //! - **Limits:** one such request waits at a time for each AI tab, counted
 //!   against its rate and its waiting requests as a command is; a name
 //!   longer than MAX_NAME, or with a control character, is refused.
@@ -24,7 +28,9 @@ use std::time::Duration;
 /// The longest name the AI may ask for, in characters.
 pub(crate) static MAX_NAME: usize = 128;
 /// How long a server you said yes to has to connect.
-static CONNECT_WAIT: Duration = Duration::from_secs(90);
+pub(crate) static CONNECT_WAIT: Duration = Duration::from_secs(90);
+/// What the AI hears when it asks again while a request waits.
+static ONE_AT_A_TIME: &str = "A request for a server already waits for the user. Wait for it first.";
 /// What the AI hears when nothing is shared: you said no, or no server has
 /// the name. The same words for both.
 pub(crate) static NOT_SHARED: &str = "The user didn't share a server by that name. Ask them to share it from its tab, or use one list_shared names.";
@@ -44,11 +50,21 @@ pub(crate) enum Found {
 /// Finds a saved server by its name: the vault in the app, a list in tests.
 pub(crate) type Lookup = Arc<dyn Fn(&str) -> Found + Send + Sync>;
 
-/// The saved servers named `name`, ignoring case: exact names only.
+/// The saved SSH servers named `name`, ignoring case in any alphabet
+/// (`ÉCOLE` finds `école`, which SQLite's `lower` wouldn't): exact names
+/// only, not one deleted, nor an RDP, VNC or telnet server.
 pub(crate) fn find(conn: &rusqlite::Connection, name: &str) -> Found {
+    let want = name.to_lowercase();
     let ids: Vec<(i64, String)> = conn
-        .prepare("SELECT id, name FROM servers WHERE lower(name) = lower(?1) LIMIT 2")
-        .and_then(|mut st| st.query_map([name], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
+        .prepare("SELECT id, name FROM servers WHERE deleted = 0 AND (protocol IS NULL OR protocol IN ('', 'ssh'))")
+        .and_then(|mut st| {
+            st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default())))?
+                .filter_map(Result::ok)
+                .filter(|(_, saved)| saved.to_lowercase() == want)
+                .take(2)
+                .map(Ok)
+                .collect()
+        })
         .unwrap_or_default();
     match ids.as_slice() {
         [(id, saved)] => Found::One(*id, saved.clone()),
@@ -71,7 +87,7 @@ pub(crate) fn check_name(name: Option<&serde_json::Value>) -> Result<String, Str
     if name.chars().count() > MAX_NAME {
         return Err(format!("name is longer than {MAX_NAME} characters."));
     }
-    if name.chars().any(|c| c.is_control() || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')) {
+    if name.chars().any(|c| c.is_control() || super::trust::hidden(c)) {
         return Err("name has a control or hidden character in it.".into());
     }
     Ok(name.to_string())
@@ -107,6 +123,8 @@ pub(crate) struct AskView {
     /// More than one saved server has the name.
     pub many: bool,
     pub asked_at: String,
+    /// You said Share, and its tab is connecting.
+    pub connecting: bool,
 }
 
 impl AiState {
@@ -122,15 +140,17 @@ impl AiState {
             Ok(n) => n,
             Err(why) => return ToolResult::err(why),
         };
-        // Already shared under that name: nothing to ask.
+        // One at a time (checked again as the card is added, below, as two
+        // can come at once). A server already shared is found by its saved
+        // id once it's looked up, not by the name it's shared as: a quick
+        // connect called "db-01" isn't the saved db-01.
         {
             let s = self.lock();
-            let Some(tab) = s.tabs.iter().find(|t| t.id == tab_id) else { return ToolResult::err("This AI tab's access has ended.") };
-            if let Some(x) = tab.servers.iter().find(|x| x.name.eq_ignore_ascii_case(&name)) {
-                return ToolResult::ok(format!("{} is already shared with you.", x.name));
+            if !s.tabs.iter().any(|t| t.id == tab_id) {
+                return ToolResult::err("This AI tab's access has ended.");
             }
             if s.server_asks.iter().any(|a| a.view.tab_id == tab_id) {
-                return ToolResult::err("A request for a server already waits for the user. Wait for it first.");
+                return ToolResult::err(ONE_AT_A_TIME);
             }
         }
         let label = match self.admit_group(tab_id) {
@@ -158,6 +178,9 @@ impl AiState {
             if !s.tabs.iter().any(|t| t.id == tab_id) {
                 return ToolResult::err("This AI tab's access has ended.");
             }
+            if s.server_asks.iter().any(|a| a.view.tab_id == tab_id) {
+                return ToolResult::err(ONE_AT_A_TIME);
+            }
             s.next_id += 1;
             let (server_id, server_name) = match &found {
                 Found::One(id, saved) => (Some(*id), Some(saved.clone())),
@@ -172,6 +195,7 @@ impl AiState {
                 server_name,
                 many: found == Found::Many,
                 asked_at: now(),
+                connecting: false,
             };
             s.server_asks.push(Ask { view: view.clone(), decide: tx });
             view
@@ -203,8 +227,8 @@ impl AiState {
             }
             Some(Answer::Failed(why)) => ToolResult::err(why),
             Some(Answer::No) => ToolResult::err(NOT_SHARED),
-            // Dropped: access ended.
-            None => ToolResult::err("This AI tab's access ended before the user answered."),
+            // Dropped: stopped, or access ended.
+            None => ToolResult::err("The request ended before a server was shared: the user stopped it, or this AI tab's access ended."),
         }
     }
 
@@ -235,36 +259,64 @@ impl AiState {
 
     /// You said yes: once `connected` finds the server's tab connected (its
     /// session id, its login user), it's shared, and the AI hears so. The
-    /// page has opened the tab by then, or opens it now.
+    /// page has opened the tab by then, or opens it now. Until then the
+    /// request stays on the list, marked connecting, so Stop, Don't share,
+    /// the AI withdrawing or its access ending take it off as before; it's
+    /// shared only if it's still there once the tab is up.
     pub(crate) async fn share_ask<F, Fut>(&self, id: u64, connected: F) -> Result<(), String>
     where
         F: Fn(i64) -> Fut,
         Fut: std::future::Future<Output = Option<(String, Option<String>)>>,
     {
-        let ask = self.take_ask(id).ok_or("That request isn't waiting any more.")?;
-        let (Some(server_id), Some(name)) = (ask.view.server_id, ask.view.server_name.clone()) else {
-            let _ = ask.decide.send(Answer::No);
+        let view = {
+            let mut s = self.lock();
+            let ask = s.server_asks.iter_mut().find(|a| a.view.id == id && !a.view.connecting).ok_or("That request isn't waiting any more.")?;
+            ask.view.connecting = true;
+            ask.view.clone()
+        };
+        let (Some(server_id), Some(name)) = (view.server_id, view.server_name.clone()) else {
+            // Nothing to share (no saved server, or several): as a no.
+            if let Some(ask) = self.take_ask(id) {
+                self.log_answer(&ask.view, "denied", Some("nothing to share".into()));
+                let _ = ask.decide.send(Answer::No);
+            }
             self.changed();
             return Err("There's no server to share for this request.".into());
         };
         self.changed();
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
+        let still_there = |s: &AiState| s.lock().server_asks.iter().any(|a| a.view.id == id && !a.decide.is_closed());
         let session = loop {
+            if !still_there(self) {
+                break None;
+            }
             if let Some(found) = connected(server_id).await {
                 break Some(found);
             }
-            if started.elapsed() >= CONNECT_WAIT || ask.decide.is_closed() {
+            if started.elapsed() >= CONNECT_WAIT {
                 break None;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         };
+        // Taken off the list now, and only if it's still there: whatever
+        // ended it meanwhile wins.
+        let Some(ask) = self.take_ask(id) else {
+            self.log_answer(&view, "allowed", Some("ended before it was shared".into()));
+            self.changed();
+            return Err("That request ended before the server was shared.".into());
+        };
+        self.changed();
+        if ask.decide.is_closed() {
+            self.log_answer(&view, "allowed", Some("withdrawn before it was shared".into()));
+            return Err("The AI withdrew the request before the server was shared.".into());
+        }
         let Some((session_id, user)) = session else {
             let why = format!("{name} didn't connect within {} seconds, so it isn't shared.", CONNECT_WAIT.as_secs());
-            self.log_answer(&ask.view, "allowed", Some(why.clone()));
+            self.log_answer(&view, "allowed", Some(why.clone()));
             let _ = ask.decide.send(Answer::Failed(why.clone()));
             return Err(why);
         };
-        if let Err(why) = self.share_as(&ask.view.tab_id, &session_id, &name, user, Some(server_id)) {
+        if let Err(why) = self.share_as(&view.tab_id, &session_id, &name, user, Some(server_id)) {
             let _ = ask.decide.send(Answer::Failed(why.clone()));
             return Err(why);
         }
@@ -272,11 +324,11 @@ impl AiState {
             .lock()
             .tabs
             .iter()
-            .find(|t| t.id == ask.view.tab_id)
+            .find(|t| t.id == view.tab_id)
             .and_then(|t| t.servers.iter().find(|x| x.session_id == session_id))
             .map(|x| x.name.clone())
             .unwrap_or(name);
-        self.log_answer(&ask.view, "allowed", Some(format!("shared as {as_name}")));
+        self.log_answer(&view, "allowed", Some(format!("shared as {as_name}")));
         let _ = ask.decide.send(Answer::Shared(as_name));
         Ok(())
     }

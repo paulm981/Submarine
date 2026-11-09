@@ -144,7 +144,7 @@ export const ServerAskCard = ({ a, act }: { a: AiServerAsk; act: (cmd: string, a
   const { down, accept } = useSettledClicks(ref);
   const found = a.server_id !== null && a.server_name !== null;
   const share = () => {
-    if (!found) return;
+    if (!found || a.connecting) return;
     openServerTab(a.server_id!);
     act("ai_answer_server_ask", { id: a.id, share: true });
   };
@@ -154,19 +154,23 @@ export const ServerAskCard = ({ a, act }: { a: AiServerAsk; act: (cmd: string, a
       <p className="text-[12px] text-zinc-200 leading-snug">
         <span className="font-semibold">{a.tab_label}</span>{" "}
         {found
-          ? <>asks to use <span className="font-semibold text-white">{a.server_name}</span>. Share it?</>
+          ? a.connecting
+            ? <>asked for <span className="font-semibold text-white">{showPlainly(a.server_name!)}</span>. Connecting…</>
+            : <>asks to use <span className="font-semibold text-white">{showPlainly(a.server_name!)}</span>. Share it?</>
           : <>asked for a server named <span className="font-mono text-white">{showPlainly(a.asked)}</span>.</>}
       </p>
       <p className="text-[11px] text-zinc-400 leading-snug">
         {found
-          ? "Its tab opens if it isn't open, and once it's connected the AI can ask to run commands there, under its own approval level."
+          ? a.connecting
+            ? "It's shared once its tab is connected. Don't share, or Stop, before then, and it isn't."
+            : "Its tab opens if it isn't open, and once it's connected the AI can ask to run commands there, under its own approval level."
           : a.many
             ? "More than one saved server has that name. Share the one you mean from its tab."
             : "No saved server has that name."}
         {!found && " The AI hears the same as when you say no to a server you have, so it can't learn which names you have."}
       </p>
       <div className="flex gap-2">
-        {found && (
+        {found && !a.connecting && (
           <NoFocusButton onPick={share} onDown={down} accept={accept}
             className={`${button} bg-primary/15 border border-primary/40 text-primary hover:bg-primary hover:text-zinc-950`}>
             <Check size={13} /> Share

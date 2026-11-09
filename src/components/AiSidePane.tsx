@@ -1,14 +1,14 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Bot, Home, Loader2, PanelRightClose, PanelRightOpen, X } from "lucide-react";
-import { AiTab, aiMarker, cardsOf, openAiTrust, sharedWith, trustTargetFor, useAi } from "../util/ai";
+import { AiTab, aiMarker, cardsOf, openAiTrust, sharedWith, trustTargetFor, useAi, waitingFor } from "../util/ai";
 import {
   PANE_MIN_WIDTH, aiStarted, aiPaneState, choosePaneAi, closePaneHere, leftView, resetAiPane, setPaneFolded, setPaneHere,
   setPaneWidth, showHomeTab, useAiPane,
 } from "../ui/aiPane";
 import { appHotkey, claimTerminal, dockedTerminal, setAiPaneKeyLive, useDockVersion } from "../ui/terminalDock";
 import { IS_ANDROID } from "../util/platform";
-import { PendingCard, levelOf } from "./AiPanel";
+import { PendingCard, ServerAskCard, levelOf } from "./AiPanel";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The AI side pane (#100): an AI tab beside the server tab you're working in,
@@ -217,8 +217,10 @@ export const AiSidePane = ({ v, onHome, onGoToServer }: {
 
   if (!m.shows || !current) return null;
   const waiting = ai.pending.filter((p) => p.tab_id === current.id);
-  // Requests, not servers: one on several servers is one (#158).
-  const asks = cardsOf(waiting).length;
+  const serverAsks = (ai.server_asks ?? []).filter((a) => a.tab_id === current.id);
+  // Requests, not servers: one on several servers is one (#158); and its
+  // requests for a server.
+  const asks = waitingFor(ai, current.id);
 
   if (!m.open) {
     return (
@@ -308,8 +310,9 @@ export const AiSidePane = ({ v, onHome, onGoToServer }: {
       />
 
       {/* Its requests, as in the AI panel. */}
-      {waiting.length > 0 && (
+      {(waiting.length > 0 || serverAsks.length > 0) && (
         <div className="shrink-0 max-h-[45%] overflow-y-auto custom-scrollbar border-b border-white/5">
+          {serverAsks.map((a) => <ServerAskCard key={a.id} a={a} act={run} />)}
           {cardsOf(waiting).map(({ p, members }) => (
             <PendingCard
               key={`${p.id}:${p.asked_at}`}

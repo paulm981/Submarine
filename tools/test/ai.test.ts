@@ -2,7 +2,7 @@
 // then npm --prefix tools/test test (type check, then vitest).
 
 import { describe, expect, it } from "vitest";
-import { AI_LEVELS, aiMarker, cardsOf, heldMay, loosestShare, copyCard, followLimit, followSoFar, levelTitle, runnerWarning, sharedWith, trustTargetFor, type AiCopy, type AiPending, type AiServer, type AiSnapshot } from "../../src/util/ai";
+import { AI_LEVELS, aiMarker, cardsOf, heldMay, loosestShare, copyCard, followLimit, followSoFar, levelTitle, runnerWarning, sharedWith, trustTargetFor, waitingFor, type AiCopy, type AiPending, type AiServer, type AiServerAsk, type AiSnapshot } from "../../src/util/ai";
 
 const pending = (id: number, group: { id: number; size: number } | null = null): AiPending => ({
   id, tab_id: "t", tab_label: "AI", session_id: `s${id}`, server: `srv${id}`, user: null, command: "uptime",
@@ -35,6 +35,20 @@ describe("cardsOf", () => {
 
   it("shows nothing for nothing", () => {
     expect(cardsOf([])).toEqual([]);
+  });
+});
+
+describe("waitingFor (#198's review)", () => {
+  const ask = (id: number, tab_id: string): AiServerAsk => ({
+    id, tab_id, tab_label: "Claude", asked: "web1", server_id: 1, server_name: "web1", many: false, asked_at: "",
+  });
+  it("counts a request for a server with the AI tab's requests, a group once", () => {
+    const g = { id: 9, size: 2 };
+    // pending() is AI tab "t"'s.
+    const ai = { pending: [pending(1), pending(2, g), pending(3, g)], server_asks: [ask(4, "t"), ask(5, "other")] };
+    expect(waitingFor(ai, "t")).toBe(3);
+    expect(waitingFor(ai, "other")).toBe(1);
+    expect(waitingFor({ pending: [], server_asks: undefined as unknown as AiServerAsk[] }, "t")).toBe(0);
   });
 });
 

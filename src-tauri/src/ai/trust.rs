@@ -88,7 +88,7 @@ static HIDDEN: LazyLock<regex::Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-fn hidden(c: char) -> bool {
+pub(crate) fn hidden(c: char) -> bool {
     // Printable ASCII never is: most of every command, without the regex.
     if (' '..='~').contains(&c) {
         return false;
