@@ -132,6 +132,21 @@ const shots = {
     await page.waitForTimeout(1500);
     await save(page, "broadcast");
   },
+
+  // Send to all: a set of commands for every Broadcast server, and who's left out.
+  async "broadcast-send"() {
+    const page = await open();
+    await page.getByRole("button", { name: "Broadcast input" }).click();
+    await page.getByRole("button", { name: "All", exact: true }).click();
+    await page.mouse.click(700, 600);
+    await page.locator(".xterm-screen:visible").nth(2).waitFor();
+    await page.getByRole("button", { name: "Pause", exact: true }).nth(2).click();
+    await page.getByRole("button", { name: "Send…" }).click();
+    await page.getByRole("dialog", { name: "Send to all" }).locator("textarea").fill(
+      "mkdir -p ~/.ssh && chmod 700 ~/.ssh\necho 'ssh-ed25519 AAAAC3Nza… ops@laptop' >> ~/.ssh/authorized_keys\nchmod 600 ~/.ssh/authorized_keys",
+    );
+    await save(page, "broadcast-send");
+  },
 };
 
 // The box around two elements and what's between them, with some room.
