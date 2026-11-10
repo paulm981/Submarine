@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.70
+
+- **Broadcast: a server that joins partway through a command waits for the next line.** Tick a server, or resume one, while a command is half typed, and it doesn't get the rest of that command: its tile says Next line until you press Enter (or Ctrl+C), and the bar counts it. So `rm -rf /tmp/x` never reaches a server as `/x`. ([#218](https://github.com/paulm981/Submarine/issues/218))
+
 ## v0.4.0-fork.69
 
 - **Broadcast: type to one server, or pause one.** On Broadcast's Wall, the target button on a tile types to that server alone, until you press Type to all. The pause button (or Ctrl+Shift+P) leaves a server out until you resume it, and its tile says Paused. Ctrl-click or Shift-click pause buttons to pause or resume several at once. The bar says who you're typing to. ([#218](https://github.com/paulm981/Submarine/issues/218))
