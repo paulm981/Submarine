@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.73
+
+- **Broadcast is one tab.** While Broadcast is on, its servers' tabs fold into one Broadcast tab. A tile's "Open this session in its own tab" pops that server out of Broadcast, back into its own tab. The ✕ on the Broadcast tab ends Broadcast and brings every tab back; the sessions stay connected. ([#224](https://github.com/paulm981/Submarine/issues/224))
+
 ## v0.4.0-fork.72
 
 - **Broadcast to a folder.** Right-click a folder in the session tree and pick Broadcast to all in this folder, or select servers and pick Broadcast to N selected: they open side by side on the Wall, and what you type goes to all of them. A folder is the saved group: no separate list to keep. ([#218](https://github.com/paulm981/Submarine/issues/218))
