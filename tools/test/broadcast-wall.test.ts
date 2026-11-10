@@ -2,7 +2,7 @@
 // ticking is turning it on.
 
 import { describe, expect, it, vi } from "vitest";
-import { broadcastable, broadcastSwitch, syncBroadcastTiles, type WallTile } from "../../src/fork/desktop/broadcastWall";
+import { broadcastable, broadcastLive, broadcastSwitch, onTickedView, shownTabs, syncBroadcastTiles, type WallTile } from "../../src/fork/desktop/broadcastWall";
 
 const tile = (sessionId: string, terminalId: string): WallTile => ({ id: `wall-${terminalId}`, sessionId, terminalId });
 
@@ -80,5 +80,35 @@ describe("Broadcast to a folder", () => {
       { id: 5, protocol: "telnet" }, { id: 6, protocol: null },
     ];
     expect(broadcastable(list).map((s) => s.id)).toEqual([1, 3, 6]);
+  });
+});
+
+describe("Broadcast's one tab (#224)", () => {
+  const tabs = [{ id: "a" }, { id: "b" }, { id: "c" }];
+  const on = (ticked: string[], enabled = true) => ({ enabled, targetSessionIds: new Set(ticked) });
+
+  it("folds its servers' tabs away while it's on, and shows them all otherwise", () => {
+    expect(shownTabs(tabs, on(["a", "c"])).map((t) => t.id)).toEqual(["b"]);
+    expect(shownTabs(tabs, on(["a", "c"], false))).toBe(tabs);
+    // One ticked isn't Broadcast: its tab stays.
+    expect(shownTabs(tabs, on(["a"]))).toBe(tabs);
+    expect(broadcastLive(on(["a", "b"]))).toBe(true);
+    expect(broadcastLive(on(["a"]))).toBe(false);
+  });
+
+  it("going to one of its servers pops it out; one ticked under you folds away to the Wall", () => {
+    expect(onTickedView("a", true, true, on(["a", "b", "c"]))).toBe("popOut");
+    expect(onTickedView("a", false, true, on(["a", "b", "c"]))).toBe("toWall");
+  });
+
+  it("isn't a pop-out when Broadcast is only starting: the view goes to the Wall", () => {
+    expect(onTickedView("a", true, false, on(["a", "b"]))).toBe("toWall");
+  });
+
+  it("leaves other views alone, and does nothing while Broadcast is off", () => {
+    expect(onTickedView("wall", true, true, on(["a", "b"]))).toBeNull();
+    expect(onTickedView("c", true, true, on(["a", "b"]))).toBeNull();
+    expect(onTickedView("a", true, true, on(["a", "b"], false))).toBeNull();
+    expect(onTickedView("a", true, true, on(["a"]))).toBeNull();
   });
 });

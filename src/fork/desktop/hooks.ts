@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { TreeItems } from "../../components/SessionTree";
 import { useBroadcast } from "../../ui/broadcast";
+import { broadcastLive, shownTabs } from "./broadcastWall";
 import { useConfirm } from "../../ui/confirm";
 import { normalizeRules, onSlowRule, setCustomRules, setServerHighlights } from "../../ui/highlight";
 import { reorderById, useTabDrag } from "../../ui/tabDrag";
@@ -225,7 +226,7 @@ export const useCloseSessions = <S extends { id: string }, T extends { confirmCl
 
 /** The keys for moving between tabs: Ctrl+Shift+K opens All tabs ▾ to jump
  *  by name (its search is focused); Ctrl+Tab / Ctrl+Shift+Tab step through
- *  the title bar left to right: Home, then the server tabs (stepTab).
+ *  the title bar left to right: Home, Broadcast's tab while it's on, then the server tabs (stepTab).
  *  preventDefault keeps the webview from doing anything of its own with
  *  Ctrl+Tab. Returns whether All tabs ▾ is open. */
 export const useTabKeys = (o: {
@@ -233,7 +234,13 @@ export const useTabKeys = (o: {
   mergedSessionIds: string[]; setMergedSessionIds: (ids: string[]) => void; setActiveView: (v: string) => void;
 }) => {
   const [allTabsOpen, setAllTabsOpen] = useState(false);
-  const order = [...(HAS_HOME && o.isUnlocked ? ["home"] : []), ...o.sessions.map(s => s.id)];
+  // The tabs as the strip shows them: Broadcast's servers folded into its tab (#224).
+  const bc = useBroadcast();
+  const order = [
+    ...(HAS_HOME && o.isUnlocked ? ["home"] : []),
+    ...(broadcastLive(bc) ? ["wall"] : []),
+    ...shownTabs(o.sessions, bc).map(s => s.id),
+  ];
   // Set anew each render, so they go by the tabs and the split as they are.
   const stepTabRef = useRef((_dir: 1 | -1) => {});
   stepTabRef.current = (dir) => {
@@ -430,7 +437,10 @@ export const useSessionTree = (o: {
   const broadcast = useBroadcast();
   const broadcastServers = async (all: any[]) => {
     const list = await openServers(all);
-    if (list.length >= 2) broadcast.setTargets(list.map((server) => `session-${server.id}`));
+    if (list.length < 2) return;
+    broadcast.setTargets(list.map((server) => `session-${server.id}`));
+    // Their tabs fold into Broadcast's (#224), even while it was on already.
+    o.setActiveView("wall");
   };
   // Share on the AI's request for a server (OPEN_SERVER, #32): opened as a
   // click here would open it, a server a teammate moved held back as here.
