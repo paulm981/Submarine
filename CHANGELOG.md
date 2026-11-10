@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.71
+
+- **Broadcast: Send a set of commands to all.** Send… on Broadcast's bar opens a box for a set of commands, typed into every server line by line, with Enter after the last one unless you untick it. It says how many servers get it and who's left out (paused, not connected, waiting for the next line) before anything goes, and keeps control keys and escape sequences out. ([#218](https://github.com/paulm981/Submarine/issues/218))
+
 ## v0.4.0-fork.70
 
 - **Broadcast: a server that joins partway through a command waits for the next line.** Tick a server, or resume one, while a command is half typed, and it doesn't get the rest of that command: its tile says Next line until you press Enter (or Ctrl+C), and the bar counts it. So `rm -rf /tmp/x` never reaches a server as `/x`. ([#218](https://github.com/paulm981/Submarine/issues/218))
