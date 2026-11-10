@@ -114,13 +114,21 @@ const shots = {
     await save(page, "ai-levels", await around(dialog, 24));
   },
 
-  // Broadcast, as the original project has it: typing goes to every tab ticked.
+  // Broadcast on one screen (#218): ticking servers puts their terminals on
+  // the Wall, and typing in any of them goes to all of them.
   async broadcast() {
     const page = await open();
     await page.getByRole("button", { name: "Broadcast input" }).click();
-    await page.getByRole("checkbox").first().check();
     await page.getByRole("button", { name: "All", exact: true }).click();
-    await save(page, "broadcast", { x: 0, y: 0, width: 1400, height: 240 });
+    // The menu closes with a click outside it.
+    await page.mouse.click(700, 600);
+    const tiles = page.locator(".xterm-screen:visible");
+    await tiles.nth(2).waitFor();
+    // Typed in one tile, it goes to all three.
+    await tiles.first().click();
+    await page.keyboard.type("uptime\r", { delay: 20 });
+    await page.waitForTimeout(1500);
+    await save(page, "broadcast");
   },
 };
 

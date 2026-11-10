@@ -1089,6 +1089,7 @@ function DesktopApp() {
     setSessionStatuses, setMergedSessionIds, broadcast, unpinSessionFromWall, setActiveView,
   });
   const [allTabsOpen, setAllTabsOpen] = Fork.useTabKeys({ isUnlocked, sessions, activeView, mergedSessionIds, setMergedSessionIds, setActiveView });
+  Fork.useBroadcastWall({ broadcast, frontTerminals: sessionActiveTerm, wallItems, setWallItems, activeView, setActiveView });
 
   // Spawn a session from inline Quick Connect auth AND leave behind a reusable
   // node in the root directory so the target can be reconnected later without
@@ -1661,7 +1662,7 @@ function DesktopApp() {
                       type="checkbox"
                       className="accent-orange-400"
                       checked={broadcast.enabled}
-                      onChange={broadcast.toggleEnabled}
+                      onChange={() => Fork.broadcastSwitch(broadcast, sessions.map(s => s.id))}
                     />
                     <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-200">
                       Broadcast input
