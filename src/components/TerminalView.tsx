@@ -404,7 +404,7 @@ const TerminalView = ({
         if (targetSid === sessionId) continue; // skip source; already written
         const targetTid = bcast.sessionTerminalMap[targetSid];
         if (!targetTid) continue; // target has no live terminal — silently skip
-        Fork.broadcastWrite({
+        Fork.broadcastWrite(terminalId, {
           terminalId: targetTid,
           data: bytes,
         }).catch(() => {

@@ -33,7 +33,7 @@ const { broadcastWrite, callsFor, caughtUp, MAX_BEHIND, MAX_DATA, MAX_TARGETS, s
 /** One keystroke's writes, as TerminalView's fan-out makes them: the same bytes to each target. */
 const type = (ids: string[], text: string) => {
   const data = Array.from(new TextEncoder().encode(text));
-  for (const terminalId of ids) void broadcastWrite({ terminalId, data });
+  for (const terminalId of ids) void broadcastWrite("source", { terminalId, data });
 };
 const text = (s: Sent) => new TextDecoder().decode(new Uint8Array(s.data));
 /** What each terminal got, in order, by whichever call. */

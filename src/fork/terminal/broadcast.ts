@@ -17,7 +17,10 @@
 //   (MAX_DATA), in order, so a big paste reaches every server.
 // - **A failed call** (the command gone after a sync, say) sends that key to
 //   each target on its own, as the original project does.
+// - **Who it reaches** (typing to one, paused ones) is broadcastAim's to
+//   say: TerminalView names the terminal typed into, `from`.
 import { invoke } from "@tauri-apps/api/core";
+import { sendsOn } from "./broadcastAim";
 
 /** The most targets in one call, and bytes in one write, as the backend
  *  allows (multiexec.rs: MAX_TARGETS, MAX_DATA). */
@@ -99,8 +102,10 @@ const flush = () => {
   flushed = now.reduce((prev, call) => prev.then(() => send(call)), flushed);
 };
 
-/** A Broadcast write to one terminal: sent with the others of this turn. */
-export const broadcastWrite = ({ terminalId, data }: Write): Promise<void> => {
+/** A Broadcast write, of what was typed into `from`, to one terminal: sent
+ *  with the others of this turn, unless it's not to reach that one. */
+export const broadcastWrite = (from: string, { terminalId, data }: Write): Promise<void> => {
+  if (!sendsOn(from, terminalId)) return Promise.resolve();
   writes.push({ terminalId, data });
   if (!queued) {
     queued = true;
