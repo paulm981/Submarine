@@ -105,7 +105,7 @@ const flush = () => {
 /** A Broadcast write, of what was typed into `from`, to one terminal: sent
  *  with the others of this turn, unless it's not to reach that one. */
 export const broadcastWrite = (from: string, { terminalId, data }: Write): Promise<void> => {
-  if (!sendsOn(from, terminalId)) return Promise.resolve();
+  if (!sendsOn(from, terminalId, data)) return Promise.resolve();
   writes.push({ terminalId, data });
   if (!queued) {
     queued = true;

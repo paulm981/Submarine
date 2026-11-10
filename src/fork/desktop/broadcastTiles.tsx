@@ -5,7 +5,8 @@
 // - `BroadcastTileChips`, on a tile's header while its server is ticked:
 //   "Only this one" (type to it alone) and pause. A paused tile says
 //   "Paused" in words; Ctrl-click (⌘) or Shift-click on pause picks tiles to
-//   pause or resume together.
+//   pause or resume together. One that joined partway through a line says
+//   "Next line" until that line ends.
 // - `BroadcastBar`, on the Wall's bar: who's typed to, in words, with "Type
 //   to all", "Pause all", "Resume all", and what to do with the picked ones.
 //   It also follows the keyboard: clicking into another tile while typing to
@@ -68,6 +69,7 @@ export const BroadcastTileChips = ({ sessionId, terminalId }: { sessionId: strin
   if (!on) return null;
   const solo = aim.solo === terminalId;
   const paused = aim.paused.has(terminalId);
+  const waiting = !paused && aim.line !== null && !aim.line.has(terminalId);
   const picked = aim.picked.includes(terminalId);
   const onPause = (e: React.MouseEvent) => {
     if (e.ctrlKey || e.metaKey || e.shiftKey) pick(terminalId, e.shiftKey);
@@ -92,6 +94,11 @@ export const BroadcastTileChips = ({ sessionId, terminalId }: { sessionId: strin
         >
           <Target size={11} />
         </button>
+      )}
+      {waiting && (
+        <span title="Joined partway through a line: what's typed reaches it from the next line" className={`${chip} text-zinc-300 border border-white/15`}>
+          Next line
+        </span>
       )}
       {picked && <span className={`${chip} text-sky-300 border border-sky-400/40`}>Picked</span>}
       <button
@@ -162,7 +169,9 @@ export const BroadcastBar = ({ tiles, sessions }: {
 
   if (!live || !ours.length) return null;
   const pausedHere = order.filter((t) => aim.paused.has(t));
-  const reaching = ours.length - pausedHere.length;
+  const waiting = aim.line === null ? 0 : order.filter((t) => !aim.paused.has(t) && !aim.line?.has(t)).length;
+  const reaching = ours.length - pausedHere.length - waiting;
+  const leftOut = [pausedHere.length > 0 && `${pausedHere.length} paused`, waiting > 0 && `${waiting} at the next line`].filter(Boolean);
   const soloTile = aim.solo === null ? null : ours.find((t) => t.terminalId === aim.solo);
   const soloName = soloTile ? sessions.find((s) => s.id === soloTile.sessionId)?.serverName : null;
   const picked = aim.picked.filter((t) => order.includes(t));
@@ -172,8 +181,8 @@ export const BroadcastBar = ({ tiles, sessions }: {
       <span className="text-[10px] font-semibold text-zinc-300 truncate" aria-live="polite">
         {aim.solo !== null
           ? `Typing to ${soloName ?? "one terminal"} only`
-          : pausedHere.length > 0
-            ? `Typing to ${reaching} of ${ours.length} · ${pausedHere.length} paused`
+          : leftOut.length > 0
+            ? `Typing to ${reaching} of ${ours.length} · ${leftOut.join(" · ")}`
             : `Typing to all ${ours.length}`}
       </span>
       {aim.solo !== null && (
