@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.69
+
+- **Broadcast: type to one server, or pause one.** On Broadcast's Wall, the target button on a tile types to that server alone, until you press Type to all. The pause button (or Ctrl+Shift+P) leaves a server out until you resume it, and its tile says Paused. Ctrl-click or Shift-click pause buttons to pause or resume several at once. The bar says who you're typing to. ([#218](https://github.com/paulm981/Submarine/issues/218))
+
 ## v0.4.0-fork.68
 
 - **Broadcast is one screen for many servers again.** Tick servers in the Broadcast menu, or All, and their terminals open side by side on the Wall; what you type in any of them goes to all of them. Ticking is turning it on, so there's no separate switch to forget after a restart, and unticking them all ends it and takes you back where you were. ([#218](https://github.com/paulm981/Submarine/issues/218))
