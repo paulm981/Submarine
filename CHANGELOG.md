@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.72
+
+- **Broadcast to a folder.** Right-click a folder in the session tree and pick Broadcast to all in this folder, or select servers and pick Broadcast to N selected: they open side by side on the Wall, and what you type goes to all of them. A folder is the saved group: no separate list to keep. ([#218](https://github.com/paulm981/Submarine/issues/218))
+
 ## v0.4.0-fork.71
 
 - **Broadcast: Send a set of commands to all.** Send… on Broadcast's bar opens a box for a set of commands, typed into every server line by line, with Enter after the last one unless you untick it. It says how many servers get it and who's left out (paused, not connected, waiting for the next line) before anything goes, and keeps control keys and escape sequences out. ([#218](https://github.com/paulm981/Submarine/issues/218))
