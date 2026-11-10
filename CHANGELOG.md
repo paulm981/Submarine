@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.68
+
+- **Broadcast is one screen for many servers again.** Tick servers in the Broadcast menu, or All, and their terminals open side by side on the Wall; what you type in any of them goes to all of them. Ticking is turning it on, so there's no separate switch to forget after a restart, and unticking them all ends it and takes you back where you were. ([#218](https://github.com/paulm981/Submarine/issues/218))
+
 ## v0.4.0-fork.65
 
 - **When the AI asks for a server, Stop still wins while it connects.** After you click Share, the card stays and says it's connecting; Don't share, Stop, or the AI withdrawing before the tab is up means it isn't shared. The AI side pane shows these cards and counts them, and only SSH servers are offered (not RDP, VNC or telnet), found by name ignoring case in any alphabet. ([#210](https://github.com/paulm981/Submarine/issues/210))
