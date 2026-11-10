@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { TreeItems } from "../../components/SessionTree";
+import { useBroadcast } from "../../ui/broadcast";
 import { useConfirm } from "../../ui/confirm";
 import { normalizeRules, onSlowRule, setCustomRules, setServerHighlights } from "../../ui/highlight";
 import { reorderById, useTabDrag } from "../../ui/tabDrag";
@@ -409,9 +410,11 @@ export const useSessionTree = (o: {
   // Open servers, each in its own tab (one already open is just shown);
   // focus lands on the first. Several at once from the tree's multi-select
   // and "Open all".
-  const openServers = async (all: any[]) => {
+  // The servers opened (those a teammate moved held back): none, or all of
+  // `all` that are left.
+  const openServers = async (all: any[]): Promise<any[]> => {
     const list = await passMoved(all);
-    if (list.length === 0) return;
+    if (list.length === 0) return [];
     o.setSessions((prev) => {
       const seen = new Set(prev.map((p) => p.id));
       const fresh = list
@@ -420,6 +423,14 @@ export const useSessionTree = (o: {
       return [...prev, ...fresh];
     });
     o.setActiveView(`session-${list[0].id}`);
+    return list;
+  };
+  // Broadcast to a folder, or the servers picked (#218): open them, and tick
+  // them in Broadcast, which turns it on and lays them out on the Wall.
+  const broadcast = useBroadcast();
+  const broadcastServers = async (all: any[]) => {
+    const list = await openServers(all);
+    if (list.length >= 2) broadcast.setTargets(list.map((server) => `session-${server.id}`));
   };
   // Share on the AI's request for a server (OPEN_SERVER, #32): opened as a
   // click here would open it, a server a teammate moved held back as here.
@@ -456,7 +467,8 @@ export const useSessionTree = (o: {
       statuses: o.statuses,
       waiting: o.waiting,
       activeSessionId: o.activeView,
-      onOpenServers: openServers,
+      onOpenServers: (list: any[]) => void openServers(list),
+      onBroadcastServers: (list: any[]) => void broadcastServers(list),
       onShowSession: (sid: string) => {
         o.setMergedSessionIds([]);
         o.setActiveView(sid);
