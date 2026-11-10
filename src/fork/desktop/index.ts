@@ -7,7 +7,7 @@ export * from "./settings";
 export * from "./hooks";
 export * from "./parts";
 export * from "./broadcastWall";
-export { BroadcastBar, BroadcastTileChips } from "./broadcastTiles";
+export { BroadcastBar, BroadcastTab, BroadcastTileChips } from "./broadcastTiles";
 // Fork modules DesktopApp renders or reads directly, through the same import.
 export { AiTrustModal } from "../../components/AiTrust";
 export { TerminalTurn } from "../terminal/turns";

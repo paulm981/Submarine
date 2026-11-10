@@ -12,10 +12,13 @@
 //   It also follows the keyboard: clicking into another tile while typing to
 //   one types to that one; Ctrl+Shift+P pauses or resumes the tile you're in.
 //   Its "Send…" opens Send to all, for a set of commands (sendToAllDialog).
+// - `BroadcastTab`, in the tab strip while Broadcast is on: its servers'
+//   tabs folded into one (#224). Its ✕ ends Broadcast; they stay connected.
 // Who gets the keys is broadcastAim's to say (src/fork/terminal/broadcastAim.ts).
 import { useEffect, useRef, useState } from "react";
-import { Pause, Play, Send, Target, X } from "lucide-react";
+import { Pause, Play, Radio, Send, Target, X } from "lucide-react";
 import { useBroadcast } from "../../ui/broadcast";
+import { titleTabClass } from "../../ui/tabStyle";
 import {
   aimNow, clearPicks, pick, sendTargets, setOrder, setPaused, togglePaused, typeToAll, typeToOne, useAim,
 } from "../terminal/broadcastAim";
@@ -256,6 +259,32 @@ export const BroadcastBar = ({ tiles, sessions, statuses }: {
           }}
         />
       )}
+    </div>
+  );
+};
+
+/** The tab Broadcast's servers fold into: the Wall, while it's on. */
+export const BroadcastTab = ({ active, compact, onClick }: { active: boolean; compact: boolean; onClick: () => void }) => {
+  const bc = useBroadcast();
+  if (!isLive(bc)) return null;
+  const n = bc.targetSessionIds.size;
+  return (
+    <div
+      data-tab="wall"
+      onClick={onClick}
+      title={`Broadcast: what you type goes to all ${n} of them`}
+      className={`no-drag group flex items-center gap-1.5 h-7 pl-3 pr-1.5 cursor-pointer transition-all shrink-0 ${titleTabClass({ compact, active })}`}
+    >
+      <Radio size={12} className="shrink-0 text-orange-400" />
+      <span className="text-[11px] font-bold whitespace-nowrap">Broadcast · {n}</span>
+      <button
+        onClick={(e) => { e.stopPropagation(); bc.selectNone(); }}
+        title="End Broadcast (the sessions stay connected, back in their own tabs)"
+        aria-label="End Broadcast"
+        className="h-5 w-5 rounded flex items-center justify-center text-zinc-500 hover:text-white hover:bg-white/[0.08]"
+      >
+        <X size={11} />
+      </button>
     </div>
   );
 };

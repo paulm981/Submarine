@@ -16,6 +16,12 @@
 //   `wallItems`).
 // - **When it ends**, who's typed to and what's paused is forgotten
 //   (broadcastAim), so next time every ticked server gets the keys.
+// - **One tab** (#224): while it's on, the ticked servers' tabs fold into
+//   one Broadcast tab, the Wall (`shownTabs`, BroadcastTab). Going to a
+//   ticked server's own view (its tile's "open in its own tab", the all-tabs
+//   list, the session tree) takes it out of Broadcast, and its tab comes
+//   back: that's popping it out. A server ticked while its tab is in front
+//   folds away, and the window goes to the Wall.
 import { useEffect, useRef, type Dispatch, type SetStateAction } from "react";
 import { resetAim } from "../terminal/broadcastAim";
 
@@ -57,13 +63,32 @@ type Broadcast = {
   sessionTerminalMap: Record<string, string>;
   enable: () => void;
   disable: () => void;
+  toggleTarget: (sessionId: string) => void;
   selectAll: (ids: string[]) => void;
   selectNone: () => void;
 };
 
+/** Broadcast is on, typing to two or more: the Wall is its screen. */
+export const broadcastLive = (b: { enabled: boolean; targetSessionIds: ReadonlySet<string> }): boolean =>
+  b.enabled && b.targetSessionIds.size >= 2;
+
+/** The tabs the strip shows: while Broadcast is on, all but its servers',
+ *  which fold into the Broadcast tab. The same `sessions` otherwise. */
+export const shownTabs = <S extends { id: string }>(sessions: S[], b: { enabled: boolean; targetSessionIds: ReadonlySet<string> }): S[] =>
+  broadcastLive(b) ? sessions.filter((s) => !b.targetSessionIds.has(s.id)) : sessions;
+
+/** What showing `view` does while Broadcast is on, `wasLive` before this
+ *  render too: going to one of its servers (`moved`, a change of view) pops
+ *  it out; one of its servers in front without a move (just ticked) folds
+ *  away to the Wall. */
+export const onTickedView = (view: string, moved: boolean, wasLive: boolean, b: { enabled: boolean; targetSessionIds: ReadonlySet<string> }): "popOut" | "toWall" | null => {
+  if (!broadcastLive(b) || !b.targetSessionIds.has(view)) return null;
+  return moved && wasLive ? "popOut" : "toWall";
+};
+
 /** The Broadcast menu's switch: on ticks every open session, off unticks
  *  them all. */
-export const broadcastSwitch = (broadcast: Broadcast, allSessionIds: string[]) => {
+export const broadcastSwitch = (broadcast: Pick<Broadcast, "enabled" | "targetSessionIds" | "selectAll" | "selectNone">, allSessionIds: string[]) => {
   if (broadcast.enabled || broadcast.targetSessionIds.size > 0) broadcast.selectNone();
   else broadcast.selectAll(allSessionIds);
 };
@@ -86,7 +111,7 @@ export const useBroadcastWall = ({ broadcast, frontTerminals, wallItems, setWall
   const before = useRef<string | null>(null);
   const viewRef = useRef(activeView);
   viewRef.current = activeView;
-  const { enabled, targetSessionIds, sessionTerminalMap, enable, disable } = broadcast;
+  const { enabled, targetSessionIds, sessionTerminalMap, enable, disable, toggleTarget } = broadcast;
   const ticked = targetSessionIds.size;
 
   // Ticking is turning it on.
@@ -117,4 +142,17 @@ export const useBroadcastWall = ({ broadcast, frontTerminals, wallItems, setWall
     // A tile of Broadcast's unpinned by hand comes back while its server is
     // ticked: untick it to take it off.
   }, [live, targetSessionIds, frontTerminals, sessionTerminalMap, wallItems, setWallItems, setActiveView]);
+
+  // One tab: popping a server out, or folding one ticked under you away.
+  const wasLive = useRef(false);
+  const lastView = useRef(activeView);
+  useEffect(() => {
+    const moved = lastView.current !== activeView;
+    lastView.current = activeView;
+    const what = onTickedView(activeView, moved, wasLive.current, broadcast);
+    wasLive.current = live;
+    if (what === "popOut") toggleTarget(activeView);
+    else if (what === "toWall") setActiveView("wall");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeView, live, targetSessionIds, toggleTarget, setActiveView]);
 };

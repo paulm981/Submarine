@@ -1406,7 +1406,8 @@ function DesktopApp() {
         onWheel={(e) => { e.currentTarget.scrollLeft += e.deltaY; }}
       >
         <Fork.HomeTab show={isUnlocked} active={activeView === "home"} compact={appSettings.compactTabs} onClick={() => setActiveView("home")} />
-        {sessions.map(s => {
+        <Fork.BroadcastTab active={activeView === "wall"} compact={appSettings.compactTabs} onClick={() => { setMergedSessionIds([]); setActiveView("wall"); }} />
+        {Fork.shownTabs(sessions, broadcast).map(s => {
           const st = sessionStatuses[s.id] ?? "connecting";
           // Dot palette: green = connected, amber = connecting, red = failed
           // or disconnected. The pulse animation only runs while connecting
