@@ -11,13 +11,16 @@
 //   to all", "Pause all", "Resume all", and what to do with the picked ones.
 //   It also follows the keyboard: clicking into another tile while typing to
 //   one types to that one; Ctrl+Shift+P pauses or resumes the tile you're in.
+//   Its "Send…" opens Send to all, for a set of commands (sendToAllDialog).
 // Who gets the keys is broadcastAim's to say (src/fork/terminal/broadcastAim.ts).
-import { useEffect, useRef } from "react";
-import { Pause, Play, Target, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Pause, Play, Send, Target, X } from "lucide-react";
 import { useBroadcast } from "../../ui/broadcast";
 import {
-  clearPicks, pick, setOrder, setPaused, togglePaused, typeToAll, typeToOne, useAim,
+  aimNow, clearPicks, pick, sendTargets, setOrder, setPaused, togglePaused, typeToAll, typeToOne, useAim,
 } from "../terminal/broadcastAim";
+import { broadcastSend } from "../terminal/broadcast";
+import { SendToAllDialog } from "./sendToAllDialog";
 
 // Each Broadcast tile's own element, for the keyboard: which tile it's in.
 const tileRoots = new Map<string, HTMLElement>();
@@ -121,12 +124,23 @@ export const BroadcastTileChips = ({ sessionId, terminalId }: { sessionId: strin
 const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
 
 /** The Wall bar's Broadcast line: who's typed to, and the buttons for it. */
-export const BroadcastBar = ({ tiles, sessions }: {
+export const BroadcastBar = ({ tiles, sessions, statuses }: {
   tiles: { sessionId: string; terminalId: string }[];
   sessions: { id: string; serverName: string }[];
+  /** Each session's state: only a connected one is sent to. */
+  statuses: Record<string, string>;
 }) => {
   const bc = useBroadcast();
   const aim = useAim();
+  const [sendOpen, setSendOpen] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  const noteTimer = useRef(0);
+  useEffect(() => () => window.clearTimeout(noteTimer.current), []);
+  const flash = (msg: string) => {
+    setNote(msg);
+    window.clearTimeout(noteTimer.current);
+    noteTimer.current = window.setTimeout(() => setNote(null), 4000);
+  };
   const live = isLive(bc);
   const ours = live ? tiles.filter((t) => bc.targetSessionIds.has(t.sessionId)) : [];
   const order = ours.map((t) => t.terminalId);
@@ -167,7 +181,19 @@ export const BroadcastBar = ({ tiles, sessions }: {
     return () => window.removeEventListener("keydown", onKey, true);
   }, [live]);
 
+  // Broadcast ended with the box open: it goes, unsent.
+  useEffect(() => {
+    if (!live) setSendOpen(false);
+  }, [live]);
+
   if (!live || !ours.length) return null;
+  // Send to all: the connected ones, then who's taking what's typed now.
+  const sendReach = () => {
+    const now = ours.filter((t) => bc.targetSessionIds.has(t.sessionId));
+    const connected = now.filter((t) => statuses[t.sessionId] === "connected").map((t) => t.terminalId);
+    const r = sendTargets(aimNow(), connected);
+    return { ids: r.to, to: r.to.length, total: now.length, paused: r.paused, waiting: r.waiting, offline: now.length - connected.length };
+  };
   const pausedHere = order.filter((t) => aim.paused.has(t));
   const waiting = aim.line === null ? 0 : order.filter((t) => !aim.paused.has(t) && !aim.line?.has(t)).length;
   const reaching = ours.length - pausedHere.length - waiting;
@@ -212,6 +238,23 @@ export const BroadcastBar = ({ tiles, sessions }: {
             </button>
           )}
         </>
+      )}
+      <button onClick={() => setSendOpen(true)} title="Type a set of commands into all of them" className={`${btn} text-orange-300 border-orange-400/40 hover:bg-orange-500/15 flex items-center gap-1`}>
+        <Send size={10} /> Send…
+      </button>
+      {note && <span role="status" className="text-[10px] text-zinc-300 truncate">{note}</span>}
+      {sendOpen && (
+        <SendToAllDialog
+          reach={sendReach}
+          onClose={() => setSendOpen(false)}
+          onSend={(data, lines, cleaned) => {
+            const r = sendReach();
+            setSendOpen(false);
+            if (!r.ids.length) return flash("No server is taking what's typed right now.");
+            broadcastSend(r.ids, data);
+            flash(`Sent ${plural(lines, "line")} to ${plural(r.ids.length, "server")}.` + (cleaned ? " Control characters were left out." : ""));
+          }}
+        />
       )}
     </div>
   );

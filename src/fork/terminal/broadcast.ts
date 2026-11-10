@@ -20,7 +20,7 @@
 // - **Who it reaches** (typing to one, paused ones) is broadcastAim's to
 //   say: TerminalView names the terminal typed into, `from`.
 import { invoke } from "@tauri-apps/api/core";
-import { sendsOn } from "./broadcastAim";
+import { sendsOn, sentToAll } from "./broadcastAim";
 
 /** The most targets in one call, and bytes in one write, as the backend
  *  allows (multiexec.rs: MAX_TARGETS, MAX_DATA). */
@@ -112,6 +112,18 @@ export const broadcastWrite = (from: string, { terminalId, data }: Write): Promi
     queueMicrotask(flush);
   }
   return Promise.resolve();
+};
+
+/** Send to all: `data` to each of `terminalIds`, as one write, whoever's
+ *  typed to; the caller has picked who (broadcastAim's sendTargets). */
+export const broadcastSend = (terminalIds: readonly string[], data: number[]) => {
+  if (!terminalIds.length) return;
+  for (const terminalId of terminalIds) writes.push({ terminalId, data });
+  if (!queued) {
+    queued = true;
+    queueMicrotask(flush);
+  }
+  sentToAll(terminalIds, data);
 };
 
 /** Done once everything asked for so far has gone, or is on its way to a

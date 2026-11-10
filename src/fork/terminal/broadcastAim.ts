@@ -59,7 +59,7 @@ export const reaches = (a: Aim, from: string, to: string): boolean =>
 // one key's writes to its targets come together, in one turn of the page,
 // with the same bytes.
 let typed: string | null = null;
-type Key = { from: string; data: number[]; members: ReadonlySet<string> | null; reached: Set<string> };
+type Key = { from: string | null; data: number[]; members: ReadonlySet<string> | null; reached: Set<string> };
 let key: Key | null = null;
 
 /** Pastes longer than this aren't read for where the line ends: the line is
@@ -85,7 +85,7 @@ const endKey = () => {
   typed = text.length > READ_MOST ? "" : lineAfter(was, text);
   if (typed === null) return setLine(null);
   const members = new Set(k.reached);
-  if (k.members === null || k.members.has(k.from)) members.add(k.from);
+  if (k.from !== null && (k.members === null || k.members.has(k.from))) members.add(k.from);
   setLine(members);
 };
 
@@ -112,6 +112,23 @@ export const sendsOn = (from: string, to: string, data: number[]): boolean => {
   const ok = reaches(aim, from, to);
   if (ok) key.reached.add(to);
   return ok;
+};
+
+/** Who a Send to all reaches now, of `ids` (Broadcast's terminals that are
+ *  connected): not paused, and not waiting for the next line. */
+export const sendTargets = (a: Aim, ids: readonly string[]) => {
+  const paused = ids.filter((t) => a.paused.has(t));
+  const waiting = ids.filter((t) => !a.paused.has(t) && a.line !== null && !a.line.has(t));
+  const to = ids.filter((t) => !a.paused.has(t) && (a.line === null || a.line.has(t)));
+  return { to, paused: paused.length, waiting: waiting.length };
+};
+
+/** `data` was sent to `ids` all at once (Send to all): the line goes on, or
+ *  ends, with them. */
+export const sentToAll = (ids: readonly string[], data: number[]) => {
+  endKey();
+  key = { from: null, data, members: aim.line, reached: new Set(ids) };
+  endKey();
 };
 
 export const aimNow = (): Aim => aim;
