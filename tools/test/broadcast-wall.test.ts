@@ -2,7 +2,7 @@
 // ticking is turning it on.
 
 import { describe, expect, it, vi } from "vitest";
-import { broadcastSwitch, syncBroadcastTiles, type WallTile } from "../../src/fork/desktop/broadcastWall";
+import { broadcastable, broadcastSwitch, syncBroadcastTiles, type WallTile } from "../../src/fork/desktop/broadcastWall";
 
 const tile = (sessionId: string, terminalId: string): WallTile => ({ id: `wall-${terminalId}`, sessionId, terminalId });
 
@@ -70,5 +70,15 @@ describe("the Broadcast menu's switch", () => {
     const stale = bc(false, ["a", "b"]);
     broadcastSwitch(stale, ["a", "b"]);
     expect(stale.selectNone).toHaveBeenCalled();
+  });
+});
+
+describe("Broadcast to a folder", () => {
+  it("takes the servers with a terminal: SSH, or no protocol saved (SSH), not RDP, VNC or Telnet", () => {
+    const list = [
+      { id: 1, protocol: "ssh" }, { id: 2, protocol: "rdp" }, { id: 3 }, { id: 4, protocol: "vnc" },
+      { id: 5, protocol: "telnet" }, { id: 6, protocol: null },
+    ];
+    expect(broadcastable(list).map((s) => s.id)).toEqual([1, 3, 6]);
   });
 });

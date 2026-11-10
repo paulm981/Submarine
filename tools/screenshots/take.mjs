@@ -133,6 +133,15 @@ const shots = {
     await save(page, "broadcast");
   },
 
+  // A folder in the session tree is a group to Broadcast to.
+  async "broadcast-folder"() {
+    const page = await open({ "submarine-session-tree-open": "1", "submarine-session-tree-expanded-demo": "[1,2]" });
+    await page.getByText("Production", { exact: true }).first().click({ button: "right" });
+    await page.getByRole("button", { name: /Broadcast to all in this folder/ }).waitFor();
+    await page.getByRole("button", { name: /Broadcast to all in this folder/ }).hover();
+    await save(page, "broadcast-folder");
+  },
+
   // Send to all: a set of commands for every Broadcast server, and who's left out.
   async "broadcast-send"() {
     const page = await open();

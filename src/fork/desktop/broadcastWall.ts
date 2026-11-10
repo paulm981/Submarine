@@ -46,6 +46,11 @@ export const syncBroadcastTiles = (
   return { tiles: next, ours: nextOurs };
 };
 
+/** The servers of `list` Broadcast can type to: those with a terminal (SSH),
+ *  not RDP, VNC or Telnet. For Broadcast to a folder or a pick (#218). */
+export const broadcastable = <S extends { protocol?: string | null }>(list: S[]): S[] =>
+  list.filter((s) => !["rdp", "vnc", "telnet"].includes(s.protocol ?? "ssh"));
+
 type Broadcast = {
   enabled: boolean;
   targetSessionIds: Set<string>;

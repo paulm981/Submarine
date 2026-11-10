@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   Activity, ArrowLeftRight, Bot, ChevronRight, ChevronsDownUp, Copy, CopyPlus, Folder, FolderInput, FolderOpen, FolderPlus,
-  Eye, History, Monitor, Pencil, Play, Plus, Search, ShieldAlert, TerminalSquare, Trash2, X,
+  Eye, History, Monitor, Pencil, Play, Plus, Radio, Search, ShieldAlert, TerminalSquare, Trash2, X,
 } from "lucide-react";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
 import { FolderRow, indexFolders, subtreeCounts, subtreeIds } from "../util/folderPath";
@@ -14,6 +14,7 @@ import { pingServers } from "../ui/ping";
 import { jumpHostNote } from "../util/jumpHostNote";
 import { showKeptSessions } from "./KeptSessions";
 import { BulkItems } from "../fork/bulk/menus";
+import { broadcastable } from "../fork/desktop/broadcastWall";
 
 // The session tree beside the main view, in the spirit of MobaXterm's
 // Sessions sidebar: every folder and server as one compact list, with the servers that have a tab open marked by their
@@ -89,7 +90,7 @@ const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? o
 
 export const SessionTree = ({
   profile, servers, folders, sessions, statuses, waiting, activeSessionId,
-  onOpenServers, onShowSession, onEditServer, onNewServer, onCloneServer,
+  onOpenServers, onBroadcastServers, onShowSession, onEditServer, onNewServer, onCloneServer,
   onCreateFolder, onRenameFolder, onDelete, onMove,
   side, onToggleSide, onClose,
 }: {
@@ -101,6 +102,8 @@ export const SessionTree = ({
   waiting: Set<string>;
   activeSessionId: string;
   onOpenServers: (servers: any[]) => void;
+  // Open these (SSH servers, two or more) and type to all of them (#218).
+  onBroadcastServers?: (servers: any[]) => void;
   // Go to a server that's already open: its tab.
   onShowSession: (sessionId: string) => void;
   onEditServer: (server: any) => void;
@@ -298,6 +301,21 @@ export const SessionTree = ({
     }))) return;
     if (list.length === 1) openServer(list[0]);
     else if (list.length) onOpenServers(list);
+  };
+
+  // Broadcast to a folder, or the servers picked (#218): a folder is the
+  // group kept. Only SSH servers have a terminal to type into; a big batch is
+  // asked about first, as opening it is.
+  const broadcastMany = async (all: any[]) => {
+    const list = broadcastable(all);
+    const n = list.length;
+    if (!onBroadcastServers || n < 2) return;
+    if (n > OPEN_MANY && !(await confirm({
+      title: `Broadcast to ${n} servers?`,
+      message: "Each one opens in a tab of its own and connects, and they open side by side on the Wall: what you type in any of them goes to all of them.",
+      okLabel: `Broadcast to ${n}`,
+    }))) return;
+    onBroadcastServers(list);
   };
 
   const pickedItems = (keys: Set<string>) => {
@@ -856,6 +874,11 @@ export const SessionTree = ({
                 <button className={menuItem} onClick={run(() => openMany(list))} disabled={list.length === 0}>
                   <Play size={13} className={menuIcon} /> Open all in this folder ({list.length})
                 </button>
+                {onBroadcastServers && (
+                  <button className={menuItem} onClick={run(() => broadcastMany(list))} disabled={broadcastable(list).length < 2}>
+                    <Radio size={13} className={menuIcon} /> Broadcast to all in this folder ({broadcastable(list).length})
+                  </button>
+                )}
                 <button className={menuItem} onClick={run(() => toggleFolder(f.id))}>
                   <ChevronRight size={13} className={menuIcon} /> {f.open ? "Collapse" : "Expand"}
                 </button>
@@ -889,6 +912,11 @@ export const SessionTree = ({
                 <button className={menuItem} onClick={run(() => (pickedCount > 1 && selected.has(r.key) ? openSelected() : openServer(r.server)))}>
                   <Play size={13} className={menuIcon} /> {pickedCount > 1 && selected.has(r.key) ? `Open ${pickedCount} selected` : "Open"}
                 </button>
+                {onBroadcastServers && pickedCount > 1 && selected.has(r.key) && broadcastable(picked.list).length > 1 && (
+                  <button className={menuItem} onClick={run(() => broadcastMany(picked.list))}>
+                    <Radio size={13} className={menuIcon} /> Broadcast to {broadcastable(picked.list).length} selected
+                  </button>
+                )}
                 {!many && (
                   <button className={menuItem} onClick={run(() => onEditServer(r.server))}>
                     <Pencil size={13} className={menuIcon} /> Edit…
