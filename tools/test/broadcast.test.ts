@@ -29,6 +29,9 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 const { broadcastWrite, callsFor, caughtUp, MAX_BEHIND, MAX_DATA, MAX_TARGETS, sent } = await import("../../src/fork/terminal/broadcast");
+// Who gets the keys (typing to one, paused, a line at a time) is
+// broadcast-aim.test's; here every test starts with all of them getting them.
+const { resetAim } = await import("../../src/fork/terminal/broadcastAim");
 
 /** One keystroke's writes, as TerminalView's fan-out makes them: the same bytes to each target. */
 const type = (ids: string[], text: string) => {
@@ -44,6 +47,7 @@ const got = () => {
 };
 
 beforeEach(async () => {
+  resetAim();
   holdAlone = false;
   while (held.length) held.shift()!();
   await caughtUp();
