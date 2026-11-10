@@ -2398,6 +2398,7 @@ function DesktopApp() {
                   <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-400 shrink-0">
                     Wall {wallItems.length > 0 ? `· ${wallItems.length}` : ''}
                   </span>
+                  <Fork.BroadcastBar tiles={wallItems} sessions={sessions} />
                   <div className="flex-1 min-w-0 flex items-center gap-3 ml-2 overflow-x-auto no-scrollbar">
                     <div className="flex items-center gap-1 shrink-0" role="group" aria-label="Columns">
                       <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-500">Cols</span>
@@ -2502,6 +2503,7 @@ function DesktopApp() {
                               <span className="text-zinc-400 truncate flex-1">
                                 {term?.title ?? item.terminalId}
                               </span>
+                              <Fork.BroadcastTileChips sessionId={item.sessionId} terminalId={item.terminalId} />
                               <button
                                 onClick={() => setActiveView(sess.id)}
                                 title="Open this session in its own tab"

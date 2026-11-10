@@ -14,7 +14,10 @@
 // - The original project's Broadcast and Wall, as they are: this only ticks,
 //   pins and unpins through them (src/ui/broadcast.tsx, DesktopApp's
 //   `wallItems`).
+// - **When it ends**, who's typed to and what's paused is forgotten
+//   (broadcastAim), so next time every ticked server gets the keys.
 import { useEffect, useRef, type Dispatch, type SetStateAction } from "react";
+import { resetAim } from "../terminal/broadcastAim";
 
 export type WallTile = { id: string; sessionId: string; terminalId: string };
 
@@ -86,6 +89,9 @@ export const useBroadcastWall = ({ broadcast, frontTerminals, wallItems, setWall
     if (ticked > 0 && !enabled) enable();
     if (ticked === 0 && enabled) disable();
   }, [ticked, enabled, enable, disable]);
+  useEffect(() => {
+    if (!enabled) resetAim();
+  }, [enabled]);
 
   const live = enabled && ticked >= 2;
   useEffect(() => {

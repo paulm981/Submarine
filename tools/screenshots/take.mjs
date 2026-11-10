@@ -124,7 +124,9 @@ const shots = {
     await page.mouse.click(700, 600);
     const tiles = page.locator(".xterm-screen:visible");
     await tiles.nth(2).waitFor();
-    // Typed in one tile, it goes to all three.
+    // The third one paused: it's left out, and says so.
+    await page.getByRole("button", { name: "Pause", exact: true }).nth(2).click();
+    // Typed in one tile, it goes to the other one that isn't paused.
     await tiles.first().click();
     await page.keyboard.type("uptime\r", { delay: 20 });
     await page.waitForTimeout(1500);

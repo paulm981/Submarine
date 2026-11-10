@@ -38,7 +38,7 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
       "Fork.tabMenuStyle", "Fork.titleTabClass", "Fork.AppVersion", "Fork.HomeTab", "Fork.HomeView", "Fork.NewsDot",
       "Fork.TabAiMarker", "Fork.AllTabsButton", "Fork.AiTitleButtons", "Fork.TabMoveItems", "Fork.TabCloseItems",
       "Fork.DesktopSessionTree", "Fork.DesktopAiSide", "Fork.PingPanel", "Fork.DesktopAiPanel", "Fork.AiTrustModal", "Fork.TerminalTurn",
-      "Fork.BulkTransfer", "Fork.BulkTabItems",
+      "Fork.BulkTransfer", "Fork.BulkTabItems", "Fork.BroadcastBar", "Fork.BroadcastTileChips",
     ],
   },
   {
@@ -100,7 +100,7 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
     // (`forkTerm.…`).
     imports: ["../fork/terminal"],
     uses: [
-      "Fork.TerminalProps", "Fork.broadcastWrite", "Fork.fileMenuAt", "Fork.useTerminal", "Fork.rootOpened", "Fork.schemeForServer", "Fork.savedPasswords",
+      "Fork.TerminalProps", "Fork.broadcastWrite(terminalId", "Fork.fileMenuAt", "Fork.useTerminal", "Fork.rootOpened", "Fork.schemeForServer", "Fork.savedPasswords",
       "Fork.xtermLook", "Fork.mountTerminal", "Fork.readClipboardText", "Fork.appHotkey", "Fork.pasteClean",
       "Fork.TerminalOverlay", "fork.commands.write", "fork.commands.resize", "fork.commands.close", "fork.resetHighlight",
       "fork.outputChannel", "fork.rootInvoke", "fork.watchForShellReady", "fork.dockElRef", "fork.dockEl", "fork.onScreen",
