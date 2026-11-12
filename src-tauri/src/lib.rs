@@ -26,6 +26,7 @@ mod monitor;
 mod cloud;
 mod cloud_config;
 mod about;
+mod feedback;
 mod mirror;
 mod docker;
 mod hlc;
@@ -25802,6 +25803,7 @@ pub fn run() {
             monitor_resume, monitor_pause, monitor_resume_all, monitor_pause_all,
             monitor_get_settings, monitor_set_settings,
             about::app_info, about::check_for_updates, about::open_external_url,
+            feedback::send_feedback,
             portable::get_storage_info,
             local_open::live_edit_editor_get, local_open::live_edit_editor_pick, local_open::live_edit_editor_reset, bulk_pick::bulk_pick_files, import_hosts, host_import::pick_client_import_file,
             multiexec::get_jump_login_limit, multiexec::set_jump_login_limit, multiexec::write_terminals_data, server_os::detect_server_os, approvals::keep_server_ssh, set_server_terminal_theme, set_server_highlight,

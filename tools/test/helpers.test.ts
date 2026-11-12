@@ -3,6 +3,7 @@
 // Small helpers of the fork's own, one describe each.
 import { describe, expect, it } from "vitest";
 import { visibleName } from "../../src/util/fileName";
+import { FORK_NEW_ISSUE_URL, feedbackIssueUrl } from "../../src/fork/feedback";
 import { clampInfoFontSize, DEFAULT_INFO_FONT_SIZE, MAX_INFO_FONT_SIZE, MIN_INFO_FONT_SIZE } from "../../src/util/infoFont";
 import { jumpHostNote } from "../../src/util/jumpHostNote";
 import { rangePick } from "../../src/util/rangePick";
@@ -87,5 +88,16 @@ describe("sessionDot", () => {
     expect(sessionDot("connecting", false).tone).toContain("animate");
     expect(sessionDot("failed", false).tone).toBe(sessionDot("disconnected", false).tone);
     expect(sessionDot("paused", false)).toEqual({ tone: "bg-zinc-500", title: "paused" });
+  });
+});
+
+describe("feedbackIssueUrl", () => {
+  it("opens a new issue on the fork, never the original project's server", () => {
+    expect(feedbackIssueUrl()).toBe(FORK_NEW_ISSUE_URL);
+    expect(feedbackIssueUrl("  ")).toBe(FORK_NEW_ISSUE_URL);
+    expect(FORK_NEW_ISSUE_URL.startsWith("https://github.com/paulm981/Submarine/")).toBe(true);
+  });
+  it("starts the issue with Suggest a fix's language, escaped", () => {
+    expect(feedbackIssueUrl("Translation (de) & more")).toBe(`${FORK_NEW_ISSUE_URL}?body=Translation%20(de)%20%26%20more%0A%0A`);
   });
 });

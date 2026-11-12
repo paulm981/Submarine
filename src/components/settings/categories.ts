@@ -29,6 +29,7 @@ export const UPSTREAM_CARD_TABS: Readonly<Record<string, SettingsTab>> = {
   "Authentication": "terminal",
   "Connections": "servers",
   "Cloud Sync": "sync",
+  "Help & feedback": "help",
 };
 
 /** The tab a card with this heading goes under: General when it's unknown.
