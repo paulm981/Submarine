@@ -118,7 +118,7 @@ mod tests {
         );
         assert_hooks("monitor.rs", include_str!("monitor.rs"), &[("", "mod jump_host_tests;", 1)]);
         assert_hooks("docker.rs", include_str!("docker.rs"), &[("", "mod cmd_tests;", 1)]);
-        assert_hooks("about.rs", include_str!("about.rs"), &[("", "mod tests;", 1)]);
+        assert_hooks("about.rs", include_str!("about.rs"), &[("", "    mod fork;", 1)]);
     }
 
     #[test]

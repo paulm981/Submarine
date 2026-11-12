@@ -51,7 +51,7 @@ export const termTabLook = (
   t: SessionTerminal, compactTabs: boolean, isFocusedHalf: boolean, isSplitPartner: boolean, count: number,
 ): { title?: string; className?: string } => ({
   title: t.container ? `${t.title} · Container: ${t.container.name}` : t.title,
-  className: `h-8 ${compactTabs
+  className: `h-10 sm:h-8 ${compactTabs
     ? `${COMPACT_TAB_PAD} ${count > 1 ? 'pr-6' : ''} gap-1.5 text-[10px] ${
         compactTermTabClass(isFocusedHalf, isSplitPartner ? "merged" : "primary")
       }`
@@ -69,7 +69,7 @@ export const termTabLook = (
  *  smaller on a compact tab. */
 export const termCloseLook = (compactTabs: boolean): { "data-no-tab-drag": boolean; className?: string } => ({
   "data-no-tab-drag": true,
-  className: `absolute right-1 top-1/2 -translate-y-1/2 ${compactTabs ? 'w-4 h-4' : 'w-5 h-5'} flex items-center justify-center rounded opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100 hover:bg-white/5 hover:text-red-400 text-zinc-500 transition-all`,
+  className: `absolute right-0 sm:right-1 top-1/2 -translate-y-1/2 w-8 h-10 ${compactTabs ? 'sm:w-4 sm:h-4' : 'sm:w-5 sm:h-5'} flex items-center justify-center rounded opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100 hover:bg-white/5 hover:text-red-400 text-zinc-500 transition-all`,
 });
 
 /** A terminal's box in the terminal area. `inView`: a pane of the split on

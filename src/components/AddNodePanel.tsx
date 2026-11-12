@@ -6,7 +6,9 @@ import PasswordField from "./PasswordField";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
 import { useSlideOverFocus } from "../ui/slideOverFocus";
 import * as Fork from "../fork/server-form";
+import { FormError, unsavedQuestion, useUnsavedGuard } from "../ui/slideOverForm";
 import { DEFAULT_RDP_OPTIONS, RDP_BUILTIN_EXPERIMENTAL, RDP_WINDOW_SIZES, type RdpOptions } from "../util/rdpOptions";
+import { DEFAULT_SESSION_KEEP } from "../util/sessionKeep";
 import { SwitchRow } from "./FormRows";
 import { RdpShareFields, RdpSpeedFields } from "./RdpOptionFields";
 import { VncSpeedFields } from "./VncOptionFields";
@@ -123,21 +125,22 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     }
   };
 
-  // What the form opened with. A click beside it closes it only if nothing
-  // would be lost: "Add server" starts blank and the pencil reloads the row,
-  // so what was typed doesn't come back. X is there for a deliberate close.
-  // The revealed password stays out of it, and all of it goes with the form:
-  // nothing here may outlive what DesktopApp clears on close and Lock. A typed
-  // password still counts as a change, through `password_dirty`.
-  const openedWithRef = useRef("");
-  const withoutPassword = ({ password, ...rest }: any) => JSON.stringify(rest);
-  useEffect(() => {
-    openedWithRef.current = isOpen ? withoutPassword(newNode) : "";
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOpen]);
-  const closeFromBackdrop = () => {
-    if (withoutPassword(newNode) === openedWithRef.current) onClose();
-  };
+  // A click beside the form, or X, closes it at once only if nothing would be
+  // lost: "Add server" starts blank and the pencil reloads the row, so what was
+  // typed doesn't come back. With changes, it asks: save them, discard them or
+  // keep editing (ui/slideOverForm). The revealed password stays out of what
+  // the form opened with, and all of it goes with the form: nothing here may
+  // outlive what DesktopApp clears on close and Lock. A typed password still
+  // counts as a change, through `password_dirty`.
+  const { requestClose, backdropProps } = useUnsavedGuard({
+    open: isOpen,
+    value: newNode,
+    close: onClose,
+    save,
+    busy: () => savingRef.current,
+    snapshot: ({ password, ...rest }: any) => JSON.stringify(rest),
+    question: (opened: any) => unsavedQuestion("server", !isEditMode, opened.name),
+  });
 
   // SSH-config import modal state. Lives here so it's colocated with the
   // "Add server" flow — the button that triggers it sits in this panel's
@@ -374,8 +377,13 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
 
   return (
     // Mounted while closed too (to slide out): inert then, so Tab can't reach
-    // its fields.
-    <div inert={isOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isOpen ? 'bg-black/60 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={closeFromBackdrop}>
+    // its fields. Clicks from the import dialog (a portal, so its events
+    // bubble here) aren't clicks beside the form.
+    <div
+      inert={isOpen ? undefined : ""}
+      className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isOpen ? 'bg-black/60 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`}
+      {...backdropProps}
+    >
       <div ref={panelRef} tabIndex={-1} className={`w-full ${isMobile ? 'max-w-full' : 'max-w-[450px]'} bg-background border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
 
         {/* Header */}
@@ -404,7 +412,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 <span className="sm:hidden">Import</span>
               </button>
             )}
-            <button aria-label="Close" onClick={onClose} className="w-8 h-8 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-xl transition-all shadow-inner">
+            <button aria-label="Close" onClick={() => void requestClose()} className="w-8 h-8 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-xl transition-all shadow-inner">
               <X size={16} />
             </button>
           </div>
@@ -412,7 +420,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
 
         {/* Scrollable Content */}
         <div className="p-6 flex-1 overflow-y-auto custom-scrollbar space-y-6">
-          {(portError || formError) && <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-500 text-[12px] font-bold">{portError || formError}</div>}
+          <FormError message={portError || formError} active={isOpen} />
 
           <div className="grid grid-cols-1 gap-4">
             {/* SSH, RDP, telnet or VNC. An RDP server opens in this
@@ -1077,6 +1085,31 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               </button>
             </div>
             </>)}
+
+            {/* This device's own choice for this server, see util/sessionKeep. */}
+            {isSsh && (
+              <div className="space-y-2 pt-1">
+                {([
+                  ["keepalives", "Send keepalives"],
+                  ["reconnect", "Reconnect automatically"],
+                ] as const).map(([field, label]) => (
+                  <div key={field} className="flex items-center justify-between gap-3">
+                    <label className="text-[11px] font-bold text-zinc-400 ml-1">{label}</label>
+                    <select
+                      aria-label={label}
+                      className="h-8 bg-[#1a1a1e] rounded-lg px-2 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50"
+                      value={(newNode.sessionKeep || DEFAULT_SESSION_KEEP)[field]}
+                      onChange={(e) => setNewNode({ ...newNode, sessionKeep: { ...(newNode.sessionKeep || DEFAULT_SESSION_KEEP), [field]: e.target.value } })}
+                    >
+                      <option value="default" className="bg-[#1a1a1e]">As in Settings</option>
+                      <option value="on" className="bg-[#1a1a1e]">On</option>
+                      <option value="off" className="bg-[#1a1a1e]">Off</option>
+                    </select>
+                  </div>
+                ))}
+                <p className="text-[10px] text-zinc-500 ml-1">Kept on this device only. A keepalive change applies the next time a session connects.</p>
+              </div>
+            )}
 
             {/* Per-node notes — free-form, plain text. Lives on the server
                 row (servers.notes column) and never crosses the network. The

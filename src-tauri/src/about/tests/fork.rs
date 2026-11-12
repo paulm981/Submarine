@@ -1,7 +1,7 @@
-//! The fork's own tests, kept in a file of their own (#136) so a sync with
-//! the original project doesn't conflict on them.
+//! The fork's own tests in `about`'s `tests`, kept in a file of their own
+//! (#136) so a sync with the original project doesn't conflict on them.
 
-use super::{newest_release, semver_greater, GhRelease};
+use crate::about::{newest_release, semver_greater, GhRelease};
 
 fn release(tag: &str, prerelease: bool) -> GhRelease {
     GhRelease { tag_name: tag.into(), html_url: format!("page/{tag}"), draft: false, prerelease }

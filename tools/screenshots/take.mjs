@@ -99,10 +99,12 @@ const shots = {
 
   // Settings › Servers & sessions: Keep sessions between connections.
   async "keep-sessions-setting"() {
-    const page = await open();
+    const page = await open({}, { width: 1400, height: 1400 });
     await page.getByTitle("Settings").first().click();
     await page.getByRole("tab", { name: "Servers & sessions" }).click();
-    await save(page, "keep-sessions-setting", { x: 0, y: 0, width: 1400, height: 700 });
+    // Down to the setting itself, wherever the tab's other cards put it.
+    const keep = await page.getByRole("switch", { name: "Keep sessions between connections" }).boundingBox();
+    await save(page, "keep-sessions-setting", { x: 0, y: 0, width: 1400, height: Math.min(1400, Math.ceil(keep.y + keep.height + 100)) });
   },
 
   // A server's AI approval: the three levels.

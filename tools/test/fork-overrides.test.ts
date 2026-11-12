@@ -29,7 +29,7 @@ const OVERRIDES: { file: string; spread: string; upstream: string[] }[] = [
     spread: "Fork.termTabLook",
     upstream: [
       "title={t.container ? `Container: ${t.container.name}` : undefined}",
-      "className={`h-8 px-3 sm:px-4 ${terminals.length > 1 ? 'pr-8 sm:pr-8' : ''} rounded-lg flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider transition-all ${",
+      "className={`h-10 sm:h-8 px-3 sm:px-4 ${terminals.length > 1 ? 'pr-8 sm:pr-8' : ''} rounded-lg flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider transition-all ${",
       "isFocusedHalf",
       "? 'bg-primary/10 text-primary border border-primary/20 shadow-inner'",
       ": isSplitPartner",
@@ -42,7 +42,7 @@ const OVERRIDES: { file: string; spread: string; upstream: string[] }[] = [
     file: "src/components/SessionView.tsx",
     spread: "Fork.termCloseLook",
     upstream: [
-      'className="absolute right-1 top-1/2 -translate-y-1/2 w-5 h-5 flex items-center justify-center rounded opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100 hover:bg-white/5 hover:text-red-400 text-zinc-500 transition-all"',
+      'className="absolute right-0 sm:right-1 top-1/2 -translate-y-1/2 w-8 h-10 sm:w-5 sm:h-5 flex items-center justify-center rounded opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100 hover:bg-white/5 hover:text-red-400 text-zinc-500 transition-all"',
     ],
   },
   {

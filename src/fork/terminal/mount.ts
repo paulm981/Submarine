@@ -85,9 +85,10 @@ export const pasteClean = (term: Terminal, text: string, pastingRef: MutableRefO
 };
 
 /** A container's terminal opened through root (rootInvoke): null when the
- *  password wasn't given, and the terminal says so. */
-export const rootOpened = (term: Terminal, syncSize: () => void) => (r: void | null) => {
-  if (r === null) { term.writeln(ROOT_CANCELLED); return; }
+ *  password wasn't given, and the terminal says so; `notOpened` then lets go
+ *  of what was typed meanwhile (util/terminalWrite). */
+export const rootOpened = (term: Terminal, syncSize: () => void, notOpened?: () => void) => (r: void | null) => {
+  if (r === null) { notOpened?.(); term.writeln(ROOT_CANCELLED); return; }
   syncSize();
 };
 

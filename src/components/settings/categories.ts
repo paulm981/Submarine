@@ -27,6 +27,7 @@ export const UPSTREAM_CARD_TABS: Readonly<Record<string, SettingsTab>> = {
   "Maintenance": "general",
   "Terminal Configuration": "terminal",
   "Authentication": "terminal",
+  "Connections": "servers",
   "Cloud Sync": "sync",
 };
 

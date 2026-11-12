@@ -102,7 +102,7 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
     uses: [
       "Fork.TerminalProps", "Fork.broadcastWrite(terminalId", "Fork.fileMenuAt", "Fork.useTerminal", "Fork.rootOpened", "Fork.schemeForServer", "Fork.savedPasswords",
       "Fork.xtermLook", "Fork.mountTerminal", "Fork.readClipboardText", "Fork.appHotkey", "Fork.pasteClean",
-      "Fork.TerminalOverlay", "fork.commands.write", "fork.commands.resize", "fork.commands.close", "fork.resetHighlight",
+      "Fork.TerminalOverlay", "fork.write", "fork.commands.resize", "fork.commands.close", "fork.resetHighlight",
       "fork.outputChannel", "fork.rootInvoke", "fork.watchForShellReady", "fork.dockElRef", "fork.dockEl", "fork.onScreen",
       "forkTerm.startGpu", "forkTerm.openLocal", "forkTerm.output", "forkTerm.write", "forkTerm.applyLook",
       "forkTerm.register", "forkTerm.unmount", "forkTerm.dispose", "forkTerm.undock",

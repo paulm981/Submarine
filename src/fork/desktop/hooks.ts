@@ -15,6 +15,7 @@ import { logLine } from "../../util/diagnostics";
 import { visibleName } from "../../util/fileName";
 import { folderTree } from "../../util/folderTree";
 import { readRdpOptions, writeRdpOptions } from "../../util/rdpOptions";
+import { readSessionKeep, writeSessionKeep } from "../../util/sessionKeep";
 import {
   type CloseWhich, type DesktopSession, HAS_HOME, START_VIEW, osChecksDue, sessionFor, stepTab, tabsToClose,
 } from "./rules";
@@ -330,15 +331,19 @@ export const useSessionTree = (o: {
   const cloneServer = async (id: number) => {
     try {
       const copyId = await invoke<number>("clone_server", { id });
-      // An RDP server's window and sharing options are this device's own,
-      // kept by sync id (util/rdpOptions): the copy starts with the same.
+      // An RDP server's window and sharing options (util/rdpOptions), and an
+      // SSH server's keepalives and reconnecting (util/sessionKeep), are this
+      // device's own, kept by sync id: the copy starts with the same.
       const original = (o.servers || []).find((s: any) => s.id === id);
-      if (original?.protocol === "rdp" && original.uuid) {
+      const isRdp = original?.protocol === "rdp";
+      const isSsh = !["rdp", "telnet", "vnc"].includes(original?.protocol);
+      if (original?.uuid && (isRdp || isSsh)) {
         try {
           const copy = (await invoke<any[]>("get_servers")).find((s) => s.id === copyId);
-          if (copy?.uuid) writeRdpOptions(copy.uuid, readRdpOptions(original.uuid));
+          if (copy?.uuid && isRdp) writeRdpOptions(copy.uuid, readRdpOptions(original.uuid));
+          else if (copy?.uuid) writeSessionKeep(copy.uuid, readSessionKeep(original.uuid));
         } catch (e) {
-          o.addLog(`CLONE_RDP_OPTIONS_FAILED: ${e}`, "error");
+          o.addLog(`CLONE_DEVICE_OPTIONS_FAILED: ${e}`, "error");
         }
       }
       o.refreshServers(); o.bumpSync(); o.addLog("Node cloned.", "success");
