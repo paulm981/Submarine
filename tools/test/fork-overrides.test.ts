@@ -22,20 +22,20 @@ const OVERRIDES: { file: string; spread: string; upstream: string[] }[] = [
   {
     file: "src/components/SessionView.tsx",
     spread: "Fork.termTabProps",
-    upstream: ['<div key={t.id} className="group relative flex items-center"'],
+    upstream: ['<div key={term.id} className="group relative flex items-center"'],
   },
   {
     file: "src/components/SessionView.tsx",
     spread: "Fork.termTabLook",
     upstream: [
-      "title={t.container ? `Container: ${t.container.name}` : undefined}",
+      'title={term.container ? t("Container: {name}", { name: term.container.name }) : undefined}',
       "className={`h-10 sm:h-8 px-3 sm:px-4 ${terminals.length > 1 ? 'pr-8 sm:pr-8' : ''} rounded-lg flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider transition-all ${",
       "isFocusedHalf",
       "? 'bg-primary/10 text-primary border border-primary/20 shadow-inner'",
       ": isSplitPartner",
       "? 'bg-primary/[0.04] text-primary/70 border border-primary/10'",
       ": 'text-zinc-300 bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/20 hover:text-white'",
-      "} ${t.container ? 'ring-1 ring-sky-400/30' : ''}`}",
+      "} ${term.container ? 'ring-1 ring-sky-400/30' : ''}`}",
     ],
   },
   {
