@@ -15,7 +15,9 @@ import { readScrollback } from '../util/terminalScrollback';
 import { TERMINAL_PASTE, withoutPasteControls, type TerminalPaste } from '../util/pasteText';
 import * as Fork from '../fork/terminal';
 import { readUseLocalShell } from '../util/terminalShell';
+import { holdTerminalInput, writeTerminal } from '../util/terminalWrite';
 import { readUseSshAgent } from '../util/sshAgent';
+import { readSendKeepalives } from '../util/sessionKeep';
 import { IS_MOBILE, IS_LINUX } from '../util/platform';
 import { useConfirm } from '../ui/confirm';
 import { parseOsc1337, parseOsc7, type ShellFolder } from '../util/shellFolder';
@@ -42,6 +44,22 @@ const looksLikePasswordPrompt = (out: string): boolean => {
 // text. F3 with a modifier looks like a cursor position (ESC [ 1 ; 2 R), so
 // that key stays on its own server too.
 const TERMINAL_REPLY = /^\x1b(?:\[[?>]?[0-9;]*[cnRt]|\[\??[0-9;]*\$y|\[[IO]|\[<[0-9;]+[Mm]|\][0-9]+;[^\x07\x1b]*(?:\x07|\x1b\\)|P[01]\$r[^\x1b]*\x1b\\)$/;
+// What a program turns on to hear from the terminal: mouse reports (9, 1000,
+// 1002, 1003, and their encodings 1005, 1006, 1015, 1016), focus reports (1004)
+// and pastes marked as such (2004). A reconnect turns them off: the program that
+// asked for them is gone, the new shell would take the reports for typed text,
+// and with 2004 left on a paste of several lines isn't asked about. A program
+// that wants them turns them on again (bash 5.1 and later, and zsh, do 2004 at
+// each prompt).
+const RESET_INPUT_MODES = '\x1b[?9;1000;1002;1003;1004;1005;1006;1015;1016;2004l';
+
+// The characters Ctrl turns into ^_ (0x1F), the undo key of emacs, zsh and
+// readline (#296). xterm only does this for "_", and not on a layout where "_"
+// sits on a digit key. Native terminals go further: X11's rule gives ^_ for
+// Ctrl+/, and PuTTY for Ctrl+- and Ctrl+/. By character: a layout where one of
+// them takes Shift or sits on another non-letter key gets the same, except that
+// the \ key without Shift stays ^\ (see attachCustomKeyEventHandler).
+const isUnderscoreKey = (key: string) => key === "-" || key === "/" || key === "_";
 
 // Shared search options — highlight all matches in yellow, the active
 // match in orange. `decorations` uses the marker overlay so the highlight
@@ -90,6 +108,12 @@ const resendPtySize = (terminalId: string, cols: number, rows: number, command?:
   sendPtySize(terminalId, size.cols, size.rows, command);
 };
 const WALL_TILE_CLOSED = 'submarine-wall-tile-closed';
+// The view each terminal's shell is opened for; a Wall tile opens none. A shell
+// done opening after its view has gone (the terminal or its tab was closed
+// meanwhile) is closed again: nobody would see it, and with its tab gone it
+// would keep the connection up. Not when a newer view has the terminal by then:
+// a server tab closed and opened again has the same first terminal.
+const shellViews = new Map<string, object>();
 // How long a terminal's size must hold before its PTY gets it. A layout
 // change passes through sizes for a few frames: the narrow and the wide
 // layout swap at 640 px (the terminal is 2 columns wide for a frame) and
@@ -144,6 +168,9 @@ const writePieces = (data: Uint8Array): Uint8Array[] => {
 
 // How long the cursor goes on blinking after the last key, click or focus.
 const CURSOR_BLINK_IDLE_MS = 10_000;
+// At the shell, a key starts a blink again that a program stopped, though not
+// more often than this (see markUsed).
+const BLINK_RESTART_MS = 1_000;
 
 const TerminalView = ({
   sessionId,
@@ -153,10 +180,12 @@ const TerminalView = ({
   shown = isActive,
   isActiveView = false,
   focusSignal = 0,
+  keepFocusRef,
   containerExec,
   connectionEpoch = 0,
   serverId = 0,
   serverName = "",
+  serverUuid,
   attachOnly = false,
   telnet = false,
   ownLogin = false,
@@ -198,6 +227,11 @@ const TerminalView = ({
   /// change — not the value — triggers the focus; only the active terminal
   /// reacts.
   focusSignal?: number;
+  /// While this holds true, becoming the active terminal doesn't take the
+  /// focus. The parent sets it around a change that must leave the focus where
+  /// it is: a tool panel closed from the keyboard keeps it on its toolbar
+  /// button, also where the panel had the terminal's place (#298).
+  keepFocusRef?: { readonly current: boolean };
   /// When set, this terminal runs `docker exec -it <container> <shell>`
   /// on the SSH host instead of the user's login shell. Used by the
   /// Docker tab in InfoPanel to open an interactive session inside a
@@ -227,6 +261,8 @@ const TerminalView = ({
   /// CA Access Control's `sesu`. When that login fails it uses the tab's
   /// connection and says so.
   ownLogin?: boolean;
+  /// The saved server's sync id, for this device's choices about it.
+  serverUuid?: string | null;
   /// A quick connect's login (it has no saved server), for `ownLogin`.
   quickAuth?: unknown;
   /// The folder the shell says it is in (OSC 7 or OSC 1337 CurrentDir, see
@@ -268,6 +304,7 @@ const TerminalView = ({
         sessionRole: 'terminal',
         separateSessions: false,
         useSshAgent: readUseSshAgent(),
+        sendKeepalives: readSendKeepalives(serverUuid),
       }).catch((e) => settle(String(e)));
     }
     const result = await done;
@@ -296,6 +333,11 @@ const TerminalView = ({
   const searchAddonRef = useRef<SearchAddon | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const openedRef = useRef(false);
+  // Lets go of what's typed while the shell is opening (util/terminalWrite), the
+  // first time or again after a reconnect. A view that goes away first drops it.
+  const releaseInputRef = useRef<((opened: boolean) => void) | null>(null);
+  // This view, for shellViews.
+  const viewRef = useRef({});
   // The xterm `onData` callback is bound once and persists for the life of the
   // component. We read this ref inside the callback so the latest `disabled`
   // state is observed without having to tear down and rebuild xterm.
@@ -329,6 +371,10 @@ const TerminalView = ({
   // the main effect, so we should NOT re-open on the first run of the
   // reconnect effect — only on subsequent value changes.
   const lastEpochRef = useRef(connectionEpoch);
+  // Set by a reconnect until xterm has read the RESET_INPUT_MODES it wrote.
+  // Until then the old program's modes are still on, and what xterm reports
+  // or answers is for that program: handleData drops it.
+  const staleModesRef = useRef<object | null>(null);
 
   // Mobile-only sticky modifiers (Ctrl / Alt / Shift) for the on-screen
   // key bar. State doubles as render input (highlighting) and is mirrored
@@ -524,9 +570,17 @@ const TerminalView = ({
         bytes = [0x09];
       }
     }
-    invoke(fork.commands.write, { terminalId, data: bytes }).catch(console.error);
+    fork.write(bytes);
     broadcastInput(bytes);
     if (consumes) consumeArmedModifiers();
+  };
+
+  // A shell is done opening: whether this view still has it. When no view
+  // does (it went away meanwhile, see shellViews), the shell is closed again.
+  const keepShell = () => {
+    if (shellViews.get(terminalId) === viewRef.current) return true;
+    if (!shellViews.has(terminalId)) invoke(fork.commands.close, { terminalId }).catch(() => {});
+    return false;
   };
 
   // Reconnect handler: when the parent bumps connectionEpoch we re-open
@@ -541,19 +595,34 @@ const TerminalView = ({
     const term = xtermRef.current;
     if (!term) return;
     fork.resetHighlight(term);
-    // Visible separator. \x1b[33m = yellow, \x1b[0m = reset.
-    term.write('\r\n\x1b[33m── reconnected ──\x1b[0m\r\n');
+    // Visible separator. \x1b[33m = yellow, \x1b[0m = reset. The modes the
+    // old program turned on go with it (RESET_INPUT_MODES). xterm reads a
+    // write a little later, in a timer, and the terminal can get the focus
+    // back first: a focus report made before then is the old program's
+    // (staleModesRef). What the new shell sends comes after this write, so
+    // what it asks is still answered.
+    const reset = {};
+    staleModesRef.current = reset;
+    term.write('\r\n\x1b[33m── reconnected ──\x1b[0m\r\n' + RESET_INPUT_MODES, () => {
+      if (staleModesRef.current === reset) staleModesRef.current = null;
+    });
     // Attach-only viewers piggyback on someone else's PTY, so they
     // must not re-open the PTY on reconnect either — the owner
     // already did it and this instance just needs to keep reading
     // events off the same terminal_id.
     if (attachOnly) return;
+    const releaseInput = holdTerminalInput(terminalId);
+    releaseInputRef.current = releaseInput;
     // As on the first open: the backend only takes resizes once the shell is
     // up, so a resize that landed while it was starting again (the window
     // was being dragged, a panel opened) is sent once more when it is. Without
     // this the shell kept the size it was reopened with, and wrapped its lines
     // at the wrong column until the next resize.
-    const syncSize = () => resendPtySize(terminalId, term.cols, term.rows);
+    const syncSize = () => {
+      if (!keepShell()) return;
+      releaseInput(true);
+      resendPtySize(terminalId, term.cols, term.rows);
+    };
     const ce = containerExecRef.current;
     if (telnet) {
       invoke('telnet_open_terminal', {
@@ -563,6 +632,7 @@ const TerminalView = ({
         rows: term.rows || 24,
         onOutput: fork.outputChannel(),
       }).then(syncSize, e => {
+        releaseInput(false);
         term.writeln(`\x1b[31mReconnect failed: ${e}\x1b[0m`);
       });
     } else if (ce) {
@@ -574,7 +644,8 @@ const TerminalView = ({
         rows: term.rows || 24,
         useSudo: ce.useSudo,
         onOutput: fork.outputChannel(),
-      }, 'Open the container terminal').then(Fork.rootOpened(term, syncSize), e => {
+      }, 'Open the container terminal').then(Fork.rootOpened(term, syncSize, () => releaseInput(false)), e => {
+        releaseInput(false);
         term.writeln(`\x1b[31mReconnect into container failed: ${e instanceof Error ? e.message : e}\x1b[0m`);
       });
     } else {
@@ -592,7 +663,8 @@ const TerminalView = ({
             onOutput: fork.outputChannel(),
           }).then(() => true);
         })
-        .then((opened) => { if (opened) { syncSize(); fork.watchForShellReady(); } }, e => {
+        .then((opened) => { if (opened) { syncSize(); fork.watchForShellReady(); } else releaseInput(false); }, e => {
+          releaseInput(false);
           term.writeln(`\x1b[31mReconnect failed: ${e}\x1b[0m`);
         });
     }
@@ -680,11 +752,14 @@ const TerminalView = ({
   };
   useEffect(() => {
     if (!isActive) return;
+    // Read now, not in the frame: the parent clears it in an effect of its
+    // own, which runs after this one.
+    const keepFocus = !!keepFocusRef?.current;
     const id = requestAnimationFrame(() => {
       refit();
       // Layout has settled and this is now the visible terminal: land the
       // caret in it so the user can type without a second click (#51).
-      focusTerminal();
+      if (!keepFocus) focusTerminal();
     });
     return () => cancelAnimationFrame(id);
   }, [isActive]);
@@ -839,6 +914,13 @@ const TerminalView = ({
       // Colours: the server's own scheme, else Settings › Terminal.
       ...Fork.xtermLook(serverId, local),
       allowProposedApi: true,
+      // Inside a program that takes the mouse (vi with mouse=a, mc, htop) a
+      // plain drag goes to the program, and xterm selects on Shift+drag
+      // instead, as PuTTY does. A Mac has no such key by default: this turns
+      // on Option+drag there, as in Terminal.app and iTerm2. The Option key
+      // keeps typing its characters (macOptionIsMeta stays off), so nothing
+      // else changes. Read on macOS only; other platforms ignore it.
+      macOptionClickForcesSelection: true,
       // OSC 8 hyperlinks a program on the server prints. What they show can
       // differ from where they go, so the real target is shown first, and
       // only an http(s) link opens, in the system browser (open_external_url
@@ -909,8 +991,22 @@ const TerminalView = ({
     // and GNOME stop a caret blinking. xterm's DOM renderer blinks with a CSS
     // animation the browser redraws at every frame: a focused terminal left
     // alone cost about 5% of a CPU core for it.
+    //
+    // A program can stop the blink too: nano, vim and other full-screen
+    // programs send "no blink" (DECRST 12) with every screen update. A key
+    // used to turn it back on each time. That made two option changes a key,
+    // and xterm takes each as a new look: every row redrawn, its style sheets
+    // written again, the glyph widths it measured forgotten. Held keys then
+    // backed up behind the redraws (#305). So in a full-screen program (the
+    // alternate screen) its choice stands, and the blink comes back when it
+    // ends. At the shell a key starts it again as before, though not more
+    // often than BLINK_RESTART_MS, for a program that runs there and sends
+    // the same (vim with t_ti unset).
     let lastUse = Date.now();
     let blinkTimer: number | null = null;
+    // The blink was stopped by blinkCheck, not by a program.
+    let stoppedIdle = false;
+    let programRestart = 0;
     const blinkCheck = () => {
       const left = lastUse + CURSOR_BLINK_IDLE_MS - Date.now();
       if (left > 0) {
@@ -918,19 +1014,47 @@ const TerminalView = ({
         return;
       }
       blinkTimer = null;
-      term.options.cursorBlink = false;
+      if (term.options.cursorBlink) {
+        term.options.cursorBlink = false;
+        stoppedIdle = true;
+      }
     };
     const markUsed = () => {
       lastUse = Date.now();
-      if (!term.options.cursorBlink) term.options.cursorBlink = true;
+      if (term.options.cursorBlink) {
+        stoppedIdle = false;
+      } else if (stoppedIdle) {
+        stoppedIdle = false;
+        term.options.cursorBlink = true;
+      } else if (term.buffer.active.type === 'normal' && lastUse - programRestart >= BLINK_RESTART_MS) {
+        programRestart = lastUse;
+        term.options.cursorBlink = true;
+      }
       if (blinkTimer === null) blinkTimer = window.setTimeout(blinkCheck, CURSOR_BLINK_IDLE_MS);
     };
     markUsed();
+    // A full-screen program that stopped the blink ends without starting it
+    // again: back at the shell the cursor blinks, unless nobody is there.
+    const blinkAfterProgram = term.buffer.onBufferChange((buffer) => {
+      if (buffer.type !== 'normal' || term.options.cursorBlink || stoppedIdle) return;
+      if (Date.now() - lastUse >= CURSOR_BLINK_IDLE_MS) {
+        stoppedIdle = true;
+        return;
+      }
+      term.options.cursorBlink = true;
+    });
     const blinkTextarea = term.textarea;
     const blinkHost = terminalRef.current;
     blinkTextarea?.addEventListener('focus', markUsed);
     blinkHost.addEventListener('mousedown', markUsed);
     forkTerm.startGpu();
+
+    // Its shell is this view's (shellViews).
+    if (!attachOnly) shellViews.set(terminalId, viewRef.current);
+    // Keys are taken from now on, the shell comes a little later.
+    if (!openedRef.current && !attachOnly && !releaseInputRef.current) {
+      releaseInputRef.current = holdTerminalInput(terminalId);
+    }
 
     const openTimer = window.setTimeout(() => {
       fitAddon.fit();
@@ -952,7 +1076,14 @@ const TerminalView = ({
         // The backend only takes resizes once the shell is up, so a refit
         // that landed while it was starting (e.g. the chosen font finished
         // loading and changed the cell size) is sent again once it's open.
-        const syncSize = () => resendPtySize(terminalId, term.cols, term.rows, fork.commands.resize);
+        // syncSize says false when this view has gone by then (keepShell).
+        const releaseInput = releaseInputRef.current ?? (() => {});
+        const syncSize = () => {
+          if (!keepShell()) return false;
+          releaseInput(true);
+          resendPtySize(terminalId, term.cols, term.rows, fork.commands.resize);
+          return true;
+        };
         if (telnet) {
           invoke('telnet_open_terminal', {
             sessionId,
@@ -961,6 +1092,7 @@ const TerminalView = ({
             rows: term.rows || 24,
             onOutput: fork.outputChannel(),
           }).then(syncSize, e => {
+            releaseInput(false);
             term.writeln(`\x1b[31mFailed to open terminal: ${e}\x1b[0m`);
           });
         } else if (local) {
@@ -974,7 +1106,8 @@ const TerminalView = ({
             rows: term.rows || 24,
             useSudo: containerExec.useSudo,
             onOutput: fork.outputChannel(),
-          }, 'Open the container terminal').then(Fork.rootOpened(term, syncSize), e => {
+          }, 'Open the container terminal').then(Fork.rootOpened(term, syncSize, () => releaseInput(false)), e => {
+            releaseInput(false);
             term.writeln(`\x1b[31mFailed to attach to container: ${e instanceof Error ? e.message : e}\x1b[0m`);
           });
         } else {
@@ -991,12 +1124,16 @@ const TerminalView = ({
               onOutput: fork.outputChannel(),
             }).then(() => true);
           }).then((opened) => {
-            if (!opened) return;
-            syncSize();
+            if (!opened) {
+              releaseInput(false);
+              return;
+            }
+            if (!syncSize()) return;
             // Its shell takes input from now on: SessionView types a server's
             // on-connect commands once it's ready for them.
             fork.watchForShellReady();
           }, e => {
+            releaseInput(false);
             term.writeln(`\x1b[31mFailed to open terminal: ${e}\x1b[0m`);
           });
         }
@@ -1013,6 +1150,9 @@ const TerminalView = ({
     // forwarded verbatim because we can't sensibly "Ctrl" a phrase.
     const handleData = (data: string) => {
       if (disabledRef.current) return;
+      // A report or answer for the program that went with the old connection
+      // (staleModesRef): the new shell would take it for typed text.
+      if (staleModesRef.current && TERMINAL_REPLY.test(data)) return;
       markUsed();
       showPasswordButton(false);
       // One write, to this terminal only. Enter in a call of its own could
@@ -1021,10 +1161,7 @@ const TerminalView = ({
       // be for this server alone.
       const request = pasteRequestRef.current;
       if (request) {
-        invoke('write_terminal_data', {
-          terminalId,
-          data: Array.from(new TextEncoder().encode(request.enter ? `${data}\r` : data)),
-        }).catch(console.error);
+        writeTerminal(terminalId, Array.from(new TextEncoder().encode(request.enter ? `${data}\r` : data)));
         commandBufRef.current = "";
         commandBufPastedRef.current = !request.enter;
         return;
@@ -1045,8 +1182,10 @@ const TerminalView = ({
             // Letters → C0 control (Ctrl+A = 0x01 … Ctrl+Z = 0x1a). `code & 0x1f`
             // does the right thing for both upper- and lower-case letters.
             ch = code & 0x1f;
+          } else if (isUnderscoreKey(data)) {
+            ch = 0x1f;
           }
-          // Non-letters under Ctrl are left as-is — Android's soft keyboard
+          // Other non-letters under Ctrl are left as-is — Android's soft keyboard
           // rarely lets the user type the ones with defined C0 mappings
           // (Ctrl+@, Ctrl+[, Ctrl+\, Ctrl+] etc.) anyway, and silently
           // mangling normal punctuation while a Ctrl chip is lit would
@@ -1063,10 +1202,7 @@ const TerminalView = ({
       } else {
         bytes = Array.from(new TextEncoder().encode(data));
       }
-      invoke(fork.commands.write, {
-        terminalId,
-        data: bytes,
-      }).catch(console.error);
+      fork.write(bytes);
       if (!TERMINAL_REPLY.test(data)) broadcastInput(bytes);
       if (local) return; // a local shell keeps no history
 
@@ -1312,6 +1448,14 @@ const TerminalView = ({
       if (Fork.fileMenuAt(ev, term, fork, () => void pasteClipboard(true))) return;
       void pasteClipboard(true);
     };
+    // A key held down while the focus moved here (Enter on a panel's close
+    // button) goes on repeating into the terminal. It wasn't pressed for the
+    // shell, so its repeats are dropped until a key goes down here. Keys an
+    // input method takes (keyCode 229) are left alone: it has used them before
+    // they get here, and xterm reads what it typed from its field afterwards.
+    let noKeySinceFocus = false;
+    const onTextareaFocus = () => { noKeySinceFocus = true; };
+    term.textarea?.addEventListener('focus', onTextareaFocus);
     // Ctrl+Shift+A / Ctrl+Shift+C / Ctrl+Shift+V — Warp/GNOME-Terminal-style
     // select-all / copy / paste, deliberately on the SHIFTED combo so plain
     // Ctrl+A (start of line) and Ctrl+C (SIGINT) keep going straight to the
@@ -1320,6 +1464,12 @@ const TerminalView = ({
     // three live in this single handler rather than three separate calls.
     term.attachCustomKeyEventHandler((ev) => {
       if (Fork.appHotkey(ev)) return false; // the app's own shortcuts (a tab, the AI side pane)
+      // A held key's repeats (see noKeySinceFocus).
+      if (ev.type === 'keydown' && !ev.repeat) noKeySinceFocus = false;
+      if (noKeySinceFocus && ev.repeat && !ev.isComposing && ev.keyCode !== 229) {
+        ev.preventDefault();
+        return false;
+      }
       const noOtherMods = !ev.altKey && !ev.metaKey && ev.ctrlKey && ev.shiftKey;
       if (noOtherMods && ev.code === 'KeyA') {
         if (ev.type === 'keydown' && !ev.repeat) term.selectAll();
@@ -1346,6 +1496,27 @@ const TerminalView = ({
           if (ev.type === 'keydown' && !ev.repeat) void pasteClipboard(false);
           return false;
         }
+      }
+      // ^_ (see isUnderscoreKey). No Alt or Meta: those combinations aren't ^_,
+      // and with Ctrl+Alt the layout may be typing the character. No letter key:
+      // those are xterm's, by keyCode, so Hebrew's Q key, which types /, stays ^Q.
+      // Nor the \ key without Shift, where a few layouts type /: Ctrl on it stays
+      // ^\, the quit signal. With Shift xterm has no ^\ there, so Ctrl+Shift on
+      // it is ^_ where Shift types / (Russian, Ukrainian and others). Repeats go
+      // out as any held key's do. Keyup and keypress send nothing with Ctrl down.
+      if (
+        ev.type === 'keydown' && ev.ctrlKey && !ev.altKey && !ev.metaKey &&
+        isUnderscoreKey(ev.key) && !(ev.keyCode >= 65 && ev.keyCode <= 90) &&
+        !(ev.keyCode === 220 && !ev.shiftKey)
+      ) {
+        ev.preventDefault();
+        // What xterm does for a typed key before it sends the data.
+        term.scrollToBottom();
+        term.clearSelection();
+        // A word still being composed goes first, as with the key bar's keys.
+        const send = () => { flushComposition(); handleData('\x1f'); };
+        if (compositionEndingRef.current) setTimeout(send); else send();
+        return false;
       }
       return true;
     });
@@ -1531,9 +1702,9 @@ const TerminalView = ({
 
     return () => {
       forkTerm.unmount();
-      window.clearTimeout(openTimer); // a terminal closed within these 50ms must not open its PTY
       fontDisposed = true;
       if (blinkTimer !== null) window.clearTimeout(blinkTimer);
+      blinkAfterProgram.dispose();
       blinkTextarea?.removeEventListener('focus', markUsed);
       blinkHost.removeEventListener('mousedown', markUsed);
       window.removeEventListener('submarine-settings-changed', handleSettingsChange);
@@ -1541,8 +1712,11 @@ const TerminalView = ({
       onDataDisposable.dispose();
       term.textarea?.removeEventListener("compositionupdate", onCompositionUpdate);
       term.textarea?.removeEventListener("compositionend", onCompositionEnd);
+      term.textarea?.removeEventListener('focus', onTextareaFocus);
       if (inputRef.current === handleData) inputRef.current = null;
       onResizeDisposable.dispose();
+      // Gone before its shell was asked for: none is opened.
+      window.clearTimeout(openTimer);
       window.clearTimeout(sizeTimer);
       window.clearTimeout(drawnTimer);
       if (container) {
@@ -1564,6 +1738,11 @@ const TerminalView = ({
       // Attach-only viewers unmount without closing so the primary
       // xterm (in the session tab) keeps working.
       if (!attachOnly) {
+        // Keys kept for a shell still opening go nowhere: it opens for no
+        // one, and what they do there would go unseen. That shell is closed
+        // once it's open (keepShell): the close below comes too early for it.
+        releaseInputRef.current?.(false);
+        if (shellViews.get(terminalId) === viewRef.current) shellViews.delete(terminalId);
         invoke(fork.commands.close, { terminalId }).catch(console.error);
         closeOwn();
         window.removeEventListener(WALL_TILE_CLOSED, onWallTileClosed);
@@ -1725,7 +1904,7 @@ const TerminalView = ({
           if (disabledRef.current) return;
           const payload = execute ? command + "\r" : command;
           const bytes = Array.from(new TextEncoder().encode(payload));
-          invoke('write_terminal_data', { terminalId, data: bytes }).catch(console.error);
+          writeTerminal(terminalId, bytes);
           // Mirror the inserted command into the local buffer so the next
           // Enter (if the user typed one manually) still logs correctly.
           if (!execute) {

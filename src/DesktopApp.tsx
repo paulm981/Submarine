@@ -24,6 +24,7 @@ import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./
 import { SCROLLBACK_KEY, readScrollback } from "./util/terminalScrollback";
 import { USE_LOCAL_SHELL_KEY, readUseLocalShell } from "./util/terminalShell";
 import { USE_SSH_AGENT_KEY, readUseSshAgent } from "./util/sshAgent";
+import { AUTO_RECONNECT_KEY, DEFAULT_SESSION_KEEP, SEND_KEEPALIVES_KEY, forgetSessionKeep, readAutoReconnectDefault, readSendKeepalivesDefault, readSessionKeep, writeSessionKeep } from "./util/sessionKeep";
 import { USE_SSH_CONFIG_KEY, readUseSshConfig } from "./util/sshConfig";
 import { DEFAULT_RDP_OPTIONS, forgetRdpOptions, readRdpOptions, writeRdpOptions } from "./util/rdpOptions";
 import { DEFAULT_VNC_OPTIONS, forgetVncOptions, readVncOptions, writeVncOptions } from "./util/vncOptions";
@@ -44,6 +45,7 @@ import TelnetSessionView from "./components/TelnetSessionView";
 import VncSessionView from "./components/VncSessionView";
 import MonitoringPanel from "./components/MonitoringPanel";
 import { ErrorBoundary, Guarded } from "./ui/ErrorBoundary";
+import { FormError, unsavedQuestion, useUnsavedGuard } from "./ui/slideOverForm";
 import { normalizeMirror, normalizeTunnel, parseObjectList } from "./util/serverJson";
 
 const appWindow = getCurrentWindow();
@@ -294,6 +296,8 @@ function DesktopApp() {
     protocol: "ssh" as "ssh" | "rdp" | "telnet" | "vnc",
     // An RDP server's window and sharing on this device (util/rdpOptions).
     rdpOptions: { ...DEFAULT_RDP_OPTIONS },
+    // An SSH server's keepalives and reconnecting on this device (util/sessionKeep).
+    sessionKeep: { ...DEFAULT_SESSION_KEEP },
     // A VNC server's speed and quality on this device (util/vncOptions).
     vncOptions: { ...DEFAULT_VNC_OPTIONS },
     name: "", host: "", port: 22, username: "", password: "",
@@ -376,6 +380,10 @@ function DesktopApp() {
     // On by default: logins may use keys from an ssh-agent on this computer.
     // See util/sshAgent.
     useSshAgent: readUseSshAgent(),
+    // On by default: idle sessions send keepalives, and a dropped one logs back
+    // in by itself. See util/sessionKeep.
+    sendKeepalives: readSendKeepalivesDefault(),
+    autoReconnect: readAutoReconnectDefault(),
     // On by default: connections use what ~/.ssh/config says about a host.
     // See util/sshConfig.
     useSshConfig: readUseSshConfig(),
@@ -402,6 +410,8 @@ function DesktopApp() {
     localStorage.setItem(MIN_CONTRAST_KEY, appSettings.terminalMinContrast ? 'on' : 'off');
     localStorage.setItem(USE_LOCAL_SHELL_KEY, appSettings.useLocalShell ? 'on' : 'off');
     localStorage.setItem(USE_SSH_AGENT_KEY, appSettings.useSshAgent ? 'on' : 'off');
+    localStorage.setItem(SEND_KEEPALIVES_KEY, appSettings.sendKeepalives === false ? 'off' : 'on');
+    localStorage.setItem(AUTO_RECONNECT_KEY, appSettings.autoReconnect === false ? 'off' : 'on');
     localStorage.setItem(USE_SSH_CONFIG_KEY, appSettings.useSshConfig ? 'on' : 'off');
     invoke("set_use_ssh_config", { enabled: appSettings.useSshConfig }).catch(() => {});
     localStorage.setItem('submarine-auto-sync', appSettings.autoSync ? 'on' : 'off');
@@ -769,6 +779,7 @@ function DesktopApp() {
     if (activeProfile) forgetServerBookmarks(activeProfile, s.id);
     if (s.uuid) {
       forgetRdpOptions(s.uuid);
+      forgetSessionKeep(s.uuid);
       forgetVncOptions(s.uuid);
     }
   };
@@ -1142,6 +1153,7 @@ function DesktopApp() {
       id: server.id,
       protocol: ["rdp", "telnet", "vnc"].includes(server.protocol) ? server.protocol : "ssh",
       rdpOptions: readRdpOptions(server.uuid),
+      sessionKeep: readSessionKeep(server.uuid),
       vncOptions: readVncOptions(server.uuid),
       name: server.name || "",
       host: server.host || "",
@@ -1185,6 +1197,152 @@ function DesktopApp() {
     newServer: { setNewNode, defaultNode, setFormError, setIsPanelOpen }, refreshFolders, refreshServers, bumpSync, addLog, forgetServer,
   });
   const { createFolder, cloneServer } = tree;
+  // The Library and Logins forms. A close with changes in a form (a click
+  // beside it, or its X) asks first, as the server form does
+  // (ui/slideOverForm). A close clears the error line, which the forms share.
+  const closeCommandPanel = () => { setIsCommandPanelOpen(false); setFormError(""); };
+  const saveCommand = async () => {
+    if (!editCommandData.title || !editCommandData.content) {
+      setFormError("Title and Content are required.");
+      addLog("Title and Content are required.", "error");
+      return;
+    }
+    const scope = editCommandData.scope;
+    if (scope && !scope.servers.length && !scope.folders.length) {
+      setFormError("Tick at least one server or folder, or choose All servers.");
+      return;
+    }
+    try {
+      if (editCommandData.id) {
+        await invoke("edit_command", { id: editCommandData.id, title: editCommandData.title, content: editCommandData.content });
+        await invoke("set_command_scope", { id: editCommandData.id, scope: scopeToJson(scope) });
+      } else {
+        await invoke("add_command", { title: editCommandData.title, content: editCommandData.content, scope: scopeToJson(scope) });
+      }
+      closeCommandPanel();
+      refreshCommands();
+      bumpSync();
+      addLog("Command saved.", "success");
+    } catch (e) {
+      setFormError(`Failed to save command: ${e}`);
+      addLog(`COMMAND_SAVE_ERROR: ${e}`, "error");
+    }
+  };
+  const commandForm = useUnsavedGuard({
+    open: isCommandPanelOpen,
+    value: editCommandData,
+    close: closeCommandPanel,
+    save: saveCommand,
+    question: (opened) => unsavedQuestion("command", !opened.id, opened.title),
+  });
+
+  const closeNotePanel = () => { setIsNotePanelOpen(false); setFormError(""); };
+  const saveNote = async () => {
+    if (!editNoteData.title.trim() && !editNoteData.body.trim()) {
+      setFormError("Add a title or some content first.");
+      return;
+    }
+    try {
+      const action = editNoteData.id
+        ? invoke("edit_note", { id: editNoteData.id, title: editNoteData.title, body: editNoteData.body })
+        : invoke("add_note", { title: editNoteData.title, body: editNoteData.body });
+      await action;
+      closeNotePanel();
+      refreshNotes();
+      bumpSync();
+      addLog("Note saved.", "success");
+    } catch (e) {
+      setFormError(`Failed to save note: ${e}`);
+      addLog(`NOTE_SAVE_ERROR: ${e}`, "error");
+    }
+  };
+  const noteForm = useUnsavedGuard({
+    open: isNotePanelOpen,
+    value: editNoteData,
+    close: closeNotePanel,
+    save: saveNote,
+    question: (opened) => unsavedQuestion("note", !opened.id, opened.title),
+  });
+
+  const closeCredPanel = () => { setIsCredPanelOpen(false); setFormError(""); };
+  const saveCred = async () => {
+    if (!editCredData.name) {
+      setFormError("Name is required.");
+      addLog("Name is required.", "error");
+      return;
+    }
+    if (editCredData.auth_type === "key" && !editCredData.key_id) {
+      setFormError("Please select a linked SSH Private Key.");
+      addLog("Please select a linked SSH Private Key.", "error");
+      return;
+    }
+    try {
+      const payload = {
+        name: editCredData.name,
+        authType: editCredData.auth_type || "password",
+        // Blank = asked when connecting (issue #54).
+        username: editCredData.username?.trim() ?? "",
+        password: editCredData.auth_type === "key" ? null : (editCredData.password || null),
+        keyId: editCredData.auth_type === "key" ? (editCredData.key_id ? parseInt(editCredData.key_id.toString()) : null) : null
+      };
+      const action = editCredData.id
+        ? invoke("edit_credential", { id: editCredData.id, ...payload })
+        : invoke("add_credential", payload);
+      await action;
+      closeCredPanel();
+      refreshCredentials();
+      bumpSync();
+      addLog("Credential saved.", "success");
+    } catch (e) {
+      setFormError(`Failed to save credential: ${e}`);
+      addLog(`CRED_SAVE_ERROR: ${e}`, "error");
+    }
+  };
+  // The revealed password is part of what the form opened with: only while
+  // it is open, as in the form itself.
+  const credForm = useUnsavedGuard({
+    open: isCredPanelOpen,
+    value: editCredData,
+    close: closeCredPanel,
+    save: saveCred,
+    question: (opened) => unsavedQuestion("login", !opened.id, opened.name),
+  });
+
+  const closeKeyPanel = () => { setIsKeyPanelOpen(false); setFormError(""); };
+  const saveKey = async () => {
+    if (!editKeyData.name || !editKeyData.private_key) {
+      setFormError("Name and Private Key are required.");
+      addLog("Name and Private Key are required.", "error");
+      return;
+    }
+    try {
+      const payload = {
+        name: editKeyData.name,
+        publicKey: editKeyData.public_key,
+        privateKey: editKeyData.private_key,
+        passphrase: editKeyData.passphrase || null
+      };
+      const action = editKeyData.id
+        ? invoke("edit_ssh_key", { id: editKeyData.id, ...payload })
+        : invoke("add_ssh_key", payload);
+      await action;
+      closeKeyPanel();
+      refreshSshKeys();
+      bumpSync();
+      addLog("SSH Key saved.", "success");
+    } catch (e) {
+      setFormError(`Failed to save SSH Key: ${e}`);
+      addLog(`KEY_SAVE_ERROR: ${e}`, "error");
+    }
+  };
+  // The same for the private key and passphrase.
+  const keyForm = useUnsavedGuard({
+    open: isKeyPanelOpen,
+    value: editKeyData,
+    close: closeKeyPanel,
+    save: saveKey,
+    question: (opened) => unsavedQuestion("SSH key", !opened.id, opened.name),
+  });
 
   // Render helper, NOT a component — it is invoked as `{TitleBar()}` below,
   // never as `<TitleBar />`. Rendering it as a JSX element would give it a
@@ -1234,7 +1392,7 @@ function DesktopApp() {
             <button
               type="button"
               onClick={() => setMobileSessionPickerOpen(v => !v)}
-              className={`w-full h-7 px-3 rounded-full flex items-center gap-2 border transition-all ${
+              className={`relative w-full h-7 px-3 rounded-full flex items-center gap-2 border transition-all before:absolute before:inset-x-0 before:-top-1 before:-bottom-2 before:content-[''] ${
                 activeView.startsWith('session-') || activeView === 'wall'
                   ? 'bg-primary/15 text-primary border-primary/40 shadow-inner'
                   : 'bg-white/[0.06] text-zinc-300 border-white/10'
@@ -1296,7 +1454,7 @@ function DesktopApp() {
                           role="option"
                           aria-selected={isActive}
                           onClick={() => { setActiveView(s.id); setMobileSessionPickerOpen(false); }}
-                          className={`flex-1 flex items-center gap-2 px-2.5 py-2 rounded-lg text-left transition-all ${
+                          className={`flex-1 flex items-center gap-2 px-2.5 py-3 sm:py-2 rounded-lg text-left transition-all ${
                             isActive
                               ? 'bg-primary/15 text-primary'
                               : isMerged
@@ -1356,7 +1514,7 @@ function DesktopApp() {
                             setActiveView(prev => (prev === sid ? START_VIEW : prev));
                           }}
                           title="Close session"
-                          className="h-8 w-8 shrink-0 rounded-lg flex items-center justify-center text-zinc-400 hover:text-red-400 hover:bg-white/[0.06] transition-all"
+                          className="h-10 w-10 sm:h-8 sm:w-8 shrink-0 rounded-lg flex items-center justify-center text-zinc-400 hover:text-red-400 hover:bg-white/[0.06] transition-all"
                         >
                           <X size={13} />
                         </button>
@@ -1374,7 +1532,7 @@ function DesktopApp() {
                       setActiveView('wall');
                       setMobileSessionPickerOpen(false);
                     }}
-                    className={`w-full flex items-center gap-2 px-2.5 py-2 rounded-lg text-left transition-all ${
+                    className={`w-full flex items-center gap-2 px-2.5 py-3 sm:py-2 rounded-lg text-left transition-all ${
                       activeView === 'wall'
                         ? 'bg-primary/15 text-primary'
                         : 'text-zinc-200 hover:bg-white/[0.06]'
@@ -1599,7 +1757,7 @@ function DesktopApp() {
               ? `Wall · ${wallItems.length} pinned terminal${wallItems.length === 1 ? '' : 's'}`
               : "Wall — pinboard for terminals across servers"}
             aria-label="Wall pinboard"
-            className={`relative flex items-center justify-center w-7 h-7 rounded-full transition-all ${
+            className={`relative flex items-center justify-center w-7 h-7 rounded-full transition-all max-sm:before:absolute max-sm:before:-inset-1.5 max-sm:before:content-[''] ${
               activeView === "wall"
                 ? "bg-primary/15 border border-primary/40 text-primary shadow-inner shadow-primary/10"
                 : "bg-white/[0.06] border border-white/10 text-zinc-400 hover:bg-white/[0.1] hover:text-white"
@@ -1634,7 +1792,7 @@ function DesktopApp() {
               ? `Broadcasting to ${broadcast.targetSessionIds.size} session${broadcast.targetSessionIds.size === 1 ? "" : "s"}`
               : "Broadcast input to multiple sessions"}
             aria-label="Broadcast input"
-            className={`relative flex items-center justify-center w-7 h-7 rounded-full transition-all ${
+            className={`relative flex items-center justify-center w-7 h-7 rounded-full transition-all max-sm:before:absolute max-sm:before:-inset-1.5 max-sm:before:content-[''] ${
               broadcast.enabled
                 ? "bg-orange-500/15 border border-orange-400/40 text-orange-300 shadow-inner shadow-orange-400/10"
                 : "bg-white/[0.06] border border-white/10 text-zinc-400 hover:bg-white/[0.1] hover:text-white"
@@ -1775,6 +1933,10 @@ function DesktopApp() {
         const targetIsActive = activeView === targetId;
         const currentMerges = targetIsActive ? mergedSessionIds : [];
         const others = sessions.filter(s => s.id !== targetId);
+        // The saved server behind the tab, for Edit server. None for a quick
+        // connect (server 0), or once the server has been deleted.
+        const targetServerId = sessions.find(s => s.id === targetId)?.serverId ?? 0;
+        const targetServer = targetServerId > 0 ? servers.find(sv => sv.id === targetServerId) : undefined;
         return (
         <>
           <div className="fixed inset-0 z-[60]" onClick={() => { setTabMenu(null); setTabRename(null); }} onContextMenu={(e) => { e.preventDefault(); setTabMenu(null); setTabRename(null); }} />
@@ -1803,6 +1965,15 @@ function DesktopApp() {
                 className="w-full text-left px-3 py-1.5 hover:bg-primary/15 hover:text-primary text-zinc-200 flex items-center gap-2"
                 onClick={() => setTabRename(targetId)}
               >Rename tab</button>
+            )}
+            {targetServer && (
+              <button
+                className="w-full text-left px-3 py-1.5 hover:bg-primary/15 hover:text-primary text-zinc-200 flex items-center gap-2"
+                onClick={() => {
+                  setTabMenu(null);
+                  void handleEditNode(targetServer);
+                }}
+              >Edit server</button>
             )}
             <Fork.TabMoveItems sessions={sessions} targetId={targetId} setSessions={setSessions} onDone={() => setTabMenu(null)} /><Fork.BulkTabItems targetId={targetId} sessions={sessions} statuses={sessionStatuses} onDone={() => setTabMenu(null)} />
             <button
@@ -3057,6 +3228,15 @@ function DesktopApp() {
                 addLog(`SAVE_RDP_OPTIONS_FAILED: ${e}`, "error");
               }
             }
+            // An SSH server's keepalives and reconnecting: the same, this device's own.
+            if (!isRdp && !isVnc && !isTelnet) {
+              try {
+                const uuid = (await invoke<any[]>("get_servers")).find((s) => s.id === savedId)?.uuid;
+                if (uuid) writeSessionKeep(uuid, newNode.sessionKeep || DEFAULT_SESSION_KEEP);
+              } catch (e) {
+                addLog(`SAVE_SESSION_KEEP_FAILED: ${e}`, "error");
+              }
+            }
             // A VNC server's speed and quality: the same, this device's own.
             if (isVnc) {
               try {
@@ -3070,6 +3250,14 @@ function DesktopApp() {
             setFormError("");
             refreshServers();
             bumpSync();
+            // A tab open on this server shows its new name (Edit server is in
+            // the tab's own menu). A tab given a name of its own keeps it.
+            if (newNode.id) {
+              const name = newNode.name;
+              setSessions(prev => prev.some(s => s.serverId === savedId && s.serverName !== name)
+                ? prev.map(s => (s.serverId === savedId ? { ...s, serverName: name } : s))
+                : prev);
+            }
             // If we just edited a node whose session is live, re-apply its saved
             // forwarding rules now so a changed/added tunnel comes up without a
             // manual reconnect. The backend cleared the stale tunnel cache when
@@ -3105,19 +3293,19 @@ function DesktopApp() {
       {/* The slide-overs stay mounted while closed (to slide out): inert
           then, so Tab can't reach their fields. */}
       <ErrorBoundary overlay label="Command form" onReset={() => setIsCommandPanelOpen(false)}><Guarded render={() => (
-      <div inert={isCommandPanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isCommandPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsCommandPanelOpen(false)}>
+      <div inert={isCommandPanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isCommandPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} {...commandForm.backdropProps}>
         <div ref={commandPanelRef} tabIndex={-1} className={`w-full max-w-[400px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isCommandPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
             <h2 className="text-[15px] font-bold text-white tracking-tight flex items-center gap-2">
               <TerminalSquare size={18} className="text-primary" />
               {editCommandData.id ? "Edit command" : "New command"}
             </h2>
-            <button aria-label="Close" onClick={() => { setIsCommandPanelOpen(false); setFormError(""); }} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
+            <button aria-label="Close" onClick={() => void commandForm.requestClose()} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
               <X size={16} />
             </button>
           </div>
           <div className="p-6 flex-1 overflow-y-auto space-y-6">
-            {formError && <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-500 text-[12px] font-bold">{formError}</div>}
+            <FormError message={formError} active={isCommandPanelOpen} />
             <div className="space-y-1.5">
               <label className="text-[12px] font-bold text-zinc-400 ml-1">Title</label>
               <input type="text" className="w-full h-10 bg-black rounded-lg px-3 text-[13px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner" placeholder="e.g. Update packages" value={editCommandData.title} onChange={e => setEditCommandData({ ...editCommandData, title: e.target.value })} />
@@ -3136,34 +3324,8 @@ function DesktopApp() {
             />
           </div>
           <div className="p-6 border-t border-white/5 shrink-0">
-            <button 
-              onClick={async () => {
-                if (!editCommandData.title || !editCommandData.content) {
-                  setFormError("Give the command a title and the command to run.");
-                  return;
-                }
-                const scope = editCommandData.scope;
-                if (scope && !scope.servers.length && !scope.folders.length) {
-                  setFormError("Tick at least one server or folder, or choose All servers.");
-                  return;
-                }
-                try {
-                  if (editCommandData.id) {
-                    await invoke("edit_command", { id: editCommandData.id, title: editCommandData.title, content: editCommandData.content });
-                    await invoke("set_command_scope", { id: editCommandData.id, scope: scopeToJson(scope) });
-                  } else {
-                    await invoke("add_command", { title: editCommandData.title, content: editCommandData.content, scope: scopeToJson(scope) });
-                  }
-                  setFormError("");
-                  setIsCommandPanelOpen(false);
-                  refreshCommands();
-                  bumpSync();
-                  addLog("Command saved.", "success");
-                } catch (e) {
-                  setFormError(`Failed to save command: ${e}`);
-                  addLog(`COMMAND_SAVE_ERROR: ${e}`, "error");
-                }
-              }} 
+            <button
+              onClick={() => void commandForm.save()}
               className="w-full h-10 bg-primary text-black font-bold rounded-lg text-[13px] tracking-tight hover:brightness-110 transition-all active:scale-[0.98] shadow-[0_0_15px_rgba(var(--primary),0.2)] flex items-center justify-center gap-2"
             >
               Save
@@ -3174,19 +3336,19 @@ function DesktopApp() {
       )} /></ErrorBoundary>
 
       <ErrorBoundary overlay label="Note form" onReset={() => setIsNotePanelOpen(false)}><Guarded render={() => (
-      <div inert={isNotePanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isNotePanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsNotePanelOpen(false)}>
+      <div inert={isNotePanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isNotePanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} {...noteForm.backdropProps}>
         <div ref={notePanelRef} tabIndex={-1} className={`w-full max-w-[480px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isNotePanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
             <h2 className="text-[15px] font-bold text-white tracking-tight flex items-center gap-2">
               <StickyNote size={18} className="text-primary" />
               {editNoteData.id ? "Edit note" : "New note"}
             </h2>
-            <button aria-label="Close" onClick={() => { setIsNotePanelOpen(false); setFormError(""); }} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
+            <button aria-label="Close" onClick={() => void noteForm.requestClose()} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
               <X size={16} />
             </button>
           </div>
           <div className="p-6 flex-1 overflow-y-auto space-y-6 flex flex-col">
-            {formError && <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-500 text-[12px] font-bold">{formError}</div>}
+            <FormError message={formError} active={isNotePanelOpen} />
             <div className="space-y-1.5">
               <label className="text-[12px] font-bold text-zinc-400 ml-1">Title</label>
               <input type="text" className="w-full h-10 bg-black rounded-lg px-3 text-[13px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner" placeholder="e.g. Production credentials reminder" value={editNoteData.title} onChange={e => setEditNoteData({ ...editNoteData, title: e.target.value })} />
@@ -3198,25 +3360,7 @@ function DesktopApp() {
           </div>
           <div className="p-6 border-t border-white/5 shrink-0">
             <button
-              onClick={async () => {
-                if (!editNoteData.title.trim() && !editNoteData.body.trim()) {
-                  setFormError("Add a title or some content first.");
-                  return;
-                }
-                try {
-                  const action = editNoteData.id
-                    ? invoke("edit_note", { id: editNoteData.id, title: editNoteData.title, body: editNoteData.body })
-                    : invoke("add_note", { title: editNoteData.title, body: editNoteData.body });
-                  await action;
-                  setIsNotePanelOpen(false);
-                  refreshNotes();
-                  bumpSync();
-                  addLog("Note saved.", "success");
-                } catch (e) {
-                  setFormError(`Failed to save note: ${e}`);
-                  addLog(`NOTE_SAVE_ERROR: ${e}`, "error");
-                }
-              }}
+              onClick={() => void noteForm.save()}
               className="w-full h-10 bg-primary text-black font-bold rounded-lg text-[13px] tracking-tight hover:brightness-110 transition-all active:scale-[0.98] shadow-[0_0_15px_rgba(var(--primary),0.2)] flex items-center justify-center gap-2"
             >
               Save
@@ -3227,19 +3371,19 @@ function DesktopApp() {
       )} /></ErrorBoundary>
 
       <ErrorBoundary overlay label="Login form" onReset={() => setIsCredPanelOpen(false)}><Guarded render={() => (
-      <div inert={isCredPanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isCredPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsCredPanelOpen(false)}>
+      <div inert={isCredPanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isCredPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} {...credForm.backdropProps}>
         <div ref={credPanelRef} tabIndex={-1} className={`w-full max-w-[400px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isCredPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
             <h2 className="text-[15px] font-bold text-white tracking-tight flex items-center gap-2">
               <Shield size={18} className="text-primary" />
               {editCredData.id ? "Edit login" : "New login"}
             </h2>
-            <button aria-label="Close" onClick={() => { setIsCredPanelOpen(false); setFormError(""); }} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
+            <button aria-label="Close" onClick={() => void credForm.requestClose()} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
               <X size={16} />
             </button>
           </div>
           <div className="p-6 flex-1 overflow-y-auto space-y-6">
-            {formError && <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-500 text-[12px] font-bold">{formError}</div>}
+            <FormError message={formError} active={isCredPanelOpen} />
             <div className="space-y-1.5">
               <label className="text-[12px] font-bold text-zinc-400 ml-1">Name</label>
               <input type="text" className="w-full h-10 bg-black rounded-lg px-3 text-[13px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner" placeholder="e.g. Work server" value={editCredData.name} onChange={e => setEditCredData({ ...editCredData, name: e.target.value })} />
@@ -3288,40 +3432,8 @@ function DesktopApp() {
             )}
           </div>
           <div className="p-6 border-t border-white/5 shrink-0">
-            <button 
-              onClick={async () => {
-                if (!editCredData.name) {
-                  setFormError("Name is required.");
-                  addLog("Name is required.", "error");
-                  return;
-                }
-                if (editCredData.auth_type === "key" && !editCredData.key_id) {
-                  setFormError("Please select a linked SSH Private Key.");
-                  addLog("Please select a linked SSH Private Key.", "error");
-                  return;
-                }
-                try {
-                  const payload = {
-                    name: editCredData.name,
-                    authType: editCredData.auth_type || "password",
-                    // Blank = asked when connecting (issue #54).
-                    username: editCredData.username?.trim() ?? "",
-                    password: editCredData.auth_type === "key" ? null : (editCredData.password || null),
-                    keyId: editCredData.auth_type === "key" ? (editCredData.key_id ? parseInt(editCredData.key_id.toString()) : null) : null
-                  };
-                  const action = editCredData.id 
-                    ? invoke("edit_credential", { id: editCredData.id, ...payload })
-                    : invoke("add_credential", payload);
-                  await action;
-                  setIsCredPanelOpen(false);
-                  refreshCredentials();
-                  bumpSync();
-                  addLog("Credential saved.", "success");
-                } catch (e) {
-                  setFormError(`Failed to save credential: ${e}`);
-                  addLog(`CRED_SAVE_ERROR: ${e}`, "error");
-                }
-              }} 
+            <button
+              onClick={() => void credForm.save()}
               className="w-full h-10 bg-primary text-black font-bold rounded-lg text-[13px] tracking-tight hover:brightness-110 transition-all active:scale-[0.98] flex items-center justify-center gap-2"
             >
               Save
@@ -3332,19 +3444,19 @@ function DesktopApp() {
       )} /></ErrorBoundary>
 
       <ErrorBoundary overlay label="Key form" onReset={() => setIsKeyPanelOpen(false)}><Guarded render={() => (
-      <div inert={isKeyPanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isKeyPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsKeyPanelOpen(false)}>
+      <div inert={isKeyPanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isKeyPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} {...keyForm.backdropProps}>
         <div ref={keyPanelRef} tabIndex={-1} className={`w-full max-w-[450px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isKeyPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
             <h2 className="text-[15px] font-bold text-white tracking-tight flex items-center gap-2">
               <Key size={18} className="text-primary" />
               {editKeyData.id ? "Edit SSH key" : "New SSH key"}
             </h2>
-            <button aria-label="Close" onClick={() => { setIsKeyPanelOpen(false); setFormError(""); }} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
+            <button aria-label="Close" onClick={() => void keyForm.requestClose()} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
               <X size={16} />
             </button>
           </div>
           <div className="p-6 flex-1 overflow-y-auto space-y-6">
-            {formError && <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-500 text-[12px] font-bold">{formError}</div>}
+            <FormError message={formError} active={isKeyPanelOpen} />
             {/* Reading the key out of ~/.ssh beats making the user cat it in a
                 terminal and paste two multi-line blobs. Fields are filled in
                 rather than saved outright — the name is a guess from the
@@ -3408,32 +3520,8 @@ function DesktopApp() {
             </div>
           </div>
           <div className="p-6 border-t border-white/5 shrink-0">
-            <button 
-              onClick={async () => {
-                if (!editKeyData.name || !editKeyData.private_key) {
-                  addLog("Name and Private Key are required.", "error");
-                  return;
-                }
-                try {
-                  const payload = {
-                    name: editKeyData.name,
-                    publicKey: editKeyData.public_key,
-                    privateKey: editKeyData.private_key,
-                    passphrase: editKeyData.passphrase || null
-                  };
-                  const action = editKeyData.id 
-                    ? invoke("edit_ssh_key", { id: editKeyData.id, ...payload })
-                    : invoke("add_ssh_key", payload);
-                  await action;
-                  setIsKeyPanelOpen(false);
-                  refreshSshKeys();
-                  bumpSync();
-                  addLog("SSH Key saved.", "success");
-                } catch (e) {
-                  setFormError(`Failed to save SSH Key: ${e}`);
-                  addLog(`KEY_SAVE_ERROR: ${e}`, "error");
-                }
-              }} 
+            <button
+              onClick={() => void keyForm.save()}
               className="w-full h-10 bg-primary text-black font-bold rounded-lg text-[13px] tracking-tight hover:brightness-110 transition-all active:scale-[0.98] flex items-center justify-center gap-2"
             >
               Save

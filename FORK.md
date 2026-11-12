@@ -11,7 +11,7 @@ This page covers:
 
 What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
-The fork is based on the original project's **0.4.0**, with every change up to [#297](https://github.com/SinaXhpm/submarine/pull/297) brought in.
+The fork is based on the original project's **0.4.0**, with every change up to [#315](https://github.com/SinaXhpm/submarine/pull/315) brought in.
 
 ## What this fork adds
 
@@ -241,12 +241,12 @@ Also:
 - **xterm.js 6**, drawn on the GPU.
 - **Fast output never freezes the window.** Output is paced by what the screen has drawn, and floods of escape sequences that would lock it up are ignored.
 - **The app's own dark right-click menus** everywhere. No right-click or F5 reloads the app.
-- **Sessions that survive a reconnect** ([#126](https://github.com/paulm981/Submarine/issues/126)). Turn on **Keep sessions between connections** in Settings › Servers & sessions (off until you do), or for one server in its settings (Use the default, Always, Never), and new terminals run in tmux on the server, or in screen where there's no tmux. Nothing ever asks: a dropped connection, sleep or a closed tab leaves the session running, and connecting again takes you back to the same shell, with what was running still running. Type `exit` to end one. A kept terminal's tab has a small mark. **Sessions…** in a server's right-click menu lists them, to open one or end it. On-connect commands go only into a new session. It's this computer's choice and never synced, nothing is installed on a server, and a server with neither gets a plain shell and a one-line note. The work is in `keep_session.rs` and `KeptSessions.tsx`.
+- **Sessions that survive a reconnect** ([#126](https://github.com/paulm981/Submarine/issues/126)). Turn on **Keep sessions between connections** in Settings › Servers & sessions (off until you do), or for one server in its settings (Use the default, Always, Never), and new terminals run in tmux on the server, or in screen where there's no tmux. Nothing ever asks: a dropped connection, sleep or a closed tab leaves the session running, and connecting again takes you back to the same shell, with what was running still running. Type `exit` to end one. With **Reconnect automatically** off (the original project's switch, in the same tab or a server's own form), a dropped session waits on the server until you press **Reconnect**, then comes back the same way. A kept terminal's tab has a small mark. **Sessions…** in a server's right-click menu lists them, to open one or end it. On-connect commands go only into a new session. It's this computer's choice and never synced, nothing is installed on a server, and a server with neither gets a plain shell and a one-line note. The work is in `keep_session.rs` and `KeptSessions.tsx`.
 
 <table>
   <tr>
     <td width="50%" valign="top" align="center">
-      <img src="docs/screenshots/fork/keep-sessions-setting.png" alt="Settings, Servers and sessions tab: Keep sessions between connections turned on" />
+      <img src="docs/screenshots/fork/keep-sessions-setting.png" alt="Settings, Servers and sessions tab: the original project's Connections card, with Send keepalives and Reconnect automatically on, and under Sessions, Keep sessions between connections turned on" />
       <br/><sub><b>Keep sessions between connections</b>, in Settings › Servers & sessions</sub>
     </td>
     <td width="50%" valign="top" align="center">
@@ -316,11 +316,12 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | A VNC password typed at its prompt ([#241](https://github.com/SinaXhpm/submarine/pull/241)) | Saved to the server's saved login when it has one | Saved only into the server itself: no tick when it has a saved login, which VNC's weak protection mustn't carry ([#121](https://github.com/paulm981/Submarine/issues/121)) |
 | What "Save password" saves ([#241](https://github.com/SinaXhpm/submarine/pull/241)) | The last password the server asked for, wherever the server's record points when the login ends | Only the first password a server asks for, only for the server's saved login name, and nothing if the server was changed while you logged in ([#121](https://github.com/paulm981/Submarine/issues/121)) |
 | VNC clipboard ([#247](https://github.com/SinaXhpm/submarine/pull/247)) | Text copied on the server goes to this computer's clipboard at once | Only while its tab is in front and the window has the focus ([#121](https://github.com/paulm981/Submarine/issues/121)) |
+| Keys typed while a shell opens, and in order ([#308](https://github.com/SinaXhpm/submarine/pull/308)) | A terminal's keys go out one write at a time and wait while its shell opens; Broadcast's keys to other servers go the same way | The same for a server's own terminal and its on-connect commands. Broadcast keeps one call for every server ([#127](https://github.com/paulm981/Submarine/issues/127)), so a server whose shell is still opening doesn't get Broadcast's keys. A Home shell's keys go straight to it, as before |
 | Website ([#229](https://github.com/SinaXhpm/submarine/pull/229)) | `website/` is published at `submarine.sinaxhpm.com` | The folder comes along with merges, unchanged, but the fork doesn't publish it: no workflow builds or deploys it |
 
 ## Changes in the original project not taken yet
 
-Every change up to [#297](https://github.com/SinaXhpm/submarine/pull/297) is taken. Where the fork takes one differently, the table above says so.
+Every change up to [#315](https://github.com/SinaXhpm/submarine/pull/315) is taken. Where the fork takes one differently, the table above says so.
 
 Not taken yet, for the next sync:
 

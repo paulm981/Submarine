@@ -10,6 +10,7 @@ import { reorderById, useTabDrag } from "../../ui/tabDrag";
 import { dockedTerminal } from "../../ui/terminalDock";
 import { findAiTools, sharedWith, useAi } from "../../util/ai";
 import { withoutPasteControls } from "../../util/pasteText";
+import { writeTerminal } from "../../util/terminalWrite";
 import { IS_ANDROID } from "../../util/platform";
 import { type AddLog, JUMP_GONE, type LogEntry, type SessionInfo, type SessionTerminal } from "./rules";
 
@@ -114,7 +115,7 @@ export const useOnConnect = ({ session, terminals, connectionEpoch, confirmRef, 
             }
             if (lines.length === 0) return;
             const bytes = Array.from(new TextEncoder().encode(lines.join('\n') + '\n'));
-            await invoke('write_terminal_data', { terminalId, data: bytes }).catch(() => {});
+            writeTerminal(terminalId, bytes);
           };
           if (!session.runOnConnectHeld) return typeThem(session.runOnConnect || "");
           // Someone this profile is shared with set or changed these

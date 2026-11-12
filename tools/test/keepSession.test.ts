@@ -4,6 +4,9 @@ import {
   firstKept, keepsSessions, keptSessionDetail, keptSessionLabel, readKeepDefault, readKeepOverride, resolveKeep,
   sortKeptSessions, writeKeepDefault, writeKeepOverride, type KeptSession,
 } from "../../src/util/keepSession";
+import {
+  forgetSessionKeep, readAutoReconnect, readSendKeepalives, writeSessionKeep, AUTO_RECONNECT_KEY, SEND_KEEPALIVES_KEY,
+} from "../../src/util/sessionKeep";
 
 const row = (over: Partial<KeptSession>): KeptSession => ({
   name: "submarine-0123abcd-1", pid: null, created: null, attached: false, ours: true, terminal: 1, ...over,
@@ -60,6 +63,33 @@ describe("whether a server keeps its sessions, on this device", () => {
   it("says what a kept session means once ever", () => {
     expect(firstKept()).toBe(true);
     expect(firstKept()).toBe(false);
+  });
+
+  // The original project's switches for keepalives and reconnecting (their
+  // #310, util/sessionKeep) are kept by sync id too, apart from these: turning
+  // reconnecting or keepalives off doesn't stop a server keeping its sessions,
+  // and forgetting a server's switches doesn't forget its choice here. A
+  // kept session then waits on the server until Reconnect is pressed.
+  it("is apart from the keepalive and reconnect switches", () => {
+    writeKeepDefault(true);
+    writeKeepOverride("u1", "always");
+    store.set(AUTO_RECONNECT_KEY, "off");
+    store.set(SEND_KEEPALIVES_KEY, "off");
+    writeSessionKeep("u2", { keepalives: "off", reconnect: "off" });
+    expect(readAutoReconnect("u1")).toBe(false);
+    expect(readSendKeepalives("u2")).toBe(false);
+    expect(keepsSessions("u1")).toBe(true);
+    expect(keepsSessions("u2")).toBe(true);
+
+    writeSessionKeep("u1", { keepalives: "on", reconnect: "on" });
+    expect(readKeepOverride("u1")).toBe("always");
+    forgetSessionKeep("u1");
+    expect(readKeepOverride("u1")).toBe("always");
+    expect(readAutoReconnect("u1")).toBe(false);
+
+    writeKeepOverride("u2", "never");
+    expect(readAutoReconnect("u2")).toBe(false);
+    expect(readSendKeepalives("u2")).toBe(false);
   });
 
   it("is off, and says nothing, where there's no storage at all", () => {

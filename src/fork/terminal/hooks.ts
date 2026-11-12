@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { MutableRefObject } from 'react';
 import type { Terminal } from '@xterm/xterm';
-import { Channel } from '@tauri-apps/api/core';
+import { Channel, invoke } from '@tauri-apps/api/core';
 import type { HighlightStream } from '../../ui/highlight';
 import { useRootInvoke } from '../../ui/rootInvoke';
 import { setLooking } from '../../ui/terminalActivity';
+import { writeTerminal } from '../../util/terminalWrite';
 import { LOCAL_COMMANDS, SHELL_FIRST_OUTPUT_MS, SHELL_READY_CAP_MS, SSH_COMMANDS } from './rules';
 import { markContainer } from './fileMenu';
 
@@ -51,6 +52,14 @@ export const useTerminal = ({
   isActiveView: boolean;
 }) => {
   const commands = local ? LOCAL_COMMANDS : SSH_COMMANDS;
+  // What's typed, on its way to the shell. An SSH shell's goes through the
+  // original project's writer (util/terminalWrite: one write at a time, in
+  // order, held while the shell opens); a shell on this computer's straight to
+  // it, as it has its own command.
+  const write = (bytes: number[]) => {
+    if (local) invoke(LOCAL_COMMANDS.write, { terminalId, data: bytes }).catch(console.error);
+    else writeTerminal(terminalId, bytes);
+  };
 
   // What draws this terminal's output (set up with its xterm, mountTerminal).
   // Each open — the first and every reconnect — passes a fresh channel to the
@@ -133,7 +142,7 @@ export const useTerminal = ({
   const onScreen = () => isActiveRef.current || shownRef.current || dockedRef.current;
 
   return {
-    sessionId, terminalId, local, attachOnly, serverId, serverName, commands, outputRef, highlightRef, outputChannel, resetHighlight,
+    sessionId, terminalId, local, attachOnly, serverId, serverName, commands, write, outputRef, highlightRef, outputChannel, resetHighlight,
     readyWatchRef, stopReadyWatch, shellReady, watchForShellReady, rootInvoke, dockElRef, dockEl, setDockEl,
     gpuUpdateRef, dockedRef, lookingNow, onScreen,
   };

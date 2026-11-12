@@ -11,10 +11,10 @@
 // a control character (it could press keys), `!` (tcsh expands it even
 // inside single quotes), or `\` (fish reads it inside them). Nor for a
 // Windows server's folder (`/C:/…`), whose shells take other commands.
-import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef } from "react";
 import { TerminalSquare } from "lucide-react";
 import { IS_ANDROID, IS_MOBILE } from "../../util/platform";
+import { writeTerminal } from "../../util/terminalWrite";
 
 /** A server tab is asked for a terminal in a folder: `{ sessionId, path }`. */
 export const TERMINAL_HERE = "submarine-terminal-here";
@@ -65,7 +65,7 @@ export const withCdHere = (terminalId: string, ready: (() => void | Promise<void
     }
     if (!line) return;
     const data = Array.from(new TextEncoder().encode(`${line}\n`));
-    await invoke("write_terminal_data", { terminalId, data }).catch(() => {});
+    writeTerminal(terminalId, data);
   };
 };
 

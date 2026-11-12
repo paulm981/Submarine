@@ -7486,6 +7486,12 @@ async fn setup_master_db_with(
     conn.execute_batch("PRAGMA secure_delete = ON;")
         .map_err(|e| format!("[DATABASE] PRAGMA_FAILED: {}", e))?;
 
+    // The VACUUM below, and any large sort or index build, can spill pages to
+    // SQLite's temporary files, which would put decrypted vault contents on
+    // disk outside the vault's encryption. Kept in memory instead.
+    conn.execute_batch("PRAGMA temp_store = MEMORY;")
+        .map_err(|e| format!("[DATABASE] PRAGMA_FAILED: {}", e))?;
+
     // secure_delete only governs deletes from here on. A vault that has been
     // in use since before this build still carries whatever its old frees
     // left behind, so purge that history once: VACUUM rebuilds the database
@@ -7753,6 +7759,14 @@ fn private_key_is_encrypted(text: &str) -> bool {
 fn check_key_algorithm(algorithm: &ssh_key::Algorithm) -> Result<(), String> {
     match algorithm {
         ssh_key::Algorithm::Ed25519 | ssh_key::Algorithm::Rsa { .. } | ssh_key::Algorithm::Ecdsa { .. } => Ok(()),
+        sk if agent_auth::is_security_key(sk) && cfg!(mobile) => Err(format!(
+            "[SSH] UNSUPPORTED_KEY_TYPE: Security keys ({}) aren't supported on phones and tablets yet.",
+            sk.as_str()
+        )),
+        sk if agent_auth::is_security_key(sk) => Err(format!(
+            "[SSH] UNSUPPORTED_KEY_TYPE: This is a security key ({}): its file can't sign here, the key itself has to. An ssh-agent that supports security keys can use it: load it with ssh-add, and leave the server's password and key empty.",
+            sk.as_str()
+        )),
         other => Err(format!("[SSH] UNSUPPORTED_KEY_TYPE: {} keys are not supported.", other.as_str())),
     }
 }
@@ -9536,6 +9550,20 @@ fn base_session_id(session_id: &str) -> &str {
     }
 }
 
+/// Which of its tab's connections this is, for the lines its session watcher
+/// adds to the tab's Activity Log; none for the tab's own connection.
+fn connection_label(session_id: &str) -> Option<&'static str> {
+    if session_id.ends_with("::sftp") {
+        Some("dedicated SFTP session")
+    } else if session_id.ends_with("::fwd") {
+        Some("dedicated port forwarding session")
+    } else if base_session_id(session_id) != session_id {
+        Some("a terminal's own login")
+    } else {
+        None
+    }
+}
+
 /// How many times in a row a server may start a keyboard-interactive round with
 /// nothing to answer before the method is given up on (a real one has a
 /// banner, or two).
@@ -10007,6 +10035,8 @@ struct SecretPromptCtx<'a> {
 /// login that works without one never touches an agent, and let go once the
 /// login is over.
 struct AgentSlot {
+    /// The device's "Use keys from an ssh-agent" setting.
+    use_agent: bool,
     looked: bool,
     agent: Option<agent_auth::AgentSession>,
     /// What `IdentityAgent` in `~/.ssh/config` says for this host, if it
@@ -10021,15 +10051,23 @@ struct AgentSlot {
 impl AgentSlot {
     /// `use_agent` is the device's "Use keys from an ssh-agent" setting. Off,
     /// the slot starts as looked-and-none, so no agent is ever contacted. With
-    /// `IdentitiesOnly yes` only the config's key files are used, as OpenSSH.
+    /// `IdentitiesOnly yes` the agent signs only for a named security key (see
+    /// `agent_allowed`).
     fn new(
         use_agent: bool,
         identity_agent: Option<ssh_config::IdentityAgent>,
         identities: ConfigIdentities,
     ) -> tokio::sync::Mutex<Self> {
-        let use_agent = use_agent && !identities.only;
-        tokio::sync::Mutex::new(Self { looked: !use_agent, agent: None, identity_agent, identities, identities_tried: false })
+        tokio::sync::Mutex::new(Self { use_agent, looked: !use_agent, agent: None, identity_agent, identities, identities_tried: false })
     }
+}
+
+/// Whether this login may offer `which` from the agent. With `IdentitiesOnly
+/// yes` only the key files ~/.ssh/config names are used, and the agent signs
+/// only for a security key among them, whose file can't. The node's own
+/// security key counts as named too, like a key given with `ssh -i`.
+fn agent_allowed(identities_only: bool, which: &agent_auth::Offer<'_>) -> bool {
+    !identities_only || matches!(which, agent_auth::Offer::Only(key) if agent_auth::is_security_key(&key.algorithm()))
 }
 
 /// The key and certificate files `~/.ssh/config` names for a host, paths
@@ -10135,7 +10173,7 @@ impl ConfigTarget {
         let certs = self.expand_paths(&c.certificate_files, "CertificateFile", user);
         let only = c.identities_only == Some(true);
         if only && !keys.is_empty() {
-            self.log.push("~/.ssh/config: IdentitiesOnly yes: only its IdentityFile keys are used, not an ssh-agent's.".into());
+            self.log.push("~/.ssh/config: IdentitiesOnly yes: only its IdentityFile keys are used, not the other keys an ssh-agent holds.".into());
         }
         ConfigIdentities { keys, certs, only }
     }
@@ -10294,7 +10332,19 @@ async fn try_agent_keys<H: russh::client::Handler>(
             return Ok(Some(outcome));
         }
     }
-    if !agent_available(ctx).await {
+    offer_agent_keys(session, user, which, already_offered, ctx).await
+}
+
+/// The agent's part of `try_agent_keys`, without the key files.
+async fn offer_agent_keys<H: russh::client::Handler>(
+    session: &mut russh::client::Handle<H>,
+    user: &str,
+    which: agent_auth::Offer<'_>,
+    already_offered: Option<&russh::keys::PublicKey>,
+    ctx: &SecretPromptCtx<'_>,
+) -> Result<Option<agent_auth::AgentOutcome>, russh::Error> {
+    let identities_only = ctx.agent.lock().await.identities.only;
+    if !agent_allowed(identities_only, &which) || !agent_available(ctx).await {
         return Ok(None);
     }
     let mut slot = ctx.agent.lock().await;
@@ -10322,6 +10372,10 @@ async fn device_keys_available(ctx: &SecretPromptCtx<'_>) -> bool {
         let slot = ctx.agent.lock().await;
         if !slot.identities_tried && !slot.identities.keys.is_empty() {
             return true;
+        }
+        // IdentitiesOnly yes: no agent key but one those files name.
+        if slot.identities.only {
+            return false;
         }
     }
     agent_available(ctx).await
@@ -10430,8 +10484,24 @@ async fn try_config_identities<H: russh::client::Handler>(
                 continue;
             }
         };
+        // A security key's file holds only a handle, and signing with it would
+        // end the session: the agent's copy of the key is offered in its place.
+        // Looked for before decoding, so no passphrase is asked for it, and
+        // after, for a file only the decoder reads.
+        if let Some(public) = agent_auth::security_key_file(&text) {
+            if let Some(found) = security_key_from_agent(session, user, &format!("IdentityFile {path}"), &public, ctx).await? {
+                return Ok(Some(found));
+            }
+            continue;
+        }
         let Some(key) = decode_identity_file(&text, &path, ctx).await else { continue };
         let public = key.public_key().clone();
+        if agent_auth::is_security_key(&public.algorithm()) {
+            if let Some(found) = security_key_from_agent(session, user, &format!("IdentityFile {path}"), &public, ctx).await? {
+                return Ok(Some(found));
+            }
+            continue;
+        }
         let key = std::sync::Arc::new(key);
         let mut with_certs: Vec<(String, russh::keys::Certificate)> =
             named_certs.iter().filter(|(_, c)| c.public_key() == public.key_data()).cloned().collect();
@@ -10477,6 +10547,44 @@ async fn try_config_identities<H: russh::client::Handler>(
     Ok(Some(outcome))
 }
 
+/// Log in with an ssh-agent's copy of a security key. Its file (`what`: an
+/// IdentityFile, or the node's own key) holds only a handle, and signing with
+/// it would end the session. `Ok(Some(_))` once logged in or the server wants
+/// another factor; `Ok(None)` otherwise, with why logged when no agent here
+/// can sign for it.
+async fn security_key_from_agent<H: russh::client::Handler>(
+    session: &mut russh::client::Handle<H>,
+    user: &str,
+    what: &str,
+    key: &russh::keys::PublicKey,
+    ctx: &SecretPromptCtx<'_>,
+) -> Result<Option<agent_auth::AgentOutcome>, russh::Error> {
+    use agent_auth::AgentOutcome;
+    let use_agent = ctx.agent.lock().await.use_agent;
+    let why = if !use_agent {
+        "keys from an ssh-agent are turned off in Settings".to_string()
+    } else if !agent_available(ctx).await {
+        "no ssh-agent with keys is available".to_string()
+    } else {
+        let (source, held, offered) = match ctx.agent.lock().await.agent.as_ref() {
+            Some(agent) => (agent.source, agent.holds(key), agent.was_offered(key)),
+            None => return Ok(None),
+        };
+        // Tried on this connection already (named twice, say).
+        if offered {
+            return Ok(None);
+        }
+        if held {
+            ctx.log(&format!("{what} is a security key, whose file can't sign here: trying it through {source}..."), "info");
+            let outcome = offer_agent_keys(session, user, agent_auth::Offer::Only(key), None, ctx).await?;
+            return Ok(outcome.filter(|o| matches!(o, AgentOutcome::Authenticated | AgentOutcome::PartialSuccess { .. })));
+        }
+        format!("{source} doesn't hold it (load it with ssh-add)")
+    };
+    ctx.log(&format!("{what} is a security key, whose file can't sign here; it isn't used: {why}."), "info");
+    Ok(None)
+}
+
 /// The agent's keys not offered yet, after the node's own credentials didn't
 /// log in. `Ok(true)` once logged in; a partial success leaves the second
 /// factor to the keyboard-interactive fallback, as with the node's own key.
@@ -10490,6 +10598,22 @@ async fn agent_keys_after<H: russh::client::Handler>(
         try_agent_keys(session, user, agent_auth::Offer::Rest, already_offered, ctx).await?,
         Some(agent_auth::AgentOutcome::Authenticated)
     ))
+}
+
+/// The node's own key is a security key, whose file can't sign: the agent's
+/// copy of it is offered, then the other keys this login may try. `Ok(true)`
+/// once logged in; a partial success leaves the second factor to the
+/// keyboard-interactive fallback.
+async fn node_security_key<H: russh::client::Handler>(
+    session: &mut russh::client::Handle<H>,
+    user: &str,
+    key: &russh::keys::PublicKey,
+    ctx: &SecretPromptCtx<'_>,
+) -> Result<bool, russh::Error> {
+    match security_key_from_agent(session, user, "This key", key, ctx).await? {
+        Some(outcome) => Ok(matches!(outcome, agent_auth::AgentOutcome::Authenticated)),
+        None => agent_keys_after(session, user, None, ctx).await,
+    }
 }
 
 /// Let the ssh-agent go once the login is over.
@@ -10837,6 +10961,11 @@ async fn authenticate_key_prompting<H: russh::client::Handler>(
     slot: SecretSlot,
     ctx: &SecretPromptCtx<'_>,
 ) -> Result<bool, russh::Error> {
+    // A security key's file can't sign, and trying would end the session: an
+    // ssh-agent's copy of the key is tried instead, with no passphrase asked.
+    if let Some(public) = agent_auth::security_key_file(private_key) {
+        return node_security_key(session, user, &public, ctx).await;
+    }
     let cached = cache_get_secret(ctx.cache, ctx.base, slot).await;
     let mut candidates = secret_candidates(None, cached, saved_passphrase).into_iter();
     let mut attempt = candidates.next();
@@ -10854,6 +10983,10 @@ async fn authenticate_key_prompting<H: russh::client::Handler>(
                     }
                 }
                 let own_key = keypair.public_key().clone();
+                // The same for one only the decoder reads (see try_config_identities).
+                if agent_auth::is_security_key(&own_key.algorithm()) {
+                    return node_security_key(session, user, &own_key, ctx).await;
+                }
                 return match ssh_manager::authenticate_with_key_result(session, user, keypair).await? {
                     russh::client::AuthResult::Success => Ok(true),
                     // The node's key was turned down. If the server still
@@ -11095,6 +11228,22 @@ mod key_format_tests {
         assert!(!AgentSlot::new(true, None, ConfigIdentities::default()).try_lock().unwrap().looked);
     }
 
+    // IdentitiesOnly yes keeps the agent's keys out, but not its copy of a
+    // security key that's named: that key's file can't sign.
+    #[test]
+    fn identities_only_lets_the_agent_sign_only_for_a_named_security_key() {
+        use ssh_key::private::{Ed25519Keypair, Ed25519PrivateKey};
+        let only = ConfigIdentities { keys: vec!["id_ed25519_sk".into()], certs: Vec::new(), only: true };
+        assert!(!AgentSlot::new(true, None, only).try_lock().unwrap().looked);
+        let plain = Ed25519Keypair::from(Ed25519PrivateKey::from_bytes(&[3; 32])).public;
+        let named = ssh_key::PublicKey::new(ssh_key::public::KeyData::SkEd25519(ssh_key::public::SkEd25519::new(plain, "ssh:")), "");
+        let plain = ssh_key::PublicKey::new(ssh_key::public::KeyData::Ed25519(plain), "");
+        assert!(agent_allowed(true, &agent_auth::Offer::Only(&named)));
+        assert!(!agent_allowed(true, &agent_auth::Offer::Only(&plain)));
+        assert!(!agent_allowed(true, &agent_auth::Offer::Rest));
+        assert!(agent_allowed(false, &agent_auth::Offer::Only(&plain)) && agent_allowed(false, &agent_auth::Offer::Rest));
+    }
+
     fn host_config(f: impl FnOnce(&mut ssh_config::HostConfig)) -> Option<ssh_config::HostConfig> {
         let mut c = ssh_config::HostConfig::default();
         f(&mut c);
@@ -11229,6 +11378,38 @@ mod key_format_tests {
     fn a_passphrase_saved_with_an_unencrypted_pem_key_is_ignored() {
         assert_eq!(public_of(&decoded(P521_PKCS8, Some("stray"))), P521_PUBLIC);
         assert_eq!(public_of(&decoded(P521_SEC1, Some("stray"))), P521_PUBLIC);
+    }
+
+    #[test]
+    fn a_security_key_is_refused_with_the_way_to_use_it() {
+        for algorithm in [ssh_key::Algorithm::SkEd25519, ssh_key::Algorithm::SkEcdsaSha2NistP256] {
+            assert!(agent_auth::is_security_key(&algorithm));
+            let err = check_key_algorithm(&algorithm).unwrap_err();
+            assert!(err.starts_with("[SSH] UNSUPPORTED_KEY_TYPE:") && err.contains("ssh-add"), "{err}");
+            assert!(err.contains("that supports security keys") && !err.contains("this server"), "{err}");
+        }
+        assert!(!agent_auth::is_security_key(&ssh_key::Algorithm::Ed25519));
+        assert_eq!(check_key_algorithm(&ssh_key::Algorithm::Ed25519), Ok(()));
+    }
+
+    // A line after the END line: the check made before decoding (the stricter
+    // reader) misses the security key, the decoder reads it. So the connect
+    // path checks the decoded key as well.
+    #[test]
+    fn a_security_key_file_only_the_decoder_reads_is_known_once_decoded() {
+        use ssh_key::private::{Ed25519Keypair, Ed25519PrivateKey, KeypairData, SkEd25519};
+        let public = Ed25519Keypair::from(Ed25519PrivateKey::from_bytes(&[4; 32])).public;
+        let keypair = SkEd25519::new(ssh_key::public::SkEd25519::new(public, "ssh:"), 0x01, vec![4u8; 16]).unwrap();
+        let file = ssh_key::PrivateKey::new(KeypairData::SkEd25519(keypair), "")
+            .unwrap()
+            .to_openssh(ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string();
+        assert!(agent_auth::security_key_file(&file).is_some());
+        let edited = format!("{file}a note\n");
+        assert!(agent_auth::security_key_file(&edited).is_none());
+        let Ok(decoded) = decode_private_key(&edited, None) else { panic!("the decoder reads it") };
+        assert!(agent_auth::is_security_key(&decoded.algorithm()));
     }
 
     #[test]
@@ -11606,6 +11787,15 @@ mod secret_prompt_tests {
         assert_eq!(base_session_id("tab-1::term-"), "tab-1::term-");
         // Anything else is left intact.
         assert_eq!(base_session_id("tab-1::other"), "tab-1::other");
+    }
+
+    #[test]
+    fn connection_label_names_the_tabs_other_connections() {
+        assert_eq!(connection_label("tab-1"), None);
+        assert_eq!(connection_label("tab-1::sftp"), Some("dedicated SFTP session"));
+        assert_eq!(connection_label("tab-1::fwd"), Some("dedicated port forwarding session"));
+        assert_eq!(connection_label("tab-1::term-tab-1-term-1729000000000"), Some("a terminal's own login"));
+        assert_eq!(connection_label("tab-1::other"), None);
     }
 
     // --- candidate order --------------------------------------------------
@@ -12183,7 +12373,9 @@ fn build_ssh_client_config() -> russh::client::Config {
     // the session watcher pings every 30s (60s on the dedicated `::sftp` /
     // `::fwd` connections) end to end — well inside the ~2-minute idle limit of
     // consumer NAT and most firewalls — and OS TCP keepalive (see
-    // apply_tcp_keepalive) probes the first hop after 30s of silence.
+    // apply_tcp_keepalive) probes the first hop after 30s of silence. For an
+    // SSH session, both only while "Send keepalives" is on (see
+    // `initiate_connection`).
     config.keepalive_interval = None;
     // russh closes the connection after `keepalive_max` unanswered keepalives
     // (default 3, i.e. ~80s of server silence). Kept OFF: liveness is decided
@@ -12967,6 +13159,8 @@ struct HopCtx<'a> {
     // refusal, a dropped handshake), so the caller reports a failure worth
     // retrying. Not for a host key, a login or a setting, which waiting won't fix.
     network_failed: &'a std::sync::atomic::AtomicBool,
+    // The connection's "Send keepalives" setting, for the sockets to its hops.
+    tcp_keepalive: bool,
     // The target session's connect attempt; the hops' prompts belong to it.
     attempt: &'a ssh_manager::ConnectAttempt,
     session_id: &'a str,
@@ -13276,7 +13470,7 @@ fn reach_hop<'a>(
                 let tcp = match tokio::time::timeout(Duration::from_secs(10), tokio::net::TcpStream::connect((host.as_str(), port))).await {
                     Ok(Ok(s)) => {
                         let _ = s.set_nodelay(true);
-                        apply_tcp_keepalive(&s);
+                        if ctx.tcp_keepalive { apply_tcp_keepalive(&s); }
                         s
                     }
                     Ok(Err(e)) => {
@@ -13348,6 +13542,7 @@ async fn login_hop(
         attempt: ctx.attempt.clone(),
         // The watcher probes the session, not the bastion hop.
         last_heard: ssh_manager::LastHeard::default(),
+        server_goodbye: ssh_manager::ServerGoodbye::default(),
         host_trust: host_trust.map(std::sync::Arc::new),
         host_key_refusal: std::sync::Arc::clone(&host_key_refusal),
     };
@@ -13572,11 +13767,12 @@ const AGENT_DID_NOT_SIGN: &str =
 
 /// Fully tear down ONE connection map-entry by its exact key. Used to reap the
 /// dedicated `::sftp` / `::fwd` secondary connections the separate-sessions
-/// feature spins up, so disconnecting or reconnecting the PRIMARY never orphans
-/// them (a leaked secondary would hold a live TCP + SSH session forever). Safe
-/// to call on a key that doesn't exist — every step is then a no-op. Bumps the
-/// key's generation so the secondary's own health watcher observes the change on
-/// its next tick and bows out WITHOUT emitting a `session-disconnected-{key}`.
+/// feature spins up, so disconnecting, reconnecting or losing the PRIMARY never
+/// orphans them (a leaked secondary would hold a live TCP + SSH session
+/// forever). Safe to call on a key that doesn't exist — every step is then a
+/// no-op. Bumps the key's generation so the secondary's own health watcher
+/// observes the change on its next tick and bows out WITHOUT emitting a
+/// `session-disconnected-{key}`.
 async fn teardown_connection_key(state: &SshState, mirrors: &MirrorMap, key: &str) {
     // Bump the generation FIRST — before removing the connection — so a connect
     // worker for this key that's still handshaking observes the newer value at
@@ -13631,6 +13827,13 @@ async fn initiate_connection(
     // frontend says otherwise). Off, no agent is contacted for this
     // connection or its jump host.
     use_ssh_agent: Option<bool>,
+    // The "Send keepalives" setting (on unless the frontend says otherwise). Off,
+    // this connection starts no traffic of its own while idle, and an idle timeout
+    // can do its work. It still answers the server's keepalives and notices a
+    // connection that closes. Two exceptions: russh's key exchange once an hour,
+    // and a saved remote (R) forward the server refused, which the watcher asks
+    // for again every minute (its tunnel retry).
+    send_keepalives: Option<bool>,
 ) -> Result<(), String> {
     use tauri::Emitter;
     use tokio::time::Duration;
@@ -13639,6 +13842,7 @@ async fn initiate_connection(
     use tokio::sync::Mutex;
 
     let use_agent = use_ssh_agent.unwrap_or(true);
+    let keepalives = send_keepalives.unwrap_or(true);
 
     // Connection role + topology flags. Kept as plain locals so the whole
     // function (worker included) can branch on them without re-parsing.
@@ -13998,6 +14202,7 @@ async fn initiate_connection(
     // Stamped by the handler whenever the server sends something; read by the
     // session watcher below.
     let last_heard = ssh_manager::LastHeard::default();
+    let server_goodbye = ssh_manager::ServerGoodbye::default();
 
     // Built here, while the database handle is still ours: the handshake
     // asks this host for the kinds of host key on file for it first.
@@ -14024,6 +14229,7 @@ async fn initiate_connection(
         prompt_allowed: !is_secondary,
         attempt: attempt.clone(),
         last_heard: last_heard.clone(),
+        server_goodbye: server_goodbye.clone(),
         host_trust: host_trust.map(Arc::new),
         host_key_refusal,
     };
@@ -14155,6 +14361,7 @@ async fn initiate_connection(
             allow_prompt: allow_kbi,
             auth_failed: &jump_auth_failed,
             network_failed: &jump_network_failed,
+            tcp_keepalive: keepalives,
             attempt: &attempt,
             session_id: &session_id_clone,
             use_agent,
@@ -14243,7 +14450,7 @@ async fn initiate_connection(
                         emit_log("SOCKS5 Proxy tunnel established successfully.", "success");
                         // Socks5Stream derefs to the inner TcpStream, so the
                         // kernel keepalive applies to the real proxy socket.
-                        apply_tcp_keepalive(&stream);
+                        if keepalives { apply_tcp_keepalive(&stream); }
                         Ok(Box::new(stream))
                     }
                     Ok(Err(e)) => {
@@ -14279,7 +14486,7 @@ async fn initiate_connection(
                         // round-trip latency. Ignore failures — set_nodelay is
                         // best-effort; some platforms / virtual NICs reject it.
                         let _ = tcp_stream.set_nodelay(true);
-                        apply_tcp_keepalive(&tcp_stream);
+                        if keepalives { apply_tcp_keepalive(&tcp_stream); }
                         if !http_connect_host_ok(&host) {
                             let err_msg = format!("'{}' can't be asked of an HTTP proxy: a host has no spaces or control characters.", host.escape_debug());
                             emit_log(&format!("Error: {}", err_msg), "error");
@@ -14322,7 +14529,7 @@ async fn initiate_connection(
                         // See HTTP-proxy branch — SSH wants every packet on the
                         // wire immediately, no Nagle batching.
                         let _ = stream.set_nodelay(true);
-                        apply_tcp_keepalive(&stream);
+                        if keepalives { apply_tcp_keepalive(&stream); }
                         emit_log("Direct TCP Connection established successfully.", "success");
                         Ok(Box::new(stream))
                     }
@@ -14748,6 +14955,8 @@ async fn initiate_connection(
                         let state_specs_w = Arc::clone(&state_session_tunnel_specs);
                         let targets_w = Arc::clone(&session_forwarded_targets);
                         let last_heard_w = last_heard.clone();
+                        let server_goodbye_w = server_goodbye.clone();
+                        let attempt_w = attempt.clone();
                         let my_gen = connect_generation;
                         tauri::async_runtime::spawn(async move {
                             // Two-tier liveness check:
@@ -14791,6 +15000,26 @@ async fn initiate_connection(
                             // Set once this server has left a keepalive unanswered but answered
                             // a channel open: probe it that way from then on.
                             let mut ping_unanswered = false;
+                            // Why it was given up on, when it wasn't simply closed.
+                            let mut went_quiet = false;
+                            // For the Activity Log: without these a report of a
+                            // connection that keeps dropping can't be read. They
+                            // go to the tab, from its other connections too
+                            // (`via` names which one, `closed` marks its drop).
+                            // Not once a newer attempt (or a disconnect) has
+                            // replaced this one: they'd read as the newer one's.
+                            let log_event = format!("session-log-{}", base_session_id(&sid_w));
+                            let via = connection_label(&sid_w);
+                            let tell = |msg: &str, closed: bool| {
+                                if !attempt_w.is_current_now() {
+                                    return;
+                                }
+                                let _ = app_w.emit(
+                                    &log_event,
+                                    serde_json::json!({ "msg": msg, "type": "warn", "activity": true, "closed": closed, "via": via }),
+                                );
+                            };
+                            let say = |msg: &str| tell(msg, false);
                             loop {
                                 tokio::time::sleep(Duration::from_secs(2)).await;
                                 tick = tick.wrapping_add(1);
@@ -14823,7 +15052,7 @@ async fn initiate_connection(
 
                                 let mut dead = is_closed;
 
-                                if !dead && tick.is_multiple_of(probe_every) {
+                                if !dead && keepalives && tick.is_multiple_of(probe_every) {
                                     // Active probe: a round trip on the
                                     // shared handle (read-locked), so commands
                                     // and tunnels open their own channels
@@ -14831,7 +15060,7 @@ async fn initiate_connection(
                                     // that a congested-but-alive link doesn't
                                     // strike out spuriously.
                                     let asked_at = ssh_manager::LastHeard::now();
-                                    let alive = {
+                                    let (alive, closed) = {
                                         let h = handle_arc.read().await;
                                         let answered = if ping_unanswered {
                                             probe_with_channel(&h).await
@@ -14870,6 +15099,7 @@ async fn initiate_connection(
                                                     let up = probe_with_channel(&h).await;
                                                     if up {
                                                         ping_unanswered = true;
+                                                        say("This server doesn't answer SSH keepalives. Checking on it by opening a channel from now on.");
                                                     }
                                                     up
                                                 }
@@ -14879,15 +15109,25 @@ async fn initiate_connection(
                                         // timed out: anything the server sent
                                         // while we waited proves it's alive,
                                         // as long as the connection is open.
-                                        answered || (last_heard_w.heard_since(asked_at) && !h.is_closed())
+                                        let closed = h.is_closed();
+                                        (answered || (last_heard_w.heard_since(asked_at) && !closed), closed)
                                     };
                                     if alive {
                                         probe_strikes = 0;
+                                    } else if closed {
+                                        // Not left unanswered: the connection
+                                        // closed while the probe waited (a
+                                        // device that drops it on a keepalive,
+                                        // #299). There's no asking again.
+                                        say("The connection closed while waiting for an answer to a keepalive.");
+                                        dead = true;
                                     } else {
                                         probe_strikes += 1;
                                         if probe_strikes >= 2 {
                                             dead = true;
+                                            went_quiet = true;
                                         } else {
+                                            say("No answer to a keepalive. Asking once more.");
                                             // One strike: re-probe on the
                                             // next 2s tick instead of a
                                             // full interval away, so a
@@ -14911,7 +15151,9 @@ async fn initiate_connection(
                                 // transports have their own migration/restore paths,
                                 // and the primary handle is the correct transport for
                                 // the default (shared) topology. Spawned so a slow
-                                // bind retry never delays death detection.
+                                // bind retry never delays death detection. An R
+                                // rule's retry is a request to the server, so it is
+                                // traffic even with keepalives off.
                                 if !dead && tick.is_multiple_of(30) && !sid_w.contains("::") {
                                     let specs = state_specs_w.lock().await.get(&sid_w).cloned().unwrap_or_default();
                                     if specs.iter().any(|spec| !spec.stopped) {
@@ -14996,10 +15238,37 @@ async fn initiate_connection(
                                     // this dead handle and hammers upload-fail on every future
                                     // FS event until the app is quit.
                                     mirror::stop_all_for_session(&state_mirrors_w, &sid_w).await;
+                                    // The tab's dedicated `::sftp` / `::fwd`
+                                    // connections go with it: nothing rides
+                                    // them while it's down, and no reconnect
+                                    // may come to reap them (reconnecting off,
+                                    // or cancelled). Their watchers bow out
+                                    // without a word. Not if a newer attempt
+                                    // has started meanwhile: that one reaps
+                                    // them, and may have opened new ones.
+                                    if !sid_w.contains("::") && attempt_w.is_current().await {
+                                        let ssh = app_w.state::<SshState>();
+                                        teardown_connection_key(ssh.inner(), &state_mirrors_w, &format!("{sid_w}::sftp")).await;
+                                        teardown_connection_key(ssh.inner(), &state_mirrors_w, &format!("{sid_w}::fwd")).await;
+                                    }
+                                    let reason = match server_goodbye_w.take() {
+                                        Some(said) if !said.is_empty() => format!("The server closed the connection: {said}"),
+                                        Some(_) => "The server closed the connection".to_string(),
+                                        None if went_quiet => "No answer to two keepalives in a row".to_string(),
+                                        None => "Connection lost".to_string(),
+                                    };
+                                    // Another of the tab's connections: the tab
+                                    // only resets a dot or writes a line in a
+                                    // terminal for it, so the reason goes to its
+                                    // Activity Log here. The tab logs its own
+                                    // connection's when it hears the event below.
+                                    if via.is_some() {
+                                        tell(&reason, true);
+                                    }
                                     let _ = app_w.emit(
                                         &format!("session-disconnected-{}", sid_w),
                                         serde_json::json!({
-                                            "reason": "Connection lost"
+                                            "reason": reason
                                         }),
                                     );
                                     break;
@@ -16315,6 +16584,7 @@ async fn initiate_rdp(
                     allow_prompt: true,
                     auth_failed: &auth_failed,
                     network_failed: &network_failed,
+                    tcp_keepalive: true,
                     attempt: &attempt,
                     session_id: &session_id,
                     use_agent,
@@ -16784,6 +17054,7 @@ async fn rdp_builtin_open(
                     allow_prompt: true,
                     auth_failed: &auth_failed,
                     network_failed: &network_failed,
+                    tcp_keepalive: true,
                     attempt: &attempt,
                     session_id: &session_id,
                     use_agent,
@@ -17364,6 +17635,7 @@ async fn telnet_connect(
                     allow_prompt: true,
                     auth_failed: &auth_failed,
                     network_failed: &network_failed,
+                    tcp_keepalive: true,
                     attempt: &attempt,
                     session_id: &session_id,
                     use_agent,
@@ -17605,6 +17877,7 @@ async fn vnc_open(
                     allow_prompt: true,
                     auth_failed: &auth_failed,
                     network_failed: &network_failed,
+                    tcp_keepalive: true,
                     attempt: &attempt,
                     session_id: &session_id,
                     use_agent,
