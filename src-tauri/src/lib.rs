@@ -25610,7 +25610,10 @@ pub fn run() {
             local_term::set_webview_env("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
             own_render_env.push("WEBKIT_DISABLE_COMPOSITING_MODE");
         }
-        if std::env::var_os("GDK_BACKEND").is_none() {
+        // Not in a Flatpak: its runtime has no mismatched library to avoid, and
+        // on a Wayland desktop a Flatpak gets no X11 at all (--socket=fallback-x11),
+        // so GTK couldn't start.
+        if std::env::var_os("GDK_BACKEND").is_none() && !about::in_flatpak() {
             local_term::set_webview_env("GDK_BACKEND", "x11");
             own_render_env.push("GDK_BACKEND");
         }

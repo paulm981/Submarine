@@ -1171,7 +1171,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
         {/* GitHub, the update check and the running version side by side,
             with live "new version" / "new changes" notices underneath when
             there are any (the check steps aside then — the notices say it
-            all). */}
+            all). A copy its store updates (Flatpak) has no check. */}
         <footer className="mt-4 flex flex-col items-center gap-2.5">
           <div aria-live="polite" className="flex flex-wrap items-center justify-center gap-1 text-[11.5px]">
             <FooterButton onClick={openRepo} title={t("Open Submarine on GitHub")} icon={<Github size={12} />} label="GitHub" />
