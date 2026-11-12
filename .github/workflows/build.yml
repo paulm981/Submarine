@@ -330,6 +330,20 @@ jobs:
               sudo -u b makepkg -f --noconfirm --skipinteg --nodeps
             '
 
+      # macOS: zip the .app bundle so a user can download a single file
+      # and just double-click. No DMG drag-to-Applications dance.
+      - name: Zip macOS .app
+        if: startsWith(matrix.os_name, 'macos')
+        run: |
+          APP_DIR="src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos"
+          cd "$APP_DIR"
+          # The .app folder is named after productName ("Submarine").
+          # Wrap it in a versioned zip for the release asset name.
+          ARCH="${{ matrix.os_name }}"
+          ZIP_NAME="Submarine-v${{ env.VERSION }}-${ARCH}.app.zip"
+          ditto -c -k --sequesterRsrc --keepParent "Submarine.app" "$ZIP_NAME"
+          echo "MAC_ZIP=$APP_DIR/$ZIP_NAME" >> $GITHUB_ENV
+
       # Collect every artifact this job produced into one folder for upload.
       - name: Stage artifacts (Windows)
         if: matrix.os_name == 'windows'
@@ -356,6 +370,14 @@ jobs:
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = Join-Path (Resolve-Path artifacts).Path "Submarine-v${{ env.VERSION }}-windows-x64-portable.zip"
           [System.IO.Compression.ZipFile]::CreateFromDirectory($stage.FullName, $zip)
+
+      - name: Stage artifacts (macOS)
+        if: startsWith(matrix.os_name, 'macos')
+        run: |
+          mkdir -p artifacts
+          cp "$MAC_ZIP" artifacts/
+          find "src-tauri/target/${{ matrix.rust_target }}/release/bundle/dmg" -name "*.dmg" -exec cp {} artifacts/ \;
+          ls -la artifacts/
 
       - name: Stage artifacts (Linux)
         if: matrix.os_name == 'linux-x64'
