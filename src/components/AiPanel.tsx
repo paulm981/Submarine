@@ -1,7 +1,7 @@
 import { ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Bot, Check, ChevronDown, ChevronRight, Loader2, ShieldAlert, Square, X, Zap } from "lucide-react";
-import { AiDone, AiPending, AiRunning, AiServerAsk, AiSnapshot, cardsOf, openServerTab, copyCard, followLimit, followSoFar, runnerWarning, STEERED_BY_OUTPUT } from "../util/ai";
+import { AiDone, AiPending, AiRunning, AiServerAsk, AiServerCandidate, AiSnapshot, cardsOf, openServerTab, pickFrom, serverTarget, copyCard, followLimit, followSoFar, runnerWarning, STEERED_BY_OUTPUT } from "../util/ai";
 import { formatBytes } from "../fork/bulk/plan";
 import { HIDDEN_CONTROLS } from "../util/fileName";
 import { WILDCARD_WARNING } from "./AiTrust";
@@ -135,9 +135,14 @@ const useSettledClicks = (ref: React.RefObject<HTMLDivElement>) => {
   return { down, accept };
 };
 
+const HEARS_THE_SAME = "The AI hears the same as when you say no to a server you have, so it can't learn which names you have.";
+
 /// The AI asking for a server by name (#32): Share opens its tab, if it
 /// isn't open, and shares it once it's connected; Don't share, or Dismiss
 /// where no saved server has the name, tells the AI the same either way.
+/// Where several saved servers have the name (#230), it lists them, those
+/// open now first, and you share the one you mean: one open now is shared
+/// from its tab at once. Nothing is shared without a click.
 /// Its buttons take the same deliberate click as a request's.
 export const ServerAskCard = ({ a, act }: { a: AiServerAsk; act: (cmd: string, args: Record<string, unknown>) => void }) => {
   const ref = useRef<HTMLDivElement>(null);
@@ -148,7 +153,22 @@ export const ServerAskCard = ({ a, act }: { a: AiServerAsk; act: (cmd: string, a
     openServerTab(a.server_id!);
     act("ai_answer_server_ask", { id: a.id, share: true });
   };
+  // One of several: Rust takes only one this request found.
+  const pick = (c: AiServerCandidate) => {
+    if (a.connecting) return;
+    // Its tab is up already: shared from it, not opened again.
+    if (!c.open) openServerTab(c.id);
+    act("ai_answer_server_ask", { id: a.id, share: true, serverId: c.id });
+  };
+  const choosing = a.many && !found && !a.connecting;
+  const list = pickFrom(a);
   const button = "flex-1 h-8 rounded-lg text-[11px] font-bold uppercase tracking-wider flex items-center justify-center gap-1.5";
+  const where = (c: AiServerCandidate) => (
+    <span className="min-w-0 flex-1 truncate text-[11px]">
+      {c.folder && <span className="text-zinc-500">{showPlainly(c.folder)} · </span>}
+      <span className="font-mono text-zinc-200">{showPlainly(serverTarget(c))}</span>
+    </span>
+  );
   return (
     <div ref={ref} className="mx-3 my-2 p-3 rounded-xl border border-primary/30 bg-primary/[0.04] space-y-2">
       <p className="text-[12px] text-zinc-200 leading-snug">
@@ -165,10 +185,37 @@ export const ServerAskCard = ({ a, act }: { a: AiServerAsk; act: (cmd: string, a
             ? "It's shared once its tab is connected. Don't share, or Stop, before then, and it isn't."
             : "Its tab opens if it isn't open, and once it's connected the AI can ask to run commands there, under its own approval level."
           : a.many
-            ? "More than one saved server has that name. Share the one you mean from its tab."
+            ? <>More than one saved server is named <span className="font-mono text-zinc-200">{showPlainly(a.asked)}</span>. Share the one you mean:</>
             : "No saved server has that name."}
-        {!found && " The AI hears the same as when you say no to a server you have, so it can't learn which names you have."}
+        {!found && !a.many && ` ${HEARS_THE_SAME}`}
       </p>
+      {choosing && (
+        <div className="space-y-1.5">
+          {list.open.map((c) => (
+            <div key={c.id} className="p-2 rounded-lg border border-primary/40 bg-primary/[0.08] space-y-1.5">
+              <div className="flex">{where(c)}</div>
+              <NoFocusButton onPick={() => pick(c)} onDown={down} accept={accept}
+                className={`${button} w-full bg-primary text-zinc-950 hover:bg-primary/85`}>
+                <Check size={13} /> Use this one (open now)
+              </NoFocusButton>
+            </div>
+          ))}
+          {list.open.length > 0 && list.others.length > 0 && (
+            <p className="pt-1 text-[10px] uppercase tracking-wider text-zinc-500">Other saved servers with this name</p>
+          )}
+          {list.others.map((c) => (
+            <div key={c.id} className="flex items-center gap-2">
+              {where(c)}
+              <NoFocusButton onPick={() => pick(c)} onDown={down} accept={accept}
+                className="shrink-0 h-7 px-2.5 rounded-lg text-[10px] font-bold uppercase tracking-wider flex items-center gap-1 bg-primary/15 border border-primary/40 text-primary hover:bg-primary hover:text-zinc-950">
+                <Check size={12} /> Share
+              </NoFocusButton>
+            </div>
+          ))}
+          {list.unlisted && <p className="text-[11px] text-zinc-400 leading-snug">{list.unlisted}</p>}
+        </div>
+      )}
+      {!found && a.many && <p className="text-[11px] text-zinc-400 leading-snug">{HEARS_THE_SAME}</p>}
       <div className="flex gap-2">
         {found && !a.connecting && (
           <NoFocusButton onPick={share} onDown={down} accept={accept}
@@ -178,7 +225,7 @@ export const ServerAskCard = ({ a, act }: { a: AiServerAsk; act: (cmd: string, a
         )}
         <NoFocusButton onPick={() => act("ai_answer_server_ask", { id: a.id, share: false })} onDown={down} accept={accept}
           className={`${button} bg-zinc-900 border border-white/10 text-zinc-300 hover:border-red-400/50 hover:text-red-300`}>
-          <X size={13} /> {found ? "Don't share" : "Dismiss"}
+          <X size={13} /> {found || a.many ? "Don't share" : "Dismiss"}
         </NoFocusButton>
       </div>
     </div>

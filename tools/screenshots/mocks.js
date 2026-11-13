@@ -55,10 +55,21 @@ const aiState = {
   audit_log: "ai-audit.log",
   tabs: [{ id: "ai-1", label: "Claude Code", servers: [aiServer(byId(1)), aiServer(byId(2)), aiServer(byId(3))], intruder_at: null }],
   // The AI asking for a server by name (ai-server-ask.png): with
-  // `mock-server-ask` in localStorage.
-  server_asks: localStorage.getItem("mock-server-ask")
-    ? [{ id: 21, tab_id: "ai-1", tab_label: "Claude Code", asked: "staging-api", server_id: 5, server_name: "staging-api", many: false, asked_at: ago(0) }]
-    : [],
+  // `mock-server-ask` in localStorage; "many" for a name several saved
+  // servers have (ai-server-ask-many.png, #230), one of them open now.
+  server_asks: localStorage.getItem("mock-server-ask") === "many"
+    ? [{
+      id: 22, tab_id: "ai-1", tab_label: "Claude Code", asked: "api", server_id: null, server_name: null, many: true, asked_at: ago(0),
+      candidates: [
+        { id: 61, name: "api", folder: "Production / EU", user: "deploy", host: "192.0.2.31", port: 22, open: true },
+        { id: 62, name: "api", folder: "Production / US", user: "deploy", host: "198.51.100.31", port: 22, open: false },
+        { id: 63, name: "api", folder: "Staging", user: "ops", host: "203.0.113.31", port: 2222, open: false },
+      ],
+      more: 0,
+    }]
+    : localStorage.getItem("mock-server-ask")
+      ? [{ id: 21, tab_id: "ai-1", tab_label: "Claude Code", asked: "staging-api", server_id: 5, server_name: "staging-api", many: false, asked_at: ago(0) }]
+      : [],
   pending: [
     pending(11, byId(1), { command: groupCmd, group }),
     pending(12, byId(2), { command: groupCmd, group }),

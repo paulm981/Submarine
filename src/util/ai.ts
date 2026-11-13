@@ -168,9 +168,38 @@ export interface AiDone {
 export interface AiServerAsk {
   id: number; tab_id: string; tab_label: string; asked: string;
   server_id: number | null; server_name: string | null; many: boolean; asked_at: string;
+  /// More than one has the name (#230): those listed, open now first, and
+  /// how many more there are. Only the card has them, never the AI.
+  candidates?: AiServerCandidate[]; more?: number;
   /// You said Share, and its tab is connecting: shared once it's up.
   connecting?: boolean;
 }
+/// One of the saved servers with the name asked for.
+export interface AiServerCandidate {
+  id: number; name: string;
+  /// Its folders, outermost first ("Production / Web"); empty at the top.
+  folder: string;
+  user: string; host: string; port: number | null;
+  /// Its tab is open and connected now.
+  open: boolean;
+}
+
+/// Where a saved server connects to: `user@host:port`, leaving out what
+/// isn't saved.
+export const serverTarget = (c: Pick<AiServerCandidate, "user" | "host" | "port">): string =>
+  `${c.user ? `${c.user}@` : ""}${c.host}${c.port !== null ? `:${c.port}` : ""}`;
+
+/// A card's list of saved servers with the name: those open now, offered
+/// first, and the others; and what it says of those it doesn't list.
+export const pickFrom = (a: Pick<AiServerAsk, "candidates" | "more">) => {
+  const all = a.candidates ?? [];
+  const more = a.more ?? 0;
+  return {
+    open: all.filter((c) => c.open),
+    others: all.filter((c) => !c.open),
+    unlisted: more > 0 ? `and ${more} more: share the one you mean from its tab.` : null,
+  };
+};
 
 /// What waits for you from AI tab `tabId`: its requests (one on several
 /// servers counts once, #158) and its requests for a server.

@@ -902,14 +902,6 @@ impl AiState {
             let guard = db.conn.lock().unwrap_or_else(|e| e.into_inner());
             guard.as_ref().map(|conn| trust::policy_for(conn, server_id)).unwrap_or_else(trust::Policy::unreadable)
         });
-        // A saved server by its name, for request_server: none without a
-        // profile open.
-        let names_app = app.clone();
-        let server_lookup: ask_server::Lookup = Arc::new(move |name| {
-            let db = names_app.state::<crate::DbState>();
-            let guard = db.conn.lock().unwrap_or_else(|e| e.into_inner());
-            guard.as_ref().map(|conn| ask_server::find(conn, name)).unwrap_or(ask_server::Found::None)
-        });
         let attention_app = app.clone();
         let attention = Box::new(move || {
             #[cfg(not(target_os = "android"))]
@@ -928,7 +920,7 @@ impl AiState {
         let state = AiState::with(exec, root_exec, changed, app.path().app_log_dir().ok(), policy, attention);
         let settings: Settings = crate::local_open::read_setting(app, SETTINGS_FILE).unwrap_or_default();
         state.0.flash.store(settings.flash, Ordering::Relaxed);
-        state.set_server_lookup(server_lookup);
+        state.set_server_lookup(ask_server::app_lookup(app.clone()));
         state.set_pull_folders(copy::kept_folders(&settings.pull_folders));
         state.set_copier(copy::app_copier(app.clone()));
         state.set_follower(follow::app_follower(app.clone()));
@@ -2687,10 +2679,18 @@ pub async fn ai_unshare(state: tauri::State<'_, AiState>, session_id: String, ta
 }
 
 /// Your answer on the AI's request for a server by name (ask_server): share
-/// it, once the page has opened its tab and it's connected, or not.
+/// it, once the page has opened its tab and it's connected, or not. Where
+/// several saved servers have the name, `server_id` is the one picked, and
+/// only one the request found is taken.
 #[tauri::command]
-pub async fn ai_answer_server_ask(state: tauri::State<'_, AiState>, ssh: tauri::State<'_, crate::ssh_manager::SshState>, id: u64, share: bool) -> Result<(), String> {
-    ask_server::answer(&state, &ssh, id, share).await
+pub async fn ai_answer_server_ask(
+    state: tauri::State<'_, AiState>,
+    ssh: tauri::State<'_, crate::ssh_manager::SshState>,
+    id: u64,
+    share: bool,
+    server_id: Option<i64>,
+) -> Result<(), String> {
+    ask_server::answer(&state, &ssh, id, share, server_id).await
 }
 
 /// The panel's Stop for an AI tab.

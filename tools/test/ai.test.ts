@@ -2,7 +2,7 @@
 // then npm --prefix tools/test test (type check, then vitest).
 
 import { describe, expect, it } from "vitest";
-import { AI_LEVELS, aiMarker, cardsOf, heldMay, loosestShare, copyCard, followLimit, followSoFar, levelTitle, runnerWarning, sharedWith, trustTargetFor, waitingFor, type AiCopy, type AiPending, type AiServer, type AiServerAsk, type AiSnapshot } from "../../src/util/ai";
+import { AI_LEVELS, aiMarker, cardsOf, heldMay, loosestShare, copyCard, followLimit, followSoFar, levelTitle, pickFrom, runnerWarning, serverTarget, sharedWith, trustTargetFor, waitingFor, type AiCopy, type AiPending, type AiServer, type AiServerAsk, type AiServerCandidate, type AiSnapshot } from "../../src/util/ai";
 
 const pending = (id: number, group: { id: number; size: number } | null = null): AiPending => ({
   id, tab_id: "t", tab_label: "AI", session_id: `s${id}`, server: `srv${id}`, user: null, command: "uptime",
@@ -49,6 +49,31 @@ describe("waitingFor (#198's review)", () => {
     expect(waitingFor(ai, "t")).toBe(3);
     expect(waitingFor(ai, "other")).toBe(1);
     expect(waitingFor({ pending: [], server_asks: undefined as unknown as AiServerAsk[] }, "t")).toBe(0);
+  });
+});
+
+describe("several saved servers with the name (#230)", () => {
+  const c = (id: number, open: boolean, extra: Partial<AiServerCandidate> = {}): AiServerCandidate => ({
+    id, name: "app", folder: "", user: "ops", host: `10.0.0.${id}`, port: 22, open, ...extra,
+  });
+  it("offers those open now first, in the order Rust sent", () => {
+    const list = pickFrom({ candidates: [c(3, true), c(1, true), c(2, false), c(4, false)], more: 0 });
+    expect(list.open.map((x) => x.id)).toEqual([3, 1]);
+    expect(list.others.map((x) => x.id)).toEqual([2, 4]);
+    expect(list.unlisted).toBeNull();
+  });
+  it("is a plain list when none is open, and says how many it doesn't list", () => {
+    const list = pickFrom({ candidates: [c(1, false), c(2, false)], more: 5 });
+    expect(list.open).toEqual([]);
+    expect(list.others.length).toBe(2);
+    expect(list.unlisted).toBe("and 5 more: share the one you mean from its tab.");
+  });
+  it("takes a card from before #230", () => {
+    expect(pickFrom({})).toEqual({ open: [], others: [], unlisted: null });
+  });
+  it("shows where each connects to, leaving out what isn't saved", () => {
+    expect(serverTarget(c(1, false))).toBe("ops@10.0.0.1:22");
+    expect(serverTarget(c(1, false, { user: "", port: null }))).toBe("10.0.0.1");
   });
 });
 
