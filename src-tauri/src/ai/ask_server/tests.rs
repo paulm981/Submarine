@@ -7,8 +7,14 @@ use serde_json::json;
 fn vault() -> rusqlite::Connection {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch(
-        "CREATE TABLE servers (id INTEGER PRIMARY KEY, name TEXT, protocol TEXT, deleted INTEGER NOT NULL DEFAULT 0);
-         INSERT INTO servers (id, name) VALUES (1, 'web1'), (2, 'db-01'), (3, 'twin'), (4, 'Twin'), (5, 'école');
+        "CREATE TABLE servers (id INTEGER PRIMARY KEY, name TEXT, host TEXT, port INTEGER, username TEXT, credential_id INTEGER, folder_id INTEGER, protocol TEXT, deleted INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE folders (id INTEGER PRIMARY KEY, name TEXT, parent_id INTEGER);
+         CREATE TABLE credentials (id INTEGER PRIMARY KEY, name TEXT, username TEXT);
+         INSERT INTO folders (id, name, parent_id) VALUES (1, 'Production', NULL), (2, 'Web', 1), (3, 'Lab', NULL);
+         INSERT INTO credentials (id, name, username) VALUES (1, 'deploy key', 'deploy');
+         INSERT INTO servers (id, name) VALUES (1, 'web1'), (2, 'db-01'), (5, 'école');
+         INSERT INTO servers (id, name, host, port, username, credential_id, folder_id) VALUES
+           (3, 'twin', '10.0.0.3', 22, 'root', NULL, 2), (4, 'Twin', '10.0.0.4', 2222, '', 1, NULL);
          INSERT INTO servers (id, name, protocol) VALUES (6, 'win', 'rdp'), (7, 'desk', 'vnc'), (8, 'switch', 'telnet'), (9, 'ssh1', 'ssh');
          INSERT INTO servers (id, name, deleted) VALUES (10, 'gone', 1);",
     )
@@ -19,12 +25,13 @@ fn vault() -> rusqlite::Connection {
 #[test]
 fn only_an_exact_name_finds_a_server_ignoring_case() {
     let conn = vault();
+    let find = |conn: &rusqlite::Connection, name: &str| find(conn, name, &HashSet::new());
     assert_eq!(find(&conn, "web1"), Found::One(1, "web1".into()));
     assert_eq!(find(&conn, "DB-01"), Found::One(2, "db-01".into()));
     for partial in ["web", "web1 ", "%", "_eb1", "db", ""] {
         assert_eq!(find(&conn, partial), Found::None, "{partial:?}");
     }
-    assert_eq!(find(&conn, "twin"), Found::Many);
+    assert!(matches!(find(&conn, "twin"), Found::Many { ref candidates, more: 0 } if candidates.len() == 2));
     // Case in any alphabet, not only ASCII.
     assert_eq!(find(&conn, "ÉCOLE"), Found::One(5, "école".into()));
     assert_eq!(find(&conn, "ssh1"), Found::One(9, "ssh1".into()));
@@ -35,7 +42,7 @@ fn a_server_that_cant_be_shared_isnt_found() {
     let conn = vault();
     // RDP, VNC and telnet have no SSH session to share; a deleted one is gone.
     for name in ["win", "desk", "switch", "gone"] {
-        assert_eq!(find(&conn, name), Found::None, "{name}");
+        assert_eq!(find(&conn, name, &HashSet::new()), Found::None, "{name}");
     }
 }
 
@@ -66,12 +73,21 @@ fn a_name_is_checked_before_anything_is_asked() {
 }
 
 fn state() -> AiState {
+    state_on(vault(), &[])
+}
+
+/// A test's AI tab, finding names in `vault`, with the tabs of the saved
+/// servers `open` connected.
+fn state_on(vault: rusqlite::Connection, open: &[i64]) -> AiState {
     let exec: Executor = Arc::new(|_, _, _, _| Box::pin(async { Err("no servers in this test".to_string()) }));
     let s = AiState::new(exec, Box::new(|| {}), None);
     s.turn_on().unwrap();
     s.start_tab("local-1", "Claude").unwrap();
-    let conn = Mutex::new(vault());
-    s.set_server_lookup(Arc::new(move |name| find(&conn.lock().unwrap(), name)));
+    let (conn, open) = (Arc::new(Mutex::new(vault)), Arc::new(open.iter().copied().collect::<HashSet<i64>>()));
+    s.set_server_lookup(Arc::new(move |name| {
+        let found = find(&conn.lock().unwrap(), &name, &open);
+        Box::pin(async move { found })
+    }));
     s
 }
 
@@ -103,12 +119,14 @@ async fn no_and_no_such_server_sound_the_same_to_the_ai() {
     assert!(unknown.is_error && declined.is_error);
     assert_eq!(unknown.text, declined.text);
     assert_eq!(unknown.text, NOT_SHARED);
-    // Two servers by the name: the card says so, and offers only Dismiss,
-    // which is a no.
+    // Two servers by the name: the card lists them, and Don't share is a
+    // no, in the same words.
     let (h, card) = ask(&s, "TWIN").await;
-    assert!(card.many && card.server_id.is_none());
+    assert!(card.many && card.server_id.is_none() && card.candidates.len() == 2);
     s.decline_ask(card.id).unwrap();
-    assert_eq!(h.await.unwrap().text, NOT_SHARED);
+    let many = h.await.unwrap();
+    assert!(many.is_error);
+    assert_eq!(many.text, NOT_SHARED);
 }
 
 #[tokio::test]
@@ -118,7 +136,7 @@ async fn yes_shares_it_once_it_connects() {
     assert_eq!(card.server_id, Some(2));
     let tries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let t = tries.clone();
-    s.share_ask(card.id, move |id| {
+    s.share_ask(card.id, None, move |id| {
         assert_eq!(id, 2);
         let n = t.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Not connected at first: it's still opening.
@@ -170,7 +188,7 @@ async fn stop_while_it_connects_shares_nothing() {
     let (h, card) = ask(&s, "web1").await;
     let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (s2, f) = (s.clone(), connects_when(&up));
-    let share = tokio::spawn(async move { s2.share_ask(card.id, f).await });
+    let share = tokio::spawn(async move { s2.share_ask(card.id, None, f).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
     // The card stays while it connects, marked so, and still counts as the
     // one waiting.
@@ -192,7 +210,7 @@ async fn dont_share_while_it_connects_shares_nothing() {
     let (h, card) = ask(&s, "web1").await;
     let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (s2, f) = (s.clone(), connects_when(&up));
-    let share = tokio::spawn(async move { s2.share_ask(card.id, f).await });
+    let share = tokio::spawn(async move { s2.share_ask(card.id, None, f).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
     s.decline_ask(card.id).unwrap();
     up.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -211,7 +229,7 @@ async fn withdrawn_after_share_shares_nothing_and_blames_nothing() {
     let card = s.snapshot().server_asks[0].clone();
     let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (s3, f) = (s.clone(), connects_when(&up));
-    let share = tokio::spawn(async move { s3.share_ask(card.id, f).await });
+    let share = tokio::spawn(async move { s3.share_ask(card.id, None, f).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
     cancel_tx.send(true).unwrap();
     assert!(h.await.unwrap().text.contains("withdrawn"));
@@ -227,7 +245,7 @@ async fn a_server_that_never_connects_isnt_shared_and_the_ai_hears_why() {
     let s = state();
     let (h, card) = ask(&s, "web1").await;
     let never = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let why = s.share_ask(card.id, connects_when(&never)).await.unwrap_err();
+    let why = s.share_ask(card.id, None, connects_when(&never)).await.unwrap_err();
     assert!(why.contains("didn't connect within 90 seconds"), "{why}");
     let r = h.await.unwrap();
     assert!(r.is_error && r.text.contains("didn't connect"), "{}", r.text);
@@ -297,6 +315,8 @@ async fn a_waiting_request_for_a_server_counts_as_one_waiting() {
                 server_id: Some(1),
                 server_name: Some("web1".into()),
                 many: false,
+                candidates: Vec::new(),
+                more: 0,
                 asked_at: String::new(),
                 connecting: false,
             },
@@ -357,7 +377,7 @@ async fn stop_as_it_connects_shares_nothing() {
     let (h, card) = ask(&s, "web1").await;
     let s2 = s.clone();
     let r = s
-        .share_ask(card.id, move |_| {
+        .share_ask(card.id, None, move |_| {
             s2.stop_tab("local-1");
             std::future::ready(Some(("session-1".to_string(), None)))
         })
@@ -375,8 +395,181 @@ async fn an_ai_gone_without_a_word_gets_nothing_shared() {
     let (h, card) = ask(&s, "web1").await;
     h.abort();
     let _ = h.await;
-    let r = s.share_ask(card.id, |_| std::future::ready(Some(("session-1".to_string(), None)))).await;
+    let r = s.share_ask(card.id, None, |_| std::future::ready(Some(("session-1".to_string(), None)))).await;
     assert!(r.is_err());
     assert!(s.snapshot().tabs[0].servers.is_empty());
     assert!(s.snapshot().server_asks.is_empty(), "and the card goes");
+}
+
+/// A vault with `n` saved servers named "app" (ids 101 on), spread over
+/// folders, and one "solo".
+fn twins(n: i64) -> rusqlite::Connection {
+    let conn = vault();
+    for i in 0..n {
+        let folder = [None, Some(1), Some(2), Some(3)][(i % 4) as usize];
+        conn.execute(
+            "INSERT INTO servers (id, name, host, port, username, folder_id) VALUES (?1, ?2, ?3, 22, 'ops', ?4)",
+            rusqlite::params![101 + i, if i % 2 == 0 { "app" } else { "APP" }, format!("10.1.0.{i}"), folder],
+        )
+        .unwrap();
+    }
+    conn
+}
+
+fn many(found: Found) -> (Vec<Candidate>, usize) {
+    match found {
+        Found::Many { candidates, more } => (candidates, more),
+        other => panic!("not several: {other:?}"),
+    }
+}
+
+#[test]
+fn several_with_the_name_are_listed_with_where_they_are() {
+    let conn = vault();
+    let (list, more) = many(find(&conn, "twin", &HashSet::new()));
+    assert_eq!(more, 0);
+    // The top level first, then by folder path; the user from the
+    // credential where the server has none.
+    let shown: Vec<_> = list.iter().map(|c| (c.id, c.folder.as_str(), c.user.as_str(), c.host.as_str(), c.port, c.open)).collect();
+    assert_eq!(shown, [(4, "", "deploy", "10.0.0.4", Some(2222), false), (3, "Production / Web", "root", "10.0.0.3", Some(22), false)]);
+    assert_eq!((list[0].name.as_str(), list[1].name.as_str()), ("Twin", "twin"));
+}
+
+#[test]
+fn none_open_lists_them_by_folder_then_name_at_most_eight() {
+    let (list, more) = many(find(&twins(11), "app", &HashSet::new()));
+    assert_eq!((list.len(), more), (MAX_SHOWN, 3));
+    assert!(list.iter().all(|c| !c.open));
+    let folders: Vec<_> = list.iter().map(|c| c.folder.as_str()).collect();
+    let mut sorted = folders.clone();
+    sorted.sort_by_key(|f| f.to_lowercase());
+    assert_eq!(folders, sorted);
+    assert_eq!(folders[0], "");
+}
+
+#[test]
+fn one_open_comes_first_even_past_the_eighth() {
+    // 111 would be cut, by folder order, if it weren't open.
+    let open = HashSet::from([111]);
+    let (list, more) = many(find(&twins(11), "app", &open));
+    assert_eq!((list.len(), more), (MAX_SHOWN, 3));
+    assert_eq!(list[0].id, 111);
+    assert!(list[0].open && list[1..].iter().all(|c| !c.open));
+}
+
+#[test]
+fn several_open_come_first_in_folder_order() {
+    // 109 at the top level, 104 and 108 in Lab, 110 in Production: open,
+    // and in folder order, then by name, then by id.
+    let open = HashSet::from([110, 104, 109, 108]);
+    let (list, _) = many(find(&twins(11), "app", &open));
+    let first: Vec<_> = list.iter().take(4).map(|c| (c.id, c.open, c.folder.as_str())).collect();
+    assert_eq!(first, [(109, true, ""), (104, true, "Lab"), (108, true, "Lab"), (110, true, "Production")]);
+    assert!(list[4..].iter().all(|c| !c.open));
+}
+
+#[test]
+fn a_folder_loop_or_a_deep_path_ends() {
+    let conn = vault();
+    conn.execute_batch(
+        "UPDATE folders SET parent_id = 2 WHERE id = 1;
+         INSERT INTO servers (id, name, host, folder_id) VALUES (20, 'loop', 'a', 2), (21, 'loop', 'b', NULL);",
+    )
+    .unwrap();
+    let (list, _) = many(find(&conn, "loop", &HashSet::new()));
+    assert_eq!(list[1].folder, "Production / Web");
+    let deep: HashMap<i64, (String, Option<i64>)> = (0..200).map(|i| (i, ("f".repeat(10), Some(i + 1)))).collect();
+    let path = folder_path(&deep, Some(0));
+    assert!(path.chars().count() <= MAX_FIELD && path.starts_with('…'), "{path}");
+}
+
+/// Sharing on a card, with the tab found connected once `connected`
+/// has been asked `after` times; the ids it was asked for.
+async fn share_picked(s: &AiState, id: u64, pick: Option<i64>, after: usize) -> (Result<(), String>, Vec<i64>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let a = asked.clone();
+    let r = s
+        .share_ask(id, pick, move |server_id| {
+            let mut a = a.lock().unwrap();
+            a.push(server_id);
+            let n = a.len();
+            std::future::ready((n > after).then(|| (format!("session-{server_id}"), Some("ops".to_string()))))
+        })
+        .await;
+    let asked = asked.lock().unwrap().clone();
+    (r, asked)
+}
+
+#[tokio::test]
+async fn a_picked_one_is_opened_waited_for_and_shared_as_for_one() {
+    let s = state_on(twins(3), &[]);
+    let (h, card) = ask(&s, "app").await;
+    assert_eq!(card.candidates.len(), 3);
+    let (r, asked) = share_picked(&s, card.id, Some(102), 1).await;
+    r.unwrap();
+    // Not connected at first: waited for, as for a single match.
+    assert_eq!(asked, [102, 102]);
+    let said = h.await.unwrap();
+    assert!(!said.is_error);
+    // The same words as for a single match, and nothing about the others.
+    assert_eq!(said.text, "The user shared it with you as APP. Its own approval level applies; call list_shared to see it.");
+    let snap = s.snapshot();
+    let shared = &snap.tabs[0].servers[0];
+    assert_eq!((shared.server_id, shared.session_id.as_str()), (Some(102), "session-102"));
+    assert!(snap.server_asks.is_empty());
+}
+
+#[tokio::test]
+async fn one_open_now_is_shared_from_its_tab_at_once() {
+    let s = state_on(twins(3), &[103]);
+    let (h, card) = ask(&s, "app").await;
+    assert!(card.candidates[0].open && card.candidates[0].id == 103);
+    let (r, asked) = share_picked(&s, card.id, Some(103), 0).await;
+    r.unwrap();
+    assert_eq!(asked, [103], "connected already: no wait");
+    assert!(h.await.unwrap().text.starts_with("The user shared it with you as app."));
+}
+
+#[tokio::test]
+async fn a_server_the_request_didnt_find_is_refused() {
+    let s = state_on(twins(3), &[1]);
+    let (h, card) = ask(&s, "app").await;
+    // Another saved server, open or not, or one that isn't saved: refused,
+    // without looking for its tab, and the card stays as it was.
+    for other in [1, 2, 104, -1] {
+        let (r, asked) = share_picked(&s, card.id, Some(other), 0).await;
+        assert_eq!(r.unwrap_err(), NOT_A_CANDIDATE, "{other}");
+        assert!(asked.is_empty());
+    }
+    let snap = s.snapshot();
+    assert!(snap.tabs[0].servers.is_empty());
+    let left = &snap.server_asks[0];
+    assert!(!left.connecting && left.server_id.is_none());
+    // And on a card for one, only that one.
+    s.decline_ask(card.id).unwrap();
+    assert_eq!(h.await.unwrap().text, NOT_SHARED);
+    let (h, card) = ask(&s, "web1").await;
+    let (r, asked) = share_picked(&s, card.id, Some(2), 0).await;
+    assert_eq!(r.unwrap_err(), NOT_A_CANDIDATE);
+    assert!(asked.is_empty());
+    let (r, asked) = share_picked(&s, card.id, Some(1), 0).await;
+    r.unwrap();
+    assert_eq!(asked, [1]);
+    assert!(h.await.unwrap().text.contains("as web1"));
+}
+
+#[tokio::test]
+async fn share_without_a_pick_on_several_is_a_no_in_the_same_words() {
+    let s = state_on(twins(3), &[]);
+    let (h, card) = ask(&s, "nothing-here").await;
+    s.decline_ask(card.id).unwrap();
+    let nothing = h.await.unwrap().text;
+    let (h, card) = ask(&s, "app").await;
+    let (r, asked) = share_picked(&s, card.id, None, 0).await;
+    assert!(r.is_err() && asked.is_empty());
+    let dismissed = h.await.unwrap();
+    assert!(dismissed.is_error);
+    assert_eq!(dismissed.text.as_bytes(), NOT_SHARED.as_bytes());
+    assert_eq!(dismissed.text, nothing);
+    assert!(s.snapshot().tabs[0].servers.is_empty());
 }

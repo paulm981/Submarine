@@ -241,6 +241,15 @@ Object.assign(shots, {
     await save(page, "ai-server-ask", await around(card, 12));
   },
 
+  // A name several saved servers have (#230): pick the one to share.
+  async "ai-server-ask-many"() {
+    const page = await open({ "mock-server-ask": "many" });
+    await page.getByRole("button", { name: "AI panel" }).click();
+    const card = page.getByText("Share the one you mean").locator("xpath=ancestor::div[contains(@class, 'rounded-xl')][1]");
+    await card.waitFor();
+    await save(page, "ai-server-ask-many", await around(card, 12));
+  },
+
   // The Profile panel, syncing through a git repository of your own.
   async "own-storage-sync"() {
     const page = await open({}, { width: 1000, height: 1200 });
