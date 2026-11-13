@@ -54,7 +54,8 @@ export function AuthPrompts({
       // too (judge_host_key), so it arrives as a mismatch.
       const isMismatch = !!fingerprintPrompt.mismatch;
       // An RDP server proves itself with a certificate, an SSH server with a key.
-      const isCert = fingerprintPrompt.keyType === "RDP certificate";
+      // An RDP server's or an FTPS server's TLS certificate (lib.rs), not an SSH host key.
+      const isCert = fingerprintPrompt.keyType === "RDP certificate" || fingerprintPrompt.keyType === "FTPS certificate";
       // The port too when it isn't SSH's usual one.
       const hostLabel = fingerprintPrompt.port && fingerprintPrompt.port !== 22
         ? `${fingerprintPrompt.host}:${fingerprintPrompt.port}`

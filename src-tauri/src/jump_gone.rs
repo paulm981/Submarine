@@ -295,7 +295,7 @@ mod tests {
             ("run", "jump_gone::jump_host_connect_directly", 1),
         ];
         // Every way of connecting to a saved server asks first.
-        for opens in ["initiate_connection", "initiate_rdp", "rdp_builtin_open", "telnet_connect", "vnc_open", "resolve_node_auth_for_monitor"] {
+        for opens in ["initiate_connection", "initiate_rdp", "rdp_builtin_open", "telnet_connect", "vnc_open", "ftp_connect", "resolve_node_auth_for_monitor"] {
             lib.push((opens, "jump_gone::refuse(", 1));
         }
         assert_hooks("lib.rs", include_str!("lib.rs"), &lib);

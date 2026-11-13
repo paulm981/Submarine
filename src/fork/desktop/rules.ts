@@ -2,6 +2,7 @@ import type { CSSProperties } from "react";
 import type { QuickAuth } from "../../components/QuickConnectModal";
 import type { AiPaneView } from "../../components/AiSidePane";
 import { IS_ANDROID } from "../../util/platform";
+import { type ServerProtocol } from "../../util/serverProtocol";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The rules behind the fork's parts of the main window. DesktopApp.tsx is the
@@ -22,7 +23,7 @@ export const START_VIEW = HAS_HOME ? "home" : "nodes";
  *  edit made while the tab is open doesn't move them). */
 export type DesktopSession = {
   id: string; serverId: number; serverName: string; serverUuid?: string | null;
-  protocol?: "ssh" | "rdp" | "telnet" | "vnc"; host?: string; port?: number; mirrors?: string;
+  protocol?: ServerProtocol; host?: string; port?: number; mirrors?: string;
   runOnConnect?: string; runOnConnectEvery?: boolean; runOnConnectHeld?: boolean; quickAuth?: QuickAuth | null;
 };
 

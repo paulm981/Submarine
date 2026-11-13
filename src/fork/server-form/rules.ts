@@ -6,6 +6,8 @@
 // AddNodePanel had in their place.
 // ─────────────────────────────────────────────────────────────────────────────
 
+import type { FtpProtocol, ServerProtocol } from "../../util/serverProtocol";
+
 /** An SSH or RDP password held while the server is switched to telnet or
  *  VNC (protocolSwitch), to come back if it's switched out again. */
 export type HeldPassword = { from: string; password: string; dirty: boolean };
@@ -53,6 +55,9 @@ export type ImportedHost = {
   user: string;
   identity_file: string | null;
   proxy_jump: string | null;
+  // FileZilla's site list: an FTP site's kind, and the password it kept.
+  protocol?: FtpProtocol;
+  password?: string;
 } & ImportedHostExtra;
 
 // What `parse_client_import` hands back: the hosts, and a line about the
@@ -100,7 +105,7 @@ export const errText = (e: unknown): string =>
  *  No SSH key outside SSH, and no saved login for VNC: VNC sends its
  *  password with weak protection and doesn't check the server's identity,
  *  so a shared login's password would be open to anyone on the path. */
-export const protocolSwitch = (newNode: ServerFormNode, protocol: "ssh" | "rdp" | "telnet" | "vnc") => {
+export const protocolSwitch = (newNode: ServerFormNode, protocol: ServerProtocol) => {
   const dropsLogin = (protocol !== "ssh" && newNode.authType === "custom_key") || (protocol === "vnc" && newNode.authType === "vault");
   const authType = dropsLogin ? "custom_pass" : newNode.authType;
   const credentialId = protocol === "vnc" ? "" : newNode.credentialId;
