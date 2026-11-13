@@ -2,7 +2,7 @@
 // then npm --prefix tools/test test (type check, then vitest).
 
 import { describe, expect, it } from "vitest";
-import { AI_LEVELS, aiMarker, cardsOf, heldMay, loosestShare, copyCard, followLimit, followSoFar, levelTitle, pickFrom, runnerWarning, serverTarget, sharedWith, trustTargetFor, waitingFor, type AiCopy, type AiPending, type AiServer, type AiServerAsk, type AiServerCandidate, type AiSnapshot } from "../../src/util/ai";
+import { AI_LEVELS, aiMarker, cardsOf, heldMay, loosestShare, copyCard, followLimit, followSoFar, levelTitle, passwordAsk, pickFrom, runnerWarning, serverTarget, sharedWith, trustTargetFor, waitingFor, type AiCopy, type AiPending, type AiServer, type AiServerAsk, type AiServerCandidate, type AiSnapshot } from "../../src/util/ai";
 
 const pending = (id: number, group: { id: number; size: number } | null = null): AiPending => ({
   id, tab_id: "t", tab_label: "AI", session_id: `s${id}`, server: `srv${id}`, user: null, command: "uptime",
@@ -219,5 +219,36 @@ describe("follows", () => {
     expect(followSoFar(start, 2048, at(12))).toMatch(/^12 min · .+ seen$/);
     expect(followSoFar(start, 0, at(75))).toMatch(/^1 h 15 min · /);
     expect(followSoFar("not a date", 0, at(5))).toMatch(/^under a minute/);
+  });
+});
+
+describe("the password a card as root asks for (#232)", () => {
+  const card = (over: Partial<AiPending>): AiPending => ({ ...pending(1), server: "web1", as_root: true, root: true, ...over });
+
+  it("is the login's own, for the tool that asked", () => {
+    const ask = passwordAsk(card({ user: "bob", root_via: "dzdo", password: "needed" }));
+    expect(ask.line).toBe("web1 asks for your password for bob (dzdo asks for it).");
+    expect(ask.placeholder).toBe("Your password for bob");
+    expect(ask.label).toBe("Your password for bob on web1, for dzdo");
+  });
+
+  it("names dzdo or sudo while neither has asked yet", () => {
+    const ask = passwordAsk(card({ user: "bob", password: "optional" }));
+    expect(ask.placeholder).toBe("Your password for bob, if dzdo or sudo asks (else leave empty)");
+    expect(ask.label).toBe("Your password for bob on web1, for dzdo or sudo");
+  });
+
+  it("works without the login's name", () => {
+    expect(passwordAsk(card({ root_via: "sudo", password: "needed" })).line).toBe("web1 asks for your login's password (sudo asks for it).");
+  });
+
+  it("never says root password", () => {
+    for (const password of ["optional", "needed", "wrong"] as const) {
+      for (const root_via of [null, "dzdo", "sudo"]) {
+        const ask = passwordAsk(card({ user: "bob", root_via, password }));
+        expect(`${ask.line} ${ask.placeholder} ${ask.label}`.toLowerCase()).not.toContain("root password");
+      }
+    }
+    expect(AI_LEVELS.map((l) => l.text).join(" ").toLowerCase()).not.toContain("root password");
   });
 });

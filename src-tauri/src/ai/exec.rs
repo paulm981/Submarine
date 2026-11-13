@@ -252,32 +252,37 @@ pub(crate) fn root_words(command: &str) -> Vec<String> {
     super::trust::plain_words(command).unwrap_or_else(|| vec!["sh".into(), "-c".into(), command.to_string()])
 }
 
-/// A [SUDO] code from lib.rs as RootRun::Failed's words.
+/// A [SUDO] code from lib.rs as RootRun::Failed's words: for the AI, what
+/// happened, and never to get root some other way (#232).
 fn failed(code: &str) -> RootRun {
-    let (you, ai): (String, &str) = if code == crate::SUDO_NO_SUDO {
-        ("Neither sudo nor dzdo is on this server.".into(), "Couldn't run it as root: the server has neither sudo nor dzdo.")
+    let dont = super::NO_ROOT_BY_HAND;
+    let (you, ai): (String, String) = if code == crate::SUDO_NO_SUDO {
+        ("Neither dzdo nor sudo is on this server.".into(), format!("Couldn't get root: this server has neither dzdo nor sudo. {dont}"))
     } else if code == crate::SUDO_NOT_ALLOWED {
         (
-            "sudo and dzdo don't let this login run that as root here.".into(),
-            "Couldn't run it as root: sudo and dzdo don't allow this login to run that on this server.",
+            "Neither dzdo nor sudo lets this login run that as root here, or open a root shell (dzdo su -).".into(),
+            format!("Couldn't get root: neither dzdo nor sudo lets this login run that as root on this server. {dont}"),
         )
     } else if code == crate::SUDO_REQUIRETTY {
         (
             "sudo here only works in a terminal (requiretty), and the AI's commands run without one.".into(),
-            "Couldn't run it as root: sudo on this server only works in a terminal, and Submarine runs commands without one.",
+            format!("Couldn't get root: sudo on this server only works in a terminal, and Submarine runs commands without one. {dont}"),
         )
     } else if code == crate::SUDO_UNSAFE {
         (
             "sudo/dzdo on this server isn't owned by root, so Submarine won't type your password into it.".into(),
-            "Couldn't run it as root: sudo or dzdo on this server isn't owned by root, so Submarine won't give it the password.",
+            format!("Couldn't get root: dzdo or sudo on this server isn't owned by root, so Submarine won't give it the password. {dont}"),
         )
     } else if code == crate::SUDO_NEED_PASSWORD {
-        ("The server asked for a root password.".into(), "Couldn't run it as root: the server asked for a root password.")
+        ("The server asked for your password.".into(), format!("Couldn't get root: it needs the user's password, which wasn't given. {dont}"))
     } else {
         let detail = code.strip_prefix(crate::SUDO_FAILED).map(|d| d.trim_start_matches(':').trim()).unwrap_or(code);
-        (format!("sudo or dzdo couldn't run it: {detail}"), "Couldn't run it as root: sudo or dzdo couldn't start it. The user can see why in Submarine.")
+        (
+            format!("dzdo or sudo couldn't run it: {detail}"),
+            format!("Couldn't get root: dzdo or sudo couldn't start it. The user can see why in Submarine. {dont}"),
+        )
     };
-    RootRun::Failed { you, ai: ai.to_string() }
+    RootRun::Failed { you, ai }
 }
 
 /// The look for root, under the stop signal and the time limit.
@@ -339,8 +344,8 @@ pub(crate) async fn run_root<H: client::Handler + 'static>(
                 Look::Done(Ok((tool, shell))) => {
                     (Arc::new(RootAccess::new(tool, Some(pw), shell, Some(std::time::Instant::now())).without_tickets()), true)
                 }
-                Look::Done(Err(e)) if e == crate::SUDO_WRONG_PASSWORD => return RootRun::WrongPassword(None),
-                Look::Done(Err(e)) => return failed(&e),
+                Look::Done(Err((e, tool))) if e == crate::SUDO_WRONG_PASSWORD => return RootRun::WrongPassword(tool),
+                Look::Done(Err((e, _))) => return failed(&e),
             }
         }
         RootHow::Find => {
@@ -449,7 +454,7 @@ pub(crate) async fn run_root<H: client::Handler + 'static>(
             // needed none, and the password was never typed.
             return RootRun::Failed {
                 you: format!("{tool} said this command needs no password, then asked for one to run it, so Submarine didn't type it."),
-                ai: format!("Couldn't run it as root: {tool} asked for a password Submarine doesn't type there."),
+                ai: format!("Couldn't get root: {tool} asked for a password Submarine doesn't type there. {}", super::NO_ROOT_BY_HAND),
             };
         }
     }

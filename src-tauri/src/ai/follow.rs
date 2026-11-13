@@ -600,7 +600,7 @@ impl AiState {
         };
         let approved_by = match (auto, rx) {
             (Some(by), _) => by,
-            (None, Some(rx)) => match self.await_answer(&req, rx, &mut cancel, false).await {
+            (None, Some(rx)) => match self.await_answer(&req, rx, &mut cancel, Asked::Nothing).await {
                 Ok((by, _)) => by,
                 Err(answer) => return answer,
             },

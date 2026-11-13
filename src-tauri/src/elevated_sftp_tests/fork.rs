@@ -21,6 +21,19 @@ fn only_the_tools_own_lines_are_read() {
     assert_eq!(classify_tool_output("sudo: sorry, you must have a tty to run sudo\n"), SUDO_REQUIRETTY);
 }
 
+/// sudo and dzdo are looked for in the system's folders, then in
+/// Centrify's (#232), which are never on the scripts' PATH.
+#[test]
+fn centrifys_folders_come_after_the_systems() {
+    assert_eq!(ROOT_TOOL_EXTRA_PATH, "/usr/share/centrifydc/bin:/opt/centrify/bin");
+    assert!(!ROOT_TOOL_PATH.contains("centrify"));
+    assert!(root_tool_extra_path().ends_with(ROOT_TOOL_EXTRA_PATH));
+    let env = root_tool_env("dzdo");
+    let order: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
+    assert_eq!(order, ["SUB_TOOL", "SUB_PATH", "SUB_XPATH", "SUB_UID"]);
+    assert_eq!(ELEVATION_TOOLS, ["dzdo", "sudo"]);
+}
+
 #[test]
 fn the_most_useful_elevation_error_wins() {
     let best = |errs: &[&str]| errs.iter().copied().max_by_key(|e| elevation_error_rank(e)).unwrap().to_string();
@@ -61,6 +74,7 @@ fn root_scripts_run_under_any_login_shell() {
         (root_exec_command("true", "TAG", true, false, true, false, &args), "TAG:READ"),
         (root_exec_command("true", "TAG", true, false, true, true, &args), "TAG:READ"),
         (root_exec_command("no-such-tool", "TAG", true, false, true, false, &args), "TAG:NO_TOOL"),
+        (root_shell_try_command("no-such-tool", "su -", true), "__SUB_SUDO:NO_SUDO"),
         (sftp_probe_command("true", false), "__SUB_SUDO:"),
         (remote_sh::sh_command(&[], SFTP_SERVER_FIND, &[]), "__SUB_SUDO:"),
         (remote_sh::sh_command(&[("SUB_MODE", "n")], SUDO_SHELL_PROBE, &[]), "__SUB_SUDO:"),

@@ -85,8 +85,9 @@ No terminal is attached and nothing is on stdin, so interactive programs and pag
 For logs, use `tail -n N`, `journalctl -n N --no-pager` or `--since`. To watch one as it grows (`tail -f`, `journalctl -f`), \
 use follow instead: here it wouldn't stream, it would run until the timeout. \
 To run it as root, set as_root to true and give the plain command (e.g. `docker ps -a`), instead of typing sudo, su or dzdo \
-yourself: Submarine asks the user, runs it through the server's sudo or dzdo, and supplies any password itself. You never see \
-or need the password, and you can't ask for it. as_root runs one command: it can't open a root shell (no `sudo -i` or `su -`). \
+yourself: Submarine asks the user, runs it through the server's dzdo or sudo (`dzdo su -` where that's the way in), and supplies any password \
+itself. You never see or need the password, and you can't ask for it. If root can't be had, don't try sudo, dzdo or su in the \
+command. as_root runs one command: it can't open a root shell for you (no `sudo -i` or `su -`). \
 Returns the exit code, then the output (stdout and stderr together) between server-output tags, with secrets replaced by [hidden by Submarine].",
             "inputSchema": {
                 "type": "object",
@@ -94,7 +95,7 @@ Returns the exit code, then the output (stdout and stderr together) between serv
                     "server": { "type": "string", "description": "The server's name, as list_shared gives it." },
                     "command": { "type": "string", "description": "The command line, run by the account's login shell on the server." },
                     "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": super::MAX_TIMEOUT, "description": "Stop it after this many seconds (default 60)." },
-                    "as_root": { "type": "boolean", "description": "Run it as root, through the server's sudo or dzdo. The user is asked, and types any password in Submarine; you never get it. Give the plain command, without sudo." }
+                    "as_root": { "type": "boolean", "description": "Run it as root, through the server's dzdo or sudo. The user is asked, and types any password in Submarine; you never get it. Give the plain command, without sudo, dzdo or su." }
                 },
                 "required": ["server", "command"],
                 "additionalProperties": false
@@ -595,6 +596,9 @@ mod tests {
         let about = run["description"].as_str().unwrap();
         assert!(about.contains("tail -n N") && about.contains("journalctl -f") && about.contains("use follow") && about.contains("server-output"), "{about}");
         assert!(INSTRUCTIONS.contains("follow and read_follow"));
+        // Root is as_root, never sudo, dzdo or su typed by the AI (#232).
+        assert!(about.contains("set as_root") && about.contains("instead of typing sudo, su or dzdo") && about.contains("don't try sudo, dzdo or su"), "{about}");
+        assert!(INSTRUCTIONS.contains("set as_root") && INSTRUCTIONS.contains("rather than typing sudo, su or dzdo"));
         // A follow isn't offered as root, and says so.
         let follow = tools().as_array().unwrap().iter().find(|t| t["name"] == "follow").cloned().unwrap();
         assert!(follow["inputSchema"]["properties"].get("as_root").is_none());

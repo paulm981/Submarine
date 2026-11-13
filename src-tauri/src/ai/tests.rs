@@ -1577,7 +1577,7 @@ mod root {
         assert_eq!(r.labs[0].attempts(), after_first + 2, "the check and the tool's own question, no ticket");
         let log = audit_lines(&r.dir);
         let notes: Vec<&str> = log.iter().filter(|l| l["event"] == "root_password").map(|l| l["note"].as_str().unwrap()).collect();
-        assert_eq!(notes, ["the server asked for a root password", "the root password was refused (one attempt)"]);
+        assert_eq!(notes, ["the server asked for the login's password", "the password was refused (one attempt)"]);
         nowhere(&r, &[&a, &b]);
     }
 
@@ -1593,9 +1593,55 @@ mod root {
         let p = card(&r.s, PasswordAsk::Wrong).await;
         r.s.decide(p.id, false).unwrap();
         let a = req.await.unwrap();
-        assert_eq!(a.text, "Denied by the user. The root password typed for it was refused.");
+        assert_eq!(
+            a.text,
+            "Denied by the user. Couldn't get root on xyz: dzdo turned down the password the user typed. Don't add sudo, dzdo or su to a command yourself."
+        );
         assert_eq!(r.labs[0].attempts(), 1);
         nowhere(&r, &[&a]);
+    }
+
+    /// dzdo whose only rule is `dzdo su -`, with the login's password, and a
+    /// sudo that wants one too (#232): the card asks for it for dzdo, the
+    /// password goes to `dzdo su -`, and sudo is never run. Denied, the AI
+    /// hears why, and not to try sudo, dzdo or su itself.
+    #[tokio::test]
+    async fn dzdo_su_comes_before_sudo() {
+        let r = root_state(&[("shell first", "all")], policy(1, &[], &[])).await;
+        r.s.share_as("local-1", "sess-1", "xyz", Some("bob".into()), Some(1)).unwrap();
+        let req = ask(&r.s, "local-1", "xyz", "echo first", true);
+        r.s.decide(card(&r.s, PasswordAsk::Optional).await.id, true).unwrap();
+        let p = card(&r.s, PasswordAsk::Needed).await;
+        assert_eq!((p.root_via, p.user.as_deref()), (Some("dzdo"), Some("bob")));
+        r.s.decide(p.id, false).unwrap();
+        let a = req.await.unwrap();
+        assert_eq!(
+            a.text,
+            "Denied by the user. Couldn't get root on xyz: dzdo needs the user's password, and they didn't give it. Don't add sudo, dzdo or su to a command yourself."
+        );
+        let req = ask(&r.s, "local-1", "xyz", "echo ran as root", true);
+        let p = card(&r.s, PasswordAsk::Optional).await;
+        r.s.allow_with_password(p.id, PW).unwrap();
+        let a = req.await.unwrap();
+        assert!(!a.is_error && a.text.contains("Ran as root, through dzdo.") && printed(&a).ends_with("ran as root\n"), "{}", a.text);
+        assert_eq!(r.labs[0].called("sudo"), 0, "sudo was asked");
+        nowhere(&r, &[&a]);
+    }
+
+    /// Where neither dzdo nor sudo lets the login become root, the AI is
+    /// told so, and not to try sudo, dzdo or su itself.
+    #[tokio::test]
+    async fn no_root_says_so_plainly() {
+        let r = root_state(&[("none", "none")], policy(1, &[], &[])).await;
+        r.s.share("local-1", "sess-1", "xyz").unwrap();
+        let req = ask(&r.s, "local-1", "xyz", "id", true);
+        r.s.decide(card(&r.s, PasswordAsk::Optional).await.id, true).unwrap();
+        let a = req.await.unwrap();
+        assert!(a.is_error);
+        assert_eq!(
+            a.text,
+            "Couldn't get root: neither dzdo nor sudo lets this login run that as root on this server. Don't add sudo, dzdo or su to a command yourself."
+        );
     }
 
     /// Root found without a password, for a command that then needs one:
@@ -1925,7 +1971,10 @@ mod root_language {
         assert_eq!(lab.attempts(), before + 1);
         assert!(s.kept_root("local-1", "sess-1").is_none());
         s.decide(s.snapshot().pending[0].id, false).unwrap();
-        assert_eq!(req.await.unwrap().text, "Denied by the user. The root password typed for it was refused.");
+        assert_eq!(
+            req.await.unwrap().text,
+            "Denied by the user. Couldn't get root on xyz: dzdo turned down the password the user typed. Don't add sudo, dzdo or su to a command yourself."
+        );
     }
 }
 
