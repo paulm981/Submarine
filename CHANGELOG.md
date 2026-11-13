@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.76
+
+- **Root through `dzdo su -` comes before sudo.** On servers where you get root with `dzdo su -`, the AI's root requests use dzdo, and its card asks for your own password for the login, not a root password. sudo is asked only where dzdo isn't there or can't give root, so it never gets a password dzdo turned down. SFTP root mode, the Info panel and Docker look in the same order, and dzdo is found in Centrify's own folders too. When root can't be had, the AI is told why, and not to type sudo, dzdo or su itself. ([#232](https://github.com/paulm981/Submarine/issues/232))
+
 ## v0.4.0-fork.75
 
 - **Pick which server to share when several have the name.** When the AI asks for a server by a name more than one of your saved servers has, its card lists them, each with its folder and host and whether it's open now, and you share the one you mean. One that's open now is at the top, with **Use this one (open now)**: it's shared from its tab straight away. Nothing is shared until you click. The AI hears nothing about the list. ([#230](https://github.com/paulm981/Submarine/issues/230))
