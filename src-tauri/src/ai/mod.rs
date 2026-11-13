@@ -242,7 +242,36 @@ impl std::fmt::Debug for KeptRoot {
     }
 }
 
-/// For a request as root, whether its card asks for the root password.
+/// What the AI hears when root can't be had: never to get it some other
+/// way (#232).
+pub(crate) const NO_ROOT_BY_HAND: &str = "Don't add sudo, dzdo or su to a command yourself.";
+
+/// What a request's card asks of the password, for what the AI is told
+/// when it's denied (#232).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Asked {
+    /// Nothing: root didn't want a password, or it isn't as root.
+    Nothing,
+    /// The tool (dzdo or sudo, if known) wants the login's password.
+    Password(Option<&'static str>),
+    /// The tool turned down the password typed for it.
+    Refused(Option<&'static str>),
+}
+
+impl Asked {
+    /// What follows "Denied by the user." for the AI.
+    fn for_ai(self, server: &str) -> String {
+        let tool = |t: Option<&str>| t.map(str::to_string).unwrap_or_else(|| "sudo or dzdo".into());
+        match self {
+            Asked::Nothing => String::new(),
+            Asked::Password(t) => format!(" Couldn't get root on {server}: {} needs the user's password, and they didn't give it. {NO_ROOT_BY_HAND}", tool(t)),
+            Asked::Refused(t) => format!(" Couldn't get root on {server}: {} turned down the password the user typed. {NO_ROOT_BY_HAND}", tool(t)),
+        }
+    }
+}
+
+/// For a request as root, whether its card asks for the login's password
+/// (for sudo or dzdo).
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 enum PasswordAsk {
@@ -2092,14 +2121,14 @@ impl AiState {
     /// Your answer to a request waiting for you: Allow (how, and a root
     /// password you typed on its card), or what the AI is told when it's
     /// denied, cancelled by an end of access, or withdrawn by the AI first,
-    /// each logged and kept in the history. `refused`: the last root
-    /// password typed for it was turned down.
+    /// each logged and kept in the history. `asked`: what its card asks of
+    /// the password, for what the AI is told when it's denied.
     async fn await_answer(
         &self,
         req: &Req,
         mut rx: oneshot::Receiver<Answer>,
         cancel: &mut watch::Receiver<bool>,
-        refused: bool,
+        asked: Asked,
     ) -> Result<(String, Option<Zeroizing<String>>), ToolResult> {
         // The answer: Some, or None when access ended first (the request
         // dropped by cancel_where or answer).
@@ -2151,7 +2180,7 @@ impl AiState {
                 self.audit(e);
                 self.remember(req.epoch, req.done("denied"));
                 self.changed();
-                let after = if refused { " The root password typed for it was refused." } else { "" };
+                let after = asked.for_ai(&req.server);
                 Err(ToolResult::err(match note {
                     Some(n) => format!("Denied by the user: {n}{after}"),
                     None => format!("Denied by the user.{after}"),
@@ -2170,7 +2199,7 @@ impl AiState {
         e.by = Some(if approved_by != BY_YOU { "your settings" } else { BY_YOU });
         e.approved_by = Some(approved_by.to_string());
         if round > 1 {
-            e.note = Some("allowed again, after the server asked for the root password".into());
+            e.note = Some("allowed again, after the server asked for the login's password".into());
         }
         self.audit(e);
     }
@@ -2208,15 +2237,15 @@ impl AiState {
         // deny it, or access ends.
         let mut auto = auto;
         let mut rx = rx;
-        // The last password typed for it was turned down.
-        let mut refused = false;
+        // What its card asks of the password, once root wanted one.
+        let mut asked = Asked::Nothing;
         let mut round = 0u32;
         let (approved_by, result, via) = loop {
             round += 1;
             let (approved_by, typed) = match (auto.take(), rx.take()) {
                 (Some(by), _) => (by, None),
                 (None, None) => return ToolResult::err("It stopped unexpectedly."),
-                (None, Some(rx)) => match self.await_answer(&req, rx, &mut cancel, refused).await {
+                (None, Some(rx)) => match self.await_answer(&req, rx, &mut cancel, asked).await {
                     Ok(answer) => answer,
                     Err(answer) => return answer,
                 },
@@ -2322,10 +2351,10 @@ impl AiState {
                 }
                 exec::RootRun::NeedPassword(tool) => {
                     drop(turn);
-                    refused = false;
+                    asked = Asked::Password(tool.or(kept_tool));
                     let mut e = entry_for("root_password");
                     e.root_tool = tool.or(kept_tool);
-                    e.note = Some("the server asked for a root password".into());
+                    e.note = Some("the server asked for the login's password".into());
                     self.audit(e);
                     match self.ask_again(&card, PasswordAsk::Needed, tool.or(kept_tool), &stop_tx) {
                         Some(again) => rx = Some(again),
@@ -2339,10 +2368,10 @@ impl AiState {
                         self.forget_root(tab_id, session_id, &k.0);
                     }
                     drop(turn);
-                    refused = true;
+                    asked = Asked::Refused(tool.or(kept_tool));
                     let mut e = entry_for("root_password");
                     e.root_tool = tool.or(kept_tool);
-                    e.note = Some("the root password was refused (one attempt)".into());
+                    e.note = Some("the password was refused (one attempt)".into());
                     self.audit(e);
                     match self.ask_again(&card, PasswordAsk::Wrong, tool.or(kept_tool), &stop_tx) {
                         Some(again) => rx = Some(again),

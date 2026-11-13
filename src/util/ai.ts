@@ -40,10 +40,10 @@ export interface AiPending {
   as_root: boolean;
   /// What it goes through as root, once known: "sudo" or "dzdo".
   root_via: string | null;
-  /// For a request as root: whether the card asks for the root password.
-  /// "optional" while nothing is known (left empty for a server that
-  /// doesn't ask), "needed" once the server asked, "wrong" when the one
-  /// typed didn't work.
+  /// For a request as root: whether the card asks for the login's own
+  /// password, for dzdo or sudo (#232). "optional" while nothing is known
+  /// (left empty for a server that doesn't ask), "needed" once the server
+  /// asked, "wrong" when the one typed didn't work.
   password: "none" | "optional" | "needed" | "wrong";
   timeout_secs: number; asked_at: string;
   server_id: number | null;
@@ -116,6 +116,20 @@ export const copyCard = (c: AiCopy): { wants: string; rows: { label: string; val
 
 
 /// A follow's card line (#179): it keeps running.
+/// What a card as root says about the password it asks for (#232): the
+/// login's own, which dzdo or sudo asks for (`root_via`, the one that will
+/// be used once it's known), never a root password.
+export const passwordAsk = (p: Pick<AiPending, "server" | "user" | "root_via" | "password">): { line: string; placeholder: string; label: string } => {
+  const yours = p.user ? `your password for ${p.user}` : "your login's password";
+  const Yours = yours[0].toUpperCase() + yours.slice(1);
+  const tool = p.root_via ?? "dzdo or sudo";
+  return {
+    line: `${p.server} asks for ${yours}${p.root_via ? ` (${p.root_via} asks for it)` : ""}.`,
+    placeholder: p.password === "optional" ? `${Yours}, if ${tool} asks (else leave empty)` : Yours,
+    label: `${Yours} on ${p.server}, for ${tool}`,
+  };
+};
+
 export const followLimit = (p: Pick<AiPending, "timeout_secs">): string => {
   const hours = p.timeout_secs / 3600;
   return `until stopped (at most ${Number.isInteger(hours) ? `${hours} h` : `${Math.round(p.timeout_secs / 60)} min`})`;
@@ -299,7 +313,7 @@ export const AI_LEVELS: { level: number; title: string; text: string }[] = [
   {
     level: 3,
     title: "Run anything, just log it",
-    text: "Every command runs without asking, including sudo where the server doesn't ask for a password. A request to run something as root runs once you've typed the root password for that AI tab, or where the server needs none. Your always-ask list still asks. Everything is in the AI panel and the audit log, and Stop still works. " + STEERED_BY_OUTPUT,
+    text: "Every command runs without asking, including sudo where the server doesn't ask for a password. A request to run something as root runs once you've typed your password for dzdo or sudo on its card, for that AI tab, or where the server needs none. Your always-ask list still asks. Everything is in the AI panel and the audit log, and Stop still works. " + STEERED_BY_OUTPUT,
   },
 ];
 

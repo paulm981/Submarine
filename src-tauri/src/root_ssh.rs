@@ -29,10 +29,16 @@ use crate::*;
 //
 // - PATH is set to ROOT_TOOL_PATH, and the tool (`$X`) is the first one
 //   found there, by its full path.
+// - Where none is there, Centrify's own folders (ROOT_TOOL_EXTRA_PATH, after
+//   the system's) are looked in, but a tool there is taken only where `safe`
+//   says so, password or not: a `dzdo` a login could have put there is
+//   never run, and sudo is asked instead. They're never on PATH, so nothing
+//   else the scripts run comes from them.
 // - Before a password goes anywhere, `safe` checks that the tool, the folder
 //   it's in, and (through a link) the file it points to and its folder, are
-//   owned by root and can't be changed by its group or by others. Otherwise
-//   the script says UNSAFE and reads nothing: no password is sent.
+//   owned by root and can't be changed by its group or by others: no one but
+//   root can change it or swap it for another. Otherwise the script says
+//   UNSAFE and reads nothing: no password is sent.
 //
 // That's as far as a script can go: the login's own start-up files run
 // before it (the login shell reads them), and could still catch what's
@@ -41,6 +47,11 @@ use crate::*;
 /// Where the tool is looked for: never the login's own PATH.
 pub(crate) const ROOT_TOOL_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin";
 
+/// Where Centrify (Delinea) puts dzdo, looked in after ROOT_TOOL_PATH finds
+/// none (#232): most of its installs link it into /usr/bin, some don't. A
+/// tool here is used only where root owns it and its folder (root_tool_find).
+pub(crate) const ROOT_TOOL_EXTRA_PATH: &str = "/usr/share/centrifydc/bin:/opt/centrify/bin";
+
 /// ROOT_TOOL_PATH, as the scripts get it (`SUB_PATH`). The tests' stand-ins
 /// for sudo and dzdo are in the test server's working folder (`.`), first.
 pub(crate) fn root_tool_path() -> String {
@@ -48,6 +59,16 @@ pub(crate) fn root_tool_path() -> String {
         format!(".:{}", ROOT_TOOL_PATH)
     } else {
         ROOT_TOOL_PATH.to_string()
+    }
+}
+
+/// ROOT_TOOL_EXTRA_PATH, as the scripts get it (`SUB_XPATH`). In the tests,
+/// `centrifydc/bin` in the test server's working folder comes first.
+pub(crate) fn root_tool_extra_path() -> String {
+    if cfg!(test) {
+        format!("centrifydc/bin:{}", ROOT_TOOL_EXTRA_PATH)
+    } else {
+        ROOT_TOOL_EXTRA_PATH.to_string()
     }
 }
 
@@ -67,22 +88,30 @@ pub(crate) fn root_tool_owner() -> String {
 
 /// The variables root_tool_find reads, for `tool`.
 pub(crate) fn root_tool_env(tool: &str) -> Vec<(&'static str, String)> {
-    vec![("SUB_TOOL", tool.to_string()), ("SUB_PATH", root_tool_path()), ("SUB_UID", root_tool_owner())]
+    vec![
+        ("SUB_TOOL", tool.to_string()),
+        ("SUB_PATH", root_tool_path()),
+        ("SUB_XPATH", root_tool_extra_path()),
+        ("SUB_UID", root_tool_owner()),
+    ]
 }
 
 /// The start of every script that runs sudo or dzdo (see above): `$X` is the
 /// tool's full path (empty when there's none), and `safe` says whether it
 /// may be given a password. POSIX sh. `unset -f` drops any function of
-/// those names a shell brought from its environment.
+/// those names a shell brought from its environment. The second loop, over
+/// Centrify's folders, puts IFS back before `safe` (whose `ls` words it
+/// splits): the loop's list was split once, as it started.
 macro_rules! root_tool_find {
     () => {
         r#"unset -f command ls readlink printf read echo pwd stty tr type 2>/dev/null
 PATH=$SUB_PATH; export PATH
+so() { set -f; set -- $(ls -ldnL "$1" 2>/dev/null); set +f; [ "$3" = 0 ] || [ "$3" = "$SUB_UID" ] || return 1; case $1 in ?????w*|????????w*) return 1;; esac; }
+safe() { so "$X" && so "${X%/*}" || return 1; r=$(readlink -f "$X" 2>/dev/null); [ -z "$r" ] || { so "$r" && so "${r%/*}"; }; }
 X=; o=$IFS; IFS=:
 for d in $PATH; do case $d in /*) ;; *) d=$(pwd)/$d;; esac; if [ -f "$d/$SUB_TOOL" ] && [ -x "$d/$SUB_TOOL" ]; then X=$d/$SUB_TOOL; break; fi; done
-IFS=$o
-so() { set -f; set -- $(ls -ldnL "$1" 2>/dev/null); set +f; [ "$3" = 0 ] || [ "$3" = "$SUB_UID" ] || return 1; case $1 in ?????w*|????????w*) return 1;; esac; }
-safe() { so "$X" && so "${X%/*}" || return 1; r=$(readlink -f "$X" 2>/dev/null); [ -z "$r" ] || { so "$r" && so "${r%/*}"; }; }"#
+[ -n "$X" ] || for d in $SUB_XPATH; do IFS=$o; case $d in /*) ;; *) d=$(pwd)/$d;; esac; X=$d/$SUB_TOOL; [ -f "$X" ] && [ -x "$X" ] && safe && break; X=; done
+IFS=$o"#
     };
 }
 
@@ -203,6 +232,30 @@ pub(crate) fn root_shell_line(script: &str) -> String {
     format!("exec {}\n", remote_sh::sh_command_with("/bin/sh", &[], script, &[]))
 }
 
+/// What starts a root shell without a password (root_shell_probe): the
+/// tool found as root_tool_find says, never by the login's PATH, which may
+/// not have it (Centrify's own folders), in English (the C locale), so its
+/// refusals are understood. Its stdin is the root shell's.
+pub(crate) const ROOT_SHELL_TRY_SCRIPT: &str = concat!(
+    root_tool_find!(),
+    "\n",
+    r#"if [ -z "$X" ]; then echo __SUB_SUDO:NO_SUDO; exit 0; fi
+LC_ALL=C; LANG=C; export LC_ALL LANG
+if [ -n "$SUB_NOTICKET" ]; then exec "$X" -n -k "$@"; fi
+exec "$X" -n "$@""#
+);
+
+/// The command that runs ROOT_SHELL_TRY_SCRIPT for `tool` and `form`.
+pub(crate) fn root_shell_try_command(tool: &str, form: &str, no_tickets: bool) -> String {
+    let mut env = root_tool_env(tool);
+    if no_tickets {
+        env.push(("SUB_NOTICKET", "1".into()));
+    }
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let words: Vec<String> = form.split(' ').map(String::from).collect();
+    remote_sh::sh_command_with("/bin/sh", &env, ROOT_SHELL_TRY_SCRIPT, &words)
+}
+
 /// Does `tool <form>` give a root shell without a password? The rules are
 /// asked first (`-l`, which doesn't run anything), then the shell is started
 /// and asked who it is.
@@ -210,80 +263,74 @@ pub(crate) async fn root_shell_probe<H: russh::client::Handler>(session_arc: &Ha
     let words: Vec<String> = form.split(' ').map(String::from).collect();
     root_probe(session_arc, tool, None, &words, no_tickets).await?;
     let line = root_shell_line("echo __SUB_SU_UID:$(id -u)");
-    // In English (the C locale), so its refusals are understood.
-    let k = if no_tickets { " -k" } else { "" };
-    let out = exec_with_stdin_capture(session_arc, &format!("env LC_ALL=C LANG=C {} -n{} {}", tool, k, form), Some(line.as_bytes()), 20).await?;
+    let out = exec_with_stdin_capture(session_arc, &root_shell_try_command(tool, form, no_tickets), Some(line.as_bytes()), 20).await?;
     if out.lines().any(|l| l.trim() == "__SUB_SU_UID:0") {
         Ok(())
     } else if out.contains("__SUB_SU_UID:") {
         Err(SUDO_NOT_ALLOWED.into())
+    } else if out.lines().any(|l| l.trim() == "__SUB_SUDO:NO_SUDO") {
+        Err(SUDO_NO_SUDO.into())
     } else {
         Err(classify_tool_output(&out))
     }
 }
 
-/// The first of `tools` that gives a root shell (ROOT_SHELL_FORMS) without
-/// a password, and how. `tools` are the ones that refused the command itself
-/// (NOT_ALLOWED: they have rules for the user, just not that one). A tool's
-/// forms stop at the first other answer: when `-l su -` wants a password,
-/// the others do too, and every refused ask is in the server's auth log.
-pub(crate) async fn find_root_shell<H: russh::client::Handler>(session_arc: &HandleArc<H>, tools: &[&'static str], no_tickets: bool) -> Option<(&'static str, &'static str)> {
+/// `tool`'s root shell (ROOT_SHELL_FORMS) without a password: the form that
+/// gives one, else why not. Tried where the tool refused the command itself
+/// (NOT_ALLOWED: it has rules for the user, just not that one). The forms
+/// stop at the first other answer: when `-l su -` wants a password, the
+/// others do too (NEED_PASSWORD, the way in is the user's password), and
+/// every refused ask is in the server's auth log.
+pub(crate) async fn find_root_shell<H: russh::client::Handler>(session_arc: &HandleArc<H>, tool: &'static str, no_tickets: bool) -> Result<&'static str, String> {
     let mut tried: Vec<String> = Vec::new();
-    for &tool in tools {
-        for &form in ROOT_SHELL_FORMS {
-            match root_shell_probe(session_arc, tool, form, no_tickets).await {
-                Ok(()) => return Some((tool, form)),
-                Err(e) => {
-                    let stop = e != SUDO_NOT_ALLOWED;
-                    tried.push(format!("`{} {}`: {}", tool, form, e));
-                    if stop {
-                        break;
-                    }
+    let mut last = SUDO_NOT_ALLOWED.to_string();
+    for &form in ROOT_SHELL_FORMS {
+        match root_shell_probe(session_arc, tool, form, no_tickets).await {
+            Ok(()) => return Ok(form),
+            Err(e) => {
+                let stop = e != SUDO_NOT_ALLOWED;
+                tried.push(format!("`{} {}`: {}", tool, form, e));
+                last = e;
+                if stop {
+                    break;
                 }
             }
         }
     }
-    if !tried.is_empty() {
-        crate::applog::write_line("root", &format!("no root shell without a password ({})", tried.join("; ")));
-    }
-    None
+    crate::applog::write_line("root", &format!("no root shell without a password ({})", tried.join("; ")));
+    Err(last)
 }
 
-/// The first of `tools` that gives a root shell (ROOT_SHELL_FORMS) with the
-/// user's `password`: `dzdo su -` where the tool asks for it. `tools` are
-/// the ones that took the password and refused the command itself. Each try
-/// is one sign-in (ROOT_EXEC_SCRIPT checks the password on its own first),
-/// and the forms are tried in order, stopping at the first that works; any
-/// answer but "not allowed" (a wrong password above all) ends the search, so
-/// a password the tool turns down is never tried again. `Ok(None)`: no form
-/// is allowed.
+/// `tool`'s root shell (ROOT_SHELL_FORMS) with the user's `password`:
+/// `dzdo su -` where the tool asks for it. `tool` took the password and
+/// refused the command itself. Each try is one sign-in (ROOT_EXEC_SCRIPT
+/// checks the password on its own first), and the forms are tried in order,
+/// stopping at the first that works; any answer but "not allowed" (a wrong
+/// password above all) ends the search, so a password the tool turns down
+/// is never tried again. `Ok(None)`: no form is allowed.
 pub(crate) async fn find_root_shell_with_password<H: russh::client::Handler>(
     session_arc: &HandleArc<H>,
-    tools: &[&'static str],
+    tool: &'static str,
     password: &zeroize::Zeroizing<String>,
     no_tickets: bool,
-) -> Result<Option<(&'static str, &'static str)>, String> {
+) -> Result<Option<&'static str>, String> {
     let mut tried: Vec<String> = Vec::new();
-    for &tool in tools {
-        for &form in ROOT_SHELL_FORMS {
-            let mut access = ssh_manager::RootAccess::new(tool, Some(password.clone()), Some(form), None);
-            access.no_tickets = no_tickets;
-            match root_run(session_arc, &access, &["true".to_string()], 25, None).await {
-                Ok(_) => {
-                    crate::applog::write_line("root", &format!("as root through `{} {}`, with the password", tool, form));
-                    return Ok(Some((tool, form)));
-                }
-                Err(e) if e == SUDO_NOT_ALLOWED => tried.push(format!("`{} {}`", tool, form)),
-                Err(e) => {
-                    crate::applog::write_line("root", &format!("`{} {}` with the password: {}", tool, form, e));
-                    return Err(e);
-                }
+    for &form in ROOT_SHELL_FORMS {
+        let mut access = ssh_manager::RootAccess::new(tool, Some(password.clone()), Some(form), None);
+        access.no_tickets = no_tickets;
+        match root_run(session_arc, &access, &["true".to_string()], 25, None).await {
+            Ok(_) => {
+                crate::applog::write_line("root", &format!("as root through `{} {}`, with the password", tool, form));
+                return Ok(Some(form));
+            }
+            Err(e) if e == SUDO_NOT_ALLOWED => tried.push(format!("`{} {}`", tool, form)),
+            Err(e) => {
+                crate::applog::write_line("root", &format!("`{} {}` with the password: {}", tool, form, e));
+                return Err(e);
             }
         }
     }
-    if !tried.is_empty() {
-        crate::applog::write_line("root", &format!("no root shell with the password ({} not allowed)", tried.join(", ")));
-    }
+    crate::applog::write_line("root", &format!("no root shell with the password ({} not allowed)", tried.join(", ")));
     Ok(None)
 }
 
@@ -948,13 +995,19 @@ pub(crate) async fn root_access_for(
     Ok(a)
 }
 
-/// The first tool (ELEVATION_TOOLS) whose rules let it run `args` as root
-/// without a password, else, as SFTP root mode does (probe_sudo_sftp), a
-/// root shell without one (find_root_shell). Signs in nowhere: the rules are
-/// asked with `-n -l`, which runs nothing. `Err`: the [SUDO] code worth
-/// showing, and the tool that gave it (None for NO_SUDO). With
-/// `no_tickets`, a sudo ticket doesn't count (`-k`), and what's found uses
-/// none (RootAccess::no_tickets).
+/// Root for `args` without a password, the tools (ELEVATION_TOOLS) in turn,
+/// dzdo first (#232). Each is asked about the command itself, then, where
+/// it refuses it (NOT_ALLOWED: it has rules for the user, just not that
+/// one), about its root shell (`dzdo su -`, find_root_shell), as SFTP root
+/// mode does (probe_sudo_sftp). The next tool is asked about anything only
+/// once this one isn't there or refuses even the root shell: where it wants
+/// the user's password, for the command or for its root shell, that's the
+/// answer, so the card asks for it for dzdo and sudo is never asked (on a
+/// server where the login isn't in sudoers, that's reported). Signs in
+/// nowhere: the rules are asked with `-n -l`, which runs nothing. `Err`:
+/// the [SUDO] code worth showing, and the tool that gave it (None for
+/// NO_SUDO). With `no_tickets`, a sudo ticket doesn't count (`-k`), and
+/// what's found uses none (RootAccess::no_tickets).
 pub(crate) async fn find_root_without_password<H: russh::client::Handler>(
     session_arc: &HandleArc<H>,
     args: &[String],
@@ -962,26 +1015,29 @@ pub(crate) async fn find_root_without_password<H: russh::client::Handler>(
 ) -> Result<ssh_manager::RootAccess, (String, Option<&'static str>)> {
     use ssh_manager::RootAccess;
     let mut best: Option<(String, &'static str)> = None;
-    let mut refused: Vec<&'static str> = Vec::new();
     for &tool in ELEVATION_TOOLS {
-        match root_probe(session_arc, tool, None, args, no_tickets).await {
+        let mut e = match root_probe(session_arc, tool, None, args, no_tickets).await {
             Ok(()) => return Ok(RootAccess { no_tickets, ..RootAccess::new(tool, None, None, None) }),
-            Err(e) => {
-                if e == SUDO_NOT_ALLOWED {
-                    refused.push(tool);
+            Err(e) => e,
+        };
+        if e != SUDO_NO_SUDO {
+            crate::applog::write_line("root", &format!("{} may not run {} itself ({})", tool, args.first().map(String::as_str).unwrap_or(""), e));
+        }
+        if e == SUDO_NOT_ALLOWED {
+            match find_root_shell(session_arc, tool, no_tickets).await {
+                Ok(form) => {
+                    crate::applog::write_line("root", &format!("as root through `{} {}`, no password", tool, form));
+                    return Ok(RootAccess { no_tickets, ..RootAccess::new(tool, None, Some(form), None) });
                 }
-                if e != SUDO_NO_SUDO {
-                    crate::applog::write_line("root", &format!("{} may not run {} itself ({})", tool, args.first().map(String::as_str).unwrap_or(""), e));
-                }
-                if best.as_ref().is_none_or(|(b, _)| elevation_error_rank(&e) > elevation_error_rank(b)) {
-                    best = Some((e, tool));
-                }
+                Err(shell) => e = shell,
             }
         }
-    }
-    if let Some((tool, form)) = find_root_shell(session_arc, &refused, no_tickets).await {
-        crate::applog::write_line("root", &format!("as root through `{} {}`, no password", tool, form));
-        return Ok(RootAccess { no_tickets, ..RootAccess::new(tool, None, Some(form), None) });
+        if e == SUDO_NEED_PASSWORD {
+            return Err((e, Some(tool)));
+        }
+        if best.as_ref().is_none_or(|(b, _)| elevation_error_rank(&e) > elevation_error_rank(b)) {
+            best = Some((e, tool));
+        }
     }
     Err(match best {
         Some((e, _)) if e == SUDO_NO_SUDO => (e, None),
@@ -1046,7 +1102,7 @@ pub(crate) async fn typed_root_access<H: russh::client::Handler>(
     if let Some(a) = kept.filter(|a| a.password.as_ref().is_some_and(|p| p.as_str() == pw.as_str())) {
         return Ok(a);
     }
-    let found = find_root_with_password(session_arc, args, &pw, false).await;
+    let found = find_root_with_password(session_arc, args, &pw, false).await.map_err(|(e, _)| e);
     match found {
         Ok((tool, shell)) => {
             gate.rejected = None;
@@ -1064,31 +1120,34 @@ pub(crate) async fn typed_root_access<H: russh::client::Handler>(
     }
 }
 
-/// How `args` run as root with the user's typed `pw`: the first tool that
-/// takes it and allows them, else a root shell through one that takes it but
-/// allows only that (`dzdo su -`, find_root_shell_with_password). A tool that
-/// isn't there or doesn't allow the user hands over to the next, and any
-/// other answer (a wrong password above all) ends it: a mistyped password is
-/// one failed attempt. Returns the tool and the root shell's words, if any.
+/// How `args` run as root with the user's typed `pw`, in the order
+/// find_root_without_password asks (#232): dzdo for the command, then
+/// dzdo's root shell (`dzdo su -`, find_root_shell_with_password), and only
+/// then sudo, then sudo's root shell. A tool that isn't there or doesn't
+/// allow the user (either way) hands over to the next, and any other answer
+/// (a wrong password above all) ends it: a mistyped password is one failed
+/// attempt, and sudo never gets a password dzdo turned down. Returns the
+/// tool and the root shell's words, if any; `Err`, the [SUDO] code and the
+/// tool that gave it (None for NOT_ALLOWED from every tool there).
 pub(crate) async fn find_root_with_password<H: russh::client::Handler>(
     session_arc: &HandleArc<H>,
     args: &[String],
     pw: &zeroize::Zeroizing<String>,
     no_tickets: bool,
-) -> Result<(&'static str, Option<&'static str>), String> {
-    let mut refused: Vec<&'static str> = Vec::new();
-    for tool in ELEVATION_TOOLS {
+) -> Result<(&'static str, Option<&'static str>), (String, Option<&'static str>)> {
+    for &tool in ELEVATION_TOOLS {
         match root_probe(session_arc, tool, Some(pw.as_str()), args, no_tickets).await {
-            Ok(()) => return Ok((*tool, None)),
+            Ok(()) => return Ok((tool, None)),
             Err(e) if e == SUDO_NO_SUDO => continue,
-            Err(e) if e == SUDO_NOT_ALLOWED => refused.push(*tool),
-            Err(e) => return Err(e),
+            Err(e) if e == SUDO_NOT_ALLOWED => {
+                if let Some(form) = find_root_shell_with_password(session_arc, tool, pw, no_tickets).await.map_err(|e| (e, Some(tool)))? {
+                    return Ok((tool, Some(form)));
+                }
+            }
+            Err(e) => return Err((e, Some(tool))),
         }
     }
-    match find_root_shell_with_password(session_arc, &refused, pw, no_tickets).await? {
-        Some((tool, form)) => Ok((tool, Some(form))),
-        None => Err(SUDO_NOT_ALLOWED.to_string()),
-    }
+    Err((SUDO_NOT_ALLOWED.to_string(), None))
 }
 
 /// Run `args` as root on this tab's server: exit code, output, and the tool.
@@ -1159,7 +1218,8 @@ pub(crate) mod root_over_ssh_tests {
     /// sudo or dzdo, as far as the app can tell. Files beside it set it up:
     /// `rules.<name>` (`all`, `shell` for `su -` only, `none`, plus
     /// `nopasswd`, or `cmdnopw`: a password to sign in, none to run a
-    /// command), `password`; `notickets` (no ticket kept after a sign-in,
+    /// command, and `first`: a command no rule names is refused at once,
+    /// before any password is asked, as Centrify's dzdo does), `password`; `notickets` (no ticket kept after a sign-in,
     /// as with `timestamp_timeout=0`); `pamprompt` (PAM's own prompt shown
     /// instead of `-p`'s); `early` (a warning of its own first, then that
     /// many seconds before it asks); `slowcheck` (seconds to check a
@@ -1168,9 +1228,14 @@ pub(crate) mod root_over_ssh_tests {
     /// caller, `ticket.global`, as with `timestamp_type=global`). Each password read is a line in `attempts`. Like sudo
     /// without a terminal, a sign-in leaves a ticket for the caller's
     /// process (its parent), which `-n` and `-v` then use; `-k` ignores it.
+    /// Every run is a line in `called.<name>`, password or not. A copy in
+    /// `centrifydc/bin` (Centrify's own folder) reads the files beside the
+    /// others.
     pub(crate) const FAKE_TOOL: &str = r#"#!/bin/sh
 D=$(dirname "$0")
 T=$(basename "$0")
+[ -f "$D/rules.$T" ] || D=$D/../..
+echo "$*" >> "$D/called.$T"
 n=; p=; l=; v=; k=
 while [ $# -gt 0 ]; do
   case $1 in
@@ -1185,6 +1250,10 @@ if [ -f "$D/early" ]; then echo "$T: unable to resolve host test: Name or servic
 rules=$(cat "$D/rules.$T")
 case $rules in
   *none*) [ -n "$l" ] && exit 1; echo "Sorry, user bob may not run $T on test." >&2; exit 1;;
+  *shell*first*) if [ -z "$v" ] && [ "$*" != "su -" ]; then
+      [ -n "$l" ] && exit 1
+      echo "Sorry, user bob is not allowed to execute '$*' as root on test." >&2; exit 1
+    fi;;
 esac
 need=1
 case $rules in *nopasswd*) need=;; esac
@@ -1279,6 +1348,28 @@ exec "$@"
         pub(crate) fn attempts(&self) -> usize {
             std::fs::read_to_string(self.dir.join("attempts")).map(|s| s.lines().count()).unwrap_or(0)
         }
+
+        /// How many times `tool` ran, password or not.
+        pub(crate) fn called(&self, tool: &str) -> usize {
+            std::fs::read_to_string(self.dir.join(format!("called.{tool}"))).map(|s| s.lines().count()).unwrap_or(0)
+        }
+
+        /// This server without `tool`.
+        pub(crate) fn remove(&self, tool: &str) {
+            std::fs::remove_file(self.dir.join(tool)).unwrap();
+        }
+
+        /// dzdo only in Centrify's own folder (ROOT_TOOL_EXTRA_PATH; the
+        /// tests' `centrifydc/bin` in the server's folder), not on the
+        /// system's: that folder.
+        pub(crate) fn dzdo_in_centrify_folder(&self) -> PathBuf {
+            let folder = self.dir.join("centrifydc/bin");
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::set_permissions(self.dir.join("centrifydc"), std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::rename(self.dir.join("dzdo"), folder.join("dzdo")).unwrap();
+            folder
+        }
     }
 
     impl Drop for Lab {
@@ -1305,12 +1396,12 @@ exec "$@"
         let cmd = words("echo ran as root");
         // Without the password: dzdo wants it, and no root shell goes without.
         assert_eq!(root_probe(&lab.handle, "dzdo", None, &cmd, false).await, Err(SUDO_NEED_PASSWORD.to_string()));
-        assert_eq!(find_root_shell(&lab.handle, &["dzdo"], false).await, None);
+        assert_eq!(find_root_shell(&lab.handle, "dzdo", false).await, Err(SUDO_NEED_PASSWORD.to_string()));
         assert_eq!(lab.attempts(), 0);
         // With it: the command itself isn't allowed, `dzdo su -` is.
         assert_eq!(root_probe(&lab.handle, "dzdo", Some("s3cret pass"), &cmd, false).await, Err(SUDO_NOT_ALLOWED.to_string()));
-        let found = find_root_shell_with_password(&lab.handle, &["dzdo"], &pw("s3cret pass"), false).await;
-        assert_eq!(found, Ok(Some(("dzdo", "su -"))));
+        let found = find_root_shell_with_password(&lab.handle, "dzdo", &pw("s3cret pass"), false).await;
+        assert_eq!(found, Ok(Some("su -")));
         assert_eq!(lab.attempts(), 2);
         // A command through it: one sign-in, then the ticket.
         let (code, out) = root_run(&lab.handle, &su("s3cret pass"), &cmd, 30, None).await.unwrap();
@@ -1321,12 +1412,133 @@ exec "$@"
     #[tokio::test]
     async fn a_wrong_password_is_tried_once() {
         let lab = Lab::new("wrong", "shell", "none").await;
-        let found = find_root_shell_with_password(&lab.handle, &["dzdo"], &pw("not it"), false).await;
+        let found = find_root_shell_with_password(&lab.handle, "dzdo", &pw("not it"), false).await;
         assert_eq!(found, Err(SUDO_WRONG_PASSWORD.to_string()));
         // Not the root shell's line as a second try, not the next form.
         assert_eq!(lab.attempts(), 1);
         assert_eq!(root_run(&lab.handle, &su("not it"), &["true".to_string()], 30, None).await, Err(SUDO_WRONG_PASSWORD.to_string()));
         assert_eq!(lab.attempts(), 2);
+    }
+
+    /// dzdo whose only rule is `su -`, with no password: root through
+    /// `dzdo su -`, and sudo, which would allow the command, is never run
+    /// (#232). SFTP root mode the same way.
+    #[tokio::test]
+    async fn dzdo_su_without_a_password_comes_before_sudo() {
+        let lab = Lab::new("dzdo-su-first", "shell nopasswd first", "all nopasswd").await;
+        let cmd = words("echo ran as root");
+        let found = find_root_without_password(&lab.handle, &cmd, true).await.unwrap();
+        assert_eq!((found.tool, found.shell, found.no_tickets), ("dzdo", Some("su -"), true));
+        let (code, out) = root_run(&lab.handle, &found, &cmd, 30, None).await.unwrap();
+        assert_eq!((code, out.trim()), (0, "ran as root"));
+        if let Ok((_, tool, shell)) = probe_sudo_sftp(&lab.handle, None).await {
+            assert_eq!((tool, shell), ("dzdo", Some("su -")));
+        }
+        assert_eq!(lab.called("sudo"), 0, "sudo was asked");
+        assert_eq!(lab.attempts(), 0);
+    }
+
+    /// dzdo whose only rule is `su -`, with a password, where sudo wants one
+    /// too: the card asks for it for dzdo, and the password goes to
+    /// `dzdo su -`, never to sudo (#232).
+    #[tokio::test]
+    async fn dzdo_su_with_a_password_comes_before_sudo() {
+        let lab = Lab::new("dzdo-su-pw-first", "shell first", "all").await;
+        let cmd = words("echo ran as root");
+        let asked = find_root_without_password(&lab.handle, &cmd, true).await.err();
+        assert_eq!(asked, Some((SUDO_NEED_PASSWORD.to_string(), Some("dzdo"))));
+        assert_eq!(probe_sudo_sftp(&lab.handle, None).await.err(), Some(SUDO_NEED_PASSWORD.to_string()));
+        assert_eq!(lab.called("sudo"), 0, "sudo was asked");
+        assert_eq!(find_root_with_password(&lab.handle, &cmd, &pw("s3cret pass"), true).await, Ok(("dzdo", Some("su -"))));
+        let state = SshState::new();
+        let a = typed_root_access(&state, "tab", &lab.handle, &cmd, pw("s3cret pass")).await.unwrap();
+        assert_eq!((a.tool, a.shell), ("dzdo", Some("su -")));
+        if let Ok((_, tool, shell)) = probe_sudo_sftp(&lab.handle, Some(&pw("s3cret pass"))).await {
+            assert_eq!((tool, shell), ("dzdo", Some("su -")));
+        }
+        assert_eq!(lab.called("sudo"), 0, "sudo got the password");
+    }
+
+    /// dzdo and sudo both want a password: it's asked for for dzdo, and
+    /// sudo isn't asked anything.
+    #[tokio::test]
+    async fn where_both_want_a_password_it_is_dzdos() {
+        let lab = Lab::new("both-pw", "all", "all").await;
+        let cmd = words("true");
+        assert_eq!(find_root_without_password(&lab.handle, &cmd, true).await.err(), Some((SUDO_NEED_PASSWORD.to_string(), Some("dzdo"))));
+        assert_eq!(find_root_with_password(&lab.handle, &cmd, &pw("s3cret pass"), true).await, Ok(("dzdo", None)));
+        assert_eq!(lab.called("sudo"), 0);
+        assert_eq!(lab.attempts(), 1);
+    }
+
+    /// A wrong password to dzdo, through its root shell or for the command:
+    /// one attempt, and sudo never gets it.
+    #[tokio::test]
+    async fn a_wrong_password_to_dzdo_never_reaches_sudo() {
+        for rules in ["shell first", "all"] {
+            let lab = Lab::new(&format!("dzdo-wrong-{}", rules.len()), rules, "all").await;
+            let got = find_root_with_password(&lab.handle, &words("true"), &pw("not it"), true).await;
+            assert_eq!(got, Err((SUDO_WRONG_PASSWORD.to_string(), Some("dzdo"))), "{rules}");
+            assert_eq!(lab.attempts(), 1, "{rules}");
+            assert_eq!(lab.called("sudo"), 0, "{rules}");
+        }
+    }
+
+    /// Where dzdo isn't there, or refuses even its root shell, sudo as
+    /// before: without a password and with one.
+    #[tokio::test]
+    async fn sudo_where_dzdo_cant_give_root() {
+        for dzdo in [None, Some("none")] {
+            let lab = Lab::new(&format!("sudo-{}", dzdo.is_some()), dzdo.unwrap_or("none"), "all nopasswd").await;
+            if dzdo.is_none() {
+                lab.remove("dzdo");
+            }
+            let cmd = words("echo ran as root");
+            let found = find_root_without_password(&lab.handle, &cmd, true).await.unwrap();
+            assert_eq!((found.tool, found.shell), ("sudo", None), "{dzdo:?}");
+            lab.set("rules.sudo", "all");
+            assert_eq!(find_root_without_password(&lab.handle, &cmd, true).await.err(), Some((SUDO_NEED_PASSWORD.to_string(), Some("sudo"))));
+            assert_eq!(find_root_with_password(&lab.handle, &cmd, &pw("s3cret pass"), true).await, Ok(("sudo", None)), "{dzdo:?}");
+        }
+    }
+
+    /// dzdo only in Centrify's own folder: found, without a password and
+    /// with one. Where the login (its group, anyone) can change it or its
+    /// folder, or root doesn't own it, it's never run: sudo is asked.
+    #[tokio::test]
+    async fn dzdo_in_centrifys_folder() {
+        let lab = Lab::new("centrify", "all nopasswd", "all nopasswd").await;
+        let folder = lab.dzdo_in_centrify_folder();
+        let cmd = words("echo ran as root");
+        let found = find_root_without_password(&lab.handle, &cmd, true).await.unwrap();
+        assert_eq!(found.tool, "dzdo");
+        let (code, out) = root_run(&lab.handle, &found, &cmd, 30, None).await.unwrap();
+        assert_eq!((code, out.trim()), (0, "ran as root"));
+        lab.set("rules.dzdo", "all");
+        assert_eq!(find_root_with_password(&lab.handle, &cmd, &pw("s3cret pass"), true).await, Ok(("dzdo", None)));
+        assert_eq!(lab.called("sudo"), 0);
+        lab.set("rules.dzdo", "all nopasswd");
+        let tool = folder.join("dzdo");
+        let mut cases: Vec<(&str, PathBuf, u32)> = vec![("folder", folder.clone(), 0o777), ("file", tool.clone(), 0o775)];
+        // SAFETY: geteuid can't fail.
+        let as_root = unsafe { libc::geteuid() } == 0;
+        if as_root {
+            // As root, the tool can be given to another owner.
+            cases.push(("owner", tool.clone(), 0o755));
+        }
+        for (what, path, mode) in cases {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            if what == "owner" {
+                std::os::unix::fs::chown(&tool, Some(65534), None).unwrap();
+            }
+            let before = lab.called("dzdo");
+            let found = find_root_without_password(&lab.handle, &cmd, true).await.unwrap();
+            assert_eq!(found.tool, "sudo", "{what}");
+            assert_eq!(root_probe(&lab.handle, "dzdo", Some("s3cret pass"), &cmd, true).await, Err(SUDO_NO_SUDO.to_string()), "{what}");
+            assert_eq!(lab.called("dzdo"), before, "{what}: it ran");
+            assert_eq!(lab.attempts(), 1, "{what}");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     /// Where the tool asks for nothing (a NOPASSWD rule), the password never
@@ -1680,10 +1892,12 @@ pub(crate) fn sftp_probe_command(tool: &str, password: bool) -> String {
     remote_sh::sh_command_with("/bin/sh", &env, SUDO_SFTP_PROBE, &[])
 }
 
-/// Programs that can run sftp-server as root, in the order they're tried.
-/// `dzdo` first: a host that has it is managed through it, and sudo there is
-/// often present but not set up for the user. Hosts without dzdo answer
-/// NO_SUDO for it at once and go on to sudo.
+/// Programs that can run a command (or sftp-server) as root, in the order
+/// they're tried. `dzdo` first: a host that has it is managed through it,
+/// often with a rule for `dzdo su -` only, and sudo there is often present
+/// but not set up for the user. So dzdo's root shell is tried too before
+/// sudo is asked anything (#232). Hosts without dzdo answer NO_SUDO for it
+/// at once and go on to sudo.
 pub(crate) const ELEVATION_TOOLS: &[&str] = &["dzdo", "sudo"];
 
 /// The error worth showing when no tool worked: one the user can act on
@@ -1703,50 +1917,54 @@ pub(crate) fn elevation_error_rank(e: &str) -> u8 {
 /// Find sftp-server and a tool (ELEVATION_TOOLS) that may run it as root.
 /// Returns the sftp-server path and the tool.
 ///
-/// Without a password every tool gets a try, so a passwordless sudo isn't
-/// missed behind a dzdo that wants one. With one, a tool that isn't there or
-/// doesn't allow the user hands over to the next, and any other answer (a
-/// wrong password above all) ends it, so a mistyped password counts as one
-/// failed attempt, not one per tool.
-///
-/// When no tool may run sftp-server itself, a root shell is tried next:
-/// without a password (find_root_shell), `dzdo su -` with no password is
-/// how many AD-managed hosts give root, and must not end in a password
-/// prompt; with one (find_root_shell_with_password), `dzdo su -` that asks
-/// for it. Returns the root shell's words too, when that's the way in.
+/// In the order find_root_without_password and find_root_with_password ask
+/// (#232): each tool for sftp-server itself, then, where it refuses that,
+/// for its root shell: without a password (find_root_shell), `dzdo su -`
+/// with no password is how many AD-managed hosts give root, and must not
+/// end in a password prompt; with one (find_root_shell_with_password),
+/// `dzdo su -` that asks for it. Returns the root shell's words too, when
+/// that's the way in. The next tool is asked only once this one isn't there
+/// or refuses even its root shell: where dzdo wants the password, that's
+/// the answer, and sudo isn't asked. With a password, any answer but those
+/// two (a wrong password above all) ends it, so a mistyped password counts
+/// as one failed attempt, not one per tool.
 pub(crate) async fn probe_sudo_sftp<H: russh::client::Handler>(
     session_arc: &HandleArc<H>,
     password: Option<&zeroize::Zeroizing<String>>,
 ) -> Result<(String, &'static str, Option<&'static str>), String> {
     let mut best: Option<String> = None;
-    let mut refused: Vec<&'static str> = Vec::new();
-    for tool in ELEVATION_TOOLS {
-        match probe_sudo_sftp_with(session_arc, password.map(|p| p.as_str()), tool).await {
+    for &tool in ELEVATION_TOOLS {
+        let mut e = match probe_sudo_sftp_with(session_arc, password.map(|p| p.as_str()), tool).await {
             Ok(path) => return Ok((path, tool, None)),
-            // A fact about the server, whichever tool asked.
-            Err(e) if e == SUDO_NO_SFTP_SERVER => return Err(e),
-            Err(e) if password.is_some() && e != SUDO_NO_SUDO && e != SUDO_NOT_ALLOWED => return Err(e),
-            Err(e) => {
-                if e == SUDO_NOT_ALLOWED {
-                    refused.push(tool);
+            Err(e) => e,
+        };
+        // A fact about the server, whichever tool asked.
+        if e == SUDO_NO_SFTP_SERVER {
+            return Err(e);
+        }
+        if e != SUDO_NO_SUDO {
+            crate::applog::write_line("root", &format!("SFTP as root: {} may not run sftp-server itself ({})", tool, e));
+        }
+        if e == SUDO_NOT_ALLOWED {
+            let shell = match password {
+                None => find_root_shell(session_arc, tool, false).await,
+                Some(pw) => find_root_shell_with_password(session_arc, tool, pw, false).await?.ok_or_else(|| SUDO_NOT_ALLOWED.to_string()),
+            };
+            match shell {
+                Ok(form) => {
+                    let path = find_sftp_server(session_arc).await?;
+                    crate::applog::write_line("root", &format!("SFTP as root: through `{} {}`", tool, form));
+                    return Ok((path, tool, Some(form)));
                 }
-                if e != SUDO_NO_SUDO {
-                    crate::applog::write_line("root", &format!("SFTP as root: {} may not run sftp-server itself ({})", tool, e));
-                }
-                if best.as_deref().is_none_or(|b| elevation_error_rank(&e) > elevation_error_rank(b)) {
-                    best = Some(e);
-                }
+                Err(shell) => e = shell,
             }
         }
-    }
-    let shell = match password {
-        None => find_root_shell(session_arc, &refused, false).await,
-        Some(pw) => find_root_shell_with_password(session_arc, &refused, pw, false).await?,
-    };
-    if let Some((tool, form)) = shell {
-        let path = find_sftp_server(session_arc).await?;
-        crate::applog::write_line("root", &format!("SFTP as root: through `{} {}`", tool, form));
-        return Ok((path, tool, Some(form)));
+        if e == SUDO_NEED_PASSWORD || (password.is_some() && e != SUDO_NO_SUDO && e != SUDO_NOT_ALLOWED) {
+            return Err(e);
+        }
+        if best.as_deref().is_none_or(|b| elevation_error_rank(&e) > elevation_error_rank(b)) {
+            best = Some(e);
+        }
     }
     Err(best.unwrap_or_else(|| SUDO_NO_SUDO.into()))
 }

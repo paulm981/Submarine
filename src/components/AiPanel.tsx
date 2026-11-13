@@ -1,7 +1,7 @@
 import { ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Bot, Check, ChevronDown, ChevronRight, Loader2, ShieldAlert, Square, X, Zap } from "lucide-react";
-import { AiDone, AiPending, AiRunning, AiServerAsk, AiServerCandidate, AiSnapshot, cardsOf, openServerTab, pickFrom, serverTarget, copyCard, followLimit, followSoFar, runnerWarning, STEERED_BY_OUTPUT } from "../util/ai";
+import { AiDone, AiPending, AiRunning, AiServerAsk, AiServerCandidate, AiSnapshot, cardsOf, openServerTab, pickFrom, serverTarget, copyCard, followLimit, followSoFar, passwordAsk, runnerWarning, STEERED_BY_OUTPUT } from "../util/ai";
 import { formatBytes } from "../fork/bulk/plan";
 import { HIDDEN_CONTROLS } from "../util/fileName";
 import { WILDCARD_WARNING } from "./AiTrust";
@@ -246,7 +246,7 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
   members?: AiPending[];
   /// The server's approval level now (#115).
   level: number;
-  /// Allow (with the root password typed on a card as root, if any), or
+  /// Allow (with the password typed on a card as root, if any), or
   /// Deny with an optional note for the AI.
   decide: (allow: boolean, note?: string, password?: string) => void;
   /// The card's other actions: "Always allow this command here" and "Allow
@@ -260,8 +260,9 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
   const [extra, setExtra] = useState<"rule" | "note" | null>(null);
   const [rule, setRule] = useState(p.command.trim());
   const [note, setNote] = useState("");
-  // The root password for a request as root (#120): typed here, sent only
-  // with Allow, to the app, which hands it to sudo's or dzdo's own prompt.
+  // The login's password for a request as root (#120, #232): typed here,
+  // sent only with Allow, to the app, which hands it to dzdo's or sudo's own
+  // prompt.
   // Never shown, and cleared as it's sent or when the card asks again.
   const [password, setPassword] = useState("");
   useEffect(() => { setPassword(""); }, [p.password]);
@@ -344,7 +345,7 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
         <span className="font-bold text-white">{p.tab_label}</span> wants to {p.follow ? "follow" : "run"} on{" "}
         <NoFocusButton onPick={() => onGoToServer(p.session_id)} className="font-bold text-white hover:underline">{p.server}</NoFocusButton>
         {p.as_root ? (
-          <> as <span className="font-bold text-amber-300">root</span>{!loginIsRoot && <span className="text-zinc-400"> (via {p.root_via ?? "sudo or dzdo"})</span>}</>
+          <> as <span className="font-bold text-amber-300">root</span>{!loginIsRoot && <span className="text-zinc-400"> (via {p.root_via ?? "dzdo or sudo"})</span>}</>
         ) : p.user && <> as <span className={`font-bold ${loginIsRoot ? "text-amber-300" : "text-white"}`}>{p.user}</span></>}
         {p.follow
           ? <span className="text-zinc-500"> · {followLimit(p)}</span>
@@ -419,7 +420,7 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
             <p className="text-[11px] text-red-300 leading-snug">That password didn't work, and counted as one try. Type it again, or deny.</p>
           )}
           {p.password === "needed" && (
-            <p className="text-[11px] text-amber-300 leading-snug">{p.server} asks for a root password{p.root_via ? ` (${p.root_via})` : ""}.</p>
+            <p className="text-[11px] text-amber-300 leading-snug">{passwordAsk(p).line}</p>
           )}
           <input
             type="password"
@@ -431,12 +432,12 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
             autoCapitalize="off"
             spellCheck={false}
             name={`ai-root-${p.id}`}
-            placeholder={p.password === "optional" ? "Root password (leave empty if the server doesn't ask)" : "Root password"}
-            aria-label={`The root password for ${p.server}`}
+            placeholder={passwordAsk(p).placeholder}
+            aria-label={passwordAsk(p).label}
             className={`${field} font-sans`}
           />
           <p className="text-[10px] text-zinc-500 leading-snug">
-            Kept for this AI tab and server until access ends. It goes only to sudo's or dzdo's own prompt, never to the AI or the logs.
+            Kept for this AI tab and server until access ends. It goes only to dzdo's or sudo's own prompt, never to the AI or the logs.
             It's only as safe as the server account, though: a program running as that account could catch it. A sudoers rule that
             needs no password for the commands you want is safer.
           </p>
