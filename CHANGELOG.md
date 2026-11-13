@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.75
+
+- **Pick which server to share when several have the name.** When the AI asks for a server by a name more than one of your saved servers has, its card lists them, each with its folder and host and whether it's open now, and you share the one you mean. One that's open now is at the top, with **Use this one (open now)**: it's shared from its tab straight away. Nothing is shared until you click. The AI hears nothing about the list. ([#230](https://github.com/paulm981/Submarine/issues/230))
+
 ## v0.4.0-fork.74
 
 - **Connections can be left alone.** Settings › Servers & sessions has **Send keepalives** and **Reconnect automatically**, both on as before; a server can have its own choice in its form. With reconnecting off, a dropped session stays down until you press Reconnect, and a kept session is waiting for you when you do. A server that says why it closed the connection has its reason in the banner. (Their [#310](https://github.com/SinaXhpm/submarine/pull/310); [#227](https://github.com/paulm981/Submarine/issues/227))
