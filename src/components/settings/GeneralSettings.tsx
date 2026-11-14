@@ -68,8 +68,8 @@ export function UiCustomizationExtras({ settings, setSettings }: any) {
       <div className="pt-6 border-t border-white/5">
         <SwitchRow
           title="Compact tabs"
-          line="Flat tabs that touch, so more fit across. Off, tabs are the rounded pills."
-          more="The tab in front has a thin line under it. Long names are cut short: hover for the whole name."
+          line="Narrower tabs, so more fit across. Long names are cut short: hover for the whole name."
+          more="A server's own terminal tabs lie flat and touch, with a thin line under the one in front. Off, they're rounded."
           on={!!settings.compactTabs}
           onToggle={() => setSettings((s: any) => ({ ...s, compactTabs: !s.compactTabs }))}
         />

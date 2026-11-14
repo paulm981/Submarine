@@ -18,7 +18,7 @@ import { readRdpOptions, writeRdpOptions } from "../../util/rdpOptions";
 import { readSessionKeep, writeSessionKeep } from "../../util/sessionKeep";
 import { serverProtocol } from "../../util/serverProtocol";
 import {
-  type CloseWhich, type DesktopSession, HAS_HOME, START_VIEW, osChecksDue, sessionFor, stepTab, tabsToClose,
+  type CloseWhich, type DesktopSession, HAS_HOME, START_VIEW, inRemoteDesktop, osChecksDue, sessionFor, stepTab, tabsToClose,
 } from "./rules";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -162,7 +162,11 @@ export const useOsBadges = (o: {
 /** Closing tabs: one connected session asks first, unless that's turned off
  *  in Settings › Servers, or with "Don't ask again" right in the prompt
  *  (`askCloseSession`). `closeSessions` closes several (All tabs ▾), always
- *  asking first when any is connected; false when the user said no.
+ *  asking first when any is connected; false when the user said no. With
+ *  `ask` false it asks nothing (the original project's closeTab, #339, for
+ *  its phone list and a tab's menu). Every way of closing a tab comes here:
+ *  the ×, a middle click, the menu, All tabs, so each forgets the tab's name
+ *  and split and goes back to Home.
  *  Unmounting a SessionView disconnects it. `closeTabs` is a tab's
  *  right-click menu: the tabs other than it, after it, the disconnected
  *  ones, or every one. */
@@ -182,10 +186,10 @@ export const useCloseSessions = <S extends { id: string }, T extends { confirmCl
     destructive: true,
     dontAskAgain: () => o.setAppSettings(s => ({ ...s, confirmCloseSession: false })),
   }));
-  const closeSessions = async (ids: string[]): Promise<boolean> => {
+  const closeSessions = async (ids: string[], ask = true): Promise<boolean> => {
     if (ids.length === 0) return true;
     const connected = ids.filter(id => o.statuses[id] === "connected").length;
-    if (connected > 0) {
+    if (ask && connected > 0) {
       const ok = ids.length === 1 ? await askCloseSession() : await confirm({
         title: `Close ${ids.length} sessions?`,
         message: connected === 1 ? "1 of them is connected; its SSH connection will be dropped." : `${connected} of them are connected; ${connected} SSH connections will be dropped.`,
@@ -223,7 +227,10 @@ export const useCloseSessions = <S extends { id: string }, T extends { confirmCl
  *  by name (its search is focused); Ctrl+Tab / Ctrl+Shift+Tab step through
  *  the title bar left to right: Home, Broadcast's tab while it's on, then the server tabs (stepTab).
  *  preventDefault keeps the webview from doing anything of its own with
- *  Ctrl+Tab. Returns whether All tabs ▾ is open. */
+ *  Ctrl+Tab. Inside a remote desktop (`data-remote-keys`, the original
+ *  project's #339) Ctrl+Tab is the remote's own, so it's left alone there.
+ *  Returns whether All tabs ▾ is open, and the tabs in the strip's order
+ *  (for its dividers, tabDivider). */
 export const useTabKeys = (o: {
   isUnlocked: boolean; sessions: { id: string }[]; activeView: string;
   mergedSessionIds: string[]; setMergedSessionIds: (ids: string[]) => void; setActiveView: (v: string) => void;
@@ -252,6 +259,7 @@ export const useTabKeys = (o: {
     const onKey = (e: KeyboardEvent) => {
       const k = appHotkey(e);
       if (k !== "jump" && k !== "next" && k !== "prev") return;
+      if (k !== "jump" && inRemoteDesktop(e.target)) return;
       e.preventDefault();
       if (e.repeat && k === "jump") return;
       // Not under a dialog: what it asks about is the view as it is.
@@ -262,7 +270,7 @@ export const useTabKeys = (o: {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
-  return [allTabsOpen, setAllTabsOpen] as const;
+  return [allTabsOpen, setAllTabsOpen, order] as const;
 };
 
 /** "Pick a jump host", from a tab whose server's jump host was deleted

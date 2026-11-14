@@ -99,6 +99,21 @@ export const stepTab = (order: string[], current: string, dir: 1 | -1): string |
   return order[at < 0 ? (dir > 0 ? 0 : order.length - 1) : (at + dir + order.length) % order.length];
 };
 
+/** A key typed inside a remote desktop (RDP or VNC): the original project
+ *  marks its screen `data-remote-keys` (#339), and the app's own shortcuts
+ *  leave those keys to the remote. */
+export const inRemoteDesktop = (target: EventTarget | null): boolean =>
+  !!(target as Element | null)?.closest?.("[data-remote-keys]");
+
+/** The thin line after a title-bar tab, as the original project draws it
+ *  between its classic tabs (#339): between two tabs where neither is the
+ *  open one. `order` is the strip's, Home and Broadcast's tab included
+ *  (useTabKeys). */
+export const tabDivider = (order: readonly string[], activeView: string, id: string): boolean => {
+  const at = order.indexOf(id);
+  return at >= 0 && id !== activeView && at + 1 < order.length && order[at + 1] !== activeView;
+};
+
 /** Where a server tab's view goes in the sessions canvas. `style` is the
  *  place it has when it's on screen (in a split, a column of it), undefined
  *  when it isn't.

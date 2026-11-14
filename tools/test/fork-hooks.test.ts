@@ -35,7 +35,7 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
       "Fork.readForkSettings", "Fork.writeForkSettings", "Fork.useServerLooks", "Fork.useHighlightRules", "Fork.useHeldActions",
       "Fork.useLiveEditKept", "Fork.useBroadcastWall", "Fork.broadcastSwitch", "Fork.wouldEnd", "Fork.useOsBadges", "Fork.useCloseSessions", "Fork.useTabKeys", "Fork.useTabStrip",
       "Fork.useJumpHostPick", "Fork.useSessionTree", "Fork.aiPaneViewOf", "Fork.saveServerLooks", "Fork.sessionPaneStyle",
-      "Fork.tabMenuStyle", "Fork.titleTabClass", "Fork.AppVersion", "Fork.HomeTab", "Fork.HomeView", "Fork.NewsDot",
+      "Fork.tabMenuStyle", "Fork.tabDivider", "Fork.AppVersion", "Fork.HomeTab", "Fork.HomeView", "Fork.NewsDot",
       "Fork.TabAiMarker", "Fork.AllTabsButton", "Fork.AiTitleButtons", "Fork.TabMoveItems", "Fork.TabCloseItems",
       "Fork.DesktopSessionTree", "Fork.DesktopAiSide", "Fork.PingPanel", "Fork.DesktopAiPanel", "Fork.AiTrustModal", "Fork.TerminalTurn",
       "Fork.BulkTransfer", "Fork.BulkTabItems", "Fork.BroadcastBar", "Fork.BroadcastTileChips", "Fork.BroadcastTab", "Fork.shownTabs",
