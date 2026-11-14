@@ -544,8 +544,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::exec::Exec;
-    use crate::ai::Executor;
+    use crate::ai_tabs::exec::Exec;
+    use crate::ai_tabs::Executor;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, DuplexStream};
 

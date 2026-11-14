@@ -464,7 +464,7 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
       <div className="flex flex-col items-start gap-1">
         {tryFirst && (
           <NoFocusButton
-            onPick={() => act("ai_decide", { id: tryFirst.id, allow: true, note: null, password: null })}
+            onPick={() => act("ai_tab_decide", { id: tryFirst.id, allow: true, note: null, password: null })}
             onDown={down}
             accept={accept}
             title={`Runs it on ${tryFirst.server} only. Its result shows in this panel, and the other servers keep waiting here for your Allow or Deny. The AI hears back once you've answered for all of them.`}
@@ -748,7 +748,7 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
               </div>
             </div>
             <NoFocusButton
-              onPick={() => run("ai_stop", { tabId: t.id })}
+              onPick={() => run("ai_tab_stop", { tabId: t.id })}
               title={`Stop: share nothing more with ${t.label}, and cancel what it asked for`}
               className="shrink-0 h-6 px-2 rounded border border-white/10 text-[10px] font-bold uppercase tracking-wider text-zinc-300 hover:border-red-400/50 hover:text-red-300 flex items-center gap-1"
             >
@@ -767,7 +767,7 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
             level={levelOf(snap, p.tab_id, p.session_id)}
             decide={(allow, note, password) => members.length > 1 && p.group
               ? run("ai_decide_group", { group: p.group.id, allow, note: note ?? null })
-              : run("ai_decide", { id: p.id, allow, note: note ?? null, password: password || null })}
+              : run("ai_tab_decide", { id: p.id, allow, note: note ?? null, password: password || null })}
             act={run}
             onGoToServer={onGoToServer}
           />

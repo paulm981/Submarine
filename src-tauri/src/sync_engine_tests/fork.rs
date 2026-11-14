@@ -18,13 +18,13 @@ fn a_shared_profile_holds_a_move_that_loosens_the_ai_s_level() {
     .unwrap();
     let (b, hb) = device("B");
     approvals::create_schema(&b).unwrap();
-    ai::trust::create_schema(&b, "this-install-0000").unwrap();
+    ai_tabs::trust::create_schema(&b, "this-install-0000").unwrap();
     b.execute("INSERT INTO sync_meta(key,value) VALUES('share_id','s1')", []).unwrap();
     apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
     let id_of = |c: &Connection, t: &str, n: &str| -> i64 { c.query_row(&format!("SELECT id FROM {t} WHERE name=?1"), [n], |r| r.get(0)).unwrap() };
     let (db, lab) = (id_of(&b, "servers", "db-01"), id_of(&b, "folders", "Lab"));
     let uuid: String = b.query_row("SELECT uuid FROM servers WHERE id=?1", [db], |r| r.get(0)).unwrap();
-    ai::trust::set_level(&b, "folder", lab, Some(3)).unwrap();
+    ai_tabs::trust::set_level(&b, "folder", lab, Some(3)).unwrap();
     let held = |b: &Connection| -> Vec<String> { approvals::held_for(b, &uuid).into_iter().collect() };
     let sync = |a: &Connection, b: &Connection| apply_remote_records(b, &KEY, &collect_local_records(a, &KEY, "").unwrap(), &hb).unwrap();
 
@@ -37,15 +37,15 @@ fn a_shared_profile_holds_a_move_that_loosens_the_ai_s_level() {
     sync(&a, &b);
     let items = held(&b);
     assert_eq!(items.len(), 1, "{items:?}");
-    let h: ai::trust::HeldPolicy = serde_json::from_str(&items[0][ai::trust::HELD_ITEM.len()..]).unwrap();
+    let h: ai_tabs::trust::HeldPolicy = serde_json::from_str(&items[0][ai_tabs::trust::HELD_ITEM.len()..]).unwrap();
     assert_eq!((h.level, h.moved.as_str(), h.moved_folder, h.into.as_str()), (3, "db-01", false, "Lab"));
-    let p = ai::trust::policy_for(&b, Some(db));
+    let p = ai_tabs::trust::policy_for(&b, Some(db));
     assert_eq!(p.level, 1);
     assert!(p.force_ask.is_some());
     // Allowed, it's what Lab says.
     approvals::allow(&b, &uuid, &[]).unwrap();
-    assert_eq!(ai::trust::policy_for(&b, Some(db)), ai::trust::Policy { level: 3, ..ai::trust::policy_for(&b, Some(db)) });
-    assert!(ai::trust::policy_for(&b, Some(db)).force_ask.is_none());
+    assert_eq!(ai_tabs::trust::policy_for(&b, Some(db)), ai_tabs::trust::Policy { level: 3, ..ai_tabs::trust::policy_for(&b, Some(db)) });
+    assert!(ai_tabs::trust::policy_for(&b, Some(db)).force_ask.is_none());
 
     // Out again, then its old folder moved into Lab: held, naming the
     // folder.
@@ -54,21 +54,21 @@ fn a_shared_profile_holds_a_move_that_loosens_the_ai_s_level() {
     assert!(held(&b).is_empty(), "a move that lets the AI do less isn't held");
     a.execute("UPDATE folders SET parent_id=(SELECT id FROM folders WHERE name='Lab') WHERE name='Prod'", []).unwrap();
     sync(&a, &b);
-    let h: ai::trust::HeldPolicy = serde_json::from_str(&held(&b)[0][ai::trust::HELD_ITEM.len()..]).unwrap();
+    let h: ai_tabs::trust::HeldPolicy = serde_json::from_str(&held(&b)[0][ai_tabs::trust::HELD_ITEM.len()..]).unwrap();
     assert_eq!((h.moved.as_str(), h.moved_folder, h.into.as_str()), ("Prod", true, "Lab"));
     // Kept as it was: no longer held, and "Ask every time" here.
-    ai::trust::keep_as_it_was(&b, db).unwrap();
+    ai_tabs::trust::keep_as_it_was(&b, db).unwrap();
     assert!(held(&b).is_empty());
-    let p = ai::trust::policy_for(&b, Some(db));
+    let p = ai_tabs::trust::policy_for(&b, Some(db));
     assert_eq!((p.level, p.force_ask.is_none()), (1, true));
 
     // A personal profile holds nothing.
     let (c, hc) = device("C");
     approvals::create_schema(&c).unwrap();
-    ai::trust::create_schema(&c, "this-install-0000").unwrap();
+    ai_tabs::trust::create_schema(&c, "this-install-0000").unwrap();
     a.execute("UPDATE folders SET parent_id=NULL WHERE name='Prod'", []).unwrap();
     apply_remote_records(&c, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hc).unwrap();
-    ai::trust::set_level(&c, "folder", id_of(&c, "folders", "Lab"), Some(3)).unwrap();
+    ai_tabs::trust::set_level(&c, "folder", id_of(&c, "folders", "Lab"), Some(3)).unwrap();
     a.execute("UPDATE servers SET folder_id=(SELECT id FROM folders WHERE name='Lab') WHERE name='db-01'", []).unwrap();
     apply_remote_records(&c, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hc).unwrap();
     assert!(approvals::held_by_server(&c).is_empty());
@@ -87,20 +87,20 @@ fn a_shared_profile_holds_new_and_re_pointed_servers() {
     .unwrap();
     let (b, hb) = device("B");
     approvals::create_schema(&b).unwrap();
-    ai::trust::create_schema(&b, "this-install-0000").unwrap();
+    ai_tabs::trust::create_schema(&b, "this-install-0000").unwrap();
     b.execute("INSERT INTO sync_meta(key,value) VALUES('share_id','s1')", []).unwrap();
     let sync = |a: &Connection, b: &Connection| apply_remote_records(b, &KEY, &collect_local_records(a, &KEY, "").unwrap(), &hb).unwrap();
     sync(&a, &b);
     let id_of = |c: &Connection, t: &str, n: &str| -> i64 { c.query_row(&format!("SELECT id FROM {t} WHERE name=?1"), [n], |r| r.get(0)).unwrap() };
-    let held_of = |b: &Connection, name: &str| -> Option<ai::trust::HeldPolicy> {
+    let held_of = |b: &Connection, name: &str| -> Option<ai_tabs::trust::HeldPolicy> {
         let uuid: String = b.query_row("SELECT uuid FROM servers WHERE name=?1", [name], |r| r.get(0)).unwrap();
         approvals::held_for(b, &uuid)
             .into_iter()
-            .find(|i| i.starts_with(ai::trust::HELD_ITEM))
-            .map(|i| serde_json::from_str(&i[ai::trust::HELD_ITEM.len()..]).unwrap())
+            .find(|i| i.starts_with(ai_tabs::trust::HELD_ITEM))
+            .map(|i| serde_json::from_str(&i[ai_tabs::trust::HELD_ITEM.len()..]).unwrap())
     };
-    ai::trust::set_level(&b, "folder", id_of(&b, "folders", "Lab"), Some(3)).unwrap();
-    ai::trust::set_level(&b, "server", id_of(&b, "servers", "db-01"), Some(2)).unwrap();
+    ai_tabs::trust::set_level(&b, "folder", id_of(&b, "folders", "Lab"), Some(3)).unwrap();
+    ai_tabs::trust::set_level(&b, "server", id_of(&b, "servers", "db-01"), Some(2)).unwrap();
 
     // New in Lab: held. New in Quiet: not.
     a.execute_batch(
@@ -111,7 +111,7 @@ fn a_shared_profile_holds_new_and_re_pointed_servers() {
     sync(&a, &b);
     let h = held_of(&b, "lab-01").expect("held");
     assert_eq!((h.change.as_str(), h.level, h.moved.as_str(), h.into.as_str()), ("added", 3, "lab-01", "Lab"));
-    assert_eq!(ai::trust::policy_for(&b, Some(id_of(&b, "servers", "lab-01"))).level, 1);
+    assert_eq!(ai_tabs::trust::policy_for(&b, Some(id_of(&b, "servers", "lab-01"))).level, 1);
     assert!(held_of(&b, "q-01").is_none());
 
     // db-01 runs allowed commands here: pointed elsewhere, it's held.
@@ -124,7 +124,7 @@ fn a_shared_profile_holds_new_and_re_pointed_servers() {
     sync(&a, &b);
     let h = held_of(&b, "db-01").expect("held");
     assert_eq!((h.change.as_str(), h.level), ("pointed", 2));
-    assert!(ai::trust::policy_for(&b, Some(id_of(&b, "servers", "db-01"))).force_ask.is_some());
+    assert!(ai_tabs::trust::policy_for(&b, Some(id_of(&b, "servers", "db-01"))).force_ask.is_some());
     assert!(held_of(&b, "web-01").is_none());
     approvals::allow(&b, &b.query_row("SELECT uuid FROM servers WHERE name='db-01'", [], |r| r.get::<_, String>(0)).unwrap(), &[]).unwrap();
     a.execute("UPDATE servers SET username='root' WHERE name='db-01'", []).unwrap();
@@ -144,22 +144,22 @@ fn a_careful_server_made_again_under_a_loose_default_is_held() {
     a.execute("INSERT INTO servers(name,host,port) VALUES('prod-db','db.example',22)", []).unwrap();
     let (b, hb) = device("B");
     approvals::create_schema(&b).unwrap();
-    ai::trust::create_schema(&b, "this-install-0000").unwrap();
+    ai_tabs::trust::create_schema(&b, "this-install-0000").unwrap();
     b.execute("INSERT INTO sync_meta(key,value) VALUES('share_id','s1')", []).unwrap();
     let sync = |a: &Connection, b: &Connection| apply_remote_records(b, &KEY, &collect_local_records(a, &KEY, "").unwrap(), &hb).unwrap();
     sync(&a, &b);
     let id: i64 = b.query_row("SELECT id FROM servers WHERE name='prod-db'", [], |r| r.get(0)).unwrap();
-    ai::trust::set_level(&b, "default", 0, Some(3)).unwrap();
-    ai::trust::set_level(&b, "server", id, Some(1)).unwrap();
+    ai_tabs::trust::set_level(&b, "default", 0, Some(3)).unwrap();
+    ai_tabs::trust::set_level(&b, "server", id, Some(1)).unwrap();
     a.execute("DELETE FROM servers WHERE name='prod-db'", []).unwrap();
     a.execute("INSERT INTO servers(name,host,port) VALUES('prod-db','db.example',22)", []).unwrap();
     sync(&a, &b);
     let (id, uuid): (i64, String) = b.query_row("SELECT id, uuid FROM servers WHERE name='prod-db'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
     let items: Vec<String> = approvals::held_for(&b, &uuid).into_iter().collect();
     assert_eq!(items.len(), 1, "{items:?}");
-    let h: ai::trust::HeldPolicy = serde_json::from_str(&items[0][ai::trust::HELD_ITEM.len()..]).unwrap();
+    let h: ai_tabs::trust::HeldPolicy = serde_json::from_str(&items[0][ai_tabs::trust::HELD_ITEM.len()..]).unwrap();
     assert_eq!((h.change.as_str(), h.level, h.into.as_str()), ("added", 3, ""));
-    let p = ai::trust::policy_for(&b, Some(id));
+    let p = ai_tabs::trust::policy_for(&b, Some(id));
     assert_eq!((p.level, p.force_ask.is_some()), (1, true));
 }
 
@@ -175,18 +175,18 @@ fn a_move_out_of_a_careful_folder_is_held() {
     .unwrap();
     let (b, hb) = device("B");
     approvals::create_schema(&b).unwrap();
-    ai::trust::create_schema(&b, "this-install-0000").unwrap();
+    ai_tabs::trust::create_schema(&b, "this-install-0000").unwrap();
     b.execute("INSERT INTO sync_meta(key,value) VALUES('share_id','s1')", []).unwrap();
     apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
     let prod: i64 = b.query_row("SELECT id FROM folders WHERE name='Prod'", [], |r| r.get(0)).unwrap();
-    ai::trust::set_level(&b, "default", 0, Some(3)).unwrap();
-    ai::trust::set_level(&b, "folder", prod, Some(1)).unwrap();
+    ai_tabs::trust::set_level(&b, "default", 0, Some(3)).unwrap();
+    ai_tabs::trust::set_level(&b, "folder", prod, Some(1)).unwrap();
     a.execute("UPDATE servers SET folder_id=NULL WHERE name='db-01'", []).unwrap();
     apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
     let uuid: String = b.query_row("SELECT uuid FROM servers WHERE name='db-01'", [], |r| r.get(0)).unwrap();
     let items: Vec<String> = approvals::held_for(&b, &uuid).into_iter().collect();
     assert_eq!(items.len(), 1);
-    let h: ai::trust::HeldPolicy = serde_json::from_str(&items[0][ai::trust::HELD_ITEM.len()..]).unwrap();
+    let h: ai_tabs::trust::HeldPolicy = serde_json::from_str(&items[0][ai_tabs::trust::HELD_ITEM.len()..]).unwrap();
     assert_eq!((h.level, h.into.as_str()), (3, ""), "to the top level");
 }
 
@@ -602,10 +602,10 @@ fn a_yes_to_a_held_record_still_holds_the_ai_s_level() {
     )
     .unwrap();
     let (b, hb) = member("B", "editor");
-    ai::trust::create_schema(&b, "this-install-0000").unwrap();
+    ai_tabs::trust::create_schema(&b, "this-install-0000").unwrap();
     apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
     let lab: i64 = b.query_row("SELECT id FROM folders WHERE name='Lab'", [], |r| r.get(0)).unwrap();
-    ai::trust::set_level(&b, "folder", lab, Some(3)).unwrap();
+    ai_tabs::trust::set_level(&b, "folder", lab, Some(3)).unwrap();
     a.execute("UPDATE servers SET password='', folder_id=(SELECT id FROM folders WHERE name='Lab')", []).unwrap();
     apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
     assert_eq!(approvals::held_wipes(&b).len(), 1, "held for the password");
@@ -614,10 +614,10 @@ fn a_yes_to_a_held_record_still_holds_the_ai_s_level() {
     let folder: Option<i64> = b.query_row("SELECT folder_id FROM servers", [], |r| r.get(0)).unwrap();
     assert_eq!(folder, Some(lab), "the move landed");
     assert!(
-        approvals::held_for(&b, &uuid).iter().any(|i| i.starts_with(ai::trust::HELD_ITEM)),
+        approvals::held_for(&b, &uuid).iter().any(|i| i.starts_with(ai_tabs::trust::HELD_ITEM)),
         "the AI's level is held"
     );
-    let p = ai::trust::policy_for(&b, Some(db));
+    let p = ai_tabs::trust::policy_for(&b, Some(db));
     assert!(p.force_ask.is_some(), "every command asks until it's allowed");
 }
 

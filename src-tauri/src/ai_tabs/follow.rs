@@ -941,6 +941,6 @@ mod hook_tests {
 
     #[test]
     fn the_hooks_are_in_place() {
-        assert_hooks("lib.rs", include_str!("../lib.rs"), &[("run", "ai::ai_stop_follow", 1)]);
+        assert_hooks("lib.rs", include_str!("../lib.rs"), &[("run", "ai_tabs::ai_stop_follow", 1)]);
     }
 }

@@ -1,4 +1,4 @@
-// Settings › AI tools (#32, src-tauri/src/ai): off by default, on this
+// Settings › AI tools (#32, src-tauri/src/ai_tabs): off by default, on this
 // device only. On, Home's menu lists the AI tools installed (Claude Code,
 // Codex: #117) under AI tools, started already connected to Submarine; off,
 // nothing listens and every AI tab's access ends. The folders the AI may

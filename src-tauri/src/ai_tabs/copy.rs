@@ -1383,6 +1383,6 @@ mod hook_tests {
 
     #[test]
     fn the_hooks_are_in_place() {
-        assert_hooks("lib.rs", include_str!("../lib.rs"), &[("run", "ai::ai_add_pull_folder", 1), ("run", "ai::ai_remove_pull_folder", 1)]);
+        assert_hooks("lib.rs", include_str!("../lib.rs"), &[("run", "ai_tabs::ai_add_pull_folder", 1), ("run", "ai_tabs::ai_remove_pull_folder", 1)]);
     }
 }

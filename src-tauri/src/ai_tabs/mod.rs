@@ -2724,7 +2724,7 @@ pub async fn ai_answer_server_ask(
 
 /// The panel's Stop for an AI tab.
 #[tauri::command]
-pub async fn ai_stop(state: tauri::State<'_, AiState>, tab_id: String) -> Result<(), String> {
+pub async fn ai_tab_stop(state: tauri::State<'_, AiState>, tab_id: String) -> Result<(), String> {
     state.stop_tab(&tab_id);
     Ok(())
 }
@@ -2755,7 +2755,7 @@ pub async fn ai_output(state: tauri::State<'_, AiState>, id: u64) -> Result<Done
 /// (#120): the root password you typed there, which goes only to sudo's or
 /// dzdo's own prompt, and is kept for this AI tab and server only.
 #[tauri::command]
-pub async fn ai_decide(state: tauri::State<'_, AiState>, id: u64, allow: bool, note: Option<String>, password: Option<String>) -> Result<(), String> {
+pub async fn ai_tab_decide(state: tauri::State<'_, AiState>, id: u64, allow: bool, note: Option<String>, password: Option<String>) -> Result<(), String> {
     if allow {
         let password = typed_password(password)?;
         state.answer(id, Answer::Allow { by: BY_YOU.into(), password })
@@ -3057,9 +3057,9 @@ mod hook_tests {
             "lib.rs",
             include_str!("../lib.rs"),
             &[
-                ("", "mod ai;", 1),
-                ("initiate_connection", "ai::tab_gone(&app, &session_id, \"reconnected\")", 1),
-                ("disconnect_session", "ai::tab_gone(&app, &session_id, \"tab closed\")", 1),
+                ("", "mod ai_tabs;", 1),
+                ("initiate_connection", "ai_tabs::tab_gone(&app, &session_id, \"reconnected\")", 1),
+                ("disconnect_session", "ai_tabs::tab_gone(&app, &session_id, \"tab closed\")", 1),
                 ("teardown_profile", "ai.end_all_tabs()", 1),
             ],
         );

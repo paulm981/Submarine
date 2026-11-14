@@ -86,7 +86,7 @@ pub(crate) fn merge_batch(tx: &Connection, key: &[u8; 32], records: &[&SyncRecor
     // And a move (a server's folder, a folder's parent) that lets the AI do
     // more on a server here is held too (ai/trust.rs): each server's AI
     // policy as it is before the merge, to compare with after it.
-    let ai_before = if shared { ai::trust::before_sync(tx) } else { None };
+    let ai_before = if shared { ai_tabs::trust::before_sync(tx) } else { None };
     // Each server's jump host before the merge: one the merge deletes leaves
     // the servers behind it refusing to go direct (jump_gone.rs).
     let jumps_before = jump_gone::links_before(tx);
@@ -153,7 +153,7 @@ pub(crate) fn merge_batch(tx: &Connection, key: &[u8; 32], records: &[&SyncRecor
     // Everything in place: hold each server whose AI policy the merge
     // loosened, until this device's user allows it.
     if let Some(before) = ai_before {
-        ai::trust::hold_loosened(tx, before)?;
+        ai_tabs::trust::hold_loosened(tx, before)?;
     }
     Ok(skipped)
 }

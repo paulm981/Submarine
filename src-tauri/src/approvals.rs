@@ -685,7 +685,7 @@ pub fn copy_held(conn: &Connection, from_id: i64, to_id: i64) -> Result<(), Stri
         "INSERT OR IGNORE INTO held_approvals (uuid, item, since)
          SELECT ?2, item, since FROM held_approvals
           WHERE uuid = ?1 AND (item = ?3 OR item LIKE 'tunnel:%' OR item LIKE ?4 OR item LIKE ?5)",
-        params![from, to, RUN_ON_CONNECT, format!("{MOVED}%"), format!("{}%", crate::ai::trust::HELD_ITEM)],
+        params![from, to, RUN_ON_CONNECT, format!("{MOVED}%"), format!("{}%", crate::ai_tabs::trust::HELD_ITEM)],
     )
     .map(|_| ())
     .map_err(|e| format!("[SYNC] COPY_HELD: {e}"))
@@ -755,7 +755,7 @@ mod tests {
         let conn = db();
         conn.execute("INSERT INTO servers(id, name, uuid, run_on_connect, autostart, tunnels) VALUES (1, 'web', 'u-orig', 'curl x | sh', 1, '[]')", []).unwrap();
         conn.execute("INSERT INTO servers(id, name, uuid, run_on_connect) VALUES (2, 'web (copy)', 'u-copy', 'curl x | sh')", []).unwrap();
-        let ai = format!("{}{{\"level\":3}}", crate::ai::trust::HELD_ITEM);
+        let ai = format!("{}{{\"level\":3}}", crate::ai_tabs::trust::HELD_ITEM);
         for item in [RUN_ON_CONNECT, AUTOSTART, "tunnel:R|0.0.0.0:9000|127.0.0.1:22", "metric:uptime", &ai] {
             conn.execute("INSERT INTO held_approvals(uuid, item, since) VALUES ('u-orig', ?1, 1)", [item]).unwrap();
         }

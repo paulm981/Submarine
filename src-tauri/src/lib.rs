@@ -53,7 +53,7 @@ mod term_filter;
 mod vault_backup;
 // The fork's own modules, each in a file of its own (#136, #163).
 mod local_open; mod host_import; mod rdp_links; mod highlight; mod server_os; mod local_term; mod tree_moves; mod multiexec; mod store_sync;
-mod remote_sh; mod applog; mod term_output; mod diagnose; mod jump_gone; mod ping; mod hop_policy; mod ai; mod trust_policy; mod secret_policy;
+mod remote_sh; mod applog; mod term_output; mod diagnose; mod jump_gone; mod ping; mod hop_policy; mod ai_tabs; mod trust_policy; mod secret_policy;
 // Root over SSH (sudo / dzdo): root_ssh.rs. Its macro (`root_tool_find!`) is
 // used here too.
 #[macro_use]
@@ -6365,7 +6365,7 @@ async fn close_profile(
     ssh: tauri::State<'_, SshState>,
     monitor_map: tauri::State<'_, MonitorMap>,
     cloud: tauri::State<'_, std::sync::Arc<cloud::CloudState>>,
-    ai: tauri::State<'_, ai::AiState>,
+    ai: tauri::State<'_, ai_tabs::AiState>,
 ) -> Result<(), String> {
     quick_unlock::profile_closed();
     let opened = state.generation_now();
@@ -6405,7 +6405,7 @@ async fn close_after_reload(app: tauri::AppHandle, _closing: tokio::sync::OwnedM
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), disconnect_all).await;
     let monitor_map = app.state::<MonitorMap>();
     let cloud = app.state::<std::sync::Arc<cloud::CloudState>>();
-    let ai = app.state::<ai::AiState>();
+    let ai = app.state::<ai_tabs::AiState>();
     let teardown = teardown_profile(&db, &ssh, &monitor_map, &cloud, &ai, opened);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), teardown).await;
 }
@@ -6417,7 +6417,7 @@ async fn teardown_profile(
     ssh: &SshState,
     monitor_map: &MonitorMap,
     cloud: &cloud::CloudState,
-    ai: &ai::AiState,
+    ai: &ai_tabs::AiState,
     opened: u64,
 ) -> Result<(), String> {
     // 0. Persist any accumulated in-memory changes (chief among them:
@@ -13887,7 +13887,7 @@ async fn initiate_connection(
         .unwrap_or_else(|| "primary".to_string());
     let is_secondary = role != "primary";
     let separate = separate_sessions.unwrap_or(false);
-    if !is_secondary { ai::tab_gone(&app, &session_id, "reconnected"); } // no longer shared with an AI tab
+    if !is_secondary { ai_tabs::tab_gone(&app, &session_id, "reconnected"); } // no longer shared with an AI tab
     // Only the PRIMARY drives interactive keyboard-interactive (2FA) auth. A
     // secondary connection that hit a 2FA challenge would emit a `kbi-prompt`
     // the UI isn't wired to answer for the suffixed session id, so it would just
@@ -18711,7 +18711,7 @@ async fn disconnect_session(
     // this IS a primary id (no `::` suffix) — a direct disconnect of a secondary
     // must not recurse into non-existent grandchildren.
     if !session_id.contains("::") {
-        ai::tab_gone(&app, &session_id, "tab closed"); // no AI tab can reach it any more
+        ai_tabs::tab_gone(&app, &session_id, "tab closed"); // no AI tab can reach it any more
         teardown_connection_key(state.inner(), mirrors.inner(), &format!("{}::sftp", session_id)).await;
         teardown_connection_key(state.inner(), mirrors.inner(), &format!("{}::fwd", session_id)).await;
         // Explicitly disconnecting a whole tab also forgets any connect-time
@@ -25510,7 +25510,7 @@ async fn clipboard_read_text(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 pub fn mcp_helper() -> i32 {
-    ai::helper::main()
+    ai_tabs::helper::main()
 }
 
 /// How long `open_main_window` waits for an earlier run's WebView2 to let go.
@@ -25704,7 +25704,7 @@ pub fn run() {
             let cloud_state = cloud::CloudState::new(&app.handle());
             app.manage(cloud_state);
             // AI tools (#32): listening already when they were left on.
-            app.manage(ai::AiState::for_app(app.handle()));
+            app.manage(ai_tabs::AiState::for_app(app.handle()));
             // .rdp files an earlier run left behind (issue #3).
             std::thread::spawn(rdp::clear_old_files);
             #[cfg(windows)]
@@ -25766,9 +25766,9 @@ pub fn run() {
             local_term::list_local_shells, local_term::local_shell_set_default, local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
             local_term::local_terminal_open, local_term::local_terminal_write, local_term::local_windows_build, local_term::local_terminal_resize, local_term::local_terminal_close,
             ping::ping_server, jump_gone::jump_host_connect_directly, diagnose_connect, ssh_firewall_as_root,
-            ai::ai_settings, ai::ai_set_enabled, ai::ai_state, ai::ai_share, ai::ai_unshare, ai::ai_stop, ai::ai_decide, ai::ai_output,
-            ai::ai_set_flash, ai::ai_allow_session, ai::ai_decide_group, ai::ai_allow_session_group, ai::ai_allow_always, ai::ai_trust_view, ai::ai_trust_scope,
-            ai::ai_trust_set_level, ai::ai_trust_add_rule, ai::ai_trust_remove_rule, ai::ai_end_allow_all, ai::ai_keep_policy, ai::ai_add_pull_folder, ai::ai_remove_pull_folder, ai::ai_stop_follow, ai::ai_answer_server_ask,
+            ai_tabs::ai_settings, ai_tabs::ai_set_enabled, ai_tabs::ai_state, ai_tabs::ai_share, ai_tabs::ai_unshare, ai_tabs::ai_tab_stop, ai_tabs::ai_tab_decide, ai_tabs::ai_output,
+            ai_tabs::ai_set_flash, ai_tabs::ai_allow_session, ai_tabs::ai_decide_group, ai_tabs::ai_allow_session_group, ai_tabs::ai_allow_always, ai_tabs::ai_trust_view, ai_tabs::ai_trust_scope,
+            ai_tabs::ai_trust_set_level, ai_tabs::ai_trust_add_rule, ai_tabs::ai_trust_remove_rule, ai_tabs::ai_end_allow_all, ai_tabs::ai_keep_policy, ai_tabs::ai_add_pull_folder, ai_tabs::ai_remove_pull_folder, ai_tabs::ai_stop_follow, ai_tabs::ai_answer_server_ask,
             ssh_info_probe_section, ssh_systemctl_action, ssh_kill_process,
             ssh_iptables_chain, ssh_nft_chain,
             applog::app_log, applog::ui_heartbeat, applog::open_log_folder, diagnostics_report,

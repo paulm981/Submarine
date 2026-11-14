@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { ShieldAlert, ShieldCheck, Trash2, X } from "lucide-react";
 import { AI_LEVELS, AiTrustTarget, closeAiTrust, levelTitle, runnerWarning, useAiTrustTarget } from "../util/ai";
 
-// How much the AI may run without asking (#115, src-tauri/src/ai/trust.rs):
+// How much the AI may run without asking (#115, src-tauri/src/ai_tabs/trust.rs):
 // the level and the two lists of a server, a folder or every server. Kept on
 // this device only; the AI can't change them. The editor is shown in a window
 // opened from a server tab's AI marker, the AI pane, or the session tree's
