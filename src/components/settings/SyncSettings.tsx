@@ -1,4 +1,4 @@
-// Settings › Sync: beside the original project's Cloud Sync card (auto-sync),
+// Settings › Sync: beside the original project's Cloud sync card (auto-sync),
 // the switch for Submarine Cloud itself.
 import { useEffect, useState } from "react";
 import { Cloud } from "lucide-react";
@@ -26,7 +26,7 @@ function CloudSwitch() {
       more={
         <p>
           The service is at submarine.sinaxhpm.com. While this is off, its buttons are hidden too, and profiles sync
-          through your own folder or git repository instead, set up on the Profile tab. Auto-sync, in the Cloud Sync card, works for both.
+          through your own folder or git repository instead, set up on the Profile tab. Auto-sync, in the Cloud sync card, works for both.
         </p>
       }
       on={on === true}

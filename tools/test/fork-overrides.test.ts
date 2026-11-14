@@ -29,7 +29,7 @@ const OVERRIDES: { file: string; spread: string; upstream: string[] }[] = [
     spread: "Fork.termTabLook",
     upstream: [
       'title={term.container ? t("Container: {name}", { name: term.container.name }) : undefined}',
-      "className={`h-10 sm:h-8 px-3 sm:px-4 ${terminals.length > 1 ? 'pr-8 sm:pr-8' : ''} rounded-lg flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider transition-all ${",
+      "className={`h-10 sm:h-8 px-3 sm:px-4 ${terminals.length > 1 ? 'pr-8 sm:pr-8' : ''} rounded-lg flex items-center gap-2 text-[12px] font-semibold transition-all ${",
       "isFocusedHalf",
       "? 'bg-primary/10 text-primary border border-primary/20 shadow-inner'",
       ": isSplitPartner",

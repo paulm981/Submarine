@@ -12,19 +12,19 @@ const icon = { render: () => null };
 
 describe("which tab a card goes under", () => {
   it("puts the original project's cards where they fit", () => {
-    expect(tabForHeading("UI Customization")).toBe("general");
+    expect(tabForHeading("UI customization")).toBe("general");
     expect(tabForHeading("Maintenance")).toBe("general");
-    expect(tabForHeading("Terminal Configuration")).toBe("terminal");
+    expect(tabForHeading("Terminal configuration")).toBe("terminal");
     expect(tabForHeading("Authentication")).toBe("terminal");
-    expect(tabForHeading("Cloud Sync")).toBe("sync");
+    expect(tabForHeading("Cloud sync")).toBe("sync");
   });
 
   it("finds a card whose heading shows in another language", () => {
-    const de: Record<string, string> = { "Terminal Configuration": "Terminal-Konfiguration", "Cloud Sync": "Cloud-Synchronisierung" };
+    const de: Record<string, string> = { "Terminal configuration": "Terminal-Konfiguration", "Cloud sync": "Cloud-Synchronisierung" };
     const translate = (s: string) => de[s] ?? s;
     expect(tabForHeading("Terminal-Konfiguration", translate)).toBe("terminal");
     expect(tabForHeading("Cloud-Synchronisierung", translate)).toBe("sync");
-    expect(tabForHeading("UI Customization", translate)).toBe("general");
+    expect(tabForHeading("UI customization", translate)).toBe("general");
     expect(tabForHeading("Etwas Neues", translate)).toBe("general");
   });
 
@@ -40,7 +40,7 @@ describe("which tab a card goes under", () => {
       "/src/components/SettingsPanel.tsx"
     ];
     // Each heading is the English text in t("…") (src/i18n), or plain text.
-    const headings = [...src.matchAll(/tracking-widest text-xs">\s*<\w+ size=\{14\} \/>\s*(?:\{t\("([^"]+)"\)\}|([^<{]+?))\s*<\/div>/g)].map((m) => m[1] ?? m[2]);
+    const headings = [...src.matchAll(/font-semibold text-xs">\s*<\w+ size=\{14\} \/>\s*(?:\{t\("([^"]+)"\)\}|([^<{]+?))\s*<\/div>/g)].map((m) => m[1] ?? m[2]);
     expect(headings.length).toBeGreaterThan(0);
     expect(headings.filter((h) => !(h in UPSTREAM_CARD_TABS)), "cards with no tab: add them to UPSTREAM_CARD_TABS").toEqual([]);
     expect(Object.keys(UPSTREAM_CARD_TABS).filter((h) => !headings.includes(h)), "headings no card has").toEqual([]);

@@ -1067,15 +1067,46 @@ async fn record_key_salt(db: &DbState, open: &Open, salt: &str) -> Result<(), St
     crate::save_vault_async(db).await
 }
 
+/// Another profile on this computer that syncs the same profile here: this
+/// computer's file was last written by a profile of another name, and that
+/// profile is still on this computer (`is_other`: its file exists, and isn't
+/// this profile's own under another case).
+///
+/// A profile's file carries its link to the store, so a copy of it imported
+/// beside it (an Export, or the original project's copy in a folder, #342)
+/// syncs here too, and as the same computer it writes the same file: the two
+/// would take turns rewriting it, and every change in either would reach the
+/// other and every computer, though they show as two profiles. Only the one
+/// that set the sync up last syncs; the other is told why.
+fn other_local_profile(seen: &Seen, profile: &str, is_other: impl Fn(&str) -> bool) -> Option<String> {
+    let (name, _, _) = seen.own.as_ref()?;
+    (name != profile && is_other(name)).then(|| name.clone())
+}
+
+fn second_profile_error(other: &str, profile: &str) -> String {
+    format!(
+        "[STORE] “{other}” on this computer already syncs this profile through your own storage, so “{profile}” doesn't: the two would mix. To sync “{profile}” instead, stop its sync on its Profile tab and set it up again."
+    )
+}
+
 /// One read–merge–write against a profile's folder (in a synced folder, or
-/// in the git working copy).
-async fn exchange(app: &tauri::AppHandle, db: &DbState, dir: PathBuf, open: &Open) -> Result<Exchanged, String> {
+/// in the git working copy). `claim`: the user set this sync up just now
+/// (store_setup, store_restore_profile), so it goes ahead even where another
+/// profile on this computer synced here before (`other_local_profile`).
+async fn exchange(app: &tauri::AppHandle, db: &DbState, dir: PathBuf, open: &Open, claim: bool) -> Result<Exchanged, String> {
     let node = crate::sync_device_node_id(app);
     let key = *open.key;
     let (d, n) = (dir.clone(), node.clone());
     let seen = tokio::task::spawn_blocking(move || read_profile(&d, &key, &n))
         .await
         .map_err(|e| format!("[STORE] JOIN: {e}"))??;
+    if !claim {
+        let real = |name: &str| crate::profile_path(app, name).ok().and_then(|p| std::fs::canonicalize(p).ok());
+        let here = real(&open.profile);
+        if let Some(other) = other_local_profile(&seen, &open.profile, |name| real(name).is_some_and(|p| Some(&p) != here.as_ref())) {
+            return Err(second_profile_error(&other, &open.profile));
+        }
+    }
 
     let vault = crate::profile_path(app, &open.profile);
     let put_back = vault.as_ref().is_ok_and(|p| crate::vault_backup::is_put_back(p));
@@ -1116,8 +1147,9 @@ async fn exchange(app: &tauri::AppHandle, db: &DbState, dir: PathBuf, open: &Ope
     Ok(Exchanged { pushed, pulled, removed, emptied, backup, key_salt })
 }
 
-/// Sync the open profile with its store. Runs under `STORE_LOCK`.
-async fn sync_open(app: &tauri::AppHandle, db: &DbState, open: &Open) -> Result<SyncReport, String> {
+/// Sync the open profile with its store. Runs under `STORE_LOCK`. `claim`:
+/// see `exchange`.
+async fn sync_open(app: &tauri::AppHandle, db: &DbState, open: &Open, claim: bool) -> Result<SyncReport, String> {
     match open.linked.store.kind {
         Kind::Folder => {
             let data = data_dir(&folder_root(&open.linked.store.location)?);
@@ -1129,7 +1161,7 @@ async fn sync_open(app: &tauri::AppHandle, db: &DbState, open: &Open) -> Result<
                 None => None,
             };
             let open = moved.as_ref().unwrap_or(open);
-            let ex = exchange(app, db, data.join(&open.linked.profile_id), open).await?;
+            let ex = exchange(app, db, data.join(&open.linked.profile_id), open, claim).await?;
             if let Some(salt) = &ex.key_salt {
                 record_key_salt(db, open, salt).await?;
             }
@@ -1156,7 +1188,7 @@ async fn sync_open(app: &tauri::AppHandle, db: &DbState, open: &Open) -> Result<
                     continue;
                 }
                 let id = &open.linked.profile_id;
-                let ex = exchange(app, db, data.join(id), open).await?;
+                let ex = exchange(app, db, data.join(id), open, claim).await?;
                 pulled += ex.pulled;
                 removed += ex.removed;
                 emptied += ex.emptied;
@@ -1181,7 +1213,7 @@ async fn sync_open(app: &tauri::AppHandle, db: &DbState, open: &Open) -> Result<
 pub(crate) async fn sync_if_linked(app: &tauri::AppHandle, db: &DbState) -> Result<Option<SyncReport>, String> {
     let _turn = store_turn(app).await?;
     let Some(open) = open_profile(db, None)? else { return Ok(None) };
-    sync_open(app, db, &open).await.map(Some)
+    sync_open(app, db, &open, false).await.map(Some)
 }
 
 /// The store's root on disk, fetched first for git.
@@ -1464,7 +1496,7 @@ pub async fn store_setup(
     let previous = link_setup(&db_state, generation, &l)?;
     let res = async {
         let open = open_profile(&db_state, Some(generation))?.ok_or("[STORE] LINK_LOST")?;
-        sync_open(&app, &db_state, &open).await
+        sync_open(&app, &db_state, &open, true).await
     }
     .await;
     if res.is_err() {
@@ -1581,7 +1613,7 @@ pub async fn store_restore_profile(
             link(conn, &Linked { store, profile_id })?;
         }
         let open = open_profile(&db_state, Some(opened))?.ok_or("[STORE] LINK_LOST")?;
-        let report = sync_open(&app, &db_state, &open).await?;
+        let report = sync_open(&app, &db_state, &open, true).await?;
         crate::save_vault_async(&db_state).await?;
         Ok::<_, String>(report)
     }
@@ -1781,6 +1813,99 @@ mod tests {
         let before = std::fs::metadata(dir.join("aaaaaaaaaaaaaaaa.subdev")).unwrap().modified().unwrap();
         assert_eq!(sync(&a, &ha, &dir, "aaaaaaaaaaaaaaaa"), (0, 0));
         assert_eq!(std::fs::metadata(dir.join("aaaaaaaaaaaaaaaa.subdev")).unwrap().modified().unwrap(), before);
+    }
+
+    /// One sync of the local profile `profile` as `exchange` does it, minus
+    /// the vault and the app, with its check for another profile on this
+    /// computer: `here` are the other profiles this computer has. Refused:
+    /// the message, and nothing written.
+    fn sync_profile(conn: &Connection, hlc: &crate::hlc::Hlc, dir: &Path, node: &str, profile: &str, here: &[&str], claim: bool) -> Result<usize, String> {
+        let seen = read_profile(dir, &KEY, node).unwrap();
+        if !claim {
+            if let Some(other) = other_local_profile(&seen, profile, |name| here.contains(&name)) {
+                return Err(second_profile_error(&other, profile));
+            }
+        }
+        let (records, pulled, _) = merge(conn, &KEY, hlc, &seen, Err("no file"), false).unwrap();
+        let mine = Mine { node, device: node, profile, records: &records, key_file: None };
+        write_profile(dir, &KEY, &seen, &mine).unwrap();
+        Ok(pulled)
+    }
+
+    fn note_titles(conn: &Connection) -> Vec<String> {
+        let mut st = conn.prepare("SELECT title FROM notes ORDER BY title").unwrap();
+        st.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+    }
+
+    fn own_label(dir: &Path, node: &str) -> String {
+        read_profile(dir, &KEY, node).unwrap().own.unwrap().0
+    }
+
+    // A copy of a profile, imported on a computer that already syncs that
+    // profile through the user's own storage (an Export, or the original
+    // project's copy in a folder, #342: the same file, with the same link to
+    // the store). As the same computer, the copy would write the profile's
+    // file for this computer too: the two would take turns rewriting it, and
+    // what's done in either would reach the other. Only one syncs.
+    #[test]
+    fn a_copy_imported_beside_the_profile_it_came_from_doesnt_sync_as_the_same_computer() {
+        let dir = tmp("copy").join("submarine-sync").join("a".repeat(32));
+        let (na, nb) = ("aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb");
+        // Computer A has "work"; computer B restored it from the store.
+        let (a, ha) = device("A");
+        a.execute("INSERT INTO servers(name,host,port) VALUES('web','h',22)", []).unwrap();
+        sync_profile(&a, &ha, &dir, na, "work", &[], false).unwrap();
+        let (b1, hb1) = device("B");
+        assert_eq!(sync_profile(&b1, &hb1, &dir, nb, "work", &[], false).unwrap(), 1);
+        assert_eq!(own_label(&dir, nb), "work");
+
+        // A's copy in a folder, imported on B as "work (copy)": A's rows.
+        let copy_dir = tmp("copy-folder").join("p");
+        std::fs::create_dir_all(&copy_dir).unwrap();
+        std::fs::copy(dir.join(format!("{na}{DEVICE_EXT}")), copy_dir.join(format!("{na}{DEVICE_EXT}"))).unwrap();
+        let (b2, hb2) = device("B2");
+        sync_profile(&b2, &hb2, &copy_dir, "cccccccccccccccc", "work (copy)", &[], false).unwrap();
+        assert_eq!(names(&b2, "servers"), ["web"]);
+        b2.execute("INSERT INTO notes(title,body) VALUES('only in the copy','x')", []).unwrap();
+
+        // Its sync is refused, naming the one that syncs, and writes nothing.
+        let before = std::fs::read(dir.join(format!("{nb}{DEVICE_EXT}"))).unwrap();
+        let err = sync_profile(&b2, &hb2, &dir, nb, "work (copy)", &["work"], false).unwrap_err();
+        assert!(err.contains("“work” on this computer already syncs") && err.contains("“work (copy)” doesn't"), "{err}");
+        assert_eq!(std::fs::read(dir.join(format!("{nb}{DEVICE_EXT}"))).unwrap(), before);
+        // "work" goes on as before, and never sees the copy's note.
+        sync_profile(&b1, &hb1, &dir, nb, "work", &["work (copy)"], false).unwrap();
+        sync_profile(&a, &ha, &dir, na, "work", &[], false).unwrap();
+        for conn in [&a, &b1] {
+            assert!(note_titles(conn).is_empty(), "the copy's note stayed in the copy");
+        }
+
+        // Set up again on the copy (store_setup claims): the copy syncs, and
+        // now "work" is the one told.
+        sync_profile(&b2, &hb2, &dir, nb, "work (copy)", &["work"], true).unwrap();
+        assert_eq!(own_label(&dir, nb), "work (copy)");
+        let err = sync_profile(&b1, &hb1, &dir, nb, "work", &["work (copy)"], false).unwrap_err();
+        assert!(err.contains("“work (copy)” on this computer already syncs"), "{err}");
+
+        // Once the other is gone from this computer (deleted, or renamed),
+        // the one left syncs again.
+        assert_eq!(sync_profile(&b1, &hb1, &dir, nb, "work", &[], false).unwrap(), 1);
+        assert_eq!(note_titles(&b1), ["only in the copy"]);
+        assert_eq!(own_label(&dir, nb), "work");
+    }
+
+    #[test]
+    fn only_another_profile_of_this_computer_stops_a_sync() {
+        let seen = |label: Option<&str>| Seen { own: label.map(|l| (l.to_string(), "B".to_string(), Stamps::default())), ..Seen::default() };
+        let here = |name: &str| name == "work" || name == "home";
+        // Its own file, as this profile wrote it: no one else.
+        assert_eq!(other_local_profile(&seen(Some("work")), "work", here), None);
+        // No file of this computer's yet.
+        assert_eq!(other_local_profile(&seen(None), "work", here), None);
+        // Written by a profile this computer no longer has (renamed, deleted).
+        assert_eq!(other_local_profile(&seen(Some("old name")), "work", here), None);
+        // Written by another profile that is still here.
+        assert_eq!(other_local_profile(&seen(Some("home")), "work", here).as_deref(), Some("home"));
     }
 
     #[test]

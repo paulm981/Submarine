@@ -11,7 +11,7 @@ This page covers:
 
 What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
-The fork is based on the original project's **0.5.0**, with every change up to [#337](https://github.com/SinaXhpm/submarine/pull/337) brought in.
+The fork is based on the original project's **0.5.0**, with every change up to [#342](https://github.com/SinaXhpm/submarine/pull/342) brought in.
 
 ## What this fork adds
 
@@ -273,6 +273,8 @@ Also:
 
 No third-party service is involved. Profiles are encrypted with their password before they leave your computer. The original project's hosted cloud stays off unless you turn it on.
 
+The original project's **A copy in a folder**, on the same page, is something else: after each save it writes the profile's encrypted file to a folder, for Import on another computer. It's a copy, not sync: changes made elsewhere don't come back.
+
 ### Ready to roll out to a team
 
 <img src="docs/screenshots/fork/troubleshooting.png" alt="Troubleshooting in Settings: Copy diagnostics and Open log folder" width="600" />
@@ -299,6 +301,10 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | Paste | The webview's clipboard | Read by the app itself, since the webviews on Windows, macOS and Linux refuse the page |
 | Text fields on macOS | Capitalize and correct what's typed | Keep exactly what's typed |
 | Closing a connected session | Always asks | Asks, unless you turn that off in Settings |
+| Tabs ([#339](https://github.com/SinaXhpm/submarine/pull/339)) | Browser-style tabs and a + to open a server. Dragging a tab changes an order of the strip's own; Ctrl+Tab steps through the server tabs, and a remote desktop keeps it; the ×, a middle click and the menu close a tab and go back to the Servers page | Their look, their + and their middle click, with Home's and Broadcast's tabs drawn the same way. Dragging, Ctrl+Tab and closing are the fork's: a drag reorders the tabs themselves, so All tabs, Ctrl+Tab and Move left/right follow it; Ctrl+Tab steps through Home, Broadcast's tab and the servers not in Broadcast, and a remote desktop keeps it, as theirs; every way of closing a tab asks unless that's turned off, and goes back to Home. Compact tabs makes them narrower, with long names cut short. All tabs ▾ stays, at the right end ([#256](https://github.com/paulm981/Submarine/issues/256)) |
+| Server cards ([#338](https://github.com/SinaXhpm/submarine/pull/338)) | The kind of connection in the server's colour, the open tab's dot, a list view; a server or folder dragged onto a folder moves into it | The same, with the OS logo in the box in place of the protocol icon once the server has reported its OS: the protocol badge and the dot stay. No drag into folders: folders and servers move in the session tree. A right-click on a card or a row opens Open, Ping and Edit ([#256](https://github.com/paulm981/Submarine/issues/256)) |
+| Buttons and small headings ([#341](https://github.com/SinaXhpm/submarine/pull/341)) | Sentence case | The same in the original project's screens. The fork's own screens (Broadcast's bar, a server's terminal tabs, the fork's Settings cards) keep their capitals until they're changed to match ([#256](https://github.com/paulm981/Submarine/issues/256)) |
+| A copy of a profile in a folder ([#342](https://github.com/SinaXhpm/submarine/pull/342)) | Each save also writes the encrypted profile file to a folder you choose, for Import on another computer | The same, beside the fork's sync through your own storage, which it doesn't replace: the copy goes one way and keeps nothing else in step, while the sync merges every computer's changes. A copy, or an Export, imported on a computer that already syncs that profile through your own storage doesn't sync too: it carries the same link, and as the same computer it would mix with the profile it came from. Only the one set up last syncs; the other says why (`store_sync.rs`). Stop copying leaves the last copy in the folder, and a cloud folder may keep older ones, which open with the password they were saved with ([#256](https://github.com/paulm981/Submarine/issues/256)) |
 | A server moved by someone else in a shared profile ([#285](https://github.com/SinaXhpm/submarine/pull/285)) | Asks before it connects to the new address, and holds its commands and forwards again | The same, from every way a server is opened (a tab, or many at once from the session tree). A switch to telnet or VNC is held as before, and stays what it was here until allowed, so it isn't a move yet |
 | Opening a profile automatically on Windows ([#275](https://github.com/SinaXhpm/submarine/pull/275), [#281](https://github.com/SinaXhpm/submarine/pull/281)) | For any profile, once turned on | Never for a shared profile: anyone using that Windows account would get everyone's saved logins. It can't be turned on for one, and sharing a profile turns it off (`secret_policy.rs`, E5) |
 | Mac and iPhone builds ([#274](https://github.com/SinaXhpm/submarine/pull/274)) | A signed universal Mac app, iOS and the App Store, built with each release (`apple.yml`) | `apple.yml` is kept as it is but never run: the fork's Mac app is the Apple silicon build added to a release once it's been tried (`build.yml`) |
@@ -330,13 +336,7 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 
 ## Changes in the original project not taken yet
 
-Every change up to [#337](https://github.com/SinaXhpm/submarine/pull/337) (0.5.0) is taken. Where the fork takes one differently, the table above says so.
-
-Not taken yet, for the next sync:
-
-| The original project's change | Why not yet |
-|---|---|
-| [#338](https://github.com/SinaXhpm/submarine/pull/338) server cards with protocol icons and a list view, [#339](https://github.com/SinaXhpm/submarine/pull/339) classic tabs, [#341](https://github.com/SinaXhpm/submarine/pull/341) sentence case, [#342](https://github.com/SinaXhpm/submarine/pull/342) a copy of a profile in a folder you choose | Made after 0.5.0. #339 overlaps the fork's tab dragging, Ctrl+Tab and All tabs, and #342 the fork's sync through your own storage, so they're studied before they come in ([#236](https://github.com/paulm981/Submarine/issues/236)) |
+Every change up to [#342](https://github.com/SinaXhpm/submarine/pull/342) is taken. Where the fork takes one differently, the table above says so. None is waiting.
 
 ## Keeping up with the original project
 
