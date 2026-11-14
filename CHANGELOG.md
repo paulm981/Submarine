@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.81
+
+- **FTP and FTPS servers.** Add one like any server; it opens in a file view, from the grid, the session tree or Quick Connect. Import also reads FileZilla's site list. Broadcast and the AI skip FTP servers, and a teammate's switch of one of your servers to plain FTP, which sends the password in clear text, waits for your OK. ([#246](https://github.com/paulm981/Submarine/issues/246))
+
 ## v0.4.0-fork.80
 
 - **A reconnect shows what it's doing.** When a session drops, the banner shows each attempt's steps (reaching the server, securing the connection, logging in), where a failed attempt stopped, and how long until the next. ([#244](https://github.com/paulm981/Submarine/issues/244))
