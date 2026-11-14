@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.83
+
+- **Feedback opens an issue on this fork's GitHub.** Settings › Help › Send feedback, the profile list's Feedback and Suggest a fix open a new issue in your browser; nothing is sent until you submit it there. ([#249](https://github.com/paulm981/Submarine/issues/249))
+
 ## v0.4.0-fork.82
 
 - **The tab you're on stays in view.** With many tabs open, the one you pick, or a new one, scrolls into view, and arrows over an end of the tab strip show there are more past it. ([#248](https://github.com/paulm981/Submarine/issues/248))
