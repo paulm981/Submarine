@@ -9,6 +9,11 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.82
+
+- **The tab you're on stays in view.** With many tabs open, the one you pick, or a new one, scrolls into view, and arrows over an end of the tab strip show there are more past it. ([#248](https://github.com/paulm981/Submarine/issues/248))
+- **An interface font.** Settings › General › Interface font changes the app's own text; paths and file names in columns follow the terminal font. ([#248](https://github.com/paulm981/Submarine/issues/248))
+
 ## v0.4.0-fork.81
 
 - **FTP and FTPS servers.** Add one like any server; it opens in a file view, from the grid, the session tree or Quick Connect. Import also reads FileZilla's site list. Broadcast and the AI skip FTP servers, and a teammate's switch of one of your servers to plain FTP, which sends the password in clear text, waits for your OK. ([#246](https://github.com/paulm981/Submarine/issues/246))
