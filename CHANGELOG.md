@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.5.0-fork.2
+
+- **Server cards show the kind of connection, and a dot while the server's tab is open.** Each card has an icon for SSH, telnet, RDP, VNC or FTP in the server's own colour (or the OS logo, once the server has reported its OS), a badge for the kind, and user@host. The search, the grid-or-list switch and the buttons share one row at the top. The list view, also new, lists name, address, type and the tab's state; the app remembers your choice on this computer. Press / to search. (Their [#338](https://github.com/SinaXhpm/submarine/pull/338); [#256](https://github.com/paulm981/Submarine/issues/256))
+
 ## v0.5.0-fork.1
 
 - **Based on the original project's 0.5.0.** Releases are now numbered `v0.5.0-fork.1`, `v0.5.0-fork.2` and so on. ([#254](https://github.com/paulm981/Submarine/issues/254))
