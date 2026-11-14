@@ -9,6 +9,11 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.5.0-fork.4
+
+- **Buttons and small headings in sentence case.** "Add server", not "ADD SERVER", across the original project's screens, in a slightly larger, semibold type. Protocol badges, status chips and key caps keep their capitals. The fork's own screens follow in a later release. (Their [#341](https://github.com/SinaXhpm/submarine/pull/341); [#256](https://github.com/paulm981/Submarine/issues/256))
+- **A copy of a profile in a folder you choose.** On a computer, the profile's page has a new card, "A copy in a folder": after each save, the profile's encrypted file is also written to the folder, say in OneDrive, for Import on your other computers. It's a copy, not sync, and sits beside "Sync through your own storage". A copy imported on a computer that already syncs that profile through your own storage doesn't sync too, and says why. (Their [#342](https://github.com/SinaXhpm/submarine/pull/342); [#256](https://github.com/paulm981/Submarine/issues/256))
+
 ## v0.5.0-fork.3
 
 - **Browser-style tabs, and a + to open a server from anywhere.** The open tab joins the toolbar under it, with a line on top in the server's colour; Home and Broadcast's tabs look the same. The + after the last tab lists your saved servers: type to narrow it, Enter to open one. A middle click closes a tab, asking first, as the ×, unless you chose "Don't ask again". Dragging tabs, Ctrl+Tab through Home, Broadcast and your servers, and All tabs work as before; inside a remote desktop, Ctrl+Tab stays with the remote. Compact tabs now makes the tabs narrower. (Their [#339](https://github.com/SinaXhpm/submarine/pull/339); [#256](https://github.com/paulm981/Submarine/issues/256))
