@@ -2,6 +2,7 @@ import type { CSSProperties } from "react";
 import type { QuickAuth } from "../../components/QuickConnectModal";
 import type { AiPaneView } from "../../components/AiSidePane";
 import { IS_ANDROID } from "../../util/platform";
+import { type ServerProtocol, serverProtocol } from "../../util/serverProtocol";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The rules behind the fork's parts of the main window. DesktopApp.tsx is the
@@ -22,16 +23,18 @@ export const START_VIEW = HAS_HOME ? "home" : "nodes";
  *  edit made while the tab is open doesn't move them). */
 export type DesktopSession = {
   id: string; serverId: number; serverName: string; serverUuid?: string | null;
-  protocol?: "ssh" | "rdp" | "telnet" | "vnc"; host?: string; port?: number; mirrors?: string;
+  protocol?: ServerProtocol; host?: string; port?: number; mirrors?: string;
   runOnConnect?: string; runOnConnectEvery?: boolean; runOnConnectHeld?: boolean; quickAuth?: QuickAuth | null;
 };
 
-/** The tab for a saved server, as opening it makes it. */
+/** The tab for a saved server, as opening it makes it: its kind as
+ *  DesktopApp's openServer reads it (util/serverProtocol), so an FTP server
+ *  opens in its file view, not as SSH on port 21. */
 export const sessionFor = (server: any): DesktopSession => ({
   id: `session-${server.id}`,
   serverId: server.id,
   serverName: server.name,
-  protocol: ["rdp", "telnet", "vnc"].includes(server.protocol) ? server.protocol : "ssh",
+  protocol: serverProtocol(server.protocol),
   host: server.host,
   port: server.port,
   // Pass the raw mirrors JSON through to SessionView so the

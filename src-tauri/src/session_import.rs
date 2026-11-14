@@ -1,7 +1,8 @@
 //! Reading other apps' session lists for the import: OpenSSH client
 //! config (`parse_ssh_config_text`), PuTTY's `.reg` export
 //! (`parse_putty_reg`), MobaXterm's `.mxtsessions` export
-//! (`parse_mobaxterm_sessions`) and its path placeholders, and what each
+//! (`parse_mobaxterm_sessions`) and its path placeholders, FileZilla's site
+//! list (`parse_filezilla_sites`, `read_filezilla_sites`), and what each
 //! host comes in as (`ImportedHost`).
 //!
 //! The fork's own, moved here out of lib.rs (#136) so a sync with the
@@ -320,6 +321,15 @@ pub(crate) struct ImportedHost {
     /// A telnet session (PuTTY's): imported as a telnet server.
     #[serde(default)]
     pub(crate) telnet: bool,
+    /// An FTP site's kind ("ftps", "ftps-implicit" or "ftp", see ftp.rs);
+    /// None for an SSH host. Only FileZilla's site list has FTP sites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) protocol: Option<String>,
+    /// A password the source kept for the site (FileZilla keeps them in
+    /// base64, which is no protection): it goes into the vault with the
+    /// server, after the page asks when the profile is shared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) password: Option<String>,
 }
 
 pub(crate) fn is_putty_reg(trimmed: &str) -> bool {
@@ -563,6 +573,7 @@ pub(crate) fn parse_mobaxterm_sessions_in(text: &str, profile_dir: Option<&str>,
             jump_credential,
             rdp,
             telnet: false,
+            ..Default::default()
         });
     }
     if out.is_empty() {
@@ -591,6 +602,222 @@ pub(crate) fn mobaxterm_jump_login(hosts: &str, users: &str) -> Option<String> {
     (hops == 1 && !login.is_empty()).then(|| login.to_string())
 }
 
+/// The most of FileZilla's site list that is read (a list of thousands of
+/// sites is a few hundred KiB).
+const FILEZILLA_MAX: usize = 16 * 1024 * 1024;
+
+/// FileZilla's site list (`sitemanager.xml`, or what File → Export writes)
+/// as hosts. FTP sites become FTP servers with at least the encryption
+/// FileZilla used: its "FTP" (TLS when the server offers it) and "FTPES" are
+/// FTPS with TLS after connecting, required here (no silent fall back to
+/// plain FTP); implicit FTPS stays implicit; only FileZilla's own "plain FTP
+/// (insecure)", chosen there on purpose, is plain. SFTP sites become SSH
+/// servers. Other kinds (S3, WebDAV, cloud storage) are left out.
+///
+/// FileZilla keeps passwords in base64, which protects nothing, unless its
+/// master password encrypts them: those stay behind and are asked when
+/// connecting. A site in folders is named by its folders and its name, so
+/// two of the same name stay apart. The XML may have no DTD (roxmltree's
+/// default), so no entity can grow it or reach outside it.
+pub(crate) fn parse_filezilla_sites(text: &str) -> Result<Vec<ImportedHost>, String> {
+    use base64::Engine as _;
+    if text.len() > FILEZILLA_MAX {
+        return Err("The site list is too big to read".into());
+    }
+    let doc = roxmltree::Document::parse(text).map_err(|e| format!("This isn't a FileZilla site list: {e}"))?;
+    let root = doc.root_element();
+    if !root.has_tag_name("FileZilla3") {
+        return Err("This isn't a FileZilla site list".into());
+    }
+    let child_text = |node: roxmltree::Node, name: &str| -> Option<String> {
+        node.children()
+            .find(|c| c.has_tag_name(name))
+            .and_then(|c| c.text())
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+    };
+    // A node's own text (not its children's): a folder's name, and a site's
+    // in older lists that have no <Name>.
+    let own_text = |node: roxmltree::Node| -> String {
+        node.children().filter(|c| c.is_text()).filter_map(|c| c.text()).collect::<String>().trim().to_string()
+    };
+    let mut out: Vec<ImportedHost> = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    for site in root.descendants().filter(|n| n.has_tag_name("Server")) {
+        let Some(host) = child_text(site, "Host") else { continue };
+        if host.chars().any(|c| c.is_whitespace() || c.is_control()) || host.len() > 253 {
+            continue;
+        }
+        let kind = child_text(site, "Protocol").and_then(|p| p.parse::<i32>().ok()).unwrap_or(0);
+        let (protocol, usual_port) = match kind {
+            0 | 4 => (Some("ftps"), crate::ftp::DEFAULT_PORT),
+            3 => (Some("ftps-implicit"), crate::ftp::IMPLICIT_PORT),
+            6 => (Some("ftp"), crate::ftp::DEFAULT_PORT),
+            1 => (None, 22),
+            _ => continue,
+        };
+        let port = child_text(site, "Port").and_then(|p| p.parse::<u16>().ok()).filter(|p| *p > 0).unwrap_or(usual_port);
+        // 0 anonymous, 1 normal, 2 ask, 3 interactive, 4 account, 5 key file.
+        let logon = child_text(site, "Logontype").and_then(|l| l.parse::<i32>().ok()).unwrap_or(1);
+        let user = if logon == 0 { String::new() } else { child_text(site, "User").unwrap_or_default() };
+        if user.contains(['\r', '\n', '\0']) {
+            continue;
+        }
+        let password = if matches!(logon, 1 | 4) {
+            site.children().find(|c| c.has_tag_name("Pass")).and_then(|p| {
+                let raw = p.text()?.trim();
+                match p.attribute("encoding") {
+                    Some("base64") => base64::engine::general_purpose::STANDARD
+                        .decode(raw)
+                        .ok()
+                        .and_then(|b| String::from_utf8(b).ok()),
+                    // Lists from before FileZilla 3.26 keep it as it is.
+                    None => Some(raw.to_string()),
+                    // "crypt": FileZilla's master password protects it.
+                    Some(_) => None,
+                }
+            })
+        } else {
+            None
+        }
+        .filter(|p| !p.is_empty() && !p.contains(['\r', '\n', '\0']));
+        let identity_file = if kind == 1 && logon == 5 { child_text(site, "Keyfile") } else { None };
+        let own = child_text(site, "Name").unwrap_or_else(|| own_text(site));
+        let own = if own.is_empty() { host.clone() } else { own };
+        let mut folders: Vec<String> = site
+            .ancestors()
+            .skip(1)
+            .filter(|a| a.has_tag_name("Folder"))
+            .map(own_text)
+            .filter(|f| !f.is_empty())
+            .collect();
+        folders.reverse();
+        folders.push(own);
+        let base = folders.join(" / ");
+        let mut name = base.clone();
+        let mut n = 2;
+        while !names.insert(name.clone()) {
+            name = format!("{base} ({n})");
+            n += 1;
+        }
+        out.push(ImportedHost {
+            host_alias: name,
+            hostname: host,
+            port,
+            user,
+            identity_file,
+            protocol: protocol.map(str::to_string),
+            password,
+            ..Default::default()
+        });
+    }
+    if out.is_empty() {
+        return Err("The site list has no FTP or SFTP sites to import.".into());
+    }
+    Ok(out)
+}
+
+/// FileZilla's own site list on this computer, read where FileZilla keeps it:
+/// %APPDATA%\FileZilla on Windows, ~/.config/filezilla elsewhere (and the
+/// older ~/.filezilla). The page offers it beside ~/.ssh/config. A lab build
+/// with `SUBMARINE_LAB_HOME` reads only below that folder, as for
+/// ~/.ssh/config (ssh_config::home_dir), never the tester's own list.
+#[tauri::command]
+pub(crate) fn read_filezilla_sites() -> Result<Vec<ImportedHost>, String> {
+    let lab = cfg!(debug_assertions) && std::env::var("SUBMARINE_LAB_HOME").is_ok_and(|h| !h.is_empty());
+    let mut places: Vec<std::path::PathBuf> = Vec::new();
+    #[cfg(windows)]
+    if let (false, Some(appdata)) = (lab, std::env::var_os("APPDATA")) {
+        places.push(std::path::PathBuf::from(appdata).join("FileZilla").join("sitemanager.xml"));
+    }
+    if let (false, Some(config)) = (lab, std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty())) {
+        places.push(std::path::PathBuf::from(config).join("filezilla").join("sitemanager.xml"));
+    }
+    if let Some(home) = crate::ssh_config::home_dir().map(std::path::PathBuf::from) {
+        places.push(home.join(".config").join("filezilla").join("sitemanager.xml"));
+        places.push(home.join(".filezilla").join("sitemanager.xml"));
+    }
+    for place in places {
+        let Ok(meta) = std::fs::metadata(&place) else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        if meta.len() > FILEZILLA_MAX as u64 {
+            return Err("FileZilla's site list is too big to read".into());
+        }
+        let text = std::fs::read_to_string(&place).map_err(|e| format!("FileZilla's site list can't be read: {e}"))?;
+        return parse_filezilla_sites(&text);
+    }
+    Err("No FileZilla site list on this computer. In FileZilla, File → Export saves one; paste it under Paste.".into())
+}
+
+// The original project's tests of FileZilla's site list, moved here with it
+// (#246): lib.rs keeps only the call in parse_client_hosts.
+#[cfg(test)]
+mod filezilla_tests {
+    use crate::parse_client_import;
+
+    /// FileZilla's site list: the kinds it has, passwords as FileZilla keeps
+    /// them, folders in the names, what is left out.
+    #[test]
+    fn filezilla_site_lists() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
+<FileZilla3 version="3.69.0" platform="windows">
+  <Servers>
+    <Server>
+      <Host>ftp.example.com</Host><Port>21</Port><Protocol>0</Protocol><Type>0</Type>
+      <User>me@example.com</User><Pass encoding="base64">czNjcjN0</Pass><Logontype>1</Logontype>
+      <Name>Web host</Name>
+    </Server>
+    <Folder expanded="1">Clients
+      <Folder>Acme
+        <Server>
+          <Host>files.acme.test</Host><Port>990</Port><Protocol>3</Protocol>
+          <User>acme</User><Pass encoding="crypt" pubkey="x">abc</Pass><Logontype>1</Logontype>
+          <Name>Files</Name>
+        </Server>
+      </Folder>
+      <Server>
+        <Host>10.0.0.5</Host><Protocol>6</Protocol><Logontype>0</Logontype><Name>Old box</Name>
+      </Server>
+      <Server>
+        <Host>sftp.acme.test</Host><Port>2222</Port><Protocol>1</Protocol>
+        <User>deploy</User><Logontype>5</Logontype><Keyfile>C:\keys\deploy.ppk</Keyfile>
+        <Name>Web host</Name>
+      </Server>
+      <Server><Host>bucket</Host><Protocol>7</Protocol><Name>S3</Name></Server>
+      <Server><Host>ask.example</Host><Protocol>4</Protocol><User>u</User><Pass encoding="base64">eA==</Pass><Logontype>2</Logontype>Legacy name</Server>
+    </Folder>
+  </Servers>
+</FileZilla3>"#;
+        let hosts = parse_client_import(xml.to_string()).unwrap().hosts;
+        let by = |n: &str| hosts.iter().find(|h| h.host_alias == n).unwrap_or_else(|| panic!("{n} missing: {:?}", hosts.iter().map(|h| &h.host_alias).collect::<Vec<_>>()));
+        assert_eq!(hosts.len(), 5, "S3 is left out");
+        let web = by("Web host");
+        assert_eq!((web.protocol.as_deref(), web.port, web.user.as_str(), web.password.as_deref()), (Some("ftps"), 21, "me@example.com", Some("s3cr3t")));
+        let files = by("Clients / Acme / Files");
+        assert_eq!((files.protocol.as_deref(), files.port, files.password.as_deref()), (Some("ftps-implicit"), 990, None));
+        let old = by("Clients / Old box");
+        assert_eq!((old.protocol.as_deref(), old.user.as_str(), old.port), (Some("ftp"), "", 21));
+        let sftp = by("Clients / Web host");
+        assert_eq!((sftp.protocol.as_deref(), sftp.port, sftp.identity_file.as_deref()), (None, 2222, Some("C:\\keys\\deploy.ppk")));
+        // "Ask for password": the user, not the password; a name in the old place.
+        let ask = by("Clients / Legacy name");
+        assert_eq!((ask.protocol.as_deref(), ask.user.as_str(), ask.password.as_deref()), (Some("ftps"), "u", None));
+    }
+
+    #[test]
+    fn filezilla_lists_with_tricks_are_refused_or_cleaned() {
+        // No DTD, so no entity can grow the list or read a file.
+        let dtd = r#"<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "aaaa">]><FileZilla3><Servers><Server><Host>&a;</Host></Server></Servers></FileZilla3>"#;
+        assert!(parse_client_import(dtd.to_string()).is_err());
+        // A host with a space and a user with a line break are left out.
+        let odd = "<FileZilla3><Servers><Server><Host>a b</Host></Server><Server><Host>ok.test</Host><User>x&#10;DELE y</User></Server></Servers></FileZilla3>";
+        assert!(parse_client_import(odd.to_string()).is_err());
+        assert!(parse_client_import("<FileZilla3><Servers/></FileZilla3>".to_string()).is_err());
+    }
+}
+
 // Every call from the original project's code into this file (fork_hooks.rs):
 // a sync that drops one, or the lines that bring the file in, fails here.
 #[cfg(test)]
@@ -610,7 +837,9 @@ mod hook_tests {
                 ("parse_client_import", "putty_skipped(", 1),
                 ("parse_client_hosts", "parse_putty_reg(", 1),
                 ("parse_client_hosts", "parse_mobaxterm_sessions(", 1),
+                ("parse_client_hosts", "parse_filezilla_sites(", 1),
                 ("run", "import_hosts", 1),
+                ("run", "read_filezilla_sites", 1),
             ],
         );
     }

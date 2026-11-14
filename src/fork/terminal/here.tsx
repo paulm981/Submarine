@@ -69,11 +69,32 @@ export const withCdHere = (terminalId: string, ready: (() => void | Promise<void
   };
 };
 
+// The server tabs that open terminals (TerminalHereListener), by session id,
+// with how many of them are mounted. An FTP server's tab shows the same file
+// panes but has no terminal (#246), so its folders don't offer one.
+const listening = new Map<string, number>();
+
+/** A server tab that can open a terminal for a folder: until the returned
+ *  function is called. */
+export const listenHere = (sessionId: string): (() => void) => {
+  listening.set(sessionId, (listening.get(sessionId) ?? 0) + 1);
+  return () => {
+    const left = (listening.get(sessionId) ?? 1) - 1;
+    if (left > 0) listening.set(sessionId, left);
+    else listening.delete(sessionId);
+  };
+};
+
+/** Whether the tab `sessionId` opens terminals (an SSH server's, not an
+ *  FTP server's). */
+export const opensTerminals = (sessionId: string) => listening.has(sessionId);
+
 /** The SFTP menu's entry, for one folder: in the server pane (`sessionId`),
- *  or the local one (none), where Home terminals run. */
+ *  or the local one (none), where Home terminals run. Not in an FTP tab's
+ *  server pane: there's no terminal there. */
 export const TerminalHereItem = ({ path, sessionId, done }: { path: string; sessionId?: string; done: () => void }) => {
   const remote = sessionId !== undefined;
-  if (IS_MOBILE || (remote ? cdLine(path) === null : IS_ANDROID)) return null;
+  if (IS_MOBILE || (remote ? cdLine(path) === null || !opensTerminals(sessionId) : IS_ANDROID)) return null;
   const open = () => {
     done();
     window.dispatchEvent(new CustomEvent(remote ? TERMINAL_HERE : HOME_HERE, { detail: { sessionId, path } }));
@@ -101,7 +122,11 @@ export const TerminalHereListener = ({ sessionId, openTerminal }: { sessionId: s
       opener.current(id);
     };
     window.addEventListener(TERMINAL_HERE, here);
-    return () => window.removeEventListener(TERMINAL_HERE, here);
+    const unlisten = listenHere(sessionId);
+    return () => {
+      window.removeEventListener(TERMINAL_HERE, here);
+      unlisten();
+    };
   }, [sessionId]);
   return null;
 };

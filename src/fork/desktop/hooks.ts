@@ -16,6 +16,7 @@ import { visibleName } from "../../util/fileName";
 import { folderTree } from "../../util/folderTree";
 import { readRdpOptions, writeRdpOptions } from "../../util/rdpOptions";
 import { readSessionKeep, writeSessionKeep } from "../../util/sessionKeep";
+import { serverProtocol } from "../../util/serverProtocol";
 import {
   type CloseWhich, type DesktopSession, HAS_HOME, START_VIEW, osChecksDue, sessionFor, stepTab, tabsToClose,
 } from "./rules";
@@ -66,7 +67,8 @@ export const useHighlightRules = (addLog: AddLog) => {
  *  they were shown (`runOnConnect`, and `runOnConnectEvery` whether they go
  *  into each new terminal): when either changed meanwhile the OK is refused
  *  and the review shows them as they are now. `keepServerSsh` declines a
- *  held switch to telnet or VNC: the server stays SSH (or RDP), and the
+ *  held switch to telnet, VNC or plain FTP: the server stays SSH (or RDP, or
+ *  FTPS), and the
  *  other computers get it back as that with the next sync. `keepAiPolicy`
  *  keeps a teammate's move that let the AI do more on a server as it was:
  *  the server stays at "Ask every time" here until it's changed (#115). */
@@ -336,7 +338,7 @@ export const useSessionTree = (o: {
       // device's own, kept by sync id: the copy starts with the same.
       const original = (o.servers || []).find((s: any) => s.id === id);
       const isRdp = original?.protocol === "rdp";
-      const isSsh = !["rdp", "telnet", "vnc"].includes(original?.protocol);
+      const isSsh = serverProtocol(original?.protocol) === "ssh";
       if (original?.uuid && (isRdp || isSsh)) {
         try {
           const copy = (await invoke<any[]>("get_servers")).find((s) => s.id === copyId);

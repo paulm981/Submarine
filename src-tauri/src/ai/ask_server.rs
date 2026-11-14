@@ -140,7 +140,7 @@ fn order(list: &mut Vec<Candidate>) {
 
 /// The saved SSH servers named `name`, ignoring case in any alphabet
 /// (`ÉCOLE` finds `école`, which SQLite's `lower` wouldn't): exact names
-/// only, not one deleted, nor an RDP, VNC or telnet server. `open`: the
+/// only, not one deleted, nor an RDP, VNC, telnet or FTP server. `open`: the
 /// saved servers whose tab is connected now. However many have the name,
 /// only MAX_SHOWN are kept.
 pub(crate) fn find(conn: &rusqlite::Connection, name: &str, open: &HashSet<i64>) -> Found {

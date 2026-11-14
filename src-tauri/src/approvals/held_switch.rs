@@ -1,20 +1,20 @@
 //! What the fork holds, besides what approvals.rs describes.
 //!
-//! **A server switched to telnet or VNC** from anything else (SSH, RDP) is held
-//! for what it would send rather than run. Telnet sends the password as plain
-//! text, and VNC answers its password check with weak protection and doesn't
-//! check the server's identity, so the switch could take the server's saved
-//! password somewhere it could be read. Unlike the others, this device keeps
+//! **A server switched to telnet, VNC or plain FTP** from anything else (SSH,
+//! RDP, FTPS) is held for what it would send rather than run. Telnet and plain
+//! FTP send the password as plain text, and VNC answers its password check
+//! with weak protection and doesn't check the server's identity, so the switch
+//! could take the server's saved password somewhere it could be read (#246). Unlike the others, this device keeps
 //! the old protocol and port in the row until it's allowed (`hold_switch` puts
 //! them back, and `before_merge` brings the synced ones back for the next
 //! record to merge over); what it pushes still carries the synced ones
 //! (`held_switch`), so the hold never undoes the change for everyone else. The
 //! user can also keep it as it was (`keep_ssh`), which is their own edit and
-//! goes to everyone. A switch to RDP isn't held: its password is only sent
-//! after the server's certificate is checked, as an SSH password is after its
-//! host key. But a switch from RDP to telnet or VNC is, or SSH to RDP to VNC
-//! would get round the hold in two steps. Its entry is
-//! `protocol:<telnet|vnc>|<port>`.
+//! goes to everyone. A switch to RDP or FTPS isn't held: its password is only
+//! sent after the server's certificate is checked, as an SSH password is after
+//! its host key. But a switch from RDP or FTPS to telnet, VNC or plain FTP is,
+//! or SSH to RDP to VNC would get round the hold in two steps. Its entry is
+//! `protocol:<telnet|vnc|ftp>|<port>`.
 //!
 //! **Entries made while a profile was shared** stay after it's left, like the
 //! rest of the device's state, until the user allows them; a held switch goes
@@ -30,7 +30,8 @@
 
 use super::*;
 
-/// A held switch of protocol: `protocol:telnet|23` or `protocol:vnc|5900`.
+/// A held switch of protocol: `protocol:telnet|23`, `protocol:vnc|5900` or
+/// `protocol:ftp|21`.
 pub const PROTOCOL_PREFIX: &str = "protocol:";
 
 /// A held switch: the protocol and port the synced record has for a server,
@@ -59,12 +60,13 @@ pub(crate) fn is_ssh(protocol: Option<&str>) -> bool {
 }
 
 /// The protocols a switch to is held for: they'd send the server's saved
-/// password where it could be read.
+/// password where it could be read. Telnet, VNC or plain FTP ("ftp"); not
+/// FTPS ("ftps", "ftps-implicit"), which checks the certificate first.
 pub(crate) fn sends_password_weakly(protocol: Option<&str>) -> bool {
-    matches!(protocol, Some("telnet") | Some("vnc"))
+    matches!(protocol, Some("telnet") | Some("vnc") | Some("ftp"))
 }
 
-/// A server's held switch to telnet or VNC, if there is one.
+/// A server's held switch to telnet, VNC or plain FTP, if there is one.
 pub fn held_switch(conn: &Connection, uuid: &str) -> Option<HeldSwitch> {
     held_for(conn, uuid).iter().find_map(|item| HeldSwitch::parse(item))
 }
@@ -103,8 +105,8 @@ pub fn before_merge(conn: &Connection, table: &str, uuid: &str) -> Result<Option
 }
 
 /// After the merge engine applied a server record: an existing server that
-/// wasn't telnet or VNC (SSH, RDP) and that the record makes a telnet or VNC
-/// one stays what it was here, on its old port, and the switch is held;
+/// wasn't telnet, VNC or plain FTP (SSH, RDP, FTPS) and that the record makes
+/// a telnet, VNC or plain FTP one stays what it was here, on its old port, and the switch is held;
 /// anything else lets a held switch go. A new server (`before` None) isn't
 /// held: the user sees what it is before opening it.
 /// Part of `hold_changes`; outside a share, run on its own for a server that
@@ -128,7 +130,7 @@ pub fn hold_switch(conn: &Connection, uuid: &str, before: Option<&Snapshot>) -> 
     }
 }
 
-/// The user's "Keep it SSH" (or RDP) for a held switch: the switch is dropped
+/// The user's "Keep it SSH" (or RDP, or FTPS) for a held switch: the switch is dropped
 /// and the server, as it was on its old port here, is saved as this device's
 /// own edit, so the next sync takes it back to that everywhere. False when
 /// nothing was held.
@@ -181,7 +183,8 @@ pub fn check_seen_run_on_connect(
 }
 
 // Every call from the original project's code into this file (fork_hooks.rs):
-/// "Keep it SSH" (or RDP) for a server whose switch to telnet or VNC is held:
+/// "Keep it SSH" (or RDP, or FTPS) for a server whose switch to telnet, VNC
+/// or plain FTP is held:
 /// it stays as it was on its old port, saved as this device's own edit, so the
 /// next sync takes it back to that everywhere (approvals::keep_ssh). False
 /// when no switch was held.

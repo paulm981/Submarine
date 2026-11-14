@@ -15,6 +15,8 @@
 //!   host behind it is linked to it. Submarine jumps through one host only,
 //!   so a chain of several is reported and left for the user;
 //! - an RDP session becomes an RDP server in its folder, with no saved login;
+//! - a FileZilla FTP site becomes an FTP server of its kind, with the
+//!   password FileZilla kept unless the page was told to leave it out;
 //! - a server already saved with the same name, host, port and folder is
 //!   left alone, so importing the same file twice adds nothing.
 
@@ -196,6 +198,7 @@ fn insert_server(
     folder_id: Option<i64>,
     run_on_connect: &str,
     protocol: Option<&str>,
+    password: Option<&str>,
 ) -> rusqlite::Result<i64> {
     // Its own key wins over a Login; then add_server's rule decides which
     // fields the row keeps (normalize_server_identity).
@@ -204,10 +207,10 @@ fn insert_server(
         (None, Some(_)) => "vault",
         (None, None) => "custom_pass",
     };
-    let (username, _, key_id, credential_id) = crate::normalize_server_identity(
+    let (username, password, key_id, credential_id) = crate::normalize_server_identity(
         auth_type,
         Some(username.to_string()),
-        None,
+        password.map(str::to_string),
         key_id.map(|k| k as i32),
         credential_id.map(|c| c as i32),
     );
@@ -215,8 +218,8 @@ fn insert_server(
     let position = saved.next_position(folder_id);
     conn.execute(
         "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, position, protocol)
-         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, 'none', '', 1080, '[]', ?7, ?8, 0, '[]', NULL, '', ?9, ?10, ?11)",
-        params![name, host, port, username, credential_id, folder_id, auth_type, key_id, run_on_connect, position, protocol],
+         VALUES (?1, ?2, ?3, ?4, ?12, ?5, ?6, 'none', '', 1080, '[]', ?7, ?8, 0, '[]', NULL, '', ?9, ?10, ?11)",
+        params![name, host, port, username, credential_id, folder_id, auth_type, key_id, run_on_connect, position, protocol, password],
     )?;
     let id = conn.last_insert_rowid();
     saved.servers.entry(saved_key(name, host, port, folder_id)).or_insert(id);
@@ -252,7 +255,18 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
         let h = &row.host;
         let name = h.host_alias.trim();
         let host = if h.hostname.trim().is_empty() { name } else { h.hostname.trim() };
-        let port = if h.port == 0 { 22 } else { h.port };
+        // An FTP site from FileZilla's list (set_server_protocol's kinds).
+        let ftp = match h.protocol.as_deref() {
+            None => None,
+            Some(p @ ("ftp" | "ftps" | "ftps-implicit")) => Some(p),
+            Some(other) => return Err(format!("[DATABASE] SERVER_PROTOCOL_UNKNOWN: {other}")),
+        };
+        let usual = match ftp {
+            Some("ftps-implicit") => crate::ftp::IMPLICIT_PORT,
+            Some(_) => crate::ftp::DEFAULT_PORT,
+            None => 22,
+        };
+        let port = if h.port == 0 { usual } else { h.port };
         let folder_id = folders.resolve(conn, &h.folder).map_err(db)?;
 
         if h.rdp {
@@ -271,7 +285,7 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
             // MobaXterm login is often shared by many servers, and its
             // password never goes to the Remote Desktop app (FORK.md, E2).
             // The app asks, and can remember it.
-            insert_server(conn, &mut saved, name, host, port, user, None, None, folder_id, "", Some("rdp")).map_err(db)?;
+            insert_server(conn, &mut saved, name, host, port, user, None, None, folder_id, "", Some("rdp"), None).map_err(db)?;
             report.rdp_added += 1;
             continue;
         }
@@ -289,7 +303,9 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
             None => None,
         };
         let run = h.run_on_connect.as_deref().map(str::trim).unwrap_or("");
-        let id = insert_server(conn, &mut saved, name, host, port, &h.user, credential_id, row.key_id, folder_id, run, h.telnet.then_some("telnet"))
+        let protocol = if h.telnet { Some("telnet") } else { ftp };
+        let password = h.password.as_deref().filter(|p| !p.is_empty());
+        let id = insert_server(conn, &mut saved, name, host, port, &h.user, credential_id, row.key_id, folder_id, run, protocol, password)
             .map_err(db)?;
         report.added += 1;
         by_alias.entry(name.to_lowercase()).or_insert(id);
@@ -345,7 +361,7 @@ pub(crate) fn import_rows(conn: &Connection, rows: &[ImportRow]) -> Result<Impor
                         Some(c) => Some(login_id(conn, &mut logins, c, &mut report).map_err(db)?),
                         None => None,
                     };
-                    let j = insert_server(conn, &mut saved, &name, &host, port, &user, login, row.jump_key_id, None, "", None).map_err(db)?;
+                    let j = insert_server(conn, &mut saved, &name, &host, port, &user, login, row.jump_key_id, None, "", None, None).map_err(db)?;
                     report.jump_hosts_created.push(name);
                     j
                 }
@@ -621,6 +637,39 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(kinds, vec![("switch".into(), Some("telnet".into())), ("web1".into(), None)]);
+    }
+
+    #[test]
+    fn a_filezilla_site_keeps_its_kind_and_password() {
+        let conn = vault();
+        let site = |name: &str, protocol: &str, port: u16, password: Option<&str>| ImportRow {
+            host: ImportedHost {
+                host_alias: name.into(),
+                hostname: format!("{name}.example"),
+                port,
+                user: "me".into(),
+                protocol: Some(protocol.into()),
+                password: password.map(String::from),
+                ..Default::default()
+            },
+            key_id: None,
+            jump_key_id: None,
+        };
+        let r = import_rows(&conn, &[site("plain", "ftp", 21, Some("s3cr3t")), site("tls", "ftps-implicit", 0, None)]).unwrap();
+        assert_eq!(r.added, 2);
+        let rows: Vec<(String, i64, Option<String>, Option<String>, String)> = conn
+            .prepare("SELECT name, port, protocol, password, auth_type FROM servers ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows, vec![
+            ("plain".into(), 21, Some("ftp".into()), Some("s3cr3t".into()), "custom_pass".into()),
+            ("tls".into(), 990, Some("ftps-implicit".into()), None, "custom_pass".into()),
+        ]);
+        // A kind the app doesn't know fails the import, not a guess at SSH.
+        assert!(import_rows(&vault(), &[site("odd", "gopher", 70, None)]).is_err());
     }
 
     #[test]

@@ -347,7 +347,7 @@ const ShareLine = ({ v, tab, shared, starting, onShare, onUnshare }: {
   const here = v.session ? tab.servers.find((s) => s.session_id === v.session!.id) : undefined;
   const marker = here ? aiMarker(here) : null;
   if (v.session && !v.session.ssh) {
-    text = "Remote Desktop, VNC and telnet tabs can't be shared with AI.";
+    text = "Remote Desktop, VNC, telnet and FTP tabs can't be shared with AI.";
   } else if (v.session) {
     text = shared
       ? `This tab is shared with ${tab.label}: it can ask to run commands here.`

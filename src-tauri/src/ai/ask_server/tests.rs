@@ -15,7 +15,8 @@ fn vault() -> rusqlite::Connection {
          INSERT INTO servers (id, name) VALUES (1, 'web1'), (2, 'db-01'), (5, 'école');
          INSERT INTO servers (id, name, host, port, username, credential_id, folder_id) VALUES
            (3, 'twin', '10.0.0.3', 22, 'root', NULL, 2), (4, 'Twin', '10.0.0.4', 2222, '', 1, NULL);
-         INSERT INTO servers (id, name, protocol) VALUES (6, 'win', 'rdp'), (7, 'desk', 'vnc'), (8, 'switch', 'telnet'), (9, 'ssh1', 'ssh');
+         INSERT INTO servers (id, name, protocol) VALUES (6, 'win', 'rdp'), (7, 'desk', 'vnc'), (8, 'switch', 'telnet'), (9, 'ssh1', 'ssh'),
+           (11, 'files', 'ftp'), (12, 'files-tls', 'ftps'), (13, 'files-990', 'ftps-implicit');
          INSERT INTO servers (id, name, deleted) VALUES (10, 'gone', 1);",
     )
     .unwrap();
@@ -40,8 +41,9 @@ fn only_an_exact_name_finds_a_server_ignoring_case() {
 #[test]
 fn a_server_that_cant_be_shared_isnt_found() {
     let conn = vault();
-    // RDP, VNC and telnet have no SSH session to share; a deleted one is gone.
-    for name in ["win", "desk", "switch", "gone"] {
+    // RDP, VNC, telnet and FTP have no SSH session to share; a deleted one
+    // is gone.
+    for name in ["win", "desk", "switch", "files", "files-tls", "files-990", "gone"] {
         assert_eq!(find(&conn, name, &HashSet::new()), Found::None, "{name}");
     }
 }

@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { ShieldAlert, X } from "lucide-react";
 import { useFocusTrap } from "../ui/confirm";
 import { heldMay } from "../util/ai";
+import { isFtp } from "../util/serverProtocol";
 import { t, useT } from "../i18n";
 
 // What this device holds back until its user allows it: a change someone else
@@ -29,11 +30,11 @@ const rank = (item: string) =>
   item.startsWith("protocol:") ? -3 : item.startsWith("moved:") ? -2 : item.startsWith(AI_ITEM) ? -1 : item === "run_on_connect" ? 0 : item === "autostart" ? 1 : item.startsWith("tunnel:") ? 2 : 3;
 const byRank = (a: string, b: string) => rank(a) - rank(b) || a.localeCompare(b);
 
-/** A held switch to telnet or VNC: `protocol:<telnet|vnc>|<port>`. */
+/** A held switch to telnet, VNC or plain FTP: `protocol:<telnet|vnc|ftp>|<port>`. */
 function switchOf(item: string): { protocol: string; label: string; port: string } | null {
   if (!item.startsWith("protocol:")) return null;
   const [protocol, port = ""] = item.slice("protocol:".length).split("|");
-  return { protocol, label: protocol === "vnc" ? "VNC" : "telnet", port };
+  return { protocol, label: protocol === "vnc" ? "VNC" : protocol === "ftp" ? "plain FTP" : "telnet", port };
 }
 
 /** A move that lets the AI do more on the server here (src-tauri/src/ai/trust.rs,
@@ -50,7 +51,7 @@ function aiMoveOf(item: string): HeldPolicy | null {
 }
 
 /** What the server is on this device while a switch is held: SSH or RDP. */
-const keptLabel = (server: HeldServer) => (server.protocol === "rdp" ? "RDP" : "SSH");
+const keptLabel = (server: HeldServer) => (server.protocol === "rdp" ? "RDP" : isFtp(server.protocol) ? "FTPS" : "SSH");
 
 /** One held item, in words, with the text it would run when there is one. */
 function describe(item: string, server: HeldServer): { what: string; detail?: string } {
@@ -92,7 +93,9 @@ function describe(item: string, server: HeldServer): { what: string; detail?: st
   if (sw) {
     const why = sw.protocol === "vnc"
       ? "VNC sends its password with weak protection and doesn't check the server's identity."
-      : "Telnet sends everything, passwords too, as plain text.";
+      : sw.protocol === "ftp"
+        ? "Plain FTP sends the password, and the files, as plain text."
+        : "Telnet sends everything, passwords too, as plain text.";
     const to = `${sw.label}${sw.port ? ` on port ${sw.port}` : ""}`;
     return {
       what: `Another computer changed this server to ${sw.label}. ${why}`,
@@ -190,7 +193,7 @@ export function HeldReview({ servers, onAllow, onKeepSsh, onKeepAi, onClose }: {
           </button>
         </div>
         <p className="px-4 pb-3 text-[12px] text-zinc-400 leading-relaxed">
-          {t("These came from someone you share this profile with, or from a profile file you imported. Until you allow one, it doesn't run on this device: commands aren't typed, forwards stay stopped, autostart doesn't connect, monitor commands don't run, a server changed to telnet or VNC stays what it was, a moved server asks before it connects, and a server moved where the AI may do more asks before every command. Allowing counts for this device only.")}
+          {t("These came from someone you share this profile with, or from a profile file you imported. Until you allow one, it doesn't run on this device: commands aren't typed, forwards stay stopped, autostart doesn't connect, monitor commands don't run, a server changed to telnet, VNC or plain FTP stays what it was, a moved server asks before it connects, and a server moved where the AI may do more asks before every command. Allowing counts for this device only.")}
         </p>
         <div className="flex-1 overflow-y-auto custom-scrollbar px-4 pb-2 space-y-3">
           {held.map((s) => (

@@ -478,27 +478,30 @@ mod tests {
 
     /// Many matches of later rules beside many hidden by earlier ones: the
     /// time grows with the output, not with its square. (Checked as a ratio,
-    /// so a slow machine or a debug build doesn't make it fail.)
+    /// so a slow machine or a debug build doesn't make it fail. The two sizes
+    /// take turns, best of three each, so a busy moment on a shared CI
+    /// machine slows both rather than one: Windows CI once took twice as long
+    /// for the larger alone, a ratio of 6.4 where 4 is linear.)
     #[test]
     fn many_secrets_take_linear_time() {
         let line = "pass=a password=b\n";
-        let time = |kb: usize| {
-            let text = line.repeat(kb * 1024 / line.len());
-            (0..2)
-                .map(|_| {
-                    let t = std::time::Instant::now();
-                    let f = filter(&text);
-                    assert_eq!(f.hidden, 2 * (kb * 1024 / line.len()));
-                    t.elapsed()
-                })
-                .min()
-                .unwrap()
+        let text = |kb: usize| line.repeat(kb * 1024 / line.len());
+        let (small_text, large_text) = (text(128), text(512));
+        let once = |text: &str| {
+            let t = std::time::Instant::now();
+            let f = filter(text);
+            assert_eq!(f.hidden, 2 * text.matches('\n').count());
+            t.elapsed()
         };
-        let (small, large) = (time(128), time(512));
+        let (mut small, mut large) = (std::time::Duration::MAX, std::time::Duration::MAX);
+        for _ in 0..3 {
+            small = small.min(once(&small_text));
+            large = large.min(once(&large_text));
+        }
         // Four times the output: about four times the time if linear,
         // sixteen if quadratic.
         let ratio = large.as_secs_f64() / small.as_secs_f64();
-        assert!(ratio < 6.0, "128 KB: {small:?}, 512 KB: {large:?}");
+        assert!(ratio < 8.0, "128 KB: {small:?}, 512 KB: {large:?}");
     }
 
     #[test]

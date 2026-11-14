@@ -25,15 +25,16 @@ export const FolderOptions = ({ folders }: { folders?: FolderRow[] | null }) => 
   <>{folderOptions(folders || []).map((f) => <option key={f.id} value={f.id.toString()} className="bg-[#1a1a1e] text-white">{f.label}</option>)}</>
 );
 
-/** Under the password field, once switching to telnet or VNC took out the
- *  SSH or RDP password (protocolSwitch) and nothing was typed in its place. */
+/** Under the password field, once switching to telnet, VNC or plain FTP took
+ *  out the SSH, RDP or FTPS password (protocolSwitch) and nothing was typed
+ *  in its place. */
 export const HeldPasswordNote = ({ newNode, isTelnet, isVnc }: { newNode: ServerFormNode; isTelnet: boolean; isVnc: boolean }) => (
   <>
-    {(isTelnet || isVnc) && newNode.heldPassword?.password && !newNode.password && (
+    {(isTelnet || isVnc || newNode.protocol === "ftp") && newNode.heldPassword?.password && !newNode.password && (
       <p className="text-[10px] text-amber-300/90 ml-1">
         {isVnc
           ? `The ${newNode.heldPassword.from} password was taken out, so it isn't sent over VNC. VNC servers have a password of their own: type it here.`
-          : `The ${newNode.heldPassword.from} password was taken out, so it isn't sent over telnet, which doesn't protect it. Type one here if you want it saved.`}
+          : `The ${newNode.heldPassword.from} password was taken out, so it isn't sent over ${isTelnet ? "telnet" : "plain FTP"}, which doesn't protect it. Type one here if you want it saved.`}
       </p>
     )}
   </>

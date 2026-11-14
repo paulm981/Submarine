@@ -24,6 +24,7 @@
 //   folds away, and the window goes to the Wall.
 import { useEffect, useRef, type Dispatch, type SetStateAction } from "react";
 import { resetAim } from "../terminal/broadcastAim";
+import { serverProtocol } from "../../util/serverProtocol";
 
 export type WallTile = { id: string; sessionId: string; terminalId: string };
 
@@ -53,9 +54,9 @@ export const syncBroadcastTiles = (
 };
 
 /** The servers of `list` Broadcast can type to: those with a terminal (SSH),
- *  not RDP, VNC or Telnet. For Broadcast to a folder or a pick (#218). */
+ *  not RDP, VNC, Telnet or FTP. For Broadcast to a folder or a pick (#218). */
 export const broadcastable = <S extends { protocol?: string | null }>(list: S[]): S[] =>
-  list.filter((s) => !["rdp", "vnc", "telnet"].includes(s.protocol ?? "ssh"));
+  list.filter((s) => serverProtocol(s.protocol) === "ssh");
 
 type Broadcast = {
   enabled: boolean;

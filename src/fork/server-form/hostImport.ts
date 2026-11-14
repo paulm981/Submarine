@@ -33,16 +33,18 @@ export const chooseImportFile = async (setError: SetText, setText: (text: string
 };
 
 /** The rest of importSelectedHosts, once the picked hosts and whether their
- *  key files go too (`withKeys`) are known.
+ *  key files go too (`withKeys`) are known, and whether the passwords
+ *  FileZilla kept go too (`withPasswords`, asked in a shared profile).
  *
  *  Load each distinct key file into the vault (import_ssh_key_file dedupes
  *  by content), then hand every picked host to `import_hosts`, which writes
  *  folders, Logins, jump hosts and servers in one transaction. A host whose
  *  key can't be read still imports, signing in without it; the summary says
  *  which key and why (a PuTTY .ppk, say, needs exporting as OpenSSH first). */
-export const importPicked = async ({ picked, withKeys, keysByPath, setImportBusy, setImportError, setImportDone, refreshServers, refreshFolders, refreshCredentials, refreshSshKeys, onImported }: {
+export const importPicked = async ({ picked, withKeys, withPasswords = true, keysByPath, setImportBusy, setImportError, setImportDone, refreshServers, refreshFolders, refreshCredentials, refreshSshKeys, onImported }: {
   picked: ImportedHost[];
   withKeys: boolean;
+  withPasswords?: boolean;
   keysByPath: Map<string, ImportedSshKey | null>;
   setImportBusy: (busy: boolean) => void;
   setImportError: SetText;
@@ -70,7 +72,9 @@ export const importPicked = async ({ picked, withKeys, keysByPath, setImportBusy
   for (const host of picked) {
     const key = await loadKey(host.identity_file);
     const jumpKey = await loadKey(host.jump_identity_file);
-    rows.push({ host, key_id: key ? key.id : null, jump_key_id: jumpKey ? jumpKey.id : null });
+    // A password FileZilla kept goes only when allowed, and not beside a key.
+    const dropPassword = !!host.password && (!withPasswords || !!key);
+    rows.push({ host: dropPassword ? { ...host, password: undefined } : host, key_id: key ? key.id : null, jump_key_id: jumpKey ? jumpKey.id : null });
   }
   let report: ImportReport | null = null;
   try {
