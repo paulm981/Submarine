@@ -103,21 +103,13 @@ export const useHeldActions = (addLog: AddLog, refreshServers: () => Promise<voi
   return { allowHeldSeen, keepServerSsh, keepAiPolicy };
 };
 
-/** The title bar's tab strip: it scrolls the tab on screen into view (with
- *  dozens open, a tab picked from All tabs lands past the edge), and
- *  dragging a server tab to a new place reorders `sessions` itself, so
- *  Ctrl+Tab and All tabs follow it. */
-export const useTabStrip = <S extends { id: string }>(activeView: string, sessions: S[], setSessions: SetList<S>) => {
-  const tabStripRef = useRef<HTMLDivElement>(null);
+/** The title bar's tab strip: dragging a server tab to a new place reorders
+ *  `sessions` itself, so Ctrl+Tab and All tabs follow it. (Keeping the tab on
+ *  screen in view is the original project's, since #326.) */
+export const useTabStrip = <S extends { id: string }>(setSessions: SetList<S>) => {
   const sessionDrag = useTabDrag("sessions", (dragId, overId, after) =>
     setSessions(prev => reorderById(prev, dragId, overId, after)));
-  useEffect(() => {
-    const strip = tabStripRef.current;
-    if (!strip) return;
-    const tab = [...strip.querySelectorAll<HTMLElement>("[data-tab]")].find(el => el.dataset.tab === activeView);
-    tab?.scrollIntoView({ block: "nearest", inline: "nearest" });
-  }, [activeView, sessions]);
-  return { tabStripRef, sessionDrag };
+  return { sessionDrag };
 };
 
 /** Live Edit copies with changes that were never uploaded, kept when their
