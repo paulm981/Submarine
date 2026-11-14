@@ -123,57 +123,116 @@ The original project's README follows.
 ---
 
 <div align="center">
-  <img src="docs/screenshots/hero.png" alt="Submarine main window — terminal session with dual-pane SFTP browser open on the right" width="900" />
+  <img src="docs/screenshots/hero.png" alt="Submarine main window: an SSH terminal on the left and the dual-pane SFTP browser (local folder on top, remote folder below) open on the right" width="900" />
 </div>
 
-> **TL;DR** — Submarine is a fast, free, open-source SSH and SFTP client for Windows, macOS, Linux, and Android. It replaces the typical PuTTY + WinSCP + tunnel-manager stack with one tabbed window per server: terminal, SFTP, port forwarding (SOCKS / HTTP / local / remote), folder mirror, and end-to-end encrypted profile sync. Built with Rust + Tauri. MIT licensed.
+> **TL;DR** — Submarine is a free, open-source SSH, SFTP and FTP client for Windows, macOS, Linux and Android. It replaces the usual PuTTY + WinSCP + FileZilla + tunnel-manager (+ Remmina / VNC viewer) stack with one tabbed window per server: terminal, SFTP and FTP, port forwarding (SOCKS / HTTP / local / remote), folder mirror, server info, Docker, and RDP, VNC and Telnet sessions. Profiles are encrypted on your device, and optional cloud sync can keep them in step across your machines and your phone. Built with Rust and Tauri. MIT licensed.
 
 ## At a glance
 
-- **One window, many tools per server** — terminal, SFTP, tunnels, folder mirror, Docker, live server info, and a per-server command library, all as tabs around the same session
-- **Watch many servers at once** — session **split view** to tile any two sessions side-by-side, plus a global **Wall** pinboard for arbitrary terminals across hosts in a grid you control
-- **Broadcast input** — type once, send to N selected sessions simultaneously (Tmux `synchronize-panes` for cross-server)
-- **Native and cross-platform** — Windows, macOS, Linux (`.deb` / `.rpm` / Arch / AppImage), and Android — same encrypted vault everywhere
-- **Zero-knowledge cloud sync** — profiles are Argon2id + AES-256-GCM sealed on your device before upload; the server (and everyone else) only sees ciphertext. Browser dashboard at [`api.sinaxhpm.com/account`](https://api.sinaxhpm.com/account/) to manage your account and stored profiles
-- **Docker manager** — containers, logs (live tail), stats, prune, and `docker exec` shells as first-class session tabs
-- **Import from anywhere** — PuTTY `.reg`, MobaXterm `.mxtsessions`, OpenSSH config, and Submarine JSON exports all bulk-imported from the Servers page
-- **Secure by default** — TOFU host keys with per-connection nonce binding, strict CSP, minimal Tauri permission ACL, zeroized master key
+- **SSH, SFTP, FTP and FTPS, Telnet, VNC and RDP in one app** — pick the type when you add a server; each opens as a tab (the terminal for SSH and Telnet, the file browser for FTP, the remote screen for VNC and RDP)
+- **In 15 languages** — English, Deutsch, Español, Français, Italiano, Polski, Português (Brasil), Türkçe, Русский, Українська, हिन्दी, 日本語, 한국어, 中文（简体）and 中文（繁體）; it follows the system's language, or pick one in Settings → Language
+- **One window, many tools per server** — terminal, SFTP, tunnels, folder mirror, Docker, live server info and a command library, all around the same session
+- **Watch many servers at once** — split view for two sessions, a **Wall** pinboard for any terminals across hosts, and **broadcast input** to several sessions at once
+- **Works with your existing SSH setup** — reads `~/.ssh/config` (Include, Match, ProxyJump, ProxyCommand, IdentityFile, certificates), logs in with keys from **ssh-agent / Pageant / the Windows OpenSSH agent**, trusts your `known_hosts`
+- **Native and cross-platform** — Windows, macOS (one app for Apple Silicon and Intel), Linux (`.deb` / `.rpm` / Arch / AppImage) and Android, with iPhone and iPad builds for the App Store, and the same encrypted vault on all of them
+- **Encrypted profiles** — Argon2id + AES-256-GCM on your device; open a profile with **Windows Hello** or an **Android fingerprint** if you turn that on
+- **Optional cloud sync** — records are encrypted before upload; use the hosted server, or [point Submarine at your own](#cloud-sync-optional)
+- **Import from anywhere** — PuTTY `.reg`, MobaXterm `.mxtsessions`, OpenSSH config and Submarine JSON exports
+- **Honest about risk** — Telnet and plain VNC are labelled *not encrypted*, and the built-in RDP client is marked *experimental*
 
 ## Screenshots
 
 <table>
   <tr>
-    <td width="50%" valign="top" align="center">
-      <a href="docs/screenshots/tunnels.png"><img src="docs/screenshots/tunnels.png" alt="Port forwarding panel: local, remote, and dynamic SOCKS tunnels with live connection counters" /></a>
-      <br/><sub><b>Port forwarding</b> — local / remote / dynamic SOCKS tunnels, live active-connection counters, autostart with the app</sub>
-    </td>
-    <td width="50%" valign="top" align="center">
-      <a href="docs/screenshots/mirror.png"><img src="docs/screenshots/mirror.png" alt="Folder Mirror setup with local/remote paths, excludes, and conflict resolution" /></a>
-      <br/><sub><b>Folder mirror</b> — two-way sync, excludes, per-mirror conflict resolution, soft delete to <code>.submarine-trash/</code></sub>
+    <td colspan="2" align="center">
+      <a href="docs/screenshots/compare.png"><img src="docs/screenshots/compare.png" alt="SFTP compare view: the local and remote folder side by side, files marked as only here, a different size, newer or older" /></a>
+      <br/><sub><b>Compare folders</b> — see at a glance what is only on one side, differs in size, or is newer or older, with a switch to hide files that are the same</sub>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top" align="center">
-      <a href="docs/screenshots/commands.png"><img src="docs/screenshots/commands.png" alt="Per-server command library with Run / Paste / Edit on each snippet, plus a Notes tab" /></a>
-      <br/><sub><b>Quick commands &amp; notes</b> — per-server snippet library and a Notes tab for runbook / contacts</sub>
+      <a href="docs/screenshots/vnc.png"><img src="docs/screenshots/vnc.png" alt="A VNC desktop shown in a Submarine tab: a not-encrypted label, and in the tab's bar Paste, a Good connection mark with a 1 ms round trip, Settings, Log and Close" /></a>
+      <br/><sub><b>VNC</b> — the remote screen in the tab, directly or through an SSH server, with a shared clipboard, the connection's quality and its speed settings; unencrypted VNC says so</sub>
     </td>
     <td width="50%" valign="top" align="center">
-      <a href="docs/screenshots/logins.png"><img src="docs/screenshots/logins.png" alt="Logins panel: saved passwords and SSH keys with Add Password / Add Key / Generate Key" /></a>
-      <br/><sub><b>Logins</b> — saved passwords and SSH keys, with built-in key generation; all credentials encrypted in the vault</sub>
+      <a href="docs/screenshots/rdp.png"><img src="docs/screenshots/rdp.png" alt="An RDP desktop shown in a Submarine tab: an Experimental label, and in the tab's bar Paste, a Good connection mark with a 6 ms round trip, Files, Settings, Log and Close" /></a>
+      <br/><sub><b>RDP</b> — opens in your computer's RDP app by default; the built-in client (shown) is experimental and opt-in, and shares the clipboard and a folder or drive</sub>
     </td>
   </tr>
   <tr>
-    <td width="50%" valign="top" align="center">
-      <a href="docs/screenshots/monitoring.png"><img src="docs/screenshots/monitoring.png" alt="Live monitoring grid: per-server CPU, memory, network-in and network-out sparklines" /></a>
-      <br/><sub><b>Monitoring</b> — per-node SSH polling for CPU, RAM, and live network in/out with sparklines</sub>
+    <td colspan="2" align="center">
+      <a href="docs/screenshots/wall.png"><img src="docs/screenshots/wall.png" alt="The Wall: three terminals from different servers pinned side by side, each running its own command" /></a>
+      <br/><sub><b>The Wall</b> — pin terminals from any servers into one grid and watch them together</sub>
     </td>
-    <td width="50%" valign="top" align="center">
-      <a href="docs/screenshots/server-edit.png"><img src="docs/screenshots/server-edit.png" alt="Server details form: folder, tag colour, host/port, login method, proxy, tunnels, mirrors, autostart" /></a>
-      <br/><sub><b>Server details</b> — folder, tag colour, host, auth, proxy, tunnels, mirrors, and autostart in one form</sub>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <a href="docs/screenshots/monitor.png"><img src="docs/screenshots/monitor.png" alt="Monitoring: live CPU, memory, disk and load graphs for three servers" /></a>
+      <br/><sub><b>Monitoring</b> — per-node SSH polling for CPU, memory, swap, disk, load and network, with graphs, outage log and your own custom metrics</sub>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <a href="docs/screenshots/servers-home-lab.png"><img src="docs/screenshots/servers-home-lab.png" alt="A folder of servers with colour tags and badges for RDP, VNC and Telnet servers" /></a>
+      <br/><sub><b>Servers</b> — nested, colour-tagged folders with drag and drop; RDP, VNC and Telnet servers carry a badge</sub>
     </td>
   </tr>
 </table>
 
+<table>
+  <tr>
+    <td width="33%" valign="top" align="center">
+      <a href="docs/screenshots/ports.png"><img src="docs/screenshots/ports.png" alt="Port forwarding panel: a local forward, a SOCKS5 proxy and a remote forward, with live state" /></a>
+      <br/><sub><b>Port forwarding</b> — local, remote and dynamic SOCKS / HTTP tunnels, named, started and stopped one by one</sub>
+    </td>
+    <td width="33%" valign="top" align="center">
+      <a href="docs/screenshots/library-panel.png"><img src="docs/screenshots/library-panel.png" alt="Per-server command library with Run, Paste and Edit on each command, and Notes and Node tabs" /></a>
+      <br/><sub><b>Command library</b> — Run or Paste saved commands in the open session; notes and node details beside them</sub>
+    </td>
+    <td width="33%" valign="top" align="center">
+      <a href="docs/screenshots/add-server.png"><img src="docs/screenshots/add-server.png" alt="Server details form with the type, folder, a tag colour picker, host, port and login method" /></a>
+      <br/><sub><b>Server form</b> — type (SSH / RDP / VNC / Telnet), folder, tag colour, login, proxy and tunnels in one place</sub>
+    </td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td width="50%" valign="top" align="center">
+      <a href="docs/screenshots/profiles.png"><img src="docs/screenshots/profiles.png" alt="Profile picker: a profile card with a password box and an Unlock button" /></a>
+      <br/><sub><b>Profiles</b> — each profile is its own encrypted vault, local or synced</sub>
+    </td>
+    <td width="50%" valign="top" align="center">
+      <a href="docs/screenshots/terminal-colours.png"><img src="docs/screenshots/terminal-colours.png" alt="Settings: terminal colour schemes with a live preview" /></a>
+      <br/><sub><b>Terminal colours</b> — built-in schemes, or bring your own from Windows Terminal</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top" align="center">
+      <a href="docs/screenshots/library.png"><img src="docs/screenshots/library.png" alt="Library page with a grid of saved commands" /></a>
+      <br/><sub><b>Library</b> — commands and notes for all servers, or only for some of them</sub>
+    </td>
+    <td width="50%" valign="top" align="center">
+      <a href="docs/screenshots/logins.png"><img src="docs/screenshots/logins.png" alt="Logins page: saved passwords and SSH keys" /></a>
+      <br/><sub><b>Logins</b> — saved passwords and SSH keys, with built-in key generation</sub>
+    </td>
+  </tr>
+</table>
+
+<details>
+<summary>More pictures: mirror, servers, settings, terminal</summary>
+
+<p align="center">
+  <img src="docs/screenshots/mirror.png" alt="Folder Mirror panel with a saved local-to-remote mirror and a New mirror button" width="320" />
+  <img src="docs/screenshots/servers.png" alt="The server list with colour-tagged folders and two servers outside any folder" width="560" />
+</p>
+<p align="center">
+  <img src="docs/screenshots/settings.png" alt="Settings: accent colour, background theme, ssh-agent and ssh config switches, terminal font" width="560" />
+  <img src="docs/screenshots/terminal.png" alt="A full-width terminal session with coloured output" width="320" />
+</p>
+
+</details>
 
 ## Looking for an alternative to…
 
@@ -190,7 +249,7 @@ If you're searching for one of these, Submarine is a direct fit:
 
 ## Why Submarine
 
-Most SSH clients feel like they were built a decade ago and never updated. Submarine is a clean, modern alternative for developers and sysadmins who connect to remote servers every day.
+Most SSH clients feel like they were built a decade ago and never updated. Submarine is a modern alternative for developers and sysadmins who connect to remote machines every day.
 
 - **Native and fast.** Built with Rust + Tauri — boots in under a second, uses around 80 MB of RAM with several sessions open. No Electron, no battery drain.
 - **One window, everything you need.** Terminal, SFTP file browser, port tunnels, folder sync, and saved commands — all live as tabs around each server. No more juggling PuTTY plus WinSCP plus a tunnel app.
@@ -198,6 +257,28 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 - **Truly cross-platform.** Same app on Windows, macOS (Apple silicon), and every major Linux distro — `.deb`, `.rpm`, Arch package, and AppImage.
 
 ## Key Features
+
+### Servers and organisation
+
+- **Nested folders** with colours, drag and drop to move servers and folders, and a search box
+- **Tag colours** on every server, so production and staging are never confused
+- **Four server types**: SSH, Telnet, VNC and RDP — one list, one vault
+- **Jump hosts and proxies** per server: another saved server as a jump host, or a SOCKS5 or HTTP proxy
+- **Import** from PuTTY `.reg`, MobaXterm `.mxtsessions`, an OpenSSH config, or a Submarine JSON export; **generate a key** right from the server form
+- **Quick connect** for a host you haven't saved yet — it is added to your root folder (with what you typed, password or key included), so remove it afterwards if you don't want it kept
+- **Autostart**: flag a server and it opens and connects when the app launches
+- **Per-server notes** and **per-server commands** (or commands for all servers)
+
+### Login methods
+
+- Passwords, key files and pasted keys (OpenSSH, PEM, PKCS#8 and SEC1 formats; RSA, ECDSA including P-521, Ed25519), with or without a passphrase
+- Keyboard-interactive and two-factor prompts, with the saved password filled in where the server asks for it
+- **ssh-agent**: keys from Pageant, the Windows OpenSSH agent (and agents that use its pipe, such as 1Password), `SSH_AUTH_SOCK` or the `IdentityAgent` named in your config; smartcards and hardware keys work through it. A per-device switch turns it off.
+- **OpenSSH and Teleport certificates** from `~/.ssh/config`, with the CA keys in your `known_hosts` trusted
+- A **blank username** is asked for when you connect; a missing password or passphrase is asked for too
+- **Save password** on a password prompt (when the saved one is wrong, or none is saved): the typed password is kept once the login with it works, for the server, its saved login or the jump host it was asked for
+- **Host keys**: trust on first use with a fingerprint prompt, pinned afterwards; a changed key (or a key of a different kind than the one on file) is flagged before anything secret is sent
+- Legacy-friendly: NIST-curve and SHA-1 group-exchange key exchanges are offered, so older appliances still connect
 
 ### Terminal
 
@@ -220,7 +301,7 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 - **Reconnect-safe scroll-back** — when a session drops and auto-reconnects, your previous output stays in the buffer to read and copy (a yellow `── reconnected ──` divider marks the boundary)
 - **Container shells** — one click from the Docker tab opens a `docker exec` shell into any container, with `bash → sh → ash` auto-fallback so distroless / Alpine / Ubuntu all just work
 
-### SFTP File Browser
+### SFTP file browser
 
 - Dual-pane (local on top, remote on bottom) with drag-and-drop between them
 - **Right-click the empty space** in a list for Refresh, New Folder, Select all and Copy folder path. Every right-click menu is the app's own, dark like the rest: text fields get Cut / Copy / Paste / Select all, selected text gets Copy, and the webview's menu (whose Reload would restart the whole app) never shows. F5 / Ctrl+R don't reload the app either
@@ -233,19 +314,30 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 - Permissions editor with a checkbox grid (chmod / chown)
 - Drag files in from your OS file manager to upload
 
-### Folder Mirror
+### FTP and FTPS
+
+- An **FTP or FTPS server** opens in a tab with the same file browser an SSH server has: transfers, folder upload and download, compare, live edit, rename, delete, new folder and permissions (`SITE CHMOD`, where the server has it)
+- **Encryption** per server: FTPS with TLS after connecting (`AUTH TLS`, the default), FTPS with TLS from the start (port 990), or plain FTP if you pick it — the form, the card and the tab say plain FTP isn't encrypted. Once FTPS is chosen, nothing goes in the clear: a server that refuses TLS isn't used
+- **Certificates**: one a public authority vouches for is accepted; any other is shown once with its SHA-256 fingerprint and remembered, like an SSH host key; a changed one is shown with a warning
+- **Directly, through one of your SSH servers, or through a SOCKS5 or HTTP proxy**; data connections are passive and go only to the saved host (no "FTP bounce")
+- An empty login name logs in as **anonymous**
+- The **folder mirror** works over FTP too (exact file times from MLSD or MDTM); **Quick Connect** takes `ftp://`, `ftps://` and `ftpes://` links, and the **server import** reads FileZilla's site list
+
+### Folder mirror
 
 Pick a local folder, pick a remote folder, and Submarine keeps them in sync.
 
-- **Two-way initial sync.** Walks both sides, compares by size and content hash (not just timestamp), and merges them into the same state.
-- **Live watcher.** Every save, create, rename, or delete on your local folder pushes to the server in real time.
-- **Conflict resolution per mirror.** Pick what wins when a file differs on both sides: **Local wins** (default, like rsync), **Remote wins**, or **Newer wins**.
-- **Soft delete.** Removed files move to `.submarine-trash/` on the server — a fat-fingered `rm` won't wipe out remote work.
-- **Overwrite-risk advisory.** Before each Start, the dry-run preview calls out which files would be overwritten locally and warns that edits made during the sync window can be silently lost — so you know to save / close editors first.
+- **Two-way initial sync** that compares size and content hash, not just timestamps
+- **Live watcher** — every save, create, rename or delete on the local folder reaches the server
+- **Conflict resolution per mirror**: **Local wins** (default), **Remote wins** or **Newer wins**; **excludes** such as `node_modules` and `*.log`
+- **Soft delete** — removed files move to `.submarine-trash/` on the server
+- A mirrored folder that goes away deletes nothing on the server, and a dry-run preview calls out what would be overwritten before each start
 
-### Server Info Panel
+### Port forwarding
 
-A read-only inspection pane for the active session — no terminal commands required.
+- Local (`-L`), remote (`-R`) and dynamic (`-D`) tunnels, **named**, started and stopped one by one, saved with the server
+- Dynamic tunnels speak **SOCKS4, SOCKS4a, SOCKS5, SOCKS5h, HTTP CONNECT and plain HTTP proxy**
+- Autostart with the app; a log shows what each tunnel did
 
 - **Overview** — hostname, OS, kernel, uptime, load average, CPU count, RAM / swap meters, disk usage per mount
 - **Network** — NICs (UP-first, with IPv4/IPv6 addresses and MAC), routing table, and **firewall rules** (`iptables` chains rendered per-chain with colored ACCEPT/DROP/REJECT badges; `nftables` raw view)
@@ -255,9 +347,13 @@ A read-only inspection pane for the active session — no terminal commands requ
 - All tabs **lazy-load on click** so opening Info doesn't fire five probes at once
 - sudo / dzdo errors (wrong password, not allowed, requiretty) are explained in plain words instead of a raw stderr dump
 
-### Docker Manager
+- **VNC** opens as the remote screen in the tab, directly or through an SSH server, on the PC and on the phone (touch, zoom, a keyboard button). Tight, ZRLE, TRLE, CopyRect and Raw encodings; the desktop takes the tab's size where the server allows it. **Speed and quality** per server on this device: the encoding, the colours (full, 16 or 8 bits), the most updates a second and the resolution, with quick choices (Standard, Less data, Least data). The **clipboard** is shared both ways, as plain ASCII text (links, commands): classic VNC carries no more. Plain VNC is **not encrypted**, and the form, the list and the tab say so.
+- **RDP** opens in **this computer's RDP app** by default (Windows Remote Desktop Connection, Remmina or FreeRDP on Linux, the system handler on macOS), with per-server full-screen, window size, clipboard and drive-sharing options kept on this device. Through an SSH server it gets the same loopback address every time, and Remote Desktop Connection on Windows gets the saved password (encrypted with DPAPI in its `.rdp` file, which is deleted once read). The **built-in RDP client** (in the tab, on the PC and the phone) is **experimental** and opt-in; its certificate is pinned like an SSH host key and checked before anything secret is sent. It also needs **NLA** (the server proves it knows the password before the client sends it): a server that answers "TLS only" is refused with nothing sent, unless you allow that one server ("Allow without NLA"). It shares the **clipboard** (text, both ways) and, on the PC, **files**: a folder or a whole drive, read only or not, which the server sees as `\\tsclient\<name>`. **Speed and quality** per server: colours (32, 24 or 16 bits), desktop effects, the network's speed, RemoteFX and the resolution, with quick choices (Best picture, Balanced, Less data).
+- **Both remote screens** have a **connection mark** in the tab's bar (Good, Fair, Weak or Not answering, with the round trip, the data rates and the session's bytes; on a weak link it offers to use less data), change their speed and quality from the tab, and **pause while the tab is hidden** (on by default), so a tab nobody looks at sends no picture.
+- **Telnet** opens in a terminal tab, directly or through an SSH server, with proper option negotiation. It is **not encrypted** and says so.
+- All three can go **through an SSH server** you already have.
 
-Manage Docker on any session host without typing a single `docker` command.
+### Server info and Docker
 
 - **Containers** — list, **Start / Stop / Restart / Pause / Kill** inline, click a name for details
 - **Logs** with adjustable tail (500 → 50 000) and a **Live stream** toggle that follows new output, smart auto-scroll
@@ -268,13 +364,14 @@ Manage Docker on any session host without typing a single `docker` command.
 - **Container terminal** — open an interactive `docker exec` shell as a new session tab
 - Cross-platform (Linux / macOS / Windows hosts) — tries `docker` first; where only root may use Docker, runs it as root through `sudo` or `dzdo`, asking for the password when the server needs one
 
-### Port Forwarding
+- **Overview** (hostname, OS, kernel, uptime, load, CPU, memory, swap, disks), **Network** (interfaces, routes, `iptables` / `nftables` rules), **Ports** (listening sockets with process names) and **Services** (`systemctl` units with Start / Stop / Restart)
+- **Docker manager**: containers (start, stop, restart, pause, kill), live logs, stats, inspect, env / mounts / ports, images, volumes, networks, compose files, safe prune (never `--volumes`, never `-a`), and `docker exec` shells as session tabs
 
-- Local (`-L`), Remote (`-R`), and Dynamic (`-D`) tunnels
-- Dynamic supports **SOCKS4, SOCKS4a, SOCKS5, SOCKS5h, HTTP CONNECT, and plain HTTP proxy**
-- Each tunnel starts and stops independently, saved with the server profile
+### Monitoring and the Wall
 
-### End-to-End Encrypted Profile Sync
+- **Monitoring**: per-node SSH polling for CPU, memory, swap, disk, load and network, graphs, an outage log with optional notifications, and your own **custom metrics** (a command whose output becomes a graph, a number or text)
+- **The Wall**: pin any terminals from any servers into a grid; choose the columns and the rows on screen
+- **Split view** to tile two sessions, and **broadcast input** to the sessions you select
 
 - Save servers once, access them on every machine you own
 - **Through storage you own** (this fork): a folder that OneDrive, Dropbox, Nextcloud, Syncthing or a network share keeps the same on your computers, or a private git repository on GitHub, GitLab or your own server. Set it up on the **Profile** tab; on another computer, choose **From storage** in the profile list and enter the profile's password.
@@ -282,7 +379,10 @@ Manage Docker on any session host without typing a single `docker` command.
 - The original project's hosted cloud, with sign-in and sharing, is still there, off unless you turn it on under **Settings → Sync**. Its server only ever holds encrypted data too (see [Security](#security))
 - No registration. No password recovery email. Your master password never leaves your device.
 
-### Productivity
+- Each profile is its own vault with its own master password; several can live on one device
+- **Quick unlock** (off by default): open a profile with **Windows Hello** (needs a TPM) or an **Android fingerprint**. The password itself is never kept: the vault key is sealed to a key in the TPM or the Android Keystore. Not offered on Linux, macOS, iPhone or iPad, never synced or exported.
+- **Portable mode** on Windows: all data in a `submarine-data` folder next to the exe
+- **Send feedback** from the app (Settings → Help & feedback, or Feedback on the profile list): only what you type is sent, and a name and an email if you give them — no logs, no list of servers, no system details
 
 - **Quick commands**: per-server snippet library, surfaced inside any open session
 - **Per-node notes**: a dedicated description / runbook / contacts field on every server, scoped only to that server
@@ -341,39 +441,54 @@ Not portable: the Microsoft Edge WebView2 runtime (a Windows system component, p
 
 ### Android
 
-Submarine on Android is a true native build of the same Rust core — same SSH stack, same encrypted vault, same profile sync. Reach a server from your phone with the same credentials you saved on your desktop.
+Submarine on Android is a native build of the same Rust core — same SSH stack, same encrypted vault format, same profile sync. Reach a server from your phone with the credentials you saved on your desktop.
 
-- **Same encrypted vault.** Cloud sync drops your profiles onto the phone exactly as they were on desktop. Nothing re-typed.
-- **Tabbed terminal optimised for touch.** Mobile soft keyboards don't have Ctrl / Alt / Shift / Esc / Tab — Submarine ships an inline **soft-key bar** between xterm and the OS keyboard with Termux-style sticky modifiers (tap to arm, double-tap to lock). Ctrl+letter, Alt+letter, and Shift+Tab all work as expected.
-- **Auto-scroll on focus.** Tap the terminal and the prompt scrolls into view; the same fires when the OS keyboard opens so the cursor row never sits hidden behind the keyboard.
-- **SFTP file browser** with multi-select, upload from the phone's storage, download into Downloads.
-- **Port forwarding (SOCKS / local / remote)** runs as long as the app is open — handy for tunnelling a mobile browser through your home box.
-- **Touch-friendly Info / Docker tabs.** Same server inspection and container manager as desktop, with ≥32 px touch targets and full-bleed modals.
-- **Folder mirror is desktop-only for now** — Android's filesystem permissions don't map cleanly onto our watcher model.
+<p align="center">
+  <img src="docs/screenshots/android-terminal.png" alt="Submarine on Android: an SSH terminal session with the key bar (Ctrl, Alt, Shift, Esc, Tab, arrows) above the keyboard and the bottom navigation bar" width="240" />
+  &nbsp;&nbsp;
+  <img src="docs/screenshots/android-server-form.png" alt="Submarine on Android: the server form with the tag colour picker wrapping into rows to fit a narrow screen" width="240" />
+</p>
 
-Tested on Android 8.0+ (API 26+). Phones, tablets, and Android-on-ChromeOS.
+- **Same encrypted vault.** With cloud sync on, your profiles appear on the phone as they were on the desktop.
+- **Touch-friendly terminal.** An inline **key bar** between the terminal and the keyboard has Esc, Tab, arrows, `|`, `~`, `/`, `-` and Termux-style sticky modifiers (tap to arm, double-tap to lock), so Ctrl+letter, Alt+letter and Shift+Tab work.
+- **Auto-scroll on focus** so the prompt never sits behind the keyboard.
+- **SFTP file browser** with multi-select, upload from the phone's storage and download into Downloads; exports go through the system file picker.
+- **VNC and the built-in RDP client** show the remote screen with touch, zoom and a keyboard button, the connection mark and their speed and quality; a phone shares no files with an RDP server.
+- **Fingerprint unlock** for a profile, if you turn it on; the app stays out of Recents.
+- **Port forwarding** (SOCKS / local / remote) runs as long as the app is open.
+- **Folder mirror is desktop-only for now.**
 
-## Security
+Built for Android 7.0 (API 24) and newer, on phones, tablets and Android-on-ChromeOS; the current builds are tested on Android 16.
 
-Your data is encrypted on your machine before anything leaves it. Submarine and the sync server never see your passwords, private keys, or profile content.
+## Security and privacy
 
-**How it works:**
+**What is encrypted, and where**
 
-1. **Your master password becomes a vault key — on your device.** When you unlock, your password is run through Argon2id to derive a key. The password is wiped from memory the moment derivation finishes. It never goes anywhere.
-2. **Profiles are sealed with AES-256-GCM — on your device.** Every saved server (credentials, keys, tunnels, notes, mirrors) is compressed and encrypted with that key. What hits disk is opaque ciphertext.
-3. **Sync uploads that same ciphertext — byte for byte.** When you turn cloud sync on, the bytes uploaded are exactly the encrypted blob from your disk. The server stores ciphertext plus a random nonce. Nothing else.
+1. **Your master password becomes a vault key on your device.** When you unlock, the password is run through Argon2id to derive a key, and the Rust backend keeps that key in zeroized memory and drops it on lock (the sharing key of a signed-in account is locked with the profile too). (The password you type passes through the webview, so a copy can linger in its memory until garbage collection.)
+2. **Profiles are sealed with AES-256-GCM on your device.** Saved servers, credentials, keys, tunnels, notes, commands and mirrors are encrypted with that key; what reaches disk is ciphertext. Window position, the last-used profile name, recent folders and similar preferences are stored in the clear in the app's own settings.
+3. **Quick unlock is opt-in.** If you turn on Windows Hello or an Android fingerprint, the vault key is sealed to a key in the TPM or the Android Keystore — never the password.
+4. **Unencrypted protocols say so.** Telnet and plain VNC are labelled *not encrypted* in the form, the list and the tab. The built-in RDP client is labelled *experimental*.
+5. **Connections are checked.** SSH host keys are pinned after the first use, and a changed key (or a key of a different kind) is flagged before anything secret is sent. An RDP certificate is pinned the same way, and the built-in RDP client refuses a server without NLA unless you allow that server.
 
-**Why the sync server can't read your profiles:**
+**Cloud sync (optional) — what the server sees**
 
-- No registration with a server-side password. No recovery email. No "forgot password" flow. **There is nothing on the server that could be used to derive your key.**
-- Encryption happens before the upload call. By the time bytes hit the network they are already ciphertext with no key material attached.
-- Even with a full server breach, an attacker gets the same opaque blob they'd see if you uploaded a random file to S3. Same threat model.
+- Signing in uses an **email address** (verified by a link) and an **account password**, with reset by email. The master password itself is never sent.
+- Each record is encrypted on your device before upload. The server **does see metadata**: record IDs, record types (servers, credentials, keys, notes, commands, folders), timestamps and deleted flags, the profile's display name, the number of records, and for shared profiles the share names and member email addresses.
+- The server also holds a copy of the vault key **sealed with your master password**. Someone who got hold of the server's data could try to guess a weak master password offline, at Argon2id cost — so use a **long master password** if you sync. A server breach does not hand over the plaintext, but the master password is the only thing standing in the way.
+- Cloud sync is **opt-in per account**: once you sign in, profiles you open are linked and synced (Auto-sync is on by default and can be turned off in Settings). Don't sign in on a computer if you don't want its profiles uploaded.
+- You can run **your own sync server** instead of the hosted one.
+- **You can delete your account from inside the app** (Cloud sync → *Delete account…*, confirmed with your password): everything the server holds for it goes at once. The full details, with retention times, are in the [privacy policy](PRIVACY.md).
+- [How your data is protected](https://submarine.sinaxhpm.com/security/) explains all of this with links to the code that does it, and ways to check it yourself.
 
-**Other defences:**
+**Network traffic besides your servers**
 
-- Master key kept in zeroized memory, wiped on lock
-- TOFU host keys with per-connection nonce binding (resists prompt-race attacks)
-- Strict Content Security Policy, minimal Tauri permission ACL, no shell or filesystem plugins exposed to the UI
+- No analytics SDK, no crash reporter and no advertising calls.
+- When the profile page opens, Submarine makes **one anonymous request to the GitHub releases API** to see whether a newer version exists (the request carries the app name and version, nothing else). There is a button to run the same check by hand.
+- If you sign in to cloud sync, it talks to the sync server (`submarine.sinaxhpm.com`, or the one you chose).
+
+**Other defences:** a strict Content Security Policy, a minimal Tauri permission ACL, and no shell or filesystem plugin exposed to the UI. The Windows build is not code-signed (see [Install](#install)); the Android APK is signed, and the App Store builds are signed by Apple's process.
+
+Found a vulnerability? Please don't post exploit details in public: open an issue that says only that you found one, and the maintainer will reply with a private way to send the details.
 
 ## Code signing policy
 
@@ -414,27 +529,39 @@ Yes. MIT-licensed. Use it personally, use it at work, fork it, redistribute it.
 
 ### Does it work offline?
 
-Yes. Cloud sync is opt-in. All profiles, mirrors, and tunnels live locally and are encrypted at rest.
+Yes. Cloud sync is optional. All profiles, mirrors and tunnels live locally and are encrypted at rest.
 
 ### I use PuTTY, WinSCP or MobaXterm today. What changes?
 
 PuTTY and WinSCP are two separate apps you alt-tab between; Submarine puts terminal, SFTP, tunnels and folder mirror in one tabbed window per server. Coming from MobaXterm, import your sessions with their folders, saved logins and jump hosts, and keep working the way you do, on Windows, macOS or Linux, with one encrypted profile that syncs between them.
 
-### Does it support keys with passphrases?
+### Does it support keys with passphrases and ssh-agent?
 
-Yes. File-based keys and pasted PEM/OpenSSH keys, with or without passphrase.
+Yes. File-based keys and pasted keys (OpenSSH, PEM, PKCS#8 and SEC1 formats) with or without a passphrase, and keys from a running ssh-agent — Pageant, the Windows OpenSSH agent, `SSH_AUTH_SOCK` or the `IdentityAgent` in your config.
+
+### Does it read my `~/.ssh/config`?
+
+Yes, read-only, and you can switch it off per device. It follows Include, Host and Match (Match `exec` is never run), ProxyJump, ProxyCommand, IdentityFile, CertificateFile and IdentityAgent. Nothing from those files is synced.
+
+### Can I use FTP or FTPS?
+
+Yes, from version 0.5: an FTP server opens in a tab with the same file browser as SFTP, with FTPS (TLS) by default, directly, through an SSH server or through a proxy. Plain FTP is there if you pick it, and the app says it isn't encrypted.
+
+### Can I use RDP, VNC and Telnet?
+
+Yes. VNC shows the screen in the tab and shares the clipboard (plain text). RDP opens in your computer's RDP app by default, or in the tab with the experimental built-in client, which shares the clipboard and, on the PC, a folder or a drive. Both remote screens show how the connection is doing and let you trade picture quality for less data. Telnet opens in a terminal tab. All three can go through an SSH server, and Telnet and plain VNC are labelled as not encrypted.
 
 ### Can I sync profiles between Windows and macOS?
 
-Yes. The encrypted vault is platform-portable. Enable sync on one machine, unlock on another with the same master password.
+Yes. The encrypted vault is platform-portable. Turn on sync on one machine, sign in and unlock on another with the same master password.
 
 ### Why Rust and Tauri instead of Electron?
 
-Smaller installer (around 10 MB vs ~100 MB for an Electron equivalent), lower RAM, faster startup, native window controls, and no Chromium per app.
+Smaller installers (7–13 MB on desktop versus ~100 MB for a typical Electron app), no Chromium bundled per app, and native window controls.
 
 ### Where are my profiles stored?
 
-In a single encrypted file under your OS app-data directory — or in the `submarine-data` folder when you run in [portable mode](#portable-mode-windows). Nothing in plaintext. Nothing in a global Keychain or registry hive.
+In an encrypted file under your OS app-data directory — or in the `submarine-data` folder when you run in [portable mode](#portable-mode-windows). Server details and secrets are encrypted; a few preferences (the last-used profile name, recent folders, window position) are stored in the clear.
 
 ### Something went wrong — how do I find out what?
 
@@ -446,11 +573,15 @@ No. There's no analytics SDK, and no crash reporter that sends data home. The lo
 
 ### Can I use Submarine on my Android phone with the same servers as my desktop?
 
-Yes. Install the APK, unlock with the same master password you use on desktop, and the encrypted vault syncs. Every server, key, and saved tunnel appears on the phone. Folder mirror is desktop-only for now; everything else (terminal, SFTP, port forwarding) works on Android.
+Yes. Install the APK, turn on cloud sync, and unlock with the same master password — every server, key and saved tunnel appears on the phone. Folder mirror is desktop-only for now; terminal, SFTP, port forwarding, VNC and RDP work on Android.
+
+### Is there an iPhone or iPad app?
+
+The same source builds for iPhone and iPad (iOS and iPadOS 15 or later). The beta is on [TestFlight](https://testflight.apple.com/join/TmefAPrY), and the App Store version is with Apple's review. It works like the Android app: terminal, SFTP, port forwarding, VNC and the built-in RDP client, the same vault and sync. Exports land in the app's folder in the Files app; there are no folder mirrors, and no files are shared with an RDP server.
 
 ### Is Submarine on the Play Store?
 
-No. Distribution is via sideloadable APK from the [releases page](https://github.com/sinaxhpm/submarine/releases). This keeps the same untouched binary running on every platform with no store-mandated changes.
+No. It is distributed as a sideloadable APK from the [releases page](https://github.com/sinaxhpm/submarine/releases).
 
 ## Build from Source
 
@@ -485,7 +616,7 @@ Extra requirements: Android SDK + Platform-Tools, NDK 27, and JDK 17. `scripts/a
 . .\scripts\android-env.ps1
 npm run android:init       # one-time per checkout
 npm run android:dev        # build + install on the connected device
-npm run android:build      # produce a signed-with-debug-key APK
+npm run android:build      # produce an APK (unsigned unless you configure a release keystore)
 ```
 
 Device must be plugged in over USB with debugging enabled.
@@ -501,7 +632,7 @@ This path works whether Wi-Fi is on or off — only USB matters. If you still se
 ## Tech Stack
 
 **Frontend** — React 18 · TypeScript · Tailwind CSS · xterm.js
-**Backend** — Rust · Tauri 2 · russh · rusqlite · aes-gcm · argon2 · zstd
+**Backend** — Rust · Tauri 2 · russh · IronRDP · vnc-rs · rusqlite · aes-gcm · argon2 · zstd
 
 ## Credits
 
@@ -515,23 +646,26 @@ The app ships with the licences of everything in it: every build lists the JavaS
 
 ## Also by the author: Echoes — network & developer toolkit
 
-<a href="https://github.com/SinaXhpm/Echoes"><img src="https://raw.githubusercontent.com/SinaXhpm/Echoes/master/Echoes.Android/Resources/mipmap-xhdpi/icon.png" alt="Echoes — free, open-source network and developer toolkit for Windows, macOS, Linux and Android" width="64" align="left" /></a>
+<a href="https://github.com/SinaXhpm/Echoes"><img src="https://raw.githubusercontent.com/SinaXhpm/Echoes/master/Echoes.Android/Resources/mipmap-xhdpi/icon.png" alt="Echoes — free, open-source network toolkit and developer tools for Windows, macOS, Linux and Android" width="64" align="left" /></a>
 
-**[Echoes](https://github.com/SinaXhpm/Echoes)** is a [free, open-source network and developer toolkit for Windows, macOS, Linux, and Android](https://github.com/SinaXhpm/Echoes): ping, port scanner, SSH, DNS/WHOIS, cURL, IP/GeoIP, uptime monitor, encrypted notes, and string/JSON tools in one app. No accounts, no telemetry, MIT licensed.
+**[Echoes](https://github.com/SinaXhpm/Echoes)** is a [free, open-source network toolkit for Windows, macOS, Linux and Android](https://github.com/SinaXhpm/Echoes) with **20 network and developer tools in one app**: the things you would run one by one (ping, traceroute, nmap, curl, dig, whois, PuTTY, netcat, a speed-test site, the Cloudflare dashboard) behind one simple window. No account, no ads, no telemetry. MIT licensed.
 
 <br clear="left" />
 
-- **Network tools** — ping and traceroute, a TCP/UDP port scanner, an SSH terminal with SOCKS5, DNS lookup and WHOIS, IP lookup and GeoIP, and global host checks (ping / HTTP / TCP / DNS from servers around the world)
-- **Web & API tools** — a cURL GUI and HTTP client, an HTTP file server for LAN file sharing, a SOCKS5 + HTTP proxy server, a Cloudflare DNS manager, and an SSL/TLS certificate inspector
-- **Developer tools** — an uptime and latency monitor, encrypted notes and encrypted backup, a regex tester, a JSON formatter (JSON ↔ YAML / CSV), a hash identifier, a subnet / CIDR calculator, an epoch converter, and UUID and password generators
-- **Built with** C# · .NET · Avalonia UI · Native AOT — a single self-contained binary on desktop, nothing to install
+- **Diagnose** — a **connection doctor** that says in one sentence why a site won't open (DNS tampering, SNI filtering, a blocked IP, a filter page, or down for everyone), **ping, TCP ping, traceroute and MTR** (loss per hop, no admin rights needed), an **internet speed test** with a bufferbloat grade, a **TCP/UDP port scanner** with service and version detection (an nmap alternative), **check host** from servers around the world, and **network info** with a Wi-Fi analyzer, ARP neighbours, open ports and the routing table
+- **DNS and web** — **DNS lookup** over UDP, DNS over HTTPS and DNS over TLS with resolver comparison and an email (SPF, DKIM, DMARC) check, **WHOIS / RDAP**, a **cURL / HTTP client** that imports curl commands (a Postman alternative), an **SSL/TLS certificate inspector**, **IP and GeoIP lookup**, a **Cloudflare manager** with dynamic DNS, and a **Telegram Bot API tester**
+- **Servers and connections** — an **SSH client** (terminal, SFTP, port forwarding, server health), a **TCP / UDP / WebSocket tool** (a netcat alternative), **LAN file sharing and chat** in any browser with a QR code plus a webhook catcher, a **SOCKS5 + HTTP proxy server** with a **proxy checker**, and an **uptime monitor** with Telegram alerts and certificate and domain expiry warnings
+- **Workspace** — **String Lab** (Base64, hashes, JWT, JSON ↔ YAML / CSV, regex, subnet / CIDR calculator, cron, UUID and password generators), **encrypted notes**, and **history with one encrypted backup file**
+- **Built with** C# · .NET · Avalonia UI · Native AOT — self-contained native apps for Windows, macOS (Intel and Apple Silicon), Linux and Android 6.0+, with nothing extra to install, dark and light themes, and secrets encrypted on your device
 
 [Echoes on GitHub](https://github.com/SinaXhpm/Echoes) · [Download Echoes for Windows, macOS, Linux and Android](https://github.com/SinaXhpm/Echoes/releases) · [More projects by Sina Xhpm](https://sinaxhpm.com)
 
 ---
 
 <sub>
-<b>Keywords</b>: SSH client, SFTP client, terminal emulator, port forwarding, SOCKS proxy, HTTP proxy, folder mirror, folder sync, remote file edit, encrypted profile sync, zero-knowledge cloud, Argon2id, AES-256-GCM, TOFU host keys, Rust, Tauri, React, xterm.js, Windows SSH client, macOS SSH client, Linux SSH client, Android SSH client, open source SSH, MIT licensed, PuTTY alternative, WinSCP alternative, MobaXterm alternative, Bitvise alternative, Termius alternative, SecureCRT alternative, Royal TSX alternative, ConnectBot alternative, JuiceSSH alternative, rsync GUI, sshfs alternative, Tabby alternative.
+<b>Keywords</b>: SSH client, SFTP client, FTP client, FTPS client, FileZilla alternative, Telnet client, VNC viewer, RDP client, remote desktop client, terminal emulator, port forwarding, SSH tunnel manager, SOCKS proxy, HTTP proxy, jump host, ProxyJump, ssh-agent, Pageant, SSH certificates, Teleport, folder mirror, folder sync, remote file edit, encrypted profile sync, self-hosted sync, Windows Hello unlock, Argon2id, AES-256-GCM, TOFU host keys, Rust, Tauri, React, xterm.js, Windows SSH client, macOS SSH client, Linux SSH client, Android SSH client, open source SSH, MIT licensed, PuTTY alternative, WinSCP alternative, MobaXterm alternative, Bitvise alternative, Termius alternative, SecureCRT alternative, Royal TSX alternative, Remmina alternative, ConnectBot alternative, JuiceSSH alternative, rsync GUI, sshfs alternative, Tabby alternative.
+<br/>
+<b>Echoes</b>: network toolkit, network tools, connection doctor, website not loading, DNS tampering test, SNI filtering test, ping, TCP ping, traceroute, MTR, WinMTR alternative, internet speed test, bufferbloat test, port scanner, nmap alternative, check host, Wi-Fi analyzer, DNS over HTTPS, DNS over TLS, DNS benchmark, SPF DKIM DMARC checker, WHOIS, RDAP, cURL GUI, Postman alternative, SSL checker, TLS inspector, IP lookup, GeoIP, Cloudflare manager, Cloudflare DDNS, dynamic DNS client, uptime monitor, Telegram alerts, netcat alternative, WebSocket client, webhook tester, LAN file sharing, QR code file transfer, SOCKS5 proxy server, proxy checker, JWT decoder, CyberChef alternative, encrypted notes.
 </sub>
 
 <sub><i>Bitvise, forever in my heart.</i></sub>
