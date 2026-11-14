@@ -21,6 +21,7 @@ import { forgetServerBookmarks } from "./util/sftpBookmarks";
 import { useIsNarrow } from "./hooks/useViewport";
 import { IS_MOBILE } from "./util/platform";
 import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./util/terminalFont";
+import { UI_FONT_FAMILY_KEY, applyFonts, readUiFontFamily } from "./util/uiFont";
 import { SCROLLBACK_KEY, readScrollback } from "./util/terminalScrollback";
 import { USE_LOCAL_SHELL_KEY, readUseLocalShell } from "./util/terminalShell";
 import { USE_SSH_AGENT_KEY, readUseSshAgent } from "./util/sshAgent";
@@ -445,6 +446,8 @@ function DesktopApp() {
     terminalFontSize: readFontSize(),
     // '' = the built-in cross-platform monospace stack (see util/terminalFont).
     terminalFontFamily: readFontFamily(),
+    // '' = the app's own interface font (see util/uiFont).
+    uiFontFamily: readUiFontFamily(),
     // Lines each terminal keeps above the screen. See util/terminalScrollback.
     terminalScrollback: readScrollback(),
     terminalBoldBright: readBoldBright(),
@@ -480,6 +483,7 @@ function DesktopApp() {
     localStorage.setItem('submarine-bg-color', appSettings.backgroundColor);
     localStorage.setItem(FONT_SIZE_KEY, appSettings.terminalFontSize.toString());
     localStorage.setItem(FONT_FAMILY_KEY, appSettings.terminalFontFamily);
+    localStorage.setItem(UI_FONT_FAMILY_KEY, appSettings.uiFontFamily);
     localStorage.setItem(SCROLLBACK_KEY, String(appSettings.terminalScrollback));
     localStorage.setItem(BOLD_BRIGHT_KEY, appSettings.terminalBoldBright ? 'on' : 'off');
     localStorage.setItem(MIN_CONTRAST_KEY, appSettings.terminalMinContrast ? 'on' : 'off');
@@ -499,6 +503,12 @@ function DesktopApp() {
   }, [appSettings]);
 
   Fork.useServerLooks(servers);
+  // The interface font and the font for text in columns (util/uiFont): set on
+  // the page only when one of the two faces changes, since a change restyles
+  // every element.
+  useEffect(() => {
+    applyFonts(appSettings.terminalFontFamily, appSettings.uiFontFamily);
+  }, [appSettings.terminalFontFamily, appSettings.uiFontFamily]);
 
   useEffect(() => {
     // Nothing to set up before the first screen:

@@ -10,6 +10,12 @@ import "./util/bundledFonts";
 import { startDiagnostics } from "./util/diagnostics";
 import { tameNativeMenus } from "./util/nativeMenus";
 import { keepTypingPlain } from "./util/plainTyping";
+import { readFontFamily } from "./util/terminalFont";
+import { applyFonts, readUiFontFamily } from "./util/uiFont";
+
+// The fonts picked in Settings, before the first screen draws: the profile
+// list shows in them too, and nothing changes face once the app is up.
+applyFonts(readFontFamily(), readUiFontFamily());
 
 // The app's log and freeze watchdog (util/diagnostics.ts): a failure that
 // escapes React (an async reject, a listener throw), console.error, and a
