@@ -156,6 +156,42 @@ const later = (fn, ms = 60) => setTimeout(fn, ms);
 // Each terminal's output channel, for the echo of what's typed.
 const outputs = new Map();
 
+// For timing a terminal's input and output (perf-io.mjs). `deliver` hands a
+// terminal output the way its backend does: over the channel it was opened
+// with, or, in the original project's page, as a `terminal-output-<id>` event
+// with the bytes in base64 (`prepare` makes that form ahead of the clock).
+// `writes` is every write to a shell, with when it was asked for; `drawn` is
+// what each terminal's page said it drew (terminal_drawn).
+const toBase64 = (bytes) => {
+  let bin = "";
+  for (let at = 0; at < bytes.length; at += 0x8000) bin += String.fromCharCode(...bytes.subarray(at, at + 0x8000));
+  return btoa(bin);
+};
+const perf = {
+  outputs,
+  sessions: new Map(),
+  drawn: new Map(),
+  writes: [],
+  prepare: (id, bytes) => (outputs.get(id) ? bytes.slice().buffer : toBase64(bytes)),
+  deliver: (id, prepared) => {
+    const out = outputs.get(id);
+    if (out) out.onmessage?.(prepared);
+    else void emit(`terminal-output-${id}`, prepared);
+  },
+};
+window.__perf = perf;
+// A shell's echo comes back after this long; "now" for the same turn of the
+// page's work queue, to time the page alone.
+const echoAfter = localStorage.getItem("mock-echo-ms");
+const echo = (id, data) => {
+  const send = () => perf.deliver(id, perf.prepare(id, new Uint8Array(data)));
+  if (echoAfter === "now") queueMicrotask(send);
+  else later(send, Number(echoAfter ?? 5));
+};
+const wrote = (cmd, targets, data) => perf.writes.push({ at: performance.now(), cmd, targets, bytes: data.length });
+// The user's own highlight rules, for timing them: `mock-highlight-rules`.
+const highlightRules = JSON.parse(localStorage.getItem("mock-highlight-rules") ?? "[]");
+
 // Commands the page asked for that have no answer here (take.mjs prints them).
 window.__unhandled = new Set();
 
@@ -179,7 +215,7 @@ mockIPC((cmd, args = {}) => {
     case "get_ssh_keys": return [];
     case "get_commands": return [];
     case "get_notes": return [];
-    case "highlight_rules_list": return [];
+    case "highlight_rules_list": return highlightRules;
     case "list_system_fonts": return [];
     case "list_local_shells":
       return {
@@ -210,11 +246,16 @@ mockIPC((cmd, args = {}) => {
       later(() => emit(`connection-success-${args.sessionId}`, {}));
       return null;
     case "open_terminal": {
-      outputs.set(args.terminalId, args.onOutput);
+      // The original project's page opens a terminal with no channel.
+      if (args.onOutput) outputs.set(args.terminalId, args.onOutput);
+      perf.sessions.set(args.terminalId, args.sessionId);
       const name = sessionServer(args.sessionId)?.name ?? "server";
-      later(() => args.onOutput?.onmessage?.(new TextEncoder().encode(terminalText(name)).buffer), 150);
+      later(() => perf.deliver(args.terminalId, perf.prepare(args.terminalId, new TextEncoder().encode(terminalText(name)))), 150);
       return null;
     }
+    case "terminal_drawn":
+      perf.drawn.set(args.terminalId, (perf.drawn.get(args.terminalId) ?? 0) + args.bytes);
+      return null;
     case "sftp_list_dir": return remoteListing(args.sessionId, args.path);
     // A shell on this computer, in Home.
     case "local_terminal_open":
@@ -223,10 +264,10 @@ mockIPC((cmd, args = {}) => {
     // Broadcast's typing, one call for every target (#127).
     case "write_terminals_data": {
       window.__calls = (window.__calls ?? 0) + 1;
+      wrote(cmd, args.terminalIds.length, args.data);
       for (const id of args.terminalIds) {
         window.__writes = (window.__writes ?? 0) + 1;
-        const out = outputs.get(id);
-        later(() => out?.onmessage?.(new Uint8Array(args.data).buffer), 5);
+        echo(id, args.data);
       }
       return null;
     }
@@ -234,8 +275,8 @@ mockIPC((cmd, args = {}) => {
     case "write_terminal_data": {
       window.__calls = (window.__calls ?? 0) + 1;
       window.__writes = (window.__writes ?? 0) + 1;
-      const out = outputs.get(args.terminalId);
-      later(() => out?.onmessage?.(new Uint8Array(args.data).buffer), 5);
+      wrote(cmd, 1, args.data);
+      echo(args.terminalId, args.data);
       return null;
     }
 

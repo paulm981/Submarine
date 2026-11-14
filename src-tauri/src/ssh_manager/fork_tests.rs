@@ -82,3 +82,44 @@ async fn one_host_key_question_at_a_time() {
     assert_eq!(waiting.await.unwrap(), None);
     assert!(matches!(host_key_turn(q()), HostKeyTurn::Ask(_)));
 }
+
+// ── Speed ─────────────────────────────────────────────────────────────
+
+/// How long a typed key's echo takes from `write_terminal_data`'s queue to
+/// the batch handed to the page, over a real (in-process) SSH connection to
+/// a server that echoes. A measure, not a check: it prints, and is run by
+/// hand (`cargo test --lib measure_ -- --ignored --nocapture`). The pump's
+/// flush window (8 ms from a batch's first byte) is most of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a measure, run by hand"]
+async fn measure_a_keys_echo_through_the_pump() {
+    use crate::ssh_test_server::{connect, TestServer};
+    use std::time::{Duration, Instant};
+
+    let session = connect(TestServer::default(), |_| {}, crate::build_ssh_client_config()).await.expect("in-process SSH connection");
+    let channel = session.channel_open_session().await.unwrap();
+    channel.exec(false, "echo").await.unwrap();
+    let (tx, rx) = mpsc::channel::<TerminalCommand>(32);
+    let (_resize_tx, resize_rx) = tokio::sync::watch::channel(PtySize { cols: 80, rows: 24 });
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Instant>();
+    let page = Arc::new(PageDrawn::default());
+    let drew = Arc::clone(&page);
+    let pump = tokio::spawn(pty_pump(channel, rx, resize_rx, page, Vec::new(), move |buf: &mut Vec<u8>| {
+        drew.add(buf.len() as u64);
+        buf.clear();
+        let _ = out_tx.send(Instant::now());
+    }));
+    let mut took = Vec::new();
+    for _ in 0..60 {
+        // Typed a key at a time, as far apart as fast typing is.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let at = Instant::now();
+        tx.send(TerminalCommand::Data(vec![b'k'])).await.unwrap();
+        let back = tokio::time::timeout(Duration::from_secs(5), out_rx.recv()).await.expect("the echo comes back").unwrap();
+        took.push(back.duration_since(at).as_secs_f64() * 1000.0);
+    }
+    took.sort_by(f64::total_cmp);
+    println!("a key's echo, queue to page: median {:.2} ms, fastest {:.2} ms, slowest {:.2} ms", took[took.len() / 2], took[0], took[took.len() - 1]);
+    drop(tx);
+    let _ = tokio::time::timeout(Duration::from_secs(10), pump).await;
+}
