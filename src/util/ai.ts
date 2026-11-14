@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { formatBytes } from "../fork/bulk/plan";
 
-// AI help on open sessions (#32, src-tauri/src/ai/mod.rs). The backend holds
+// AI help on open sessions (#32, src-tauri/src/ai_tabs/mod.rs). The backend holds
 // all of it: the AI tabs, what's shared with each, the requests waiting for
 // you, what ran. The page shows it (the AI panel, Share with AI) and passes
 // on your clicks; `ai-changed` says when to look again.
@@ -65,7 +65,7 @@ export interface AiPending {
   follow: boolean;
 }
 
-/// What a copy_files request copies (src-tauri/src/ai/copy.rs, CopyView).
+/// What a copy_files request copies (src-tauri/src/ai_tabs/copy.rs, CopyView).
 export interface AiCopy {
   direction: "push" | "pull";
   /// Push: the path on this computer; pull: the path on each server.
@@ -177,7 +177,7 @@ export interface AiDone {
   /// A follow (#179): how it ended and what it saw. Its output isn't kept.
   follow: { ended: string; bytes_seen: number } | null;
 }
-/// The AI asking for a server by name (src-tauri/src/ai/ask_server.rs): the
+/// The AI asking for a server by name (src-tauri/src/ai_tabs/ask_server.rs): the
 /// saved server it found, if exactly one has that name.
 export interface AiServerAsk {
   id: number; tab_id: string; tab_label: string; asked: string;
@@ -284,7 +284,7 @@ export const findAiTools = (): Promise<{ id: string; label: string }[]> =>
     .then((s) => s.ai_tools ?? [])
     .catch(() => []);
 
-// ── Approval levels (#115, src-tauri/src/ai/trust.rs) ───────────────────────
+// ── Approval levels (#115, src-tauri/src/ai_tabs/trust.rs) ───────────────────────
 // How much the AI may run on a server without asking. Set on a server, a
 // folder or for every server, on this device only; only you change them.
 
@@ -293,7 +293,7 @@ export const findAiTools = (): Promise<{ id: string; label: string }[]> =>
 export const STEERED_BY_OUTPUT =
   "Anything a server prints can steer the AI, and this runs what that text talks it into without asking you.";
 
-/// The levels as stored (src-tauri/src/ai/trust.rs, Level): "Run commands
+/// The levels as stored (src-tauri/src/ai_tabs/trust.rs, Level): "Run commands
 /// that only read" (#190) is 4, though it sits between 2 and 3.
 export const READ_ONLY_LEVEL = 4;
 
@@ -331,7 +331,7 @@ export const aiMarker = (s: Pick<AiServer, "level" | "allow_all" | "reads_alone"
         : null;
 
 /// What a teammate's move held for your OK lets the AI do here, for Waiting
-/// for your OK (HeldReview.tsx; src-tauri/src/ai/trust.rs, HeldPolicy).
+/// for your OK (HeldReview.tsx; src-tauri/src/ai_tabs/trust.rs, HeldPolicy).
 export const heldMay = (move: { level: number; allow: number; change?: string }): string =>
   move.level === 3
     ? "the AI may run anything without asking"

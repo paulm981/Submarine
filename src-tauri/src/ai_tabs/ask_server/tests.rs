@@ -368,7 +368,7 @@ async fn a_bad_name_never_reaches_you() {
 // The call from the original project's code into this file (fork_hooks.rs).
 #[test]
 fn the_hooks_are_in_place() {
-    crate::fork_hooks::assert_hooks("lib.rs", include_str!("../../lib.rs"), &[("run", "ai::ai_answer_server_ask", 1)]);
+    crate::fork_hooks::assert_hooks("lib.rs", include_str!("../../lib.rs"), &[("run", "ai_tabs::ai_answer_server_ask", 1)]);
 }
 
 #[tokio::test]

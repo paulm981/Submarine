@@ -3057,9 +3057,9 @@ mod hook_tests {
             "lib.rs",
             include_str!("../lib.rs"),
             &[
-                ("", "mod ai;", 1),
-                ("initiate_connection", "ai::tab_gone(&app, &session_id, \"reconnected\")", 1),
-                ("disconnect_session", "ai::tab_gone(&app, &session_id, \"tab closed\")", 1),
+                ("", "mod ai_tabs;", 1),
+                ("initiate_connection", "ai_tabs::tab_gone(&app, &session_id, \"reconnected\")", 1),
+                ("disconnect_session", "ai_tabs::tab_gone(&app, &session_id, \"tab closed\")", 1),
                 ("teardown_profile", "ai.end_all_tabs()", 1),
             ],
         );

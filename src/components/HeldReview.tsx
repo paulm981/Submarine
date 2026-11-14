@@ -37,7 +37,7 @@ function switchOf(item: string): { protocol: string; label: string; port: string
   return { protocol, label: protocol === "vnc" ? "VNC" : protocol === "ftp" ? "plain FTP" : "telnet", port };
 }
 
-/** A move that lets the AI do more on the server here (src-tauri/src/ai/trust.rs,
+/** A move that lets the AI do more on the server here (src-tauri/src/ai_tabs/trust.rs,
  *  HeldPolicy): `ai_policy:` and its JSON. */
 const AI_ITEM = "ai_policy:";
 type HeldPolicy = {

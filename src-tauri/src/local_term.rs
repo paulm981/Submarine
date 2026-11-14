@@ -82,7 +82,7 @@ pub struct Shell {
     #[serde(skip)]
     env: Vec<(String, String)>,
     /// Taken out of its environment: for an AI tool, your SSH agent and
-    /// cloud logins (ai::CREDENTIAL_ENV). Ordinary shells keep them.
+    /// cloud logins (ai_tabs::CREDENTIAL_ENV). Ordinary shells keep them.
     #[serde(skip)]
     env_remove: Vec<&'static str>,
     /// Where it starts: an AI tool's own folder. None: your home folder.
@@ -429,8 +429,8 @@ pub struct LocalShells {
 
 fn ai_tools(app: &tauri::AppHandle) -> Vec<Shell> {
     use tauri::Manager;
-    let Some(state) = app.try_state::<crate::ai::AiState>() else { return Vec::new() };
-    crate::ai::home_tools(&state)
+    let Some(state) = app.try_state::<crate::ai_tabs::AiState>() else { return Vec::new() };
+    crate::ai_tabs::home_tools(&state)
         .into_iter()
         .map(|(id, label, path)| {
             let shown = path.display().to_string();
@@ -644,7 +644,7 @@ mod pty {
             },
             move || {
                 // An AI tab's access ends with its tool.
-                if let Some(ai) = ai_app.try_state::<crate::ai::AiState>() {
+                if let Some(ai) = ai_app.try_state::<crate::ai_tabs::AiState>() {
                     ai.end_tab(&end_id);
                 }
                 let _ = end_output.send(
@@ -977,8 +977,8 @@ fn open_ai_tool(
     if !valid_id(terminal_id) {
         return Err("[LOCAL_TERM] BAD_ID".into());
     }
-    let ai = app.state::<crate::ai::AiState>();
-    let launch = crate::ai::home_launch(app, &ai, tool, terminal_id)?;
+    let ai = app.state::<crate::ai_tabs::AiState>();
+    let launch = crate::ai_tabs::home_launch(app, &ai, tool, terminal_id)?;
     let label = launch.label.clone();
     let s = ai_shell(tool, launch);
     if let Err(e) = pty::open(app, terms, terminal_id, &s, cols, rows, on_output) {
@@ -1035,7 +1035,7 @@ fn start_dir(shell: &Shell, home: Option<PathBuf>) -> Option<PathBuf> {
 /// An AI tool's terminal: its program, with what to add to its environment
 /// and what to take out, started in its own folder.
 #[cfg(not(target_os = "android"))]
-fn ai_shell(tool: &str, launch: crate::ai::HomeLaunch) -> Shell {
+fn ai_shell(tool: &str, launch: crate::ai_tabs::HomeLaunch) -> Shell {
     let mut s = shell(tool, launch.label, GROUP_AI, launch.program, &[]);
     s.args = launch.args;
     s.env = launch.env;
@@ -1089,7 +1089,7 @@ pub async fn local_terminal_resize(terms: tauri::State<'_, LocalTerms>, terminal
 #[tauri::command]
 pub async fn local_terminal_close(
     terms: tauri::State<'_, LocalTerms>,
-    ai: tauri::State<'_, crate::ai::AiState>,
+    ai: tauri::State<'_, crate::ai_tabs::AiState>,
     terminal_id: String,
 ) -> Result<(), String> {
     // Closing an AI tab ends its access at once, before its tool has gone.
@@ -1240,12 +1240,12 @@ mod tests {
 
     /// What home_launch gives for an AI tool.
     #[cfg(not(target_os = "android"))]
-    fn ai_launch() -> crate::ai::HomeLaunch {
-        crate::ai::HomeLaunch {
+    fn ai_launch() -> crate::ai_tabs::HomeLaunch {
+        crate::ai_tabs::HomeLaunch {
             program: PathBuf::from("/bin/claude"),
             args: vec![],
             env: vec![("SUBMARINE_AI_TOKEN".into(), "t".into()), ("SSH_AUTH_SOCK".into(), "/dev/null".into())],
-            env_remove: crate::ai::CREDENTIAL_ENV.to_vec(),
+            env_remove: crate::ai_tabs::CREDENTIAL_ENV.to_vec(),
             cwd: PathBuf::from("/data/submarine/ai-workspace"),
             label: "Claude".into(),
         }
@@ -1266,7 +1266,7 @@ mod tests {
     fn an_ai_tool_starts_without_your_ssh_agent_or_cloud_logins() {
         use portable_pty::CommandBuilder;
         let inherited = |cmd: &mut CommandBuilder| {
-            for name in crate::ai::CREDENTIAL_ENV {
+            for name in crate::ai_tabs::CREDENTIAL_ENV {
                 cmd.env(name, "from-your-session");
             }
             cmd.env("SSH_AUTH_SOCK", "/tmp/ssh-you/agent.1");
@@ -1278,7 +1278,7 @@ mod tests {
         let mut cmd = CommandBuilder::new("claude");
         inherited(&mut cmd);
         pty::environment(&mut cmd, &ai);
-        for name in crate::ai::CREDENTIAL_ENV {
+        for name in crate::ai_tabs::CREDENTIAL_ENV {
             assert_eq!(cmd.get_env(name), None, "{name}");
         }
         assert_eq!(cmd.get_env("SSH_AUTH_SOCK").and_then(|v| v.to_str()), Some("/dev/null"));

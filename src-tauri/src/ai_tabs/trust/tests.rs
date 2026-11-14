@@ -270,7 +270,7 @@ fn level_two_runs_allowed_commands_only() {
 fn level_two_asks_for_sudo_even_with_a_rule() {
     let allow = rules(&["sudo *", "systemctl *"]);
     let cmd = "sudo systemctl restart nginx";
-    assert!(crate::ai::asks_for_root(cmd));
+    assert!(crate::ai_tabs::asks_for_root(cmd));
     assert_eq!(dec(2, false, &allow, &[], cmd), ask());
     for cmd in ["su -c id", "doas id", "pkexec id", "dzdo id", "/usr/bin/sudo id"] {
         let allow = rules(&["* id", "su *", "doas *", "pkexec *", "dzdo *", "/usr/bin/sudo *"]);
@@ -537,7 +537,7 @@ fn root_is_seen_however_it_is_written() {
         "doas id",
     ] {
         assert!(mentions_root(cmd), "{cmd}");
-        assert!(crate::ai::asks_for_root(cmd), "{cmd}: the card says so too");
+        assert!(crate::ai_tabs::asks_for_root(cmd), "{cmd}: the card says so too");
         let p = Policy { level: 2, allow: rules(&["* id", "sud? *", "s\\udo *", "'sudo' *", "SUDO *", "sudoedit *", "run0 *", "doas *", "su *"]), ask: vec![], windows: false, force_ask: None, os: None };
         assert_eq!(decide(&p, false, cmd), ask(), "{cmd}");
     }

@@ -4,13 +4,13 @@
 //! sync backfill and triggers. Each step is additive: an older build simply
 //! doesn't see what it adds.
 
-use crate::{ai, highlight, multiexec, rdp_links, server_os};
+use crate::{ai_tabs, highlight, multiexec, rdp_links, server_os};
 use rusqlite::Connection;
 
 /// Adds them all, in order. True when the vault needs saving again for it
 /// (the AI's approval levels were set up just now).
 pub(crate) fn add_fork_schema(conn: &Connection, app: &tauri::AppHandle) -> Result<bool, String> {
-    add_fork_schema_with(conn, || ai::trust::install_id(app))
+    add_fork_schema_with(conn, || ai_tabs::trust::install_id(app))
 }
 
 /// `add_fork_schema`, with this install's id asked for only when the AI's
@@ -45,7 +45,7 @@ fn add_fork_schema_with(conn: &Connection, install_id: impl FnOnce() -> String) 
     // The AI's approval levels and rules (ai/trust.rs, #115): device-local
     // too, so a shared profile never changes how much the AI may do here,
     // and tied to this install, so a copy of the vault doesn't carry them.
-    let resave = ai::trust::create_schema(conn, &install_id())?;
+    let resave = ai_tabs::trust::create_schema(conn, &install_id())?;
     // The OS each server last reported (server_os.rs), for its badge.
     // Device-local, not a synced column. Added here for both vault paths too;
     // on a vault that has it already this answers "duplicate column".
