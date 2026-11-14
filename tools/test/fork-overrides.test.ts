@@ -35,7 +35,7 @@ const OVERRIDES: { file: string; spread: string; upstream: string[] }[] = [
       ": isSplitPartner",
       "? 'bg-primary/[0.04] text-primary/70 border border-primary/10'",
       ": 'text-zinc-300 bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/20 hover:text-white'",
-      "} ${term.container ? 'ring-1 ring-sky-400/30' : ''}`}",
+      "} ${term.container ? 'ring-1 ring-sky-400/30' : ''} ${term.ai && aiFull ? 'ring-1 ring-rose-500/60' : ''}`}",
     ],
   },
   {

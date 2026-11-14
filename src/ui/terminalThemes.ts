@@ -1,6 +1,6 @@
 import type { ITheme } from "@xterm/xterm";
 import { IS_WINDOWS } from "../util/platform";
-import { CUSTOM_THEME_ID, parseWindowsTerminalScheme } from "../util/terminalTheme";
+import { parseWindowsTerminalScheme } from "../util/terminalTheme";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Terminal color schemes.
@@ -106,7 +106,9 @@ const byId = new Map(SCHEMES.map((s) => [s.id, s]));
 
 // ── A scheme of the user's own ──────────────────────────────────────────────
 
-export const CUSTOM_SCHEME = CUSTOM_THEME_ID;
+// util/terminalTheme's CUSTOM_THEME_ID (the tests check), not read from there
+// as this file loads: that file reads this one (readScheme).
+export const CUSTOM_SCHEME = "custom";
 /** The pasted scheme, as checked Windows Terminal JSON. */
 export const CUSTOM_SCHEME_KEY = "submarine-terminal-custom-theme";
 
@@ -150,6 +152,10 @@ export function schemeById(id: string | null | undefined): TerminalScheme {
   if (id === CUSTOM_SCHEME) return readCustomScheme() || byId.get(DEFAULT_SCHEME)!;
   return (id && byId.get(id)) || byId.get(DEFAULT_SCHEME)!;
 }
+
+/** This device's scheme: the colours of the original project's AI terminal
+ *  (components/ai/AiTerminal.tsx, through util/terminalTheme). */
+export const readScheme = (): TerminalScheme => schemeById(readSchemeId());
 
 /** This device's chosen scheme id (Settings › Terminal). */
 export function readSchemeId(): string {

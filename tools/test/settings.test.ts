@@ -2,8 +2,8 @@
 // this device remembers.
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  SETTINGS_TABS, SETTINGS_TAB_KEY, UPSTREAM_CARD_TABS, availableTabs, headingOf, parseTab, readTab, tabForHeading,
-  writeTab,
+  SETTINGS_TABS, SETTINGS_TAB_KEY, UPSTREAM_CARD_TABS, availableTabs, headingOf, parseTab, readTab, tabForAiSettings,
+  tabForHeading, writeTab,
 } from "../../src/components/settings/categories";
 
 // A React element, as headingOf sees one.
@@ -44,6 +44,27 @@ describe("which tab a card goes under", () => {
     expect(headings.length).toBeGreaterThan(0);
     expect(headings.filter((h) => !(h in UPSTREAM_CARD_TABS)), "cards with no tab: add them to UPSTREAM_CARD_TABS").toEqual([]);
     expect(Object.keys(UPSTREAM_CARD_TABS).filter((h) => !headings.includes(h)), "headings no card has").toEqual([]);
+  });
+});
+
+describe("the original project's AI settings (#252)", () => {
+  const raw = (path: string) =>
+    import.meta.glob<string>(["/src/components/SettingsPanel.tsx", "/src/components/settings/SettingsTabs.tsx"], {
+      query: "?raw", import: "default", eager: true,
+    })[path];
+
+  it("go under AI tools, or under General where that tab isn't shown", () => {
+    expect(tabForAiSettings(availableTabs(false))).toBe("ai");
+    expect(tabForAiSettings(availableTabs(true))).toBe("general");
+  });
+
+  it("are the components SettingsPanel renders, each known to the tabs", () => {
+    const panel = raw("/src/components/SettingsPanel.tsx");
+    const tabs = raw("/src/components/settings/SettingsTabs.tsx");
+    for (const name of ["AiSettings", "AgentSettings"]) {
+      expect(panel, `SettingsPanel renders <${name}>`).toMatch(new RegExp(`<${name}\\b`));
+      expect(tabs, `SettingsTabs knows ${name}`).toMatch(new RegExp(`AI_SETTINGS[^;]*\\b${name}\\b`));
+    }
   });
 });
 

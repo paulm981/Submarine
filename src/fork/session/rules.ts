@@ -17,6 +17,8 @@ export type SessionTerminal = {
   baseTitle?: string;
   container?: { name: string; useSudo: boolean };
   ownLogin?: boolean;
+  /** The assistant's terminal (upstream's AI tab): no shell runs in it. */
+  ai?: boolean;
 };
 
 /** What the fork reads of a server tab's session (DesktopApp's Session). */
@@ -48,7 +50,7 @@ export const stripLook = (compactTabs: boolean): { className?: string } => ({
 /** A terminal tab's button: its whole name as the hover title (compact tabs
  *  cut it), and the compact look (Settings). */
 export const termTabLook = (
-  t: SessionTerminal, compactTabs: boolean, isFocusedHalf: boolean, isSplitPartner: boolean, count: number,
+  t: SessionTerminal, compactTabs: boolean, isFocusedHalf: boolean, isSplitPartner: boolean, count: number, aiFull = false,
 ): { title?: string; className?: string } => ({
   title: t.container ? `${t.title} · Container: ${t.container.name}` : t.title,
   className: `h-10 sm:h-8 ${compactTabs
@@ -62,7 +64,7 @@ export const termTabLook = (
             ? 'bg-primary/[0.04] text-primary/70 border border-primary/10'
             : 'text-zinc-300 bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/20 hover:text-white'
       }`
-  } flex items-center font-bold uppercase tracking-wider transition-all ${t.container ? 'ring-1 ring-sky-400/30' : ''}`,
+  } flex items-center font-bold uppercase tracking-wider transition-all ${t.container ? 'ring-1 ring-sky-400/30' : ''} ${t.ai && aiFull ? 'ring-1 ring-rose-500/60' : ''}`,
 });
 
 /** A terminal tab's close button: never starts a drag (ui/tabDrag), and

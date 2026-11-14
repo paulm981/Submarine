@@ -32,6 +32,15 @@ export const UPSTREAM_CARD_TABS: Readonly<Record<string, SettingsTab>> = {
   "Help & feedback": "help",
 };
 
+/** The original project's AI settings (#252): components of their own that
+ *  SettingsPanel renders, "AI Assistant" (ai/AiSettings.tsx) and "AI agents"
+ *  (agents/AgentSettings.tsx), not cards written there, so SettingsTabs knows
+ *  them by what they are (AI_SETTINGS). They go under AI tools; where that
+ *  tab isn't shown (a phone), under General, as the assistant works there. */
+export function tabForAiSettings(available: readonly SettingsTab[]): SettingsTab {
+  return available.includes("ai") ? "ai" : "general";
+}
+
 /** The tab a card with this heading goes under: General when it's unknown.
  *  In another language a card shows its heading translated, so `translate`
  *  (the page's t) turns each English heading above into the one on screen. */
