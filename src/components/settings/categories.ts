@@ -31,11 +31,14 @@ export const UPSTREAM_CARD_TABS: Readonly<Record<string, SettingsTab>> = {
   "Cloud Sync": "sync",
 };
 
-/** The tab a card with this heading goes under: General when it's unknown. */
-export function tabForHeading(heading: string | null): SettingsTab {
-  return (heading !== null && Object.prototype.hasOwnProperty.call(UPSTREAM_CARD_TABS, heading))
-    ? UPSTREAM_CARD_TABS[heading]
-    : "general";
+/** The tab a card with this heading goes under: General when it's unknown.
+ *  In another language a card shows its heading translated, so `translate`
+ *  (the page's t) turns each English heading above into the one on screen. */
+export function tabForHeading(heading: string | null, translate: (english: string) => string = (s) => s): SettingsTab {
+  if (heading === null) return "general";
+  if (Object.prototype.hasOwnProperty.call(UPSTREAM_CARD_TABS, heading)) return UPSTREAM_CARD_TABS[heading];
+  const english = Object.keys(UPSTREAM_CARD_TABS).find((k) => translate(k) === heading);
+  return english ? UPSTREAM_CARD_TABS[english] : "general";
 }
 
 /** The tabs this device shows: AI tools only where they run (not on a

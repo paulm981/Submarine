@@ -8,6 +8,7 @@ import {
   SETTINGS_TABS, availableTabs, headingOf, readTab, tabForHeading, writeTab, type SettingsTab,
 } from "./categories";
 import { ForkSettings } from "./ForkSettings";
+import { t } from "../../i18n";
 
 const ICONS: Record<SettingsTab, LucideIcon> = {
   general: Palette,
@@ -83,7 +84,7 @@ export function SettingsTabBar({ tab, onChange }: { tab: SettingsTab; onChange: 
  *  the page's columns. */
 export function InTab({ tab, children }: { tab: SettingsTab; children: ReactNode }) {
   const shown = Children.toArray(children).filter(
-    (card) => (isValidElement(card) && card.type === ForkSettings) || tabForHeading(headingOf(card)) === tab,
+    (card) => (isValidElement(card) && card.type === ForkSettings) || tabForHeading(headingOf(card), t) === tab,
   );
   return (
     <div role="tabpanel" id={PANEL_ID} aria-labelledby={tabId(tab)} className="contents">

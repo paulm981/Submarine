@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "i18n": "node scripts/i18n-check.mjs",
     "build": "node scripts/notices.mjs && tsc --noEmit -p tsconfig.json && vite build && node scripts/check-bundle.mjs",
     "notices": "node scripts/notices.mjs",
     "preview": "vite preview",

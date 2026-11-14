@@ -6,6 +6,7 @@
 // The fork keeps its schemes, this device's choice and a server's own scheme
 // in src/ui/terminalThemes.ts; this file only reads and writes the pasted one.
 import type { ITheme } from "@xterm/xterm";
+import { t } from "../i18n";
 
 export const CUSTOM_THEME_ID = "custom";
 
@@ -29,15 +30,15 @@ export function parseWindowsTerminalScheme(text: string): PastedScheme {
   try {
     data = JSON.parse(text);
   } catch {
-    throw new Error("That isn't JSON. Paste a Windows Terminal colour scheme: { \"name\": …, \"background\": \"#…\", … }");
+    throw new Error(t("That isn't JSON. Paste a Windows Terminal colour scheme: { \"name\": …, \"background\": \"#…\", … }"));
   }
   if (Array.isArray(data)) data = data[0];
-  if (!data || typeof data !== "object") throw new Error("That isn't a colour scheme.");
+  if (!data || typeof data !== "object") throw new Error(t("That isn't a colour scheme."));
   const src = data as Record<string, unknown>;
   const color = (key: string, required: boolean): string | undefined => {
     const v = src[key];
     if (v === undefined && !required) return undefined;
-    if (typeof v !== "string" || !HEX.test(v.trim())) throw new Error(`"${key}" needs a colour like #1e1e2e.`);
+    if (typeof v !== "string" || !HEX.test(v.trim())) throw new Error(t("\"{key}\" needs a colour like #1e1e2e.", { key }));
     return v.trim().toLowerCase();
   };
   const background = color("background", true)!;
@@ -53,7 +54,7 @@ export function parseWindowsTerminalScheme(text: string): PastedScheme {
     (theme as Record<string, string | undefined>)[k] = color(wt, true);
   }
   const rawName = typeof src.name === "string" ? src.name.replace(/[\u0000-\u001f\u007f]/g, "").trim() : "";
-  return { id: CUSTOM_THEME_ID, name: rawName.slice(0, 60) || "My scheme", theme };
+  return { id: CUSTOM_THEME_ID, name: rawName.slice(0, 60) || t("My scheme"), theme };
 }
 
 // A checked scheme back as Windows Terminal JSON, to keep: only the keys it
