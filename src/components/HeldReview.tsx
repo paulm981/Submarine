@@ -193,7 +193,7 @@ export function HeldReview({ servers, onAllow, onKeepSsh, onKeepAi, onClose }: {
           </button>
         </div>
         <p className="px-4 pb-3 text-[12px] text-zinc-400 leading-relaxed">
-          {t("These came from someone you share this profile with, or from a profile file you imported. Until you allow one, it doesn't run on this device: commands aren't typed, forwards stay stopped, autostart doesn't connect, monitor commands don't run, a server changed to telnet or VNC stays what it was, a moved server asks before it connects, and a server moved where the AI may do more asks before every command. Allowing counts for this device only.")}
+          {t("These came from someone you share this profile with, or from a profile file you imported. Until you allow one, it doesn't run on this device: commands aren't typed, forwards stay stopped, autostart doesn't connect, monitor commands don't run, a server changed to telnet, VNC or plain FTP stays what it was, a moved server asks before it connects, and a server moved where the AI may do more asks before every command. Allowing counts for this device only.")}
         </p>
         <div className="flex-1 overflow-y-auto custom-scrollbar px-4 pb-2 space-y-3">
           {held.map((s) => (
