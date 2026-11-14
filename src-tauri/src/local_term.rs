@@ -590,6 +590,24 @@ mod pty {
     /// the cap, so a firehose doesn't flood the page with events.
     const FLUSH_CAP: usize = 256 * 1024;
     const FLUSH_WINDOW: Duration = Duration::from_millis(8);
+    /// A typed key's echo, or a prompt: output this small, after the shell
+    /// said nothing for a flush window, goes to the page at once.
+    /// Waiting the window for more made every key's echo 8 ms late. More
+    /// than this is the start of a longer answer or a screen being redrawn,
+    /// which still waits for the rest, so it's drawn in one piece.
+    const AT_ONCE_MAX: usize = 1024;
+
+    /// How long a batch that starts now with `first` bytes waits for more,
+    /// when the batch before it went out `since_last` ago (None: there was
+    /// none). Never two batches within a flush window, so a firehose still
+    /// sends the page no more than one each window.
+    pub(super) fn flush_wait(since_last: Option<Duration>, first: usize) -> Duration {
+        match since_last {
+            Some(since) if since < FLUSH_WINDOW => FLUSH_WINDOW - since,
+            _ if first <= AT_ONCE_MAX => Duration::ZERO,
+            _ => FLUSH_WINDOW,
+        }
+    }
 
     /// Open a terminal for the page: output to `on_output`, paced by what
     /// the page has drawn (term_output::pace), then a line saying the shell
@@ -837,11 +855,13 @@ mod pty {
         }
     }
 
-    fn send_batches(rx: mpsc::Receiver<Vec<u8>>, mut flush: impl FnMut(&mut Vec<u8>)) {
+    pub(super) fn send_batches(rx: mpsc::Receiver<Vec<u8>>, mut flush: impl FnMut(&mut Vec<u8>)) {
         let mut batch = Vec::new();
+        let mut last: Option<Instant> = None;
         while let Ok(first) = rx.recv() {
             batch.extend_from_slice(&first);
-            let deadline = Instant::now() + FLUSH_WINDOW;
+            let now = Instant::now();
+            let deadline = now + flush_wait(last.map(|at| now.saturating_duration_since(at)), first.len());
             while batch.len() < FLUSH_CAP {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
@@ -854,6 +874,7 @@ mod pty {
             }
             flush(&mut batch);
             batch.clear();
+            last = Some(Instant::now());
         }
     }
 
@@ -1316,6 +1337,78 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(pty::write(&terms, "local-test", b"x").is_err(), "closed");
+    }
+
+    /// A key's echo doesn't wait for the flush window; a flood still
+    /// sends no more than a batch each window, and a screen being redrawn
+    /// waits for the rest of it. By the rule itself, not the clock, so it
+    /// can't fail on a busy machine.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn a_keys_echo_goes_at_once_and_a_flood_is_still_batched() {
+        use std::time::Duration;
+        let window = Duration::from_millis(8);
+        // The shell was quiet (or has said nothing yet): small output goes now.
+        assert_eq!(pty::flush_wait(None, 1), Duration::ZERO);
+        assert_eq!(pty::flush_wait(Some(Duration::from_millis(60)), 1), Duration::ZERO);
+        assert_eq!(pty::flush_wait(Some(window), 1024), Duration::ZERO);
+        // The start of something longer waits for the rest, as before.
+        assert_eq!(pty::flush_wait(Some(Duration::from_secs(1)), 1025), window);
+        assert_eq!(pty::flush_wait(None, 16 * 1024), window);
+        // Right after a batch, the next one waits out the window, whatever its size.
+        assert_eq!(pty::flush_wait(Some(Duration::ZERO), 1), window);
+        assert_eq!(pty::flush_wait(Some(Duration::from_millis(3)), 1), Duration::from_millis(5));
+        assert_eq!(pty::flush_wait(Some(Duration::from_millis(3)), 16 * 1024), Duration::from_millis(5));
+    }
+
+    /// A burst of small reads reaches the page as a few batches, not one
+    /// message each: counted, not timed. Two here (the first read at once,
+    /// the rest together); a machine that stalls mid-burst may make one more.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn a_burst_of_small_reads_goes_to_the_page_in_a_few_batches() {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let mut want = Vec::new();
+        for i in 0..2000u32 {
+            let read = format!("line {i:04}\r\n").into_bytes();
+            want.extend_from_slice(&read);
+            tx.send(read).unwrap();
+        }
+        drop(tx);
+        let mut got = Vec::new();
+        let mut batches = 0;
+        pty::send_batches(rx, |batch: &mut Vec<u8>| {
+            got.extend_from_slice(batch);
+            batches += 1;
+        });
+        assert!(got == want, "all of it, in order");
+        assert!(batches <= 6, "{batches} batches for 2000 reads");
+    }
+
+    /// How long a typed key's echo takes from `local_terminal_write`'s queue
+    /// to the batch handed on for the page, through a real shell (`cat`
+    /// echoes as a terminal does). A measure, not a check: it prints, and is
+    /// run by hand (`cargo test --lib measure_ -- --ignored --nocapture`).
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "a measure, run by hand"]
+    fn measure_a_keys_echo_through_a_local_shell() {
+        use std::time::{Duration, Instant};
+        let terms = pty::LocalTerms::default();
+        let (out, _end) = run_shell(&terms, "local-echo");
+        // The prompt, and anything else the shell says first.
+        while out.recv_timeout(Duration::from_millis(500)).is_ok() {}
+        let mut took = Vec::new();
+        for _ in 0..60 {
+            std::thread::sleep(Duration::from_millis(60));
+            let at = Instant::now();
+            pty::write(&terms, "local-echo", b"k").unwrap();
+            out.recv_timeout(Duration::from_secs(5)).expect("the echo comes back");
+            took.push(at.elapsed().as_secs_f64() * 1000.0);
+        }
+        took.sort_by(f64::total_cmp);
+        println!("a key's echo, queue to page: median {:.2} ms, fastest {:.2} ms, slowest {:.2} ms", took[took.len() / 2], took[0], took[took.len() - 1]);
+        pty::close(&terms, "local-echo");
     }
 
     #[cfg(unix)]

@@ -171,4 +171,64 @@ mod tests {
         assert!(shown.len() < 6 + lines.len(), "not all of it went to the page");
         assert!(shown.trim_end().ends_with("line 1599999"), "the newest lines are kept");
     }
+
+    // ── Speed ─────────────────────────────────────────────────────────
+
+    /// Made-up output, the same every time: log lines with a colored word in
+    /// each (`colored`), or plain ones.
+    fn lines(bytes: usize, colored: bool) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes + 128);
+        let mut i = 0u32;
+        while out.len() < bytes {
+            let level = if colored { "\x1b[1;32mINFO\x1b[0m" } else { "INFO" };
+            out.extend_from_slice(format!("2026-11-07 10:41:{:02} {level} api request {i} handled from 192.0.2.{} in {} ms\r\n", i % 60, i % 250, i % 900).as_bytes());
+            i += 1;
+        }
+        out
+    }
+
+    /// What the backend does to a megabyte of output on its way to the page:
+    /// the filter (term_filter.rs), in reads the size SSH hands them over,
+    /// and the batch to the channel. Returns megabytes a second, the best of
+    /// `tries` (a busy machine slows some of them, never all).
+    fn megabytes_a_second(data: &[u8], tries: u32) -> f64 {
+        let channel = Channel::new(|_| Ok(()));
+        let mut best = f64::MAX;
+        for _ in 0..tries {
+            let mut limiter = crate::term_filter::CsiLimiter::default();
+            limiter.set_size(120, 40);
+            let mut out = Vec::new();
+            let mut passed = 0;
+            let t = std::time::Instant::now();
+            for read in data.chunks(32 * 1024) {
+                limiter.filter(read, &mut out);
+                if out.len() >= 256 * 1024 {
+                    passed += out.len();
+                    send("t-speed", &channel, &mut out);
+                }
+            }
+            passed += out.len();
+            send("t-speed", &channel, &mut out);
+            best = best.min(t.elapsed().as_secs_f64());
+            assert_eq!(passed, data.len(), "real output passes whole");
+        }
+        data.len() as f64 / (1024.0 * 1024.0) / best
+    }
+
+    /// A budget for the backend's work on output, about a tenth of
+    /// what it does today, so only a change that makes it many times slower
+    /// fails, never a busy machine: an unoptimized build (as the tests are)
+    /// does about 220 MB/s of plain lines and 135 of colored ones on a slow
+    /// machine; a release build 2000 and 870. The page draws 5 to 15 MB/s,
+    /// so while this passes the backend isn't what's slow.
+    #[test]
+    fn filtering_and_sending_output_stays_fast() {
+        let plain = megabytes_a_second(&lines(4 << 20, false), 5);
+        let colored = megabytes_a_second(&lines(4 << 20, true), 5);
+        println!("plain {plain:.0} MB/s, colored {colored:.0} MB/s");
+        assert!(plain >= PLAIN_MB_S, "plain output: {plain:.0} MB/s, under the budget of {PLAIN_MB_S}");
+        assert!(colored >= COLORED_MB_S, "colored output: {colored:.0} MB/s, under the budget of {COLORED_MB_S}");
+    }
+    const PLAIN_MB_S: f64 = 20.0;
+    const COLORED_MB_S: f64 = 12.0;
 }
