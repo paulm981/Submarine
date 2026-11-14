@@ -16,7 +16,7 @@ export function UpdatesSection({ settings, setSettings }: any) {
             The profile screen says when there's a newer release of the fork.
           </p>
           <LearnMore>
-            Every change to the fork is a release, numbered like v0.4.0-fork.2 and shown in the title bar. Built from
+            Every change to the fork is a release, numbered like v0.5.0-fork.2 and shown in the title bar. Built from
             source, it also says when the fork's main has changes to pull and rebuild.
           </LearnMore>
         </div>
