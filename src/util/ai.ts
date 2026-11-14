@@ -229,8 +229,9 @@ const EMPTY: AiSnapshot = { enabled: false, tabs: [], pending: [], server_asks: 
 
 /// Asks the session tree to open a saved server's tab (or show it, if it's
 /// open): Share on a request for a server. The tree's own opening holds
-/// back a server a teammate moved, as a click there would.
-export const OPEN_SERVER = "submarine-ai-open-server";
+/// back a server a teammate moved, as a click there would. Not the original
+/// project's "submarine-ai-open-server" (util/aiApi.ts), whose detail differs.
+export const OPEN_SERVER = "submarine-ai-tabs-open-server";
 export const openServerTab = (serverId: number) => window.dispatchEvent(new CustomEvent(OPEN_SERVER, { detail: serverId }));
 
 // One copy of the state for the whole page, however many components use it:

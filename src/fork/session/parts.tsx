@@ -1,6 +1,6 @@
 import type { Dispatch, SetStateAction } from "react";
 import { createPortal } from "react-dom";
-import { Bot, Columns, Container, Rows, SplitSquareHorizontal, TerminalSquare } from "lucide-react";
+import { Bot, Columns, Container, Rows, Sparkles, SplitSquareHorizontal, TerminalSquare } from "lucide-react";
 import { KeptMark } from "../../components/KeptSessions";
 import { reorderById } from "../../ui/tabDrag";
 import { COMPACT_TAB_NAME, NewsDot } from "../../ui/tabStyle";
@@ -43,15 +43,18 @@ export const JumpGoneChoices = ({ jumpGone, box }: { jumpGone: JumpGone; box?: s
 /** What a terminal tab shows: its icon, a dot when it printed something
  *  while out of sight (cleared when it comes on screen, so never on the tab
  *  in front), the kept-session mark, and its name (cut on a compact tab;
- *  the full one is the hover title). */
-export const TermTabLabel = ({ t, compactTabs }: { t: SessionTerminal; compactTabs: boolean }) => (
+ *  the full one is the hover title). The assistant's terminal (upstream's AI
+ *  tab) has its own icon, and `aiFullTitle`, in red, while Full access is on. */
+export const TermTabLabel = ({ t, compactTabs, aiFullTitle }: { t: SessionTerminal; compactTabs: boolean; aiFullTitle?: string }) => (
   <>
     {t.container
       ? <Container size={compactTabs ? 12 : 14} className="text-sky-300 shrink-0" />
-      : <TerminalSquare size={compactTabs ? 12 : 14} className="shrink-0" />}
+      : t.ai
+        ? <Sparkles size={compactTabs ? 12 : 14} className={aiFullTitle ? "text-rose-300 shrink-0" : "shrink-0"} />
+        : <TerminalSquare size={compactTabs ? 12 : 14} className="shrink-0" />}
     <NewsDot terminals={[t.id]} />
     <KeptMark terminalId={t.id} />
-    <span className={compactTabs ? COMPACT_TAB_NAME : undefined}>{t.title}</span>
+    <span className={`${compactTabs ? COMPACT_TAB_NAME : ""} ${aiFullTitle ? "text-rose-300" : ""}`}>{aiFullTitle ?? t.title}</span>
   </>
 );
 

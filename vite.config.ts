@@ -29,6 +29,18 @@ const fontsourceWoff2Only = {
 export default defineConfig(async () => ({
   plugins: [react(), fontsourceWoff2Only],
 
+  // fork: the fork's terminal is on xterm.js 6 (@xterm/*). The original
+  // project's AI terminal (src/components/ai/AiTerminal.tsx) still names the
+  // old packages; they are these (src/fork/xterm-names.d.ts says the same
+  // to TypeScript).
+  resolve: {
+    alias: [
+      { find: /^xterm$/, replacement: "@xterm/xterm" },
+      { find: /^xterm\/(.*)$/, replacement: "@xterm/xterm/$1" },
+      { find: /^xterm-addon-fit$/, replacement: "@xterm/addon-fit" },
+    ],
+  },
+
   // What the page is built for: the web views the app runs in (WebView2 and
   // Android's are Chromium, WebKitGTK and WKWebView are Safari's engine), at
   // ES2021. Vite's default is ES2020, which made esbuild rewrite xterm.js's

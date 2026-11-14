@@ -72,3 +72,7 @@ export function schemeToWindowsTerminalJson(s: PastedScheme): string {
   }
   return JSON.stringify(out);
 }
+
+// fork: the original project's AI terminal (components/ai/AiTerminal.tsx)
+// takes its colours from here; the fork keeps its schemes in ui/terminalThemes.
+export { readScheme } from "../ui/terminalThemes";

@@ -2221,3 +2221,19 @@ async fn trying_one_server_first_runs_it_alone_and_answers_once_all_are_decided(
     assert!(!r.text.contains("hello from sess-8") && !r.text.contains("hello from sess-9"), "{}", r.text);
     assert_eq!(r.text.matches("Denied by the user: not yet").count(), 2, "{}", r.text);
 }
+
+/// `submarine --mcp` is this module's helper (main.rs, before anything else),
+/// `submarine mcp` the original project's agent bridge (lib.rs `run`,
+/// gateway::bridge). Each is its own exact first argument, so neither starts
+/// the other's program (#252).
+#[test]
+fn the_helper_and_the_agent_bridge_answer_to_arguments_of_their_own() {
+    assert_eq!(crate::gateway::bridge::ARGUMENT, "mcp");
+    let main = include_str!("../main.rs");
+    let helper = main.find("a == \"--mcp\"").expect("main.rs starts the helper on --mcp");
+    let app = main.find("submarine_lib::run()").expect("main.rs runs the app");
+    assert!(helper < app, "the helper is chosen before the app (and its bridge check) runs");
+    // What Home's Claude Code starts the helper with.
+    let config = claude::mcp_config(std::path::Path::new("/opt/submarine"));
+    assert_eq!(config["mcpServers"][tools::SERVER]["args"], serde_json::json!(["--mcp"]));
+}

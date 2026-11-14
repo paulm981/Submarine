@@ -9,6 +9,8 @@ import { cdLine } from "../../src/fork/terminal/here";
 import { pathLike, resolvePath, wordAt } from "../../src/fork/terminal/fileMenu";
 import { MOST_PER_FRAME, nextTurns, QUICK_FRAME_MS, SLOW_FRAME_MS } from "../../src/fork/terminal/turns";
 import { clearWidths, MAX_WIDTHS, sharedMeasure, widthKey } from "../../src/fork/terminal/widthCache";
+import { CUSTOM_SCHEME, DEFAULT_SCHEME, schemeById } from "../../src/ui/terminalThemes";
+import { CUSTOM_THEME_ID, readScheme } from "../../src/util/terminalTheme";
 
 describe("hasVisibleText", () => {
   it("ignores control codes: colours, a title change, cursor moves", () => {
@@ -185,5 +187,17 @@ describe("right-click on a file name (#40)", () => {
     for (const [w, f] of [["nginx.conf", undefined], ["~/.bashrc", "/home/u"], ["../x.conf", "/etc/nginx"], ["/etc/a\nb", undefined]] as const) {
       expect(resolvePath(w, f), w).toBeNull();
     }
+  });
+});
+
+describe("the original project's AI terminal (#252)", () => {
+  it("takes this device's scheme from the fork's schemes", () => {
+    // No storage here: the default scheme.
+    expect(readScheme()).toBe(schemeById(DEFAULT_SCHEME));
+    expect(readScheme().theme.background).toBeTruthy();
+  });
+
+  it("calls a pasted scheme by the same id in both files", () => {
+    expect(CUSTOM_SCHEME).toBe(CUSTOM_THEME_ID);
   });
 });

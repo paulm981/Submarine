@@ -5,9 +5,11 @@ import { Children, isValidElement, useCallback, useRef, useState, type KeyboardE
 import { Bot, Cloud, LifeBuoy, Palette, Server, TerminalSquare, type LucideIcon } from "lucide-react";
 import { IS_MOBILE } from "../../util/platform";
 import {
-  SETTINGS_TABS, availableTabs, headingOf, readTab, tabForHeading, writeTab, type SettingsTab,
+  SETTINGS_TABS, availableTabs, headingOf, readTab, tabForAiSettings, tabForHeading, writeTab, type SettingsTab,
 } from "./categories";
 import { ForkSettings } from "./ForkSettings";
+import { AiSettings } from "../ai/AiSettings";
+import { AgentSettings } from "../agents/AgentSettings";
 import { t } from "../../i18n";
 
 const ICONS: Record<SettingsTab, LucideIcon> = {
@@ -78,13 +80,23 @@ export function SettingsTabBar({ tab, onChange }: { tab: SettingsTab; onChange: 
   );
 }
 
+/** The original project's AI settings, components of their own rather than
+ *  cards in SettingsPanel (categories.ts, tabForAiSettings). */
+const AI_SETTINGS: readonly unknown[] = [AiSettings, AgentSettings];
+
+/** The tab a card in SettingsPanel goes under. */
+const tabOf = (card: ReactNode): SettingsTab =>
+  isValidElement(card) && AI_SETTINGS.includes(card.type)
+    ? tabForAiSettings(availableTabs(IS_MOBILE))
+    : tabForHeading(headingOf(card), t);
+
 /** Around the original project's cards: only those under the open tab show
  *  (a card with a heading the fork doesn't know shows under General), and
  *  ForkSettings, which picks its own. A `contents` box, so the cards stay in
  *  the page's columns. */
 export function InTab({ tab, children }: { tab: SettingsTab; children: ReactNode }) {
   const shown = Children.toArray(children).filter(
-    (card) => (isValidElement(card) && card.type === ForkSettings) || tabForHeading(headingOf(card), t) === tab,
+    (card) => (isValidElement(card) && card.type === ForkSettings) || tabOf(card) === tab,
   );
   return (
     <div role="tabpanel" id={PANEL_ID} aria-labelledby={tabId(tab)} className="contents">
