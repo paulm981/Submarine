@@ -21,14 +21,14 @@ export const SETTINGS_TABS: readonly { id: SettingsTab; label: string }[] = [
 
 /** The original project's cards in SettingsPanel.tsx, by their heading. */
 export const UPSTREAM_CARD_TABS: Readonly<Record<string, SettingsTab>> = {
-  "UI Customization": "general",
+  "UI customization": "general",
   "Privacy": "general",
-  "Activity Log": "general",
+  "Activity log": "general",
   "Maintenance": "general",
-  "Terminal Configuration": "terminal",
+  "Terminal configuration": "terminal",
   "Authentication": "terminal",
   "Connections": "servers",
-  "Cloud Sync": "sync",
+  "Cloud sync": "sync",
   "Help & feedback": "help",
 };
 
