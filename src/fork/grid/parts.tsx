@@ -11,11 +11,11 @@ import type { CardMenuAt, MenuServer } from "./hooks";
 // NodeGrid did in its place, or nothing where it didn't.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** A server card's OS badge once the server has reported its OS
- *  (server_os.rs), in place of the monogram. */
-export const OsAvatar = ({ os }: { os: string }) => (
-  <div className="w-9 h-9 flex items-center justify-center shrink-0"><OsBadge os={os} size={30} /></div>
-);
+/** A server's OS badge once the server has reported its OS (server_os.rs),
+ *  in place of the protocol icon inside the original project's avatar box:
+ *  the box keeps the server's colour and the open tab's dot, and the card's
+ *  protocol badge still says what kind of server it is. */
+export const OsAvatar = ({ os, size }: { os: string; size: number }) => <OsBadge os={os} size={size} />;
 
 /** The header's path to the open folder: All, then each folder down to it;
  *  each step above it opens that level. */
