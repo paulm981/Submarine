@@ -11,7 +11,7 @@ This page covers:
 
 What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
-The fork is based on the original project's **0.4.0**, with every change up to [#315](https://github.com/SinaXhpm/submarine/pull/315) brought in.
+The fork is based on the original project's **0.5.0**, with every change up to [#337](https://github.com/SinaXhpm/submarine/pull/337) brought in.
 
 ## What this fork adds
 
@@ -279,7 +279,7 @@ No third-party service is involved. Profiles are encrypted with their password b
 
 - **Troubleshooting.** The app keeps a log on your computer, and a watchdog notes when the window froze and why. **Copy diagnostics** copies the log with server, user and host names replaced, ready to send to whoever is helping.
 - **A failed connect says why:** under the error, whether the name resolved and to what, and whether the port answered, through the jump host or proxy when there is one.
-- **A release from every change**, numbered like `v0.4.0-fork.8` and shown in the title bar, with a notice when there's a newer one.
+- **A release from every change**, numbered like `v0.5.0-fork.8` and shown in the title bar, with a notice when there's a newer one.
 - **Hardening.** On every system, characters that disguise a file name are shown plainly, and a trusted server that shows a different kind of key is a warning, not a silent change. What a file from a server may run is under [Files](#files).
 
 ## Where it behaves differently
@@ -289,13 +289,13 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | Area | The original project | This fork |
 |---|---|---|
 | Profile sync | Its hosted cloud, `submarine.sinaxhpm.com` | A folder or git repository you own. The hosted cloud is off unless you turn it on. |
-| Updates | Releases of the original project | Releases of this fork, one for every change: `v0.4.0-fork.1`, `v0.4.0-fork.2`, … |
+| Updates | Releases of the original project | Releases of this fork, one for every change: `v0.5.0-fork.1`, `v0.5.0-fork.2`, … |
 | Live Edit | Refuses a program; on Windows opens a script in Notepad; opens anything else with its default app ([#212](https://github.com/SinaXhpm/submarine/pull/212)) | Refuses a program, and opens anything else in an editor: the one picked in Settings, or Notepad on Windows, the default text editor on macOS, and on Linux the text editor set for plain text. It never runs a file |
 | Root | `sudo` | `sudo` or `dzdo`, and `dzdo su -`. A server without an sftp-server uses the original project's shell file access, under `sudo` only. |
 | Docker | As the user | As the user, or through root where only root may use Docker |
 | Remote Desktop | RDP servers ([#173](https://github.com/SinaXhpm/submarine/pull/173)), opened in the system's RDP app or, experimentally, in the tab ([#199](https://github.com/SinaXhpm/submarine/pull/199)) | The same: Remote Desktop is the original project's code, as they have it ([#160](https://github.com/paulm981/Submarine/issues/160)). The fork only brings RDP servers in: its own Remote Desktop links from before are moved over as RDP servers set to open in the system's app (`rdp_links.rs`), and the MobaXterm import brings RDP sessions in as RDP servers, without their saved login ([#42](https://github.com/paulm981/Submarine/issues/42)) |
 | VNC password | The server's own, or its saved login's | The server's own only. VNC sends its password with weak protection and doesn't check the server's identity, so a saved login, shared with other servers, is never sent there |
-| A server switched to telnet or VNC by another computer | Switched at once | In a shared profile, held on this computer, like synced on-connect commands: it stays what it was (SSH, or RDP) on its old port here until you allow the switch, or keep it as it was, which changes it back everywhere. Telnet and VNC would send its saved password where it could be read. A held switch stays held if you leave the share |
+| A server switched to telnet, VNC or plain FTP by another computer | Switched at once | In a shared profile, held on this computer, like synced on-connect commands: it stays what it was (SSH, RDP or FTPS) on its old port here until you allow the switch, or keep it as it was, which changes it back everywhere. Telnet, VNC and plain FTP would send its saved password where it could be read. A switch to FTPS isn't held: it checks the server's certificate first. A held switch stays held if you leave the share ([#246](https://github.com/paulm981/Submarine/issues/246)) |
 | Paste | The webview's clipboard | Read by the app itself, since the webviews on Windows, macOS and Linux refuse the page |
 | Text fields on macOS | Capitalize and correct what's typed | Keep exactly what's typed |
 | Closing a connected session | Always asks | Asks, unless you turn that off in Settings |
@@ -324,16 +324,19 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 | VNC clipboard ([#247](https://github.com/SinaXhpm/submarine/pull/247)) | Text copied on the server goes to this computer's clipboard at once | Only while its tab is in front and the window has the focus ([#121](https://github.com/paulm981/Submarine/issues/121)) |
 | Keys typed while a shell opens, and in order ([#308](https://github.com/SinaXhpm/submarine/pull/308)) | A terminal's keys go out one write at a time and wait while its shell opens; Broadcast's keys to other servers go the same way | The same for a server's own terminal and its on-connect commands. Broadcast keeps one call for every server ([#127](https://github.com/paulm981/Submarine/issues/127)), so a server whose shell is still opening doesn't get Broadcast's keys. A Home shell's keys go straight to it, as before |
 | Website ([#229](https://github.com/SinaXhpm/submarine/pull/229)) | `website/` is published at `submarine.sinaxhpm.com` | The folder comes along with merges, unchanged, but the fork doesn't publish it: no workflow builds or deploys it |
+| FTP servers ([#323](https://github.com/SinaXhpm/submarine/pull/323)) | FTP and FTPS servers with a file view | The same, kept out of Broadcast, the fork's AI tools, push and pull, and "Open terminal here". An FTP server whose jump host was deleted isn't connected directly. FileZilla's import lives with the fork's other imports ([#246](https://github.com/paulm981/Submarine/issues/246)) |
+| Feedback ([#320](https://github.com/SinaXhpm/submarine/pull/320)) | A form in the app sends what you type to the original project's server | Opens a new issue on this fork's GitHub in your browser; nothing is sent until you submit it there ([#249](https://github.com/paulm981/Submarine/issues/249)) |
+| AI ([#333](https://github.com/SinaXhpm/submarine/pull/333), [#337](https://github.com/SinaXhpm/submarine/pull/337)) | An AI assistant with your own provider, and access for AI agents on this computer through `submarine mcp` | Both, as they are, beside the fork's own AI tools (Claude Code and Codex from Home, Share with AI, root, many servers at once), which live in `src-tauri/src/ai_tabs/`. Their settings are in **Settings › AI tools** ([#252](https://github.com/paulm981/Submarine/issues/252)) |
 
 ## Changes in the original project not taken yet
 
-Every change up to [#315](https://github.com/SinaXhpm/submarine/pull/315) is taken. Where the fork takes one differently, the table above says so.
+Every change up to [#337](https://github.com/SinaXhpm/submarine/pull/337) (0.5.0) is taken. Where the fork takes one differently, the table above says so.
 
 Not taken yet, for the next sync:
 
 | The original project's change | Why not yet |
 |---|---|
-| Nothing at the moment | |
+| [#338](https://github.com/SinaXhpm/submarine/pull/338) server cards with protocol icons and a list view, [#339](https://github.com/SinaXhpm/submarine/pull/339) classic tabs, [#341](https://github.com/SinaXhpm/submarine/pull/341) sentence case, [#342](https://github.com/SinaXhpm/submarine/pull/342) a copy of a profile in a folder you choose | Made after 0.5.0. #339 overlaps the fork's tab dragging, Ctrl+Tab and All tabs, and #342 the fork's sync through your own storage, so they're studied before they come in ([#236](https://github.com/paulm981/Submarine/issues/236)) |
 
 ## Keeping up with the original project
 
@@ -372,9 +375,9 @@ Not taken yet, for the next sync:
 
 **Versions.**
 
-- **Every merge to main is a release.** GitHub builds it and publishes it, tagged with the original project's version and the fork's count: `v0.4.0-fork.1`, `v0.4.0-fork.2`, and so on. A higher count is newer. There's nothing to tag by hand.
-- **The title bar shows it,** as in `v0.4.0-fork.8`, and the profile screen says when there's a newer release.
-- **When the original project releases a new version** and it's merged, the count starts again. Releases on 0.3.8 ran from `v0.3.8-fork.1` to `v0.3.8-fork.11`; with 0.4.0 in, they're `v0.4.0-fork.1` and on.
+- **Every merge to main is a release.** GitHub builds it and publishes it, tagged with the original project's version and the fork's count: `v0.5.0-fork.1`, `v0.5.0-fork.2`, and so on. A higher count is newer. There's nothing to tag by hand.
+- **The title bar shows it,** as in `v0.5.0-fork.8`, and the profile screen says when there's a newer release.
+- **When the original project releases a new version** and it's merged, the count starts again. Releases on 0.3.8 ran from `v0.3.8-fork.1` to `v0.3.8-fork.11`, and on 0.4.0 from `v0.4.0-fork.1`; with 0.5.0 in, they're `v0.5.0-fork.1` and on.
 - **The installers keep the same names** in every release, so a link to the latest release's `Submarine-windows-x64-setup.exe` always gets the newest. On Windows the installer itself can only say `0.4.0`; the app still knows it's `0.4.0-fork.8`.
 - **Windows and Linux are in every release; macOS is added to one once it has been tried,** since a macOS minute costs ten of the account's GitHub Actions minutes. **Run workflow** with **Or: add the Mac build to this release** set to its tag builds the Mac app from that release's code and adds it to the release. Only a release with its Windows installer gets one. Or build it on your own Mac: [Builds on GitHub](README.md#builds-on-github) says how.
 - **The changelog fills itself in.** A pull request with something a person using the app will notice adds a file to `changelog.d/`, named after its issue (`126.md`), holding its line or lines. When the merge is released, the release job moves the released commit's files into CHANGELOG.md under that release's number and deletes them (`scripts/changelog_release.py`). Two pull requests then never change the same lines. A file merged after the release was built waits for the next one. [changelog.d/README.md](changelog.d/README.md) shows the format.

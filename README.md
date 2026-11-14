@@ -112,7 +112,7 @@
 - **Sync through storage you own**: a folder that OneDrive, Dropbox, Nextcloud, Syncthing or a network share keeps the same on your computers, or a private git repository, with no third-party service. Profiles are encrypted with their password first. The original project's hosted cloud stays off unless you turn it on.
 
 **Ready to roll out to a team**
-- **A release from every change**, numbered like `v0.4.0-fork.N` and shown in the title bar, with a notice when there's a newer one.
+- **A release from every change**, numbered like `v0.5.0-fork.N` and shown in the title bar, with a notice when there's a newer one.
 - **Shared profiles that can't act behind your back**: when someone you share a profile with changes on-connect commands, autostart, forwards or monitor commands, or switches a server to telnet or VNC, it waits for your OK on your computer. [More in FORK.md](FORK.md#shared-profiles).
 - **Troubleshooting**: a log on your computer, a watchdog that notes when the window froze and why, and **Copy diagnostics** with server, user and host names replaced, ready to send to whoever is helping. When a connect fails, Submarine says whether the name resolved and the port answered.
 - **Hardening**: characters that disguise a file name are shown plainly, and a trusted server that shows a different kind of key is a warning, not a silent change. Live Edit opens a file in an editor and never runs it, and keeps changes that didn't reach the server in **Submarine unsent edits** in your Downloads folder. The Local pane asks before it opens a file that would run, on Windows, macOS and Linux. Downloads never replace each other, and are marked as from the internet on Windows and macOS. A mirror keeps a file's permissions on the server. As in the original project, a program on a server isn't opened from the file pane at all.
@@ -431,7 +431,7 @@ Download from the **[latest release](https://github.com/paulm981/Submarine/relea
 | Arch / Manjaro / EndeavourOS | `Submarine-linux-x86_64.pkg.tar.zst` — `sudo pacman -U Submarine-linux-x86_64.pkg.tar.zst` |
 | Any Linux | `Submarine-linux-x86_64.AppImage` — `chmod +x` and double-click |
 
-To update, run the newer setup `.exe` over the installed one. Submarine tells you when there is one: the profile screen shows *"New version v0.4.0-fork.N available"*. Each release has the original project's version and the fork's count, `v0.4.0-fork.1`, `v0.4.0-fork.2` and so on, in the title bar and at the bottom of the profile screen. To install on many PCs, the setup `.exe` runs silently with `/S`.
+To update, run the newer setup `.exe` over the installed one. Submarine tells you when there is one: the profile screen shows *"New version v0.5.0-fork.N available"*. Each release has the original project's version and the fork's count, `v0.5.0-fork.1`, `v0.5.0-fork.2` and so on, in the title bar and at the bottom of the profile screen. To install on many PCs, the setup `.exe` runs silently with `/S`.
 
 Every release is on the [releases page](https://github.com/paulm981/Submarine/releases). The Android `.apk` comes from the [original project's releases](https://github.com/sinaxhpm/submarine/releases).
 
@@ -642,12 +642,12 @@ npm run tauri build        # build release bundle
 
 [`.github/workflows/build.yml`](.github/workflows/build.yml) builds the installers on GitHub's Windows, macOS and Linux runners:
 
-- **Every merge into `main`** is a [release](https://github.com/paulm981/Submarine/releases), tagged with the original project's version and the fork's count: `v0.4.0-fork.1`, `v0.4.0-fork.2` and so on, starting again at 1 when the original project's version changes. The count is one more than the newest tag of that version. If the Windows build fails, no release is made, and the next merge makes it. The workflow passes the version to `src-tauri/build.rs`, which stamps it into the app.
+- **Every merge into `main`** is a [release](https://github.com/paulm981/Submarine/releases), tagged with the original project's version and the fork's count: `v0.5.0-fork.1`, `v0.5.0-fork.2` and so on, starting again at 1 when the original project's version changes. The count is one more than the newest tag of that version. If the Windows build fails, no release is made, and the next merge makes it. The workflow passes the version to `src-tauri/build.rs`, which stamps it into the app.
 - **Run workflow** on the [Actions tab](https://github.com/paulm981/Submarine/actions/workflows/build.yml) builds a version you type in, as a test, and publishes nothing.
 
 Each run's files are also kept for 90 days under **Artifacts** on the run's page (GitHub sign-in needed there). Android is built only when the repository variable `BUILD_ANDROID` is `true` and the signing secrets the workflow names are set.
 
-A release is Windows and Linux when it's made. A macOS minute uses ten of the account's GitHub Actions minutes, so the Mac build is added only to a release that has been tried: **Run workflow** with **Or: add the Mac build to this release** set to its tag, such as `v0.4.0-fork.19`. It builds the Mac app from that release's own code and adds the `.dmg` and the `.app.zip` to its downloads and its notes. Only a release that has its Windows installer gets one. The Mac app is for Apple silicon (M1 or later); it doesn't run on an Intel Mac. Pull request checks run on Linux and Windows, and on macOS too when the pull request has the `macos` label.
+A release is Windows and Linux when it's made. A macOS minute uses ten of the account's GitHub Actions minutes, so the Mac build is added only to a release that has been tried: **Run workflow** with **Or: add the Mac build to this release** set to its tag, such as `v0.5.0-fork.3`. It builds the Mac app from that release's own code and adds the `.dmg` and the `.app.zip` to its downloads and its notes. Only a release that has its Windows installer gets one. The Mac app is for Apple silicon (M1 or later); it doesn't run on an Intel Mac. Pull request checks run on Linux and Windows, and on macOS too when the pull request has the `macos` label.
 
 **Building macOS on your own Mac:** install the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) (Xcode's command line tools, Rust, Node 20+), then in a clone of the repository run `npm ci` and `SUBMARINE_VERSION=0.4.0-fork.N npm run tauri build -- --bundles app,dmg` with the release's number. The app and the `.dmg` land in `src-tauri/target/release/bundle/`.
 
