@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.5.0-fork.3
+
+- **Browser-style tabs, and a + to open a server from anywhere.** The open tab joins the toolbar under it, with a line on top in the server's colour; Home and Broadcast's tabs look the same. The + after the last tab lists your saved servers: type to narrow it, Enter to open one. A middle click closes a tab, asking first, as the ×, unless you chose "Don't ask again". Dragging tabs, Ctrl+Tab through Home, Broadcast and your servers, and All tabs work as before; inside a remote desktop, Ctrl+Tab stays with the remote. Compact tabs now makes the tabs narrower. (Their [#339](https://github.com/SinaXhpm/submarine/pull/339); [#256](https://github.com/paulm981/Submarine/issues/256))
+
 ## v0.5.0-fork.2
 
 - **Server cards show the kind of connection, and a dot while the server's tab is open.** Each card has an icon for SSH, telnet, RDP, VNC or FTP in the server's own colour (or the OS logo, once the server has reported its OS), a badge for the kind, and user@host. The search, the grid-or-list switch and the buttons share one row at the top. The list view, also new, lists name, address, type and the tab's state; the app remembers your choice on this computer. Press / to search. (Their [#338](https://github.com/SinaXhpm/submarine/pull/338); [#256](https://github.com/paulm981/Submarine/issues/256))
