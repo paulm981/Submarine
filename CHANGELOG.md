@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.80
+
+- **A reconnect shows what it's doing.** When a session drops, the banner shows each attempt's steps (reaching the server, securing the connection, logging in), where a failed attempt stopped, and how long until the next. ([#244](https://github.com/paulm981/Submarine/issues/244))
+
 ## v0.4.0-fork.79
 
 - **The app in 15 languages.** Settings › General › Language picks one; it follows your system at first. The fork's own screens (the session tree, the AI panel, the fork's Settings cards) stay in English for now: choose English to avoid a mix. ([#242](https://github.com/paulm981/Submarine/issues/242))
