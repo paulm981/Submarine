@@ -8,7 +8,7 @@ import AllTabsMenu from "../../components/AllTabsMenu";
 import HomePane from "../../components/HomePane";
 import { SessionTree } from "../../components/SessionTree";
 import { useAiPane } from "../../ui/aiPane";
-import { titleTabClass } from "../../ui/tabStyle";
+import { TitleTabEdges, titleTabClass } from "../../ui/tabStyle";
 import { reorderById } from "../../ui/tabDrag";
 import { aiMarker, cardsOf, loosestShare, openAiTrust, sharedWith, trustTargetFor, useAi } from "../../util/ai";
 import { type CloseWhich, HAS_HOME, closeCounts } from "./rules";
@@ -45,17 +45,16 @@ export const AppVersion = () => {
 /** Home's tab, first in the title bar, like MobaXterm's home tab: always
  *  there to go back to, and not a session (no status, no close, never in a
  *  broadcast or a split). */
-export const HomeTab = ({ show, active, compact, onClick }: { show: boolean; active: boolean; compact: boolean; onClick: () => void }) => {
+export const HomeTab = ({ show, active, compact, divider, onClick }: { show: boolean; active: boolean; compact: boolean; divider: boolean; onClick: () => void }) => {
   if (!HAS_HOME || !show) return null;
   return (
     <div
       onClick={onClick}
       title="Home — terminals on this computer"
       aria-label="Home"
-      className={`no-drag flex items-center justify-center h-7 w-9 cursor-pointer transition-all shrink-0 ${
-        titleTabClass({ compact, active })
-      }`}
+      className={`no-drag group justify-center ${compact ? "w-8" : "w-10"} ${titleTabClass({ active })}`}
     >
+      <TitleTabEdges active={active} divider={divider} color="rgb(var(--primary))" />
       <Home size={14} className="shrink-0" />
     </div>
   );
@@ -96,7 +95,7 @@ export const TabAiMarker = ({ sessionId }: { sessionId: string }) => {
         onClick={(e) => { e.stopPropagation(); openAiTrust(trustTargetFor(loosest)); }}
         title={`Shared with ${with_.map(t => t.label).join(", ")}. ${marker}. Click to change it.`}
         aria-label={marker}
-        className={`mr-1 shrink-0 flex items-center gap-0.5 rounded px-0.5 text-amber-300 hover:bg-amber-400/15 ${busy ? "animate-pulse" : ""}`}
+        className={`shrink-0 flex items-center gap-0.5 rounded px-0.5 text-amber-300 hover:bg-amber-400/15 ${busy ? "animate-pulse" : ""}`}
       >
         <Bot size={10} />
         {/* The marker's words, the Bot icon standing for "AI:". */}
@@ -105,14 +104,15 @@ export const TabAiMarker = ({ sessionId }: { sessionId: string }) => {
     );
   }
   return (
-    <span title={`Shared with ${with_.map(t => t.label).join(", ")}`} aria-label="Shared with AI" className={`mr-1 shrink-0 flex ${busy ? "text-primary animate-pulse" : "text-zinc-400"}`}>
+    <span title={`Shared with ${with_.map(t => t.label).join(", ")}`} aria-label="Shared with AI" className={`shrink-0 flex ${busy ? "text-primary animate-pulse" : "text-zinc-400"}`}>
       <Bot size={10} />
     </span>
   );
 };
 
 /** All tabs ▾ in the title bar: every session, searchable (Ctrl+Shift+K),
- *  anchored at the right edge however many tabs are open. */
+ *  anchored at the right edge however many tabs are open (after the original
+ *  project's +, which follows the last tab). */
 export const AllTabsButton = <S extends { id: string; serverId: number; serverName: string }>({
   show, open, setOpen, sessions, label, statuses, waiting, activeView, onShow, onClose,
 }: {
@@ -124,7 +124,7 @@ export const AllTabsButton = <S extends { id: string; serverId: number; serverNa
 }) => {
   if (!show || sessions.length === 0) return null;
   return (
-    <div className="relative no-drag shrink-0 mx-0.5">
+    <div className="relative no-drag shrink-0 self-center ml-auto mr-0.5">
       <button
         type="button"
         onClick={() => setOpen(v => !v)}

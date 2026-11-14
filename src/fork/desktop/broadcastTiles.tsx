@@ -18,7 +18,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Pause, Play, Radio, Send, Target, X } from "lucide-react";
 import { useBroadcast } from "../../ui/broadcast";
-import { titleTabClass } from "../../ui/tabStyle";
+import { TitleTabEdges, titleTabClass } from "../../ui/tabStyle";
 import {
   aimNow, clearPicks, pick, sendTargets, setOrder, setPaused, togglePaused, typeToAll, typeToOne, useAim,
 } from "../terminal/broadcastAim";
@@ -264,7 +264,7 @@ export const BroadcastBar = ({ tiles, sessions, statuses }: {
 };
 
 /** The tab Broadcast's servers fold into: the Wall, while it's on. */
-export const BroadcastTab = ({ active, compact, onClick }: { active: boolean; compact: boolean; onClick: () => void }) => {
+export const BroadcastTab = ({ active, compact, divider, onClick }: { active: boolean; compact: boolean; divider: boolean; onClick: () => void }) => {
   const bc = useBroadcast();
   if (!isLive(bc)) return null;
   const n = bc.targetSessionIds.size;
@@ -273,10 +273,11 @@ export const BroadcastTab = ({ active, compact, onClick }: { active: boolean; co
       data-tab="wall"
       onClick={onClick}
       title={`Broadcast: what you type goes to all ${n} of them`}
-      className={`no-drag group flex items-center gap-1.5 h-7 pl-3 pr-1.5 cursor-pointer transition-all shrink-0 ${titleTabClass({ compact, active })}`}
+      className={`no-drag group gap-1.5 ${compact ? "pl-2 pr-1" : "pl-3 pr-1.5"} ${titleTabClass({ active })}`}
     >
+      <TitleTabEdges active={active} divider={divider} color="#fb923c" />
       <Radio size={12} className="shrink-0 text-orange-400" />
-      <span className="text-[11px] font-bold whitespace-nowrap">Broadcast · {n}</span>
+      <span className="text-[11.5px] font-bold whitespace-nowrap">Broadcast · {n}</span>
       <button
         onClick={(e) => { e.stopPropagation(); bc.selectNone(); }}
         title="End Broadcast (the sessions stay connected, back in their own tabs)"
