@@ -321,7 +321,7 @@ export const AiSidePane = ({ v, onHome, onGoToServer }: {
               level={levelOf(ai, p.tab_id, p.session_id)}
               decide={(allow, note, password) => members.length > 1 && p.group
                 ? run("ai_decide_group", { group: p.group.id, allow, note: note ?? null })
-                : run("ai_decide", { id: p.id, allow, note: note ?? null, password: password || null })}
+                : run("ai_tab_decide", { id: p.id, allow, note: note ?? null, password: password || null })}
               act={run}
               onGoToServer={onGoToServer}
             />

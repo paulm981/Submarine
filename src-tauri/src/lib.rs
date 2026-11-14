@@ -25766,7 +25766,7 @@ pub fn run() {
             local_term::list_local_shells, local_term::local_shell_set_default, local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
             local_term::local_terminal_open, local_term::local_terminal_write, local_term::local_windows_build, local_term::local_terminal_resize, local_term::local_terminal_close,
             ping::ping_server, jump_gone::jump_host_connect_directly, diagnose_connect, ssh_firewall_as_root,
-            ai_tabs::ai_settings, ai_tabs::ai_set_enabled, ai_tabs::ai_state, ai_tabs::ai_share, ai_tabs::ai_unshare, ai_tabs::ai_stop, ai_tabs::ai_decide, ai_tabs::ai_output,
+            ai_tabs::ai_settings, ai_tabs::ai_set_enabled, ai_tabs::ai_state, ai_tabs::ai_share, ai_tabs::ai_unshare, ai_tabs::ai_tab_stop, ai_tabs::ai_tab_decide, ai_tabs::ai_output,
             ai_tabs::ai_set_flash, ai_tabs::ai_allow_session, ai_tabs::ai_decide_group, ai_tabs::ai_allow_session_group, ai_tabs::ai_allow_always, ai_tabs::ai_trust_view, ai_tabs::ai_trust_scope,
             ai_tabs::ai_trust_set_level, ai_tabs::ai_trust_add_rule, ai_tabs::ai_trust_remove_rule, ai_tabs::ai_end_allow_all, ai_tabs::ai_keep_policy, ai_tabs::ai_add_pull_folder, ai_tabs::ai_remove_pull_folder, ai_tabs::ai_stop_follow, ai_tabs::ai_answer_server_ask,
             ssh_info_probe_section, ssh_systemctl_action, ssh_kill_process,
