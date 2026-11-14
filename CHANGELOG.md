@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.77
+
+- **A Home terminal shows what you type sooner.** The echo of each key used to wait about 8 ms before reaching the screen; now it goes at once. Big bursts of output are still grouped as before, so a flood doesn't slow the app down. Tests now check that typing and output stay this fast. ([#234](https://github.com/paulm981/Submarine/issues/234))
+
 ## v0.4.0-fork.76
 
 - **Root through `dzdo su -` comes before sudo.** On servers where you get root with `dzdo su -`, the AI's root requests use dzdo, and its card asks for your own password for the login, not a root password. sudo is asked only where dzdo isn't there or can't give root, so it never gets a password dzdo turned down. SFTP root mode, the Info panel and Docker look in the same order, and dzdo is found in Centrify's own folders too. When root can't be had, the AI is told why, and not to type sudo, dzdo or su itself. ([#232](https://github.com/paulm981/Submarine/issues/232))
