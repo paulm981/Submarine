@@ -55,6 +55,7 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
     ],
   },
   { file: "src/components/DockerTab.tsx", imports: ["../ui/rootInvoke", "../util/infoFont"] },
+  { file: "src/components/Feedback.tsx", imports: ["../fork/feedback"], uses: ["if (feedbackOnGithub"] },
   { file: "src/components/FilePanel.tsx", imports: ["../util/fileName", "../fork/terminal/here"], uses: ["TerminalHereItem"] },
   { file: "src/components/HeldReview.tsx", imports: ["../util/ai"] },
   { file: "src/components/InfoPanel.tsx", imports: ["../ui/rootInvoke", "../util/infoFont"] },
