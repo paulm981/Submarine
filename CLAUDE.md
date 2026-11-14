@@ -25,6 +25,7 @@ Every line the fork changes inside one of the original project's files can confl
 
 - **Start from the plan.** What's done and what's next is in [#163](https://github.com/paulm981/Submarine/issues/163)'s latest comment; read it first, and update it when a batch of work ends.
 - **What the owner cares about most:**
+  - terminal typing and output as fast as they can be: never slower, for any feature;
   - the AI (Claude Code, Codex) working well, with as few approval prompts as safety allows;
   - Broadcast to many servers;
   - pushing and pulling files on many servers, by the owner and by the AI;
@@ -56,6 +57,7 @@ Every change is held to these, in review and in the code itself:
 - Nothing blocking on an async worker: SQLite, file I/O and other synchronous work go in `spawn_blocking`. Never hold a `std::sync::Mutex` guard across an `.await`.
 - Anything that can grow from outside has a bound: channels, queues, buffers, output, retries.
 - Nothing heavy per keystroke or per frame in the page: batch it and coalesce it, and measure before and after when a change is about speed.
+- **Typing and output are protected.** A change on the terminal path (keys, the backend's output loops, the output filter, highlighting, xterm, how a connection carries a session) keeps the speed tests passing (`tools/test/perf.test.ts`, the Rust budgets in `term_output.rs` and `local_term.rs`), and is measured with `tools/screenshots/perf-io.mjs` before and after. If it's slower, it doesn't merge: a feature that costs typing speed is redesigned or dropped.
 - One command for a batch rather than one per item, across the Tauri bridge or SSH.
 
 **Well-known Rust patterns, not anti-patterns.**
