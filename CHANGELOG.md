@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.85
+
+- **AGY and other AI agents can work on your servers.** Turn on Settings › AI tools › AI agents and paste its snippet into the agent's MCP settings: the agent asks with a purpose, and you pick the server, what it may do and for how long on a card in Submarine. It never gets passwords, keys or server addresses. Claude Code and Codex from Home keep working as before. There's also a built-in AI assistant in a server's tab, using your own provider key; both are off until you turn them on. ([#252](https://github.com/paulm981/Submarine/issues/252))
+
 ## v0.4.0-fork.83
 
 - **Feedback opens an issue on this fork's GitHub.** Settings › Help › Send feedback, the profile list's Feedback and Suggest a fix open a new issue in your browser; nothing is sent until you submit it there. ([#249](https://github.com/paulm981/Submarine/issues/249))
