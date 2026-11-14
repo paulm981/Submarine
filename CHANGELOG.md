@@ -9,6 +9,11 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.78
+
+- **A server whose name has a dead address still connects.** When a name stands for several addresses and the first never answers, the next is tried after a quarter second instead of failing, which on Windows took about 21 seconds. This covers SSH, jump hosts, proxies, Remote Desktop, VNC, telnet and Monitoring. An HTTP proxy no longer loses the server's first words. ([#238](https://github.com/paulm981/Submarine/issues/238))
+- **Dragging across blank cells no longer copies spaces** over what's on your clipboard. ([#238](https://github.com/paulm981/Submarine/issues/238))
+
 ## v0.4.0-fork.77
 
 - **A Home terminal shows what you type sooner.** The echo of each key used to wait about 8 ms before reaching the screen; now it goes at once. Big bursts of output are still grouped as before, so a flood doesn't slow the app down. Tests now check that typing and output stay this fast. ([#234](https://github.com/paulm981/Submarine/issues/234))
