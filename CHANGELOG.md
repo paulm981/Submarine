@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.4.0-fork.79
+
+- **The app in 15 languages.** Settings › General › Language picks one; it follows your system at first. The fork's own screens (the session tree, the AI panel, the fork's Settings cards) stay in English for now: choose English to avoid a mix. ([#242](https://github.com/paulm981/Submarine/issues/242))
+
 ## v0.4.0-fork.78
 
 - **A server whose name has a dead address still connects.** When a name stands for several addresses and the first never answers, the next is tried after a quarter second instead of failing, which on Windows took about 21 seconds. This covers SSH, jump hosts, proxies, Remote Desktop, VNC, telnet and Monitoring. An HTTP proxy no longer loses the server's first words. ([#238](https://github.com/paulm981/Submarine/issues/238))
