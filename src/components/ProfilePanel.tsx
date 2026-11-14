@@ -6,6 +6,8 @@ import {
 } from "lucide-react";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
 import QuickUnlockCard from "./QuickUnlockCard";
+import FolderCopyCard from "./FolderCopyCard";
+import { IS_MOBILE } from "../util/platform";
 import { RoleBadge, roleBlurb } from "./shareRoles";
 import * as Fork from "../fork/profile";
 import { hostOf } from "./SyncServerSetting";
@@ -378,6 +380,8 @@ export default function ProfilePanel({ onSync, syncing, lastSyncLabel, autoSync,
       {st?.profile && <QuickUnlockCard profile={st.profile} card={card} label={label} />}
 
       <Fork.StoreSection own={ownStore} shared={shared} card={card} label={label} busy={busy} setBusy={setBusy} confirm={confirm} refresh={refresh} loadStats={loadStats} flash={flash} fail={fail} stats={stats} syncing={syncing} lastSyncLabel={lastSyncLabel} autoSync={autoSync} syncIntervalMin={syncIntervalMin} onSetInterval={onSetInterval} onToggleAutoSync={onToggleAutoSync} doSync={doSync} />
+      {/* ---- A copy in a folder, on a computer (#319) ---- */}
+      {st?.profile && !IS_MOBILE && <FolderCopyCard profile={st.profile} card={card} label={label} />}
 
       {/* ---- Cloud + sync ---- */}
       {ownStore.cloudOn && !ownStore.store && (
