@@ -2,7 +2,8 @@
 // moved out of DesktopApp.tsx, the original project's file, for #163).
 import { describe, expect, it } from "vitest";
 import {
-  type DesktopSession, aiPaneViewOf, closeCounts, osChecksDue, sessionFor, sessionPaneStyle, stepTab, tabMenuStyle, tabsToClose, wouldEnd,
+  type DesktopSession, aiPaneViewOf, closeCounts, inRemoteDesktop, osChecksDue, sessionFor, sessionPaneStyle, stepTab, tabDivider, tabMenuStyle,
+  tabsToClose, wouldEnd,
 } from "../../src/fork/desktop/rules";
 
 describe("wouldEnd", () => {
@@ -152,5 +153,61 @@ describe("aiPaneViewOf", () => {
       expect(aiPaneViewOf(tab.id, [tab], { [tab.id]: "connected" }, {}, (s) => s.serverName).session).toMatchObject({ ssh: false });
       expect(osChecksDue([tab], { [tab.id]: "connected" }, [{ id: 4, port: 21 }], new Set())).toEqual([]);
     }
+  });
+});
+
+describe("the title bar's tabs (the original project's classic tabs, #339)", () => {
+  const order = ["home", "wall", "s1", "s2"];
+
+  it("draws a divider between two tabs where neither is the open one", () => {
+    expect(tabDivider(order, "s2", "home")).toBe(true);
+    expect(tabDivider(order, "s2", "wall")).toBe(true);
+    // Not on the open tab, nor on the one just before it, nor on the last.
+    expect(tabDivider(order, "s2", "s2")).toBe(false);
+    expect(tabDivider(order, "s2", "s1")).toBe(false);
+    expect(tabDivider(order, "home", "s2")).toBe(false);
+    // A tab that isn't in the strip (Broadcast off) has none.
+    expect(tabDivider(["home", "s1"], "s1", "wall")).toBe(false);
+  });
+
+  it("leaves Ctrl+Tab to a remote desktop, and only there", () => {
+    const inside = { closest: (sel: string) => (sel === "[data-remote-keys]" ? {} : null) } as unknown as EventTarget;
+    const outside = { closest: () => null } as unknown as EventTarget;
+    expect(inRemoteDesktop(inside)).toBe(true);
+    expect(inRemoteDesktop(outside)).toBe(false);
+    expect(inRemoteDesktop(null)).toBe(false);
+    // The window itself has no closest().
+    expect(inRemoteDesktop({} as EventTarget)).toBe(false);
+  });
+
+  // The original project's #339 added its own tab drag and Ctrl+Tab. Both
+  // merged into DesktopApp.tsx without a conflict and would have beaten the
+  // fork's: a later onPointerDown wins over the fork's drag spread, and a
+  // capture-phase Ctrl+Tab listener runs before Fork.useTabKeys, skipping
+  // Home and Broadcast and pulling servers out of Broadcast. This fails if a
+  // sync brings them back.
+  const SOURCES = import.meta.glob<string>("/src/DesktopApp.tsx", { query: "?raw", import: "default", eager: true });
+  const code = (SOURCES["/src/DesktopApp.tsx"] ?? "")
+    .replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "").replace(/\s\/\/ .*$/gm, "");
+
+  it("drags a server tab with the fork's drag only", () => {
+    const lines = code.split("\n");
+    const at = lines.findIndex((l) => l.includes("{...sessionDrag.tabProps(s.id)}"));
+    expect(at, "DesktopApp no longer spreads the fork's tab drag").toBeGreaterThanOrEqual(0);
+    const end = lines.findIndex((l, i) => i > at && l.trim() === ">");
+    const tab = lines.slice(at + 1, end).join("\n");
+    expect(tab).not.toMatch(/onPointerDown=/);
+    expect(code).not.toMatch(/startTabDrag|setTabOrder|tabDragged/);
+  });
+
+  it("has one Ctrl+Tab, the fork's", () => {
+    expect(code).toMatch(/Fork\.useTabKeys\(/);
+    expect(code).not.toMatch(/e\.key\s*!==?\s*["']Tab["']/);
+    expect(code).not.toMatch(/addEventListener\(["']keydown["'][^)]*,\s*true\)/);
+  });
+
+  it("closes a tab, from its ×, a middle click, its menu or the phone's list, through the fork's close", () => {
+    expect(code).toMatch(/const closeTab = async \(sid: string, ask: boolean\) => \{ await closeSessions\(\[sid\], ask\); \};/);
+    expect(code).toMatch(/onAuxClick=\{\(e\) => \{\s*if \(e\.button !== 1\) return;\s*e\.preventDefault\(\);\s*void closeTab\(s\.id, true\);/);
   });
 });

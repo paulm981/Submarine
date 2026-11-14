@@ -15,7 +15,7 @@ export { default as PingPanel } from "../../components/PingPanel";
 // Bulk push and pull (#159): the dialog, and its items in a tab's menu.
 export { BulkTransfer } from "../bulk/BulkDialog";
 export { BulkTabItems } from "../bulk/menus";
-export { COMPACT_TAB_NAME, COMPACT_TAB_PAD, NewsDot, titleTabClass } from "../../ui/tabStyle";
+export { COMPACT_TAB_NAME, COMPACT_TAB_PAD, NewsDot } from "../../ui/tabStyle";
 // The original project's "bold in bright colors" and "keep text readable",
 // which the fork's terminal colors (ui/terminalThemes) read and keep.
 export { BOLD_BRIGHT_KEY, MIN_CONTRAST_KEY, readBoldBright, readMinContrast } from "../../ui/terminalThemes";

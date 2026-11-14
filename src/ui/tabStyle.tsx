@@ -1,10 +1,13 @@
 import { useHasNews } from "./terminalActivity";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// How tabs look, in one place: the title bar's tabs (Home, servers)
-// and each server's terminal tabs. Two looks, picked in Settings ›
-// Appearance: rounded pills, or compact — flat tabs that touch, with a thin
-// line under the one in front.
+// How tabs look, in one place: the title bar's tabs (Home, Broadcast, servers)
+// and each server's terminal tabs. The title bar's are the original project's
+// classic tabs (#339): the open one joins the toolbar under it, with a line
+// on top; the fork draws Home and Broadcast's tabs the same way. Compact tabs
+// (Settings › General) makes them narrower, with long names cut short, and
+// makes a server's terminal tabs flat tabs that touch, with a thin line under
+// the one in front.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// primary: a server or Home; merged: a server shown in a split beside the
@@ -23,24 +26,23 @@ const COMPACT: Record<TabTone, { on: string; off: string }> = {
   },
 };
 
-// The same for the pills.
-const PILL: Record<TabTone, { on: string; off: string }> = {
-  primary: {
-    on: "bg-primary/15 text-primary border-primary/40 shadow-inner shadow-primary/10",
-    off: "bg-white/[0.06] text-zinc-300 border-white/10 hover:bg-white/[0.1] hover:border-white/20 hover:text-white",
-  },
-  merged: {
-    on: "bg-primary/15 text-primary border-primary/40 shadow-inner shadow-primary/10",
-    off: "bg-primary/[0.05] text-primary/80 border-primary/25 hover:bg-primary/10",
-  },
-};
+/// Shape and colours of the fork's title-bar tabs (Home, Broadcast), as the
+/// original project draws a server's tab in DesktopApp.tsx (#339). The
+/// caller adds its own width or padding.
+export const titleTabClass = ({ active }: { active: boolean }): string =>
+  `relative flex items-center h-[33px] rounded-t-lg cursor-pointer shrink-0 transition-colors ${
+    active ? "z-10 bg-[#141417] text-zinc-100 border-x border-t border-white/10" : "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]"
+  }`;
 
-/// Shape and colours of a title-bar tab (Home, a server). The caller
-/// adds its own width or padding (`COMPACT_TAB_PAD` in the compact look).
-export const titleTabClass = ({ compact, active, tone = "primary" }: { compact: boolean; active: boolean; tone?: TabTone }): string =>
-  compact
-    ? `rounded-none border-b-2 border-r border-r-white/5 ${COMPACT[tone][active ? "on" : "off"]}`
-    : `rounded-full mr-1 border ${PILL[tone][active ? "on" : "off"]}`;
+/// Inside a fork's title-bar tab: the open one's line on top (`color`), and
+/// the thin line after it when neither it nor the next tab is open
+/// (tabDivider), as the original project draws a server's tab.
+export const TitleTabEdges = ({ active, divider, color }: { active: boolean; divider: boolean; color: string }) => (
+  <>
+    {active && <span aria-hidden className="absolute left-2 right-2 top-0 h-[2px] rounded-b-full" style={{ background: color }} />}
+    {divider && <span aria-hidden className="absolute right-0 top-2 bottom-2 w-px bg-white/10" />}
+  </>
+);
 
 /// Colours of a compact terminal tab (inside a server): same as the title
 /// bar's, without the dividing line.
