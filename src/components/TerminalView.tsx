@@ -18,7 +18,7 @@ import { readUseLocalShell } from '../util/terminalShell';
 import { holdTerminalInput, writeTerminal } from '../util/terminalWrite';
 import { readUseSshAgent } from '../util/sshAgent';
 import { readSendKeepalives } from '../util/sessionKeep';
-import { IS_MOBILE, IS_LINUX } from '../util/platform';
+import { IS_MOBILE, IS_LINUX, IS_ANDROID } from '../util/platform';
 import { useConfirm } from '../ui/confirm';
 import { parseOsc1337, parseOsc7, type ShellFolder } from '../util/shellFolder';
 
@@ -1298,6 +1298,35 @@ const TerminalView = ({
     term.textarea?.addEventListener("compositionupdate", onCompositionUpdate);
     term.textarea?.addEventListener("compositionend", onCompositionEnd);
 
+    // Android (#314): a keyboard app that types a key without a composition
+    // (Gboard committing a key at once, keys that come in a fast burst) sends a
+    // keydown with keyCode 229, then the key as an input event. xterm answers
+    // that keydown by comparing its field's text before and after a zero-delay
+    // timer and sending the difference; when keys come fast, those timers run
+    // after the next keys have landed, and letters went out twice and out of
+    // order. Kept from xterm, the keydown starts no such timer, and xterm's own
+    // input handler sends each typed text as it is, once. A key that deletes
+    // comes the same way and only that timer turned it into a backspace, so it
+    // is sent here, one for each, as the timer did. Inside a composition
+    // nothing changes: the keydown still reaches xterm, and the word goes when
+    // the composition ends.
+    let imeKeyHidden = false;
+    const onAndroidKeyDown = (ev: KeyboardEvent) => {
+      imeKeyHidden = ev.keyCode === 229 && !ev.isComposing && !composingRef.current;
+      if (imeKeyHidden) ev.stopPropagation();
+    };
+    const onAndroidInput = (ev: Event) => {
+      const e = ev as InputEvent;
+      if (!imeKeyHidden || e.isComposing) return;
+      imeKeyHidden = false;
+      if (e.inputType.startsWith("delete")) inputRef.current?.("\x7f");
+      else if (e.inputType === "insertLineBreak" || e.inputType === "insertParagraph") inputRef.current?.("\r");
+    };
+    if (IS_ANDROID) {
+      term.element?.addEventListener("keydown", onAndroidKeyDown, true);
+      term.textarea?.addEventListener("input", onAndroidInput);
+    }
+
     // ---- Copy on select / paste on right-click --------------------------------
     // Selection-change fires per mouse move during a drag — that's noisy AND
     // it would clobber the clipboard mid-drag. We instead wait for the user
@@ -1339,7 +1368,10 @@ const TerminalView = ({
       // A selection that runs past the last line ends in empty rows: Ctrl+Shift+A
       // takes the whole buffer, the blank rows under the prompt included.
       const text = buildSelectedText().replace(/\n+$/, '');
-      if (!text) return;
+      // Selections of only blank padding (easy to grab when dragging across
+      // a TUI screen) must neither clobber the clipboard with invisible
+      // spaces nor toast a lie.
+      if (!text.trim()) return;
       const ok = await writeClipboard(text);
       if (ok) notify('Copied');
     };
@@ -1356,6 +1388,14 @@ const TerminalView = ({
     // when there's no real selection — so a plain click (which clears the
     // selection) still can't clobber it. The selection end is set by the last
     // mousemove, so it's final by the time we read it on mouseup.
+    //
+    // A drag that a mouse-tracking program takes (vi with mouse=a, mc, htop)
+    // can't copy stale text here: xterm clears its own selection when the
+    // program turns mouse tracking on, and again when it sends the program a
+    // mouse report. No snapshot of the selection at mousedown is kept: xterm
+    // makes a double- or triple-click's word or line in its own mousedown
+    // handler, which runs before this one, so such a snapshot would already
+    // hold the new selection and the release would copy nothing.
     let selectionArmed = false;
     const onMouseDown = (ev: MouseEvent) => {
       // Assign (not just set-true) so a non-left mousedown re-disarms a flag
@@ -1712,6 +1752,8 @@ const TerminalView = ({
       onDataDisposable.dispose();
       term.textarea?.removeEventListener("compositionupdate", onCompositionUpdate);
       term.textarea?.removeEventListener("compositionend", onCompositionEnd);
+      term.element?.removeEventListener("keydown", onAndroidKeyDown, true);
+      term.textarea?.removeEventListener("input", onAndroidInput);
       term.textarea?.removeEventListener('focus', onTextareaFocus);
       if (inputRef.current === handleData) inputRef.current = null;
       onResizeDisposable.dispose();
