@@ -105,6 +105,23 @@ describe("switching a server's kind", () => {
     expect(telnet).toMatchObject({ password: "", password_dirty: true, heldPassword: { from: "SSH", password: "pw", dirty: false }, port: 23 });
     expect(afterSetProtocol(telnet, "ssh")).toMatchObject({ password: "pw", password_dirty: false, heldPassword: undefined, port: 22 });
   });
+
+  // Plain FTP sends the password as plain text, as telnet does (#246).
+  it("holds an SSH or FTPS password over plain FTP, and keeps it for FTPS", () => {
+    const ssh = { protocol: "ssh", port: 22, authType: "custom_pass", password: "pw", password_dirty: false };
+    const plain = { ...ssh, ...protocolSwitch(ssh, "ftp"), protocol: "ftp" };
+    expect(plain).toMatchObject({ password: "", password_dirty: true, heldPassword: { from: "SSH", password: "pw", dirty: false } });
+    expect({ ...plain, ...protocolSwitch(plain, "ftps") }).toMatchObject({ password: "pw", password_dirty: false, heldPassword: undefined });
+    // FTPS checks the server's certificate first: the password stays.
+    expect(protocolSwitch(ssh, "ftps")).toEqual({ authType: "custom_pass", credentialId: undefined });
+    expect(protocolSwitch(ssh, "ftps-implicit")).toEqual({ authType: "custom_pass", credentialId: undefined });
+    const ftps = { protocol: "ftps-implicit", authType: "custom_pass", password: "tls", password_dirty: true };
+    expect(protocolSwitch(ftps, "ftp")).toMatchObject({ password: "", heldPassword: { from: "FTPS", password: "tls", dirty: true } });
+    // A saved login stays (ftp_connect signs in with it, as telnet does);
+    // an SSH key doesn't.
+    expect(protocolSwitch({ protocol: "ssh", authType: "vault", credentialId: "7" }, "ftp")).toMatchObject({ authType: "vault", credentialId: "7" });
+    expect(protocolSwitch({ protocol: "ssh", authType: "custom_key" }, "ftps")).toMatchObject({ authType: "custom_pass" });
+  });
 });
 
 describe("a new folder from the form", () => {
@@ -305,6 +322,33 @@ describe("importing sessions", () => {
     expect(sent.filter((c) => c.cmd === "import_ssh_key_file").map((c) => (JSON.parse(c.args) as { path: string }).path))
       .toEqual(["~/.ssh/id_ed25519", "~/.ssh/jump.ppk", "~/.ssh/locked"]);
     expect(seen.map((s) => s[0])).toEqual(["busy", "error", "busy", "servers", "folders", "credentials", "keys", "imported", "done"]);
+  });
+});
+
+describe("importing FileZilla's sites", () => {
+  const sites = [
+    host("files", { protocol: "ftps", port: 21, password: "s3cr3t" }),
+    host("sftp", { identity_file: "~/.ssh/id_ed25519", password: "unused" }),
+    host("open", { protocol: "ftp", port: 21 }),
+  ];
+  const rowsSent = async (withPasswords: boolean | undefined) => {
+    calls.length = 0;
+    answer = (cmd) => cmd === "import_ssh_key_file" ? { id: 3, name: "k", reused: false, encrypted: false } : cmd === "import_hosts" ? REPORT : undefined;
+    const quiet = () => {};
+    await importPicked({ picked: sites, withKeys: true, ...(withPasswords === undefined ? {} : { withPasswords }), keysByPath: new Map(), setImportBusy: quiet, setImportError: quiet, setImportDone: quiet });
+    return (JSON.parse(calls.find((c) => c.cmd === "import_hosts")!.args) as { rows: ImportRow[] }).rows;
+  };
+
+  it("sends an FTP site's kind, and its password unless told not to or beside a key", async () => {
+    for (const allowed of [undefined, true]) {
+      const rows = await rowsSent(allowed);
+      expect(rows.map((r) => [r.host.host_alias, r.host.protocol, r.host.password])).toEqual([
+        ["files", "ftps", "s3cr3t"], ["sftp", undefined, undefined], ["open", "ftp", undefined],
+      ]);
+    }
+    const without = await rowsSent(false);
+    expect(without.map((r) => [r.host.protocol, r.host.password])).toEqual([["ftps", undefined], [undefined, undefined], ["ftp", undefined]]);
+    expect(without[1].key_id).toBe(3);
   });
 });
 

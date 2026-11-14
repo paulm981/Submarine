@@ -92,6 +92,15 @@ describe("opening a saved server", () => {
     });
     expect(sessionFor({ id: 1, name: "desk", protocol: "rdp" })).toMatchObject({ protocol: "rdp", serverUuid: null, runOnConnectHeld: false });
   });
+
+  // From the session tree or a folder, an FTP server opens in its file
+  // view (DesktopApp's FtpSessionView), as from the grid: not as SSH on 21.
+  it("keeps an FTP server's kind", () => {
+    for (const protocol of ["ftp", "ftps", "ftps-implicit", "telnet", "vnc"]) {
+      expect(sessionFor({ id: 2, name: "files", host: "f.example", port: 21, protocol }).protocol).toBe(protocol);
+    }
+    expect(sessionFor({ id: 3, name: "web", protocol: null }).protocol).toBe("ssh");
+  });
 });
 
 describe("osChecksDue", () => {
@@ -135,5 +144,13 @@ describe("aiPaneViewOf", () => {
 
   it("has no session for a view that isn't a server tab", () => {
     expect(aiPaneViewOf("home", sessions, {}, {}, (s) => s.serverName)).toEqual({ view: "home", session: null });
+  });
+  // An FTP tab has no SSH session: it can't be shared with the AI (#246).
+  it("says an FTP tab isn't SSH, opened from the tree or not", () => {
+    for (const protocol of ["ftp", "ftps", "ftps-implicit"]) {
+      const tab = sessionFor({ id: 4, name: "files", host: "f.example", port: 21, protocol });
+      expect(aiPaneViewOf(tab.id, [tab], { [tab.id]: "connected" }, {}, (s) => s.serverName).session).toMatchObject({ ssh: false });
+      expect(osChecksDue([tab], { [tab.id]: "connected" }, [{ id: 4, port: 21 }], new Set())).toEqual([]);
+    }
   });
 });

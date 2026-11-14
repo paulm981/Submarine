@@ -120,6 +120,8 @@ fn merge_protocol(conn: &Connection, uuid: &str, protocol: Option<&str>) {
         Some("vnc") => 5900,
         Some("telnet") => 23,
         Some("rdp") => 3389,
+        Some("ftp" | "ftps") => 21,
+        Some("ftps-implicit") => 990,
         _ => 22,
     };
     merge_switch(conn, uuid, Some(protocol), port);
@@ -230,6 +232,38 @@ fn a_switch_to_telnet_or_vnc_by_way_of_rdp_is_held_too() {
     merge_protocol(&conn, "u2", Some("telnet"));
     allow(&conn, "u2", &[]).unwrap();
     assert_eq!((protocol_of(&conn, "u2").as_deref(), port_of(&conn, "u2")), (Some("telnet"), 23));
+}
+
+/// Plain FTP sends the password as plain text, as telnet does (#246): a
+/// synced switch to it is held, from SSH or from FTPS. FTPS checks the
+/// server's certificate before the password, so a switch to it isn't.
+#[test]
+fn a_synced_switch_to_plain_ftp_is_held_and_one_to_ftps_is_not() {
+    let conn = db();
+    merge_protocol(&conn, "u1", None);
+    merge_protocol(&conn, "u1", Some("ftp"));
+    assert_eq!((protocol_of(&conn, "u1"), port_of(&conn, "u1")), (None, 22), "still SSH on 22 here");
+    assert_eq!(held_switch(&conn, "u1"), Some(HeldSwitch { protocol: "ftp".into(), port: Some(21) }));
+    assert!(keep_ssh(&conn, "u1").unwrap());
+    assert_eq!((protocol_of(&conn, "u1"), port_of(&conn, "u1")), (None, 22));
+
+    merge_protocol(&conn, "u2", None);
+    for ftps in ["ftps", "ftps-implicit"] {
+        merge_protocol(&conn, "u2", Some(ftps));
+        assert_eq!(protocol_of(&conn, "u2").as_deref(), Some(ftps), "FTPS isn't held");
+        assert!(held_switches(&conn, "u2").is_empty());
+    }
+    // From FTPS to plain FTP is: it stays FTPS here, on its port.
+    merge_protocol(&conn, "u2", Some("ftp"));
+    assert_eq!((protocol_of(&conn, "u2").as_deref(), port_of(&conn, "u2")), (Some("ftps-implicit"), 990));
+    assert_eq!(held_switches(&conn, "u2"), vec!["protocol:ftp|21".to_string()]);
+    allow(&conn, "u2", &[]).unwrap();
+    assert_eq!((protocol_of(&conn, "u2").as_deref(), port_of(&conn, "u2")), (Some("ftp"), 21));
+
+    assert!(sends_password_weakly(Some("ftp")));
+    for not_weak in [None, Some("ssh"), Some("rdp"), Some("ftps"), Some("ftps-implicit")] {
+        assert!(!sends_password_weakly(not_weak), "{not_weak:?}");
+    }
 }
 
 #[test]

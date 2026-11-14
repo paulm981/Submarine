@@ -6,10 +6,11 @@
 // AddNodePanel had in their place.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import type { FtpProtocol, ServerProtocol } from "../../util/serverProtocol";
+import { type FtpProtocol, type ServerProtocol, isFtp } from "../../util/serverProtocol";
 
-/** An SSH or RDP password held while the server is switched to telnet or
- *  VNC (protocolSwitch), to come back if it's switched out again. */
+/** An SSH, RDP or FTPS password held while the server is switched to telnet,
+ *  VNC or plain FTP (protocolSwitch), to come back if it's switched out
+ *  again. */
 export type HeldPassword = { from: string; password: string; dirty: boolean };
 
 /** What the fork reads and writes of the form's `newNode` (DesktopApp's). */
@@ -109,19 +110,20 @@ export const protocolSwitch = (newNode: ServerFormNode, protocol: ServerProtocol
   const dropsLogin = (protocol !== "ssh" && newNode.authType === "custom_key") || (protocol === "vnc" && newNode.authType === "vault");
   const authType = dropsLogin ? "custom_pass" : newNode.authType;
   const credentialId = protocol === "vnc" ? "" : newNode.credentialId;
-  // An SSH or RDP password isn't sent over VNC (weakly protected) or
-  // telnet (not protected at all): switching into either from another kind
-  // empties the field, and the save clears the saved one too. It's held
-  // here, so switching out again before saving (to SSH or RDP) brings it
-  // back as it was.
-  const weak = (p: string | undefined) => p === "vnc" || p === "telnet";
+  // An SSH, RDP or FTPS password isn't sent over VNC (weakly protected),
+  // telnet or plain FTP (not protected at all): switching into one of them
+  // from another kind empties the field, and the save clears the saved one
+  // too. It's held here, so switching out again before saving (to SSH, RDP
+  // or FTPS) brings it back as it was. The same list holds a teammate's
+  // synced switch (approvals/held_switch.rs, sends_password_weakly).
+  const weak = (p: string | undefined) => p === "vnc" || p === "telnet" || p === "ftp";
   let password = {};
   if (!weak(newNode.protocol) && weak(protocol)) {
     password = {
       password: "",
       password_dirty: true,
       heldPassword: {
-        from: newNode.protocol === "rdp" ? "RDP" : "SSH",
+        from: newNode.protocol === "rdp" ? "RDP" : isFtp(newNode.protocol) ? "FTPS" : "SSH",
         password: newNode.password || "",
         dirty: !!newNode.password_dirty,
       },

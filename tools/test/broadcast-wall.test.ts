@@ -74,10 +74,11 @@ describe("the Broadcast menu's switch", () => {
 });
 
 describe("Broadcast to a folder", () => {
-  it("takes the servers with a terminal: SSH, or no protocol saved (SSH), not RDP, VNC or Telnet", () => {
+  it("takes the servers with a terminal: SSH, or no protocol saved (SSH), not RDP, VNC, Telnet or FTP", () => {
     const list = [
       { id: 1, protocol: "ssh" }, { id: 2, protocol: "rdp" }, { id: 3 }, { id: 4, protocol: "vnc" },
       { id: 5, protocol: "telnet" }, { id: 6, protocol: null },
+      { id: 7, protocol: "ftp" }, { id: 8, protocol: "ftps" }, { id: 9, protocol: "ftps-implicit" },
     ];
     expect(broadcastable(list).map((s) => s.id)).toEqual([1, 3, 6]);
   });

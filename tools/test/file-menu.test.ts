@@ -17,11 +17,27 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 const { folderOf, forgetFolder, isAway, lineAt, pathLike, pathToEdit, resolvePath, trackFolder, wordUnder } = await import("../../src/fork/terminal/fileMenu");
-const { waitToCd, withCdHere } = await import("../../src/fork/terminal/here");
+const { listenHere, opensTerminals, waitToCd, withCdHere } = await import("../../src/fork/terminal/here");
 const { skipIfKept } = await import("../../src/components/KeptSessions");
 
 const term = (cols = 40) => new Terminal({ cols, rows: 6, allowProposedApi: true });
 const put = (t: Terminal, s: string) => new Promise<void>((done) => t.write(s, done));
+
+describe("\"Open terminal here\" in a server's files", () => {
+  // An SSH tab listens for it; an FTP tab (#246) shows the same panes but
+  // has no terminal, so its folders don't offer one.
+  it("is offered only in a tab that opens terminals, while it's open", () => {
+    expect(opensTerminals("session-9")).toBe(false);
+    const first = listenHere("session-9");
+    const again = listenHere("session-9");
+    expect(opensTerminals("session-9")).toBe(true);
+    expect(opensTerminals("session-10")).toBe(false);
+    first();
+    expect(opensTerminals("session-9")).toBe(true);
+    again();
+    expect(opensTerminals("session-9")).toBe(false);
+  });
+});
 
 describe("the word under the pointer is the one shown", () => {
   it("counts a wide character as one character in two cells", async () => {

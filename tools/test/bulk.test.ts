@@ -5,6 +5,20 @@ import {
   localBase, overwriteFor, pullStep, pushLine, pushSteps, remoteDirArg, remoteItemArg, rowText, runFew, runTotals,
   safeFolderName, summarize, thereLine, throttle,
 } from "../../src/fork/bulk/plan";
+import { canBulk } from "../../src/fork/bulk/store";
+
+// Push and pull run commands over an SSH session: an FTP server's tab, like
+// an RDP, VNC or telnet one, isn't offered (#246).
+describe("the tabs push and pull go over", () => {
+  it("takes a connected SSH tab only", () => {
+    expect(canBulk({}, "connected")).toBe(true);
+    expect(canBulk({ protocol: "ssh" }, "connected")).toBe(true);
+    expect(canBulk({ protocol: "ssh" }, "connecting")).toBe(false);
+    for (const protocol of ["ftp", "ftps", "ftps-implicit", "rdp", "vnc", "telnet"]) {
+      expect(canBulk({ protocol }, "connected")).toBe(false);
+    }
+  });
+});
 
 describe("a server's name as a folder name", () => {
   it("keeps an ordinary name as it is", () => {

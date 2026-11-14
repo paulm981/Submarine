@@ -83,6 +83,9 @@ const SERVER_TYPES: Record<string, { label: string; title: string; tone: string 
   rdp: { label: "RDP", title: "RDP server", tone: "bg-sky-500/10 text-sky-300 border-sky-500/20" },
   telnet: { label: "TELNET", title: "Telnet server (not encrypted)", tone: "bg-amber-500/10 text-amber-300 border-amber-500/20" },
   vnc: { label: "VNC", title: "VNC server", tone: "bg-violet-500/10 text-violet-300 border-violet-500/20" },
+  ftp: { label: "FTP", title: "FTP server (not encrypted)", tone: "bg-amber-500/10 text-amber-300 border-amber-500/20" },
+  ftps: { label: "FTPS", title: "FTPS server", tone: "bg-teal-500/10 text-teal-300 border-teal-500/20" },
+  "ftps-implicit": { label: "FTPS", title: "FTPS server (TLS from the start)", tone: "bg-teal-500/10 text-teal-300 border-teal-500/20" },
 };
 
 const errText = (e: any) => (typeof e === "string" ? e : (e?.message || String(e)));
