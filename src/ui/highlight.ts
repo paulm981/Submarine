@@ -781,6 +781,10 @@ const CONTROL = /[\x00-\x08\x0a-\x1f\x7f-\x9f]/g;
 const HOLD_AFTER = 512;
 const HOLD_MAX = 4096;
 const HOLD_MS = 25;
+/** The end of a shell's prompt (`$ `, `# `, `> `, `% `): the last thing a
+ *  command prints, so nothing more is on its way. After a big batch (a long
+ *  listing, a `cat`), holding it made the prompt show HOLD_MS late (#234). */
+const PROMPT_END = /[$#>%] ?$/;
 
 /** The most time highlighting takes in any one second. Past that, in a
  *  flood (a `cat` of a big file), only the last TAIL_CHARS of each batch are
@@ -905,7 +909,7 @@ export class HighlightStream {
     // A batch that ends partway through a line: after a big one (a stream),
     // the rest is probably on its way, so that part waits for it.
     const last = parts[parts.length - 1];
-    if (last && typeof last !== "string" && text.length >= HOLD_AFTER && last.text.length < HOLD_MAX) {
+    if (last && typeof last !== "string" && text.length >= HOLD_AFTER && last.text.length < HOLD_MAX && !PROMPT_END.test(last.text)) {
       this.held = parts.pop() as Plain;
       this.timer = window.setTimeout(() => {
         this.timer = 0;

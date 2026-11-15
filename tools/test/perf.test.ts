@@ -180,6 +180,20 @@ describe("highlighting a batch of output", () => {
     expect(vi.getTimerCount()).toBe(0);
     stream.dispose();
   });
+
+  it("doesn't hold the prompt after a big burst: it shows in the same call", () => {
+    const stream = new HighlightStream(() => {});
+    stream.setMatcher(buildMatcher("standard", [])!, false);
+    const big = `${"line of output\r\n".repeat(200)}`;
+    for (const prompt of ["user@web1:~$ ", "[root@db ~]# ", "PS C:\\> ", "host% "]) {
+      expect(stream.push(new TextEncoder().encode(big + prompt))).toContain(prompt);
+      expect(vi.getTimerCount(), prompt).toBe(0);
+    }
+    // A line cut off mid-word in a stream still waits for the rest of it.
+    stream.push(new TextEncoder().encode(`${big}build ok`));
+    expect(vi.getTimerCount()).toBe(1);
+    stream.dispose();
+  });
 });
 
 describe("highlighting against the clock", () => {
