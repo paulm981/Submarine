@@ -764,6 +764,9 @@ where
     F: FnMut(&mut Vec<u8>),
 {
     use russh::ChannelMsg;
+    // fork: a short echo goes at once (term_output::flush_wait, #234).
+    let echo = crate::term_output::EchoClock::default();
+    let mut flush = echo.watch(&mut flush);
 
     let (mut read_half, write_half) = channel.split();
     // The terminal's size, for the output filter below.
@@ -855,7 +858,7 @@ where
                         let next = if flow.send(&mut out_buf, &page, &mut flush) { park() } else { flow.wait_until() };
                         flush_timer.as_mut().reset(next);
                     } else if was_empty {
-                        flush_timer.as_mut().reset(tokio::time::Instant::now() + FLUSH_WINDOW);
+                        flush_timer.as_mut().reset(echo.deadline(FLUSH_WINDOW, out_buf.len()));
                     }
                 }
                 // Flush whatever's buffered before the terminal goes away so
