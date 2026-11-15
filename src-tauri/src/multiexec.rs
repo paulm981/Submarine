@@ -37,7 +37,10 @@ struct LimitFile {
     limit: i64,
 }
 
-fn login_limit(app: &tauri::AppHandle) -> i64 {
+/// "Logins per jump host": with sharing off, how many log in to a jump host
+/// at once; with sharing on, also how many logins one key keeps open
+/// (jump_pool.rs). 0 means no limit.
+pub(crate) fn login_limit(app: &tauri::AppHandle) -> i64 {
     let cached = LOGIN_LIMIT.load(Ordering::Relaxed);
     if cached >= 0 {
         return cached;

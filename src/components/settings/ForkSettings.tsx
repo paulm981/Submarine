@@ -6,7 +6,7 @@ import type { SettingsTab } from "./categories";
 import { AiToolsSection } from "./AiToolsSettings";
 import { LiveEditSection } from "./GeneralSettings";
 import { LicensesSection, TroubleshootingSection, UpdatesSection } from "./HelpSettings";
-import { ServersSection, SessionsSection } from "./ServersSettings";
+import { JumpHostsSection, ServersSection, SessionsSection } from "./ServersSettings";
 import { SubmarineCloudSection } from "./SyncSettings";
 import { HomeTerminalSection } from "./TerminalSettings";
 
@@ -21,6 +21,7 @@ export function ForkSettings({ tab, settings, setSettings }: { tab: SettingsTab;
       return (
         <>
           <ServersSection settings={settings} setSettings={setSettings} />
+          <JumpHostsSection />
           <SessionsSection />
         </>
       );

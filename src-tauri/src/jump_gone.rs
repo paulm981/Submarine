@@ -36,6 +36,8 @@ fn ensure(conn: &Connection) -> Result<(), String> {
 /// it is noted, with its name. (A deletion from another device is noted by
 /// `note_lost`.)
 pub(crate) fn note_behind(conn: &Connection, jump_id: i64) -> Result<(), String> {
+    // Its logins that tabs share take no more tabs (jump_pool.rs).
+    crate::jump_pool::forget_saved(jump_id);
     ensure(conn)?;
     conn.execute(
         "INSERT OR REPLACE INTO jump_hosts_gone(server_id, jump_name)
@@ -79,6 +81,13 @@ pub(crate) fn links_before(conn: &Connection) -> Vec<(i64, i64, String)> {
 pub(crate) fn note_lost(conn: &Connection, before: &[(i64, i64, String)]) -> Result<(), String> {
     if before.is_empty() {
         return Ok(());
+    }
+    // The jump hosts the merge deleted: their logins that tabs share take no
+    // more tabs (jump_pool.rs).
+    for (_, jump, _) in before {
+        if !conn.query_row("SELECT EXISTS(SELECT 1 FROM servers WHERE id = ?1)", params![jump], |r| r.get::<_, bool>(0)).unwrap_or(true) {
+            crate::jump_pool::forget_saved(*jump);
+        }
     }
     ensure(conn)?;
     let mut stmt = conn
