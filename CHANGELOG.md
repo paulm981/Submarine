@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.5.0-fork.6
+
+- **An SSH terminal shows what you type sooner.** A key's echo goes to the screen at once instead of waiting about 8 ms for more output, as in Home's shells since #234. Long output and floods are still grouped as before. ([#265](https://github.com/paulm981/Submarine/issues/265))
+
 ## v0.5.0-fork.5
 
 - **Remote Desktop uses your keyboard layout.** The built-in RDP client tells the server this computer's default layout (the first in Windows' language list), so keys type what they say on a non-US keyboard. (Their [#344](https://github.com/SinaXhpm/submarine/pull/344); [#263](https://github.com/paulm981/Submarine/issues/263))
