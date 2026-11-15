@@ -176,7 +176,7 @@ export const AiTrustModal = () => {
     return () => window.removeEventListener("keydown", onKey);
   }, [target]);
   if (!target) return null;
-  const title = target.scope === "default" ? "AI approval for every server" : `AI approval: ${target.name}`;
+  const title = target.scope === "default" ? "Claude Code & Codex approval for every server" : `Claude Code & Codex approval: ${target.name}`;
   return (
     <div className="fixed inset-0 z-[10000] bg-black/60 backdrop-blur-sm flex items-center justify-center p-3" onClick={closeAiTrust}>
       <div role="dialog" aria-modal="true" aria-label={title} className="w-full max-w-lg max-h-[85vh] flex flex-col bg-[#121214] border border-white/10 rounded-xl shadow-2xl" onClick={(e) => e.stopPropagation()}>
