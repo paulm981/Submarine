@@ -590,23 +590,11 @@ mod pty {
     /// the cap, so a firehose doesn't flood the page with events.
     const FLUSH_CAP: usize = 256 * 1024;
     const FLUSH_WINDOW: Duration = Duration::from_millis(8);
-    /// A typed key's echo, or a prompt: output this small, after the shell
-    /// said nothing for a flush window, goes to the page at once.
-    /// Waiting the window for more made every key's echo 8 ms late. More
-    /// than this is the start of a longer answer or a screen being redrawn,
-    /// which still waits for the rest, so it's drawn in one piece.
-    const AT_ONCE_MAX: usize = 1024;
-
     /// How long a batch that starts now with `first` bytes waits for more,
-    /// when the batch before it went out `since_last` ago (None: there was
-    /// none). Never two batches within a flush window, so a firehose still
-    /// sends the page no more than one each window.
+    /// when the batch before it went out `since_last` ago: the rule an SSH
+    /// terminal's pump follows too (term_output::flush_wait, #234).
     pub(super) fn flush_wait(since_last: Option<Duration>, first: usize) -> Duration {
-        match since_last {
-            Some(since) if since < FLUSH_WINDOW => FLUSH_WINDOW - since,
-            _ if first <= AT_ONCE_MAX => Duration::ZERO,
-            _ => FLUSH_WINDOW,
-        }
+        crate::term_output::flush_wait(FLUSH_WINDOW, since_last, first)
     }
 
     /// Open a terminal for the page: output to `on_output`, paced by what

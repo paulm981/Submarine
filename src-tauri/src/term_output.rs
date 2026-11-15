@@ -76,8 +76,96 @@ pub async fn pace(
     after();
 }
 
+/// A typed key's echo, or a prompt: output this small, after nothing went
+/// to the page for a flush window, goes at once (#234). Waiting the window
+/// for more made every key's echo 8 ms late. More than this is the start of
+/// a longer answer or a screen being redrawn, which still waits for the
+/// rest, so it's drawn in one piece.
+pub(crate) const AT_ONCE_MAX: usize = 1024;
+
+/// How long a batch that starts now with `first` bytes waits for more, when
+/// the batch before it went out `since_last` ago (None: there was none).
+/// Never two batches within the pump's flush `window`, so a firehose still
+/// sends the page no more than one each window.
+pub(crate) fn flush_wait(window: std::time::Duration, since_last: Option<std::time::Duration>, first: usize) -> std::time::Duration {
+    match since_last {
+        Some(since) if since < window => window - since,
+        _ if first <= AT_ONCE_MAX => std::time::Duration::ZERO,
+        _ => window,
+    }
+}
+
+/// When a pump last handed the page a batch, for `flush_wait`: an SSH
+/// terminal's echo goes at once too (ssh_manager::pty_pump).
+#[derive(Default)]
+pub(crate) struct EchoClock {
+    // Held only to read or set it, never across an await: the pump's future
+    // moves between threads, which a Cell couldn't.
+    last: std::sync::Mutex<Option<tokio::time::Instant>>,
+}
+
+impl EchoClock {
+    /// `flush`, noting when each batch goes.
+    pub(crate) fn watch<'a>(&'a self, mut flush: impl FnMut(&mut Vec<u8>) + 'a) -> impl FnMut(&mut Vec<u8>) + 'a {
+        move |buf: &mut Vec<u8>| {
+            if !buf.is_empty() {
+                *self.last.lock().unwrap_or_else(|p| p.into_inner()) = Some(tokio::time::Instant::now());
+            }
+            flush(buf)
+        }
+    }
+
+    /// When a batch that starts now with `first` bytes goes, with the
+    /// pump's flush `window`.
+    pub(crate) fn deadline(&self, window: std::time::Duration, first: usize) -> tokio::time::Instant {
+        let now = tokio::time::Instant::now();
+        let last = *self.last.lock().unwrap_or_else(|p| p.into_inner());
+        now + flush_wait(window, last.map(|at| now.saturating_duration_since(at)), first)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// An SSH terminal's echo goes at once too (#234): counted on a paused
+    /// clock, so it can't fail on a busy machine.
+    #[tokio::test(start_paused = true)]
+    async fn an_ssh_echo_goes_at_once_and_a_flood_still_waits_the_window() {
+        use std::time::Duration;
+        let window = Duration::from_millis(8);
+        let echo = super::EchoClock::default();
+        let now = tokio::time::Instant::now();
+        // Nothing went yet: a key's echo goes now; the start of a screenful waits.
+        assert_eq!(echo.deadline(window, 1), now);
+        assert_eq!(echo.deadline(window, 16 * 1024), now + window);
+        // A batch goes: for a window, the next one waits out the rest of it.
+        let mut sent = Vec::new();
+        let mut flush = echo.watch(|b: &mut Vec<u8>| sent.push(std::mem::take(b)));
+        flush(&mut b"x".to_vec());
+        flush(&mut Vec::new()); // nothing to send isn't a batch
+        drop(flush);
+        assert_eq!(sent.len(), 2);
+        tokio::time::advance(Duration::from_millis(3)).await;
+        assert_eq!(echo.deadline(window, 1), tokio::time::Instant::now() + Duration::from_millis(5));
+        // Quiet for a window: small output goes at once again.
+        tokio::time::advance(window).await;
+        assert_eq!(echo.deadline(window, 1024), tokio::time::Instant::now());
+    }
+
+    /// The SSH pump's one-line hooks (ssh_manager::pty_pump): a sync that
+    /// drops one fails here.
+    #[test]
+    fn the_hooks_are_in_place() {
+        crate::fork_hooks::assert_hooks(
+            "ssh_manager.rs",
+            include_str!("ssh_manager.rs"),
+            &[
+                ("pty_pump", "let echo = crate::term_output::EchoClock::default();", 1),
+                ("pty_pump", "let mut flush = echo.watch(&mut flush);", 1),
+                ("pty_pump", "flush_timer.as_mut().reset(echo.deadline(FLUSH_WINDOW, out_buf.len()));", 1),
+            ],
+        );
+    }
+
     use super::*;
     use std::sync::{Arc, Mutex};
 
