@@ -211,20 +211,28 @@ async fn an_idle_tab_echoes_at_speed_while_its_neighbour_floods_on_a_fair_link()
     fair_link_flood(Duration::from_millis(20)).await;
 }
 
-/// The same at 40 ms there and back. The echo stays within its 45 ms, but
-/// the flood gets half of 512 KiB a round trip, not 80% of it: russh tops a
-/// channel's window up only once half of it is used, so a flood has 256 KiB
-/// on its way for most of each round trip (6.25 MB/s here, where the design
-/// counted on 10). Kept to the design's bar, so it fails until a russh that
-/// tops the window up sooner is used: a larger shared window that passes it
-/// (1 MiB) breaks the echo bar at 20 ms (`measure_shared_windows`, #237).
+/// The same at 40 ms there and back. The echo stays within its 45 ms; the
+/// flood gets about half of 512 KiB a round trip (6.25 MB/s here), since
+/// russh tops a channel's window up only once half of it is used. That is
+/// the cost the owner accepted for sharing, which is off by default (#237);
+/// a larger window that would lift it breaks the echo bar
+/// (`measure_shared_windows`). Held at that, so it can't get worse unseen.
 #[tokio::test(start_paused = true)]
-#[ignore = "fails: a flood on a shared login gets half of 512 KiB per round trip at 40 ms (#237)"]
 async fn an_idle_tab_echoes_at_speed_while_its_neighbour_floods_on_a_fair_link_at_40_ms() {
-    fair_link_flood(Duration::from_millis(40)).await;
+    fair_link_flood_with(Duration::from_millis(40), ACCEPTED_AT_40_MS).await;
 }
 
+/// The share of `flood_bound` a flood through a shared login keeps: the
+/// design's bar, and what the owner accepted where russh's window top-up
+/// holds it to about half (#237).
+const DESIGN_BAR: f64 = 0.8;
+const ACCEPTED_AT_40_MS: f64 = 0.45;
+
 async fn fair_link_flood(rtt: Duration) {
+    fair_link_flood_with(rtt, DESIGN_BAR).await;
+}
+
+async fn fair_link_flood_with(rtt: Duration, share: f64) {
     let spec = LinkSpec::new(100, rtt, 1 << 20, Queuing::Fair);
     let (own, own_speed) = flood_beside_echo(spec, None).await;
     let (shared, speed) = flood_beside_echo(spec, Some(crate::jump_pool::WINDOW)).await;
@@ -235,7 +243,7 @@ async fn fair_link_flood(rtt: Duration) {
     let allowed = f64::from(crate::jump_pool::WINDOW + crate::jump_pool::MAX_PACKET) / spec.rate as f64 * 1000.0;
     assert!(shared.1 <= own.1 + allowed, "p99: shared {:.1} ms, own logins {:.1} ms + {allowed:.1} ms", shared.1, own.1);
     let bound = flood_bound(&spec);
-    assert!(speed >= 0.8 * bound, "the flood ran at {:.2} MB/s, under 80% of {:.2} MB/s", speed / 1e6, bound / 1e6);
+    assert!(speed >= share * bound, "the flood ran at {:.2} MB/s, under {:.0}% of {:.2} MB/s", speed / 1e6, share * 100.0, bound / 1e6);
 }
 
 /// A tab whose session stops reading (the app holds its channel and reads
