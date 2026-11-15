@@ -9,6 +9,11 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.5.0-fork.8
+
+- **The prompt shows at once after a long listing.** With highlighting on, the prompt after a big burst of output (a long `ls`, a `cat`) no longer waits a moment before it appears. ([#268](https://github.com/paulm981/Submarine/issues/268))
+- **"AI approval…" is now "Claude Code & Codex approval…"** in the session tree's menu, so it isn't mistaken for the server card's "AI permission level…", which is for the original project's AI and agents such as AGY. ([#269](https://github.com/paulm981/Submarine/issues/269))
+
 ## v0.5.0-fork.7
 
 - **The AI tools never see hidden characters in server output.** What Claude Code or Codex gets from a server no longer holds invisible Unicode "tag" characters, a known way to hide instructions for a model, or terminal escape codes, and a password an escape code splits is still hidden from it. What you see doesn't change. ([#267](https://github.com/paulm981/Submarine/issues/267))
