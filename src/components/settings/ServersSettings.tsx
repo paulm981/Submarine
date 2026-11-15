@@ -1,14 +1,18 @@
-// Settings › Servers & sessions: how servers show and close, the jump host
-// queue and shared jump host logins, and sessions kept between connections.
+// Settings › Servers & sessions: how servers show and close, jump hosts (how
+// many logins, and whether tabs share them), and sessions kept between
+// connections.
 import { useEffect, useState } from "react";
-import { History, Server } from "lucide-react";
+import { History, Network, Server } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { KeepSessionSetting } from "../KeptSessions";
 import { CARD, LearnMore, SettingsSection, SwitchRow } from "./parts";
 
-// How many sessions log in to the same jump host at once (multiexec.rs):
-// opening a folder of servers behind one queues the rest. Kept by the
-// backend, which does the queueing.
+// The "Jump hosts" card: one number and one switch. The number is
+// "Logins per jump host" (multiexec.rs, jump_login_limit.json): with sharing
+// off, how many tabs log in to a jump host at once; with sharing on, also how
+// many logins one jump host keeps open for the tabs that share them
+// (jump_pool.rs, #237). The switch is jump_share.json, off unless turned on.
+// Both are kept by the backend, which does the queueing and the sharing.
 function JumpLoginLimit() {
   const [limit, setLimit] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
@@ -30,16 +34,26 @@ function JumpLoginLimit() {
   return (
     <div className="flex items-start justify-between gap-4">
       <div className="min-w-0">
-        <div className="text-sm font-semibold text-zinc-100">Logins at a time per jump host</div>
+        <div className="text-sm font-semibold text-zinc-100">Logins per jump host</div>
         <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
-          How many servers behind one jump host log in at once; the rest wait their turn. 0 means no limit.
+          How many logins to one jump host there can be at a time. 0 means no limit.
         </p>
         <LearnMore>
-          When many servers behind one jump host open at once (a whole folder opened, say), this many log in to it
-          together and the rest wait their turn — a jump host turns away logins past its own limit (OpenSSH starts
-          at 10). Each jump host in a ProxyJump chain from ~/.ssh/config has its own line too: shared with a saved
-          jump host at the same address, or, behind another jump host, its own for that way there. Servers reached
-          directly aren't held back.
+          <p>
+            With sharing off, each tab logs in to the jump host itself, and this many log in at once: when you open a
+            whole folder, the rest wait their turn. A jump host turns away logins past its own limit (OpenSSH starts at
+            10).
+          </p>
+          <p className="mt-2">
+            With sharing on, it's also how many logins to one jump host stay open for the tabs that share them. There's
+            one at first. Another is made only when every login already has two tabs, and a new tab goes on the login
+            with the fewest. With 0, there's a login for every two tabs.
+          </p>
+          <p className="mt-2">
+            Each jump host in a ProxyJump chain from ~/.ssh/config counts on its own: as the same machine as a saved
+            jump host at the same address, or, behind another jump host, on its own for that way there. Servers reached
+            directly aren't held back.
+          </p>
         </LearnMore>
         {error && <p className="text-[11px] text-red-400 mt-1">{error}</p>}
       </div>
@@ -47,7 +61,7 @@ function JumpLoginLimit() {
         type="number"
         min={0}
         max={256}
-        aria-label="Logins at a time per jump host"
+        aria-label="Logins per jump host"
         value={draft}
         disabled={limit === null}
         onChange={(e) => setDraft(e.target.value)}
@@ -59,8 +73,6 @@ function JumpLoginLimit() {
   );
 }
 
-// SSH tabs behind the same jump host share one login to it (jump_pool.rs,
-// #237). Kept by the backend, which does the sharing.
 function JumpSharing() {
   const [on, setOn] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -75,25 +87,26 @@ function JumpSharing() {
   };
   return (
     <SwitchRow
-      title="One login per jump host"
-      line="SSH tabs behind the same jump host share one login to it: one password or code for them all, not one per tab."
+      title="Share logins between tabs"
+      line="SSH tabs behind the same jump host log in to it once and share that login, up to the number above."
       more={
         <>
           <p>
-            Up to 16 tabs share a login. The 17th makes a second one, once the first is ready, and uses the
-            password you typed for the first; a one-time code is asked for again. A login stays open for 30
-            seconds after its last tab closes, so a reconnect doesn't log in again.
+            A one-time code or a push approval is asked once for each login, not once for each tab. Opening a big
+            folder can still ask up to the number above times, once as each new login is made. A password you typed
+            is used again for those; a code isn't.
           </p>
           <p className="mt-2">
-            Tabs only share when they log in as the same user, with the same password or key, the same way to the
-            jump host. A tab's own SFTP and port forwarding connections, a terminal's own login, Remote Desktop, VNC,
-            telnet and FTP through a jump host, and Monitoring, keep logins of their own. A jump host that records
-            sessions sees one login for all the tabs on it.
+            Big output, such as a large file printed to the screen, can be slower through a shared login than through
+            a tab's own, and a tab flooding output can slow typing in the other tabs on the same login a little.
           </p>
           <p className="mt-2">
-            Off, each tab logs in to the jump host itself, as before. Tabs already sharing a login keep it until they
-            reconnect.
+            Tabs only share when they log in as the same user, with the same password or key, the same way to the jump
+            host. A tab's own SFTP and port forwarding connections, a terminal's own login, Remote Desktop, VNC, telnet,
+            FTP and Monitoring keep logins of their own. A login stays open 30 seconds after its last tab closes. A jump
+            host that records sessions sees one login for all the tabs on it.
           </p>
+          <p className="mt-2">Off, each tab logs in itself. Tabs already sharing a login keep it until they reconnect.</p>
         </>
       }
       on={on === true}
@@ -136,6 +149,15 @@ export function ServersSection({ settings, setSettings }: any) {
           on={settings.pingSound !== false}
           onToggle={() => setSettings((s: any) => ({ ...s, pingSound: !(s.pingSound !== false) }))}
         />
+      </div>
+    </SettingsSection>
+  );
+}
+
+export function JumpHostsSection() {
+  return (
+    <SettingsSection icon={Network} title="Jump hosts">
+      <div className={CARD}>
         <JumpLoginLimit />
         <JumpSharing />
       </div>
