@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.5.0-fork.5
+
+- **Remote Desktop uses your keyboard layout.** The built-in RDP client tells the server this computer's default layout (the first in Windows' language list), so keys type what they say on a non-US keyboard. (Their [#344](https://github.com/SinaXhpm/submarine/pull/344); [#263](https://github.com/paulm981/Submarine/issues/263))
+
 ## v0.5.0-fork.4
 
 - **Buttons and small headings in sentence case.** "Add server", not "ADD SERVER", across the original project's screens, in a slightly larger, semibold type. Protocol badges, status chips and key caps keep their capitals. The fork's own screens follow in a later release. (Their [#341](https://github.com/SinaXhpm/submarine/pull/341); [#256](https://github.com/paulm981/Submarine/issues/256))
