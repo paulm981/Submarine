@@ -109,6 +109,8 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
       "forkTerm.register", "forkTerm.unmount", "forkTerm.dispose", "forkTerm.undock",
     ],
   },
+  // Report this reply goes to the fork's GitHub, with the fork's words.
+  { file: "src/components/ai/ChatPanel.tsx", imports: ["../../fork/feedback"], uses: ["...REPORT_REPLY_CONFIRM"] },
   { file: "src/main.tsx", imports: ["./util/diagnostics", "./util/nativeMenus", "./util/plainTyping"] },
   { file: "src/ui/confirm.tsx", imports: ["../util/fileName"] },
 ];
