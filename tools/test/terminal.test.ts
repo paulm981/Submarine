@@ -12,6 +12,7 @@ import { clearWidths, MAX_WIDTHS, sharedMeasure, widthKey } from "../../src/fork
 import { CUSTOM_SCHEME, DEFAULT_SCHEME, schemeById } from "../../src/ui/terminalThemes";
 import { CUSTOM_THEME_ID, readScheme } from "../../src/util/terminalTheme";
 import { CLOSE_TAB_ASKING, closeTabAsking } from "../../src/fork/session/split";
+import { appHotkey } from "../../src/ui/terminalDock";
 
 describe("hasVisibleText", () => {
   it("ignores control codes: colours, a title change, cursor moves", () => {
@@ -223,5 +224,34 @@ describe("Ctrl+Shift+W on a tab's last terminal (#275)", () => {
 
   it("says no one took it when no main window listens, so the tab closes the original project's way", () => {
     withWindow(() => { expect(closeTabAsking("s1")).toBe(false); });
+  });
+});
+
+describe("Ctrl+Shift+K clears, Ctrl+Shift+J jumps to a tab (#275)", () => {
+  const key = (code: string, mods: { ctrl?: boolean; shift?: boolean; meta?: boolean; alt?: boolean } = {}) => ({
+    code, ctrlKey: !!mods.ctrl, shiftKey: !!mods.shift, metaKey: !!mods.meta, altKey: !!mods.alt,
+  }) as KeyboardEvent;
+  // The files' text, read by Vite (as fork-hooks.test.ts does).
+  const sources = import.meta.glob<string>(["/src/components/TerminalView.tsx", "/src/fork/desktop/hooks.ts"], { query: "?raw", import: "default", eager: true });
+  const source = (path: string): string => sources[path] ?? "";
+
+  it("takes Ctrl+Shift+J for the jump, and leaves Ctrl+Shift+K to the terminal", () => {
+    expect(appHotkey(key("KeyJ", { ctrl: true, shift: true }))).toBe("jump");
+    expect(appHotkey(key("KeyK", { ctrl: true, shift: true }))).toBeNull();
+    // Only with Ctrl and Shift, and nothing else.
+    expect(appHotkey(key("KeyJ", { ctrl: true }))).toBeNull();
+    expect(appHotkey(key("KeyJ", { ctrl: true, shift: true, alt: true }))).toBeNull();
+    expect(appHotkey(key("KeyJ", { meta: true, shift: true }))).toBeNull();
+  });
+
+  it("has one handler for each: the terminal's clear on K, the fork's jump on J", () => {
+    const terminal = source("/src/components/TerminalView.tsx");
+    const tabKeys = source("/src/fork/desktop/hooks.ts");
+    // The original project's Ctrl+Shift listener clears on K, and does nothing on J.
+    expect(terminal).toMatch(/e\.keyCode === 75\) \{\s*e\.preventDefault\(\);\s*if \(!e\.repeat\) clearTerminal\(terminalId\);/);
+    expect(terminal).not.toMatch(/keyCode === 74|"KeyJ"|'KeyJ'/);
+    // The jump goes only by appHotkey: no key of its own here.
+    expect(tabKeys).toContain("const k = appHotkey(e);");
+    expect(tabKeys).not.toMatch(/KeyK|KeyJ|keyCode === 7[45]/);
   });
 });

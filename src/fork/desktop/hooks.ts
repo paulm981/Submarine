@@ -242,8 +242,9 @@ export const useCloseSessions = <S extends { id: string }, T extends { confirmCl
   return { askCloseSession, closeSessions, closeTabs };
 };
 
-/** The keys for moving between tabs: Ctrl+Shift+K opens All tabs ▾ to jump
- *  by name (its search is focused); Ctrl+Tab / Ctrl+Shift+Tab step through
+/** The keys for moving between tabs: Ctrl+Shift+J opens All tabs ▾ to jump
+ *  by name (its search is focused; Ctrl+Shift+K is the original project's
+ *  Clear terminal, #294); Ctrl+Tab / Ctrl+Shift+Tab step through
  *  the title bar left to right: Home, Broadcast's tab while it's on, then the server tabs (stepTab).
  *  preventDefault keeps the webview from doing anything of its own with
  *  Ctrl+Tab. Inside a remote desktop (`data-remote-keys`, the original
