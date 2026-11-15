@@ -2419,7 +2419,10 @@ impl AiState {
                 let output_bytes = output.len();
                 let filtered = tokio::task::spawn_blocking(move || {
                     let text = Zeroizing::new(String::from_utf8_lossy(&output).into_owned());
-                    let f = filter::filter(&text);
+                    // The AI's copy is cleaned first (boundary::for_model), so a
+                    // secret split by an escape sequence is whole when the
+                    // filter looks at it.
+                    let f = filter::filter(&boundary::for_model(&output));
                     let filtered = Zeroizing::new(f.text);
                     let ai = Zeroizing::new(shorten_for_ai(&filtered));
                     (text, f.hidden, ai)
