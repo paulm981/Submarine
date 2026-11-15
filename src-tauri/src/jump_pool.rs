@@ -36,7 +36,7 @@
 //!   `WINDOW` at the link's speed (42 ms at 100 Mbit/s), and a FIFO link by
 //!   less than separate logins would (ssh_manager/fork_tests/jump_share.rs).
 //!
-//! Settings › Servers & sessions turns it off (`jump_share.json`). The pool
+//! Off until Settings › Servers & sessions turns it on (`jump_share.json`). The pool
 //! is emptied when the profile closes (`clear`, from
 //! `SshState::forget_fork_sessions`), and a deleted jump host's logins take no
 //! more tabs (`forget_saved`, from jump_gone.rs).
@@ -548,8 +548,11 @@ async fn wait_for(mut rx: watch::Receiver<Option<Outcome>>) -> Outcome {
 // ── The setting ───────────────────────────────────────────────────────────
 
 const SETTING_FILE: &str = "jump_share.json";
-/// Until Settings says otherwise: on.
-pub(crate) const DEFAULT_ON: bool = true;
+/// Until Settings says otherwise: off. A shared login carries a big dump
+/// (a `cat` of a large file) at about half the speed of a tab's own login on
+/// a ~40 ms link (russh tops a channel's window up only once half is used),
+/// so the owner turns it on where faster folder opens are worth that (#237).
+pub(crate) const DEFAULT_ON: bool = false;
 
 /// 0 = not read yet, 1 = off, 2 = on.
 static SHARING: AtomicU8 = AtomicU8::new(0);
