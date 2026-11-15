@@ -85,6 +85,9 @@ async fn one_host_key_question_at_a_time() {
 
 // ── Speed ─────────────────────────────────────────────────────────────
 
+// A jump host login that SSH terminal tabs share (#237), through the pump.
+mod jump_share;
+
 /// How long a typed key's echo takes from `write_terminal_data`'s queue to
 /// the batch handed to the page, over a real (in-process) SSH connection to
 /// a server that echoes. A measure, not a check: it prints, and is run by

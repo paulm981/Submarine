@@ -48,6 +48,11 @@ use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::watch;
 
+#[cfg(test)]
+pub(crate) mod shaped_link;
+#[cfg(test)]
+mod tests;
+
 /// The most tabs (and hops chained behind) on one login.
 pub(crate) const CAP: usize = 16;
 /// How long a login no tab uses any more stays open.
@@ -510,6 +515,21 @@ impl<H: Handler + 'static> Pool<H> {
             gone.and_then(|(key, id)| take_entry(&mut inner, &key, id))
         };
         drop(gone);
+    }
+
+    /// Logins in the pool and the leases on each, by key (tests).
+    #[cfg(test)]
+    pub(crate) fn census(&self, key: &Key) -> Vec<usize> {
+        let inner = self.lock();
+        let mut key = key.clone();
+        key.epoch = inner.epoch;
+        inner.entries.get(&key).map(|l| l.iter().map(|e| e.leases).collect()).unwrap_or_default()
+    }
+
+    /// Logins in the pool, all keys (tests).
+    #[cfg(test)]
+    pub(crate) fn logins(&self) -> usize {
+        self.lock().entries.values().map(Vec::len).sum()
     }
 }
 

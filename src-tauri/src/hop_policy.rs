@@ -103,6 +103,12 @@ impl RouteQueues {
         RouteQueues { last: Default::default(), share }
     }
 
+    /// Whether this route's hops may share logins (tests).
+    #[cfg(test)]
+    pub(crate) fn shares(&self) -> bool {
+        self.share.is_some()
+    }
+
     /// The queue of the next hop, `host:port`. One dialled from here is known
     /// by its address. One reached through the hop before it is known by that
     /// hop's queue and its address: `10.0.0.5` behind one gateway isn't the
@@ -670,6 +676,8 @@ mod tests {
             include_str!("jump_gone.rs"),
             &[("note_behind", "crate::jump_pool::forget_saved(", 1), ("note_lost", "crate::jump_pool::forget_saved(", 1)],
         );
+        // The speed tests of a shared login run with the fork's tests there.
+        assert_hooks("ssh_manager/fork_tests.rs", include_str!("ssh_manager/fork_tests.rs"), &[("", "mod jump_share;", 1)]);
         assert_hooks("monitor.rs", include_str!("monitor.rs"), &[("run_poller", "hop_policy::queue_key(", 1)]);
         // Moved out of lib.rs into a fork file of its own (#136).
         assert_hooks("connect_diag.rs", include_str!("connect_diag.rs"), &[("first_hop_route", "hop_policy::first_hop_in_config(", 1)]);
