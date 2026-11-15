@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.5.0-fork.9
+
+- **SSH tabs behind the same jump host can share their logins to it.** Turn on **Share logins between tabs** in Settings › Servers & sessions › Jump hosts, and a folder of servers behind a jump host logs in to it a few times instead of once per tab: one login at first, another for every two tabs, up to **Logins per jump host** (8 unless you change it), so a one-time code is asked once per login. It's off unless you turn it on: a big dump (a `cat` of a large file) through a shared login scrolls about half as fast on a ~40 ms link, and a jump host that records sessions sees the tabs on one login as one. **Logins per jump host** was **Logins at a time per jump host**, and keeps its number. ([#237](https://github.com/paulm981/Submarine/issues/237))
+
 ## v0.5.0-fork.8
 
 - **The prompt shows at once after a long listing.** With highlighting on, the prompt after a big burst of output (a long `ls`, a `cat`) no longer waits a moment before it appears. ([#268](https://github.com/paulm981/Submarine/issues/268))
