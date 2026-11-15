@@ -123,7 +123,7 @@ export const SessionTree = ({
 }) => {
   const confirm = useConfirm();
   const prompt = useTextPrompt();
-  // "AI approval…" in the menus, while AI tools are on (#115).
+  // "Claude Code & Codex approval…" in the menus, while AI tools are on (#115).
   const aiOn = useAi().enabled;
   const [search, setSearch] = useState("");
   const [openOnly, setOpenOnly] = useState(readOpenOnly);
@@ -887,7 +887,7 @@ export const SessionTree = ({
                 </button>
                 {aiOn && !many && (
                   <button className={menuItem} onClick={run(() => openAiTrust({ scope: "folder", id: f.id, name: f.name }))}>
-                    <Bot size={13} className={menuIcon} /> AI approval for this folder…
+                    <Bot size={13} className={menuIcon} /> Claude Code & Codex approval for this folder…
                   </button>
                 )}
                 {menuSep}
@@ -964,7 +964,7 @@ export const SessionTree = ({
                 )}
                 {aiOn && !many && (r.server.protocol ?? "ssh") === "ssh" && (
                   <button className={menuItem} onClick={run(() => openAiTrust({ scope: "server", id: r.server.id, name: r.server.name }))}>
-                    <Bot size={13} className={menuIcon} /> AI approval…
+                    <Bot size={13} className={menuIcon} /> Claude Code & Codex approval…
                   </button>
                 )}
                 {/* Its kept sessions (#126), listed over one of its open tabs. */}

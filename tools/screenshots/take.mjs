@@ -111,8 +111,8 @@ const shots = {
   async "ai-levels"() {
     const page = await open({ "submarine-session-tree-open": "1" }, { width: 1400, height: 1200 });
     await treeServer(page, "web1").click({ button: "right" });
-    await page.getByRole("button", { name: "AI approval…" }).click();
-    const dialog = page.getByRole("dialog", { name: "AI approval: web1" });
+    await page.getByRole("button", { name: "Claude Code & Codex approval…" }).click();
+    const dialog = page.getByRole("dialog", { name: "Claude Code & Codex approval: web1" });
     await save(page, "ai-levels", await around(dialog, 24));
   },
 
