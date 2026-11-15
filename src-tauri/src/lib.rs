@@ -56,7 +56,7 @@ mod ai;
 mod gateway;
 // The fork's own modules, each in a file of its own (#136, #163).
 mod local_open; mod host_import; mod rdp_links; mod highlight; mod server_os; mod local_term; mod tree_moves; mod multiexec; mod store_sync;
-mod remote_sh; mod applog; mod term_output; mod diagnose; mod jump_gone; mod ping; mod hop_policy; mod ai_tabs; mod trust_policy; mod secret_policy;
+mod remote_sh; mod applog; mod term_output; mod diagnose; mod jump_gone; mod ping; mod hop_policy; mod ai_tabs; mod trust_policy; mod secret_policy; mod jump_pool;
 // Root over SSH (sudo / dzdo): root_ssh.rs. Its macro (`root_tool_find!`) is
 // used here too.
 #[macro_use]
@@ -13467,7 +13467,7 @@ mod hop_channel_tests {
 async fn connect_jump_host(
     ctx: &HopCtx<'_>,
     jump_server_id: i32,
-) -> Result<Vec<russh::client::Handle<ssh_manager::ClientHandler>>, String> {
+) -> Result<Vec<hop_policy::HopHandle>, String> {
     // Resolve the bastion synchronously and drop the DB guard before any await
     // (rusqlite Connection is not Send).
     let ((host, port, user, password, key_data), jump_name) = {
@@ -13493,7 +13493,7 @@ async fn connect_jump_host(
 
 /// A route's hops being connected, boxed: the steps below call each other.
 type HopChain<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<russh::client::Handle<ssh_manager::ClientHandler>>, String>> + Send + 'a>>;
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<hop_policy::HopHandle>, String>> + Send + 'a>>;
 
 /// The `Handle`s of a `ProxyJump` list from `~/.ssh/config`, in order. Each
 /// hop's own config applies (its alias, user, agent); the first one is reached
@@ -13516,7 +13516,7 @@ fn config_jump_chain<'a>(
                 "ProxyJump in ~/.ssh/config: more than {MAX_JUMP_HOPS} hops — a loop between its Host blocks?"
             ));
         }
-        let mut chain: Vec<russh::client::Handle<ssh_manager::ClientHandler>> = Vec::new();
+        let mut chain: Vec<hop_policy::HopHandle> = Vec::new();
         for (i, jh) in hops.into_iter().enumerate() {
             let mut target =
                 ConfigTarget::resolve(&jh.host, jh.port.unwrap_or(22), jh.user.as_deref().unwrap_or(""), None).await;
@@ -13550,7 +13550,7 @@ fn config_jump_chain<'a>(
                 chain = reach_hop(ctx, hop, route, depth).await?;
             } else {
                 let via = chain.last().ok_or("ProxyJump: no previous hop")?;
-                let _turn = hop_policy::hop_turn(ctx, &hop.target, true).await?; // fork (#43, D1): login queue per hop
+                let _turn = match hop_policy::hop_turn(ctx, &hop, hop_policy::Via::Previous).await? { hop_policy::HopTurn::Shared(h) => { chain.push(h); continue } t => t }; // fork (#43, D1; #237): login queue per hop, or a shared login
                 let stream = hop_channel(via, &hop.target.host, hop.target.port).await.map_err(|e| ctx.network_error(e))?;
                 chain.push(login_hop(ctx, hop, HopStream::Channel(stream), None).await?);
             }
@@ -13575,7 +13575,7 @@ fn reach_hop<'a>(
                 ctx.log(&format!("~/.ssh/config: reaching the jump host {host} through ProxyJump {spec}..."), "info");
                 let mut chain = config_jump_chain(ctx, &spec, depth).await?;
                 let via = chain.last().ok_or("ProxyJump: no hops")?;
-                let _turn = hop_policy::hop_turn(ctx, &hop.target, true).await?; // fork (#43, D1): login queue per hop
+                let _turn = match hop_policy::hop_turn(ctx, &hop, hop_policy::Via::Previous).await? { hop_policy::HopTurn::Shared(h) => { chain.push(h); return Ok(chain) } t => t }; // fork (#43, D1; #237): login queue per hop, or a shared login
                 let stream = hop_channel(via, &host, port).await.map_err(|e| ctx.network_error(e))?;
                 let handle = login_hop(ctx, hop, HopStream::Channel(stream), None).await?;
                 chain.push(handle);
@@ -13587,12 +13587,12 @@ fn reach_hop<'a>(
                     "info",
                 );
                 let user = hop.target.user.trim().to_string();
-                let _turn = hop_policy::hop_turn(ctx, &hop.target, false).await?; // fork (#43, D1): login queue per hop
+                let _turn = match hop_policy::hop_turn(ctx, &hop, hop_policy::Via::Command(&command)).await? { hop_policy::HopTurn::Shared(h) => return Ok(vec![h]), t => t }; // fork (#43, D1; #237): login queue per hop, or a shared login
                 let (stream, watch) = start_proxy_command(ctx.app, ctx.session_id, ctx.attempt, &command, &hop.target, &user)?;
                 Ok(vec![login_hop(ctx, hop, HopStream::Command(stream), Some(watch)).await?])
             }
             _ => {
-                let _turn = hop_policy::hop_turn(ctx, &hop.target, false).await?; // fork (#43, D1): login queue per hop
+                let _turn = match hop_policy::hop_turn(ctx, &hop, hop_policy::Via::Direct).await? { hop_policy::HopTurn::Shared(h) => return Ok(vec![h]), t => t }; // fork (#43, D1; #237): login queue per hop, or a shared login
                 ctx.log(&format!("Connecting to jump host {host}:{port}..."), "info");
                 let tcp = match tokio::time::timeout(Duration::from_secs(10), dial::connect((host.as_str(), port))).await {
                     Ok(Ok(s)) => {
@@ -13617,7 +13617,7 @@ async fn login_hop(
     hop: Hop,
     transport: HopStream,
     proxy_watch: Option<proxy_command::Watch>,
-) -> Result<russh::client::Handle<ssh_manager::ClientHandler>, String> {
+) -> Result<hop_policy::HopHandle, String> {
     use tokio::time::Duration;
     let Hop { mut target, password, key_data, cache_id, save_to } = hop;
     let identity_agent = target.identity_agent();
@@ -13626,7 +13626,7 @@ async fn login_hop(
     let known_files = target.known_hosts_files(&user);
     let host_trust = known_hosts::for_host(known_files, &host, port).await;
     let mut notes = std::mem::take(&mut target.log);
-    let config = client_config_for_target(ctx.db, &host, port, host_trust.as_ref(), target.host_key_algorithms().as_deref(), &mut notes);
+    let config = ctx.queues.tune(client_config_for_target(ctx.db, &host, port, host_trust.as_ref(), target.host_key_algorithms().as_deref(), &mut notes));
     for line in notes {
         ctx.log(&line, "info");
     }
@@ -13855,7 +13855,7 @@ async fn login_hop(
     match auth_res {
         Ok(true) => {
             ctx.log("Jump host authenticated.", "success");
-            Ok(session)
+            Ok(ctx.queues.keep(session))
         }
         Ok(false) if prompt_ctx.cancelled.load(std::sync::atomic::Ordering::Relaxed) => {
             ctx.auth_failed.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -14468,7 +14468,7 @@ async fn initiate_connection(
 
         // ProxyJump takes precedence over a direct / proxied transport (see
         // the route below).
-        let mut jump_handles: Vec<russh::client::Handle<ssh_manager::ClientHandler>> = Vec::new();
+        let mut jump_handles: Vec<hop_policy::HopHandle> = Vec::new();
         // Set by connect_jump_host when the bastion login itself failed.
         let jump_auth_failed = std::sync::atomic::AtomicBool::new(false);
         // Set by it when a hop couldn't be reached or its link broke.
@@ -14493,7 +14493,7 @@ async fn initiate_connection(
             attempt: &attempt,
             session_id: &session_id_clone,
             use_agent,
-            queues: Default::default(),
+            queues: hop_policy::RouteQueues::shared(&app, &session_id_clone), // fork (#237): a jump host login other tabs share
         };
         // The jump hosts (a saved one, or ProxyJump from ~/.ssh/config), then a
         // direct-tcpip channel through the last one to the target: what
@@ -14505,7 +14505,7 @@ async fn initiate_connection(
             ConnectRoute::Jump(jid) => Some(*jid),
             _ => None,
         };
-        let chain: Option<Result<Vec<russh::client::Handle<ssh_manager::ClientHandler>>, String>> = match &route {
+        let chain: Option<Result<Vec<hop_policy::HopHandle>, String>> = match &route {
             ConnectRoute::Jump(jid) => {
                 emit_log(&format!("ProxyJump: routing through jump host (server id {})...", jid), "info");
                 Some(connect_jump_host(&hop_ctx, *jid).await)
@@ -14899,11 +14899,11 @@ async fn initiate_connection(
                                 // and a later reconnect / disconnect / close
                                 // drops them together.
                                 if !jump_handles.is_empty() {
-                                    let handles = std::mem::take(&mut jump_handles).into_iter().map(Arc::new).collect();
+                                    let handles = std::mem::take(&mut jump_handles);
                                     state_jump_connections
                                         .lock()
                                         .await
-                                        .insert(session_id_clone.clone(), ssh_manager::JumpRoute { jump_id: route_jump_id, handles });
+                                        .insert(session_id_clone.clone(), ssh_manager::JumpRoute { jump_id: route_jump_id, handles, leases: hop_ctx.queues.take_leases() });
                                 }
                                 true
                             } else {
@@ -16726,7 +16726,7 @@ async fn initiate_rdp(
                     use_agent,
                     queues: Default::default(),
                 };
-                let chain = match connect_jump_host(&ctx, jid).await {
+                let chain = match connect_jump_host(&ctx, jid).await.and_then(hop_policy::owned) {
                     Ok(chain) => chain,
                     Err(e) => {
                         let reason = format!("The SSH server {via_name}: {e}");
@@ -17196,7 +17196,7 @@ async fn rdp_builtin_open(
                     use_agent,
                     queues: Default::default(),
                 };
-                let chain = match connect_jump_host(&ctx, jid).await {
+                let chain = match connect_jump_host(&ctx, jid).await.and_then(hop_policy::owned) {
                     Ok(chain) => chain,
                     Err(e) => {
                         let reason = format!("The SSH server {via_name}: {e}");
@@ -17782,7 +17782,7 @@ async fn telnet_connect(
                     use_agent,
                     queues: Default::default(),
                 };
-                let chain = match connect_jump_host(&ctx, jid).await {
+                let chain = match connect_jump_host(&ctx, jid).await.and_then(hop_policy::owned) {
                     Ok(chain) => chain,
                     Err(e) => {
                         let reason = format!("The SSH server {via_name}: {e}");
@@ -18115,7 +18115,7 @@ async fn ftp_connect(
                     use_agent,
                     queues: Default::default(),
                 };
-                match connect_jump_host(&ctx, jid).await {
+                match connect_jump_host(&ctx, jid).await.and_then(hop_policy::owned) {
                     Ok(chain) => (ftp::dial_through(Arc::new(chain), &host), Some(via_name)),
                     Err(e) => {
                         let reason = format!("The SSH server {via_name}: {e}");
@@ -18470,7 +18470,7 @@ async fn vnc_open(
                     use_agent,
                     queues: Default::default(),
                 };
-                let chain = match connect_jump_host(&ctx, jid).await {
+                let chain = match connect_jump_host(&ctx, jid).await.and_then(hop_policy::owned) {
                     Ok(chain) => chain,
                     Err(e) => {
                         let reason = format!("The SSH server {via_name}: {e}");
@@ -25933,7 +25933,7 @@ pub fn run() {
             feedback::send_feedback,
             portable::get_storage_info,
             local_open::live_edit_editor_get, local_open::live_edit_editor_pick, local_open::live_edit_editor_reset, bulk_pick::bulk_pick_files, import_hosts, host_import::pick_client_import_file,
-            multiexec::get_jump_login_limit, multiexec::set_jump_login_limit, multiexec::write_terminals_data, server_os::detect_server_os, approvals::keep_server_ssh, set_server_terminal_theme, set_server_highlight,
+            multiexec::get_jump_login_limit, multiexec::set_jump_login_limit, multiexec::write_terminals_data, jump_pool::get_jump_sharing, jump_pool::set_jump_sharing, server_os::detect_server_os, approvals::keep_server_ssh, set_server_terminal_theme, set_server_highlight,
             fonts::list_system_fonts,
             clipboard_read_text
         ]);

@@ -15,9 +15,12 @@ use super::*;
 /// (ping.rs) takes its own reference instead of holding the map; the
 /// connections close once the last reference goes. `jump_id`: the saved
 /// jump host it went through, None for a ProxyJump from ~/.ssh/config.
+/// `leases`: its share of the logins it uses that other tabs share too
+/// (jump_pool.rs, #237), let go with the route.
 pub struct JumpRoute {
     pub jump_id: Option<i32>,
     pub handles: Vec<Arc<client::Handle<ClientHandler>>>,
+    pub leases: crate::jump_pool::Leases,
 }
 
 /// Keys typed into `terminal_id`, for a terminal whose keys don't go through
@@ -163,7 +166,10 @@ impl SshState {
 
     /// The same for every tab, when the profile closes (lib.rs,
     /// teardown_profile), and which saved server each tab and terminal is for.
+    /// The jump host logins tabs shared are let go too: none is used by the
+    /// next profile (jump_pool.rs).
     pub(crate) async fn forget_fork_sessions(&self) {
+        crate::jump_pool::clear();
         self.fork.root_access.lock().await.clear();
         self.fork.root_gates.lock().await.clear();
         self.fork.docker_root.lock().await.clear();
