@@ -294,7 +294,9 @@ pub(crate) async fn hop_turn<'a>(ctx: &'a crate::HopCtx<'a>, hop: &crate::Hop, v
     // Where login_hop keeps a password typed for this hop (#30).
     let typed_at = format!("{}|{}|{}:{}|{}", crate::base_session_id(ctx.session_id), hop.cache_id, target.host, target.port, target.user.trim());
     let waiting = || ctx.log(&format!("Waiting for the login to jump host {} in another tab...", target.host), "info");
-    match crate::jump_pool::POOL.acquire(key, &typed_at, ctx.attempt, waiting).await {
+    // "Logins per jump host" caps the logins the key keeps open (0: none).
+    let max_logins = usize::try_from(crate::multiexec::login_limit(ctx.app)).unwrap_or(0);
+    match crate::jump_pool::POOL.acquire(key, &typed_at, ctx.attempt, max_logins, waiting).await {
         Ok(crate::jump_pool::Acquired::Shared(login, lease)) => {
             ctx.log(&format!("Using the login to jump host {} that another tab opened.", target.host), "info");
             *locked(&share.last_login) = Some(lease.login_id());
@@ -411,24 +413,24 @@ pub(crate) async fn hop_channel_within<H: russh::client::Handler>(
     limit: std::time::Duration,
 ) -> Result<crate::tunnel::DrainedChannelStream, String> {
     let open = via.channel_open_direct_tcpip(host.to_string(), u32::from(port), "127.0.0.1", 0);
-    // A shared login that can't open one takes no more tabs (#237): one the
-    // jump host has no room on stays for the tabs on it; one that doesn't
-    // answer, or has gone, is replaced by the next tab's login. A refusal
-    // for the server behind it (it's down, or not allowed) is that server's,
-    // not the login's.
-    let failed = |full: bool| crate::jump_pool::POOL.channel_failed(via as *const russh::client::Handle<H> as usize, full);
+    // A shared login that can't open one, in time or at all, is unhealthy
+    // and takes no more tabs (#237): no answer, no room on it (resource
+    // shortage), or gone. Its tabs reconnect onto the key's other logins. A
+    // refusal for the server behind it (it's down, or not allowed) is that
+    // server's, not the login's.
+    let failed = || crate::jump_pool::POOL.unhealthy(via as *const russh::client::Handle<H> as usize);
     match tokio::time::timeout(limit, open).await {
         Ok(Ok(channel)) => Ok(crate::tunnel::drained_stream(channel)),
         Ok(Err(e)) => {
             match &e {
-                russh::Error::ChannelOpenFailure(russh::ChannelOpenFailure::ResourceShortage) => failed(true),
+                russh::Error::ChannelOpenFailure(russh::ChannelOpenFailure::ResourceShortage) => failed(),
                 russh::Error::ChannelOpenFailure(_) => {}
-                _ => failed(false),
+                _ => failed(),
             }
             Err(format!("could not open a channel to {host}:{port} through the jump host: {e}"))
         }
         Err(_) => {
-            failed(false);
+            failed();
             Err(format!("the jump host didn't open a channel to {host}:{port} within {} seconds", limit.as_secs()))
         }
     }

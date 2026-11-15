@@ -281,10 +281,13 @@ impl Direction {
 
     /// Every connection so far breaks: what's on its way is lost, its
     /// readers see the end and its writers an error. Later ones work.
-    fn cut(&self) {
+    fn cut(&self, only: Option<usize>) {
         let mut st = self.lock();
         let st = &mut *st;
         for flow in 0..st.flows.len() {
+            if only.is_some_and(|f| f != flow) {
+                continue;
+            }
             st.broken[flow] = true;
             let q = &mut st.flows[flow];
             st.total -= q.bytes;
@@ -300,8 +303,13 @@ impl Direction {
                 w.wake();
             }
         }
-        st.order.clear();
-        st.waiting.clear();
+        let broken = std::mem::take(&mut st.broken);
+        st.order.retain(|&f| !broken[f]);
+        st.waiting.retain(|&f| !broken[f]);
+        st.broken = broken;
+        if let Some(w) = st.waiting.front().copied().and_then(|f| st.flows[f].writer.take()) {
+            w.wake();
+        }
     }
 }
 
@@ -338,8 +346,14 @@ impl ShapedLink {
 
     /// Every connection over the link breaks at once.
     pub(crate) fn cut(&self) {
-        self.up.cut();
-        self.down.cut();
+        self.up.cut(None);
+        self.down.cut(None);
+    }
+
+    /// The `n`th connection dialled (from 0) breaks; the others carry on.
+    pub(crate) fn cut_one(&self, n: usize) {
+        self.up.cut(Some(n));
+        self.down.cut(Some(n));
     }
 }
 

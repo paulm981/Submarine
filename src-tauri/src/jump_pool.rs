@@ -1,5 +1,5 @@
-//! One login per jump host, shared by the SSH terminal tabs that go through
-//! it (#237).
+//! Jump host logins shared by the SSH terminal tabs that go through them
+//! (#237): a small pool of logins per jump host, like a thread pool.
 //!
 //! Opening a folder of servers behind one jump host used to log in to the
 //! jump host once per tab: one password or code prompt each, and as many
@@ -26,9 +26,15 @@
 //!   fail with it (a wrong password fails them all, as an auth error, so they
 //!   don't each ask again), or take over when the first tab is closed.
 //! - Each tab holds a `Lease` on each login of its route, kept with its jump
-//!   route (`ssh_manager::JumpRoute`) and dropped with it. At most `CAP` per
-//!   login: the next tab makes a second login, once the first is ready, and
-//!   reuses a password typed for the first.
+//!   route (`ssh_manager::JumpRoute`) and dropped with it.
+//! - Like a thread pool, a key starts with one login and grows to at most
+//!   "Logins per jump host" (`multiexec::login_limit`, 8 unless changed; 0
+//!   means no cap): a tab goes on the least busy login, and a new login is
+//!   made only when every login has `GROW_AT` tabs. At the cap, the least
+//!   busy takes it. Logins being made still wait in the jump host's login
+//!   queue (multiexec.rs), under the same number. The next login is made once the one before is ready, and
+//!   reuses a password typed for the first (a one-time code is asked again).
+//!   A login that stops answering takes no more tabs (`unhealthy`).
 //! - The last lease gone, the login stays `LINGER` for a tab that reconnects,
 //!   then closes. A login that dropped is replaced by the next tab that comes.
 //! - A shared login gets a smaller SSH window (`tune`): one tab's flood can
@@ -53,11 +59,21 @@ pub(crate) mod shaped_link;
 #[cfg(test)]
 mod tests;
 
-/// The most tabs (and hops chained behind) on one login.
-pub(crate) const CAP: usize = 16;
+/// A new login is made only once every login of the key has this many tabs
+/// (and hops chained behind); at the most logins a key may have (the
+/// "Logins per jump host" setting), tabs go on the least busy.
+pub(crate) const GROW_AT: usize = 2;
 /// How long a login no tab uses any more stays open.
 pub(crate) const LINGER: Duration = Duration::from_secs(30);
-/// A shared login's SSH window and largest packet (`tune`).
+/// A shared login's SSH window and largest packet (`tune`). Picked by the
+/// speed tests (ssh_manager/fork_tests/jump_share.rs, `measure_shared_windows`):
+/// 512 KiB is the only window tried (512 KiB to 8 MiB) that keeps a tab's echo
+/// beside a flood on the same login within 45 ms of its own login's at
+/// 100 Mbit/s (fair queuing, 20 to 80 ms) and no slower than its own on a
+/// FIFO 20 Mbit/s link. The flood pays: russh tops a window up only once half
+/// is used, so at 40 ms it gets half of what its own login would (1 MiB gets
+/// it all there, but adds 60 ms to the echo at 20 ms; 2 MiB is needed at
+/// 80 ms, adding 123 ms at 40 ms).
 pub(crate) const WINDOW: u32 = 512 * 1024;
 pub(crate) const MAX_PACKET: u32 = 32 * 1024;
 
@@ -172,9 +188,6 @@ struct Entry<H: Handler + 'static> {
     /// Bumped when the last lease goes; the linger only closes a login whose
     /// count is the same when it ends.
     idle_gen: u64,
-    /// Takes no more tabs (the jump host turned a channel down for lack of
-    /// room on this connection).
-    full: bool,
     /// Where the password typed for it is kept (the creating tab's
     /// prompted-secret slot), and a copy taken when it was made, in memory
     /// only: a second login for the same key reuses it.
@@ -320,13 +333,16 @@ impl<H: Handler + 'static> Pool<H> {
 
     /// A login for `key` to share, or the turn to make it. `typed_at`: where
     /// a password typed for it will be kept, for a second login of the same
-    /// key. Waits while another tab makes it (`waiting` is called once then),
-    /// and gives up when `attempt` is replaced or its tab closed.
+    /// key. `max_logins`: the most logins the key may have (0: no cap, a
+    /// login for every `GROW_AT` tabs). Waits while another tab makes one
+    /// (`waiting` is called once then), and gives up when `attempt` is
+    /// replaced or its tab closed.
     pub(crate) async fn acquire(
         &self,
         mut key: Key,
         typed_at: &str,
         attempt: &crate::ssh_manager::ConnectAttempt,
+        max_logins: usize,
         waiting: impl FnOnce(),
     ) -> Result<Acquired<H>, Waited> {
         let mut waiting = Some(waiting);
@@ -346,8 +362,16 @@ impl<H: Handler + 'static> Pool<H> {
                         i += 1;
                     }
                 }
-                let room = |e: &Entry<H>| !e.full && e.leases < CAP;
-                if let Some(e) = list.iter_mut().find(|e| room(e) && matches!(e.state, State::Ready(_))) {
+                // Like a thread pool: the least busy login takes the tab,
+                // unless every login has `GROW_AT` tabs and there's room for
+                // another login (`max_logins`), which is then made.
+                // A login being made counts as the one to grow into: the tab
+                // waits for it rather than crowd the others. (One is made at
+                // a time, so ready ones under the cap leave room for it.)
+                let ready = list.iter().filter(|e| matches!(e.state, State::Ready(_))).count();
+                let least = list.iter_mut().filter(|e| matches!(e.state, State::Ready(_))).min_by_key(|e| (e.leases, e.id));
+                let grow = least.as_ref().is_none_or(|e| e.leases >= GROW_AT) && (max_logins == 0 || ready < max_logins);
+                if let Some(e) = least.filter(|_| !grow) {
                     let State::Ready(h) = &e.state else { unreachable!() };
                     let h = Arc::clone(h);
                     e.leases += 1;
@@ -357,9 +381,9 @@ impl<H: Handler + 'static> Pool<H> {
                     drop(closed);
                     return Ok(Acquired::Shared(h, lease));
                 }
-                // One login of a key is made at a time: a second one only once
-                // the first is ready (and full), so its prompts come one after
-                // another, and a password typed for the first is there for it.
+                // One login of a key is made at a time: the next only once the
+                // one before is ready, so its prompts come one after another,
+                // and a password typed for the first is there for it.
                 let creating = list.iter().find_map(|e| match &e.state {
                     State::Creating(rx) => Some(rx.clone()),
                     State::Ready(_) => None,
@@ -367,12 +391,12 @@ impl<H: Handler + 'static> Pool<H> {
                 match creating {
                     Some(rx) => (rx, closed),
                     None => {
-                        let first = list.iter().find(|e| matches!(e.state, State::Ready(_)));
+                        let first = list.iter().find(|e| e.typed.is_some()).or_else(|| list.iter().find(|e| matches!(e.state, State::Ready(_))));
                         let (typed, first_at) = (first.and_then(|e| e.typed.clone()), first.map(|e| e.typed_at.clone()));
                         let (tx, rx) = watch::channel(None);
                         let id = inner.next_id;
                         inner.next_id += 1;
-                        let entry = Entry { id, state: State::Creating(rx), leases: 1, idle_gen: 0, full: false, typed_at: typed_at.to_string(), typed: None, behind: None };
+                        let entry = Entry { id, state: State::Creating(rx), leases: 1, idle_gen: 0, typed_at: typed_at.to_string(), typed: None, behind: None };
                         inner.entries.entry(key.clone()).or_default().push(entry);
                         drop(inner);
                         drop(closed);
@@ -492,27 +516,17 @@ impl<H: Handler + 'static> Pool<H> {
         drop(gone);
     }
 
-    /// A channel couldn't be opened on the login at `addr` (`Handle`'s
-    /// address): `full`, the jump host has no room for more on it, and it
-    /// takes no more tabs; otherwise it isn't answering and goes, so the next
-    /// tab logs in afresh.
-    pub(crate) fn channel_failed(&self, addr: usize, full: bool) {
+    /// The login at `addr` (`Handle`'s address) stopped answering: a channel
+    /// open on it timed out, the jump host has no room on it, or it's gone.
+    /// It takes no more tabs; the tabs on it carry on until they reconnect,
+    /// onto the key's other logins, or a new one.
+    pub(crate) fn unhealthy(&self, addr: usize) {
         let gone = {
             let mut inner = self.lock();
-            let mut gone = None;
-            'find: for (key, list) in inner.entries.iter_mut() {
-                for e in list.iter_mut() {
-                    if matches!(&e.state, State::Ready(h) if Arc::as_ptr(h) as usize == addr) {
-                        if full {
-                            e.full = true;
-                        } else {
-                            gone = Some((key.clone(), e.id));
-                        }
-                        break 'find;
-                    }
-                }
-            }
-            gone.and_then(|(key, id)| take_entry(&mut inner, &key, id))
+            let found = inner.entries.iter().find_map(|(key, list)| {
+                list.iter().find(|e| matches!(&e.state, State::Ready(h) if Arc::as_ptr(h) as usize == addr)).map(|e| (key.clone(), e.id))
+            });
+            found.and_then(|(key, id)| take_entry(&mut inner, &key, id))
         };
         drop(gone);
     }

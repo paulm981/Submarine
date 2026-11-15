@@ -14,6 +14,9 @@ use std::collections::HashMap;
 
 type Gens = Arc<tokio::sync::Mutex<HashMap<String, u64>>>;
 
+/// "Logins per jump host", as it is until changed (multiexec.rs).
+const LIMIT: usize = crate::multiexec::DEFAULT_LOGIN_LIMIT as usize;
+
 /// A tab's connect attempt.
 struct Tab {
     id: String,
@@ -82,7 +85,16 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<client::Handle<TestClient>, russh::Error>>,
 {
-    match pool.acquire(key.clone(), &tab.id, &tab.attempt, || {}).await? {
+    open_capped(pool, key, tab, LIMIT, login).await
+}
+
+/// `open`, with "Logins per jump host" at `max`.
+async fn open_capped<F, Fut>(pool: &Arc<Pool<TestClient>>, key: &Key, tab: &Tab, max: usize, login: F) -> Result<(Shared<TestClient>, Lease<TestClient>), Waited>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<client::Handle<TestClient>, russh::Error>>,
+{
+    match pool.acquire(key.clone(), &tab.id, &tab.attempt, max, || {}).await? {
         Acquired::Shared(h, lease) => Ok((h, lease)),
         Acquired::Create(mut reservation) => {
             let made = tokio::select! {
@@ -111,7 +123,11 @@ where
 }
 
 async fn open_on(pool: &Arc<Pool<TestClient>>, key: &Key, tab: &Tab, link: &ShapedLink) -> (Shared<TestClient>, Lease<TestClient>) {
-    open(pool, key, tab, || log_in(link, TestServer::default())).await.expect("a login")
+    open_on_capped(pool, key, tab, link, LIMIT).await
+}
+
+async fn open_on_capped(pool: &Arc<Pool<TestClient>>, key: &Key, tab: &Tab, link: &ShapedLink, max: usize) -> (Shared<TestClient>, Lease<TestClient>) {
+    open_capped(pool, key, tab, max, || log_in(link, TestServer::default())).await.expect("a login")
 }
 
 /// A server behind the jump host, through a channel on `login`, as a tab's
@@ -205,25 +221,97 @@ async fn the_key_holds_who_logs_in_where_and_how() {
     assert!(!format!("{same:?}").contains("pw"));
 }
 
-#[tokio::test(start_paused = true)]
-async fn the_seventeenth_tab_makes_a_second_login() {
-    let (pool, link) = (Pool::new(), link());
+/// Opens `n` tabs one after another; the tabs, their logins and leases.
+async fn tabs_on(pool: &Arc<Pool<TestClient>>, link: &ShapedLink, n: usize, max: usize) -> Vec<(Tab, Shared<TestClient>, Lease<TestClient>)> {
     let mut tabs = Vec::new();
-    for n in 0..CAP + 1 {
-        let t = tab(&format!("t{n}"));
-        let (h, lease) = open_on(&pool, &alice(), &t, &link).await;
+    for i in 0..n {
+        let t = tab(&format!("t{i}"));
+        let (h, lease) = open_on_capped(pool, &alice(), &t, link, max).await;
         tabs.push((t, h, lease));
     }
-    assert_eq!(link.dials(), 2);
-    assert_eq!(pool.census(&alice()), vec![CAP, 1]);
-    assert!(Arc::ptr_eq(&tabs[0].1, &tabs[CAP - 1].1));
-    assert!(!Arc::ptr_eq(&tabs[0].1, &tabs[CAP].1));
-    // One of the first sixteen goes: the next tab takes its place there.
-    tabs.remove(3);
-    let t = tab("late");
-    let (h, _l) = open_on(&pool, &alice(), &t, &link).await;
-    assert!(Arc::ptr_eq(&h, &tabs[0].1));
-    assert_eq!(link.dials(), 2);
+    tabs
+}
+
+/// Like a thread pool: one login for one or two tabs, a second at the third
+/// tab, and so on, one more login for every two tabs, up to "Logins per jump
+/// host" (5 here: 5 logins from the ninth tab on).
+#[tokio::test(start_paused = true)]
+async fn a_key_grows_a_login_for_every_two_tabs_up_to_the_setting() {
+    let (pool, link) = (Pool::new(), link());
+    let mut tabs = Vec::new();
+    for n in 1..=14usize {
+        let t = tab(&format!("t{n}"));
+        tabs.push((open_on_capped(&pool, &alice(), &t, &link, 5).await, t));
+        let logins = n.div_ceil(2).min(5);
+        assert_eq!(link.dials(), logins, "{n} tabs");
+        assert_eq!(pool.census(&alice()).len(), logins, "{n} tabs");
+    }
+    let mut counts = pool.census(&alice());
+    counts.sort_unstable();
+    assert_eq!(counts, vec![2, 3, 3, 3, 3]);
+}
+
+/// Never more logins for one key than the setting says, however many tabs
+/// open at once: 3 here, so 30 tabs at once are 3 logins of 10, made one
+/// after another.
+#[tokio::test(start_paused = true)]
+async fn a_key_never_has_more_logins_than_the_setting() {
+    let (pool, link) = (Pool::new(), link());
+    let tabs: Vec<Tab> = (0..30).map(|n| tab(&format!("t{n}"))).collect();
+    let k = alice();
+    let opened = futures::future::join_all(tabs.iter().map(|t| open_on_capped(&pool, &k, t, &link, 3))).await;
+    assert_eq!(link.dials(), 3);
+    assert_eq!(pool.census(&alice()), vec![10, 10, 10]);
+    // More come later: still 3.
+    let more = tabs_on(&pool, &link, 6, 3).await;
+    assert_eq!(link.dials(), 3);
+    assert_eq!(pool.census(&alice()), vec![12, 12, 12]);
+    drop((opened, more));
+}
+
+/// 0 means no cap: a login for every two tabs.
+#[tokio::test(start_paused = true)]
+async fn with_no_cap_a_key_has_a_login_for_every_two_tabs() {
+    let (pool, link) = (Pool::new(), link());
+    let tabs = tabs_on(&pool, &link, 23, 0).await;
+    assert_eq!(link.dials(), 12);
+    assert_eq!(pool.census(&alice()).iter().sum::<usize>(), 23);
+    assert!(pool.census(&alice()).iter().all(|&n| n <= 2));
+    drop(tabs);
+}
+
+/// The default, 8: a folder of 40 servers opened at once is 8 logins of 5.
+#[tokio::test(start_paused = true)]
+async fn many_tabs_at_once_spread_over_the_settings_logins() {
+    let (pool, link) = (Pool::new(), link());
+    let tabs: Vec<Tab> = (0..40).map(|n| tab(&format!("t{n}"))).collect();
+    let k = alice();
+    let opened = futures::future::join_all(tabs.iter().map(|t| open_on(&pool, &k, t, &link))).await;
+    assert_eq!(link.dials(), LIMIT);
+    assert_eq!(pool.census(&alice()), vec![5; LIMIT]);
+    drop(opened);
+}
+
+/// A new tab goes on the least busy login (the oldest of those as busy).
+#[tokio::test(start_paused = true)]
+async fn a_tab_goes_on_the_least_busy_login() {
+    let (pool, link) = (Pool::new(), link());
+    let mut tabs = tabs_on(&pool, &link, 10, 5).await;
+    // Logins A..E with two tabs each, in that order. Both of C's tabs close,
+    // and one of A's.
+    let c = Arc::clone(&tabs[4].1);
+    let a = Arc::clone(&tabs[0].1);
+    assert!(Arc::ptr_eq(&c, &tabs[5].1) && !Arc::ptr_eq(&a, &c));
+    tabs.remove(5);
+    tabs.remove(4);
+    tabs.remove(0);
+    let t = tab("next");
+    let (h, _l1) = open_on_capped(&pool, &alice(), &t, &link, 5).await;
+    assert!(Arc::ptr_eq(&h, &c), "C has none");
+    let t2 = tab("after");
+    let (h2, _l2) = open_on_capped(&pool, &alice(), &t2, &link, 5).await;
+    assert!(Arc::ptr_eq(&h2, &a), "A and C have one each: A is older");
+    assert_eq!(link.dials(), 5);
 }
 
 /// The second login of a key gets the password typed for the first (copied
@@ -232,39 +320,21 @@ async fn the_seventeenth_tab_makes_a_second_login() {
 async fn a_second_login_gets_the_password_typed_for_the_first() {
     let (pool, link) = (Pool::new(), link());
     let first = tab("first");
-    let Acquired::Create(r) = pool.acquire(alice(), "first|jump1|bastion:22|alice", &first.attempt, || {}).await.unwrap() else { panic!("creates") };
+    let Acquired::Create(r) = pool.acquire(alice(), "first|jump1|bastion:22|alice", &first.attempt, LIMIT, || {}).await.unwrap() else { panic!("creates") };
     assert!(r.typed.is_none() && r.typed_at.is_none(), "nothing typed before the first login");
     let h = Arc::new(log_in(&link, TestServer::default()).await.unwrap());
     let mut leases = vec![r.ready(Arc::clone(&h), None, Some(zeroize::Zeroizing::new("typed".into()))).unwrap()];
-    for n in 1..CAP {
-        let t = tab(&format!("t{n}"));
-        let Acquired::Shared(_, l) = pool.acquire(alice(), &t.id, &t.attempt, || {}).await.unwrap() else { panic!("shares") };
-        leases.push(l);
-    }
+    let t = tab("t1");
+    let Acquired::Shared(_, l) = pool.acquire(alice(), &t.id, &t.attempt, LIMIT, || {}).await.unwrap() else { panic!("shares") };
+    leases.push(l);
     let late = tab("late");
-    let Acquired::Create(second) = pool.acquire(alice(), "late|jump1|bastion:22|alice", &late.attempt, || {}).await.unwrap() else { panic!("a second login") };
+    let Acquired::Create(second) = pool.acquire(alice(), "late|jump1|bastion:22|alice", &late.attempt, LIMIT, || {}).await.unwrap() else { panic!("a second login") };
     assert_eq!(second.typed.as_deref().map(String::as_str), Some("typed"));
     assert_eq!(second.typed_at.as_deref(), Some("first|jump1|bastion:22|alice"));
     // Another key never gets it.
     let b = tab("b");
-    let Acquired::Create(other) = pool.acquire(key("bob", Via::Direct, "jump1", b"password"), "b", &b.attempt, || {}).await.unwrap() else { panic!("creates") };
+    let Acquired::Create(other) = pool.acquire(key("bob", Via::Direct, "jump1", b"password"), "b", &b.attempt, LIMIT, || {}).await.unwrap() else { panic!("creates") };
     assert!(other.typed.is_none() && other.typed_at.is_none());
-}
-
-/// Many tabs at once: one makes the login, the rest wait for it and share
-/// it; the seventeenth on makes a second login only once the first is
-/// ready, so a folder of 40 servers is 3 logins, one after another.
-#[tokio::test(start_paused = true)]
-async fn many_tabs_at_once_make_one_login_per_sixteen() {
-    let (pool, link) = (Pool::new(), link());
-    let tabs: Vec<Tab> = (0..40).map(|n| tab(&format!("t{n}"))).collect();
-    let k = alice();
-    let opened = futures::future::join_all(tabs.iter().map(|t| open_on(&pool, &k, t, &link))).await;
-    assert_eq!(link.dials(), 3);
-    let mut counts = pool.census(&alice());
-    counts.sort_unstable();
-    assert_eq!(counts, vec![8, 16, 16]);
-    drop(opened);
 }
 
 #[tokio::test(start_paused = true)]
@@ -292,19 +362,59 @@ async fn a_login_no_tab_uses_closes_thirty_seconds_after_the_last_one() {
     assert_eq!(link.dials(), 2);
 }
 
-/// The shared login drops: every tab on it sees its session end, and their
-/// reconnects make one new login between them, not sixteen.
+/// Waits until `h` has seen its connection go.
+async fn until_closed(h: &client::Handle<TestClient>) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !h.is_closed() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the login drops");
+}
+
+/// A login drops: its tabs reconnect onto the key's other logins, and only
+/// when none is left is a new one made.
 #[tokio::test(start_paused = true)]
-async fn a_dropped_login_is_made_again_once_for_every_tab() {
+async fn tabs_on_a_dropped_login_reconnect_onto_the_others() {
     let (pool, link) = (Pool::new(), link());
-    let tabs: Vec<Tab> = (0..CAP).map(|n| tab(&format!("t{n}"))).collect();
+    // A has two tabs, B one; then one of A's closes: one each.
+    let mut tabs = tabs_on(&pool, &link, 3, 5).await;
+    let (a, b) = (Arc::clone(&tabs[0].1), Arc::clone(&tabs[2].1));
+    assert!(!Arc::ptr_eq(&a, &b));
+    tabs.remove(1);
+    link.cut_one(0);
+    until_closed(&a).await;
+    // A's tab reconnects (letting go of its old route first): onto B.
+    tabs.remove(0);
+    let t = tab("t0 again");
+    let (h, lease) = open_on_capped(&pool, &alice(), &t, &link, 5).await;
+    assert!(Arc::ptr_eq(&h, &b));
+    assert_eq!(link.dials(), 2, "no new login");
+    // B drops too: nothing left, so the tabs make a new one between them.
+    link.cut_one(1);
+    until_closed(&b).await;
+    drop((tabs, h, lease));
+    let back: Vec<Tab> = (0..2).map(|n| tab(&format!("back{n}"))).collect();
+    let k = alice();
+    let opened = futures::future::join_all(back.iter().map(|t| open_on_capped(&pool, &k, t, &link, 5))).await;
+    assert_eq!(link.dials(), 3);
+    assert!(Arc::ptr_eq(&opened[0].0, &opened[1].0) && !opened[0].0.is_closed());
+}
+
+/// Every login of a key drops: every tab sees its session end, and their
+/// reconnects make the logins again, one after another, not one each.
+#[tokio::test(start_paused = true)]
+async fn dropped_logins_are_made_again_once_for_all_their_tabs() {
+    let (pool, link) = (Pool::new(), link());
+    let tabs: Vec<Tab> = (0..10).map(|n| tab(&format!("t{n}"))).collect();
     let mut sessions = Vec::new();
     for t in &tabs {
-        let (h, lease) = open_on(&pool, &alice(), t, &link).await;
+        let (h, lease) = open_on_capped(&pool, &alice(), t, &link, 5).await;
         let server = target(&h).await;
         sessions.push((h, lease, server));
     }
-    assert_eq!(link.dials(), 1);
+    assert_eq!(link.dials(), 5);
     link.cut();
     // Every tab's session ends (its watcher would say so and reconnect).
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -313,18 +423,20 @@ async fn a_dropped_login_is_made_again_once_for_every_tab() {
         }
     })
     .await
-    .expect("every tab sees the login drop");
+    .expect("every tab sees the logins drop");
     // A reconnect lets go of the tab's old route first (initiate_connection).
     drop(sessions);
-    let reconnects: Vec<Tab> = (0..CAP).map(|n| tab(&format!("t{n} again"))).collect();
+    let reconnects: Vec<Tab> = (0..10).map(|n| tab(&format!("t{n} again"))).collect();
+    let k = alice();
     let back = futures::future::join_all(reconnects.iter().map(|t| async {
-        let (h, lease) = open_on(&pool, &alice(), t, &link).await;
+        let (h, lease) = open_on_capped(&pool, &k, t, &link, 5).await;
         let server = target(&h).await;
         (h, lease, server)
     }))
     .await;
-    assert_eq!(link.dials(), 2, "one new login for the sixteen tabs");
-    assert!(back.iter().all(|(h, _, s)| Arc::ptr_eq(h, &back[0].0) && !s.is_closed()));
+    assert_eq!(link.dials(), 10, "five new logins for the ten tabs");
+    assert_eq!(pool.census(&alice()), vec![2; 5]);
+    assert!(back.iter().all(|(_, _, s)| !s.is_closed()));
 }
 
 /// The shared login drops while its tabs still hold it: the next tab finds
@@ -422,26 +534,28 @@ fn only_an_ssh_tabs_own_connection_shares_and_only_when_on() {
     assert!(!RouteQueues::default().shares());
 }
 
+/// A login that stopped answering (a channel open timed out, no room on it,
+/// or gone) takes no more tabs; its own tabs carry on until they reconnect.
 #[tokio::test(start_paused = true)]
-async fn a_login_that_cant_open_a_channel_takes_no_more_tabs() {
+async fn an_unhealthy_login_takes_no_more_tabs() {
     let (pool, link) = (Pool::new(), link());
-    let a = tab("a");
-    let (h, _l) = open_on(&pool, &alice(), &a, &link).await;
-    // No room for another channel on it: it stays for its tabs, and the next
-    // tab makes another login.
-    pool.channel_failed(Arc::as_ptr(&h) as usize, true);
-    assert_eq!(pool.census(&alice()), vec![1]);
-    let b = tab("b");
-    let (hb, _lb) = open_on(&pool, &alice(), &b, &link).await;
-    assert!(!Arc::ptr_eq(&h, &hb));
-    assert_eq!(link.dials(), 2);
-    // One that doesn't answer goes: the next tab logs in afresh.
-    pool.channel_failed(Arc::as_ptr(&hb) as usize, false);
-    assert_eq!(pool.census(&alice()), vec![1]);
-    let c = tab("c");
-    let (hc, _lc) = open_on(&pool, &alice(), &c, &link).await;
-    assert!(!Arc::ptr_eq(&hb, &hc) && !Arc::ptr_eq(&h, &hc));
+    let tabs = tabs_on(&pool, &link, 3, 5).await;
+    let (a, b) = (Arc::clone(&tabs[0].1), Arc::clone(&tabs[2].1));
+    // B has one tab, so it's the least busy: it's B that goes.
+    pool.unhealthy(Arc::as_ptr(&b) as usize);
+    assert_eq!(pool.census(&alice()), vec![2]);
+    assert!(!target(&b).await.is_closed(), "its tab carries on");
+    // A has two: the next tab makes a new login rather than go on B.
+    let t = tab("next");
+    let (h, _l) = open_on_capped(&pool, &alice(), &t, &link, 5).await;
+    assert!(!Arc::ptr_eq(&h, &b) && !Arc::ptr_eq(&h, &a));
     assert_eq!(link.dials(), 3);
+    // And A, unhealthy too: tabs go on the new login only.
+    pool.unhealthy(Arc::as_ptr(&a) as usize);
+    let t2 = tab("after");
+    let (h2, _l2) = open_on_capped(&pool, &alice(), &t2, &link, 5).await;
+    assert!(Arc::ptr_eq(&h2, &h));
+    drop(tabs);
 }
 
 /// A deleted jump host's logins take no more tabs; a tab on one carries on.
@@ -468,7 +582,7 @@ async fn a_deleted_jump_hosts_login_takes_no_more_tabs() {
 async fn a_login_made_across_a_profile_close_isnt_shared() {
     let (pool, link) = (Pool::new(), link());
     let a = tab("a");
-    let Acquired::Create(reservation) = pool.acquire(alice(), "a", &a.attempt, || {}).await.unwrap() else { panic!("creates") };
+    let Acquired::Create(reservation) = pool.acquire(alice(), "a", &a.attempt, LIMIT, || {}).await.unwrap() else { panic!("creates") };
     let h = Arc::new(log_in(&link, TestServer::default()).await.unwrap());
     pool.clear();
     assert!(reservation.ready(Arc::clone(&h), None, None).is_none());
@@ -482,9 +596,9 @@ async fn a_login_made_across_a_profile_close_isnt_shared() {
 async fn a_waiting_tab_that_is_closed_stops_waiting() {
     let pool: Arc<Pool<TestClient>> = Pool::new();
     let a = tab("a");
-    let _making = pool.acquire(alice(), "a", &a.attempt, || {}).await.unwrap();
+    let _making = pool.acquire(alice(), "a", &a.attempt, LIMIT, || {}).await.unwrap();
     let b = tab("b");
-    let waited = async { pool.acquire(alice(), "b", &b.attempt, || {}).await };
+    let waited = async { pool.acquire(alice(), "b", &b.attempt, LIMIT, || {}).await };
     let closing = async {
         tokio::time::sleep(Duration::from_secs(2)).await;
         b.close().await;
@@ -501,7 +615,7 @@ async fn a_hop_behind_a_shared_login_holds_it() {
     let a = tab("a");
     let (h1, l1) = open_on(&pool, &alice(), &a, &link).await;
     let second = key("alice", Via::Through(l1.login_id()), "cfgjump|inner", b"");
-    let Acquired::Create(reservation) = pool.acquire(second.clone(), "a", &a.attempt, || {}).await.unwrap() else { panic!("creates") };
+    let Acquired::Create(reservation) = pool.acquire(second.clone(), "a", &a.attempt, LIMIT, || {}).await.unwrap() else { panic!("creates") };
     let h2 = Arc::new(client_over(crate::hop_channel(&h1, "inner", 22).await.unwrap(), tune(client::Config::default()), TestClient::default()).await.unwrap());
     let l2 = reservation.ready(Arc::clone(&h2), pool.lease_again(&l1), None).unwrap();
     assert_eq!(pool.census(&alice()), vec![2]);

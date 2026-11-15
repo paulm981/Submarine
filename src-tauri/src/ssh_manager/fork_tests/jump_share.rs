@@ -30,11 +30,19 @@ const FLOOD: usize = 64 << 20;
 /// How fast the page draws: what `Outflow` assumes until it knows.
 const PAGE_RATE: f64 = 8_000_000.0;
 
-/// A login to the jump host over `link`: the shared window for a shared one.
-async fn jump_login(link: &ShapedLink, shared: bool) -> client::Handle<TestClient> {
+/// A login to the jump host over `link`: a tab's own (`None`), or a shared
+/// one with this window (`jump_pool::tune`, with its window replaced).
+async fn jump_login(link: &ShapedLink, window: Option<u32>) -> client::Handle<TestClient> {
     let (c, s) = link.dial();
     serve(TestServer::default(), |_| {}, s);
-    let config = if shared { crate::jump_pool::tune(crate::build_ssh_client_config()) } else { crate::build_ssh_client_config() };
+    let config = match window {
+        Some(w) => {
+            let mut c = crate::jump_pool::tune(crate::build_ssh_client_config());
+            c.window_size = w;
+            c
+        }
+        None => crate::build_ssh_client_config(),
+    };
     client_over(c, config, TestClient::default()).await.expect("the jump host logs in")
 }
 
@@ -109,11 +117,12 @@ fn percentiles(mut v: Vec<f64>) -> (f64, f64) {
 /// A tab's echo, idle, 200 times: (p50, p99).
 async fn idle_echo(shared: bool) -> (f64, f64) {
     let link = ShapedLink::new(LinkSpec::new(100, Duration::from_millis(40), 1 << 20, Queuing::Fair));
-    let login = jump_login(&link, shared).await;
-    // On a shared login, 15 other tabs are open and idle.
+    let login = jump_login(&link, shared.then_some(crate::jump_pool::WINDOW)).await;
+    // On a shared login, 15 other tabs are open and idle: more than a login
+    // carries until its key has `MAX_LOGINS` logins.
     let mut others = Vec::new();
     if shared {
-        for _ in 0..crate::jump_pool::CAP - 1 {
+        for _ in 0..15 {
             let s = tab_session(&login, crate::build_ssh_client_config()).await;
             let t = terminal(&s, "echo").await;
             others.push((s, t));
@@ -137,13 +146,13 @@ async fn echo_through_a_shared_login_is_as_fast_as_through_its_own() {
 /// A flooding tab and an echoing one on `link`, on one shared login or a
 /// login each: the echo's (p50, p99) while the flood runs, and the flood's
 /// speed (bytes a second).
-async fn flood_beside_echo(spec: LinkSpec, shared: bool) -> ((f64, f64), f64) {
+async fn flood_beside_echo(spec: LinkSpec, shared: Option<u32>) -> ((f64, f64), f64) {
     let link = ShapedLink::new(spec);
-    let (flood_login, echo_login) = if shared {
-        let l = jump_login(&link, true).await;
+    let (flood_login, echo_login) = if shared.is_some() {
+        let l = jump_login(&link, shared).await;
         (l, None)
     } else {
-        (jump_login(&link, false).await, Some(jump_login(&link, false).await))
+        (jump_login(&link, None).await, Some(jump_login(&link, None).await))
     };
     let flood_session = tab_session(&flood_login, crate::build_ssh_client_config()).await;
     let echo_session = tab_session(echo_login.as_ref().unwrap_or(&flood_login), crate::build_ssh_client_config()).await;
@@ -182,8 +191,8 @@ fn flood_bound(spec: &LinkSpec) -> f64 {
 #[tokio::test(start_paused = true)]
 async fn an_idle_tab_echoes_at_speed_while_its_neighbour_floods_on_a_fifo_link() {
     let spec = LinkSpec::new(20, Duration::from_millis(40), 1 << 20, Queuing::Fifo);
-    let (own, own_speed) = flood_beside_echo(spec, false).await;
-    let (shared, speed) = flood_beside_echo(spec, true).await;
+    let (own, own_speed) = flood_beside_echo(spec, None).await;
+    let (shared, speed) = flood_beside_echo(spec, Some(crate::jump_pool::WINDOW)).await;
     println!(
         "FIFO 20 Mbit/s, 40 ms, 1 MiB buffer: echo beside a flood: own logins p50 {:.1} ms p99 {:.1} ms (flood {:.2} MB/s); shared p50 {:.1} ms p99 {:.1} ms (flood {:.2} MB/s)",
         own.0, own.1, own_speed / 1e6, shared.0, shared.1, speed / 1e6
@@ -207,7 +216,8 @@ async fn an_idle_tab_echoes_at_speed_while_its_neighbour_floods_on_a_fair_link()
 /// channel's window up only once half of it is used, so a flood has 256 KiB
 /// on its way for most of each round trip (6.25 MB/s here, where the design
 /// counted on 10). Kept to the design's bar, so it fails until a russh that
-/// tops the window up sooner, or a larger shared window, is decided on (#237).
+/// tops the window up sooner is used: a larger shared window that passes it
+/// (1 MiB) breaks the echo bar at 20 ms (`measure_shared_windows`, #237).
 #[tokio::test(start_paused = true)]
 #[ignore = "fails: a flood on a shared login gets half of 512 KiB per round trip at 40 ms (#237)"]
 async fn an_idle_tab_echoes_at_speed_while_its_neighbour_floods_on_a_fair_link_at_40_ms() {
@@ -216,8 +226,8 @@ async fn an_idle_tab_echoes_at_speed_while_its_neighbour_floods_on_a_fair_link_a
 
 async fn fair_link_flood(rtt: Duration) {
     let spec = LinkSpec::new(100, rtt, 1 << 20, Queuing::Fair);
-    let (own, own_speed) = flood_beside_echo(spec, false).await;
-    let (shared, speed) = flood_beside_echo(spec, true).await;
+    let (own, own_speed) = flood_beside_echo(spec, None).await;
+    let (shared, speed) = flood_beside_echo(spec, Some(crate::jump_pool::WINDOW)).await;
     println!(
         "fair 100 Mbit/s, {} ms: echo beside a flood: own logins p50 {:.1} ms p99 {:.1} ms (flood {:.2} MB/s); shared p50 {:.1} ms p99 {:.1} ms (flood {:.2} MB/s)",
         rtt.as_millis(), own.0, own.1, own_speed / 1e6, shared.0, shared.1, speed / 1e6
@@ -238,7 +248,7 @@ async fn a_stalled_tab_never_holds_up_the_shared_connection() {
     let spec = LinkSpec::new(100, Duration::from_millis(40), 1 << 20, Queuing::Fair);
     let idle = idle_echo(true).await;
     let link = ShapedLink::new(spec);
-    let login = jump_login(&link, true).await;
+    let login = jump_login(&link, Some(crate::jump_pool::WINDOW)).await;
     // Its session takes all the server sends (a window larger than the
     // flood), and nothing reads its channel: its session stops at once, and
     // what comes waits in the channel's drained queue, past the cap.
@@ -276,11 +286,87 @@ async fn a_stalled_tab_never_holds_up_the_shared_connection() {
 async fn measure_a_floods_speed_by_round_trip() {
     for rtt in [5, 10, 20, 40, 80] {
         let spec = LinkSpec::new(100, Duration::from_millis(rtt), 1 << 20, Queuing::Fair);
-        let (own, own_speed) = flood_beside_echo(spec, false).await;
-        let (shared, speed) = flood_beside_echo(spec, true).await;
+        let (own, own_speed) = flood_beside_echo(spec, None).await;
+        let (shared, speed) = flood_beside_echo(spec, Some(crate::jump_pool::WINDOW)).await;
         println!(
             "fair 100 Mbit/s, {rtt} ms: own logins echo p99 {:.1} ms, flood {:.2} MB/s; shared echo p99 {:.1} ms, flood {:.2} MB/s ({:.0}% of min(link, 512 KiB/RTT) = {:.2} MB/s)",
             own.1, own_speed / 1e6, shared.1, speed / 1e6, 100.0 * speed / flood_bound(&spec), flood_bound(&spec) / 1e6
         );
+    }
+}
+
+/// Ten tabs on a key's five logins (placed by the pool, as "Logins per jump
+/// host" 5 has them), on a fair link: a flood in one tab leaves the tabs on
+/// the other logins at the echo of an idle login of their own.
+#[tokio::test(start_paused = true)]
+async fn a_flood_on_one_login_leaves_the_tabs_on_the_others_at_idle_speed() {
+    use crate::jump_pool::{Acquired, Key, Pool, Via};
+    let spec = LinkSpec::new(100, Duration::from_millis(40), 1 << 20, Queuing::Fair);
+    let idle = idle_echo(false).await;
+    let link = ShapedLink::new(spec);
+    let pool = Pool::<TestClient>::new();
+    let key = Key::new(Via::Direct, crate::hop_policy::queue_key("bastion", 22), "alice".into(), "jump1".into(), crate::jump_pool::digest(&[b"pw"]));
+    let gens = Arc::new(Mutex::new(HashMap::new()));
+    let mut tabs = Vec::new();
+    for i in 0..10 {
+        let id = format!("t{i}");
+        gens.lock().await.insert(id.clone(), 1);
+        let attempt = ConnectAttempt::new(Arc::clone(&gens), id.clone(), 1);
+        let (login, lease) = match pool.acquire(key.clone(), &id, &attempt, 5, || {}).await.expect("a login") {
+            Acquired::Shared(h, l) => (h, l),
+            Acquired::Create(r) => {
+                let h = Arc::new(jump_login(&link, Some(crate::jump_pool::WINDOW)).await);
+                let l = r.ready(Arc::clone(&h), None, None).expect("kept");
+                (h, l)
+            }
+        };
+        let session = tab_session(&login, crate::build_ssh_client_config()).await;
+        tabs.push((login, lease, session));
+    }
+    assert_eq!(link.dials(), 5);
+    assert_eq!(pool.census(&key), vec![2; 5]);
+    // The first tab floods; the second is on its login too. The other eight
+    // are on the other four logins.
+    assert!(Arc::ptr_eq(&tabs[0].0, &tabs[1].0));
+    assert!(tabs[2..].iter().all(|(l, _, _)| !Arc::ptr_eq(l, &tabs[0].0)));
+    let flood = terminal(&tabs[0].2, &format!("flood {FLOOD}")).await;
+    let mut others = Vec::new();
+    for (_, _, session) in &tabs[2..] {
+        others.push(terminal(session, "echo").await);
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let took = futures::future::join_all(others.iter_mut().map(|t| echoes(t, Duration::from_millis(100), 30, std::future::pending()))).await;
+    assert!(!flood.pump.is_finished(), "measured while the flood ran");
+    let beside = percentiles(took.into_iter().flatten().collect());
+    println!(
+        "a flood on one of five logins, fair 100 Mbit/s, 40 ms: echo on the other logins p50 {:.2} ms p99 {:.2} ms (idle own login p99 {:.2} ms)",
+        beside.0, beside.1, idle.1
+    );
+    assert!(beside.1 <= idle.1 + 1.0, "p99 on the other logins {:.2} ms, idle {:.2} ms", beside.1, idle.1);
+}
+
+/// Each shared window tried against logins of their own: the flood's speed
+/// and the echo beside it, on a fair 100 Mbit/s link at 20, 40 and 80 ms and
+/// a FIFO 20 Mbit/s one at 40 ms. A measure, run by hand
+/// (`cargo test --lib measure_shared_windows -- --ignored --nocapture`).
+#[tokio::test(start_paused = true)]
+#[ignore = "a measure, run by hand"]
+async fn measure_shared_windows() {
+    let links = [
+        ("fair 100 Mbit/s 20 ms", LinkSpec::new(100, Duration::from_millis(20), 1 << 20, Queuing::Fair)),
+        ("fair 100 Mbit/s 40 ms", LinkSpec::new(100, Duration::from_millis(40), 1 << 20, Queuing::Fair)),
+        ("fair 100 Mbit/s 80 ms", LinkSpec::new(100, Duration::from_millis(80), 1 << 20, Queuing::Fair)),
+        ("FIFO 20 Mbit/s 40 ms", LinkSpec::new(20, Duration::from_millis(40), 1 << 20, Queuing::Fifo)),
+    ];
+    for (name, spec) in links {
+        let (own, own_speed) = flood_beside_echo(spec, None).await;
+        println!("{name}: own logins: echo p99 {:.1} ms, flood {:.2} MB/s", own.1, own_speed / 1e6);
+        for w in [512u32 << 10, 1 << 20, 2 << 20, 3 << 20, 4 << 20, 8 << 20] {
+            let (shared, speed) = flood_beside_echo(spec, Some(w)).await;
+            println!(
+                "{name}: shared {} KiB: echo p99 {:.1} ms ({:+.1}), flood {:.2} MB/s ({:.1}% of own)",
+                w >> 10, shared.1, shared.1 - own.1, speed / 1e6, 100.0 * speed / own_speed
+            );
+        }
     }
 }
