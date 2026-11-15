@@ -542,7 +542,7 @@ fn prepare(buf: &[u8], mut cut: usize, last: bool, mut hiding: Option<Block>) ->
         hidden += 1;
         hidden_part(&mut text, &buf[..hide_to]);
     }
-    let plain = Zeroizing::new(String::from_utf8_lossy(&buf[hide_to..cut]).into_owned());
+    let plain = Zeroizing::new(super::boundary::for_model(&buf[hide_to..cut]));
     let f = filter::filter(&plain);
     text.push_str(&f.text);
     hidden += f.hidden;
