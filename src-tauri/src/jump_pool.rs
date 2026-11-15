@@ -548,8 +548,8 @@ async fn wait_for(mut rx: watch::Receiver<Option<Outcome>>) -> Outcome {
 // ── The setting ───────────────────────────────────────────────────────────
 
 const SETTING_FILE: &str = "jump_share.json";
-/// Until Settings says otherwise.
-pub(crate) const DEFAULT_ON: bool = false;
+/// Until Settings says otherwise: on.
+pub(crate) const DEFAULT_ON: bool = true;
 
 /// 0 = not read yet, 1 = off, 2 = on.
 static SHARING: AtomicU8 = AtomicU8::new(0);

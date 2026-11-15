@@ -1,5 +1,5 @@
 // Settings › Servers & sessions: how servers show and close, the jump host
-// queue, and sessions kept between connections.
+// queue and shared jump host logins, and sessions kept between connections.
 import { useEffect, useState } from "react";
 import { History, Server } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
@@ -59,6 +59,51 @@ function JumpLoginLimit() {
   );
 }
 
+// SSH tabs behind the same jump host share one login to it (jump_pool.rs,
+// #237). Kept by the backend, which does the sharing.
+function JumpSharing() {
+  const [on, setOn] = useState<boolean | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    invoke<boolean>("get_jump_sharing").then(setOn).catch(() => setOn(null));
+  }, []);
+  const toggle = () => {
+    if (on === null) return;
+    invoke<boolean>("set_jump_sharing", { on: !on })
+      .then((v) => { setOn(v); setError(null); })
+      .catch((e) => setError(String(e)));
+  };
+  return (
+    <SwitchRow
+      title="One login per jump host"
+      line="SSH tabs behind the same jump host share one login to it: one password or code for them all, not one per tab."
+      more={
+        <>
+          <p>
+            Up to 16 tabs share a login. The 17th makes a second one, once the first is ready, and uses the
+            password you typed for the first; a one-time code is asked for again. A login stays open for 30
+            seconds after its last tab closes, so a reconnect doesn't log in again.
+          </p>
+          <p className="mt-2">
+            Tabs only share when they log in as the same user, with the same password or key, the same way to the
+            jump host. A tab's own SFTP and port forwarding connections, a terminal's own login, Remote Desktop, VNC,
+            telnet and FTP through a jump host, and Monitoring, keep logins of their own. A jump host that records
+            sessions sees one login for all the tabs on it.
+          </p>
+          <p className="mt-2">
+            Off, each tab logs in to the jump host itself, as before. Tabs already sharing a login keep it until they
+            reconnect.
+          </p>
+        </>
+      }
+      on={on === true}
+      disabled={on === null}
+      onToggle={toggle}
+      error={error}
+    />
+  );
+}
+
 const mono = "font-mono text-zinc-300";
 
 export function ServersSection({ settings, setSettings }: any) {
@@ -92,6 +137,7 @@ export function ServersSection({ settings, setSettings }: any) {
           onToggle={() => setSettings((s: any) => ({ ...s, pingSound: !(s.pingSound !== false) }))}
         />
         <JumpLoginLimit />
+        <JumpSharing />
       </div>
     </SettingsSection>
   );
