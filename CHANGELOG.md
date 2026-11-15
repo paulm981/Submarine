@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.5.0-fork.7
+
+- **The AI tools never see hidden characters in server output.** What Claude Code or Codex gets from a server no longer holds invisible Unicode "tag" characters, a known way to hide instructions for a model, or terminal escape codes, and a password an escape code splits is still hidden from it. What you see doesn't change. ([#267](https://github.com/paulm981/Submarine/issues/267))
+
 ## v0.5.0-fork.6
 
 - **An SSH terminal shows what you type sooner.** A key's echo goes to the screen at once instead of waiting about 8 ms for more output, as in Home's shells since #234. Long output and floods are still grouped as before. ([#265](https://github.com/paulm981/Submarine/issues/265))
