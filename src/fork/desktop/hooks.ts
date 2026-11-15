@@ -11,6 +11,7 @@ import { appHotkey } from "../../ui/terminalDock";
 import { setServerSchemes } from "../../ui/terminalThemes";
 import { OPEN_SERVER } from "../../util/ai";
 import { HOME_HERE } from "../terminal/here";
+import { CLOSE_TAB_ASKING } from "../session/split";
 import { logLine } from "../../util/diagnostics";
 import { visibleName } from "../../util/fileName";
 import { folderTree } from "../../util/folderTree";
@@ -167,6 +168,7 @@ export const useOsBadges = (o: {
  *  its phone list and a tab's menu). Every way of closing a tab comes here:
  *  the ×, a middle click, the menu, All tabs, so each forgets the tab's name
  *  and split and goes back to Home.
+ *  Ctrl+Shift+W on a tab's last terminal comes here too, as its × does.
  *  Unmounting a SessionView disconnects it. `closeTabs` is a tab's
  *  right-click menu: the tabs other than it, after it, the disconnected
  *  ones, or every one. */
@@ -220,6 +222,23 @@ export const useCloseSessions = <S extends { id: string }, T extends { confirmCl
   const closeTabs = async (which: CloseWhich, targetId: string) => {
     await closeSessions(tabsToClose(which, o.sessions.map(s => s.id), targetId, o.statuses));
   };
+  // Ctrl+Shift+W on a tab's last terminal (closeTabAsking): as the tab's ×,
+  // asking first while it's connected. Set anew each render, so it goes by
+  // the tabs and their states as they are.
+  const askedRef = useRef((_id: string): boolean => false);
+  askedRef.current = (id) => {
+    if (!o.sessions.some(s => s.id === id)) return false;
+    void closeSessions([id]);
+    return true;
+  };
+  useEffect(() => {
+    const onAsk = (e: Event) => {
+      const id = (e as CustomEvent<unknown>).detail;
+      if (typeof id === "string" && askedRef.current(id)) e.preventDefault();
+    };
+    window.addEventListener(CLOSE_TAB_ASKING, onAsk);
+    return () => window.removeEventListener(CLOSE_TAB_ASKING, onAsk);
+  }, []);
   return { askCloseSession, closeSessions, closeTabs };
 };
 

@@ -11,6 +11,7 @@ import { MOST_PER_FRAME, nextTurns, QUICK_FRAME_MS, SLOW_FRAME_MS } from "../../
 import { clearWidths, MAX_WIDTHS, sharedMeasure, widthKey } from "../../src/fork/terminal/widthCache";
 import { CUSTOM_SCHEME, DEFAULT_SCHEME, schemeById } from "../../src/ui/terminalThemes";
 import { CUSTOM_THEME_ID, readScheme } from "../../src/util/terminalTheme";
+import { CLOSE_TAB_ASKING, closeTabAsking } from "../../src/fork/session/split";
 
 describe("hasVisibleText", () => {
   it("ignores control codes: colours, a title change, cursor moves", () => {
@@ -199,5 +200,28 @@ describe("the original project's AI terminal (#252)", () => {
 
   it("calls a pasted scheme by the same id in both files", () => {
     expect(CUSTOM_SCHEME).toBe(CUSTOM_THEME_ID);
+  });
+});
+
+describe("Ctrl+Shift+W on a tab's last terminal (#275)", () => {
+  // No page here: the window is a bare EventTarget for these tests.
+  const g = globalThis as unknown as { window?: EventTarget };
+  const withWindow = (run: (w: EventTarget) => void) => {
+    const before = g.window;
+    g.window = new EventTarget();
+    try { run(g.window); } finally { g.window = before; }
+  };
+
+  it("goes to the main window's close, which asks first, and says it was taken", () => {
+    withWindow((w) => {
+      const asked: unknown[] = [];
+      w.addEventListener(CLOSE_TAB_ASKING, (e) => { asked.push((e as CustomEvent).detail); e.preventDefault(); });
+      expect(closeTabAsking("s1")).toBe(true);
+      expect(asked).toEqual(["s1"]);
+    });
+  });
+
+  it("says no one took it when no main window listens, so the tab closes the original project's way", () => {
+    withWindow(() => { expect(closeTabAsking("s1")).toBe(false); });
   });
 });

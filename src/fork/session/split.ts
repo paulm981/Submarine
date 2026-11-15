@@ -13,7 +13,7 @@ import type { SessionTerminal } from "./rules";
 
 export const splitActions = ({
   sessionId, splitOn, splitTerminals, setSplitTerminals, setSplitRatios, activeTab, setActiveTab,
-  terminals, setTerminals, nextTerminalNumber, ownLogin,
+  setTerminals, nextTerminalNumber, ownLogin,
 }: {
   sessionId: string;
   /** The split is on screen (splitShown). */
@@ -23,7 +23,6 @@ export const splitActions = ({
   setSplitRatios: Dispatch<SetStateAction<number[]>>;
   activeTab: string;
   setActiveTab: Dispatch<SetStateAction<string>>;
-  terminals: SessionTerminal[];
   setTerminals: Dispatch<SetStateAction<SessionTerminal[]>>;
   /** SessionView's: the title of a new terminal. */
   nextTerminalNumber: (terminals: SessionTerminal[]) => string;
@@ -64,20 +63,17 @@ export const splitActions = ({
     }
     if (activeTab === id) setActiveTab(nextTerms[0] ?? id);
   };
-  // A terminal tab's close button.
-  const closeTerminal = (id: string) => {
-    const rest = terminals.filter(x => x.id !== id);
-    setTerminals(rest);
-    // A closed terminal leaves the split too, or the layout
-    // would keep a slot for it.
-    removeFromSplit(id);
-    // The one in front closed: the split's next pane, else the
-    // first tab left (not the closed one, when it was first).
-    if (activeTab === id) {
-      const nextInSplit = splitTerminals.find(s => s !== id && rest.some(x => x.id === s));
-      setActiveTab(nextInSplit ?? rest[0].id);
-    }
-  };
-  return { splitWith, splitWithNew, removeFromSplit, closeTerminal };
+  return { splitWith, splitWithNew, removeFromSplit };
 };
 export type SplitActions = ReturnType<typeof splitActions>;
+
+/** The window event asking the main window to close a server's tab. */
+export const CLOSE_TAB_ASKING = "submarine-close-tab-asking";
+/** Ctrl+Shift+W on a tab's last terminal (the original project's
+ *  closeTerminal, #340) closes the tab the way its × in the title bar does:
+ *  through the fork's close (useCloseSessions), which asks first while it's
+ *  connected ("Close this session?", unless that's turned off) and drops its
+ *  Wall pin. False when nothing took it (no main window listening), and the
+ *  caller then closes it the original project's way. */
+export const closeTabAsking = (sessionId: string): boolean =>
+  !window.dispatchEvent(new CustomEvent(CLOSE_TAB_ASKING, { detail: sessionId, cancelable: true }));
