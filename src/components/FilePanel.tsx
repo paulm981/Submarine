@@ -22,6 +22,7 @@ import { IS_ANDROID, IS_IOS, IS_MOBILE, IS_WINDOWS } from "../util/platform";
 import { nameFilterMatcher } from "../util/nameFilter";
 import { BOOKMARKS_MAX, readBookmarks, writeBookmarks } from "../util/sftpBookmarks";
 import { t, tk, tn, tx, useLanguage, useT } from "../i18n";
+import { copyText as copyToClipboard } from "../util/clipboard";
 
 // Batch overwrite state shared across items in a single download/upload run.
 // Once the user picks "Overwrite all", "Skip all" or Cancel the kind is sticky
@@ -1524,7 +1525,7 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
   // Copy name / Copy path in a row's menu. `done` is the message once copied.
   const copyText = async (text: string, done: string) => {
     try {
-      await navigator.clipboard.writeText(text);
+      await copyToClipboard(text);
       notify(done, "success");
     } catch (err: any) {
       notify(t("Copy failed: {error}", { error: String(err) }), "error");

@@ -25599,8 +25599,11 @@ async fn monitor_resume_all(
     jump_gone::resume_skipped(&db_state, skipped)
 }
 
-/// The clipboard's text, for a paste into the terminal. Only the Linux
-/// frontend asks; the others read it in the page.
+/// The clipboard's text, for a paste. The Linux and Android frontends ask;
+/// the others read it in the page.
+///
+/// Android's WebView refuses the page's `navigator.clipboard` altogether, so
+/// there the app's own Android plugin reads the system clipboard.
 ///
 /// WebKitGTK refuses the page's `navigator.clipboard.readText()` (#89). And
 /// where the webview reads the clipboard itself (a keyboard paste, or the
@@ -25626,10 +25629,30 @@ async fn clipboard_read_text(app: tauri::AppHandle) -> Result<String, String> {
             _ => Err("The clipboard did not answer.".to_string()),
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "android")]
+    {
+        android_bridge::clipboard_read(&app).await
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let _ = app;
         clipboard_read::read_text().await
+    }
+}
+
+/// Text onto the clipboard, for a copy on Android: its WebView refuses the
+/// page's `navigator.clipboard`, so the app's own Android plugin writes the
+/// system clipboard. The other platforms copy in the page.
+#[tauri::command]
+async fn clipboard_write_text(app: tauri::AppHandle, text: String) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        android_bridge::clipboard_write(&app, &text).await
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, text);
+        Err("Writing the clipboard here is only for Android.".to_string())
     }
 }
 
@@ -25958,7 +25981,8 @@ pub fn run() {
             local_open::live_edit_editor_get, local_open::live_edit_editor_pick, local_open::live_edit_editor_reset, bulk_pick::bulk_pick_files, import_hosts, host_import::pick_client_import_file,
             multiexec::get_jump_login_limit, multiexec::set_jump_login_limit, multiexec::write_terminals_data, jump_pool::get_jump_sharing, jump_pool::set_jump_sharing, server_os::detect_server_os, approvals::keep_server_ssh, set_server_terminal_theme, set_server_highlight,
             fonts::list_system_fonts,
-            clipboard_read_text
+            clipboard_read_text,
+            clipboard_write_text
         ]);
 
     // Clear out live-edit / drag temp dirs a crashed earlier run left behind

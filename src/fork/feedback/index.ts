@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { copyText } from "../../util/clipboard";
 
 // Feedback in this fork (#236, decision 3): the original project's form sends
 // what you type to its author's server (src-tauri/src/feedback.rs), which
@@ -35,7 +36,7 @@ export const REPORT_REPLY_CONFIRM: { message?: string; okLabel?: string } = {
 export async function openOnGithub(opts: { prefill?: string; append?: string } = {}): Promise<void> {
   if (opts.append) {
     // Before the browser opens, while the app still has the focus a copy needs.
-    try { await navigator.clipboard.writeText(opts.append); } catch (e) { console.error("[feedback] couldn't copy the reply:", e); }
+    try { await copyText(opts.append); } catch (e) { console.error("[feedback] couldn't copy the reply:", e); }
   }
   try { await invoke("open_external_url", { url: feedbackIssueUrl(opts.prefill) }); } catch (e) { console.error("[feedback] couldn't open the issue page:", e); }
 }
