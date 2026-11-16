@@ -28,16 +28,14 @@ export const IS_MOBILE: boolean = IS_ANDROID || IS_IOS;
 export const IS_LINUX: boolean =
   typeof navigator !== "undefined" && /Linux/i.test(navigator.userAgent) && !IS_ANDROID;
 
-// Windows, where the webview is WebView2. Clipboard reads go through the
-// backend there too — see util/clipboard.
+// A Mac, or an iPad (its WebView says "Macintosh" too): Command is the
+// shortcut key there, and Control+click is a right-click.
+export const IS_MAC: boolean =
+  typeof navigator !== "undefined" && /Mac/i.test(navigator.platform || navigator.userAgent) && !IS_ANDROID;
+
+// Windows, where drives have letters (an RDP server may be given a whole one).
 export const IS_WINDOWS: boolean =
   typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
-
-// macOS, where the webview is WKWebView. Clipboard reads go through the
-// backend there too — see util/clipboard. (iPhone and iPad user agents say
-// "like Mac OS X", so "Macintosh" is what's matched.)
-export const IS_MAC: boolean =
-  typeof navigator !== "undefined" && /Macintosh/i.test(navigator.userAgent);
 
 // True when we're inside a Tauri WebView (desktop or Android). Kept for future
 // use — some UI may want to differentiate a browser preview from packaged app.
