@@ -385,8 +385,20 @@ pub async fn ssh_docker_volumes_list(
 
 // Compose plugin first (`docker compose`); fall back to legacy script if
 // the plugin isn't installed. Caller never has to care which is present.
-fn compose_prefix() -> &'static str {
-    "if docker compose version >/dev/null 2>&1; then CCMD='docker compose'; else CCMD='docker-compose'; fi; $CCMD"
+/// A compose command with `args`: the compose plugin (`docker compose`) when
+/// the server has it, else the old `docker-compose`. The choice is made in
+/// the same shell as the command. (It used to be made inside `( … )`, a
+/// subshell, so it was lost: with the plugin, "compose ls" ran a bare
+/// `ls --all` and the `-f` actions failed. And `sudo -n` in front of the
+/// whole line was a syntax error.) With `sudo`, `sudo -n` goes in front of
+/// the compose command itself. `$CCMD` is unquoted on purpose: `docker
+/// compose` is two words.
+fn compose_command(args: &str, sudo: bool) -> String {
+    format!(
+        "if docker compose version >/dev/null 2>&1; then CCMD='docker compose'; else CCMD='docker-compose'; fi; {}$CCMD {}",
+        if sudo { "sudo -n " } else { "" },
+        args
+    )
 }
 
 #[tauri::command]
@@ -885,6 +897,59 @@ pub async fn open_container_terminal(
     ));
 
     Ok(())
+}
+
+#[cfg(test)]
+mod compose_command_tests {
+    use super::compose_command;
+
+    #[test]
+    fn the_choice_is_made_in_the_same_shell_and_sudo_goes_on_the_compose_command() {
+        let plain = compose_command("ls --all", false);
+        assert!(!plain.contains('('), "no subshell: {plain}");
+        assert!(plain.starts_with("if docker compose version >/dev/null 2>&1; then CCMD='docker compose'; else CCMD='docker-compose'; fi; "));
+        assert!(plain.ends_with("; $CCMD ls --all"), "{plain}");
+        let sudo = compose_command("-f '/srv/app/compose.yml' up -d --no-deps", true);
+        assert!(sudo.ends_with("; sudo -n $CCMD -f '/srv/app/compose.yml' up -d --no-deps"), "{sudo}");
+        assert_eq!(sudo.matches("sudo").count(), 1, "sudo only on the compose command: {sudo}");
+    }
+
+    // The command text in a real sh, with a stand-in `docker` (and `sudo`) on
+    // PATH: with the compose plugin, without it, and through sudo.
+    #[cfg(unix)]
+    #[test]
+    fn the_command_runs_the_right_compose_in_sh() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sub-compose-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = |name: &str, body: &str| {
+            let p = bin.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let run = |cmd: &str| {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{cmd} 2>&1"))
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        // A docker with the compose plugin: `docker compose version` works.
+        tool("docker", "echo \"docker $*\"");
+        tool("docker-compose", "echo \"docker-compose $*\"");
+        tool("sudo", "shift; \"$@\"");
+        assert_eq!(run(&compose_command("ls --all", false)), "docker compose ls --all");
+        assert_eq!(run(&compose_command("ls --all", true)), "docker compose ls --all");
+        // Without the plugin: `docker compose` fails, the old binary runs.
+        tool("docker", "[ \"$1\" = compose ] && exit 1; echo \"docker $*\"");
+        assert_eq!(run(&compose_command("-f 'a b.yml' ps", false)), "docker-compose -f a b.yml ps");
+        assert_eq!(run(&compose_command("-f 'a b.yml' ps", true)), "docker-compose -f a b.yml ps");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
