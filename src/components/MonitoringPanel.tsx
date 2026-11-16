@@ -9,6 +9,7 @@ import Sparkline from "./Sparkline";
 import { useConfirm } from "../ui/confirm";
 import { usePageShown } from "../hooks/usePageShown";
 import { t, tk, tn, tx, useT } from "../i18n";
+import { readUseSshAgentForMonitor } from "../util/sshAgent";
 
 // ---------- shared types ------------------------------------------------------
 
@@ -409,11 +410,14 @@ const MonitoringPanel = ({ servers, addLog, active = true }: Props) => {
       setLatest((p) => { const { [nodeId]: _, ...rest } = p; return rest; });
     });
   const pauseNode = (nodeId: number) => wrap(() => invoke("monitor_pause", { nodeId }));
-  const resumeNode = (nodeId: number) => wrap(() => invoke("monitor_resume", { nodeId }));
+  // A node with no saved password or key is logged in to with an ssh-agent's
+  // keys when this device's setting allows it (util/sshAgent).
+  // A resume also lets a node use the agent again after it didn't sign.
+  const resumeNode = (nodeId: number) => wrap(() => invoke("monitor_resume", { nodeId, useSshAgent: readUseSshAgentForMonitor() }));
   const pauseAll = () => wrap(() => invoke("monitor_pause_all"));
   // It names the servers it couldn't start; the rest did, so the list is
   // read again either way.
-  const resumeAll = () => wrap(() => invoke("monitor_resume_all").finally(() => reload()));
+  const resumeAll = () => wrap(() => invoke("monitor_resume_all", { useSshAgent: readUseSshAgentForMonitor() }).finally(() => reload()));
   const setMetrics = (nodeId: number, metrics: string[]) =>
     wrap(() => invoke("monitor_set_metrics", { nodeId, metrics }));
   const setCustoms = (nodeId: number, customs: CustomMetric[]) =>

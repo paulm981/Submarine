@@ -2,7 +2,8 @@
 //! original project doesn't conflict on them: what known_hosts says about a
 //! node (`KnownHosts`), a connection kept with its jump host's
 //! (`MonitorSession`), the node as `~/.ssh/config` and known_hosts resolve it
-//! with its jump host (`config_target`, #43), and the handler methods that
+//! with its jump host (`config_target`, #43), the login through it
+//! (`connect_for_monitor`), and the handler methods that
 //! refuse every channel a server tries to open (`refuse_server_channels!`).
 //! monitor.rs brings it in with `use fork::*`.
 
@@ -35,12 +36,16 @@ impl MonitorSession {
 /// its User when none is saved; its jump host's too, as the terminal resolves
 /// it (`ConfigTarget::resolve_jump_host`), so the monitor dials the address
 /// the terminal does and finds the host key the terminal stored under it.
-/// The monitor takes nothing else from the config (no ProxyCommand /
-/// ProxyJump, key files or agent): in the background it never runs commands
-/// or asks for anything. A node the config sends through a ProxyCommand or
-/// ProxyJump (and that has no proxy of its own), or a jump host it sends
-/// through either, isn't checked at all: `Err` says why. The terminal goes
-/// through them (#169), so dialling past them would check another path.
+/// With it, what the config says about the ssh-agent (IdentityAgent,
+/// IdentitiesOnly) for the node and for its jump host (`RouteAgents`), for a
+/// hop with no saved password or key (`Login::Agent`, as the original project
+/// has it since their #361). The monitor takes nothing else from the config
+/// (no ProxyCommand / ProxyJump or key files): in the background it never
+/// runs commands or asks for anything. A node the config sends through a
+/// ProxyCommand or ProxyJump (and that has no proxy of its own), or a jump
+/// host it sends through either, isn't checked at all: `Err` says why. The
+/// terminal goes through them (#169), so dialling past them would check
+/// another path.
 ///
 /// A server (or jump host) that proves who it is only with a certificate
 /// isn't checked either: the monitor trusts host keys the app has on file,
@@ -49,9 +54,10 @@ pub(crate) async fn config_target(
     db: &Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
     auth: &NodeAuth,
     node_name: &str,
-) -> Result<NodeAuth, String> {
+) -> Result<(NodeAuth, RouteAgents), String> {
     let mut target = crate::ConfigTarget::resolve(&auth.host, auth.port, &auth.username, Some(node_name.to_string())).await;
     let node_trust = known_hosts_for(&mut target).await.map(Arc::new);
+    let node_agent = agent_config_of(&target);
     let mut jump = match auth.jump.as_deref() {
         Some(j) => Some(
             crate::ConfigTarget::resolve_jump_host(&j.host, i32::from(j.port), &j.username, j.name.clone())
@@ -64,6 +70,7 @@ pub(crate) async fn config_target(
         Some((j, _)) => known_hosts_for(j).await.map(Arc::new),
         None => None,
     };
+    let agents = RouteAgents { node: node_agent, jump: jump.as_ref().map(|(j, _)| agent_config_of(j)).unwrap_or_default() };
     let mut resolved = apply_ssh_config(auth, target, jump)?;
     resolved.known_hosts = KnownHosts(node_trust.clone());
     if let Some(j) = resolved.jump.as_deref_mut() {
@@ -84,7 +91,95 @@ pub(crate) async fn config_target(
             }
         }
     }
-    Ok(resolved)
+    Ok((resolved, agents))
+}
+
+/// What `~/.ssh/config` says about the ssh-agent for the node and for its
+/// jump host (`config_target`). Each hop with no saved password or key logs
+/// in with the agent's keys as its own Host entry allows, as a terminal's
+/// hops do.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RouteAgents {
+    pub(super) node: AgentConfig,
+    pub(super) jump: AgentConfig,
+}
+
+/// What `t`'s Host entry says about the ssh-agent, as the original project's
+/// `with_ssh_config` reads it.
+pub(super) fn agent_config_of(t: &crate::ConfigTarget) -> AgentConfig {
+    AgentConfig {
+        identity_agent: t.identity_agent(),
+        identities_only: t.config.as_ref().is_some_and(|c| c.identities_only == Some(true)),
+    }
+}
+
+/// How the monitor logs in to one hop (`hop_login` in monitor.rs): the
+/// original project's `Login`, and for `Login::Agent` the ssh-agent found
+/// for it.
+pub(super) struct HopLogin {
+    pub(super) login: Login,
+    pub(super) agent: Option<crate::agent_auth::AgentSession>,
+}
+
+/// Whether the node, or its jump host, logs in with the ssh-agent's keys:
+/// then the poller doesn't ask an agent that didn't sign until a resume
+/// (`MonitorEntry::agent_stopped`), whichever hop it was for.
+pub(super) fn route_uses_agent(target: &NodeAuth, use_agent: bool) -> bool {
+    login_uses_agent(target, use_agent) || target.jump.as_deref().is_some_and(|j| login_uses_agent(j, use_agent))
+}
+
+/// The limit for a whole connect (`connect_limit`), through the jump host
+/// too: it has a reach, a handshake and a login of its own, with the agent's
+/// limits when it logs in with the agent's keys, and the channel between.
+pub(super) fn route_connect_limit(target: &NodeAuth, connect_timeout: Duration, use_agent: bool) -> Duration {
+    let hop = |a: &NodeAuth| connect_limit(connect_timeout, login_uses_agent(a, use_agent));
+    hop(target) + target.jump.as_deref().map_or(Duration::ZERO, hop)
+}
+
+/// Connect and log in, through the node's jump host when it has one.
+/// `agents`: what the config says about the ssh-agent for each hop
+/// (`config_target`); `use_agent`: the device's "Use keys from an ssh-agent"
+/// setting. `jump_turn`: the turn in the jump host's login queue, let go once
+/// the jump host has logged this one in (or failed to). An agent's prompt on
+/// the jump host's login holds it at most `agent_login_limit`.
+pub(super) async fn connect_for_monitor(
+    db: &Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
+    auth: &NodeAuth,
+    agents: &RouteAgents,
+    connect_timeout: Duration,
+    use_agent: bool,
+    jump_turn: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<MonitorSession, ConnectError> {
+    let login = hop_login(auth, &agents.node, use_agent).await?;
+    let Some(jump) = auth.jump.as_deref() else {
+        let transport = open_transport(auth, connect_timeout).await?;
+        let session = login_for_monitor(db, auth, transport, connect_timeout, login).await?;
+        return Ok(MonitorSession { session, jump: None });
+    };
+    // Through the jump host like `ssh -J`: log in to it, open a channel to
+    // the server, and run this server's handshake over that channel. Both
+    // host keys must already be trusted (from a terminal session), as for a
+    // direct connection, so an agent signs only for hosts the app trusts.
+    // Both hops' logins are known (and their agents found) before either
+    // server is contacted.
+    let in_jump = |e: ConnectError| ConnectError { message: format!("jump host {}: {}", jump.host, e.message), ..e };
+    let jump_login = hop_login(jump, &agents.jump, use_agent).await.map_err(in_jump)?;
+    let transport = open_transport(jump, connect_timeout).await.map_err(|e| in_jump(e.into()))?;
+    let bastion = login_for_monitor(db, jump, transport, connect_timeout, jump_login).await.map_err(in_jump)?;
+    drop(jump_turn);
+    let channel = tokio::time::timeout(
+        connect_timeout,
+        bastion.channel_open_direct_tcpip(auth.host.clone(), auth.port as u32, "127.0.0.1", 0),
+    )
+    .await
+    .map_err(|_| format!("jump host {}: no channel to {}:{} in time", jump.host, auth.host, auth.port))?
+    .map_err(|e| format!("jump host {}: could not reach {}:{}: {}", jump.host, auth.host, auth.port, e))?;
+    // Always drained, as for the interactive session's hop (see
+    // tunnel::DrainedChannelStream): a plain ChannelStream can deadlock the
+    // two connections on each other.
+    let transport: Box<dyn AsyncStream> = Box::new(crate::tunnel::drained_stream(channel));
+    let session = login_for_monitor(db, auth, transport, connect_timeout, login).await?;
+    Ok(MonitorSession { session, jump: Some(bastion) })
 }
 
 /// What the user's known_hosts files say about `t` (None with the
@@ -251,7 +346,15 @@ mod hook_tests {
         crate::fork_hooks::assert_hooks(
             "monitor.rs",
             include_str!("../monitor.rs"),
-            &[("", "mod fork;", 1), ("", "pub(crate) use fork::*;", 1), ("", "refuse_server_channels!();", 1), ("run_poller", "config_target(", 1)],
+            &[
+                ("", "mod fork;", 1),
+                ("", "pub(crate) use fork::*;", 1),
+                ("", "refuse_server_channels!();", 1),
+                ("run_poller", "config_target(", 1),
+                // The ssh-agent for the node and its jump host (#275).
+                ("run_poller", "route_uses_agent(", 1),
+                ("run_poller", "route_connect_limit(", 1),
+            ],
         );
     }
 }
