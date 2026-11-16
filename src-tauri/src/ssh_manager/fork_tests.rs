@@ -86,6 +86,9 @@ async fn one_host_key_question_at_a_time() {
 // ── Speed ─────────────────────────────────────────────────────────────
 
 // A jump host login that SSH terminal tabs share (#237), through the pump.
+// Test-only already (this file is), and marked so for remote_sh's exec
+// count, which skips a test-only module's own file but not its children.
+#[cfg(test)]
 mod jump_share;
 
 /// How long a typed key's echo takes from `write_terminal_data`'s queue to

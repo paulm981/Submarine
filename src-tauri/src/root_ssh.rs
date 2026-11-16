@@ -157,6 +157,7 @@ pub(crate) fn root_probe_command(tool: &str, password: bool, args: &[String], no
 /// it printed, up to 64 KB.
 pub(crate) async fn exec_probe_with_password<H: russh::client::Handler>(session_arc: &HandleArc<H>, cmd: &str, password: &str, timeout_secs: u64) -> Result<String, String> {
     use russh::ChannelMsg;
+    let line = password_line(password)?;
     let mut channel = shell_sftp::open_session_channel(session_arc).await?;
     channel.exec(true, cmd.as_bytes()).await.map_err(|e| e.to_string())?;
     let mut out: Vec<u8> = Vec::new();
@@ -170,7 +171,7 @@ pub(crate) async fn exec_probe_with_password<H: russh::client::Handler>(session_
                     }
                     if !sent && String::from_utf8_lossy(&out).lines().any(|l| l.trim() == "__SUB_SUDO:READ") {
                         sent = true;
-                        channel.data(&password_line(password)[..]).await.map_err(|e| e.to_string())?;
+                        channel.data(line.as_bytes()).await.map_err(|e| e.to_string())?;
                         channel.eof().await.map_err(|e| e.to_string())?;
                     }
                 }
@@ -343,13 +344,24 @@ pub(crate) fn new_root_tag() -> String {
     format!("__SUB_{}", hex)
 }
 
+/// What a root call fails with when the password has a line break (or a
+/// NUL) in it.
+pub(crate) const SUDO_PASSWORD_LINE_BREAK: &str = "[SUDO] FAILED: the password has a line break in it, so Submarine won't send it.";
+
 /// The password and a line break, in a buffer that never grows (so no copy
-/// is left behind unzeroised).
-pub(crate) fn password_line(password: &str) -> zeroize::Zeroizing<Vec<u8>> {
-    let mut line = zeroize::Zeroizing::new(Vec::with_capacity(password.len() + 1));
-    line.extend_from_slice(password.as_bytes());
-    line.push(b'\n');
-    line
+/// is left behind unzeroised). Every root path sends its password through
+/// here, after a script: sudo, dzdo and the scripts' `read` take one line,
+/// and the rest of a password with a line break in it would stay on stdin
+/// for what reads it next (a root shell would run it, as root). So such a
+/// password is refused, never cut or cleaned.
+pub(crate) fn password_line(password: &str) -> Result<zeroize::Zeroizing<String>, String> {
+    if password.contains(['\n', '\r', '\0']) {
+        return Err(SUDO_PASSWORD_LINE_BREAK.into());
+    }
+    let mut line = zeroize::Zeroizing::new(String::with_capacity(password.len() + 1));
+    line.push_str(password);
+    line.push('\n');
+    Ok(line)
 }
 
 /// How every command runs as root (POSIX sh, remote_sh::sh_command, the
@@ -493,6 +505,8 @@ pub(crate) async fn root_feed(channel: &mut russh::Channel<russh::client::Msg>, 
     let no_printf_tag = format!("{}:NO_PRINTF", feed.tag);
     let no_tool_tag = format!("{}:NO_TOOL", feed.tag);
     let mut hook = hook;
+    // Refused before the script is answered at all (password_line).
+    let pw_line = feed.password.map(password_line).transpose()?;
     // The script's lines up to RUN; what the tool said since READ.
     let mut pending: Vec<u8> = Vec::new();
     let mut said: Vec<u8> = Vec::new();
@@ -530,8 +544,8 @@ pub(crate) async fn root_feed(channel: &mut russh::Channel<russh::client::Msg>, 
             } else if line == no_tool_tag {
                 return Err(SUDO_NO_SUDO.into());
             } else if line == read_tag {
-                let Some(pw) = feed.password else { return Err(format!("{}: unexpected reply from the server", SUDO_FAILED)) };
-                channel.data(&password_line(pw)[..]).await.map_err(|e| e.to_string())?;
+                let Some(pw) = &pw_line else { return Err(format!("{}: unexpected reply from the server", SUDO_FAILED)) };
+                channel.data(pw.as_bytes()).await.map_err(|e| e.to_string())?;
                 deadline = Instant::now() + ROOT_CHECK_WAIT;
             } else if let Some(code) = line.strip_prefix(verdict_tag.as_str()) {
                 if code == "0" {
@@ -568,7 +582,7 @@ pub(crate) async fn root_feed(channel: &mut russh::Channel<russh::client::Msg>, 
         // prompt), and the password isn't sent. A prompt of PAM's own instead
         // isn't answered: in a terminal with nothing else to send, the user
         // sees it and types; otherwise it fails.
-        let pw = feed.password.ok_or_else(|| format!("{}: unexpected reply from the server", SUDO_FAILED))?;
+        let pw = pw_line.as_ref().ok_or_else(|| format!("{}: unexpected reply from the server", SUDO_FAILED))?;
         let prompt = format!("{}:PW:", feed.tag);
         let start = Instant::now();
         let mut quiet_by: Option<Instant> = None;
@@ -618,7 +632,7 @@ pub(crate) async fn root_feed(channel: &mut russh::Channel<russh::client::Msg>, 
         }
         let at = asked.unwrap_or(0);
         rest.drain(..at + prompt.len());
-        channel.data(&password_line(pw)[..]).await.map_err(|e| e.to_string())?;
+        channel.data(pw.as_bytes()).await.map_err(|e| e.to_string())?;
         if feed.pty && !feed.then.is_empty() {
             // The tool is done with the terminal (and drops what was typed
             // ahead) once the root shell shows its prompt.
@@ -1418,6 +1432,43 @@ exec "$@"
         assert_eq!(lab.attempts(), 1);
         assert_eq!(root_run(&lab.handle, &su("not it"), &["true".to_string()], 30, None).await, Err(SUDO_WRONG_PASSWORD.to_string()));
         assert_eq!(lab.attempts(), 2);
+    }
+
+    /// A password goes to the tool as one line (password_line): one with a
+    /// line break would leave the rest on stdin, for a root shell to run as
+    /// root. It's refused, never cut or cleaned.
+    #[test]
+    fn a_password_with_a_line_break_is_refused() {
+        for bad in ["s3cret\nid", "s3cret\r", "\nid", "s3cret\r\nid", "s3cret\0"] {
+            assert_eq!(password_line(bad).map(|_| ()), Err(SUDO_PASSWORD_LINE_BREAK.to_string()), "{bad:?}");
+        }
+        assert_eq!(password_line("s3cret pass").unwrap().as_str(), "s3cret pass\n");
+        assert_eq!(password_line("").unwrap().as_str(), "\n");
+        assert_eq!(password_line("it's $x `y` \\ !").unwrap().as_str(), "it's $x `y` \\ !\n");
+    }
+
+    /// Every way a password reaches a server (a probe, a command, a root
+    /// shell, SFTP's root mode, a stream) refuses one with a line break
+    /// before the tool is run at all: no attempt is counted, and nothing
+    /// after the break reaches a root shell.
+    #[tokio::test]
+    async fn a_password_with_a_line_break_never_reaches_the_server() {
+        let lab = Lab::new("pw-break", "shell", "all").await;
+        let bad = "s3cret pass\ntouch ran-as-root";
+        let refused = Err(SUDO_PASSWORD_LINE_BREAK.to_string());
+        let cmd = words("echo ran as root");
+        assert_eq!(root_probe(&lab.handle, "dzdo", Some(bad), &cmd, false).await, refused);
+        assert_eq!(find_root_shell_with_password(&lab.handle, "dzdo", &pw(bad), false).await, refused.clone().map(|()| None));
+        assert_eq!(root_run(&lab.handle, &su(bad), &cmd, 30, None).await.map(|_| ()), refused);
+        let sudo = ssh_manager::RootAccess::new("sudo", Some(pw(bad)), None, None);
+        assert_eq!(root_run(&lab.handle, &sudo, &cmd, 30, None).await.map(|_| ()), refused);
+        assert_eq!(root_channel_open(&lab.handle, &su(bad), &cmd, None, None).await.map(|_| ()), refused);
+        assert_eq!(probe_sudo_sftp(&lab.handle, Some(&pw(bad))).await.map(|_| ()), refused);
+        let path = "/usr/lib/openssh/sftp-server".to_string();
+        let elevation = ssh_manager::SftpElevation { server_path: Some(path.clone()), tool: "dzdo", password: Some(pw(bad)), shell: Some("su -"), password_failed: false };
+        assert_eq!(open_elevated_sftp(&lab.handle, &path, &elevation).await.map(|_| ()), refused);
+        assert_eq!((lab.attempts(), lab.called("dzdo"), lab.called("sudo")), (0, 0, 0));
+        assert!(!lab.dir.join("ran-as-root").exists());
     }
 
     /// dzdo whose only rule is `su -`, with no password: root through
