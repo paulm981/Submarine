@@ -9,6 +9,14 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.5.0-fork.12
+
+- **Jump to a tab by name is now Ctrl+Shift+J.** It was Ctrl+Shift+K, which now clears the terminal, as in the original project. Ctrl+Shift+J opens All tabs with its search ready, as Ctrl+Shift+K did. (Their [#294](https://github.com/SinaXhpm/submarine/pull/294); [#275](https://github.com/paulm981/Submarine/issues/275))
+- **Ctrl+Shift+K clears the terminal** (Cmd+Shift+K on a Mac), and so does **Clear terminal** in a terminal tab's right-click menu. It clears the screen and scrollback in the app only, keeps the line you're typing on, and sends nothing to the server. It does nothing while a full-screen program like vim or htop runs. (Their [#294](https://github.com/SinaXhpm/submarine/pull/294); [#275](https://github.com/paulm981/Submarine/issues/275))
+- **Ctrl+Shift+W closes the terminal you're in** (Cmd+Shift+W on a Mac). On a server's last terminal it closes the server's tab, the same way as the tab's ×: it asks "Close this session?" first while it's connected, unless you've turned that question off. Once a terminal's shell has ended, plain Ctrl+W closes it too. (Their [#340](https://github.com/SinaXhpm/submarine/pull/340); [#275](https://github.com/paulm981/Submarine/issues/275))
+- **Ctrl+Shift+Plus opens another terminal** on the same server. Once a terminal's shell has ended, plain Ctrl+Plus does too. (Their [#340](https://github.com/SinaXhpm/submarine/pull/340); [#275](https://github.com/paulm981/Submarine/issues/275))
+- **Ctrl+Shift+click in a terminal opens another terminal** on the same server (Cmd+Shift+click on a Mac), even while a program like htop or vim has the mouse. (Their [#358](https://github.com/SinaXhpm/submarine/pull/358); [#275](https://github.com/paulm981/Submarine/issues/275))
+
 ## v0.5.0-fork.11
 
 - **"Report this reply" in the AI chat goes to this fork.** It copies the reply to your clipboard and opens a new issue on the fork's GitHub, where you paste it and say what's wrong. It used to open the original project's issue page. The reply is never put in the page's address, and nothing is sent until you submit the issue. (Their [#343](https://github.com/SinaXhpm/submarine/pull/343); [#275](https://github.com/paulm981/Submarine/issues/275))
