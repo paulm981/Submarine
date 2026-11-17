@@ -442,7 +442,7 @@ mod over_ssh {
         std::fs::set_permissions(bin.join("hostname"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
         for login in LOGIN_SHELLS {
-            if !installed(login[0]) {
+            if !installed(login[0]) || fork::own_hostname(login, &path, &bin) { // fork: a busybox whose sh runs its own hostname can't show the stand-in
                 continue;
             }
             let _ = std::fs::remove_file(&log);
