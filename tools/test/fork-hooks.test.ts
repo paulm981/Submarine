@@ -111,13 +111,15 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
   },
   // Report this reply goes to the fork's GitHub, with the fork's words.
   { file: "src/components/ai/ChatPanel.tsx", imports: ["../../fork/feedback"], uses: ["...REPORT_REPLY_CONFIRM"] },
-  { file: "src/main.tsx", imports: ["./util/diagnostics", "./util/nativeMenus", "./util/plainTyping"] },
+  { file: "src/main.tsx", imports: ["./util/diagnostics", "./util/nativeMenus", "./util/plainTyping", "./fork/dialogFocus.css"] },
   { file: "src/ui/confirm.tsx", imports: ["../util/fileName"] },
 ];
 
 // Every source file's text, by its path from the repository root ("/src/…"):
 // read by Vite, so the test needs no Node types under the app's tsconfig.
 const SOURCES = import.meta.glob<string>("/src/**/*.{ts,tsx}", { query: "?raw", import: "default", eager: true });
+// Style files a hook imports (src/fork/dialogFocus.css): found by name, not read.
+const STYLES = new Set(Object.keys(import.meta.glob("/src/**/*.css")));
 
 /** `src` without its comments: block ones, and those on a line of their own
  *  or after the code (" // …"). */
@@ -141,6 +143,7 @@ const resolve = (file: string, spec: string): string | null => {
     else if (p !== ".") parts.push(p);
   }
   const base = parts.join("/");
+  if (base.endsWith(".css")) return STYLES.has(base) ? base : null;
   return [".ts", ".tsx", "/index.ts", "/index.tsx"].map((e) => base + e).find((p) => p in SOURCES) ?? null;
 };
 
