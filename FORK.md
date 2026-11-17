@@ -338,7 +338,7 @@ These are choices the fork makes on purpose. Each was weighed against staying cl
 
 ## Changes in the original project not taken yet
 
-Every change up to [#344](https://github.com/SinaXhpm/submarine/pull/344) is taken. Where the fork takes one differently, the table above says so. None is waiting.
+Every change up to [#344](https://github.com/SinaXhpm/submarine/pull/344) is taken. Where the fork takes one differently, the table above says so. The sync to #365 ([#275](https://github.com/paulm981/Submarine/issues/275)) comes in steps: its first brought in #343, #345, #336, #347, #348, #349, #351, #359, #362 and #365. Still to come in it: #340, #294 and #358 (terminal keys), #357 and #360 (scripts through sh, and compose), and #361 (monitoring with the ssh-agent).
 
 ## Keeping up with the original project
 
