@@ -17,6 +17,7 @@ import { IS_MOBILE, IS_WINDOWS } from "../util/platform";
 import { TAG_COLOURS, customTagColour, pickerValue } from "../util/tagColours";
 import { USUAL_PORTS, isFtp, type FtpProtocol, type ServerProtocol } from "../util/serverProtocol";
 import { t, tn, tx, useT } from "../i18n";
+import { copyText } from "../util/clipboard";
 
 // Compact "2h ago" style relative time for the attribution line.
 function relTime(d: Date): string {
@@ -383,7 +384,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
   const copyPublicKey = async () => {
     if (!generatedKey) return;
     try {
-      await navigator.clipboard.writeText(generatedKey.publicKey);
+      await copyText(generatedKey.publicKey);
       setPublicKeyCopied(true);
     } catch {
       setKeyBrowseNote(t("Couldn't copy — select the key text and copy it by hand."));
@@ -760,7 +761,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               <div className="grid grid-cols-4 gap-3 animate-in fade-in">
                 <input
                   className="col-span-3 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner"
-                  placeholder={t("Proxy Host")}
+                  placeholder={t("Proxy host")}
                   value={newNode.proxyHost || ""}
                   onChange={e => setNewNode({ ...newNode, proxyHost: e.target.value })}
                 />

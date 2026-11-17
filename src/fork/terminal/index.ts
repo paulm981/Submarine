@@ -11,4 +11,3 @@ export { fileMenuAt } from "./fileMenu";
 // Fork modules TerminalView calls directly, through the same import.
 export { appHotkey } from "../../ui/terminalDock";
 export { schemeForServer } from "../../ui/terminalThemes";
-export { readClipboardText } from "../../util/clipboard";

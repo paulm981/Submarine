@@ -1,12 +1,26 @@
 import { invoke } from "@tauri-apps/api/core";
-import { IS_LINUX, IS_MAC, IS_WINDOWS } from "./platform";
+import { IS_ANDROID, IS_LINUX } from "./platform";
+import { IS_MAC, IS_WINDOWS } from "./platform"; // fork
 
-// The clipboard's text, for a paste the app makes itself (a right-click in a
-// terminal). On Linux and Windows it comes from the backend
-// (lib.rs `clipboard_read_text`): WebKitGTK refuses the page's own read, and
-// crashes the app on an empty clipboard; WebView2 puts it behind a permission
-// prompt that, blocked or dismissed once, fails every paste after it;
-// WKWebView on macOS refuses it outright. The keyboard's own paste is the
-// webview's and needs neither. Android still reads it in the page.
-export const readClipboardText = (): Promise<string> =>
-  IS_LINUX || IS_WINDOWS || IS_MAC ? invoke<string>("clipboard_read_text") : navigator.clipboard.readText();
+// Copy and paste for the whole app. The page's own clipboard API
+// (navigator.clipboard) isn't usable everywhere:
+// - Android's WebView refuses it: a paste said "Clipboard read denied" and the
+//   copy buttons did nothing. There the app's Android plugin uses the system
+//   clipboard (lib.rs clipboard_read_text / clipboard_write_text).
+// - WebKitGTK on Linux refuses the page's read, and the webview's own read can
+//   crash the app on an empty clipboard (#89): reads go through the backend.
+// Elsewhere the page's API works.
+
+/** Puts `text` on the clipboard. Rejects when it couldn't. */
+export function copyText(text: string): Promise<void> {
+  if (IS_ANDROID) return invoke<void>("clipboard_write_text", { text });
+  if (!navigator.clipboard) return Promise.reject(new Error("No clipboard here"));
+  return navigator.clipboard.writeText(text);
+}
+
+/** The clipboard's text ("" when it holds none). Rejects when it can't be read. */
+export function readClipboardText(): Promise<string> {
+  if (IS_ANDROID || IS_LINUX || IS_WINDOWS || IS_MAC) return invoke<string>("clipboard_read_text"); // fork: Windows and macOS too (FORK.md, Paste)
+  if (!navigator.clipboard) return Promise.reject(new Error("No clipboard here"));
+  return navigator.clipboard.readText();
+}

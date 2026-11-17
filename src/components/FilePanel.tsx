@@ -22,6 +22,7 @@ import { IS_ANDROID, IS_IOS, IS_MOBILE, IS_WINDOWS } from "../util/platform";
 import { nameFilterMatcher } from "../util/nameFilter";
 import { BOOKMARKS_MAX, readBookmarks, writeBookmarks } from "../util/sftpBookmarks";
 import { t, tk, tn, tx, useLanguage, useT } from "../i18n";
+import { copyText as copyToClipboard } from "../util/clipboard";
 
 // Batch overwrite state shared across items in a single download/upload run.
 // Once the user picks "Overwrite all", "Skip all" or Cancel the kind is sticky
@@ -1524,7 +1525,7 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
   // Copy name / Copy path in a row's menu. `done` is the message once copied.
   const copyText = async (text: string, done: string) => {
     try {
-      await navigator.clipboard.writeText(text);
+      await copyToClipboard(text);
       notify(done, "success");
     } catch (err: any) {
       notify(t("Copy failed: {error}", { error: String(err) }), "error");
@@ -2115,7 +2116,7 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
               <RefreshCw size={11} className={loading ? "animate-spin" : ""} />
             </button>
           </div>
-          <button onClick={() => setModal({ type: "mkdir", v1: "" })} title={t("New Folder")} aria-label={t("New Folder")}
+          <button onClick={() => setModal({ type: "mkdir", v1: "" })} title={t("New folder")} aria-label={t("New folder")}
             className={`${headerBtn} text-indigo-300 ml-auto`}>
             <FolderPlus size={11} />
           </button>
@@ -2603,7 +2604,7 @@ const FilePanel = forwardRef<FilePanelHandle, FilePanelProps>(({
 
           <button onClick={() => { setContextMenu(null); setModal({ type: "mkdir", v1: "" }); }}
             className="w-full flex items-center gap-2 p-1.5 rounded hover:bg-white/10 text-left hover:text-white">
-            <Plus size={11} className="text-indigo-300" /><span>{t("New Folder")}</span>
+            <Plus size={11} className="text-indigo-300" /><span>{t("New folder")}</span>
           </button>
           {!multi && (
             <button onClick={() => { setContextMenu(null); setModal({ type: "rename", entry: contextMenu.entry, v1: contextMenu.entry.name }); }}

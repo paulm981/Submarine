@@ -12,6 +12,7 @@ import { useConfirm } from "../ui/confirm";
 import { useRootInvoke } from "../ui/rootInvoke";
 import { DEFAULT_INFO_FONT_SIZE, useInfoFontSize } from "../util/infoFont";
 import { t, tk, tn, tx, useT } from "../i18n";
+import { copyText } from "../util/clipboard";
 
 interface DockerTabProps {
   sessionId: string;
@@ -824,10 +825,10 @@ const PruneView = ({ sessionId }: { sessionId: string }) => {
   const confirm = useConfirm();
 
   const scopes: { key: string; label: string; description: string; warning?: string }[] = [
-    { key: "containers", label: t("Stopped Containers"), description: t("Removes containers that are not running. Safe — restartable containers are unaffected.") },
-    { key: "images",     label: t("Dangling Images"),    description: t("Removes images with no tag and no container referencing them. Tagged images are untouched.") },
-    { key: "networks",   label: t("Unused Networks"),    description: t("Removes user-created networks no container is attached to. Default bridge/host/none are untouched.") },
-    { key: "builder",    label: t("Build Cache"),        description: t("Clears Docker BuildKit cache. Future builds re-download / rebuild base layers.") },
+    { key: "containers", label: t("Stopped containers"), description: t("Removes containers that are not running. Safe — restartable containers are unaffected.") },
+    { key: "images",     label: t("Dangling images"),    description: t("Removes images with no tag and no container referencing them. Tagged images are untouched.") },
+    { key: "networks",   label: t("Unused networks"),    description: t("Removes user-created networks no container is attached to. Default bridge/host/none are untouched.") },
+    { key: "builder",    label: t("Build cache"),        description: t("Clears Docker BuildKit cache. Future builds re-download / rebuild base layers.") },
     { key: "system",     label: t("Everything (safe)"),  description: t("Runs all of the above. Does NOT touch named volumes or tagged images."), warning: t("Combines all safe prune scopes in one go.") },
   ];
 
@@ -1159,7 +1160,7 @@ const ContainerDetailsModal = ({
               </button>
               {live && <span className="text-[10px] text-emerald-400 font-mono animate-pulse-brief">{t("● streaming")}</span>}
               <button
-                onClick={() => { navigator.clipboard.writeText(logs).catch(() => {}); }}
+                onClick={() => { copyText(logs).catch(() => {}); }}
                 className="ml-auto h-7 px-2 rounded-md text-[11px] font-semibold text-zinc-400 hover:text-white hover:bg-white/5 flex items-center gap-1.5"
               >
                 <Copy size={11} /> {t("Copy")}
@@ -1221,7 +1222,7 @@ const ContainerDetailsModal = ({
                 {inspect.loading ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />} {t("Refresh")}
               </button>
               <button
-                onClick={() => { if (inspect.text) navigator.clipboard.writeText(inspect.text).catch(() => {}); }}
+                onClick={() => { if (inspect.text) copyText(inspect.text).catch(() => {}); }}
                 className="ml-auto h-7 px-2 rounded-md text-[11px] font-semibold text-zinc-400 hover:text-white hover:bg-white/5 flex items-center gap-1.5"
               >
                 <Copy size={11} /> {t("Copy JSON")}
@@ -1362,7 +1363,7 @@ const ComposeViewerModal = ({
   useEffect(() => { loadYaml(); /* eslint-disable-next-line */ }, []);
 
   const copyPath = () => {
-    navigator.clipboard.writeText(filePath).then(() => {
+    copyText(filePath).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     }).catch(() => {});
@@ -1394,7 +1395,7 @@ const ComposeViewerModal = ({
         ) : (
           <Card title="compose.yaml" actions={
             yaml.data && (
-              <button onClick={() => { navigator.clipboard.writeText(yaml.data!).catch(() => {}); }}
+              <button onClick={() => { copyText(yaml.data!).catch(() => {}); }}
                 className="h-6 px-2 rounded text-[11px] font-semibold text-zinc-400 hover:text-white hover:bg-white/5 flex items-center gap-1">
                 <Copy size={10} /> {t("Copy")}
               </button>

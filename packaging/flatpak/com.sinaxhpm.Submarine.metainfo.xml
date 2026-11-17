@@ -8,6 +8,7 @@
   <developer id="com.sinaxhpm">
     <name>Sina Xhpm</name>
   </developer>
+  <update_contact>sinaxhpm@gmail.com</update_contact>
   <description>
     <p>
       Submarine keeps your servers in one window. Each server opens as a tab with its terminal,
@@ -43,11 +44,11 @@
     </screenshot>
     <screenshot>
       <caption>Live monitoring of several servers</caption>
-      <image>https://raw.githubusercontent.com/SinaXhpm/Submarine/main/docs/screenshots/monitoring.png</image>
+      <image>https://raw.githubusercontent.com/SinaXhpm/Submarine/main/docs/screenshots/monitor.png</image>
     </screenshot>
     <screenshot>
       <caption>A server's connection settings</caption>
-      <image>https://raw.githubusercontent.com/SinaXhpm/Submarine/main/docs/screenshots/server-edit.png</image>
+      <image>https://raw.githubusercontent.com/SinaXhpm/Submarine/main/docs/screenshots/add-server.png</image>
     </screenshot>
   </screenshots>
   <releases>

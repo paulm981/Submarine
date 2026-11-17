@@ -176,7 +176,7 @@ The original project's README follows.
   </tr>
   <tr>
     <td colspan="2" align="center">
-      <a href="docs/screenshots/servers-home-lab.png"><img src="docs/screenshots/servers-home-lab.png" alt="A folder of servers with colour tags and badges for RDP, VNC and Telnet servers" /></a>
+      <a href="docs/screenshots/servers-home-lab.png"><img src="docs/screenshots/servers-home-lab.png" alt="A folder of servers as cards: each with its protocol icon in its own colour and a badge for SSH, RDP, VNC or Telnet" /></a>
       <br/><sub><b>Servers</b> — nested, colour-tagged folders with drag and drop; RDP, VNC and Telnet servers carry a badge</sub>
     </td>
   </tr>
@@ -230,7 +230,7 @@ The original project's README follows.
   <img src="docs/screenshots/servers.png" alt="The server list with colour-tagged folders and two servers outside any folder" width="560" />
 </p>
 <p align="center">
-  <img src="docs/screenshots/settings.png" alt="Settings: accent colour, background theme, ssh-agent and ssh config switches, terminal font" width="560" />
+  <img src="docs/screenshots/settings.png" alt="Settings: the language, keepalives and reconnecting, the ssh-agent switch, the accent colour and the background theme" width="560" />
   <img src="docs/screenshots/terminal.png" alt="A full-width terminal session with coloured output" width="320" />
 </p>
 
@@ -471,9 +471,9 @@ Not portable: the Microsoft Edge WebView2 runtime (a Windows system component, p
 Submarine on Android is a native build of the same Rust core — same SSH stack, same encrypted vault format, same profile sync. Reach a server from your phone with the credentials you saved on your desktop.
 
 <p align="center">
-  <img src="docs/screenshots/android-terminal.png" alt="Submarine on Android: an SSH terminal session with the key bar (Ctrl, Alt, Shift, Esc, Tab, arrows) above the keyboard and the bottom navigation bar" width="240" />
+  <img src="docs/screenshots/android-terminal.png" alt="Submarine on Android: an SSH terminal session with the key bar (Ctrl, Alt, Shift, Esc, Tab, arrows) and the bottom navigation bar" width="240" />
   &nbsp;&nbsp;
-  <img src="docs/screenshots/android-server-form.png" alt="Submarine on Android: the server form with the tag colour picker wrapping into rows to fit a narrow screen" width="240" />
+  <img src="docs/screenshots/android-servers.png" alt="Submarine on Android: the server list, with folders and servers as cards in one column, and the bottom navigation bar" width="240" />
 </p>
 
 - **Same encrypted vault.** With cloud sync on, your profiles appear on the phone as they were on the desktop.
@@ -504,7 +504,7 @@ Built for Android 7.0 (API 24) and newer, on phones, tablets and Android-on-Chro
 - Each record is encrypted on your device before upload. The server **does see metadata**: record IDs, record types (servers, credentials, keys, notes, commands, folders), timestamps and deleted flags, the profile's display name, the number of records, and for shared profiles the share names and member email addresses.
 - The server also holds a copy of the vault key **sealed with your master password**. Someone who got hold of the server's data could try to guess a weak master password offline, at Argon2id cost — so use a **long master password** if you sync. A server breach does not hand over the plaintext, but the master password is the only thing standing in the way.
 - Cloud sync is **opt-in per account**: once you sign in, profiles you open are linked and synced (Auto-sync is on by default and can be turned off in Settings). Don't sign in on a computer if you don't want its profiles uploaded.
-- You can run **your own sync server** instead of the hosted one.
+- You can run **your own sync server** instead of the hosted one: [submarine-sync-server](https://github.com/SinaXhpm/submarine-sync-server).
 - **You can delete your account from inside the app** (Cloud sync → *Delete account…*, confirmed with your password): everything the server holds for it goes at once. The full details, with retention times, are in the [privacy policy](PRIVACY.md).
 - [How your data is protected](https://submarine.sinaxhpm.com/security/) explains all of this with links to the code that does it, and ways to check it yourself.
 

@@ -102,13 +102,15 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
     imports: ["../fork/terminal"],
     uses: [
       "Fork.TerminalProps", "Fork.broadcastWrite(terminalId", "Fork.fileMenuAt", "Fork.useTerminal", "Fork.rootOpened", "Fork.schemeForServer", "Fork.savedPasswords",
-      "Fork.xtermLook", "Fork.mountTerminal", "Fork.readClipboardText", "Fork.appHotkey", "Fork.pasteClean",
+      "Fork.xtermLook", "Fork.mountTerminal", "Fork.appHotkey", "Fork.pasteClean",
       "Fork.TerminalOverlay", "fork.write", "fork.commands.resize", "fork.commands.close", "fork.resetHighlight",
       "fork.outputChannel", "fork.rootInvoke", "fork.watchForShellReady", "fork.dockElRef", "fork.dockEl", "fork.onScreen",
       "forkTerm.startGpu", "forkTerm.openLocal", "forkTerm.output", "forkTerm.write", "forkTerm.applyLook",
       "forkTerm.register", "forkTerm.unmount", "forkTerm.dispose", "forkTerm.undock",
     ],
   },
+  // Report this reply goes to the fork's GitHub, with the fork's words.
+  { file: "src/components/ai/ChatPanel.tsx", imports: ["../../fork/feedback"], uses: ["...REPORT_REPLY_CONFIRM"] },
   { file: "src/main.tsx", imports: ["./util/diagnostics", "./util/nativeMenus", "./util/plainTyping", "./fork/dialogFocus.css"] },
   { file: "src/ui/confirm.tsx", imports: ["../util/fileName"] },
 ];
