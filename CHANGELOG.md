@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.5.0-fork.14
+
+- **Monitoring logs in with your ssh-agent's keys** for a server with no saved password or key, when "Use keys from an ssh-agent" is on in Settings. It works through a jump host too: the jump host, if nothing is saved for it either, logs in with the agent's keys as well. Security keys are never offered, since nobody is there to touch them. An agent that refuses or doesn't answer in time isn't asked again for that server until you pause and resume it, so its prompts don't keep coming back. `IdentityAgent` and `IdentitiesOnly` in `~/.ssh/config` are respected. (Their [#361](https://github.com/SinaXhpm/submarine/pull/361); [#275](https://github.com/paulm981/Submarine/issues/275))
+
 ## v0.5.0-fork.13
 
 - **Servers whose login shell is csh, tcsh or fish work in the Info panel and in monitoring.** The app's own scripts now always run in sh, whatever the server's login shell, as Docker and root (sudo, dzdo) already did. On csh and tcsh, opening the Info panel as root could rename the server to "2"; it no longer does. The OS badge shows on those servers too, and still on Windows ones. Each script the app sends has a time limit, so a server that stops reading can't hold it up. (Their [#357](https://github.com/SinaXhpm/submarine/pull/357); [#275](https://github.com/paulm981/Submarine/issues/275))
