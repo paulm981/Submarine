@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.5.0-fork.13
+
+- **Servers whose login shell is csh, tcsh or fish work in the Info panel and in monitoring.** The app's own scripts now always run in sh, whatever the server's login shell, as Docker and root (sudo, dzdo) already did. On csh and tcsh, opening the Info panel as root could rename the server to "2"; it no longer does. The OS badge shows on those servers too, and still on Windows ones. Each script the app sends has a time limit, so a server that stops reading can't hold it up. (Their [#357](https://github.com/SinaXhpm/submarine/pull/357); [#275](https://github.com/paulm981/Submarine/issues/275))
+
 ## v0.5.0-fork.12
 
 - **Jump to a tab by name is now Ctrl+Shift+J.** It was Ctrl+Shift+K, which now clears the terminal, as in the original project. Ctrl+Shift+J opens All tabs with its search ready, as Ctrl+Shift+K did. (Their [#294](https://github.com/SinaXhpm/submarine/pull/294); [#275](https://github.com/paulm981/Submarine/issues/275))
