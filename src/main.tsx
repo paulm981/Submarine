@@ -5,6 +5,7 @@ import ErrorBoundary from "./components/ErrorBoundary";
 import { IS_IOS, IS_MOBILE } from "./util/platform";
 import { initI18n } from "./i18n";
 import "./App.css";
+import "./fork/dialogFocus.css"; // the focused button in a dialog stands out (#273)
 // Registers the bundled terminal fonts (@font-face) before any terminal mounts.
 import "./util/bundledFonts";
 import { startDiagnostics } from "./util/diagnostics";

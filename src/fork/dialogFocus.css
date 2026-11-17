@@ -1,0 +1,10 @@
+/* The button a dialog's Enter presses is the one with the focus, so it is the
+   one that has to stand out. The original project's dialogs focus Cancel
+   where Enter mustn't say yes (the question before pasting several lines,
+   opening a link), but draw the other button in the bright colour, so it
+   looked like the one Enter would press (#273). A clear ring shows where the
+   focus is, in every modal dialog; Tab moves it, and Enter presses that one. */
+[role="dialog"][aria-modal="true"] button:focus {
+  outline: 2px solid rgba(255, 255, 255, 0.9);
+  outline-offset: 2px;
+}
