@@ -9,6 +9,13 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.5.0-fork.11
+
+- **"Report this reply" in the AI chat goes to this fork.** It copies the reply to your clipboard and opens a new issue on the fork's GitHub, where you paste it and say what's wrong. It used to open the original project's issue page. The reply is never put in the page's address, and nothing is sent until you submit the issue. (Their [#343](https://github.com/SinaXhpm/submarine/pull/343); [#275](https://github.com/paulm981/Submarine/issues/275))
+- **Remote Desktop: open the shared folder on the server.** The RDP tab's Files panel says where your shared folder is on the server ("<name> on Submarine" in This PC, or thinclient_drives with xrdp). "Open it on the server" opens Run there and types the folder's address, leaving Enter to you. The server form's hint names the folder too. (Their [#365](https://github.com/SinaXhpm/submarine/pull/365); [#275](https://github.com/paulm981/Submarine/issues/275))
+- **More buttons and labels in sentence case.** Add password, Add key, Port forwarding, New folder, the monitor's settings and chart labels, Docker's clean-up choices and others in the original project's screens. (Their [#348](https://github.com/SinaXhpm/submarine/pull/348); [#275](https://github.com/paulm981/Submarine/issues/275))
+- **On Android:** copy and paste work, a held arrow on the key bar keeps the keyboard up, the session list no longer reopens after its last session closes, and the keep-alive notification shows only while a connection is open. (Their [#343](https://github.com/SinaXhpm/submarine/pull/343), [#345](https://github.com/SinaXhpm/submarine/pull/345), [#347](https://github.com/SinaXhpm/submarine/pull/347), [#362](https://github.com/SinaXhpm/submarine/pull/362); [#275](https://github.com/paulm981/Submarine/issues/275))
+
 ## v0.5.0-fork.10
 
 - **A dialog shows which button Enter will press.** The focused button now has a clear ring. In the question before pasting several lines, Cancel is the default and now looks it: press Tab, then Enter, to paste. ([#273](https://github.com/paulm981/Submarine/issues/273))
