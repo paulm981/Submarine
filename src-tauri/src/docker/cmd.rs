@@ -29,7 +29,7 @@ impl Cmd {
         let join = |w: &[String]| w.iter().map(|w| shq(w)).collect::<Vec<_>>().join(" ");
         match self {
             Cmd::Docker(w) => join(w),
-            Cmd::Compose(w) => format!("{} {}", compose_prefix(), join(w)),
+            Cmd::Compose(w) => compose_command(&join(w), false),
         }
     }
 }

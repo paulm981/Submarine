@@ -18,8 +18,48 @@ pub(crate) const RESET_TRIGGER: &str = "DROP TRIGGER IF EXISTS servers_os_reset;
   BEGIN UPDATE servers SET os = NULL WHERE id = NEW.id; END;";
 
 /// os-release on Linux and the BSDs that have it, then uname, then Windows'
-/// `ver` (cmd.exe, the default shell of Windows' OpenSSH server).
-const PROBE: &str = "cat /etc/os-release 2>/dev/null || uname -s 2>/dev/null || ver";
+/// `ver` (cmd.exe, the default shell of Windows' OpenSSH server). The login
+/// shell reads it as it is (run_probe), so it is one line every one of them
+/// reads the same way: sh, csh, tcsh and fish, and cmd.exe. No `2>`: csh
+/// reads `cat f 2>/dev/null` as `cat f 2`, its output to /dev/null. Only
+/// stdout is read, so what fails says nothing.
+const PROBE: &str = "cat /etc/os-release || uname -s || ver";
+
+/// How long the probe gets, sent and answered.
+const PROBE_SECS: u64 = 15;
+
+/// What of its answer is read.
+const PROBE_MAX: usize = 64 * 1024;
+
+/// PROBE's stdout, up to PROBE_MAX, on a channel of its own. Not through
+/// the app's `run_script` (`sh -s`): a Windows server has no sh, and the
+/// badge is how it says it is Windows. So the login shell gets the line as
+/// it is (remote_sh::Reader::LoginShell).
+async fn run_probe<H: russh::client::Handler>(session: &tokio::sync::RwLock<russh::client::Handle<H>>) -> Result<String, String> {
+    use tokio::io::AsyncReadExt;
+    let channel = crate::shell_sftp::open_session_channel(session).await?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(PROBE_SECS);
+    crate::remote_sh::send_command(&channel, crate::remote_sh::Reader::LoginShell, PROBE, deadline).await?;
+    let mut stream = channel.into_stream();
+    let mut out: Vec<u8> = Vec::with_capacity(4096);
+    let read = async {
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let room = PROBE_MAX - out.len();
+                    out.extend_from_slice(&buf[..n.min(room)]);
+                    if out.len() >= PROBE_MAX {
+                        break;
+                    }
+                }
+            }
+        }
+    };
+    tokio::time::timeout_at(deadline, read).await.map_err(|_| format!("the OS probe timed out after {}s", PROBE_SECS))?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
 
 /// The OS IDs the frontend has a badge for (src/components/OsBadge.tsx). An
 /// ID not among them is stored as the first of its ID_LIKE that is.
@@ -105,7 +145,11 @@ pub async fn detect_server_os(
     host: String,
     port: i64,
 ) -> Result<Option<String>, String> {
-    let out = crate::run_exec_capture(&ssh, &session_id, PROBE, 15).await?;
+    let session = {
+        let connections = ssh.connections.lock().await;
+        connections.get(&session_id).map(std::sync::Arc::clone).ok_or_else(|| "Session not connected".to_string())?
+    };
+    let out = run_probe(&session).await?;
     let Some(os) = parse_os(&out) else { return Ok(None) };
     let changed = {
         let conn_guard = db.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
@@ -121,6 +165,43 @@ pub async fn detect_server_os(
 #[cfg(test)]
 mod tests {
     use super::{parse_os, store_os, RESET_TRIGGER};
+
+    /// The probe through each login shell this machine has, as a server
+    /// runs it: the line as it is, read by that shell (sh, csh, tcsh and
+    /// fish all name the OS), never `sh -s`, which a Windows server lacks.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_login_shell_names_the_os() {
+        use crate::ssh_test_server::{connect, ShellOpts, TestServer};
+        use std::sync::Arc;
+        let mut ran = Vec::new();
+        for login in [&["sh", "-c"][..], &["bash", "-c"], &["dash", "-c"], &["csh", "-c"], &["tcsh", "-c"], &["fish", "-c"]] {
+            let found = std::process::Command::new("sh").args(["-c", &format!("command -v {} >/dev/null", login[0])]).status();
+            if !found.is_ok_and(|s| s.success()) {
+                eprintln!("skipped {}: not installed", login[0]);
+                continue;
+            }
+            let server = TestServer::with_shell(ShellOpts {
+                path: None,
+                cwd: None,
+                login: login.iter().map(|s| s.to_string()).collect(),
+                keep_running_on_close: false,
+            });
+            let commands = Arc::clone(&server.commands);
+            let s = tokio::sync::RwLock::new(connect(server, |_| {}, crate::build_ssh_client_config()).await.unwrap());
+            let out = super::run_probe(&s).await.unwrap();
+            assert!(parse_os(&out).is_some(), "{}: {out}", login[0]);
+            assert_eq!(*commands.lock().unwrap(), vec![super::PROBE.to_string()], "{}", login[0]);
+            ran.push(login[0]);
+        }
+        assert!(ran.contains(&"sh"), "{ran:?}");
+    }
+
+    /// One line, nothing csh, fish or cmd.exe read another way.
+    #[test]
+    fn the_probe_reads_the_same_in_every_shell() {
+        assert!(!super::PROBE.contains(['\n', '\'', '"', '!', '\\', '$', '>', '<', '`', ';']), "{}", super::PROBE);
+    }
     use rusqlite::Connection;
 
     #[test]

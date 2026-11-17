@@ -36,10 +36,14 @@ impl DockerStreams {
 
 // ---- helpers ----------------------------------------------------------------
 
-// POSIX-safe quoting (remote_sh::quote). Works on the typical Linux/macOS
-// docker host. Windows servers running docker almost always use WSL2
-// (POSIX), so this is the right default.
-use crate::remote_sh::quote as shq;
+// POSIX-safe quoting: wrap in single quotes, escape internal single quotes.
+// Works on the typical Linux/macOS docker host. Windows servers running
+// docker almost always use WSL2 (POSIX), so this is the right default.
+// `pub(crate)` — lib.rs's `open_terminal` reuses it to quote a shell path
+// for the "use my default shell" setting rather than duplicate the escaping.
+pub(crate) fn shq(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
 
 // Validate a docker object name (container/image/volume/network/project).
 // Docker's accepted character set is roughly [a-zA-Z0-9_.-], plus colon
@@ -82,24 +86,23 @@ async fn run_capture(
     cmd: &str,
     timeout_secs: u64,
 ) -> Result<(i32, String), String> {
-    // Run by sh whatever the login shell is: csh and tcsh read `2>&1` and
-    // `$?` their own way (remote_sh). A Windows server (OpenSSH's cmd.exe or
-    // PowerShell) has no sh: there it runs as it was before.
-    let wrapped = crate::remote_sh::sh_command(&[], &format!("{}\necho __DOCK_EXIT:$?", cmd), &[]);
-    let (code, out) = run_capture_raw(state, session_id, &wrapped, timeout_secs).await?;
+    // A Windows server (OpenSSH's cmd.exe or PowerShell) has no sh: there
+    // the command goes to the login shell as it is, as it did before.
+    let (code, out) = run_capture_raw(state, session_id, cmd, timeout_secs, crate::remote_sh::Reader::Sh).await?;
     if code != 0 && out.contains("'sh' is not recognized") {
-        return run_capture_raw(state, session_id, &format!("{}\necho __DOCK_EXIT:$?", cmd), timeout_secs).await;
+        return run_capture_raw(state, session_id, cmd, timeout_secs, crate::remote_sh::Reader::LoginShell).await;
     }
     Ok((code, out))
 }
 
-/// Run `wrapped` (which ends by echoing `__DOCK_EXIT:<code>`) and split the
-/// code from the output.
+/// Run `cmd`, read by `reader`, and split its exit code (it echoes
+/// `__DOCK_EXIT:<code>` last) from the output.
 async fn run_capture_raw(
     state: &SshState,
     session_id: &str,
-    wrapped: &str,
+    cmd: &str,
     timeout_secs: u64,
+    reader: crate::remote_sh::Reader,
 ) -> Result<(i32, String), String> {
     let session_arc = {
         let connections = state.connections.lock().await;
@@ -109,10 +112,11 @@ async fn run_capture_raw(
             .ok_or_else(|| "Session not connected".to_string())?
     };
     let channel = crate::shell_sftp::open_session_channel(&session_arc).await?;
-    channel
-        .exec(true, wrapped.as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
+    // sh reads it, whatever the login shell is (remote_sh). Sending it and
+    // reading what it prints share the time limit.
+    let wrapped = format!("{}\necho __DOCK_EXIT:$?", cmd);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    crate::remote_sh::send_command(&channel, reader, &wrapped, deadline).await?;
     let mut stream = channel.into_stream();
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let read_fut = async {
@@ -129,7 +133,7 @@ async fn run_capture_raw(
             }
         }
     };
-    tokio::time::timeout(Duration::from_secs(timeout_secs), read_fut)
+    tokio::time::timeout_at(deadline, read_fut)
         .await
         .map_err(|_| format!("docker command timed out after {}s", timeout_secs))?;
     let text = String::from_utf8_lossy(&buf).into_owned();
@@ -381,8 +385,20 @@ pub async fn ssh_docker_volumes_list(
 
 // Compose plugin first (`docker compose`); fall back to legacy script if
 // the plugin isn't installed. Caller never has to care which is present.
-fn compose_prefix() -> &'static str {
-    "if docker compose version >/dev/null 2>&1; then CCMD='docker compose'; else CCMD='docker-compose'; fi; $CCMD"
+/// A compose command with `args`: the compose plugin (`docker compose`) when
+/// the server has it, else the old `docker-compose`. The choice is made in
+/// the same shell as the command. (It used to be made inside `( … )`, a
+/// subshell, so it was lost: with the plugin, "compose ls" ran a bare
+/// `ls --all` and the `-f` actions failed. And `sudo -n` in front of the
+/// whole line was a syntax error.) With `sudo`, `sudo -n` goes in front of
+/// the compose command itself. `$CCMD` is unquoted on purpose: `docker
+/// compose` is two words.
+fn compose_command(args: &str, sudo: bool) -> String {
+    format!(
+        "if docker compose version >/dev/null 2>&1; then CCMD='docker compose'; else CCMD='docker-compose'; fi; {}$CCMD {}",
+        if sudo { "sudo -n " } else { "" },
+        args
+    )
 }
 
 #[tauri::command]
@@ -589,11 +605,11 @@ pub async fn ssh_docker_logs_start(
                 .ok_or_else(|| "Session not connected".to_string())?
         };
         let channel = crate::shell_sftp::open_session_channel(&session_arc).await?;
-        let cmd = crate::remote_sh::sh_command(&[], &format!("{} 2>&1", Cmd::Docker(args).shell()), &[]);
-        channel
-            .exec(true, cmd.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
+        let cmd = format!("{} 2>&1", Cmd::Docker(args).shell());
+        // The logs then come for as long as they are wanted; only starting has a
+        // time limit.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        crate::remote_sh::run_script(&channel, &cmd, deadline).await?;
         (channel, None, Vec::new())
     };
     let mut stream = channel.into_stream();
@@ -752,6 +768,25 @@ pub async fn ssh_docker_logs_stop(
 
 // ---- terminal exec into container ------------------------------------------
 
+/// The command line for a terminal in `container`. Shell auto-detect runs
+/// inside the container: prefer bash, fall back to sh, fall back to ash
+/// (Alpine). Anything more exotic and the user can jump in via a regular ssh
+/// terminal and figure it out.
+///
+/// The login shell runs this line as it is (one of the few, see remote_sh):
+/// the terminal is its stdin, so no script can come there first. So it is a
+/// plain command with quoted words only, the same in sh, csh and fish: no
+/// line break, no `!`, no redirection outside the quotes.
+fn container_terminal_command(container: &str, use_sudo: bool) -> String {
+    let inner = r#"if command -v bash >/dev/null 2>&1; then exec bash; elif command -v sh >/dev/null 2>&1; then exec sh; elif command -v ash >/dev/null 2>&1; then exec ash; else echo 'no shell found in container' && exit 1; fi"#;
+    let docker_cmd = format!("docker exec -it {} sh -c {}", shq(container), shq(inner));
+    if use_sudo {
+        format!("sudo -n {}", docker_cmd)
+    } else {
+        docker_cmd
+    }
+}
+
 // Opens a PTY-backed exec channel running `docker exec -it <name> <shell>`
 // with shell auto-detect: try bash → sh. Wires into the same terminal-IO
 // pipeline (output over the page's channel, term_output.rs, + write/resize/close commands)
@@ -808,8 +843,9 @@ pub async fn open_container_terminal(
                 .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
                 .await
                 .map_err(|e| e.to_string())?;
+            let terminal_cmd = container_terminal_command(&container, false);
             channel
-                .exec(true, Cmd::Docker(args).shell().as_bytes())
+                .exec(true, terminal_cmd.as_bytes())
                 .await
                 .map_err(|e| e.to_string())?;
             (channel, Vec::new())
@@ -864,11 +900,88 @@ pub async fn open_container_terminal(
 }
 
 #[cfg(test)]
+mod compose_command_tests {
+    use super::compose_command;
+
+    #[test]
+    fn the_choice_is_made_in_the_same_shell_and_sudo_goes_on_the_compose_command() {
+        let plain = compose_command("ls --all", false);
+        assert!(!plain.contains('('), "no subshell: {plain}");
+        assert!(plain.starts_with("if docker compose version >/dev/null 2>&1; then CCMD='docker compose'; else CCMD='docker-compose'; fi; "));
+        assert!(plain.ends_with("; $CCMD ls --all"), "{plain}");
+        let sudo = compose_command("-f '/srv/app/compose.yml' up -d --no-deps", true);
+        assert!(sudo.ends_with("; sudo -n $CCMD -f '/srv/app/compose.yml' up -d --no-deps"), "{sudo}");
+        assert_eq!(sudo.matches("sudo").count(), 1, "sudo only on the compose command: {sudo}");
+    }
+
+    // The command text in a real sh, with a stand-in `docker` (and `sudo`) on
+    // PATH: with the compose plugin, without it, and through sudo.
+    #[cfg(unix)]
+    #[test]
+    fn the_command_runs_the_right_compose_in_sh() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sub-compose-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = |name: &str, body: &str| {
+            let p = bin.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let run = |cmd: &str| {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{cmd} 2>&1"))
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        // A docker with the compose plugin: `docker compose version` works.
+        tool("docker", "echo \"docker $*\"");
+        tool("docker-compose", "echo \"docker-compose $*\"");
+        tool("sudo", "shift; \"$@\"");
+        assert_eq!(run(&compose_command("ls --all", false)), "docker compose ls --all");
+        assert_eq!(run(&compose_command("ls --all", true)), "docker compose ls --all");
+        // Without the plugin: `docker compose` fails, the old binary runs.
+        tool("docker", "[ \"$1\" = compose ] && exit 1; echo \"docker $*\"");
+        assert_eq!(run(&compose_command("-f 'a b.yml' ps", false)), "docker-compose -f a b.yml ps");
+        assert_eq!(run(&compose_command("-f 'a b.yml' ps", true)), "docker-compose -f a b.yml ps");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
 mod cmd_tests;
 
 #[cfg(test)]
 mod name_tests {
-    use super::{is_safe_name, is_safe_path};
+    use super::{container_terminal_command, is_safe_name, is_safe_path};
+
+    #[test]
+    fn the_container_terminal_line_reads_the_same_in_any_login_shell() {
+        for sudo in [false, true] {
+            let line = container_terminal_command("web-1", sudo);
+            assert!(!line.contains(['\n', '!', '\\', '$']), "{line}");
+            // Outside quotes, only words; inside double quotes, only the `'`
+            // that shq puts there.
+            let (mut outside, mut quote) = (String::new(), None);
+            let mut doubled = String::new();
+            for c in line.chars() {
+                match (quote, c) {
+                    (None, '\'' | '"') => quote = Some(c),
+                    (None, _) => outside.push(c),
+                    (Some(q), _) if c == q => quote = None,
+                    (Some('"'), _) => doubled.push(c),
+                    _ => {}
+                }
+            }
+            assert!(quote.is_none(), "{line}");
+            assert!(outside.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '-'), "{outside}");
+            assert!(doubled.chars().all(|c| c == '\''), "{doubled}");
+        }
+    }
 
     #[test]
     fn name_rejects_leading_dash_flags() {
