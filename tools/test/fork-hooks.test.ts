@@ -88,7 +88,7 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
       "Fork.splitShown", "Fork.splitActions", "Fork.stripLook", "Fork.termTabProps", "Fork.termTabLook",
       "Fork.termCloseLook", "Fork.paneLook", "Fork.TermTabLabel", "Fork.SplitButton", "Fork.ShareWithAiButton",
       "Fork.SplitBesideItems", "Fork.AiBesideItems", "Fork.KeptSessions", "Fork.TermMoveItems", "Fork.ShareWithAiMenu",
-      "Fork.JumpGoneChoices", "jumpGone.refused", "jumpGone.clear", "split.closeTerminal", "split.splitWithNew",
+      "Fork.JumpGoneChoices", "jumpGone.refused", "jumpGone.clear", "Fork.closeTabAsking", "split.splitWithNew",
       "split.splitWith", "split.removeFromSplit", "onShellReadyFor", "Fork.TerminalTurn", "Fork.TerminalHereListener",
     ],
   },

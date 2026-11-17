@@ -12,14 +12,14 @@ import { useBroadcast } from '../ui/broadcast';
 import HistorySearchOverlay from './HistorySearchOverlay';
 import { DEFAULT_FONT_STACK, fontFamilyCss, readFontFamily, readFontSize } from '../util/terminalFont';
 import { readScrollback } from '../util/terminalScrollback';
-import { TERMINAL_PASTE, withoutPasteControls, type TerminalPaste } from '../util/pasteText';
+import { TERMINAL_CLEAR, TERMINAL_PASTE, clearTerminal, withoutPasteControls, type TerminalPaste } from '../util/pasteText';
 import * as Fork from '../fork/terminal';
 import { TERMINAL_READ, TERMINAL_READ_REPLY, type TerminalRead, type TerminalReadReply } from '../util/terminalRead';
 import { readUseLocalShell } from '../util/terminalShell';
 import { holdTerminalInput, writeTerminal } from '../util/terminalWrite';
 import { readUseSshAgent } from '../util/sshAgent';
 import { readSendKeepalives } from '../util/sessionKeep';
-import { IS_MOBILE, IS_LINUX, IS_ANDROID } from '../util/platform';
+import { IS_MOBILE, IS_LINUX, IS_ANDROID, IS_MAC } from '../util/platform';
 import { useConfirm } from '../ui/confirm';
 import { parseOsc1337, parseOsc7, type ShellFolder } from '../util/shellFolder';
 import { tn, useT } from '../i18n';
@@ -195,6 +195,8 @@ const TerminalView = ({
   ownLogin = false,
   quickAuth = null,
   onFolder,
+  onClose,
+  onNewTerminal,
   local, onShellReady, inView,
 }: {
   sessionId: string;
@@ -276,6 +278,10 @@ const TerminalView = ({
   /// util/shellFolder), for the SFTP panel's Follow (#245). Reported at
   /// every prompt; the parent keeps what changed.
   onFolder?: (terminalId: string, path: string, host: string) => void;
+  /// Closes the parent session tab.
+  onClose?: () => void;
+  /// Opens another terminal in the parent session.
+  onNewTerminal?: () => void;
 } & Fork.TerminalProps) => {
   const t = useT();
   // The connection this terminal's shell runs on: its tab's, or its own
@@ -337,6 +343,16 @@ const TerminalView = ({
   };
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<Terminal | null>(null);
+  const shellEndedRef = useRef(false);
+
+  // The xterm setup effect lives for the terminal's entire lifetime.
+  // Keep the latest close callback available without rebuilding xterm.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  const onNewTerminalRef = useRef(onNewTerminal);
+  onNewTerminalRef.current = onNewTerminal;
+
   const fitAddonRef = useRef<FitAddon | null>(null);
   const searchAddonRef = useRef<SearchAddon | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
@@ -628,6 +644,7 @@ const TerminalView = ({
     // at the wrong column until the next resize.
     const syncSize = () => {
       if (!keepShell()) return;
+      shellEndedRef.current = false;
       releaseInput(true);
       resendPtySize(terminalId, term.cols, term.rows);
     };
@@ -710,6 +727,7 @@ const TerminalView = ({
   useEffect(() => {
     const off = listen(`terminal-closed-${terminalId}`, (e: any) => {
       if (!e.payload?.shell_ended) return;
+      shellEndedRef.current = true;
       xtermRef.current?.write("\r\n\x1b[33m" + t("── this shell has ended; + opens a new terminal ──") + "\x1b[0m\r\n");
     });
     return () => { off.then((f) => f()); };
@@ -815,7 +833,9 @@ const TerminalView = ({
   // never reach here. A Ctrl+Shift combo gets no key from xterm and bubbles
   // untouched. Matched by keyCode, the layout's F and R keys (the ones xterm
   // goes by too), so Dvorak gets the same keys. The webview's own reload on
-  // Ctrl+Shift+R is cancelled app-wide (main.tsx).
+  // Ctrl+Shift+R is cancelled app-wide (main.tsx). Ctrl+Shift+K / Cmd+Shift+K
+  // clears the terminal in the app (see clearLocalTerminal), the key other
+  // terminals use for it (WezTerm, Konsole, Warp).
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (!(e.ctrlKey || e.metaKey) || !e.shiftKey) return;
@@ -835,11 +855,14 @@ const TerminalView = ({
       } else if (e.keyCode === 82 && !local) { // a local shell keeps Ctrl+R for its own reverse search
         e.preventDefault();
         setShowHistory(true);
+      } else if (e.keyCode === 75) {
+        e.preventDefault();
+        if (!e.repeat) clearTerminal(terminalId);
       }
     };
     document.addEventListener('keydown', onKeyDown);
     return () => document.removeEventListener('keydown', onKeyDown);
-  }, []);
+  }, [terminalId]);
 
   // Close + clear search decorations. Refocuses xterm so the user's next
   // keystroke goes to the shell, not to nowhere.
@@ -1095,6 +1118,7 @@ const TerminalView = ({
         const releaseInput = releaseInputRef.current ?? (() => {});
         const syncSize = () => {
           if (!keepShell()) return false;
+          shellEndedRef.current = false;
           releaseInput(true);
           resendPtySize(terminalId, term.cols, term.rows, fork.commands.resize);
           return true;
@@ -1422,6 +1446,16 @@ const TerminalView = ({
       selectionArmed = false;
       void copySelectionIfAny();
     };
+    // Ctrl+Shift+click (Cmd+Shift+click on a Mac) opens a new terminal. Only
+    // those keys: on a Mac, Control+click is a right-click, which pastes here,
+    // and a click with Alt as well is left alone.
+    const onNewTerminalClick = (ev: MouseEvent) => {
+      const primary = IS_MAC ? ev.metaKey && !ev.ctrlKey : ev.ctrlKey && !ev.metaKey;
+      if (ev.button !== 0 || !primary || !ev.shiftKey || ev.altKey) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      onNewTerminalRef.current?.();
+    };
     // If the window loses focus mid-drag (Alt-Tab, a focus-stealing dialog),
     // the button is released over another window and the matching `mouseup`
     // never reaches `document`, leaving selectionArmed stuck true. A later
@@ -1524,6 +1558,49 @@ const TerminalView = ({
         ev.preventDefault();
         return false;
       }
+      const primaryModifier = ev.ctrlKey || ev.metaKey;
+      if (!primaryModifier && ev.key !== 'Insert') return true; // fork: plain typing goes straight on (none below is for it)
+
+      // Ctrl+Shift+W always closes the current terminal tab.
+      // Plain Ctrl+W does so only after its shell has ended; while the shell
+      // is running, ^W remains available to readline and other applications.
+      if (
+        ev.type === 'keydown' &&
+        !ev.repeat &&
+        primaryModifier &&
+        !ev.altKey &&
+        ev.code === 'KeyW' &&
+        (ev.shiftKey || shellEndedRef.current)
+      ) {
+        ev.preventDefault();
+        onCloseRef.current?.();
+        return false;
+      }
+      // Ctrl+Shift+Plus opens another terminal while the shell is running.
+      // Once the shell has ended, Ctrl+Plus works as well.
+      //
+      // Matched by the key's character, so only the plus key counts: "+" itself,
+      // the keypad's plus, the US "=/+" key unshifted (Ctrl+= once the shell has
+      // ended), and the German plus key with Shift, which gives "*". A key in
+      // the same place on another layout ("]" or "}" on a US keyboard) doesn't.
+      const isPlusKey =
+        ev.key === '+' ||
+        ev.code === 'NumpadAdd' ||
+        (ev.code === 'Equal' && ev.key === '=') ||
+        (ev.code === 'BracketRight' && ev.key === '*');
+
+      if (
+        ev.type === 'keydown' &&
+        !ev.repeat &&
+        primaryModifier &&
+        !ev.altKey &&
+        isPlusKey &&
+        (ev.shiftKey || shellEndedRef.current)
+      ) {
+        ev.preventDefault();
+        onNewTerminalRef.current?.();
+        return false;
+      }
       const noOtherMods = !ev.altKey && !ev.metaKey && ev.ctrlKey && ev.shiftKey;
       if (noOtherMods && ev.code === 'KeyA') {
         if (ev.type === 'keydown' && !ev.repeat) term.selectAll();
@@ -1574,6 +1651,9 @@ const TerminalView = ({
       }
       return true;
     });
+    // In the capture phase, before xterm's own handlers: with mouse tracking
+    // on (htop, vim) those send the click to the program and stop it there.
+    terminalRef.current.addEventListener('mousedown', onNewTerminalClick, true);
     terminalRef.current.addEventListener('mousedown', onMouseDown);
     document.addEventListener('mouseup', onDocMouseUp);
     window.addEventListener('blur', onWindowBlur);
@@ -1601,6 +1681,10 @@ const TerminalView = ({
       void pasteRequested(text, enter);
     };
     window.addEventListener(TERMINAL_PASTE, onPasteRequest);
+    const onClearRequest = (e: Event) => {
+      if ((e as CustomEvent<string>).detail === terminalId) clearLocalTerminalRef.current();
+    };
+    window.addEventListener(TERMINAL_CLEAR, onClearRequest);
     // The last `count` lines of the buffer, scrollback included, a wrapped
     // line rebuilt into one as buildSelectedText does. The blank lines at the
     // end (the rows under the prompt) are left out.
@@ -1815,6 +1899,7 @@ const TerminalView = ({
       window.clearTimeout(sizeTimer);
       window.clearTimeout(drawnTimer);
       if (container) {
+        container.removeEventListener('mousedown', onNewTerminalClick, true);
         container.removeEventListener('mousedown', onMouseDown);
         container.removeEventListener('contextmenu', onContextMenu);
         container.removeEventListener('paste', onPasteEvent, true);
@@ -1822,6 +1907,7 @@ const TerminalView = ({
       document.removeEventListener('mouseup', onDocMouseUp);
       window.removeEventListener('blur', onWindowBlur);
       window.removeEventListener(TERMINAL_PASTE, onPasteRequest);
+      window.removeEventListener(TERMINAL_CLEAR, onClearRequest);
       window.removeEventListener(TERMINAL_READ, onReadRequest);
       window.visualViewport?.removeEventListener('resize', onVvResize);
       if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
@@ -1851,6 +1937,27 @@ const TerminalView = ({
       }
     };
   }, [sessionId, terminalId]);
+
+  // Local presentation only: never send input or reset the terminal modes.
+  // xterm keeps the row with the cursor; everything else goes, for good.
+  const clearLocalTerminal = () => {
+    const term = xtermRef.current;
+    if (!term) return;
+    // Full-screen applications own their alternate-screen layout. Clearing
+    // it locally would leave their idea of the screen out of sync.
+    if (term.buffer.active.type === 'alternate') {
+      notify(t("Not while a full-screen app runs"), 'err');
+      return;
+    }
+    searchAddonRef.current?.clearDecorations?.();
+    term.clearSelection();
+    term.clear();
+    notify(t("Cleared"));
+  };
+  // The clear request's listener lives as long as the xterm; it calls the
+  // latest one (its texts follow the language).
+  const clearLocalTerminalRef = useRef(clearLocalTerminal);
+  clearLocalTerminalRef.current = clearLocalTerminal;
 
   return (
     // flex-col so the MobileKeyBar can pin to the bottom of the terminal

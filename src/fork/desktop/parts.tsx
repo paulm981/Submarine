@@ -110,7 +110,7 @@ export const TabAiMarker = ({ sessionId }: { sessionId: string }) => {
   );
 };
 
-/** All tabs ▾ in the title bar: every session, searchable (Ctrl+Shift+K),
+/** All tabs ▾ in the title bar: every session, searchable (Ctrl+Shift+J),
  *  anchored at the right edge however many tabs are open (after the original
  *  project's +, which follows the last tab). */
 export const AllTabsButton = <S extends { id: string; serverId: number; serverName: string }>({
@@ -128,7 +128,7 @@ export const AllTabsButton = <S extends { id: string; serverId: number; serverNa
       <button
         type="button"
         onClick={() => setOpen(v => !v)}
-        title={`All sessions (${sessions.length}) — Ctrl+Shift+K to jump by name`}
+        title={`All sessions (${sessions.length}) — Ctrl+Shift+J to jump by name`}
         aria-label="All sessions"
         className={`relative flex items-center justify-center w-7 h-7 rounded-full transition-all ${
           open

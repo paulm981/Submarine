@@ -16,7 +16,7 @@ import { AiPanel } from "./ai/AiPanel";
 import { AiTerminal } from "./ai/AiTerminal";
 import { createFeed, registerFeed, AI_FOCUS_EVENT, takeAiFocus } from "../util/aiEvents";
 import { ai, AI_LEVEL_EVENT, type AiLevelDetail } from "../util/aiApi";
-import { writeToTerminal } from "../util/pasteText";
+import { clearTerminal, writeToTerminal } from "../util/pasteText";
 import { readTerminal } from "../util/terminalRead";
 import { RenameInput } from "../ui/renameInput";
 import { useIsCompact } from "../hooks/useViewport";
@@ -766,6 +766,19 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   const [aiPending, setAiPending] = useState(0);
   // New terminals of this server log in on their own (its choice on this device).
   const [ownLoginDefault, setOwnLoginDefault] = useState(() => readOwnLogin(session.serverUuid));
+  // open new terminal: the next number no open terminal has, and the default login mode.
+  const openNewTerminal = useCallback(() => {
+    const newId = `${session.id}-term-${Date.now()}`;
+    setTerminals(prev => [
+      ...prev,
+      {
+        id: newId,
+        title: nextTerminalNumber(prev),
+        ownLogin: ownLoginDefault,
+      },
+    ]);
+    setActiveTab(newId);
+  }, [session.id, ownLoginDefault]);
   // SFTP's Follow, and the folder each terminal's shell last reported (a
   // container's terminal reports none: its folders aren't the server's).
   const [follow, setFollow] = useState(readFollow);
@@ -984,6 +997,58 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // panes redistributes those two panes' share and leaves the rest
   // alone. Reset (double-click a divider) flattens back to all-equal.
   const [splitRatios, setSplitRatios] = useState<number[]>([]);
+  const closeTerminal = useCallback((terminalId: string) => {
+    // Closing the only terminal closes the complete session.
+    if (terminals.length <= 1) {
+      if (!Fork.closeTabAsking(session.id)) onClose(); // fork: as the tab's ×, asking first
+      return;
+    }
+
+    const closingIndex = terminals.findIndex(term => term.id === terminalId);
+
+    const splitReplacement =
+      splitTerminals.find(id => id !== terminalId);
+
+    const adjacentReplacement =
+      terminals[closingIndex + 1]?.id ??
+      terminals[closingIndex - 1]?.id;
+
+    const nextActiveTab =
+      splitReplacement ??
+      adjacentReplacement;
+
+    setTerminals(prev =>
+      prev.filter(term => term.id !== terminalId)
+    );
+
+    if (activeTab === terminalId && nextActiveTab) {
+      setActiveTab(nextActiveTab);
+    }
+
+    if (splitTerminals.includes(terminalId)) {
+      const index = splitTerminals.indexOf(terminalId);
+
+      const nextTerms =
+        splitTerminals.filter(id => id !== terminalId);
+
+      const nextRatios =
+        splitRatios.filter((_, ratioIndex) => ratioIndex !== index);
+
+      if (nextTerms.length < 2) {
+        setSplitTerminals([]);
+        setSplitRatios([]);
+      } else {
+        setSplitTerminals(nextTerms);
+        setSplitRatios(nextRatios);
+      }
+    }
+  }, [
+    terminals,
+    activeTab,
+    splitTerminals,
+    splitRatios,
+    onClose,
+  ]);
   // "+" button's secondary menu — the arrow beside "+", or a right-click /
   // long-press on "+", so the primary click stays a fast "new tab" without
   // stealing the advanced flows (split view, compare across servers).
@@ -1810,7 +1875,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // the active terminal alone, and the split is back when there's room again.
   const splitOn = Fork.splitShown(splitTerminals, isCompact, activeTab);
   const panes = splitPanes(splitTerminals.map((_, i) => splitRatios[i] ?? 1));
-  const split = Fork.splitActions({ sessionId: session.id, splitOn, splitTerminals, setSplitTerminals, setSplitRatios, activeTab, setActiveTab, terminals, setTerminals, nextTerminalNumber, ownLogin: ownLoginDefault });
+  const split = Fork.splitActions({ sessionId: session.id, splitOn, splitTerminals, setSplitTerminals, setSplitRatios, activeTab, setActiveTab, setTerminals, nextTerminalNumber, ownLogin: ownLoginDefault });
 
   // Connected State with Nested Tabs
   return (
@@ -1872,7 +1937,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               <button
                 onClick={(e) => {
                   e.stopPropagation();
-                  split.closeTerminal(term.id);
+                  closeTerminal(term.id);
                 }}
                 aria-label={t("Close terminal")}
                 className="absolute right-0 sm:right-1 top-1/2 -translate-y-1/2 w-8 h-10 sm:w-5 sm:h-5 flex items-center justify-center rounded opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100 hover:bg-white/5 hover:text-red-400 text-zinc-500 transition-all"
@@ -1893,11 +1958,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               went unnoticed (#243); the arrow also lets the keyboard in. */}
           <div ref={plusGroupRef} className="ml-1 shrink-0 flex items-stretch rounded-lg border border-dashed border-white/10">
             <button
-              onClick={() => {
-                const newId = `${session.id}-term-${Date.now()}`;
-                setTerminals(prev => [...prev, { id: newId, title: nextTerminalNumber(prev), ownLogin: ownLoginDefault }]);
-                setActiveTab(newId);
-              }}
+              onClick={openNewTerminal}
               onContextMenu={(e) => {
                 e.preventDefault();
                 openPlusMenu(false);
@@ -2156,12 +2217,21 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                 onCancel={() => setTermRename(null)}
               />
             ) : (
-              <button
-                onClick={() => setTermRename(termMenu.termId)}
-                className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left"
-              >
-                <span className="flex-1">{t("Rename tab")}</span>
-              </button>
+              <>
+                <button
+                  onClick={() => setTermRename(termMenu.termId)}
+                  className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left"
+                >
+                  <span className="flex-1">{t("Rename tab")}</span>
+                </button>
+                <button
+                  onClick={() => { clearTerminal(termMenu.termId); setTermMenu(null); requestTerminalFocus(); }}
+                  title={t("Clears the display and scrollback in this app (Ctrl+Shift+K, Cmd+Shift+K on a Mac) and keeps the line with the cursor. Sends nothing to the server.")}
+                  className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-white/[0.06] text-zinc-200 hover:text-white text-left"
+                >
+                  <span className="flex-1">{t("Clear terminal")}</span>
+                </button>
+              </>
             )}
             <Fork.TermMoveItems terminals={terminals} termId={termMenu.termId} setTerminals={setTerminals} close={() => setTermMenu(null)} />
           </div>
@@ -2394,6 +2464,8 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                   ownLogin={term.ownLogin}
                   quickAuth={session.quickAuth}
                   onFolder={term.container ? undefined : onTerminalFolder}
+                  onClose={() => closeTerminal(term.id)}
+                  onNewTerminal={openNewTerminal}
                 />
                 </Fork.TerminalTurn>
                 )}
