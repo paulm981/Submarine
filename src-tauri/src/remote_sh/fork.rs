@@ -188,9 +188,57 @@ pub(super) mod allowed {
     }
 }
 
+/// Whether `login`'s sh runs a `hostname` of its own rather than the one in
+/// `bin` (first on `path`): a busybox built to prefer its applets, as on the
+/// Ubuntu 22.04 the checks run on. The original project's
+/// `the_overview_probe_never_renames_the_host` can't see its stand-in there,
+/// so it skips that shell (one hook there), saying why. Any other answer,
+/// a failure to ask included, runs the test as it is.
+#[cfg(all(test, unix))]
+pub(super) fn own_hostname(login: &[&str], path: &str, bin: &std::path::Path) -> bool {
+    let Some((program, args)) = login.split_first() else { return false };
+    let Ok(out) = std::process::Command::new(program)
+        .args(args)
+        .arg("sh -c 'command -v hostname'")
+        .env("PATH", path)
+        .output()
+    else {
+        return false;
+    };
+    let found = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let own = out.status.success() && found != bin.join("hostname").to_string_lossy();
+    if own {
+        eprintln!("skipped {program}: its sh runs its own hostname ({found}), not the one on PATH");
+    }
+    own
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The skip in their overview test is taken only when sh can't find the
+    /// stand-in `hostname`: found first on PATH, the test runs as it is.
+    #[cfg(unix)]
+    #[test]
+    fn own_hostname_only_when_the_stand_in_cant_be_seen() {
+        let bin = std::env::temp_dir().join(format!("sub-own-hostname-{}", std::process::id()));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("hostname"), "#!/bin/sh\necho labhost\n").unwrap();
+        std::fs::set_permissions(bin.join("hostname"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let system = std::env::var("PATH").unwrap_or_default();
+        let first = format!("{}:{system}", bin.display());
+        assert!(!own_hostname(&["sh", "-c"], &first, &bin));
+        // Another hostname comes first: what an applet does to the test.
+        let last = format!("{system}:{}", bin.display());
+        let other = std::process::Command::new("sh").args(["-c", "command -v hostname"]).env("PATH", &system).output().unwrap();
+        if other.status.success() {
+            assert!(own_hostname(&["sh", "-c"], &last, &bin));
+        }
+        // A login shell that can't be started: the test runs, and says so if it fails.
+        assert!(!own_hostname(&["no-such-shell-here", "-c"], &first, &bin));
+        std::fs::remove_dir_all(&bin).unwrap();
+    }
 
     const SCRIPT: &str = "if [ \"$1\" = 'a b' ]; then echo one; fi\nfor w; do printf '%s|' \"$w\"; done\necho \"$SUB_X\" | tr \"\\n\" ' ' ; echo; echo 'done!'\n";
 
@@ -307,6 +355,7 @@ mod tests {
                 ("", "mod fork;", 1),
                 ("", "pub(crate) use fork::*;", 1),
                 ("scripts_reach_a_server_only_through_here", "fork::allowed::with_fork(", 1),
+                ("the_overview_probe_never_renames_the_host", "fork::own_hostname(", 1),
             ],
         );
         assert_hooks(
