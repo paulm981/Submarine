@@ -46,6 +46,12 @@
     ],
     "macOS": {
       "signingIdentity": "-"
+    },
+    "windows": {
+      "wix": {
+        "bannerPath": "../packaging/windows/msi/banner.bmp",
+        "dialogImagePath": "../packaging/windows/msi/dialog.bmp"
+      }
     }
   }
 }
