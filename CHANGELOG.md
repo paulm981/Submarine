@@ -9,6 +9,14 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.5.0-fork.15
+
+- **A right click in a program that uses the mouse goes to that program only.** In htop, mc or vim with the mouse on, a right click used to reach the program and paste your clipboard into it too, where a copied line ending in a line break could run. Now only the program gets it. Hold Shift and right-click (Option on a Mac) to paste there, or to open the menu on a file name. In a plain shell, right-click pastes or opens the file-name menu as before. (Their [#371](https://github.com/SinaXhpm/submarine/pull/371); [#280](https://github.com/paulm981/Submarine/issues/280))
+- **Shift+drag copies in a program that uses the mouse.** It selected the text but didn't copy it, and the selection vanished when you let go. Now it's copied and stays on screen. (Their [#371](https://github.com/SinaXhpm/submarine/pull/371); [#280](https://github.com/paulm981/Submarine/issues/280))
+- **On a PC with a touch screen, a new terminal takes the keyboard again.** You could open a terminal and find your typing went nowhere until you clicked in it. Now it's ready to type in, unless you last tapped the screen with a finger. (Their [#368](https://github.com/SinaXhpm/submarine/pull/368); [#280](https://github.com/paulm981/Submarine/issues/280))
+- **On a touch screen, a finger's swipe scrolls programs as the mouse wheel does**: less, vim, tmux with the mouse on, and Claude Code's full-screen view. A long press shows a **Paste** button, and only a tap on it pastes. (Their [#373](https://github.com/SinaXhpm/submarine/pull/373), [#364](https://github.com/SinaXhpm/submarine/pull/364); [#280](https://github.com/paulm981/Submarine/issues/280))
+- **Text copied on a remote desktop (RDP, VNC) reaches your clipboard only while Submarine is the app in front**; otherwise it waits in the tab's "Copy it here" bar. Ctrl+Shift+click on a Wall tile or a telnet tab goes to the terminal, since no terminal can be opened from there. On Android, reading a clipboard that holds a file no longer holds up the app. (Their [#363](https://github.com/SinaXhpm/submarine/pull/363); [#280](https://github.com/paulm981/Submarine/issues/280))
+
 ## v0.5.0-fork.14
 
 - **Monitoring logs in with your ssh-agent's keys** for a server with no saved password or key, when "Use keys from an ssh-agent" is on in Settings. It works through a jump host too: the jump host, if nothing is saved for it either, logs in with the agent's keys as well. Security keys are never offered, since nobody is there to touch them. An agent that refuses or doesn't answer in time isn't asked again for that server until you pause and resume it, so its prompts don't keep coming back. `IdentityAgent` and `IdentitiesOnly` in `~/.ssh/config` are respected. (Their [#361](https://github.com/SinaXhpm/submarine/pull/361); [#275](https://github.com/paulm981/Submarine/issues/275))
