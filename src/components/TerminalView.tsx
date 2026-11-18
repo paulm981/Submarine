@@ -5,7 +5,7 @@ import { SearchAddon, ISearchOptions } from '@xterm/addon-search';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import '@xterm/xterm/css/xterm.css';
-import { KeyRound } from 'lucide-react';
+import { ClipboardPaste, KeyRound } from 'lucide-react';
 import { useIsNarrow } from '../hooks/useViewport';
 import { MobileKeyBar, ModifiersState, ModKey, SpecialKey } from './MobileKeyBar';
 import { useBroadcast } from '../ui/broadcast';
@@ -20,6 +20,7 @@ import { holdTerminalInput, writeTerminal } from '../util/terminalWrite';
 import { readUseSshAgent } from '../util/sshAgent';
 import { readSendKeepalives } from '../util/sessionKeep';
 import { IS_MOBILE, IS_LINUX, IS_ANDROID, IS_MAC } from '../util/platform';
+import { lastInputWasTouch } from '../util/lastInput';
 import { useConfirm } from '../ui/confirm';
 import { parseOsc1337, parseOsc7, type ShellFolder } from '../util/shellFolder';
 import { tn, useT } from '../i18n';
@@ -737,7 +738,10 @@ const TerminalView = ({
   // become-active effect and the parent-driven focus signal below, so the
   // user can type the moment a terminal tab (or its server tab) is selected
   // — issue #51. Bails in every situation where grabbing focus is wrong:
-  //   • touch devices — focusing xterm pops the soft keyboard unasked;
+  //   • a phone or tablet, or a tap last on a PC's touch screen — focusing
+  //     xterm would bring up the on-screen keyboard unasked. A PC with a
+  //     touch screen used with its mouse and keys still gets the focus
+  //     (lastInputWasTouch);
   //   • a terminal whose SessionView isn't the frontmost server tab, or an
   //     attach-only Wall mirror (isActiveView=false) — never steal from the
   //     session the user is actually looking at;
@@ -751,9 +755,7 @@ const TerminalView = ({
   //   • a modal dialog is open — confirm / overwrite / text-prompt all carry
   //     aria-modal.
   const focusTerminal = () => {
-    const coarsePointer =
-      typeof window !== "undefined" && !!window.matchMedia?.("(pointer: coarse)")?.matches;
-    if (IS_MOBILE || coarsePointer) return;
+    if (IS_MOBILE || lastInputWasTouch()) return;
     if (!isActiveViewRef.current) return;
     if (disabledRef.current) return;
     const term = xtermRef.current;
@@ -895,6 +897,30 @@ const TerminalView = ({
     if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
     toastTimerRef.current = window.setTimeout(() => setToast(null), 1400);
   };
+
+  // A long press on a touch screen shows a Paste button by the finger (see
+  // onContextMenu), and only a tap on it pastes: people long-press on a
+  // phone to select or to look, and a pasted line that ends in a line break
+  // would run. Any other touch, key or scroll takes the button away.
+  const [pasteAt, setPasteAt] = useState<{ x: number; y: number } | null>(null);
+  const pasteClipboardRef = useRef<((toast: boolean) => Promise<void>) | null>(null);
+  useEffect(() => {
+    if (!pasteAt) return;
+    const hide = () => setPasteAt(null);
+    const timer = window.setTimeout(hide, 6000);
+    const onDown = (e: PointerEvent) => {
+      if (!(e.target instanceof Element && e.target.closest('[data-paste-button]'))) hide();
+    };
+    window.addEventListener('pointerdown', onDown, true);
+    window.addEventListener('keydown', hide, true);
+    window.addEventListener('wheel', hide, { capture: true, passive: true });
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener('pointerdown', onDown, true);
+      window.removeEventListener('keydown', hide, true);
+      window.removeEventListener('wheel', hide, true);
+    };
+  }, [pasteAt]);
 
   // The output ends in a password prompt (sudo, su, …): a button offers to
   // type a saved password there (#28). The next key typed or more output
@@ -1414,6 +1440,12 @@ const TerminalView = ({
       const ok = await writeClipboard(text);
       if (ok) notify(t('Copied'));
     };
+    // A program that takes the mouse (mc, htop, vim with mouse=a) gets the
+    // clicks from xterm. xterm keeps a click for the terminal only while the
+    // bypass key is held: Shift, or Option on a Mac (macOptionClickForcesSelection
+    // in the options above). The copy and the paste here go by the same key.
+    const programHasMouse = () => term.modes.mouseTrackingMode !== 'none';
+    const bypassesProgram = (ev: MouseEvent) => (IS_MAC ? ev.altKey : ev.shiftKey);
     // Copy-on-select must fire wherever the mouse is RELEASED — not only inside
     // the terminal. A user who drags a selection and lets go past the terminal's
     // edge (a very natural motion) still expects the copy, but the old handler
@@ -1428,32 +1460,51 @@ const TerminalView = ({
     // selection) still can't clobber it. The selection end is set by the last
     // mousemove, so it's final by the time we read it on mouseup.
     //
-    // A drag that a mouse-tracking program takes (vi with mouse=a, mc, htop)
-    // can't copy stale text here: xterm clears its own selection when the
-    // program turns mouse tracking on, and again when it sends the program a
-    // mouse report. No snapshot of the selection at mousedown is kept: xterm
-    // makes a double- or triple-click's word or line in its own mousedown
-    // handler, which runs before this one, so such a snapshot would already
-    // hold the new selection and the release would copy nothing.
+    // Both in the capture phase, before xterm's own handlers (#369). In a
+    // program that takes the mouse, xterm stops the bypass key's mousedown at
+    // its own element, so a listener further out never saw that selection and
+    // nothing was copied. And xterm sends the program the release all the same,
+    // which in the SGR mouse mode most programs use counts as input and clears
+    // the selection: it's read before that, and put back on screen after it.
+    //
+    // A press without the bypass key in such a program is the program's, so it
+    // doesn't arm: no stale selection is copied by it. No snapshot of the
+    // selection at mousedown is kept: xterm makes a double- or triple-click's
+    // word or line in its own mousedown handler, after this one, and the
+    // release reads it.
     let selectionArmed = false;
+    let selectionForced = false;
     const onMouseDown = (ev: MouseEvent) => {
       // Assign (not just set-true) so a non-left mousedown re-disarms a flag
       // that got stuck from an earlier drag whose mouseup we never saw.
-      selectionArmed = ev.button === 0;
+      const program = programHasMouse();
+      selectionArmed = ev.button === 0 && (!program || bypassesProgram(ev));
+      selectionForced = selectionArmed && program;
     };
     const onDocMouseUp = (ev: MouseEvent) => {
       if (ev.button !== 0 || !selectionArmed) return;
       selectionArmed = false;
+      const range = selectionForced ? term.getSelectionPosition() : undefined;
+      // Reads the selection at once, before its first await.
       void copySelectionIfAny();
+      if (!range) return;
+      setTimeout(() => {
+        const length = (range.end.y - range.start.y) * term.cols + range.end.x - range.start.x;
+        if (!term.hasSelection() && length > 0) term.select(range.start.x, range.start.y, length);
+      }, 0);
     };
     // Ctrl+Shift+click (Cmd+Shift+click on a Mac) opens a new terminal. Only
     // those keys: on a Mac, Control+click is a right-click, which pastes here,
-    // and a click with Alt as well is left alone.
+    // and a click with Alt as well is left alone. Where no terminal can be
+    // opened from here (a Wall tile, a telnet tab), the click goes on to xterm.
+    // Nothing else of this terminal sees it, the copy-on-select listener beside
+    // this one included: the click doesn't copy a selection already there.
     const onNewTerminalClick = (ev: MouseEvent) => {
+      if (!onNewTerminalRef.current) return;
       const primary = IS_MAC ? ev.metaKey && !ev.ctrlKey : ev.ctrlKey && !ev.metaKey;
       if (ev.button !== 0 || !primary || !ev.shiftKey || ev.altKey) return;
       ev.preventDefault();
-      ev.stopPropagation();
+      ev.stopImmediatePropagation();
       onNewTerminalRef.current?.();
     };
     // If the window loses focus mid-drag (Alt-Tab, a focus-stealing dialog),
@@ -1519,6 +1570,7 @@ const TerminalView = ({
       catch (e) { notify(typeof e === 'string' ? e : t('Clipboard read denied'), 'err'); return; }
       await pasteText(text, toast);
     };
+    pasteClipboardRef.current = pasteClipboard;
     // Ctrl+V, Ctrl+Shift+V, Shift+Insert and a phone's paste menu would reach
     // xterm's own paste. They go through pasteText instead, like a right-click,
     // so control characters and the question about several lines apply to
@@ -1530,12 +1582,77 @@ const TerminalView = ({
       void pasteText(raw, false);
     };
     // Right-click → paste. preventDefault swallows the platform context menu
-    // so the user gets the terminal-style behavior they asked for.
+    // so the user gets the terminal-style behavior they asked for. A long
+    // press on a touch screen comes as a context menu too: it only shows the
+    // Paste button there (see pasteAt).
+    let lastPointerType = '';
+    const onPointerDown = (ev: PointerEvent) => { lastPointerType = ev.pointerType; };
     const onContextMenu = (ev: MouseEvent) => {
       ev.preventDefault();
+      const touch = IS_MOBILE || lastPointerType === 'touch' || (ev as PointerEvent).pointerType === 'touch';
+      const pane = terminalRef.current?.parentElement?.getBoundingClientRect();
+      if (touch && pane) {
+        if (disabledRef.current) return;
+        // Kept inside the pane: the button is drawn above the finger.
+        setPasteAt({
+          x: Math.min(Math.max(ev.clientX - pane.left, 64), Math.max(pane.width - 64, 64)),
+          y: Math.max(ev.clientY - pane.top, 64),
+        });
+        return;
+      }
+      // A program that takes the mouse got this click from xterm (mc selects a
+      // file with it), so pasting as well would type the clipboard into it
+      // (#369). With the bypass key held, xterm kept the click for the
+      // terminal, and it pastes, as Shift+right-click does in PuTTY.
+      if (programHasMouse() && !bypassesProgram(ev)) return;
       if (Fork.fileMenuAt(ev, term, fork, () => void pasteClipboard(true))) return;
       void pasteClipboard(true);
     };
+    // A finger's swipe does what a mouse wheel does (#372). xterm scrolls its
+    // scrollback by touch on its own, but gives a program nothing: one on the
+    // alternate screen (less, vim) got no arrow keys, and one that takes the
+    // mouse (Claude Code's fullscreen view, tmux with the mouse on) no wheel,
+    // so on a phone there was no way to scroll back in it. There, each row the
+    // finger moves goes to xterm as one line of a wheel, and xterm sends it on
+    // as it does a wheel's: as arrow keys, or as the program's wheel reports.
+    // A second finger ends the swipe.
+    let swipeY: number | null = null;
+    let swipeRest = 0;
+    const onTouchStart = (ev: TouchEvent) => {
+      swipeRest = 0;
+      swipeY = ev.touches.length === 1 && (programHasMouse() || term.buffer.active.type === 'alternate')
+        ? ev.touches[0].clientY
+        : null;
+    };
+    const onTouchMove = (ev: TouchEvent) => {
+      if (swipeY === null) return;
+      const screen = term.element?.querySelector('.xterm-screen');
+      if (ev.touches.length !== 1 || !screen) {
+        swipeY = null;
+        return;
+      }
+      if (ev.cancelable) ev.preventDefault();
+      const finger = ev.touches[0];
+      // A finger moving down shows what was above: the wheel turned up.
+      swipeRest += swipeY - finger.clientY;
+      swipeY = finger.clientY;
+      const rowHeight = screen.getBoundingClientRect().height / term.rows;
+      if (!(rowHeight > 0)) return;
+      const lines = Math.trunc(swipeRest / rowHeight);
+      if (!lines) return;
+      swipeRest -= lines * rowHeight;
+      for (let i = 0; i < Math.abs(lines); i++) {
+        screen.dispatchEvent(new WheelEvent('wheel', {
+          deltaY: Math.sign(lines),
+          deltaMode: WheelEvent.DOM_DELTA_LINE,
+          clientX: finger.clientX,
+          clientY: finger.clientY,
+          bubbles: true,
+          cancelable: true,
+        }));
+      }
+    };
+    const onTouchEnd = () => { swipeY = null; };
     // A key held down while the focus moved here (Enter on a panel's close
     // button) goes on repeating into the terminal. It wasn't pressed for the
     // shell, so its repeats are dropped until a key goes down here. Keys an
@@ -1653,12 +1770,20 @@ const TerminalView = ({
     });
     // In the capture phase, before xterm's own handlers: with mouse tracking
     // on (htop, vim) those send the click to the program and stop it there.
+    // The new-terminal click goes first, so it can keep the copy out.
     terminalRef.current.addEventListener('mousedown', onNewTerminalClick, true);
-    terminalRef.current.addEventListener('mousedown', onMouseDown);
-    document.addEventListener('mouseup', onDocMouseUp);
+    terminalRef.current.addEventListener('mousedown', onMouseDown, true);
+    document.addEventListener('mouseup', onDocMouseUp, true);
     window.addEventListener('blur', onWindowBlur);
+    terminalRef.current.addEventListener('pointerdown', onPointerDown, true);
     terminalRef.current.addEventListener('contextmenu', onContextMenu);
     terminalRef.current.addEventListener('paste', onPasteEvent, true);
+    // Before xterm's own touch handlers too; touchmove can't be passive, it
+    // keeps the swipe from scrolling the page.
+    terminalRef.current.addEventListener('touchstart', onTouchStart, { capture: true, passive: true });
+    terminalRef.current.addEventListener('touchmove', onTouchMove, { capture: true, passive: false });
+    terminalRef.current.addEventListener('touchend', onTouchEnd, true);
+    terminalRef.current.addEventListener('touchcancel', onTouchEnd, true);
     // A paste from outside the terminal (see TERMINAL_PASTE). Text only to be
     // pasted (the Library's Paste, the AI's Insert) was asked about as a
     // paste; where each of its lines would run as it lands, that is asked
@@ -1900,11 +2025,16 @@ const TerminalView = ({
       window.clearTimeout(drawnTimer);
       if (container) {
         container.removeEventListener('mousedown', onNewTerminalClick, true);
-        container.removeEventListener('mousedown', onMouseDown);
+        container.removeEventListener('mousedown', onMouseDown, true);
+        container.removeEventListener('pointerdown', onPointerDown, true);
         container.removeEventListener('contextmenu', onContextMenu);
         container.removeEventListener('paste', onPasteEvent, true);
+        container.removeEventListener('touchstart', onTouchStart, true);
+        container.removeEventListener('touchmove', onTouchMove, true);
+        container.removeEventListener('touchend', onTouchEnd, true);
+        container.removeEventListener('touchcancel', onTouchEnd, true);
       }
-      document.removeEventListener('mouseup', onDocMouseUp);
+      document.removeEventListener('mouseup', onDocMouseUp, true);
       window.removeEventListener('blur', onWindowBlur);
       window.removeEventListener(TERMINAL_PASTE, onPasteRequest);
       window.removeEventListener(TERMINAL_CLEAR, onClearRequest);
@@ -1970,6 +2100,22 @@ const TerminalView = ({
         className="flex-1 min-h-0 w-full overflow-hidden select-text"
       />
       <Fork.TerminalOverlay el={fork.dockEl}>
+      {/* The long press's Paste button (see pasteAt). Pressing it doesn't
+          take the focus, so the soft keyboard stays up. */}
+      {pasteAt && !disabled && (
+        <button
+          type="button"
+          data-paste-button
+          onPointerDown={(e) => e.preventDefault()}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => { setPasteAt(null); void pasteClipboardRef.current?.(true); }}
+          style={{ left: pasteAt.x, top: pasteAt.y }}
+          className="absolute z-30 -translate-x-1/2 -translate-y-full -mt-3 h-10 px-4 flex items-center gap-1.5 rounded-lg bg-zinc-800 border border-white/15 shadow-xl text-[13px] font-semibold text-zinc-100 active:bg-zinc-700"
+        >
+          <ClipboardPaste size={15} className="text-primary shrink-0" />
+          {t('Paste')}
+        </button>
+      )}
       {/* Search chip — floats above xterm; positioned inside the outer
           flex column so it never displaces the terminal grid. Absolute
           top-2 right-2 keeps it clear of the disconnected badge (which
