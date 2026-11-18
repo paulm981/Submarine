@@ -9,6 +9,10 @@ This changelog lists the releases of [paulm981/Submarine](https://github.com/pau
 
 ## Next release
 
+## v0.5.0-fork.16
+
+- **A new Windows installer.** `Submarine-windows-x64-setup.exe` is now the original project's own setup: one window in Submarine's look and your language, in place of the old step-by-step wizard. It installs for you alone, with no administrator prompt, into the same folder as before, so running it over an installed copy updates that copy: your profiles, settings and shortcuts stay. If Submarine is open, it asks before closing it. The uninstaller, under Apps in Windows Settings, has the same look, and deletes your profiles and settings only if you tick that box. On each update it says version 0.5.0 is already installed and offers **Reinstall**, since to Windows every 0.5.0 release is the same version. It installs the new one all the same. The installer still isn't signed, so Windows may ask once before it runs (**More info**, then **Run anyway**). (Their [#370](https://github.com/SinaXhpm/submarine/pull/370); [#280](https://github.com/paulm981/Submarine/issues/280))
+
 ## v0.5.0-fork.15
 
 - **A right click in a program that uses the mouse goes to that program only.** In htop, mc or vim with the mouse on, a right click used to reach the program and paste your clipboard into it too, where a copied line ending in a line break could run. Now only the program gets it. Hold Shift and right-click (Option on a Mac) to paste there, or to open the menu on a file name. In a plain shell, right-click pastes or opens the file-name menu as before. (Their [#371](https://github.com/SinaXhpm/submarine/pull/371); [#280](https://github.com/paulm981/Submarine/issues/280))
