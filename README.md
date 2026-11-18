@@ -300,7 +300,7 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
   - Only the screen changes: what's copied, typed or sent is untouched. Full-screen programs (vim, less, top) and text a program colored itself are left alone, and in a flood (a `cat` of a huge file) highlighting stays out of the way so the output keeps up, while the screen it ends on is still highlighted
 - **Clickable links** — URLs in the output and OSC 8 hyperlinks open in your browser after a prompt
 - **Select to copy** — release the mouse over your selection and it's in the clipboard
-- Right-click to paste
+- Right-click to paste; in a program that takes the mouse (htop, mc, vim), the click is the program's, and Shift+right-click pastes (Option on a Mac). Shift+drag copies there too
 - Wrapped lines copy as a single line (no phantom blank rows)
 - **Reconnect-safe scroll-back** — when a session drops and auto-reconnects, your previous output stays in the buffer to read and copy (a yellow `── reconnected ──` divider marks the boundary)
 - **Container shells** — one click from the Docker tab opens a `docker exec` shell into any container, with `bash → sh → ash` auto-fallback so distroless / Alpine / Ubuntu all just work
