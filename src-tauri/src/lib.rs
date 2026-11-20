@@ -26056,6 +26056,23 @@ async fn clipboard_write_text(app: tauri::AppHandle, text: String) -> Result<(),
     }
 }
 
+/// Whether Android has a hardware keyboard in use (a keyboard cover, a USB or
+/// Bluetooth keyboard): a new terminal takes the focus then, as no on-screen
+/// keyboard comes up over it (TerminalView). False everywhere else, and when
+/// Android can't say.
+#[tauri::command]
+async fn hardware_keyboard_attached(app: tauri::AppHandle) -> bool {
+    #[cfg(target_os = "android")]
+    {
+        android_bridge::hardware_keyboard(&app).await.unwrap_or(false)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        false
+    }
+}
+
 pub fn mcp_helper() -> i32 {
     ai_tabs::helper::main()
 }
@@ -26382,7 +26399,8 @@ pub fn run() {
             multiexec::get_jump_login_limit, multiexec::set_jump_login_limit, multiexec::write_terminals_data, jump_pool::get_jump_sharing, jump_pool::set_jump_sharing, server_os::detect_server_os, approvals::keep_server_ssh, set_server_terminal_theme, set_server_highlight,
             fonts::list_system_fonts,
             clipboard_read_text,
-            clipboard_write_text
+            clipboard_write_text,
+            hardware_keyboard_attached
         ]);
 
     // Clear out live-edit / drag temp dirs a crashed earlier run left behind
