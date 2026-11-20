@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
+import { disposeTerminal } from '../util/xtermDispose';
 import { FitAddon } from '../fork/terminal';
 import { SearchAddon, ISearchOptions } from '@xterm/addon-search';
 import { invoke } from '@tauri-apps/api/core';
@@ -2044,7 +2045,7 @@ const TerminalView = ({
       forkTerm.dispose();
       searchAddon.dispose();
       searchAddonRef.current = null;
-      term.dispose();
+      disposeTerminal(term);
       forkTerm.undock();
       // Only the PTY owner tears the backend PTY down on unmount.
       // Attach-only viewers unmount without closing so the primary
