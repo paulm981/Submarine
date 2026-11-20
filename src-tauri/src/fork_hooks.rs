@@ -87,6 +87,21 @@ pub(crate) fn assert_hooks(file: &str, src: &str, hooks: &[(&str, &str, usize)])
     assert!(missing.is_empty(), "a fork hook was lost or moved (FORK.md, \"Keeping up with the original project\"):\n{}", missing.join("\n"));
 }
 
+/// Assert that `function` in `src`, the text of `file`, has each of `steps`
+/// once, in this order: for a hook whose place matters, not only that it's
+/// there (Live Edit's watcher registers after the fork's "already watching"
+/// return, #283).
+pub(crate) fn assert_in_order(file: &str, src: &str, function: &str, steps: &[&str]) {
+    let body = body_of(src, function).unwrap_or_else(|| panic!("{file} has no `fn {function}` any more"));
+    let mut from = 0;
+    for step in steps {
+        assert_eq!(body.matches(step).count(), 1, "`{function}` in {file} should have `{step}` once");
+        let at = body.find(step).unwrap_or_default();
+        assert!(at >= from, "a fork hook was moved: in `{function}` ({file}), `{step}` should come after the steps before it: {steps:?}");
+        from = at;
+    }
+}
+
 /// The `CREATE TABLE` statement a new vault makes `table` with (lib.rs,
 /// open_or_create_vault), to run in a test's own database.
 pub(crate) fn app_table(table: &str) -> String {
@@ -149,6 +164,13 @@ mod tests {
         assert_hooks("monitor.rs", include_str!("monitor.rs"), &[("", "mod jump_host_tests;", 1)]);
         assert_hooks("docker.rs", include_str!("docker.rs"), &[("", "mod cmd_tests;", 1)]);
         assert_hooks("about.rs", include_str!("about.rs"), &[("", "    mod fork;", 1)]);
+    }
+
+    #[test]
+    fn steps_out_of_order_are_named() {
+        assert_in_order("x.rs", SRC, "b", &["hook(2)", "hook(3)"]);
+        assert!(std::panic::catch_unwind(|| assert_in_order("x.rs", SRC, "b", &["hook(3)", "hook(2)"])).is_err());
+        assert!(std::panic::catch_unwind(|| assert_in_order("x.rs", SRC, "b", &["hook(2)", "hook(4)"])).is_err());
     }
 
     #[test]

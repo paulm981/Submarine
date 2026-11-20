@@ -6376,6 +6376,7 @@ async fn select_profile(
 /// `known_hosts` writes they triggered to the NEXT profile's DB.
 #[tauri::command]
 async fn close_profile(
+    app: tauri::AppHandle,
     state: tauri::State<'_, DbState>,
     ssh: tauri::State<'_, SshState>,
     monitor_map: tauri::State<'_, MonitorMap>,
@@ -6384,7 +6385,7 @@ async fn close_profile(
 ) -> Result<(), String> {
     quick_unlock::profile_closed();
     let opened = state.generation_now();
-    teardown_profile(&state, &ssh, &monitor_map, &cloud, &ai, opened).await?;
+    teardown_profile(&app, &state, &ssh, &monitor_map, &cloud, &ai, opened).await?;
     // Here and not in the teardown: after a reload the name may be the one
     // the new page has just picked.
     *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE")? = None;
@@ -6407,6 +6408,8 @@ async fn close_after_reload(app: tauri::AppHandle, _closing: tokio::sync::OwnedM
     };
     let ssh = app.state::<SshState>();
     let mut sessions: Vec<String> = ssh.connections.lock().await.keys().cloned().collect();
+    // FTP tabs too: their mirrors and live edits stop with them.
+    sessions.extend(ssh.ftp_sessions.lock().await.keys().cloned());
     sessions.extend(app.state::<rdp::RdpSessions>().lock().await.keys().cloned());
     sessions.extend(app.state::<vnc_client::VncClients>().lock().await.keys().cloned());
     sessions.extend(app.state::<RdpClients>().lock().await.keys().cloned());
@@ -6421,7 +6424,7 @@ async fn close_after_reload(app: tauri::AppHandle, _closing: tokio::sync::OwnedM
     let monitor_map = app.state::<MonitorMap>();
     let cloud = app.state::<std::sync::Arc<cloud::CloudState>>();
     let ai = app.state::<ai_tabs::AiState>();
-    let teardown = teardown_profile(&db, &ssh, &monitor_map, &cloud, &ai, opened);
+    let teardown = teardown_profile(&app, &db, &ssh, &monitor_map, &cloud, &ai, opened);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), teardown).await;
 }
 
@@ -6448,6 +6451,7 @@ pub(crate) async fn any_connection_open(app: &tauri::AppHandle) -> bool {
 /// What closing a profile takes down, see `close_profile`. `opened` is the
 /// generation of the profile that closes.
 async fn teardown_profile(
+    app: &tauri::AppHandle,
     state: &DbState,
     ssh: &SshState,
     monitor_map: &MonitorMap,
@@ -6500,6 +6504,14 @@ async fn teardown_profile(
     for flag in ssh.transfer_cancels.lock().await.values() {
         flag.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // So does what else runs on its own beside the tabs, each holding its
+    // connection open: folder mirrors (an FTP tab's went on syncing after a
+    // reload), live-edit watchers and Docker's live logs. A tab's Disconnect
+    // stops its own; after a reload, or a tab whose Disconnect didn't finish
+    // in time, this is what does.
+    mirror::stop_all(app.state::<MirrorMap>().inner()).await;
+    ssh.live_edits.lock().await.clear();
+    app.state::<docker::DockerStreams>().stop_all().await;
 
     // 2b. Collect every active session id, then run the standard
     // disconnect path for each one. This frees tunnel listener sockets,
@@ -6554,6 +6566,12 @@ async fn teardown_profile(
     ssh.ftp_sessions.lock().await.clear();
     ssh.connections.lock().await.clear();
     ssh.jump_connections.lock().await.clear();
+    // The forwarding rules each tab replays when it connects again. A tab is
+    // `session-<server id>`, and the next profile's servers are numbered from
+    // 1 too: a list left here (a tab whose connection had dropped, so a
+    // reload didn't disconnect it) was replayed on that profile's server of
+    // the same number, with this profile's forwards.
+    ssh.session_tunnel_specs.lock().await.clear();
     ssh.fp_txs.lock().await.clear();
     ssh.kbi_txs.lock().await.clear();
 
@@ -15107,6 +15125,7 @@ async fn initiate_connection(
                         let state_gen_w = Arc::clone(&state_session_generation);
                         let state_tunnels_w = Arc::clone(&state_tunnels);
                         let state_mirrors_w: MirrorMap = mirrors_owned.clone();
+                        let state_jump_w = Arc::clone(&state_jump_connections);
                         // Captured so the watcher can periodically re-attempt a
                         // configured tunnel that failed to bind while the session
                         // stays alive (see the retry block in the loop below).
@@ -15350,6 +15369,18 @@ async fn initiate_connection(
                                         match conns.get(&sid_w) {
                                             Some(cur) if Arc::ptr_eq(cur, &handle_arc) => { conns.remove(&sid_w); }
                                             _ => break, // superseded by a fresh connection — leave it be
+                                        }
+                                    }
+                                    // The jump hosts (ProxyJump) it went through
+                                    // close with it: their connections stayed
+                                    // open, for nothing, until the tab was
+                                    // disconnected or reconnected. A reconnect
+                                    // opens its own; one already under way has
+                                    // a newer generation, and its jump hosts stay.
+                                    {
+                                        let g = state_gen_w.lock().await;
+                                        if g.get(&sid_w).copied().unwrap_or(0) == my_gen {
+                                            state_jump_w.lock().await.remove(&sid_w);
                                         }
                                     }
                                     // Close the SFTP session too, not just
@@ -18789,6 +18820,12 @@ async fn disconnect_session(
     // Running transfers hold their own SFTP session, so dropping the cached one
     // below wouldn't reach them.
     cancel_session_transfers(state.inner(), &session_id).await;
+    // Docker's live logs and the live-edit watchers end with the tab too. A
+    // log stream holds a channel of its own, which kept the connection up
+    // after the Disconnect, `docker logs -f` running on the server.
+    app.state::<docker::DockerStreams>().stop_for_session(&session_id).await;
+    let live_edit_prefix = ssh_manager::live_edit_key(&session_id, "");
+    state.live_edits.lock().await.retain(|key, _| !key.starts_with(&live_edit_prefix));
     // Drop SFTP first so the channel it holds is freed before we tear down the
     // underlying SSH handle. The tab is gone, so is its root (sudo) mode and
     // the in-memory sudo password.
@@ -23553,6 +23590,13 @@ async fn sftp_open_remote_file(
         }
         return Ok(());
     }
+    // The file opened again: the copy is written anew below, and the watcher
+    // made for it the last time ends here, before it, or two watchers would
+    // upload each save. It goes without a word and leaves the copy alone.
+    let (end_tx, end_rx) = tokio::sync::oneshot::channel::<ssh_manager::LiveEditEnd>();
+    if let Some(old) = state.live_edits.lock().await.insert(ssh_manager::live_edit_key(&session_id, &remote_path), end_tx) {
+        let _ = old.send(ssh_manager::LiveEditEnd::Replaced);
+    }
     let forget_watcher = |path: &Path| {
         live_edit_watchers().lock().unwrap_or_else(|e| e.into_inner()).remove(path);
     };
@@ -23637,6 +23681,7 @@ async fn sftp_open_remote_file(
         // Set when the watch is to end: whether it was idle for too long, and
         // whether opening the file again would undo why (end_live_edit_watch).
         let mut ended: Option<(bool, bool)> = None;
+        let mut end_rx = end_rx;
         loop {
             if let Some((idle_end, can_go_on)) = ended.take() {
                 match end_live_edit_watch(&app_handle_clone, &session_id_clone, &filename_clone, &temp_file_path_clone, idle_end, can_go_on) {
@@ -23648,6 +23693,15 @@ async fn sftp_open_remote_file(
             tokio::select! {
                 _ = wait => {
                     ended = Some((true, true));
+                    continue;
+                }
+                // Told to end: the file opened again (Replaced), or the tab
+                // disconnected or the profile closed (the entry dropped).
+                end = &mut end_rx => {
+                    // Replaced: the copy is the new watcher's now. Dropped: as
+                    // for a session gone (live_edit.rs), which ends the loop.
+                    if matches!(end, Ok(ssh_manager::LiveEditEnd::Replaced)) { break; }
+                    ended = Some((false, false));
                     continue;
                 }
                 maybe = tok_rx.recv() => {

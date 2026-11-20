@@ -655,7 +655,75 @@ mod hook_tests {
                 ("sftp_open_remote_file", "keep_before_reopen(", 1),
                 ("sftp_open_remote_file", "end_live_edit_watch(", 1),
                 ("sftp_open_remote_file", "LIVE_EDIT_APP", 1),
+                // #388's end signal: the tab's Disconnect and a Lock end the
+                // watcher, as a session gone.
+                ("sftp_open_remote_file", "state.live_edits.lock().await.insert(", 1),
+                ("sftp_open_remote_file", "ended = Some((false, false));\r\n                    continue;\r\n                }\r\n                maybe = tok_rx.recv()", 1),
             ],
         );
+        // Only a new watcher registers (#283): registering on every open, as
+        // the original project does, would end the watcher that's running
+        // when the file is opened again, and the fork starts none then.
+        crate::fork_hooks::assert_in_order(
+            "lib.rs",
+            include_str!("lib.rs"),
+            "sftp_open_remote_file",
+            &["    if watching {\r\n", "        return Ok(());\r\n    }\r\n", "state.live_edits.lock().await.insert(", "tokio::spawn(async move {"],
+        );
+    }
+}
+
+#[cfg(test)]
+mod reopen_tests {
+    use crate::ssh_manager::{live_edit_key, LiveEditEnd, SshState};
+
+    /// Open the same file twice, as sftp_open_remote_file does (its order is
+    /// checked in hook_tests): the first open starts a watcher and registers
+    /// its end signal; the second finds it running (live_edit_watchers) and
+    /// returns before registering. So the first watcher is never told
+    /// `Replaced`, and a save after the second open is still uploaded by it.
+    /// Only the tab's Disconnect (or a Lock) ends it, by dropping the signal.
+    #[tokio::test]
+    async fn a_file_opened_twice_keeps_its_one_watcher() {
+        let state = SshState::new();
+        let copy = std::env::temp_dir().join(format!("submarine-reopen-watch-{}", std::process::id())).join("index.php");
+        let key = live_edit_key("session-7", "/var/www/index.php");
+        // What sftp_open_remote_file does with the watchers' lock, then its
+        // registration, which comes only when no watcher is running.
+        let open = |state: &SshState| {
+            let watching = {
+                let mut watchers = super::live_edit_watchers().lock().unwrap();
+                let watching = watchers.contains_key(&copy);
+                watchers.insert(copy.clone(), watching.then(std::time::Instant::now));
+                watching
+            };
+            let live_edits = std::sync::Arc::clone(&state.live_edits);
+            let key = key.clone();
+            async move {
+                if watching {
+                    return None;
+                }
+                let (end_tx, end_rx) = tokio::sync::oneshot::channel::<LiveEditEnd>();
+                if let Some(old) = live_edits.lock().await.insert(key, end_tx) {
+                    let _ = old.send(LiveEditEnd::Replaced);
+                }
+                Some(end_rx)
+            }
+        };
+        let mut first = open(&state).await.expect("the first open starts a watcher");
+        assert!(open(&state).await.is_none(), "the second open starts no other watcher");
+        assert!(
+            matches!(first.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+            "the running watcher isn't told to end: it uploads the next save"
+        );
+        assert_eq!(state.live_edits.lock().await.len(), 1);
+        // The reopen gave it a new deadline (end_live_edit_watch goes on).
+        assert!(matches!(super::live_edit_watchers().lock().unwrap().get(&copy), Some(Some(_))));
+        // The tab's Disconnect drops its signal: the watcher ends as for a
+        // session gone, keeping unsent edits.
+        let prefix = live_edit_key("session-7", "");
+        state.live_edits.lock().await.retain(|k, _| !k.starts_with(&prefix));
+        assert!(matches!(first.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)));
+        super::live_edit_watchers().lock().unwrap().remove(&copy);
     }
 }
