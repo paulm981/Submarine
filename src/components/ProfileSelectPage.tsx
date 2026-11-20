@@ -8,7 +8,7 @@ import {
 import CloudPanel from "./CloudPanel";
 import { StoreRestoreModal } from "./StoreSync";
 import { CloudConfigView, hostOf } from "./SyncServerSetting";
-import logoUrl from "../assets/logo.png";
+import logoUrl from "../assets/logo-ui.png";
 import { IS_ANDROID, IS_IOS, IS_MOBILE } from "../util/platform";
 import { PRIVACY_URL } from "../util/links";
 import { openFeedback } from "./Feedback";
@@ -1569,9 +1569,10 @@ const NewsButton = ({ onClick, title, label }: { onClick: () => void; title: str
     title={title}
     className="group flex items-center gap-1.5 text-[10.5px] text-primary/90 hover:text-primary animate-in fade-in slide-in-from-bottom-1 duration-700"
   >
-    {/* pulsing dot — the "something new" signal */}
+    {/* pulsing dot — the "something new" signal (App.css: three
+        pings, then still) */}
     <span className="relative flex h-1.5 w-1.5">
-      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary/70 opacity-75" />
+      <span className="update-ping absolute inline-flex h-full w-full rounded-full bg-primary/70" />
       <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-primary" />
     </span>
     <ArrowUpCircle size={11} className="shrink-0" />
