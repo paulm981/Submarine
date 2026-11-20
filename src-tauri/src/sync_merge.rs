@@ -14,8 +14,9 @@ use rusqlite::Connection;
 /// shim in apply_entity, as it is NOT NULL. `scope` is a command's (#185).
 /// `protocol` is a server's type (#173: NULL for SSH, "rdp", "telnet",
 /// "vnc"): a peer from before it doesn't turn this device's RDP, telnet or
-/// VNC server back into an SSH one.
-pub(crate) const LATE_COLS: &[&str] = &["terminal_theme", "highlight", "scope", "protocol", "run_on_connect_every"];
+/// VNC server back into an SSH one. `is_secret` and `tags` are a command's
+/// (their #356): a peer from before them doesn't clear a secret flag or tags.
+pub(crate) const LATE_COLS: &[&str] = &["terminal_theme", "highlight", "scope", "protocol", "run_on_connect_every", "is_secret", "tags"];
 
 /// LATE_COLS whose NULL means "not known here", and so is left out of what
 /// this device sends, as an older peer leaves it out. A server's row inserted

@@ -91,6 +91,9 @@ export interface ConfirmOptions {
   /** Focus starts on Cancel: an Enter meant for something else (the
    *  terminal the prompt appeared over) can't answer yes. */
   safeDefault?: boolean;
+  /** Hidden text the user can reveal inside the dialog (a secret command
+   *  about to run): the message stays hidden until they ask to see it. */
+  revealableText?: string;
 }
 
 type Resolver = (value: boolean) => void;
@@ -172,7 +175,8 @@ const UNSAVED_POINTER_GRACE_MS = 300;
 
 const sameConfirm = (a: ConfirmOptions, b: ConfirmOptions) =>
   a.title === b.title && a.message === b.message && a.okLabel === b.okLabel &&
-  a.cancelLabel === b.cancelLabel && !!a.destructive === !!b.destructive;
+  a.cancelLabel === b.cancelLabel && !!a.destructive === !!b.destructive &&
+  a.revealableText === b.revealableText;
 
 // A dialog comes up under the pointer of the click that asked for it, so the
 // second click of a double-click lands on the dialog: beside it, or on one of
@@ -208,6 +212,9 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
   // The confirm's "Don't ask again" box, unticked for each new confirm.
   const [dontAsk, setDontAsk] = useState(false);
   const [tpError, setTpError] = useState<string | null>(null);
+  // Whether the confirm on screen is showing its revealable text (a
+  // secret command about to run). Reset with each new prompt.
+  const [confirmRevealed, setConfirmRevealed] = useState(false);
 
   const active = queueRef.current[0] ?? null;
   const state = active?.kind === "confirm" ? active : null;
@@ -219,6 +226,7 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
   // determine "inside vs outside" for the Tab-cycle logic.
   const owPanelRef = useRef<HTMLDivElement | null>(null);
   const confirmPanelRef = useRef<HTMLDivElement | null>(null);
+  const confirmRevealRef = useRef<HTMLButtonElement | null>(null);
   const tpPanelRef = useRef<HTMLDivElement | null>(null);
   const usPanelRef = useRef<HTMLDivElement | null>(null);
   useFocusTrap(owState?.id ?? null, owPanelRef);
@@ -232,6 +240,7 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
   const primeText = useCallback((p: Pending | undefined) => {
     setTpValue(p?.kind === "text" ? p.opts.initialValue ?? "" : "");
     setTpError(null);
+    setConfirmRevealed(false);
   }, []);
 
   const enqueue = useCallback((p: Pending) => {
@@ -330,7 +339,8 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
   // muscle memory keeps working. A key still held down from before (auto
   // repeat) answers nothing: it was not pressed for this prompt. When focus
   // is on one of the panel's own controls (Cancel, ✕, the "Don't ask again"
-  // box), Enter does what that control does natively, so
+  // box, the Show command toggle), Enter does what that control does
+  // natively: on the toggle it only flips the reveal, and
   // tabbing to Cancel and pressing Enter cancels. Only an Enter with focus on
   // none of them takes the default: OK, or Cancel in a prompt whose default
   // is Cancel (`safeDefault`), so an Enter alone never says yes there.
@@ -497,8 +507,19 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
             </div>
             {/* Scrolls: a Library command is shown whole, however long it is,
                 and the buttons have to stay on screen. */}
+            {state.opts.revealableText && (
+              <button
+                type="button"
+                ref={confirmRevealRef}
+                aria-expanded={confirmRevealed}
+                onClick={() => setConfirmRevealed((r) => !r)}
+                className="mb-2 text-[11px] font-semibold text-primary hover:underline"
+              >
+                {confirmRevealed ? t("Hide command") : t("Show command")}
+              </button>
+            )}
             <p className="text-[12px] text-zinc-300 leading-relaxed mb-4 whitespace-pre-wrap break-words max-h-[60vh] overflow-y-auto custom-scrollbar">
-              {state.opts.message}
+              {confirmRevealed && state.opts.revealableText ? state.opts.revealableText : state.opts.message}
             </p>
             <div className="flex items-center justify-end gap-2">
               {state.opts.dontAskAgain && (
