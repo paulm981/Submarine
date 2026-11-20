@@ -136,13 +136,13 @@ export const useDockVersion = (): number => useSyncExternalStore(subscribe, () =
 /// Keys the app takes before a terminal sees them (xterm would otherwise
 /// turn Ctrl+Shift+J into Ctrl+J for the shell): Ctrl+Shift+J jumps to a
 /// session by name, Ctrl+Shift+L opens or folds the AI side pane (AiSidePane;
-/// Ctrl+Shift+A is the terminal's Select all), Ctrl+Tab and Ctrl+Shift+Tab go
-/// to the next and previous tab. For those two xterm would send the shell Tab
-/// and back-tab, which it still gets from Tab and Shift+Tab. The shifted
-/// letters are free: the shell only ever sees the plain Ctrl+letter.
-/// Ctrl+Shift+K isn't one of them: it's the original project's Clear
-/// terminal (#294), which TerminalView takes.
-export type AppHotkey = "jump" | "aiPane" | "next" | "prev";
+/// Ctrl+Shift+A is the terminal's Select all). The shifted letters are free:
+/// the shell only ever sees the plain Ctrl+letter. They stay beside the
+/// original project's shortcuts table (#374), which won't give them to any
+/// of its actions (fork/keys' RESERVED_KEYS). Ctrl+Tab and Ctrl+Shift+Tab
+/// are that table's Next tab and Previous tab now, and Ctrl+Shift+K its
+/// Clear terminal (#294): DesktopApp and TerminalView take those.
+export type AppHotkey = "jump" | "aiPane";
 // Ctrl+Shift+L is the pane's only while it can do something with it (the
 // pane says so as it renders: AI tools on, an AI tab open, not in Home, the
 // window wide enough for it). Otherwise the terminal keeps it, and the shell
@@ -150,9 +150,7 @@ export type AppHotkey = "jump" | "aiPane" | "next" | "prev";
 let aiPaneKeyLive = false;
 export const setAiPaneKeyLive = (on: boolean) => { aiPaneKeyLive = on; };
 export const appHotkey = (e: KeyboardEvent): AppHotkey | null => {
-  if (!e.ctrlKey || e.altKey || e.metaKey) return null;
-  if (e.code === "Tab") return e.shiftKey ? "prev" : "next";
-  if (!e.shiftKey) return null;
+  if (!e.ctrlKey || !e.shiftKey || e.altKey || e.metaKey) return null;
   if (e.code === "KeyJ") return "jump";
   if (e.code === "KeyL" && aiPaneKeyLive) return "aiPane";
   return null;

@@ -39,6 +39,9 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
       "Fork.TabAiMarker", "Fork.AllTabsButton", "Fork.AiTitleButtons", "Fork.TabMoveItems", "Fork.TabCloseItems",
       "Fork.DesktopSessionTree", "Fork.DesktopAiSide", "Fork.PingPanel", "Fork.DesktopAiPanel", "Fork.AiTrustModal", "Fork.TerminalTurn",
       "Fork.BulkTransfer", "Fork.BulkTabItems", "Fork.BroadcastBar", "Fork.BroadcastTileChips", "Fork.BroadcastTab", "Fork.shownTabs",
+      // The original project's shortcuts table (#374): the early return for plain
+      // typing, and Next tab and Previous tab in the fork's order.
+      "if (!Fork.mayBeShortcut(e)) return", "Fork.tabStepList(orderedSessionsRef.current",
     ],
   },
   {
@@ -93,6 +96,8 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
     ],
   },
   { file: "src/components/SettingsPanel.tsx", imports: ["./settings"] },
+  // The fork's keys beside the shortcuts table (#374): refused there, and named under it.
+  { file: "src/components/ShortcutSettings.tsx", imports: ["../fork/keys"], uses: ["SYSTEM_KEYS.push(...RESERVED_KEYS", "<ReservedKeysNote"] },
   { file: "src/components/SftpWorkspace.tsx", imports: ["../util/fileName"] },
   {
     file: "src/components/TerminalView.tsx",
@@ -102,9 +107,9 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
     imports: ["../fork/terminal"],
     uses: [
       "Fork.TerminalProps", "Fork.broadcastWrite(terminalId", "Fork.fileMenuAt", "Fork.useTerminal", "Fork.rootOpened", "Fork.schemeForServer", "Fork.savedPasswords",
-      "Fork.xtermLook", "Fork.mountTerminal", "Fork.appHotkey", "Fork.pasteClean",
+      "Fork.xtermLook", "Fork.mountTerminal", "Fork.appHotkey", "if (!Fork.mayBeShortcut(ev)) return true", "Fork.pasteClean",
       "Fork.TerminalOverlay", "fork.write", "fork.commands.resize", "fork.commands.close", "fork.resetHighlight",
-      "fork.outputChannel", "fork.rootInvoke", "fork.watchForShellReady", "fork.dockElRef", "fork.dockEl", "fork.onScreen",
+      "fork.outputChannel", "fork.rootInvoke", "fork.watchForShellReady", "fork.dockEl", "fork.onScreen",
       "forkTerm.startGpu", "forkTerm.openLocal", "forkTerm.output", "forkTerm.write", "forkTerm.applyLook",
       "forkTerm.register", "forkTerm.unmount", "forkTerm.dispose", "forkTerm.undock",
     ],

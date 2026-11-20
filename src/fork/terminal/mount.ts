@@ -179,7 +179,6 @@ export const mountTerminal = (
   host.style.height = '100%';
   dock.appendChild(host);
   home.appendChild(dock);
-  fork.dockElRef.current = dock;
   fork.setDockEl(dock);
   const ref = terminalRef as MutableRefObject<HTMLDivElement | null>;
   ref.current = host;
@@ -422,7 +421,6 @@ export const mountTerminal = (
      *  TerminalView's own. */
     undock: () => {
       dock.remove();
-      if (fork.dockElRef.current === dock) fork.dockElRef.current = null;
       fork.setDockEl((cur) => (cur === dock ? null : cur));
       if (ref.current === host) ref.current = home;
       if (!attachOnly) forgetTerminal(terminalId);

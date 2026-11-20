@@ -34,6 +34,7 @@ import { DEFAULT_VNC_OPTIONS, forgetVncOptions, readVncOptions, writeVncOptions 
 import { Sidebar } from "./components/Sidebar";
 import * as Fork from "./fork/desktop";
 import { OpenServerMenu } from "./components/OpenServerMenu";
+import { APP_SHORTCUTS, matchShortcut } from "./util/shortcuts";
 import { accentOf } from "./util/serverLook";
 import { folderTree } from "./util/folderTree";
 import { CommandScope, describeScope, parseCommandScope, scopeToJson } from "./util/commandScope";
@@ -1266,7 +1267,7 @@ function DesktopApp() {
     sessions, statuses: sessionStatuses, confirmClose: appSettings.confirmCloseSession, setAppSettings, clearTabName, setSessions,
     setSessionStatuses, setMergedSessionIds, broadcast, unpinSessionFromWall, setActiveView,
   });
-  const [allTabsOpen, setAllTabsOpen, titleTabs] = Fork.useTabKeys({ isUnlocked, sessions, activeView, mergedSessionIds, setMergedSessionIds, setActiveView });
+  const [allTabsOpen, setAllTabsOpen, titleTabs] = Fork.useTabKeys({ isUnlocked, sessions });
   Fork.useBroadcastWall({ broadcast, frontTerminals: sessionActiveTerm, wallItems, setWallItems, activeView, setActiveView });
 
   // The AI page's ways out: "All chats" shows it, and "Open the server" opens
@@ -1583,6 +1584,49 @@ function DesktopApp() {
   // fork: through the fork's close (Fork.useCloseSessions): "Don't ask
   // again", and back to Home.
   const closeTab = async (sid: string, ask: boolean) => { await closeSessions([sid], ask); };
+
+  // The shortcuts that work anywhere in the window (util/shortcuts; Settings →
+  // Keyboard shortcuts): open a server (the + after the last tab), and the
+  // next or the previous tab (Ctrl+Tab and Ctrl+Shift+Tab by default; a
+  // terminal gets Ctrl+Tab as a plain Tab, so the shell loses nothing). In the
+  // capture phase, before a terminal turns the keys into input. Left alone:
+  // keys in a remote desktop, which are the remote's own (switching its
+  // windows, say), keys while a dialog is open, and the keys Settings is
+  // taking for a shortcut. In the open-a-server menu, its key closes it (see
+  // OpenServerMenu).
+  const orderedSessionsRef = useRef(orderedSessions);
+  orderedSessionsRef.current = orderedSessions;
+  const activeViewRef = useRef(activeView);
+  activeViewRef.current = activeView;
+  const openServerButton = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!Fork.mayBeShortcut(e)) return; // fork: plain typing goes straight on
+      const action = matchShortcut(e, APP_SHORTCUTS);
+      if (!action) return;
+      if ((e.target as HTMLElement | null)?.closest?.("[data-remote-keys], [data-shortcut-recorder], [data-open-server-menu]")) return;
+      if (document.querySelector('[aria-modal="true"]')) return;
+      if (action === "openServer") {
+        const plus = openServerButton.current;
+        if (!plus) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (!e.repeat) setOpenServerAnchor(plus);
+        return;
+      }
+      const list = Fork.tabStepList(orderedSessionsRef.current); // fork: Home, Broadcast's tab, then the servers
+      if (list.length === 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const at = list.findIndex((s) => s.id === activeViewRef.current);
+      const step = action === "previousTab" ? -1 : 1;
+      const next = list[at < 0 ? (step > 0 ? 0 : list.length - 1) : (at + step + list.length) % list.length];
+      setMergedSessionIds((prev) => (prev.includes(next.id) ? prev : []));
+      setActiveView(next.id);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, []);
 
   // Render helper, NOT a component — it is invoked as `{TitleBar()}` below,
   // never as `<TitleBar />`. Rendering it as a JSX element would give it a
@@ -2008,6 +2052,7 @@ function DesktopApp() {
           going back to the Servers page. */}
       {isUnlocked && (
         <button
+          ref={openServerButton}
           type="button"
           // A click leaves the focus where it was (a terminal, say): the
           // menu gives it back there when Escape closes it.

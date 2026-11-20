@@ -2,9 +2,11 @@
 // moved out of DesktopApp.tsx, the original project's file, for #163).
 import { describe, expect, it } from "vitest";
 import {
-  type DesktopSession, aiPaneViewOf, closeCounts, inRemoteDesktop, osChecksDue, sessionFor, sessionPaneStyle, stepTab, tabDivider, tabMenuStyle,
+  type DesktopSession, aiPaneViewOf, closeCounts, osChecksDue, sessionFor, sessionPaneStyle, tabDivider, tabMenuStyle,
   tabsToClose, wouldEnd,
 } from "../../src/fork/desktop/rules";
+import { setTabStepOrder, tabStepList } from "../../src/fork/keys";
+import { appHotkey } from "../../src/ui/terminalDock";
 
 describe("wouldEnd", () => {
   it("asks nothing for no sessions and Home's one terminal, which the app always has", () => {
@@ -37,19 +39,41 @@ describe("closing tabs from a tab's menu", () => {
   });
 });
 
-describe("stepTab", () => {
-  const order = ["home", "s1", "s2"];
+// Next tab and Previous tab (Ctrl+Tab and Ctrl+Shift+Tab by default) are the
+// original project's, in their shortcuts table (#374). Their handler in
+// DesktopApp steps through the list Fork.tabStepList gives it: the title bar
+// as the fork shows it, Home, Broadcast's tab, then the servers.
+describe("Next tab and Previous tab, through the fork's tabs", () => {
+  // Their step, as DesktopApp has it (the source is checked below).
+  const step = (list: { id: string }[], current: string, dir: 1 | -1): string | null => {
+    if (list.length === 0) return null;
+    const at = list.findIndex((s) => s.id === current);
+    return list[at < 0 ? (dir > 0 ? 0 : list.length - 1) : (at + dir + list.length) % list.length].id;
+  };
+  const servers = [{ id: "s1" }, { id: "s2" }];
 
-  it("steps through the tabs and round", () => {
-    expect(stepTab(order, "home", 1)).toBe("s1");
-    expect(stepTab(order, "s2", 1)).toBe("home");
-    expect(stepTab(order, "home", -1)).toBe("s2");
+  it("steps through Home, Broadcast's tab and the server tabs, and round", () => {
+    setTabStepOrder(["home", "wall", "s2"]);
+    const list = tabStepList(servers);
+    expect(list.map((t) => t.id)).toEqual(["home", "wall", "s2"]);
+    expect(step(list, "home", 1)).toBe("wall");
+    expect(step(list, "wall", 1)).toBe("s2");
+    expect(step(list, "s2", 1)).toBe("home");
+    expect(step(list, "home", -1)).toBe("s2");
   });
 
   it("goes to the first or last tab from a view that isn't one", () => {
-    expect(stepTab(order, "settings", 1)).toBe("home");
-    expect(stepTab(order, "settings", -1)).toBe("s2");
-    expect(stepTab([], "settings", 1)).toBeNull();
+    setTabStepOrder(["home", "s1", "s2"]);
+    expect(step(tabStepList(servers), "settings", 1)).toBe("home");
+    expect(step(tabStepList(servers), "settings", -1)).toBe("s2");
+    setTabStepOrder([]);
+    expect(step(tabStepList(servers), "settings", 1)).toBeNull();
+  });
+
+  it("is no longer one of the fork's own keys, so no second handler moves a tab", () => {
+    const tab = (shift: boolean) => ({ code: "Tab", key: "Tab", ctrlKey: true, shiftKey: shift, altKey: false, metaKey: false }) as KeyboardEvent;
+    expect(appHotkey(tab(false))).toBeNull();
+    expect(appHotkey(tab(true))).toBeNull();
   });
 });
 
@@ -170,25 +194,15 @@ describe("the title bar's tabs (the original project's classic tabs, #339)", () 
     expect(tabDivider(["home", "s1"], "s1", "wall")).toBe(false);
   });
 
-  it("leaves Ctrl+Tab to a remote desktop, and only there", () => {
-    const inside = { closest: (sel: string) => (sel === "[data-remote-keys]" ? {} : null) } as unknown as EventTarget;
-    const outside = { closest: () => null } as unknown as EventTarget;
-    expect(inRemoteDesktop(inside)).toBe(true);
-    expect(inRemoteDesktop(outside)).toBe(false);
-    expect(inRemoteDesktop(null)).toBe(false);
-    // The window itself has no closest().
-    expect(inRemoteDesktop({} as EventTarget)).toBe(false);
-  });
-
-  // The original project's #339 added its own tab drag and Ctrl+Tab. Both
-  // merged into DesktopApp.tsx without a conflict and would have beaten the
-  // fork's: a later onPointerDown wins over the fork's drag spread, and a
-  // capture-phase Ctrl+Tab listener runs before Fork.useTabKeys, skipping
-  // Home and Broadcast and pulling servers out of Broadcast. This fails if a
-  // sync brings them back.
-  const SOURCES = import.meta.glob<string>("/src/DesktopApp.tsx", { query: "?raw", import: "default", eager: true });
-  const code = (SOURCES["/src/DesktopApp.tsx"] ?? "")
-    .replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "").replace(/\s\/\/ .*$/gm, "");
+  // The original project's #339 added its own tab drag, which merged into
+  // DesktopApp.tsx without a conflict and would have beaten the fork's: a
+  // later onPointerDown wins over the fork's drag spread. Their Ctrl+Tab,
+  // now their shortcuts table's Next tab and Previous tab (#374), is taken,
+  // stepping the fork's way. These fail if a sync changes either.
+  const SOURCES = import.meta.glob<string>(["/src/DesktopApp.tsx", "/src/fork/desktop/hooks.ts", "/src/fork/**/*.{ts,tsx}", "/src/ui/*.{ts,tsx}"], { query: "?raw", import: "default", eager: true });
+  const stripComments = (src: string) =>
+    src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "").replace(/\s\/\/ .*$/gm, "");
+  const code = stripComments(SOURCES["/src/DesktopApp.tsx"] ?? "");
 
   it("drags a server tab with the fork's drag only", () => {
     const lines = code.split("\n");
@@ -200,10 +214,30 @@ describe("the title bar's tabs (the original project's classic tabs, #339)", () 
     expect(code).not.toMatch(/startTabDrag|setTabOrder|tabDragged/);
   });
 
-  it("has one Ctrl+Tab, the fork's", () => {
-    expect(code).toMatch(/Fork\.useTabKeys\(/);
-    expect(code).not.toMatch(/e\.key\s*!==?\s*["']Tab["']/);
-    expect(code).not.toMatch(/addEventListener\(["']keydown["'][^)]*,\s*true\)/);
+  it("has one Ctrl+Tab: their table's, in the fork's order, behind the early return for plain typing", () => {
+    // One window listener in the capture phase: theirs.
+    expect(code.match(/addEventListener\(["']keydown["'][^)]*,\s*true\)/g) ?? []).toHaveLength(1);
+    const at = code.indexOf("const onKey = (e: KeyboardEvent) => {");
+    expect(at, "DesktopApp's shortcut listener is gone").toBeGreaterThanOrEqual(0);
+    const body = code.slice(at, code.indexOf('window.addEventListener("keydown", onKey, true)', at));
+    const lines = body.split("\n").map((l) => l.trim()).filter(Boolean);
+    // The early return comes first, before their table is looked up.
+    expect(lines[1]).toBe("if (!Fork.mayBeShortcut(e)) return;");
+    expect(lines[2]).toBe("const action = matchShortcut(e, APP_SHORTCUTS);");
+    // Keys in a remote desktop are the remote's own.
+    expect(body).toContain("[data-remote-keys]");
+    // Their step, through the fork's tabs (the step tested above).
+    expect(body).toContain("const list = Fork.tabStepList(orderedSessionsRef.current);");
+    expect(body).toContain("const at = list.findIndex((s) => s.id === activeViewRef.current);");
+    expect(body).toContain('const step = action === "previousTab" ? -1 : 1;');
+    expect(body).toContain("const next = list[at < 0 ? (step > 0 ? 0 : list.length - 1) : (at + step + list.length) % list.length];");
+    expect(body).toMatch(/e\.preventDefault\(\);\s*e\.stopPropagation\(\);\s*const at = list/);
+    // No key handler of the fork's goes by Tab with Ctrl: no second move.
+    for (const [file, src] of Object.entries(SOURCES)) {
+      if (file === "/src/DesktopApp.tsx") continue;
+      expect(stripComments(src), file).not.toMatch(/code === ["']Tab["']|"next" \| "prev"/);
+    }
+    expect(stripComments(SOURCES["/src/fork/desktop/hooks.ts"] ?? "")).toContain('if (k !== "jump") return;');
   });
 
   it("closes a tab, from its ×, a middle click, its menu or the phone's list, through the fork's close", () => {
