@@ -1,4 +1,4 @@
-// Settings › Help: updates, troubleshooting and the open-source licenses.
+// Settings › Help: fork releases, troubleshooting and the open-source licenses.
 import { useState } from "react";
 import { ClipboardCopy, FolderOpen, LifeBuoy, RefreshCw, Scale } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
@@ -7,9 +7,11 @@ import { windowSummary } from "../../util/diagnostics";
 import { IS_ANDROID } from "../../util/platform";
 import { CARD, LearnMore, SettingsSection, SwitchRow } from "./parts";
 
-export function UpdatesSection({ settings, setSettings }: any) {
+// "Fork releases", not "Updates": the original project's own Updates card
+// (Tell me about beta versions) shows under Help too.
+export function ForkReleasesSection({ settings, setSettings }: any) {
   return (
-    <SettingsSection icon={RefreshCw} title="Updates">
+    <SettingsSection icon={RefreshCw} title="Fork releases">
       <div className={CARD}>
         <div>
           <p className="text-sm text-zinc-400 leading-relaxed">
@@ -17,7 +19,8 @@ export function UpdatesSection({ settings, setSettings }: any) {
           </p>
           <LearnMore>
             Every change to the fork is a release, numbered like v0.5.0-fork.2 and shown in the title bar. Built from
-            source, it also says when the fork's main has changes to pull and rebuild.
+            source, it also says when the fork's main has changes to pull and rebuild. Fork releases aren't betas, so
+            you're told about each one whether Tell me about beta versions is on or off.
           </LearnMore>
         </div>
         <div className="border-t border-white/5 pt-4">

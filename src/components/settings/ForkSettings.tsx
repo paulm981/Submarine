@@ -5,7 +5,7 @@ import { IS_MOBILE } from "../../util/platform";
 import type { SettingsTab } from "./categories";
 import { AiToolsSection } from "./AiToolsSettings";
 import { LiveEditSection } from "./GeneralSettings";
-import { LicensesSection, TroubleshootingSection, UpdatesSection } from "./HelpSettings";
+import { LicensesSection, TroubleshootingSection, ForkReleasesSection } from "./HelpSettings";
 import { JumpHostsSection, ServersSection, SessionsSection } from "./ServersSettings";
 import { SubmarineCloudSection } from "./SyncSettings";
 import { HomeTerminalSection } from "./TerminalSettings";
@@ -32,7 +32,7 @@ export function ForkSettings({ tab, settings, setSettings }: { tab: SettingsTab;
     case "help":
       return (
         <>
-          <UpdatesSection settings={settings} setSettings={setSettings} />
+          <ForkReleasesSection settings={settings} setSettings={setSettings} />
           <TroubleshootingSection />
           <LicensesSection />
         </>

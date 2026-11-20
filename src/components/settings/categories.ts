@@ -30,6 +30,7 @@ export const UPSTREAM_CARD_TABS: Readonly<Record<string, SettingsTab>> = {
   "Connections": "servers",
   "Cloud sync": "sync",
   "Help & feedback": "help",
+  "Updates": "help",
 };
 
 /** The original project's AI settings (#252): components of their own that
