@@ -1604,6 +1604,25 @@ exec "$@"
         assert_eq!(lab.attempts(), 0);
     }
 
+    /// A Services action as root (#283): the service's name reaches
+    /// rc-service as one word of its own, never read by a shell, with sudo
+    /// and through `dzdo su -` with a password. The stand-in rc-service is in
+    /// the server's folder, which is on the tests' tool path.
+    #[tokio::test]
+    async fn a_service_name_reaches_the_manager_as_one_word() {
+        let lab = Lab::new("svc", "shell", "all nopasswd").await;
+        let stand_in = lab.dir.join("rc-service");
+        std::fs::write(&stand_in, "#!/bin/sh\nprintf '[%s]' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let args = service_root_args(ServiceManager::OpenRc, "restart", "getty@tty1").unwrap();
+        let sudo = ssh_manager::RootAccess::new("sudo", None, None, None);
+        let (code, out) = root_run(&lab.handle, &sudo, &args, 30, None).await.unwrap();
+        assert_eq!((code, out.as_str()), (0, "[getty@tty1][restart]"));
+        let (code, out) = root_run(&lab.handle, &su("s3cret pass"), &args, 30, None).await.unwrap();
+        assert_eq!((code, out.trim()), (0, "[getty@tty1][restart]"));
+        assert_eq!(lab.attempts(), 1);
+    }
+
     /// PAM's own prompt ("Password for bob@REALM:", an OTP) instead of the
     /// tool's: the password is checked without looking for any prompt, so
     /// it works; where no ticket is kept, it fails plainly, after one
@@ -2076,6 +2095,187 @@ pub(crate) fn tool_answer(out: &str) -> Option<String> {
     (!lines.is_empty()).then(|| classify_sudo_failure(&lines.join(" ")))
 }
 
+/// What a Services action runs as root (ssh_systemctl_action in lib.rs,
+/// #283): the command's words for the server's service manager, each a
+/// word of its own (root_run never puts them through a shell line):
+///
+/// - systemd: `systemctl <action> <unit>`
+/// - OpenRC (Alpine, Gentoo): `rc-service <name> <action>`
+/// - procd (OpenWrt): `/etc/init.d/<name> <action>`
+///
+/// The name comes from the server's service list, so it's checked here
+/// again, on its own, whatever lib.rs checked first: a strict set of
+/// characters, a length limit, and no leading `-` (an option) or `.` (`..`,
+/// a hidden file). It never holds a `/`, so the procd script stays in
+/// /etc/init.d. A name or action that doesn't pass is refused, never
+/// cleaned. The action word is the app's own fixed text, not the caller's.
+pub(crate) fn service_root_args(manager: ServiceManager, action: &str, name: &str) -> Result<Vec<String>, String> {
+    let action: &'static str = match (manager, action) {
+        (_, "start") => "start",
+        (_, "stop") => "stop",
+        (_, "restart") => "restart",
+        (ServiceManager::Systemd, "reload") => "reload",
+        (ServiceManager::Systemd, "status") => "status",
+        _ => return Err(SERVICE_ACTION_REFUSED.into()),
+    };
+    if !service_name_ok(manager, name) {
+        return Err(SERVICE_NAME_REFUSED.into());
+    }
+    Ok(match manager {
+        ServiceManager::Systemd => vec!["systemctl".into(), action.into(), name.into()],
+        ServiceManager::OpenRc => vec!["rc-service".into(), name.into(), action.into()],
+        ServiceManager::Procd => vec![format!("/etc/init.d/{name}"), action.into()],
+    })
+}
+
+/// What service_root_args fails with for a name it doesn't take.
+pub(crate) const SERVICE_NAME_REFUSED: &str = "invalid service name";
+
+/// What service_root_args fails with for an action it doesn't take.
+pub(crate) const SERVICE_ACTION_REFUSED: &str = "invalid service action";
+
+/// The longest systemd unit name service_root_args takes (as lib.rs's
+/// is_safe_systemctl_unit), and the longest OpenRC or procd script name.
+pub(crate) const SYSTEMD_UNIT_MAX: usize = 256;
+pub(crate) const INIT_NAME_MAX: usize = 128;
+
+/// A service name the root path takes (service_root_args): ASCII letters,
+/// digits, `.`, `-`, `_` and `@`, and for systemd also `:` and `\` (how it
+/// writes a dash in an instance name, `\x2d`); not starting with `-` or `.`.
+fn service_name_ok(manager: ServiceManager, name: &str) -> bool {
+    let (max, systemd) = match manager {
+        ServiceManager::Systemd => (SYSTEMD_UNIT_MAX, true),
+        ServiceManager::OpenRc | ServiceManager::Procd => (INIT_NAME_MAX, false),
+    };
+    !name.is_empty()
+        && name.len() <= max
+        && !name.starts_with(['-', '.'])
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'@') || (systemd && matches!(b, b':' | b'\\')))
+}
+
+/// What an Info panel action (a service, a kill) came to as root
+/// (run_as_root), after the user's own try (`plain`) was refused. Where the
+/// server has neither sudo nor dzdo (OpenWrt, Alpine as installed), the
+/// user's own answer says why the action failed, as the original project's
+/// `sudo_missing` has it.
+pub(crate) fn root_action_result(ran: Result<(i32, String, &'static str), String>, plain: SystemctlActionResult) -> Result<SystemctlActionResult, String> {
+    match ran {
+        Ok((code, out, tool)) => Ok(SystemctlActionResult {
+            success: code == 0,
+            exit_code: code,
+            stdout: out,
+            stderr: String::new(),
+            used_sudo: true,
+            root_tool: Some(tool.to_string()),
+        }),
+        Err(e) if e == SUDO_NO_SUDO => Ok(plain),
+        Err(e) => Err(e),
+    }
+}
+
+/// The Services tab's root path (#283): what a service's name, which comes
+/// from the server, can and can't become.
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+
+    fn args(manager: ServiceManager, action: &str, name: &str) -> Result<Vec<String>, String> {
+        service_root_args(manager, action, name)
+    }
+
+    #[test]
+    fn each_manager_gets_its_own_words() {
+        assert_eq!(args(ServiceManager::Systemd, "restart", "nginx.service").unwrap(), ["systemctl", "restart", "nginx.service"]);
+        assert_eq!(args(ServiceManager::Systemd, "status", r"dev-disk-by\x2duuid-1.swap").unwrap(), ["systemctl", "status", r"dev-disk-by\x2duuid-1.swap"]);
+        assert_eq!(args(ServiceManager::Systemd, "start", "getty@tty1.service").unwrap(), ["systemctl", "start", "getty@tty1.service"]);
+        assert_eq!(args(ServiceManager::OpenRc, "restart", "sshd").unwrap(), ["rc-service", "sshd", "restart"]);
+        assert_eq!(args(ServiceManager::OpenRc, "stop", "openvpn.tun0").unwrap(), ["rc-service", "openvpn.tun0", "stop"]);
+        assert_eq!(args(ServiceManager::Procd, "stop", "dnsmasq").unwrap(), ["/etc/init.d/dnsmasq", "stop"]);
+        assert_eq!(args(ServiceManager::Procd, "start", "php-fpm84").unwrap(), ["/etc/init.d/php-fpm84", "start"]);
+    }
+
+    /// A name that could leave /etc/init.d, become an option, or carry a
+    /// second command is refused for every manager, never cleaned.
+    #[test]
+    fn a_hostile_name_is_refused() {
+        let long_init = "a".repeat(INIT_NAME_MAX + 1);
+        let long_unit = "a".repeat(SYSTEMD_UNIT_MAX + 1);
+        let hostile = [
+            "", ".", "..", "../../bin/sh", "../x", "/bin/sh", "a/b", "a/../../b", ".hidden", "-x", "--help", "-H", "foo;id", "foo id",
+            "foo|id", "foo&id", "$(id)", "`id`", "a'b", "a\"b", "a\nb", "a\rb", "a\0b", "a\tb", "a*", "a?", "a~", "a>b", "a<b", "a#b",
+            "\u{e9}t\u{e9}", "a\u{2215}b",
+        ];
+        for manager in [ServiceManager::Systemd, ServiceManager::OpenRc, ServiceManager::Procd] {
+            for name in hostile {
+                assert_eq!(args(manager, "restart", name), Err(SERVICE_NAME_REFUSED.to_string()), "{manager:?} {name:?}");
+            }
+            assert_eq!(args(manager, "restart", &long_unit), Err(SERVICE_NAME_REFUSED.to_string()), "{manager:?}");
+        }
+        // systemd's `:` and `\` are its own: never an init script's.
+        for manager in [ServiceManager::OpenRc, ServiceManager::Procd] {
+            assert_eq!(args(manager, "restart", &long_init), Err(SERVICE_NAME_REFUSED.to_string()));
+            for name in ["a:b", r"a\x2db", r"..\x2f"] {
+                assert_eq!(args(manager, "restart", name), Err(SERVICE_NAME_REFUSED.to_string()), "{manager:?} {name:?}");
+            }
+        }
+        assert!(args(ServiceManager::Systemd, "restart", &"a".repeat(SYSTEMD_UNIT_MAX)).is_ok());
+        assert!(args(ServiceManager::OpenRc, "restart", &"a".repeat(INIT_NAME_MAX)).is_ok());
+    }
+
+    /// Whatever passes, procd's script is a file right in /etc/init.d.
+    #[test]
+    fn a_procd_script_never_leaves_init_d() {
+        for name in ["dnsmasq", "a..b", "x.y", "getty@tty1", "network"] {
+            let words = args(ServiceManager::Procd, "start", name).unwrap();
+            let rest = words[0].strip_prefix("/etc/init.d/").expect("in /etc/init.d");
+            assert!(!rest.contains('/') && rest != ".." && rest != "." && rest == name, "{name:?}");
+        }
+    }
+
+    /// The action is the app's own word, from its short list for each
+    /// manager: OpenRC and procd scripts have no reload or status of their own
+    /// for every service.
+    #[test]
+    fn only_known_actions() {
+        for manager in [ServiceManager::Systemd, ServiceManager::OpenRc, ServiceManager::Procd] {
+            for action in ["", "enable", "disable", "mask", "kill", "Start", "start ", "start;id", "-H", "--now", "edit"] {
+                assert_eq!(args(manager, action, "sshd"), Err(SERVICE_ACTION_REFUSED.to_string()), "{manager:?} {action:?}");
+            }
+        }
+        for action in ["reload", "status"] {
+            assert!(args(ServiceManager::Systemd, action, "sshd.service").is_ok());
+            assert_eq!(args(ServiceManager::OpenRc, action, "sshd"), Err(SERVICE_ACTION_REFUSED.to_string()));
+            assert_eq!(args(ServiceManager::Procd, action, "sshd"), Err(SERVICE_ACTION_REFUSED.to_string()));
+        }
+    }
+
+    fn plain() -> SystemctlActionResult {
+        SystemctlActionResult {
+            success: false,
+            exit_code: 1,
+            stdout: " * rc-service: permission denied".into(),
+            stderr: String::new(),
+            used_sudo: false,
+            root_tool: None,
+        }
+    }
+
+    /// No sudo or dzdo on the server: the user's own answer says why.
+    #[test]
+    fn without_sudo_or_dzdo_the_users_own_answer() {
+        let r = root_action_result(Err(SUDO_NO_SUDO.into()), plain()).unwrap();
+        assert!(!r.success && !r.used_sudo && r.root_tool.is_none());
+        assert_eq!((r.exit_code, r.stdout.as_str()), (1, " * rc-service: permission denied"));
+        // Every other answer from the root path is passed on as it is.
+        for e in [SUDO_NEED_PASSWORD, SUDO_WRONG_PASSWORD, SUDO_NOT_ALLOWED, SUDO_UNSAFE, SUDO_PASSWORD_LINE_BREAK] {
+            assert_eq!(root_action_result(Err(e.into()), plain()).err(), Some(e.to_string()));
+        }
+        let r = root_action_result(Ok((0, "done".into(), "dzdo")), plain()).unwrap();
+        assert!(r.success && r.used_sudo);
+        assert_eq!((r.exit_code, r.stdout.as_str(), r.root_tool.as_deref()), (0, "done", Some("dzdo")));
+    }
+}
+
 /// What get_sftp_session's elevated open (lib.rs) came to.
 pub(crate) enum ElevatedOpen {
     /// Another open of this tab's finished while this one waited its turn:
@@ -2177,6 +2377,9 @@ mod hook_tests {
                 ("ssh_kill_process", "sh_user_command(", 1),
                 ("ssh_iptables_chain", "sh_user_command(", 1),
                 ("ssh_nft_chain", "sh_user_command(", 1),
+                ("ssh_systemctl_action", "service_root_args(", 1),
+                ("ssh_systemctl_action", "root_action_result(", 1),
+                ("ssh_kill_process", "root_action_result(", 1),
             ],
         );
         assert_hooks(

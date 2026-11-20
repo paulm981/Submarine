@@ -16,8 +16,26 @@
 
 /// The text of `fn name` in `src`, from its `fn` line to its closing brace
 /// (the first line after it that is the `fn` line's indent and `}`, as
-/// rustfmt writes it). None when there is no such function.
+/// rustfmt writes it). None when there is no such function. Where there's
+/// more than one, the one at the top level of the file: a test's helper of
+/// the same name (the original project's `fn run` in a test module, #387)
+/// doesn't stand in for the app's own.
 fn body_of<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+    let mut first = None;
+    let mut rest = src;
+    while let Some((body, indented, after)) = next_body(rest, name) {
+        if !indented {
+            return Some(body);
+        }
+        first = first.or(Some(body));
+        rest = after;
+    }
+    first
+}
+
+/// The first `fn name` in `src` (body_of): its text, whether it's indented,
+/// and the text after it.
+fn next_body<'a>(src: &'a str, name: &str) -> Option<(&'a str, bool, &'a str)> {
     let mut offset = 0;
     let mut start: Option<(usize, String)> = None;
     for line in src.split_inclusive('\n') {
@@ -32,14 +50,14 @@ fn body_of<'a>(src: &'a str, name: &str) -> Option<&'a str> {
                 if after_fn.is_some_and(|rest| rest.strip_prefix(name).is_some_and(|r| r.starts_with(['(', '<']))) {
                     // A body on the same line: `fn d() {}`.
                     if code.ends_with('}') {
-                        return Some(line);
+                        return Some((line, !indent.is_empty(), &src[offset + line.len()..]));
                     }
                     start = Some((offset, indent.to_string()));
                 }
             }
             Some((from, indent)) => {
                 if text == format!("{indent}}}") {
-                    return Some(&src[*from..offset + line.len()]);
+                    return Some((&src[*from..offset + line.len()], !indent.is_empty(), &src[offset + line.len()..]));
                 }
             }
         }
@@ -96,6 +114,18 @@ mod tests {
         assert_eq!(body_of(SRC, "d").unwrap().matches("hook(").count(), 0);
         // `fn ab` isn't `fn a`.
         assert!(body_of("fn ab() {\n}\n", "a").is_none());
+    }
+
+    /// A test's helper of the same name, earlier in the file, doesn't stand
+    /// in for the function at the top level; with none there, the first.
+    #[test]
+    fn the_top_level_function_comes_first() {
+        let src = "mod tests {\r\n    fn run(x: u8) {\r\n        helper();\r\n    }\r\n}\r\n\r\npub fn run() {\r\n    hook(1);\r\n    hook(2);\r\n}\r\n";
+        let body = body_of(src, "run").unwrap();
+        assert_eq!((body.matches("hook(").count(), body.matches("helper(").count()), (2, 0));
+        assert_eq!(body_of(src, "run").unwrap(), "pub fn run() {\r\n    hook(1);\r\n    hook(2);\r\n}\r\n");
+        let only_indented = "impl S {\n    fn c(&self) {\n        hook(4);\n    }\n    fn c2() {}\n}\n";
+        assert_eq!(body_of(only_indented, "c").unwrap().matches("hook(").count(), 1);
     }
 
     #[test]
