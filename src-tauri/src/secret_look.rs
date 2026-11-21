@@ -137,11 +137,14 @@ pub(crate) fn shown_name(raw: Option<&str>) -> Option<String> {
     Some(cut)
 }
 
+/// A command's saved text, whether it's on the list, and who and when.
+type LookRow = (Option<String>, bool, Option<String>, Option<String>);
+
 /// Whether a run of command `id`, whose text the list holds as `content`,
 /// waits for Show command, and why. None: it runs as before.
 pub(crate) fn look_for(conn: &Connection, id: i64, content: &str) -> Result<Option<SecretLook>, String> {
     let db = |e: rusqlite::Error| format!("[DATABASE] SECRET_LOOKS_FAILED: {e}");
-    let row: Option<(Option<String>, bool, Option<String>, Option<String>)> = conn
+    let row: Option<LookRow> = conn
         .query_row(
             "SELECT c.content, l.command_id IS NOT NULL, l.changed_by, l.stamp
                FROM commands c LEFT JOIN secret_looks l ON l.command_id = c.id WHERE c.id = ?1",
