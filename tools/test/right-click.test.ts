@@ -39,6 +39,8 @@ type World = {
   alt?: boolean;
   /** The fork's file-path menu finds a path under the pointer. */
   onPath?: boolean;
+  /** Two fingers pinched the text size since the first one landed (their #395). */
+  pinched?: boolean;
 };
 
 const handlerSource = Promise.all(["programHasMouse", "bypassesProgram", "onContextMenu"].map(declaration))
@@ -59,6 +61,7 @@ const rightClick = async (world: World) => {
     fork: {},
     terminalRef: { current: { parentElement: { getBoundingClientRect: () => pane } } },
     disabledRef: { current: false },
+    pinched: !!world.pinched,
     setPasteAt: () => { did.push("Paste button"); },
     pasteClipboard: async () => { did.push("paste"); },
     Fork: {
@@ -108,6 +111,8 @@ describe("a right click in a terminal does one thing (#280, their #371)", () => 
 
   it("shows only the Paste button for a long press on a touch screen", async () => {
     expect(await rightClick({ pointer: "touch" })).toEqual(["Paste button"]);
+    // Not after a pinch (their #395): the fingers changed the text size.
+    expect(await rightClick({ pointer: "touch", pinched: true })).toEqual([]);
     expect(await rightClick({ pointer: "touch", onPath: true, mouseProgram: true })).toEqual(["Paste button"]);
     expect(await rightClick({ mobile: true })).toEqual(["Paste button"]);
   });
