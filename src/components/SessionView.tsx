@@ -31,6 +31,8 @@ import * as Fork from "../fork/session";
 import { ErrorBoundary } from "../ui/ErrorBoundary";
 import { parseObjectList } from "../util/serverJson";
 import { tk, tn, tx, useT } from "../i18n";
+import NotConnected from "./NotConnected";
+import { useWaitToConnect } from "../hooks/useWaitToConnect";
 
 // What the shell-config push commands answer (mirror.rs' ShellSync* types).
 type ShellSyncShells = { remote_shell: string; local_shell: string; shell_mismatch: boolean };
@@ -418,6 +420,9 @@ function writeFollow(on: boolean) {
 // this session is on screen, not behind another one or another view.
 const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onStatusChange, chromeless = false, onTerminalsChange, onSessionTitle, isActiveView = false, shown: sessionShown = true, onPromptChange, compactTabs = false }: any) => {
   const t = useT();
+  // A tab opened at startup without connecting waits for Connect: the tab
+  // shows it as 'idle', and its own status stays 'connecting' until then.
+  const { waiting, connectNow } = useWaitToConnect(session);
   const [status, setStatus] = useState<'connecting' | 'connected' | 'failed' | 'disconnected'>('connecting');
 
   // Bubble every status change up to the parent so the session-tab strip
@@ -426,9 +431,9 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // wiring we already do here.
   useEffect(() => {
     if (typeof onStatusChange === "function") {
-      onStatusChange(session?.id, status);
+      onStatusChange(session?.id, waiting ? 'idle' : status);
     }
-  }, [status, session?.id, onStatusChange]);
+  }, [status, waiting, session?.id, onStatusChange]);
   const [disconnectReason, setDisconnectReason] = useState<string>("");
   const jumpGone = Fork.useJumpGone(session.serverId, () => reconnect(), (msg) => pushLog({ msg, type: 'error' }));
   const [logs, setLogs] = useState<{ msg: string, type: string, time?: string }[]>([]);
@@ -1266,6 +1271,8 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   };
 
   useEffect(() => {
+    // Opened at startup without connecting: nothing starts until Connect.
+    if (waiting) return;
     if (initiatedRef.current) return;
     initiatedRef.current = true;
 
@@ -1500,7 +1507,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           if (session.serverUuid) window.dispatchEvent(new CustomEvent<AiLevelDetail>(AI_LEVEL_EVENT, { detail: { serverUuid: session.serverUuid } }));
         });
     };
-  }, [session.id, session.serverId]);
+  }, [session.id, session.serverId, waiting]);
 
   const scheduleReconnect = (attempt: number) => {
     if (reconnectTimerRef.current) {
@@ -1574,11 +1581,14 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // round-tripping through React props — keeps DesktopApp's tab UI decoupled
   // from SessionView's reconnect lifecycle.
   useEffect(() => {
+    // While the tab waits to be connected, its menu's Connect starts the
+    // first connect instead (hooks/useWaitToConnect).
+    if (waiting) return;
     const onReconnect = () => reconnect();
     const evt = `session-reconnect-${session.id}`;
     window.addEventListener(evt, onReconnect);
     return () => window.removeEventListener(evt, onReconnect);
-  }, [session.id, customPassword]);
+  }, [session.id, customPassword, waiting]);
 
   // Reconnecting turned off in Settings stops a countdown that is running, at
   // once rather than when it ends.
@@ -1770,6 +1780,9 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // included, so once the session has been up it must never run: whatever a
   // reconnect does, the terminals, their scrollback and the SFTP state stay,
   // behind a slim banner.
+  if (waiting) {
+    return <NotConnected name={displayName || session.serverName} onConnect={connectNow} onClose={onClose} />;
+  }
   if (!everConnected && (status === 'connecting' || status === 'failed')) {
     const retryWaiting = reconnectAttempt > 0 && nextReconnectAt !== null;
     const retryIn = <SecondsLeft until={nextReconnectAt ?? 0} />;

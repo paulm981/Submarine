@@ -18,5 +18,6 @@ export const sessionDot = (st: string, waiting: boolean): { tone: string; title:
     st === "connecting"   ? "Connecting…" :
     st === "failed"       ? "Connection failed" :
     st === "disconnected" ? "Disconnected" :
+    st === "idle"         ? "Not connected" :
                             st,
 });

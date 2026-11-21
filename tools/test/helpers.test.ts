@@ -88,6 +88,8 @@ describe("sessionDot", () => {
     expect(sessionDot("connecting", false).tone).toContain("animate");
     expect(sessionDot("failed", false).tone).toBe(sessionDot("disconnected", false).tone);
     expect(sessionDot("paused", false)).toEqual({ tone: "bg-zinc-500", title: "paused" });
+    // A tab that opened with the profile, waiting for Connect (their #394).
+    expect(sessionDot("idle", false)).toEqual({ tone: "bg-zinc-500", title: "Not connected" });
   });
 });
 
