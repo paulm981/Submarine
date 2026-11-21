@@ -31,6 +31,7 @@
     "active": true,
     "targets": "all",
     "homepage": "https://submarine.sinaxhpm.com",
+    "publisher": "Sina Xhpm",
     "copyright": "Copyright (c) Sina Xhpm. MIT License.",
     "license": "MIT",
     "category": "DeveloperTool",
@@ -45,6 +46,12 @@
     ],
     "macOS": {
       "signingIdentity": "-"
+    },
+    "windows": {
+      "wix": {
+        "bannerPath": "../packaging/windows/msi/banner.bmp",
+        "dialogImagePath": "../packaging/windows/msi/dialog.bmp"
+      }
     }
   }
 }
