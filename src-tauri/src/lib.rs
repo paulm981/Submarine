@@ -78,6 +78,7 @@ mod keep_session;
 mod bulk_pick;
 mod vault_schema;
 mod sync_merge;
+mod secret_look;
 mod profile_create;
 mod clipboard_read;
 #[cfg(windows)]
@@ -7760,6 +7761,7 @@ async fn setup_master_db_with(
     // What a shared profile's synced data would run by itself waits here for
     // this device's OK (see approvals.rs).
     approvals::create_schema(&conn)?;
+    needs_resave |= secret_look::create(&conn)?; // who changed a secret Library command (#286)
     create_share_pins(&conn)?;
     needs_resave |= rdp_links::move_into_servers(&conn)? > 0; // RDP links are RDP servers now (#42, rdp_links.rs)
 
@@ -26520,6 +26522,7 @@ pub fn run() {
             ssh_info_probe_section, ssh_systemctl_action, ssh_kill_process,
             ssh_iptables_chain, ssh_nft_chain,
             applog::app_log, applog::ui_heartbeat, applog::open_log_folder, diagnostics_report,
+            secret_look::secret_look_get, secret_look::secret_look_seen,
             highlight::highlight_rules_list, highlight::highlight_rule_save, highlight::highlight_rule_set_enabled, highlight::highlight_rule_delete, highlight::highlight_rules_reorder,
             docker::ssh_docker_container_action,
             docker::ssh_docker_inspect,

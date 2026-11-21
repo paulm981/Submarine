@@ -57,6 +57,8 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
       "jumpRowRef",
     ],
   },
+  // The session panel's Run asks the fork who changed a secret first (#286).
+  { file: "src/components/CmdsPanel.tsx", imports: ["../fork/library/secretLook"], uses: ["confirm: lookFirst(confirm, c.id, c.content"] },
   { file: "src/components/DockerTab.tsx", imports: ["../ui/rootInvoke", "../util/infoFont"] },
   { file: "src/components/Feedback.tsx", imports: ["../fork/feedback"], uses: ["if (feedbackOnGithub"] },
   { file: "src/components/FilePanel.tsx", imports: ["../util/fileName", "../fork/terminal/here"], uses: ["TerminalHereItem"] },
@@ -117,7 +119,13 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
   // Report this reply goes to the fork's GitHub, with the fork's words.
   { file: "src/components/ai/ChatPanel.tsx", imports: ["../../fork/feedback"], uses: ["...REPORT_REPLY_CONFIRM"] },
   { file: "src/main.tsx", imports: ["./util/diagnostics", "./util/nativeMenus", "./util/plainTyping", "./fork/dialogFocus.css"] },
-  { file: "src/ui/confirm.tsx", imports: ["../util/fileName"] },
+  // A secret Library command someone else changed waits for Show command (#286):
+  // the box's line, its Run greyed, and no yes while it is.
+  {
+    file: "src/ui/confirm.tsx",
+    imports: ["../util/fileName", "../fork/library/secretLook"],
+    uses: ["look?: SecretLook", "<LookLine look={state.opts.look", "...lookRunProps(state.opts, confirmRevealed", "if (value && lookLocked(state?.opts, confirmRevealed)) return"],
+  },
 ];
 
 // Every source file's text, by its path from the repository root ("/src/…"):

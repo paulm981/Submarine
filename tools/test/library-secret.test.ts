@@ -105,7 +105,8 @@ describe("a secret on screen", () => {
     expect(panel).toContain('{c.is_secret ? "••••••" :');
     expect(panel).toContain('title={c.is_secret ? t("Secret command — its content is hidden.") : c.content}');
     expect(panel).toMatch(/\{!c\.is_secret && \(\s*<button\s+onClick=\{\(\) => toTerminal\(c\.content, false\)\}/);
-    expect(panel).toContain("toTerminal(c.content, true, cutOnCard(e.currentTarget), !!c.is_secret)");
+    // Run goes the same way, through the fork's look first (#286, secret-look.test.ts).
+    expect(panel).toContain("void writeToTerminal({ terminalId: activeTab, text: c.content, enter: true, cut: cutOnCard(e.currentTarget), confirm: lookFirst(confirm, c.id, c.content), secret: !!c.is_secret })");
   });
 
   it("isn't shown by any other part of the page: only the Library and the session panel load commands", () => {

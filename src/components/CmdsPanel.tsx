@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Play, RefreshCw, Search, X, Terminal, StickyNote, ClipboardCopy, ChevronDown, ChevronRight, Pencil, Check, Server, Lock, Tag } from "lucide-react";
 import { useConfirm } from "../ui/confirm";
 import { writeToTerminal } from "../util/pasteText";
+import { lookFirst } from "../fork/library/secretLook";
 import SecretTextarea from "./SecretTextarea";
 import { splitTags, tagKey, tagsProblem } from "../util/commandTags";
 import { serverRowChanged } from "../util/serverJson";
@@ -710,7 +711,7 @@ export const CmdsPanel = ({ activeTab, onClose, headerActions, serverId, serverN
                       </div>
                       <div className="flex gap-1.5 mt-2">
                         <button
-                          onClick={(e) => toTerminal(c.content, true, cutOnCard(e.currentTarget), !!c.is_secret)}
+                          onClick={(e) => void writeToTerminal({ terminalId: activeTab, text: c.content, enter: true, cut: cutOnCard(e.currentTarget), confirm: lookFirst(confirm, c.id, c.content), secret: !!c.is_secret })}
                           className="flex-1 h-7 rounded-lg bg-primary/10 text-primary border border-primary/20 hover:bg-primary hover:text-zinc-950 hover:border-primary flex items-center justify-center gap-1.5 text-[10px] font-bold transition-all"
                           title={t("Run in active terminal (writes + Enter)")}
                         >

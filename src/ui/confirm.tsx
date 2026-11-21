@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { AlertTriangle, X } from "lucide-react";
 import { visibleName } from "../util/fileName";
 import { useT } from "../i18n";
+import { LookLine, lookLocked, lookRunProps, type SecretLook } from "../fork/library/secretLook";
 
 // Focus trap for our modal portals. When a prompt opens (`openId` is its id,
 // null while that kind of prompt is closed), remember the element that had
@@ -94,6 +95,7 @@ export interface ConfirmOptions {
   /** Hidden text the user can reveal inside the dialog (a secret command
    *  about to run): the message stays hidden until they ask to see it. */
   revealableText?: string;
+  look?: SecretLook; // fork: a secret someone else changed: Run waits for Show command (#286)
 }
 
 type Resolver = (value: boolean) => void;
@@ -296,6 +298,7 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
   };
 
   const close = (value: boolean) => {
+    if (value && lookLocked(state?.opts, confirmRevealed)) return;
     if (state && advance(state)) {
       if (value && dontAsk) state.opts.dontAskAgain?.();
       state.resolve(value);
@@ -518,6 +521,7 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
                 {confirmRevealed ? t("Hide command") : t("Show command")}
               </button>
             )}
+            <LookLine look={state.opts.look} />
             <p className="text-[12px] text-zinc-300 leading-relaxed mb-4 whitespace-pre-wrap break-words max-h-[60vh] overflow-y-auto custom-scrollbar">
               {confirmRevealed && state.opts.revealableText ? state.opts.revealableText : state.opts.message}
             </p>
@@ -534,6 +538,7 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
                 {state.opts.cancelLabel || t("Cancel")}
               </button>
               <button onClick={() => close(true)}
+                      {...lookRunProps(state.opts, confirmRevealed)}
                       data-default-focus={state.opts.safeDefault ? undefined : true}
                       className={`px-3 h-10 sm:h-8 rounded text-[12px] font-semibold border ${
                         state.opts.destructive
