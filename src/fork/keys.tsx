@@ -7,22 +7,54 @@
 //     through the title bar as the fork shows it;
 //   - RESERVED_KEYS and ReservedKeysNote: the fork's keys beside the table,
 //     which it won't let an action take.
-import { comboTextLabel } from "../util/shortcuts";
+import { comboTextLabel, readShortcuts, type ShortcutTable } from "../util/shortcuts";
 
-/** Whether a key event can be one of the table's shortcuts at all. Their rule
+// What the table holds that a key without Ctrl or ⌘ could match: a key set
+// with Alt alone (Alt+B, say), or an F-key set with no modifier but Shift.
+// (Insert is always let through, below.) Worked out again only when the
+// table changes: readShortcuts gives the same object until then.
+let seen: ShortcutTable | null = null;
+let altOnly = false;
+let fKeys = false;
+const reread = (table: ShortcutTable) => {
+  seen = table;
+  altOnly = false;
+  fKeys = false;
+  for (const combos of Object.values(table)) {
+    for (const c of combos) {
+      if (c.ctrl || c.meta) continue;
+      if (c.alt) altOnly = true;
+      else if (c.key !== "Insert") fKeys = true;
+    }
+  }
+};
+
+/** Whether a key event can be one of the table's shortcuts at all, so plain
+ *  typing goes on before anything is looked up or made. Their rule
  *  (usableCombo): a shortcut holds Ctrl, Alt or ⌘, except F1 to F24 and
- *  Shift+Insert. So every other key, which is nearly all typing, is no
- *  shortcut, and goes on before anything is looked up or made. A few
- *  comparisons, no regex, nothing allocated: it runs on every key typed. */
+ *  Shift+Insert. Nearly all typing has none of those. Keys typed with Alt
+ *  alone (a Mac's Option types @ and [ on many layouts) and F-keys go on too
+ *  unless the table has a key of that kind, which it doesn't by default.
+ *  Insert always counts: a paste key the table doesn't have is held back
+ *  there (isWebviewEditKey), whatever the table holds. A few comparisons, no
+ *  regex, nothing allocated: it runs on every key typed. */
 export const mayBeShortcut = (e: KeyboardEvent): boolean => {
-  if (e.ctrlKey || e.altKey || e.metaKey) return true;
+  if (e.ctrlKey || e.metaKey) return true;
   const k = e.key;
   if (k === "Insert") return true;
+  if (e.altKey) {
+    const table = readShortcuts();
+    if (table !== seen) reread(table);
+    return altOnly;
+  }
   // "F1" to "F24": an F, then a digit 1 to 9. No other key's name starts so.
   // (A browser's autofill sends a keydown with no key at all.)
   if (!k || k.length < 2 || k.charCodeAt(0) !== 70) return false;
   const d = k.charCodeAt(1);
-  return d >= 49 && d <= 57;
+  if (d < 49 || d > 57) return false;
+  const table = readShortcuts();
+  if (table !== seen) reread(table);
+  return fKeys;
 };
 
 /** The fork's keys, which stay beside the table, written as the table keeps

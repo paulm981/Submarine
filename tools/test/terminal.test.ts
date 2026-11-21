@@ -14,7 +14,9 @@ import { CUSTOM_THEME_ID, readScheme } from "../../src/util/terminalTheme";
 import { CLOSE_TAB_ASKING, closeTabAsking } from "../../src/fork/session/split";
 import { appHotkey } from "../../src/ui/terminalDock";
 import { mayBeShortcut, RESERVED_KEYS } from "../../src/fork/keys";
-import { comboOf, comboText, defaultShortcuts, parseCombo, SHORTCUT_ACTIONS, usableCombo } from "../../src/util/shortcuts";
+import {
+  comboOf, comboText, defaultShortcuts, isWebviewEditKey, parseCombo, resetShortcuts, setShortcuts, SHORTCUT_ACTIONS, shortcutFor, usableCombo,
+} from "../../src/util/shortcuts";
 
 describe("hasVisibleText", () => {
   it("ignores control codes: colours, a title change, cursor moves", () => {
@@ -281,30 +283,70 @@ describe("the shortcuts table and the fork's keys", () => {
   ];
   const MODS = Array.from({ length: 16 }, (_, i) => ({ ctrl: !!(i & 1), alt: !!(i & 2), shift: !!(i & 4), meta: !!(i & 8) }));
 
-  it("lets every key the table could have a shortcut on past the early return for plain typing", () => {
+  // What runShortcut acts on: a key set for an action (with a shell that has
+  // ended, the close and new keys without Shift too), or a key the webview
+  // would copy or paste with by itself.
+  const used = (e: KeyboardEvent): boolean => {
+    const c = comboOf(e);
+    return !!c && (!!shortcutFor(c, SHORTCUT_ACTIONS, ["closeTerminal", "newTerminal"]) || isWebviewEditKey(c));
+  };
+  const everyUsedKeyGetsPast = () => {
     for (const [key, code, keyCode] of KEYS) {
       for (const m of MODS) {
         const e = ev(key, code, keyCode, m);
-        const c = comboOf(e);
-        if (c && usableCombo(c)) expect(mayBeShortcut(e), `${comboText(c)}`).toBe(true);
+        if (used(e)) expect(mayBeShortcut(e), `${comboText(comboOf(e)!)}`).toBe(true);
       }
+    }
+  };
+
+  it("lets every key the table acts on past the early return for plain typing", () => {
+    everyUsedKeyGetsPast();
+  });
+
+  it("lets Alt and F-keys past only while the table has such a key", () => {
+    // The table keeps its changes in localStorage, which Node doesn't have.
+    const kept = new Map<string, string>();
+    const was = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      value: { getItem: (k: string) => kept.get(k) ?? null, setItem: (k: string, v: string) => { kept.set(k, v); }, removeItem: (k: string) => { kept.delete(k); } },
+    });
+    try {
+      // By default none: Option typing @ or [ on a Mac, readline's Alt+B and
+      // mc's F5 go straight on, as before the table.
+      expect(mayBeShortcut(ev("@", "KeyL", 76, { alt: true }))).toBe(false);
+      expect(mayBeShortcut(ev("b", "KeyB", 66, { alt: true }))).toBe(false);
+      expect(mayBeShortcut(ev("F5", "F5", 116))).toBe(false);
+      // Set one of each, and they get to the table.
+      setShortcuts("nextTab", [parseCombo("Alt+B")!, parseCombo("F5")!]);
+      setShortcuts("closeTerminal", [parseCombo("Alt+Shift+W")!]);
+      expect(mayBeShortcut(ev("b", "KeyB", 66, { alt: true }))).toBe(true);
+      expect(mayBeShortcut(ev("F5", "F5", 116))).toBe(true);
+      everyUsedKeyGetsPast();
+      // Back to the defaults: back to going straight on.
+      resetShortcuts();
+      expect(mayBeShortcut(ev("b", "KeyB", 66, { alt: true }))).toBe(false);
+      expect(mayBeShortcut(ev("F5", "F5", 116))).toBe(false);
+    } finally {
+      resetShortcuts();
+      if (was) Object.defineProperty(globalThis, "localStorage", was);
+      else delete (globalThis as { localStorage?: unknown }).localStorage;
     }
   });
 
   it("stops plain typing at the early return: letters, digits, Shift, Enter, Backspace, the arrows", () => {
-    const typed = KEYS.filter(([key]) => !/^F\d+$/.test(key) && key !== "Insert");
+    const typed = KEYS.filter(([key]) => key !== "Insert");
     for (const [key, code, keyCode] of typed) {
       expect(mayBeShortcut(ev(key, code, keyCode)), key).toBe(false);
       expect(mayBeShortcut(ev(key.toUpperCase(), code, keyCode, { shift: true })), `Shift+${key}`).toBe(false);
     }
     // A capital F is a letter, not an F-key.
     expect(mayBeShortcut(ev("F", "KeyF", 70, { shift: true }))).toBe(false);
-    // With Ctrl, Alt or ⌘ any key may be one, as may F1 to F24 and Insert.
+    // With Ctrl or ⌘ any key may be one, as may Insert (a paste key).
     expect(mayBeShortcut(ev("c", "KeyC", 67, { ctrl: true }))).toBe(true);
-    expect(mayBeShortcut(ev("b", "KeyB", 66, { alt: true }))).toBe(true);
     expect(mayBeShortcut(ev("v", "KeyV", 86, { meta: true }))).toBe(true);
-    expect(mayBeShortcut(ev("F2", "F2", 113))).toBe(true);
     expect(mayBeShortcut(ev("Insert", "Insert", 45, { shift: true }))).toBe(true);
+    expect(mayBeShortcut(ev("Insert", "Insert", 45))).toBe(true);
     // A browser's autofill sends a keydown with no key: no shortcut, no error.
     expect(mayBeShortcut({ ctrlKey: false, altKey: false, metaKey: false } as KeyboardEvent)).toBe(false);
   });
