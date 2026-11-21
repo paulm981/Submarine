@@ -167,9 +167,10 @@ impl SshState {
     /// The same for every tab, when the profile closes (lib.rs,
     /// teardown_profile), and which saved server each tab and terminal is for.
     /// The jump host logins tabs shared are let go too: none is used by the
-    /// next profile (jump_pool.rs).
+    /// next profile (jump_pool.rs). So are the routes Ping held (ping.rs).
     pub(crate) async fn forget_fork_sessions(&self) {
         crate::jump_pool::clear();
+        crate::ping::let_go_all();
         self.fork.root_access.lock().await.clear();
         self.fork.root_gates.lock().await.clear();
         self.fork.docker_root.lock().await.clear();
