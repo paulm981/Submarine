@@ -37,6 +37,17 @@ export const LINE_BUDGET = 100_000;
 export const CHAR_BUDGET = 1_000_000;
 export const LINE_FINALS = new Set<string>(['S', 'T', 'L', 'M']);
 
+// The longest title a program may set (OSC 0 and 2, their #393), in UTF-16
+// units, as xterm hands it over. It comes from the server, and xterm takes up
+// to 10 MB in one; their util/terminalTitle cleans and cuts it to 120
+// characters, but walks all of it first, on the page's one thread. A longer
+// one is refused (the tab keeps the title it had), not repaired: no real
+// program sets one this long.
+export const TITLE_RAW_MAX = 4096;
+/** A title (OSC 0 or 2's text) the terminal refuses: true takes it and
+ *  drops it, false lets xterm set it (mount.ts). */
+export const titleTooLong = (data: string): boolean => data.length > TITLE_RAW_MAX;
+
 // A container's terminal that needed root, and the password wasn't given.
 export const ROOT_CANCELLED = '\x1b[33mThis container\'s terminal needs root on the server. Close this tab and open it again to enter the password.\x1b[0m';
 
