@@ -270,7 +270,7 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 - **Jump hosts and proxies** per server: another saved server as a jump host, or a SOCKS5 or HTTP proxy
 - **Import** from PuTTY `.reg`, MobaXterm `.mxtsessions`, an OpenSSH config, or a Submarine JSON export; **generate a key** right from the server form
 - **Quick connect** for a host you haven't saved yet — it is added to your root folder (with what you typed, password or key included), so remove it afterwards if you don't want it kept
-- **Autostart**: flag a server and it opens and connects when the app launches
+- **At startup**: a server's tab can open and connect when you unlock the profile (SSH servers), or open and wait for you to press **Connect** (any kind of server)
 - **Per-server notes** and **per-server commands** (or commands for all servers)
 
 ### Login methods
@@ -290,6 +290,8 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 - **Split** — the button next to + opens another shell on the same server beside the one you're in (watch a log in one, work in the other); right-click it to put an open tab beside this one or to stack them top and bottom
 - **Fast output never freezes the app** — a busy `tail -f` or a `cat` of a huge file is sent as raw bytes and paced by what the window has drawn; when a stream stays faster than the screen can show, the oldest unseen part is skipped with a note in the terminal, and Ctrl+C still answers at once. Escape sequences with absurd counts (`ESC[999999999S`, which a binary file can contain by chance and which xterm.js would loop on for hours) are ignored
 - Full xterm.js 6 — true colour, ANSI 256, mouse support, drawn with the GPU on Windows (WebGL; a switch in Settings, off by default on macOS and Linux), Unicode 11 widths so emoji and CJK line up
+- **Program titles on tabs** — a title a program sets, such as the folder you're in or the file you're editing, shows after the tab's name (Settings › Terminal turns it off)
+- **Text size** — pinch a terminal, or Ctrl + wheel over it (⌘ + wheel on a Mac), or use the − and + keys on a phone's key bar; it's the size in Settings, so every terminal follows
 - **Color schemes** — Submarine's own plus Campbell, One Half, Solarized, Dracula, Nord, Tokyo Night, Catppuccin and Gruvbox (Settings › Terminal, with a live preview). A server can have **its own**, which syncs with it — e.g. a light scheme for production
 - **Keep text readable** — text a program colors too close to the background is lifted to a 4.5:1 contrast, as in VS Code
 - **Syntax highlighting** — words and addresses colored in what the terminal shows (Settings › Terminal › Highlighting, with a live preview and a box to paste your own output into):

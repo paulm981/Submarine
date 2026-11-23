@@ -23,10 +23,11 @@ import { RenameInput } from "./ui/renameInput";
 import { forgetServerBookmarks } from "./util/sftpBookmarks";
 import { useIsNarrow } from "./hooks/useViewport";
 import { IS_MOBILE } from "./util/platform";
-import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./util/terminalFont";
+import { FONT_FAMILY_KEY, FONT_SIZE_KEY, FONT_SIZE_REQUEST, readFontFamily, readFontSize, requestedFontSize } from "./util/terminalFont";
 import { UI_FONT_FAMILY_KEY, applyFonts, readUiFontFamily } from "./util/uiFont";
 import { SCROLLBACK_KEY, readScrollback } from "./util/terminalScrollback";
 import { USE_LOCAL_SHELL_KEY, readUseLocalShell } from "./util/terminalShell";
+import { SHOW_TERMINAL_TITLES_KEY, readShowTerminalTitles } from "./util/terminalTitle";
 import { USE_SSH_AGENT_KEY, readUseSshAgent } from "./util/sshAgent";
 import { AUTO_RECONNECT_KEY, DEFAULT_SESSION_KEEP, SEND_KEEPALIVES_KEY, forgetSessionKeep, readAutoReconnectDefault, readSendKeepalivesDefault, readSessionKeep, writeSessionKeep } from "./util/sessionKeep";
 import { USE_SSH_CONFIG_KEY, readUseSshConfig } from "./util/sshConfig";
@@ -43,6 +44,7 @@ import { CommandScope, describeScope, parseCommandScope, scopeToJson } from "./u
 import CommandScopePicker from "./components/CommandScopePicker";
 import type { HeldDeletion } from "./components/HeldDeletions";
 import { isFtp, serverProtocol, type ServerProtocol } from "./util/serverProtocol";
+import { startupChoice } from "./util/startupChoice";
 import { ai, errText, AI_OPEN_EVENT, AI_OPEN_SERVER_EVENT, type AiOpenServerDetail } from "./util/aiApi";
 import { clearAiFocus, clearFeeds, requestAiFocus } from "./util/aiEvents";
 import { ErrorBoundary, Guarded } from "./ui/ErrorBoundary";
@@ -95,8 +97,35 @@ const SESSION_STATUS: Record<string, string> = {
 // `host` and `port`: as the tab was opened (Fork.DesktopSession).
 // `serverUuid` is the saved server's sync id, which keys this device's own
 // per-server settings (the Shell button, see util/shellSync.ts).
-type Session = { id: string; serverId: number; serverName: string; serverUuid?: string | null; protocol?: ServerProtocol; host?: string; port?: number; mirrors?: string; runOnConnect?: string; runOnConnectEvery?: boolean; runOnConnectHeld?: boolean; quickAuth?: QuickAuth | null };
+// `openOnly`: opened when the profile was unlocked, without connecting (the
+// server's "At startup: Open the tab"); the tab waits for Connect
+// (hooks/useWaitToConnect).
+type Session = { id: string; serverId: number; serverName: string; serverUuid?: string | null; protocol?: ServerProtocol; host?: string; port?: number; mirrors?: string; runOnConnect?: string; runOnConnectEvery?: boolean; runOnConnectHeld?: boolean; quickAuth?: QuickAuth | null; openOnly?: boolean };
 const { START_VIEW, BOLD_BRIGHT_KEY, MIN_CONTRAST_KEY, readBoldBright, readMinContrast } = Fork;
+
+// A saved server's tab, as a click on it opens it.
+function sessionOf(server: any): Session {
+  return {
+    id: `session-${server.id}`,
+    serverId: server.id,
+    serverName: server.name,
+    protocol: serverProtocol(server.protocol),
+    host: server.host,
+    port: server.port,
+    // Pass the raw mirrors JSON through to SessionView so the
+    // MirrorsPanel can pre-populate "Saved on this node" without
+    // another round-trip to the backend.
+    mirrors: server.mirrors,
+    serverUuid: server.uuid ?? null,
+    // Commands to auto-run once on the first terminal (see SessionView).
+    runOnConnect: server.run_on_connect || "",
+    // And once into each new terminal of the tab (#256).
+    runOnConnectEvery: !!server.run_on_connect_every,
+    // Set or changed elsewhere, not allowed here yet: SessionView asks
+    // before typing them.
+    runOnConnectHeld: (server.held || []).includes("run_on_connect"),
+  };
+}
 
 const hexToRgb = (hex: string) => {
   const r = parseInt(hex.slice(1, 3), 16);
@@ -140,6 +169,14 @@ function DesktopApp() {
   // lock: session ids come from each profile's server ids, so another
   // profile would reuse them.
   const [tabNames, setTabNames] = useState<Record<string, string>>({});
+  // The title a program in a terminal set itself (OSC 0/2, #391), by session
+  // id: the active terminal's, cleaned (util/terminalTitle). Shown on the tab
+  // after the name, and only there: lists, prompts and dialogs keep the
+  // server's own name. Dropped when the session closes and on lock, like
+  // tabNames: session ids come from each profile's server ids, so another
+  // profile would reuse them.
+  const [oscTitles, setOscTitles] = useState<Record<string, string>>({});
+  const clearOscTitle = (sid: string) => setOscTitles(prev => { const { [sid]: _, ...rest } = prev; return rest; });
   // The tab whose menu shows the name editor; gone with the menu.
   const [tabRename, setTabRename] = useState<string | null>(null);
   useEffect(() => { if (!tabMenu) setTabRename(null); }, [tabMenu]);
@@ -201,6 +238,21 @@ function DesktopApp() {
       const next = prev.filter(i => i.sessionId !== sid || terms.some(t => t.id === i.terminalId));
       return next.length === prev.length ? prev : next;
     });
+  }, []);
+  // A session's active terminal set (or cleared) its own title (OSC 0/2,
+  // #391). Stable identity matters: SessionView memoises on prop equality,
+  // same reasoning as handleTerminalsChange above. An unchanged title is a
+  // no-op so a program that re-sends its title doesn't re-render the app.
+  const handleSessionTitle = useCallback((sid: string, title: string) => {
+    if (title) {
+      setOscTitles(prev => (prev[sid] === title ? prev : { ...prev, [sid]: title }));
+    } else {
+      setOscTitles(prev => {
+        if (!(sid in prev)) return prev;
+        const { [sid]: _, ...rest } = prev;
+        return rest;
+      });
+    }
   }, []);
   const wallHasTerminal = (terminalId: string) => wallItems.some(i => i.terminalId === terminalId);
   const pinTerminalToWall = (sid: string, terminalId: string) => {
@@ -358,7 +410,10 @@ function DesktopApp() {
     authType: "custom_pass", credentialId: "", folderId: "", keyId: "",
     proxyType: "none", proxyHost: "", proxyPort: 1080,
     tunnels: [] as { local: string, remote: string, type: string, name?: string, stopped?: boolean }[],
+    // At startup: autostart = open the tab and connect (SSH servers only);
+    // autoOpen = open the tab without connecting (any kind of server).
     autostart: false,
+    autoOpen: false,
     mirrors: [] as { local: string, remote: string, soft_delete: boolean, excludes: string[], conflict_resolution: string }[],
     color: null as string | null,
     // Free-form per-node description / runbook text. Lives on the server row
@@ -490,6 +545,9 @@ function DesktopApp() {
     // Off by default: terminals start the remote account's own shell, same
     // as before this setting existed. See util/terminalShell.
     useLocalShell: readUseLocalShell(),
+    // On by default: tabs show the title a program sets after their name. See
+    // util/terminalTitle.
+    showTerminalTitles: readShowTerminalTitles(),
     // On by default: logins may use keys from an ssh-agent on this computer.
     // See util/sshAgent.
     useSshAgent: readUseSshAgent(),
@@ -526,6 +584,7 @@ function DesktopApp() {
     localStorage.setItem(BOLD_BRIGHT_KEY, appSettings.terminalBoldBright ? 'on' : 'off');
     localStorage.setItem(MIN_CONTRAST_KEY, appSettings.terminalMinContrast ? 'on' : 'off');
     localStorage.setItem(USE_LOCAL_SHELL_KEY, appSettings.useLocalShell ? 'on' : 'off');
+    localStorage.setItem(SHOW_TERMINAL_TITLES_KEY, appSettings.showTerminalTitles === false ? 'off' : 'on');
     localStorage.setItem(USE_SSH_AGENT_KEY, appSettings.useSshAgent ? 'on' : 'off');
     // Monitoring reads it at each connect, in the background. A phone or
     // tablet has no ssh-agent (see readUseSshAgentForMonitor).
@@ -545,6 +604,19 @@ function DesktopApp() {
   }, [appSettings]);
 
   Fork.useServerLooks(servers);
+  // A pinch on a terminal and the key bar's text-size keys (util/terminalFont).
+  useEffect(() => {
+    const onRequest = (e: Event) => {
+      const request = (e as CustomEvent).detail;
+      setAppSettings((s) => {
+        const size = requestedFontSize(s.terminalFontSize, request);
+        return size === s.terminalFontSize ? s : { ...s, terminalFontSize: size };
+      });
+    };
+    window.addEventListener(FONT_SIZE_REQUEST, onRequest);
+    return () => window.removeEventListener(FONT_SIZE_REQUEST, onRequest);
+  }, []);
+
   // The interface font and the font for text in columns (util/uiFont): set on
   // the page only when one of the two faces changes, since a change restyles
   // every element.
@@ -573,6 +645,7 @@ function DesktopApp() {
         setSessions(prev => prev.filter(s => s.id !== sessId));
         setSessionStatuses(prev => { const { [sessId]: _, ...rest } = prev; return rest; });
         clearTabName(sessId);
+        clearOscTitle(sessId);
         setActiveView(prev => (prev === sessId ? START_VIEW : prev));
         // Purge the closing session from broadcast state so a stale id doesn't
         // linger in the target set (would let a user re-enable broadcast and
@@ -972,44 +1045,45 @@ function DesktopApp() {
     invoke<{ signed_in: boolean; email: string | null }>("cloud_status")
       .then((s) => invoke("set_editor_label", { label: s.signed_in && s.email ? s.email : "" }))
       .catch(() => {});
-    // Autostart sweep: load servers directly (refreshAll is also doing this
+    // Startup sweep: load servers directly (refreshAll is also doing this
     // in parallel, but its state update is async and we can't read `servers`
-    // back here without a stale-closure race), pick the ones flagged
-    // autostart, and stage them all into the sessions tab strip in one
-    // setSessions call. The user lands focused on the first autostart node;
-    // each new SessionView component then kicks off its own connect on mount.
+    // back here without a stale-closure race), pick the ones set to open at
+    // startup ("At startup" in the server form), and stage them all into the
+    // sessions tab strip in one setSessions call, in the list's order. Each
+    // new view then kicks off its own connect on mount, or waits for Connect
+    // when it opens only. The user lands on the first one that connects,
+    // else on the first one opened.
     try {
       const list = await invoke<any[]>("get_servers");
       // Autostart someone else switched on in a shared profile waits for
       // this device's OK (Servers → Review) instead of connecting by itself.
       const isHeld = (s: any) => (s.held || []).includes("autostart");
-      const waiting = list.filter((s) => s.autostart && isHeld(s));
+      // And a server someone else moved waits for it before its tab opens:
+      // Connect in that tab wouldn't ask about the new address, as opening
+      // the server by hand does.
+      const isMoved = (s: any) => (s.held || []).some((i: string) => i.startsWith("moved:"));
+      // Open and connect: only SSH servers start by themselves (an RDP server
+      // would open an app).
+      const connects = (s: any) => !!s.autostart && !isHeld(s) && (s.protocol ?? "ssh") === "ssh";
+      // Open the tab, not connected: any kind of server.
+      const opensOnly = (s: any) => !connects(s) && !!s.auto_open && !isMoved(s);
+      const waiting = list.filter((s) => (s.autostart && isHeld(s)) || (s.auto_open && !connects(s) && isMoved(s)));
       if (waiting.length > 0) {
         addLog(t("Autostart: {names} waiting for your OK (Servers → Review).", { names: waiting.map((s) => s.name).join(", ") }), "info");
       }
-      // Only SSH servers start by themselves (an RDP server would open an app).
-      const toStart = list.filter((s) => s.autostart && !isHeld(s) && (s.protocol ?? "ssh") === "ssh");
-      if (toStart.length === 0) return;
-      const newSessions = toStart.map((s) => ({
-        id: `session-${s.id}`,
-        serverId: s.id,
-        serverName: s.name,
-        host: s.host,
-        port: s.port,
-        mirrors: s.mirrors,
-        serverUuid: s.uuid ?? null,
-        // As when it's opened by hand (openServer).
-        runOnConnect: s.run_on_connect || "",
-        runOnConnectEvery: !!s.run_on_connect_every,
-        runOnConnectHeld: (s.held || []).includes("run_on_connect"),
-      }));
-      setSessions((prev: any[]) => {
+      const toOpen = list.filter((s) => connects(s) || opensOnly(s));
+      if (toOpen.length === 0) return;
+      const newSessions: Session[] = toOpen.map((s) => (opensOnly(s) ? { ...sessionOf(s), openOnly: true } : sessionOf(s)));
+      setSessions((prev: Session[]) => {
         const seen = new Set(prev.map((p) => p.id));
         const fresh = newSessions.filter((n) => !seen.has(n.id));
         return [...prev, ...fresh];
       });
-      setActiveView(newSessions[0].id);
-      addLog(tn(newSessions.length, "Autostart: opened {count} node.", "Autostart: opened {count} nodes."), "info");
+      setActiveView((newSessions.find((s) => !s.openOnly) ?? newSessions[0]).id);
+      const started = newSessions.filter((s) => !s.openOnly).length;
+      const opened = newSessions.length - started;
+      if (started > 0) addLog(tn(started, "Autostart: opened {count} node.", "Autostart: opened {count} nodes."), "info");
+      if (opened > 0) addLog(tn(opened, "Opened {count} tab without connecting.", "Opened {count} tabs without connecting."), "info");
     } catch (e) {
       addLog(`AUTOSTART_LOAD_FAILED: ${e}`, "error");
     }
@@ -1069,7 +1143,7 @@ function DesktopApp() {
   const sessionsRef = useRef(sessions);
   useEffect(() => { sessionsRef.current = sessions; }, [sessions]);
   const homeShellsRef = useRef(0); // Home's terminals (Fork.HomeView)
-  const wouldEnd = () => Fork.wouldEnd(sessionsRef.current.length, homeShellsRef.current);
+  const wouldEnd = Fork.useWouldEnd(sessionsRef, sessionStatuses, homeShellsRef); // a tab waiting for Connect ends nothing
 
   // Intercept BOTH the in-app X button (which calls appWindow.close()) AND
   // OS-level closes (Alt+F4, taskbar context-menu close, system shutdown).
@@ -1211,6 +1285,7 @@ function DesktopApp() {
     setActiveProfile(null);
     setSessions([]);
     setTabNames({});
+    setOscTitles({});
     setActiveView(START_VIEW);
     setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setCommands([]); setNotes([]);
     // The next profile numbers its servers from 1 too, so anything kept by
@@ -1250,26 +1325,11 @@ function DesktopApp() {
         if (!ok) return false;
         await allowHeld(server.id, [moved]);
       }
-      setSessions((prev: Session[]) => prev.some((s) => s.id === sessionId) ? prev : [...prev, {
-        id: sessionId,
-        serverId: server.id,
-        serverName: server.name,
-        protocol: serverProtocol(server.protocol),
-        host: server.host,
-        port: server.port,
-        // Pass the raw mirrors JSON through to SessionView so the
-        // MirrorsPanel can pre-populate "Saved on this node" without
-        // another round-trip to the backend.
-        mirrors: server.mirrors,
-        serverUuid: server.uuid ?? null,
-        // Commands to auto-run once on the first terminal (see SessionView).
-        runOnConnect: server.run_on_connect || "",
-        // And once into each new terminal of the tab (#256).
-        runOnConnectEvery: !!server.run_on_connect_every,
-        // Set or changed elsewhere, not allowed here yet: SessionView asks
-        // before typing them.
-        runOnConnectHeld: (server.held || []).includes("run_on_connect"),
-      }]);
+      setSessions((prev: Session[]) => prev.some((s) => s.id === sessionId) ? prev : [...prev, sessionOf(server)]);
+    } else if (existing.openOnly && sessionStatuses[sessionId] === "idle") {
+      // Its tab opened at startup and waits: opening the server connects it,
+      // as Connect in the tab does (hooks/useWaitToConnect).
+      window.dispatchEvent(new CustomEvent(`session-reconnect-${sessionId}`));
     }
 
     setActiveView(sessionId);
@@ -1417,6 +1477,7 @@ function DesktopApp() {
       proxyPort: server.proxy_port || 1080,
       tunnels: parseObjectList(server.tunnels).map(normalizeTunnel),
       autostart: !!server.autostart,
+      autoOpen: !!server.auto_open,
       mirrors: parseObjectList(server.mirrors).map(normalizeMirror),
       color: server.color ?? null,
       notes: server.notes || "",
@@ -1909,6 +1970,7 @@ function DesktopApp() {
             st === "connecting"   ? t("Connecting…") :
             st === "failed"       ? t("Connection failed") :
             st === "disconnected" ? t("Disconnected") :
+            st === "idle"         ? t("Not connected") :
                                     st;
           // Broadcast indicator: small orange dot next to the status dot when
           // this session is in the target set AND broadcast is armed. Kept
@@ -1918,6 +1980,10 @@ function DesktopApp() {
           const isMergedTab = mergedSessionIds.includes(s.id);
           const compact = appSettings.compactTabs; // narrower tabs, long names cut short
           const drag = sessionDrag.tabMark(s.id);
+          // The program's title after the name (#391). The name comes first
+          // and stays whole, so a title can't pass for another server.
+          const programTitle = oscTitles[s.id];
+          const fullLabel = programTitle ? `${tabLabel(s)} · ${programTitle}` : tabLabel(s);
           // The open tab joins the session's toolbar below it, with a line in
           // the server's own colour on top. A thin line parts two tabs where
           // neither is the open one.
@@ -1979,7 +2045,7 @@ function DesktopApp() {
               // wheel-to-horizontal scroll above), so wider tabs just mean
               // more scrolling — they never hide the name behind an ellipsis.
               // `whitespace-nowrap` keeps long names on a single line.
-              title={isMergedTab ? t("{name} · split beside current view (Ctrl-click to unpair)", { name: tabLabel(s) }) : tabLabel(s)}
+              title={isMergedTab ? t("{name} · split beside current view (Ctrl-click to unpair)", { name: fullLabel }) : fullLabel}
               className={`group no-drag relative flex items-center gap-2 h-[33px] ${compact ? Fork.COMPACT_TAB_PAD : 'pl-3 pr-1.5'} rounded-t-lg cursor-pointer shrink-0 transition-colors ${
                 active
                   ? 'z-10 bg-[#141417] text-zinc-100 border-x border-t border-white/10'
@@ -2021,6 +2087,12 @@ function DesktopApp() {
                 className={`text-[11.5px] font-semibold whitespace-nowrap tracking-tight rounded outline-none focus-visible:ring-2 focus-visible:ring-primary/60 ${compact ? Fork.COMPACT_TAB_NAME : ''}`}
               >
                 {tabLabel(s)}
+                {/* A long title is cut here; the tooltip has all of it. */}
+                {programTitle && (
+                  <span className="inline-block max-w-[16rem] truncate align-bottom ml-1 font-normal opacity-70">
+                    · <bdi>{programTitle}</bdi>
+                  </span>
+                )}
               </button>
               {/* Mobile-only actions trigger. On phone we surface the same
                   tabMenu (Reconnect / Disconnect / Close) here since there
@@ -2267,6 +2339,7 @@ function DesktopApp() {
                         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                           st === "connected" ? "bg-emerald-400" :
                           st === "connecting" ? "bg-amber-400" :
+                          st === "idle" ? "bg-zinc-500" :
                           "bg-rose-500"
                         }`} />
                         <span className="truncate text-[11px] font-medium text-zinc-200 flex-1">
@@ -2362,20 +2435,24 @@ function DesktopApp() {
               >{t("Edit server")}</button>
             )}
             <Fork.TabMoveItems sessions={sessions} targetId={targetId} setSessions={setSessions} onDone={() => setTabMenu(null)} /><Fork.BulkTabItems targetId={targetId} sessions={sessions} statuses={sessionStatuses} onDone={() => setTabMenu(null)} />
+            {/* A tab that hasn't connected yet (opened at startup, or an RDP
+                tab on a phone) connects; there's nothing to disconnect. */}
             <button
               className="w-full text-left px-3 py-1.5 hover:bg-primary/15 hover:text-primary text-zinc-200 flex items-center gap-2"
               onClick={() => {
                 window.dispatchEvent(new CustomEvent(`session-reconnect-${targetId}`));
                 setTabMenu(null);
               }}
-            >{t("Reconnect")}</button>
-            <button
-              className="w-full text-left px-3 py-1.5 hover:bg-white/10 text-zinc-200"
-              onClick={() => {
-                invoke("disconnect_session", { sessionId: targetId }).catch(console.error);
-                setTabMenu(null);
-              }}
-            >{t("Disconnect")}</button>
+            >{sessionStatuses[targetId] === "idle" ? t("Connect") : t("Reconnect")}</button>
+            {sessionStatuses[targetId] !== "idle" && (
+              <button
+                className="w-full text-left px-3 py-1.5 hover:bg-white/10 text-zinc-200"
+                onClick={() => {
+                  invoke("disconnect_session", { sessionId: targetId }).catch(console.error);
+                  setTabMenu(null);
+                }}
+              >{t("Disconnect")}</button>
+            )}
 
             {/* Pin/Unpin the session's currently-active terminal to
                 the Wall — one-click convenience so users don't have to
@@ -2476,6 +2553,7 @@ function DesktopApp() {
                         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                           st === "connected" ? "bg-emerald-400" :
                           st === "connecting" ? "bg-amber-400" :
+                          st === "idle" ? "bg-zinc-500" :
                           "bg-rose-500"
                         }`} />
                         <span className="truncate text-[11px] font-medium text-zinc-200 flex-1">
@@ -2872,6 +2950,7 @@ function DesktopApp() {
                             onReset={() => {
                               setSessions(prev => prev.filter(s => s.id !== sess.id));
                               clearTabName(sess.id);
+                              clearOscTitle(sess.id);
                               if (activeView === sess.id) setActiveView(START_VIEW);
                             }}
                           >
@@ -2915,6 +2994,7 @@ function DesktopApp() {
                                 isActiveView={isFocused}
                                 onScreen={onScreen}
                                 onPromptChange={handlePromptChange}
+                                onSessionTitle={handleSessionTitle}
                               />
                             ) : (
                             <SessionView
@@ -2925,6 +3005,7 @@ function DesktopApp() {
                               addLog={addLog}
                               onStatusChange={handleSessionStatus}
                               onTerminalsChange={handleTerminalsChange}
+                              onSessionTitle={handleSessionTitle}
                               chromeless={isVisible && isTiled && !isFocused}
                               isActiveView={isFocused}
                               shown={isVisible && viewIsSession}
@@ -3045,6 +3126,7 @@ function DesktopApp() {
                         const dotTone =
                           st === 'connected'    ? 'bg-emerald-400' :
                           st === 'connecting'   ? 'bg-amber-400 animate-pulse-brief' :
+                          st === 'idle'         ? 'bg-zinc-500' :
                                                   'bg-rose-500';
                         return (
                           <div
@@ -3148,6 +3230,7 @@ function DesktopApp() {
                                   <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                                     st === 'connected' ? 'bg-emerald-400' :
                                     st === 'connecting' ? 'bg-amber-400' :
+                                    st === 'idle' ? 'bg-zinc-500' :
                                     'bg-rose-500'
                                   }`} />
                                   <span className="text-[11px] font-bold text-zinc-200 truncate flex-1">
@@ -3638,6 +3721,14 @@ function DesktopApp() {
               await invoke("set_server_jump_host", { id: savedId, value: newNode.jumpHostId ? parseInt(newNode.jumpHostId) : null, persist: false });
             } catch (e) {
               addLog(`SAVE_JUMP_HOST_FAILED: ${e}`, "error");
+            }
+            // At startup: open the tab without connecting, for any kind of
+            // server (util/startupChoice; autostart went with the rest above).
+            try {
+              const sshServer = !isRdp && !isTelnet && !isVnc && !ftpServer;
+              await invoke("set_server_auto_open", { id: savedId, value: startupChoice(newNode, sshServer) === "open", persist: false });
+            } catch (e) {
+              addLog(`SAVE_AUTO_OPEN_FAILED: ${e}`, "error");
             }
             // SSH, RDP, telnet, VNC or FTP: the same separate-write pattern.
             try {

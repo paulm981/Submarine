@@ -14,7 +14,7 @@ import { forgetTerminal, logLine, noteTerminalOutput, noteTerminalParsed, noteTe
 import { withoutPasteControls } from '../../util/pasteText';
 import { IS_WINDOWS } from '../../util/platform';
 import type { TerminalFork, TerminalProps } from './hooks';
-import { CHAR_BUDGET, COUNTED_FINALS, LINE_BUDGET, LINE_FINALS, ROOT_CANCELLED, SHELL_QUIET_MS } from './rules';
+import { CHAR_BUDGET, COUNTED_FINALS, LINE_BUDGET, LINE_FINALS, ROOT_CANCELLED, SHELL_QUIET_MS, titleTooLong } from './rules';
 import { shareWidths } from './widthCache';
 import { forgetFolder, trackFolder } from './fileMenu';
 
@@ -165,6 +165,12 @@ export const mountTerminal = (
       return true;
     });
   }
+
+  // A program's title (OSC 0 and 2) longer than TITLE_RAW_MAX is taken here
+  // and dropped, so xterm's own handler never sets it and their title code
+  // (util/terminalTitle) never walks it; a shorter one goes on to xterm. Run
+  // only when a program sets a title, never per chunk of output.
+  for (const ident of [0, 2]) term.parser.registerOscHandler(ident, titleTooLong);
 
   // xterm draws into a div of its own, which the AI side pane can borrow
   // (see src/ui/terminalDock.ts) — so the mouse, resize and focus handling

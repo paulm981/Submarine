@@ -2,11 +2,21 @@
 // moved out of DesktopApp.tsx, the original project's file, for #163).
 import { describe, expect, it } from "vitest";
 import {
-  type DesktopSession, aiPaneViewOf, closeCounts, osChecksDue, sessionFor, sessionPaneStyle, tabDivider, tabMenuStyle,
-  tabsToClose, wouldEnd,
+  type DesktopSession, aiPaneViewOf, closeCounts, endingTabs, osChecksDue, sessionFor, sessionPaneStyle, tabDivider, tabMenuStyle,
+  tabsToClose, waitingTabs, wouldEnd,
 } from "../../src/fork/desktop/rules";
 import { setTabStepOrder, tabStepList } from "../../src/fork/keys";
 import { appHotkey } from "../../src/ui/terminalDock";
+
+describe("endingTabs", () => {
+  // Their #394: a tab that opened with the profile and waits for Connect has
+  // no connection, so closing the window or locking doesn't ask about it.
+  it("counts every server tab but one waiting for Connect", () => {
+    const tabs = [{ id: "a" }, { id: "b" }, { id: "c" }, { id: "d" }];
+    expect(endingTabs(tabs, { a: "idle", b: "connected", c: "failed" })).toBe(3);
+    expect(endingTabs(tabs.slice(0, 1), { a: "idle" })).toBe(0);
+  });
+});
 
 describe("wouldEnd", () => {
   it("asks nothing for no sessions and Home's one terminal, which the app always has", () => {
@@ -125,6 +135,22 @@ describe("opening a saved server", () => {
       expect(sessionFor({ id: 2, name: "files", host: "f.example", port: 21, protocol }).protocol).toBe(protocol);
     }
     expect(sessionFor({ id: 3, name: "web", protocol: null }).protocol).toBe("ssh");
+  });
+
+  // Their #394: a tab that opened with the profile waits ("idle") until
+  // Connect; opening its server from the tree, Broadcast or the AI's Share
+  // connects it. Any other tab, an RDP tab on a phone (idle too, but not
+  // opened with the profile) and one already connecting are left alone.
+  it("connects a tab that opened with the profile and waits", () => {
+    const sessions: DesktopSession[] = [
+      { ...sessionFor({ id: 1, name: "a" }), openOnly: true },
+      { ...sessionFor({ id: 2, name: "b" }), openOnly: true },
+      sessionFor({ id: 3, name: "desk", protocol: "rdp" }),
+      sessionFor({ id: 4, name: "d" }),
+    ];
+    const statuses = { "session-1": "idle", "session-2": "connecting", "session-3": "idle", "session-4": "connected" };
+    expect(waitingTabs([{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }], sessions, statuses)).toEqual(["session-1"]);
+    expect(waitingTabs([{ id: 2 }], sessions, statuses)).toEqual([]);
   });
 });
 

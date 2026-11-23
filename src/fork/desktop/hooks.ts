@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type MutableRefObject, useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { TreeItems } from "../../components/SessionTree";
@@ -20,7 +20,7 @@ import { readRdpOptions, writeRdpOptions } from "../../util/rdpOptions";
 import { readSessionKeep, writeSessionKeep } from "../../util/sessionKeep";
 import { serverProtocol } from "../../util/serverProtocol";
 import {
-  type CloseWhich, type DesktopSession, HAS_HOME, START_VIEW, osChecksDue, sessionFor, tabsToClose,
+  type CloseWhich, type DesktopSession, HAS_HOME, START_VIEW, endingTabs, osChecksDue, sessionFor, tabsToClose, waitingTabs, wouldEnd,
 } from "./rules";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -159,6 +159,17 @@ export const useOsBadges = (o: {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [o.statuses, o.sessions, o.servers, o.detectOs]);
+};
+
+/** What closing the window or locking would end (`wouldEnd`), read when it's
+ *  asked, from DesktopApp's refs and the tabs' statuses now: a tab waiting
+ *  for Connect (their #394) doesn't count, so it never brings the question. */
+export const useWouldEnd = (
+  sessions: MutableRefObject<{ id: string }[]>, statuses: Record<string, string>, homeShells: MutableRefObject<number>,
+) => {
+  const statusesRef = useRef(statuses);
+  statusesRef.current = statuses;
+  return useCallback(() => wouldEnd(endingTabs(sessions.current, statusesRef.current), homeShells.current), [sessions, homeShells]);
 };
 
 /** Closing tabs: one connected session asks first, unless that's turned off
@@ -445,6 +456,8 @@ export const useSessionTree = (o: {
       return [...prev, ...fresh];
     });
     o.setActiveView(`session-${list[0].id}`);
+    // A tab that opened with the profile and waits connects now (their #394).
+    for (const sid of waitingTabs(list, o.sessions, o.statuses)) window.dispatchEvent(new CustomEvent(`session-reconnect-${sid}`));
     return list;
   };
   // Broadcast to a folder, or the servers picked (#218): open them, and tick

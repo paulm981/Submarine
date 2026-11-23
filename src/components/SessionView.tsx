@@ -31,6 +31,8 @@ import * as Fork from "../fork/session";
 import { ErrorBoundary } from "../ui/ErrorBoundary";
 import { parseObjectList } from "../util/serverJson";
 import { tk, tn, tx, useT } from "../i18n";
+import NotConnected from "./NotConnected";
+import { useWaitToConnect } from "../hooks/useWaitToConnect";
 
 // What the shell-config push commands answer (mirror.rs' ShellSync* types).
 type ShellSyncShells = { remote_shell: string; local_shell: string; shell_mismatch: boolean };
@@ -416,8 +418,11 @@ function writeFollow(on: boolean) {
 // from the server's (DesktopApp's tabNames). `profile`: the unlocked
 // profile's name, for what is kept per server on this device. `sessionShown`:
 // this session is on screen, not behind another one or another view.
-const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onStatusChange, chromeless = false, onTerminalsChange, isActiveView = false, shown: sessionShown = true, onPromptChange, compactTabs = false }: any) => {
+const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onStatusChange, chromeless = false, onTerminalsChange, onSessionTitle, isActiveView = false, shown: sessionShown = true, onPromptChange, compactTabs = false }: any) => {
   const t = useT();
+  // A tab opened at startup without connecting waits for Connect: the tab
+  // shows it as 'idle', and its own status stays 'connecting' until then.
+  const { waiting, connectNow } = useWaitToConnect(session);
   const [status, setStatus] = useState<'connecting' | 'connected' | 'failed' | 'disconnected'>('connecting');
 
   // Bubble every status change up to the parent so the session-tab strip
@@ -426,9 +431,9 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // wiring we already do here.
   useEffect(() => {
     if (typeof onStatusChange === "function") {
-      onStatusChange(session?.id, status);
+      onStatusChange(session?.id, waiting ? 'idle' : status);
     }
-  }, [status, session?.id, onStatusChange]);
+  }, [status, waiting, session?.id, onStatusChange]);
   const [disconnectReason, setDisconnectReason] = useState<string>("");
   const jumpGone = Fork.useJumpGone(session.serverId, () => reconnect(), (msg) => pushLog({ msg, type: 'error' }));
   const [logs, setLogs] = useState<{ msg: string, type: string, time?: string }[]>([]);
@@ -760,6 +765,8 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   useEffect(() => {
     if (activeTab !== aiTermId) setUserTab(activeTab);
   }, [activeTab, aiTermId]);
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
   const aiFeed = useMemo(() => createFeed(), []);
   // Known by session: a run of this server's chat on the AI page shows here too.
   useEffect(() => registerFeed(session.id, aiFeed), [session.id, aiFeed]);
@@ -797,6 +804,32 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
     termFoldersRef.current.set(terminalId, next);
     if (followRef.current) setFolderTick((n) => n + 1);
   }, []);
+  // The title a program in a terminal set itself (OSC 0/2, #391), by
+  // terminal id, cleaned by TerminalView (util/terminalTitle). Each terminal's
+  // tab shows its own after its name; only the ACTIVE terminal's reaches the
+  // session tab (via onSessionTitle), so a background terminal's title waits
+  // until its tab is selected. An empty title clears the entry: none was set,
+  // Settings turned titles off, or the terminal closed.
+  const oscTitlesRef = useRef(new Map<string, string>());
+  // Bump to re-render the nested tab bar when any terminal's title
+  // changes, so every split pane's tab shows its own live title
+  // (not just the active terminal's, which reaches the session tab
+  // via onSessionTitle). Mirrors the folderTick pattern above.
+  const [, setTitlesTick] = useState(0);
+  const onTerminalTitle = useCallback((terminalId: string, title: string) => {
+    if ((oscTitlesRef.current.get(terminalId) ?? "") === title) return;
+    if (title) oscTitlesRef.current.set(terminalId, title);
+    else oscTitlesRef.current.delete(terminalId);
+    setTitlesTick((n) => n + 1);
+    if (terminalId === activeTabRef.current) onSessionTitle?.(session.id, title);
+  }, [onSessionTitle, session.id]);
+  // The session tab follows the active terminal's title: switching
+  // terminals re-reports the newly active one's title ("" when it set none).
+  useEffect(() => {
+    if (typeof onSessionTitle === "function") {
+      onSessionTitle(session.id, oscTitlesRef.current.get(activeTab) ?? "");
+    }
+  }, [activeTab, session.id, onSessionTitle]);
   // What the SFTP panel follows: the active terminal's folder, null while its
   // shell hasn't said, undefined while Follow is off.
   const followFolder = follow ? (termFoldersRef.current.get(activeTab) ?? null) : undefined;
@@ -1238,6 +1271,8 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   };
 
   useEffect(() => {
+    // Opened at startup without connecting: nothing starts until Connect.
+    if (waiting) return;
     if (initiatedRef.current) return;
     initiatedRef.current = true;
 
@@ -1472,7 +1507,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           if (session.serverUuid) window.dispatchEvent(new CustomEvent<AiLevelDetail>(AI_LEVEL_EVENT, { detail: { serverUuid: session.serverUuid } }));
         });
     };
-  }, [session.id, session.serverId]);
+  }, [session.id, session.serverId, waiting]);
 
   const scheduleReconnect = (attempt: number) => {
     if (reconnectTimerRef.current) {
@@ -1546,11 +1581,14 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // round-tripping through React props — keeps DesktopApp's tab UI decoupled
   // from SessionView's reconnect lifecycle.
   useEffect(() => {
+    // While the tab waits to be connected, its menu's Connect starts the
+    // first connect instead (hooks/useWaitToConnect).
+    if (waiting) return;
     const onReconnect = () => reconnect();
     const evt = `session-reconnect-${session.id}`;
     window.addEventListener(evt, onReconnect);
     return () => window.removeEventListener(evt, onReconnect);
-  }, [session.id, customPassword]);
+  }, [session.id, customPassword, waiting]);
 
   // Reconnecting turned off in Settings stops a countdown that is running, at
   // once rather than when it ends.
@@ -1742,6 +1780,9 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // included, so once the session has been up it must never run: whatever a
   // reconnect does, the terminals, their scrollback and the SFTP state stay,
   // behind a slim banner.
+  if (waiting) {
+    return <NotConnected name={displayName || session.serverName} onConnect={connectNow} onClose={onClose} />;
+  }
   if (!everConnected && (status === 'connecting' || status === 'failed')) {
     const retryWaiting = reconnectAttempt > 0 && nextReconnectAt !== null;
     const retryIn = <SecondsLeft until={nextReconnectAt ?? 0} />;
@@ -1904,6 +1945,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           // a softer accent, so the pairing is obvious at a glance.
           const isFocusedHalf = activeTab === term.id;
           const isSplitPartner = !!(splitTerminals.includes(term.id) && !isFocusedHalf);
+          const programTitle = oscTitlesRef.current.get(term.id);
           return (
           <div key={term.id} className="group relative flex items-center"
             {...Fork.termTabProps(termDrag, term.id)}
@@ -1918,7 +1960,10 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                 // a tool pane / another input) — issue #51.
                 requestTerminalFocus();
               }}
-              title={term.container ? t("Container: {name}", { name: term.container.name }) : undefined}
+              title={[
+                term.container ? t("Container: {name}", { name: term.container.name }) : "",
+                programTitle ?? "",
+              ].filter(Boolean).join("\n") || undefined}
               className={`h-10 sm:h-8 px-3 sm:px-4 ${terminals.length > 1 ? 'pr-8 sm:pr-8' : ''} rounded-lg flex items-center gap-2 text-[12px] font-semibold transition-all ${
                 isFocusedHalf
                   ? 'bg-primary/10 text-primary border border-primary/20 shadow-inner'
@@ -1926,9 +1971,15 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                     ? 'bg-primary/[0.04] text-primary/70 border border-primary/10'
                     : 'text-zinc-300 bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/20 hover:text-white'
               } ${term.container ? 'ring-1 ring-sky-400/30' : ''} ${term.ai && aiFull ? 'ring-1 ring-rose-500/60' : ''}`}
-              {...Fork.termTabLook(term, compactTabs, isFocusedHalf, isSplitPartner, terminals.length, aiFull)}
+              {...Fork.termTabLook(term, compactTabs, isFocusedHalf, isSplitPartner, terminals.length, aiFull, programTitle)}
             >
               <Fork.TermTabLabel t={term} compactTabs={compactTabs} aiFullTitle={term.ai && aiFull ? t("{title} · Full access", { title: term.title }) : undefined} />
+              {/* After the name, cut when long; the tooltip has all of it. */}
+              {programTitle && (
+                <span className="min-w-0 max-w-[12rem] truncate font-normal opacity-70">
+                  · <bdi>{programTitle}</bdi>
+                </span>
+              )}
               {isSplitPartner && (
                 <SplitSquareHorizontal size={10} className="text-primary/60" />
               )}
@@ -2464,6 +2515,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                   ownLogin={term.ownLogin}
                   quickAuth={session.quickAuth}
                   onFolder={term.container ? undefined : onTerminalFolder}
+                  onTitle={onTerminalTitle}
                   onClose={() => closeTerminal(term.id)}
                   onNewTerminal={openNewTerminal}
                 />

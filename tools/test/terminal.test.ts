@@ -14,6 +14,8 @@ import { CUSTOM_THEME_ID, readScheme } from "../../src/util/terminalTheme";
 import { CLOSE_TAB_ASKING, closeTabAsking } from "../../src/fork/session/split";
 import { appHotkey } from "../../src/ui/terminalDock";
 import { mayBeShortcut, RESERVED_KEYS } from "../../src/fork/keys";
+import { TITLE_RAW_MAX, titleTooLong } from "../../src/fork/terminal/rules";
+import { cleanTerminalTitle, TITLE_MAX } from "../../src/util/terminalTitle";
 import {
   comboOf, comboText, defaultShortcuts, isWebviewEditKey, parseCombo, resetShortcuts, setShortcuts, SHORTCUT_ACTIONS, shortcutFor, usableCombo,
 } from "../../src/util/shortcuts";
@@ -232,7 +234,7 @@ describe("Ctrl+Shift+W on a tab's last terminal (#275)", () => {
 });
 
 // The files' text, read by Vite (as fork-hooks.test.ts does).
-const sources = import.meta.glob<string>(["/src/components/TerminalView.tsx", "/src/components/ShortcutSettings.tsx", "/src/fork/desktop/hooks.ts"], { query: "?raw", import: "default", eager: true });
+const sources = import.meta.glob<string>(["/src/components/TerminalView.tsx", "/src/components/ShortcutSettings.tsx", "/src/fork/desktop/hooks.ts", "/src/fork/terminal/mount.ts"], { query: "?raw", import: "default", eager: true });
 const source = (path: string): string => sources[path] ?? "";
 
 describe("Ctrl+Shift+K clears, Ctrl+Shift+J jumps to a tab (#275)", () => {
@@ -389,5 +391,24 @@ describe("the shortcuts table and the fork's keys", () => {
     expect(settings).toContain("if (SYSTEM_KEYS.includes(comboText(combo))) {");
     // And the keys still do what they did.
     expect(appHotkey({ code: "KeyJ", ctrlKey: true, shiftKey: true, altKey: false, metaKey: false } as KeyboardEvent)).toBe("jump");
+  });
+});
+
+// Their #393 shows a program's title (OSC 0 and 2) on the tab. It comes from
+// the server: their cleaning takes out what can't be seen and cuts it, and the
+// fork refuses one too long to be real before xterm sets it.
+describe("a program's title", () => {
+  it("is refused past TITLE_RAW_MAX, before xterm sets it, for OSC 0 and 2", () => {
+    expect(titleTooLong("x".repeat(TITLE_RAW_MAX))).toBe(false);
+    expect(titleTooLong("x".repeat(TITLE_RAW_MAX + 1))).toBe(true);
+    const mount = source("/src/fork/terminal/mount.ts");
+    expect(mount).toContain("for (const ident of [0, 2]) term.parser.registerOscHandler(ident, titleTooLong);");
+  });
+
+  it("shows as one line of text, without hidden or right-to-left characters, cut at TITLE_MAX", () => {
+    expect(cleanTerminalTitle("web\u202e10-bew\u200b\x1b[31m\n  ~/logs")).toBe("web10-bew[31m ~/logs");
+    const long = cleanTerminalTitle("y".repeat(TITLE_RAW_MAX));
+    expect(Array.from(long)).toHaveLength(TITLE_MAX);
+    expect(long.endsWith("…")).toBe(true);
   });
 });
