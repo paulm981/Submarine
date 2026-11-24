@@ -811,8 +811,8 @@ fn container_terminal_command(container: &str, use_sudo: bool) -> String {
 // pipeline (output over the page's channel, term_output.rs, + write/resize/close commands)
 // the regular shell terminal uses, so xterm.js on the frontend works
 // without any branch — just a different exec target.
-#[allow(clippy::too_many_arguments)]
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn open_container_terminal(
     app: tauri::AppHandle,
     state: tauri::State<'_, SshState>,
@@ -822,6 +822,7 @@ pub async fn open_container_terminal(
     cols: u32,
     rows: u32,
     use_sudo: bool,
+    session_log: Option<crate::session_log::Request>,
     password: Option<String>,
     on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Result<(), String> {
@@ -905,10 +906,12 @@ pub async fn open_container_terminal(
     // What the container's shell wrote while the password prompt was
     // looked for (root_channel) comes first, through the pump's own filter
     // (term_filter.rs), so a sequence split across the two is cut down too.
+    let log = crate::start_session_log(&app, &terminal_id, session_log);
     tauri::async_runtime::spawn(crate::ssh_manager::run_pty_pump(
         app.clone(),
         terminal_id.clone(),
         channel,
+        log,
         rx,
         resize_rx,
         on_output,

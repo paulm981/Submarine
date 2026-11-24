@@ -716,11 +716,14 @@ fn skipped_note(bytes: u64) -> String {
 /// term_output.rs), keystrokes / resizes → the channel, then
 /// `terminal-closed-{id}`, whose `shell_ended` says the server ended it
 /// (`exit`), as against a closed terminal or a lost connection. See
-/// `pty_pump`.
+/// `pty_pump`. `log` is the terminal's session log, if it
+/// has one (session_log.rs).
+#[allow(clippy::too_many_arguments)] // The fork's `on_output` and `early` make eight.
 pub async fn run_pty_pump(
     app: AppHandle,
     terminal_id: String,
     channel: russh::Channel<client::Msg>,
+    log: Option<crate::session_log::SessionLog>,
     rx: mpsc::Receiver<TerminalCommand>,
     resize_rx: tokio::sync::watch::Receiver<PtySize>,
     on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
@@ -729,7 +732,7 @@ pub async fn run_pty_pump(
     early: Vec<u8>,
 ) {
     let page = page_start(&terminal_id);
-    let shell_ended = pty_pump(channel, rx, resize_rx, Arc::clone(&page), early, |buf| crate::term_output::send(&terminal_id, &on_output, buf)).await;
+    let shell_ended = pty_pump(channel, log, rx, resize_rx, Arc::clone(&page), early, |buf| crate::term_output::send(&terminal_id, &on_output, buf)).await;
     page_end(&terminal_id, &page);
     let _ = app.emit(&format!("terminal-closed-{}", terminal_id), serde_json::json!({ "shell_ended": shell_ended }));
 }
@@ -738,7 +741,8 @@ pub async fn run_pty_pump(
 /// gets each coalesced batch and must leave the buffer empty, as
 /// `emit_terminal_batch` does) so tests can run it against a real connection.
 /// `page` is what the page has drawn: what it hasn't stays bounded (Outflow).
-/// Returns whether the server ended the channel.
+/// Returns whether the server ended the channel. `log` gets all the output as
+/// it comes, before the filter and the page's limits.
 ///
 /// The channel is SPLIT so its read side is drained continuously, whatever the
 /// write side is doing. Since russh 0.50 every channel has a bounded queue and
@@ -753,6 +757,7 @@ pub async fn run_pty_pump(
 /// signal.
 async fn pty_pump<F>(
     channel: russh::Channel<client::Msg>,
+    mut log: Option<crate::session_log::SessionLog>,
     mut rx: mpsc::Receiver<TerminalCommand>,
     mut resize_rx: tokio::sync::watch::Receiver<PtySize>,
     page: Arc<PageDrawn>,
@@ -850,6 +855,9 @@ where
             msg_opt = read_half.wait() => match msg_opt {
                 Some(ChannelMsg::Data { ref data })
                 | Some(ChannelMsg::ExtendedData { ref data, .. }) => {
+                    if let Some(log) = log.as_mut() {
+                        log.write(data);
+                    }
                     let was_empty = out_buf.is_empty();
                     let size = *sizes.borrow();
                     limiter.set_size(size.cols, size.rows);
@@ -2349,7 +2357,7 @@ mod tests {
         // A page that draws all it gets.
         let page = Arc::new(PageDrawn::default());
         let drew = Arc::clone(&page);
-        let pump = tokio::spawn(pty_pump(channel, rx, resize_rx, page, Vec::new(), move |buf: &mut Vec<u8>| {
+        let pump = tokio::spawn(pty_pump(channel, None, rx, resize_rx, page, Vec::new(), move |buf: &mut Vec<u8>| {
             sink.fetch_add(buf.len(), Ordering::SeqCst);
             drew.add(buf.len() as u64);
             buf.clear();
@@ -2391,7 +2399,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel::<TerminalCommand>(32);
         let (_resize_tx, resize_rx) = tokio::sync::watch::channel(PtySize { cols: 80, rows: 24 });
         let page = Arc::new(PageDrawn::default());
-        let ended = tokio::time::timeout(Duration::from_secs(10), pty_pump(channel, rx, resize_rx, page, Vec::new(), |buf: &mut Vec<u8>| buf.clear()))
+        let ended = tokio::time::timeout(Duration::from_secs(10), pty_pump(channel, None, rx, resize_rx, page, Vec::new(), |buf: &mut Vec<u8>| buf.clear()))
             .await
             .expect("the pump ends with the shell");
         assert!(ended, "the server ended this one");
@@ -2403,7 +2411,7 @@ mod tests {
         let (_resize_tx, resize_rx) = tokio::sync::watch::channel(PtySize { cols: 80, rows: 24 });
         let page = Arc::new(PageDrawn::default());
         drop(tx);
-        let ended = tokio::time::timeout(Duration::from_secs(10), pty_pump(channel, rx, resize_rx, page, Vec::new(), |buf: &mut Vec<u8>| buf.clear()))
+        let ended = tokio::time::timeout(Duration::from_secs(10), pty_pump(channel, None, rx, resize_rx, page, Vec::new(), |buf: &mut Vec<u8>| buf.clear()))
             .await
             .expect("the pump ends once the terminal is closed");
         assert!(!ended, "this side closed that one");
@@ -2432,7 +2440,7 @@ mod tests {
         page.add(1);
         let got = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let sink = Arc::clone(&got);
-        let pump = tokio::spawn(pty_pump(channel, rx, resize_rx, page, Vec::new(), move |buf: &mut Vec<u8>| {
+        let pump = tokio::spawn(pty_pump(channel, None, rx, resize_rx, page, Vec::new(), move |buf: &mut Vec<u8>| {
             sink.lock().unwrap().extend_from_slice(buf);
             buf.clear();
         }));
@@ -2495,7 +2503,7 @@ mod tests {
             channel.exec(false, "echo").await.unwrap();
             let (tx, rx) = mpsc::channel::<TerminalCommand>(32);
             let (resize_tx, resize_rx) = tokio::sync::watch::channel(PtySize { cols: 80, rows: 24 });
-            let pump = tokio::spawn(pty_pump(channel, rx, resize_rx, Arc::new(PageDrawn::default()), Vec::new(), |buf: &mut Vec<u8>| buf.clear()));
+            let pump = tokio::spawn(pty_pump(channel, None, rx, resize_rx, Arc::new(PageDrawn::default()), Vec::new(), |buf: &mut Vec<u8>| buf.clear()));
             tokio::time::sleep(Duration::from_millis(2)).await;
             drop(tx);
             drop(resize_tx);
@@ -2526,7 +2534,7 @@ mod tests {
         let (resize_tx, resize_rx) = tokio::sync::watch::channel(PtySize { cols: 80, rows: 24 });
         let got = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let sink = Arc::clone(&got);
-        let pump = tokio::spawn(pty_pump(channel, rx, resize_rx, Arc::new(PageDrawn::default()), Vec::new(), move |buf: &mut Vec<u8>| {
+        let pump = tokio::spawn(pty_pump(channel, None, rx, resize_rx, Arc::new(PageDrawn::default()), Vec::new(), move |buf: &mut Vec<u8>| {
             sink.lock().unwrap().extend_from_slice(buf);
             buf.clear();
         }));
