@@ -1,9 +1,10 @@
-// A right click in a terminal does one thing (#280): the long press's Paste
-// button on a touch screen; nothing of the app's in a program that has the
-// mouse (htop, mc, vim with mouse=a), which gets the click from xterm; and
-// elsewhere, or with Shift held (Option on a Mac), the fork's file-path menu
-// on a path or else a paste through the fork's own path (control characters
-// left out, "Paste N lines?").
+// A right click in a terminal does one thing (#280): on a touch screen, the
+// long press (their #405: a word's selection, or Paste on a blank cell),
+// stopped before xterm's own handler; nothing of the app's in a program that
+// has the mouse (htop, mc, vim with mouse=a), which gets the click from xterm;
+// and elsewhere, or with Shift held (Option on a Mac), the fork's file-path
+// menu on a path or else a paste through the fork's own path (control
+// characters left out, "Paste N lines?").
 //
 // The handler lives inside TerminalView, the original project's component,
 // so it is read from the file as it is and run here, with stand-ins for what
@@ -41,6 +42,8 @@ type World = {
   onPath?: boolean;
   /** Two fingers pinched the text size since the first one landed (their #395). */
   pinched?: boolean;
+  /** The long press's timer already made this touch's long press (their #405). */
+  pressed?: boolean;
 };
 
 const handlerSource = Promise.all(["programHasMouse", "bypassesProgram", "onContextMenu"].map(declaration))
@@ -62,7 +65,8 @@ const rightClick = async (world: World) => {
     terminalRef: { current: { parentElement: { getBoundingClientRect: () => pane } } },
     disabledRef: { current: false },
     pinched: !!world.pinched,
-    setPasteAt: () => { did.push("Paste button"); },
+    pressed: !!world.pressed,
+    longPress: () => { did.push("long press"); },
     pasteClipboard: async () => { did.push("paste"); },
     Fork: {
       fileMenuAt: (_ev: unknown, t: unknown, _f: unknown, paste: () => void) => {
@@ -80,6 +84,8 @@ const rightClick = async (world: World) => {
     shiftKey: !!world.shift, altKey: !!world.alt, ctrlKey: false, metaKey: false,
     pointerType: world.pointer ?? "mouse",
     preventDefault: () => { defaultPrevented = true; },
+    // Stopped: xterm's own handler, after this one, never hears it.
+    stopPropagation: () => { did.push("stopped"); },
   });
   // The webview's own menu never shows.
   expect(defaultPrevented).toBe(true);
@@ -109,11 +115,13 @@ describe("a right click in a terminal does one thing (#280, their #371)", () => 
     expect(await rightClick({ mouseProgram: true, mac: true, alt: true })).toEqual(["paste"]);
   });
 
-  it("shows only the Paste button for a long press on a touch screen", async () => {
-    expect(await rightClick({ pointer: "touch" })).toEqual(["Paste button"]);
+  it("makes only the long press for a touch screen's context menu, and stops it before xterm", async () => {
+    expect(await rightClick({ pointer: "touch" })).toEqual(["stopped", "long press"]);
     // Not after a pinch (their #395): the fingers changed the text size.
-    expect(await rightClick({ pointer: "touch", pinched: true })).toEqual([]);
-    expect(await rightClick({ pointer: "touch", onPath: true, mouseProgram: true })).toEqual(["Paste button"]);
-    expect(await rightClick({ mobile: true })).toEqual(["Paste button"]);
+    expect(await rightClick({ pointer: "touch", pinched: true })).toEqual(["stopped"]);
+    // Not twice (their #405): the timer already made this touch's long press.
+    expect(await rightClick({ pointer: "touch", pressed: true })).toEqual(["stopped"]);
+    expect(await rightClick({ pointer: "touch", onPath: true, mouseProgram: true })).toEqual(["stopped", "long press"]);
+    expect(await rightClick({ mobile: true })).toEqual(["stopped", "long press"]);
   });
 });
