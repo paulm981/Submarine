@@ -82,8 +82,6 @@ mod vault_schema;
 mod sync_merge;
 mod profile_create;
 mod clipboard_read;
-#[cfg(windows)]
-mod windows_clipboard;
 #[cfg(test)]
 mod fork_hooks;
 #[cfg(target_os = "android")]
@@ -26380,21 +26378,32 @@ async fn monitor_resume_all(
     jump_gone::resume_skipped(&db_state, skipped)
 }
 
-/// The clipboard's text, for a paste. The Linux and Android frontends ask;
-/// the others read it in the page.
+/// The clipboard's text, for a paste. The Windows, Linux and Android
+/// frontends ask; macOS and iOS read it in the page (WebKit shows its own
+/// Paste button for each read).
 ///
 /// Android's WebView refuses the page's `navigator.clipboard` altogether, so
 /// there the app's own Android plugin reads the system clipboard.
+///
+/// WebView2 on Windows asks the user to allow or block the page's
+/// `navigator.clipboard.readText()`, and after a Block every right-click
+/// paste (and the RDP and VNC tabs' paste) said "Clipboard read denied". So
+/// on Windows the page asks here and the clipboard is read directly.
 ///
 /// WebKitGTK refuses the page's `navigator.clipboard.readText()` (#89). And
 /// where the webview reads the clipboard itself (a keyboard paste, or the
 /// page API once it is allowed), it crashes the whole app when nothing owns
 /// the clipboard (seen with WebKitGTK 2.54). So on Linux the page asks here
 /// and GTK is asked directly. A clipboard that is empty or holds no text
-/// gives an empty string. The fork reads it here on Windows and macOS too
-/// (clipboard_read.rs).
+/// gives an empty string.
+/// The fork reads it here on macOS too (clipboard_read.rs).
 #[tauri::command]
 async fn clipboard_read_text(app: tauri::AppHandle) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        let _ = app;
+        file_clipboard::read_text().await
+    }
     #[cfg(target_os = "linux")]
     {
         let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
@@ -26414,7 +26423,7 @@ async fn clipboard_read_text(app: tauri::AppHandle) -> Result<String, String> {
     {
         android_bridge::clipboard_read(&app).await
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
     {
         let _ = app;
         clipboard_read::read_text().await
