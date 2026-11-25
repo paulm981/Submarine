@@ -159,7 +159,7 @@ export const ShareWithAiMenu = ({ share, name }: { share: ShareWithAi; name: str
       <div
         role="menu"
         style={{ left: Math.max(8, aiMenu.x - 220), top: aiMenu.y }}
-        className="fixed z-[9999] w-[220px] bg-[#15151a] border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
+        className="fixed z-[9999] w-[220px] bg-shade-15151a border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
       >
         <div className="px-3 pt-1 pb-0.5 text-[9.5px] font-bold uppercase tracking-wider text-zinc-500">Share {name} with</div>
         {ai.tabs.map((t) => (

@@ -144,7 +144,7 @@ export function KeptSessions({ session, terminals, openTerminal }: {
         <div
           role="status"
           onClick={() => setToast(false)}
-          className="fixed bottom-6 right-6 z-[9999] max-w-[320px] px-3 py-2 rounded-lg bg-[#15151a] border border-primary/30 shadow-2xl text-[12px] text-zinc-200 flex items-start gap-2 cursor-default"
+          className="fixed bottom-6 right-6 z-[9999] max-w-[320px] px-3 py-2 rounded-lg bg-shade-15151a border border-primary/30 shadow-2xl text-[12px] text-zinc-200 flex items-start gap-2 cursor-default"
         >
           <History size={13} className="text-primary shrink-0 mt-0.5" />
           <span>This session keeps running on the server. Type exit to end it.</span>
@@ -212,7 +212,7 @@ function SessionsList({ session, on, onClose, openTerminal }: {
         aria-modal="true"
         aria-labelledby="kept-sessions-title"
         onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-[480px] max-h-[80vh] flex flex-col bg-[#121214] border border-white/10 rounded-xl shadow-2xl font-mono text-[12px]"
+        className="w-full max-w-[480px] max-h-[80vh] flex flex-col bg-shade-121214 border border-white/10 rounded-xl shadow-2xl font-mono text-[12px]"
       >
         <div className="flex items-start justify-between gap-3 p-4 pb-2">
           <div className="flex items-center gap-2 min-w-0">
@@ -281,7 +281,7 @@ function SessionsList({ session, on, onClose, openTerminal }: {
 export function KeepSessionSetting() {
   const [on, setOn] = useState(readKeepDefault);
   return (
-    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 shadow-xl">
+    <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 shadow-xl">
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <div className="text-sm font-semibold text-zinc-100">Keep sessions between connections</div>
@@ -301,7 +301,7 @@ export function KeepSessionSetting() {
           onClick={() => { writeKeepDefault(!on); setOn(!on); }}
           className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${on ? "bg-primary" : "bg-zinc-700"}`}
         >
-          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${on ? "left-[22px]" : "left-0.5"}`} />
+          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-knob transition-all ${on ? "left-[22px]" : "left-0.5"}`} />
         </button>
       </div>
     </div>
@@ -327,7 +327,7 @@ export function KeepSessionOverride({ uuid }: { uuid?: string | null }) {
           writeKeepOverride(uuid, next);
           setChoice(next);
         }}
-        className="w-full bg-[#1a1a1e] rounded-lg px-3 h-9 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50"
+        className="w-full bg-shade-1a1a1e rounded-lg px-3 h-9 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50"
       >
         <option value="default">Use the default ({readKeepDefault() ? "on" : "off"})</option>
         <option value="always">Always</option>

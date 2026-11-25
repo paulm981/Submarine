@@ -104,7 +104,7 @@ export const JumpHostPicker = ({ value, onChange, servers, folders, selfId, dire
 
   return (
     <div ref={boxRef} className="relative flex-1 min-w-0">
-      <div className="flex items-center h-9 bg-[#1a1a1e] rounded-lg px-3 border border-white/10 focus-within:border-primary/50 focus-within:bg-[#232328] transition-all shadow-inner">
+      <div className="flex items-center h-9 bg-shade-1a1a1e rounded-lg px-3 border border-white/10 focus-within:border-primary/50 focus-within:bg-shade-232328 transition-all shadow-inner">
         {open && <Search size={13} className="text-zinc-500 shrink-0 mr-2" />}
         <input
           ref={inputRef}
@@ -134,7 +134,7 @@ export const JumpHostPicker = ({ value, onChange, servers, folders, selfId, dire
           id={listId}
           role="listbox"
           aria-label={label}
-          className="absolute z-50 left-0 right-0 mt-1 max-h-72 overflow-y-auto rounded-lg border border-white/10 bg-[#1a1a1e] shadow-2xl py-1"
+          className="absolute z-50 left-0 right-0 mt-1 max-h-72 overflow-y-auto rounded-lg border border-white/10 bg-shade-1a1a1e shadow-2xl py-1"
         >
           <Row id={`${listId}-0`} row={0} active={active === 0} selected={!value} onPick={() => pick("")} onHover={() => setActive(0)}>
             <span className="text-zinc-400">{directLabel}</span>

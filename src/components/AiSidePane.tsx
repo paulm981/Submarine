@@ -229,7 +229,7 @@ export const AiSidePane = ({ v, onHome, onGoToServer }: {
         onClick={(e) => act(e.detail === 0)}
         title={`Open the AI pane: ${current.label} (Ctrl+Shift+L)`}
         aria-label={`Open the AI pane: ${current.label}${asks ? `, ${asks} waiting for you` : ""}`}
-        className="relative w-7 shrink-0 min-h-0 flex flex-col items-center gap-2 pt-3 bg-[#111114] border-l border-white/10 text-zinc-400 hover:text-white hover:bg-white/[0.04] focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary"
+        className="relative w-7 shrink-0 min-h-0 flex flex-col items-center gap-2 pt-3 bg-shade-111114 border-l border-white/10 text-zinc-400 hover:text-white hover:bg-white/[0.04] focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary"
       >
         <PanelRightOpen size={14} />
         <Bot size={14} className="text-primary" />
@@ -256,7 +256,7 @@ export const AiSidePane = ({ v, onHome, onGoToServer }: {
       ref={paneRef}
       aria-label={`AI pane: ${current.label}`}
       style={{ width }}
-      className="relative shrink-0 min-h-0 flex flex-col bg-[#111114] border-l border-white/10 text-[12px]"
+      className="relative shrink-0 min-h-0 flex flex-col bg-shade-111114 border-l border-white/10 text-[12px]"
     >
       <Resizer width={width} max={maxW} />
       <div className="h-11 shrink-0 pl-3 pr-1.5 flex items-center gap-2 border-b border-white/5">
@@ -468,9 +468,9 @@ const AiTerminalSlot = ({ terminalId, wantFocus, inputs, dim }: {
   return (
     <div data-ai-pane="" className={`flex-1 min-h-0 relative transition-opacity duration-150 ${dim ? "opacity-60" : ""}`}>
       {/* The padding takes the terminal's own scheme background. */}
-      <div ref={slotRef} className="absolute inset-0 p-1.5 select-text" style={{ background: entry?.term.options.theme?.background ?? "#09090b" }} />
+      <div ref={slotRef} className="theme-dark absolute inset-0 p-1.5 select-text" style={{ background: entry?.term.options.theme?.background ?? "#09090b" }} />
       {!entry && (
-        <div className="absolute inset-0 flex items-center justify-center gap-2 text-zinc-500 text-[11px] bg-[#09090b]">
+        <div className="absolute inset-0 flex items-center justify-center gap-2 text-zinc-500 text-[11px] bg-shade-09090b">
           <Loader2 size={13} className="animate-spin" /> Starting…
         </div>
       )}

@@ -89,7 +89,7 @@ const Switch = ({ on, label, onToggle }: { on: boolean; label: string; onToggle:
     onClick={onToggle}
     className={`relative shrink-0 w-9 h-5 rounded-full transition-colors ${on ? "bg-primary" : "bg-zinc-700"}`}
   >
-    <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${on ? "left-[18px]" : "left-0.5"}`} />
+    <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-knob transition-all ${on ? "left-[18px]" : "left-0.5"}`} />
   </button>
 );
 
@@ -316,7 +316,7 @@ export function HighlightSettings({ settings, setSettings, onRulesChanged }: any
   const grays = grayBrights(schemeById(settings.terminalScheme || DEFAULT_SCHEME).theme);
 
   return (
-    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-5 shadow-xl">
+    <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 space-y-5 shadow-xl">
       <div className="space-y-2">
         <div className="text-[11px] font-black text-zinc-500 uppercase tracking-wider">Highlighting</div>
         <div role="radiogroup" aria-label="Highlighting" className="grid grid-cols-2 gap-1.5">

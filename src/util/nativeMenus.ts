@@ -40,7 +40,7 @@ const showMenu = (x: number, y: number, items: Item[]) => {
   const menu = document.createElement("div");
   menu.setAttribute("role", "menu");
   menu.className =
-    "fixed z-[10000] min-w-[160px] bg-[#0c0c0e] border border-white/10 rounded-lg shadow-2xl p-1 text-[12px] text-zinc-200 select-none";
+    "fixed z-[10000] min-w-[160px] bg-shade-0c0c0e border border-white/10 rounded-lg shadow-2xl p-1 text-[12px] text-zinc-200 select-none";
 
   const onDown = (e: MouseEvent) => {
     if (!menu.contains(e.target as Node)) close();

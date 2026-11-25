@@ -48,7 +48,7 @@ function AiToolsSettings() {
   };
   if (!info) return error ? <p className="text-[11.5px] text-red-400">{error}</p> : null;
   return (
-    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-3 shadow-xl">
+    <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 space-y-3 shadow-xl">
       <SwitchRow
         title="AI tools"
         line="Let an AI tool you start from Home run commands on the server tabs you share with it, after you allow them."

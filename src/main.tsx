@@ -13,10 +13,13 @@ import { tameNativeMenus } from "./util/nativeMenus";
 import { keepTypingPlain } from "./util/plainTyping";
 import { readFontFamily } from "./util/terminalFont";
 import { applyFonts, readUiFontFamily } from "./util/uiFont";
+import { applyTheme, readBackgroundColor, readPrimaryColor } from "./util/appTheme";
 
-// The fonts picked in Settings, before the first screen draws: the profile
-// list shows in them too, and nothing changes face once the app is up.
+// The fonts and colours picked in Settings, before the first screen draws:
+// the profile list shows in them too, and nothing changes face or turns
+// light once the app is up.
 applyFonts(readFontFamily(), readUiFontFamily());
+applyTheme(readPrimaryColor(), readBackgroundColor());
 
 // The app's log and freeze watchdog (util/diagnostics.ts): a failure that
 // escapes React (an async reject, a listener throw), console.error, and a

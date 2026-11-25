@@ -22,7 +22,7 @@ type Servers = ComponentProps<typeof JumpHostPicker>["servers"];
 /** The folder picker's folders: nested ones by their full path, in path
  *  order (util/folderPath). */
 export const FolderOptions = ({ folders }: { folders?: FolderRow[] | null }) => (
-  <>{folderOptions(folders || []).map((f) => <option key={f.id} value={f.id.toString()} className="bg-[#1a1a1e] text-white">{f.label}</option>)}</>
+  <>{folderOptions(folders || []).map((f) => <option key={f.id} value={f.id.toString()} className="bg-shade-1a1a1e text-white">{f.label}</option>)}</>
 );
 
 /** Under the password field, once switching to telnet, VNC or plain FTP took
@@ -91,7 +91,7 @@ export const MoreFields = ({ isSsh, isTelnet, isEditMode, newNode, setNewNode, s
           id="node-terminal-colors"
           value={newNode.terminalTheme || ""}
           onChange={(e) => setNewNode({ ...newNode, terminalTheme: e.target.value })}
-          className="flex-1 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner"
+          className="flex-1 h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-shade-232328 transition-all shadow-inner"
         >
           <option value="">Same as Settings ({schemeById(readSchemeId()).name})</option>
           {SCHEMES.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
@@ -113,7 +113,7 @@ export const MoreFields = ({ isSsh, isTelnet, isEditMode, newNode, setNewNode, s
         id="node-highlight"
         value={newNode.highlight || ""}
         onChange={(e) => setNewNode({ ...newNode, highlight: e.target.value })}
-        className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner"
+        className="w-full h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-shade-232328 transition-all shadow-inner"
       >
         <option value="">Same as Settings ({highlightSetById(readHighlightId()).name})</option>
         {HIGHLIGHT_SETS.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}

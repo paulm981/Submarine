@@ -27,7 +27,7 @@ const Popover = ({ onDismiss, width, children }: { onDismiss: () => void; width:
     <>
       <div className="fixed inset-0 z-[60]" onClick={onDismiss} onContextMenu={(e) => { e.preventDefault(); onDismiss(); }} />
       <div
-        className="absolute z-[70] top-full mt-1 right-0 max-w-[calc(100vw-16px)] max-h-[75vh] flex flex-col bg-[#15151a] border border-white/10 rounded-lg shadow-2xl p-1.5"
+        className="absolute z-[70] top-full mt-1 right-0 max-w-[calc(100vw-16px)] max-h-[75vh] flex flex-col bg-shade-15151a border border-white/10 rounded-lg shadow-2xl p-1.5"
         style={{ width }}
       >
         {children}

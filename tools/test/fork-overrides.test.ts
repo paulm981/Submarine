@@ -52,7 +52,7 @@ const OVERRIDES: { file: string; spread: string; upstream: string[] }[] = [
     file: "src/components/SessionView.tsx",
     spread: "Fork.paneLook",
     upstream: [
-      "className={`absolute ${",
+      "className={`theme-dark absolute ${",
       "inSplit",
       "? `z-10 border ${",
       "isFocused",

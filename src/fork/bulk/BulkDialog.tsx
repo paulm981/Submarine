@@ -318,7 +318,7 @@ export const BulkTransfer = ({ sessions, statuses }: { sessions: Session[]; stat
 
   return (
     <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-3" onClick={() => { if (!busy) hideBulk(); }}>
-      <div role="dialog" aria-modal="true" aria-label={title} className="w-full max-w-xl max-h-[85vh] flex flex-col bg-[#121214] border border-white/10 rounded-xl shadow-2xl" onClick={(e) => e.stopPropagation()}>
+      <div role="dialog" aria-modal="true" aria-label={title} className="w-full max-w-xl max-h-[85vh] flex flex-col bg-shade-121214 border border-white/10 rounded-xl shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div className="shrink-0 px-4 py-3 border-b border-white/5 flex items-center justify-between gap-3">
           <span className="text-[12px] font-bold uppercase tracking-widest text-white flex items-center gap-2">
             {mode === "push" ? <ArrowUpFromLine size={13} className="text-indigo-300" /> : <ArrowDownToLine size={13} className="text-indigo-300" />}

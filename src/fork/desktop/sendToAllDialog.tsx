@@ -49,7 +49,7 @@ export const SendToAllDialog = ({ reach, onSend, onClose }: {
         role="dialog"
         aria-modal="true"
         aria-label="Send to all"
-        className="w-full max-w-xl flex flex-col bg-[#121214] border border-white/10 rounded-xl shadow-2xl"
+        className="w-full max-w-xl flex flex-col bg-shade-121214 border border-white/10 rounded-xl shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-4 py-3 border-b border-white/5 flex items-center justify-between">

@@ -682,7 +682,7 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
   return (
     <aside
       aria-label="AI panel"
-      className="w-[380px] shrink-0 min-h-0 flex flex-col bg-[#111114] border-l border-white/10 text-[12px]"
+      className="w-[380px] shrink-0 min-h-0 flex flex-col bg-shade-111114 border-l border-white/10 text-[12px]"
     >
       <div className="h-11 shrink-0 px-3 flex items-center gap-2 border-b border-white/5">
         <Bot size={15} className="text-primary" />

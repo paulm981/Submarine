@@ -179,7 +179,7 @@ export const AiTrustModal = () => {
   const title = target.scope === "default" ? "Claude Code & Codex approval for every server" : `Claude Code & Codex approval: ${target.name}`;
   return (
     <div className="fixed inset-0 z-[10000] bg-black/60 backdrop-blur-sm flex items-center justify-center p-3" onClick={closeAiTrust}>
-      <div role="dialog" aria-modal="true" aria-label={title} className="w-full max-w-lg max-h-[85vh] flex flex-col bg-[#121214] border border-white/10 rounded-xl shadow-2xl" onClick={(e) => e.stopPropagation()}>
+      <div role="dialog" aria-modal="true" aria-label={title} className="w-full max-w-lg max-h-[85vh] flex flex-col bg-shade-121214 border border-white/10 rounded-xl shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div className="shrink-0 px-4 py-3 border-b border-white/5 flex items-center justify-between gap-2">
           <span className="text-[12px] font-bold tracking-wide text-white truncate">{title}</span>
           <button onClick={closeAiTrust} aria-label="Close" className="text-zinc-400 hover:text-white"><X size={16} /></button>
