@@ -470,7 +470,7 @@ const AiTerminalSlot = ({ terminalId, wantFocus, inputs, dim }: {
       {/* The padding takes the terminal's own scheme background. */}
       <div ref={slotRef} className="theme-dark absolute inset-0 p-1.5 select-text" style={{ background: entry?.term.options.theme?.background ?? "#09090b" }} />
       {!entry && (
-        <div className="absolute inset-0 flex items-center justify-center gap-2 text-zinc-500 text-[11px] bg-shade-09090b">
+        <div className="theme-dark absolute inset-0 flex items-center justify-center gap-2 text-zinc-500 text-[11px] bg-shade-09090b">
           <Loader2 size={13} className="animate-spin" /> Starting…
         </div>
       )}
