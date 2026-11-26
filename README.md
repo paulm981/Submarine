@@ -489,7 +489,7 @@ Submarine on Android is a native build of the same Rust core — same SSH stack,
 - **Same encrypted vault.** With cloud sync on, your profiles appear on the phone as they were on the desktop.
 - **Touch-friendly terminal.** An inline **key bar** between the terminal and the keyboard has Esc, Tab, arrows, `|`, `~`, `/`, `-` and Termux-style sticky modifiers (tap to arm, double-tap to lock), so Ctrl+letter, Alt+letter and Shift+Tab work.
 - **A hardware keyboard** (a keyboard cover, USB or Bluetooth) types into the terminal as on a computer: the terminal takes the focus, and Shift and AltGr characters work.
-- **A long press** on the terminal shows a **Paste** button; copy and paste go through Android's clipboard.
+- **Select and copy by touch.** A long press on text selects its word, with a handle at each end to drag and a bar with **Copy**, **Paste** and **Select all**; a tap ends it. A long press on an empty spot shows only **Paste**. Copy and paste go through Android's clipboard, and the keyboard stays down while you select.
 - **Auto-scroll on focus** so the prompt never sits behind the keyboard.
 - **SFTP file browser** with multi-select, upload from the phone's storage and download into Downloads; exports go through the system file picker.
 - **VNC and the built-in RDP client** show the remote screen with touch, zoom and a keyboard button, the connection mark and their speed and quality; a phone shares no files with an RDP server.
