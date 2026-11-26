@@ -103,7 +103,7 @@
 - **Syntax highlighting**: errors, warnings, OK, addresses, links and dates colored in the output, with sets for shell scripts, network devices and SQL, a set per server, and rules of your own that sync with the profile.
 - **Fast output never freezes the window**: output is paced by what the screen has drawn, and floods of escape sequences that would lock it up are ignored.
 - **A Home view** of terminals on your own computer: PowerShell, Command Prompt, Git Bash and each WSL distribution by name on Windows (the default one marked); the login shell and every other installed shell on macOS and Linux.
-- The app's own dark right-click menus everywhere, and no right-click or F5 that reloads the app.
+- The app's own right-click menus everywhere, dark or light with the rest of the app, and no right-click or F5 that reloads the app.
 
 **Settings in categories**
 - Tabs across the top: General, Terminal, Servers & sessions, AI tools, Sync and Help. Settings opens on the one you used last. Each setting says what it does in one line, with the longer explanation behind **Learn more**.
@@ -194,7 +194,7 @@ The original project's README follows.
     </td>
     <td width="33%" valign="top" align="center">
       <a href="docs/screenshots/add-server.png"><img src="docs/screenshots/add-server.png" alt="Server details form with the type, folder, a tag colour picker, host, port and login method" /></a>
-      <br/><sub><b>Server form</b> — type (SSH / RDP / VNC / Telnet), folder, tag colour, login, proxy and tunnels in one place</sub>
+      <br/><sub><b>Server form</b> — type (SSH / FTP / RDP / VNC / Telnet), folder, tag colour, login, proxy and tunnels in one place</sub>
     </td>
   </tr>
 </table>
@@ -266,17 +266,18 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 
 - **Nested folders** with colours, drag and drop to move servers and folders, and a search box
 - **Tag colours** on every server, so production and staging are never confused
-- **Four server types**: SSH, Telnet, VNC and RDP — one list, one vault
+- **Five server types**: SSH, FTP and FTPS, Telnet, VNC and RDP — one list, one vault
+- **Cards or a list**: each server shows its kind of connection, its login and port, and a dot when its tab is open
 - **Jump hosts and proxies** per server: another saved server as a jump host, or a SOCKS5 or HTTP proxy
 - **Import** from PuTTY `.reg`, MobaXterm `.mxtsessions`, an OpenSSH config, or a Submarine JSON export; **generate a key** right from the server form
 - **Quick connect** for a host you haven't saved yet — it is added to your root folder (with what you typed, password or key included), so remove it afterwards if you don't want it kept
 - **At startup**: a server's tab can open and connect when you unlock the profile (SSH servers), or open and wait for you to press **Connect** (any kind of server)
-- **Per-server notes** and **per-server commands** (or commands for all servers)
+- **Per-server notes** and **per-server commands** (or commands for all servers); a command can be **secret** (hidden until you show it, and run, never pasted) and carry **tags** to filter by
 
 ### Login methods
 
 - Passwords, key files and pasted keys (OpenSSH, PEM, PKCS#8 and SEC1 formats; RSA, ECDSA including P-521, Ed25519), with or without a passphrase
-- Keyboard-interactive and two-factor prompts, with the saved password filled in where the server asks for it
+- Keyboard-interactive and two-factor prompts, with the saved or typed password filled in where the server asks for it, so a server that asks for a one-time code after the password (Google Authenticator through PAM) asks you only for the code; a wrong password is asked for again, up to three times
 - **ssh-agent**: keys from Pageant, the Windows OpenSSH agent (and agents that use its pipe, such as 1Password), `SSH_AUTH_SOCK` or the `IdentityAgent` named in your config; smartcards and hardware keys work through it. A per-device switch turns it off.
 - **OpenSSH and Teleport certificates** from `~/.ssh/config`, with the CA keys in your `known_hosts` trusted
 - A **blank username** is asked for when you connect; a missing password or passphrase is asked for too
@@ -286,13 +287,18 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 
 ### Terminal
 
-- Tabbed sessions per server and multiple shells per session
+- **Tabs as in a browser**: the **+** after the last tab (or Ctrl+Shift+T, ⌘T on a Mac) opens a server, Ctrl+Tab moves between tabs, drag a tab to move it, middle-click to close it
+- Several shells per session (a new one takes the lowest free number); **rename** tabs
 - **Split** — the button next to + opens another shell on the same server beside the one you're in (watch a log in one, work in the other); right-click it to put an open tab beside this one or to stack them top and bottom
 - **Fast output never freezes the app** — a busy `tail -f` or a `cat` of a huge file is sent as raw bytes and paced by what the window has drawn; when a stream stays faster than the screen can show, the oldest unseen part is skipped with a note in the terminal, and Ctrl+C still answers at once. Escape sequences with absurd counts (`ESC[999999999S`, which a binary file can contain by chance and which xterm.js would loop on for hours) are ignored
 - Full xterm.js 6 — true colour, ANSI 256, mouse support, drawn with the GPU on Windows (WebGL; a switch in Settings, off by default on macOS and Linux), Unicode 11 widths so emoji and CJK line up
 - **Program titles on tabs** — a title a program sets, such as the folder you're in or the file you're editing, shows after the tab's name (Settings › Terminal turns it off)
+- **Session logs** — a terminal's output saved to a file while the session runs, as text or as all output, for SSH, container and telnet terminals (Settings › Terminal, off unless you turn it on; a server can choose for itself on this device). A log holds whatever the screen showed, a secret command's text once the shell echoes it included. On Linux and macOS only you can read it, and it stops at 1 GB
+- Ctrl+Shift+K **clears** a terminal, Ctrl+Shift+W closes it and Ctrl+Shift+click opens another one (Cmd+Shift on macOS)
+- **Change any shortcut** in Settings → Keyboard shortcuts, even keys the shell uses: Ctrl+C can be Copy, as in Windows Terminal (with a selection it copies; without one it still stops the program)
 - **Text size** — pinch a terminal, or Ctrl + wheel over it (⌘ + wheel on a Mac), or use the − and + keys on a phone's key bar; it's the size in Settings, so every terminal follows
-- **Color schemes** — Submarine's own plus Campbell, One Half, Solarized, Dracula, Nord, Tokyo Night, Catppuccin and Gruvbox (Settings › Terminal, with a live preview). A server can have **its own**, which syncs with it — e.g. a light scheme for production
+- **Color schemes** — Submarine's own plus Campbell, One Half, Solarized, Dracula, Nord, Tokyo Night, Catppuccin and Gruvbox (Settings › Terminal, with a live preview). A server can have **its own**, which syncs with it — e.g. a light scheme for production; a separate **interface font** for menus and panels (Settings › General)
+- **A light look** — pick a light background in Settings › General (or the Snow, Paper and Silver presets) and the whole interface turns light: tabs, panels, menus, dialogs and the session tree. Terminals and remote desktops keep their own colors, and so does what's drawn over a terminal
 - **Keep text readable** — text a program colors too close to the background is lifted to a 4.5:1 contrast, as in VS Code
 - **Syntax highlighting** — words and addresses colored in what the terminal shows (Settings › Terminal › Highlighting, with a live preview and a box to paste your own output into):
   - **Standard** (the default): errors and failures in red, warnings in yellow, OK and success in green, IP and MAC addresses, links, dates and times, and "Last login"
@@ -310,7 +316,7 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 ### SFTP file browser
 
 - Dual-pane (local on top, remote on bottom) with drag-and-drop between them
-- **Right-click the empty space** in a list for Refresh, New Folder, Select all and Copy folder path. Every right-click menu is the app's own, dark like the rest: text fields get Cut / Copy / Paste / Select all, selected text gets Copy, and the webview's menu (whose Reload would restart the whole app) never shows. F5 / Ctrl+R don't reload the app either
+- **Right-click the empty space** in a list for Refresh, New Folder, Select all and Copy folder path. Every right-click menu is the app's own, in the same look as the rest: text fields get Cut / Copy / Paste / Select all, selected text gets Copy, and the webview's menu (whose Reload would restart the whole app) never shows. F5 / Ctrl+R don't reload the app either
 - **Tabs or Split layout** — toggle between stacked tabs (one pane visible, more screen real-estate) and the classic split, persisted per device
 - **Per-pane filter input** — type to filter the listing live with an N/M counter, Esc to clear
 - **Multi-select with Ctrl/Shift-click** plus **Select-All button and Ctrl+A** for bulk download, move, or delete
@@ -335,7 +341,9 @@ Pick a local folder, pick a remote folder, and Submarine keeps them in sync.
 
 - **Two-way initial sync** that compares size and content hash, not just timestamps
 - **Live watcher** — every save, create, rename or delete on the local folder reaches the server
-- **Conflict resolution per mirror**: **Local wins** (default), **Remote wins** or **Newer wins**; **excludes** such as `node_modules` and `*.log`
+- **Conflict resolution per mirror**: **Local wins** (default), **Remote wins** or **Newer wins**
+- **Only some files**: **Only these** and **Skip these** patterns, such as `*.sql`, `db/`, `backups/**/*.sql` or a word anywhere in the path (up to 100 in each list); a skipped folder removed on your computer stays on the server
+- **One way, or once**: copy both ways, only up to the server, or only down from it (down runs once and never writes to the server); any mirror can **run once**, copying what the preview lists and stopping
 - **Soft delete** — removed files move to `.submarine-trash/` on the server
 - A mirrored folder that goes away deletes nothing on the server, and a dry-run preview calls out what would be overwritten before each start
 
@@ -354,7 +362,7 @@ Pick a local folder, pick a remote folder, and Submarine keeps them in sync.
 - sudo / dzdo errors (wrong password, not allowed, requiretty) are explained in plain words instead of a raw stderr dump
 
 - **VNC** opens as the remote screen in the tab, directly or through an SSH server, on the PC and on the phone (touch, zoom, a keyboard button). Tight, ZRLE, TRLE, CopyRect and Raw encodings; the desktop takes the tab's size where the server allows it. **Speed and quality** per server on this device: the encoding, the colours (full, 16 or 8 bits), the most updates a second and the resolution, with quick choices (Standard, Less data, Least data). The **clipboard** is shared both ways, as plain ASCII text (links, commands): classic VNC carries no more. Plain VNC is **not encrypted**, and the form, the list and the tab say so.
-- **RDP** opens in **this computer's RDP app** by default (Windows Remote Desktop Connection, Remmina or FreeRDP on Linux, the system handler on macOS), with per-server full-screen, window size, clipboard and drive-sharing options kept on this device. Through an SSH server it gets the same loopback address every time, and Remote Desktop Connection on Windows gets the saved password (encrypted with DPAPI in its `.rdp` file, which is deleted once read). The **built-in RDP client** (in the tab, on the PC and the phone) is **experimental** and opt-in; its certificate is pinned like an SSH host key and checked before anything secret is sent. It also needs **NLA** (the server proves it knows the password before the client sends it): a server that answers "TLS only" is refused with nothing sent, unless you allow that one server ("Allow without NLA"). It shares the **clipboard** (text, both ways) and, on the PC, **files**: a folder or a whole drive, read only or not, which the server sees as `\\tsclient\<name>`. **Speed and quality** per server: colours (32, 24 or 16 bits), desktop effects, the network's speed, RemoteFX and the resolution, with quick choices (Best picture, Balanced, Less data).
+- **RDP** opens in **this computer's RDP app** by default (Windows Remote Desktop Connection, Remmina or FreeRDP on Linux, the system handler on macOS), with per-server full-screen, window size, clipboard and drive-sharing options kept on this device. Through an SSH server it gets the same loopback address every time, and Remote Desktop Connection on Windows gets the saved password (encrypted with DPAPI in its `.rdp` file, which is deleted once read). The **built-in RDP client** (in the tab, on the PC and the phone) is **experimental** and opt-in; its certificate is pinned like an SSH host key and checked before anything secret is sent. It also needs **NLA** (the server proves it knows the password before the client sends it): a server that answers "TLS only" is refused with nothing sent, unless you allow that one server ("Allow without NLA"). It shares the **clipboard** (text, both ways) and, on the PC, **files**: a folder or a whole drive, read only or not, which the server sees as `\\tsclient\<name>`; on a Windows server, **Open it on the server** in the tab's Files panel types its address into Run. **Speed and quality** per server: colours (32, 24 or 16 bits), desktop effects, the network's speed, RemoteFX and the resolution, with quick choices (Best picture, Balanced, Less data).
 - **Both remote screens** have a **connection mark** in the tab's bar (Good, Fair, Weak or Not answering, with the round trip, the data rates and the session's bytes; on a weak link it offers to use less data), change their speed and quality from the tab, and **pause while the tab is hidden** (on by default), so a tab nobody looks at sends no picture.
 - **Telnet** opens in a terminal tab, directly or through an SSH server, with proper option negotiation. It is **not encrypted** and says so.
 - All three can go **through an SSH server** you already have.
@@ -370,7 +378,7 @@ Pick a local folder, pick a remote folder, and Submarine keeps them in sync.
 - **Container terminal** — open an interactive `docker exec` shell as a new session tab
 - Cross-platform (Linux / macOS / Windows hosts) — tries `docker` first; where only root may use Docker, runs it as root through `sudo` or `dzdo`, asking for the password when the server needs one
 
-- **Overview** (hostname, OS, kernel, uptime, load, CPU, memory, swap, disks), **Network** (interfaces, routes, `iptables` / `nftables` rules), **Ports** (listening sockets with process names) and **Services** (`systemctl` units with Start / Stop / Restart)
+- **Overview** (hostname, OS, kernel, uptime, load, CPU, memory, swap, disks), **Network** (interfaces, routes, `iptables` / `nftables` rules), **Ports** (listening sockets with process names) and **Services** (systemd, OpenRC and OpenWrt's procd, with Start / Stop / Restart)
 - **Docker manager**: containers (start, stop, restart, pause, kill), live logs, stats, inspect, env / mounts / ports, images, volumes, networks, compose files, safe prune (never `--volumes`, never `-a`), and `docker exec` shells as session tabs
 
 ### Monitoring and the Wall
@@ -411,6 +419,7 @@ The assistant's and the agents' screens are in English for now.
 - Each profile is its own vault with its own master password; several can live on one device
 - **Quick unlock** (off by default): open a profile with **Windows Hello** (needs a TPM) or an **Android fingerprint**. The password itself is never kept: the vault key is sealed to a key in the TPM or the Android Keystore. Not offered on Linux, macOS, iPhone or iPad, never synced or exported.
 - **Portable mode** on Windows: all data in a `submarine-data` folder next to the exe
+- **A copy in a folder** (on a computer): every save also writes the profile's encrypted file into a folder you choose. Put it in OneDrive, Google Drive or Dropbox, and Import opens it on your other computers with the profile's password. It is a copy, not sync
 - **Send feedback** from the app (Settings → Help & feedback, or Feedback on the profile list): only what you type is sent, and a name and an email if you give them — no logs, no list of servers, no system details
 
 - **Quick commands**: per-server snippet library, surfaced inside any open session
@@ -482,6 +491,8 @@ Submarine on Android is a native build of the same Rust core — same SSH stack,
 
 - **Same encrypted vault.** With cloud sync on, your profiles appear on the phone as they were on the desktop.
 - **Touch-friendly terminal.** An inline **key bar** between the terminal and the keyboard has Esc, Tab, arrows, `|`, `~`, `/`, `-` and Termux-style sticky modifiers (tap to arm, double-tap to lock), so Ctrl+letter, Alt+letter and Shift+Tab work.
+- **A hardware keyboard** (a keyboard cover, USB or Bluetooth) types into the terminal as on a computer: the terminal takes the focus, and Shift and AltGr characters work.
+- **Select and copy by touch.** A long press on text selects its word, with a handle at each end to drag and a bar with **Copy**, **Paste** and **Select all**; a tap ends it. A long press on an empty spot shows only **Paste**. Copy and paste go through Android's clipboard, and the keyboard stays down while you select.
 - **Auto-scroll on focus** so the prompt never sits behind the keyboard.
 - **SFTP file browser** with multi-select, upload from the phone's storage and download into Downloads; exports go through the system file picker.
 - **VNC and the built-in RDP client** show the remote screen with touch, zoom and a keyboard button, the connection mark and their speed and quality; a phone shares no files with an RDP server.
@@ -691,21 +702,23 @@ MIT — see [LICENSE](LICENSE).
 
 The app ships with the licences of everything in it: every build lists the JavaScript packages and Rust crates it includes, with their licence texts (`scripts/notices.mjs`), and the fonts' and color schemes' licences are in `public/licenses/`. In the app: Settings › Help, under Open-source licenses.
 
-## Also by the author: Echoes — network & developer toolkit
+## Also by the author
 
-<a href="https://github.com/SinaXhpm/Echoes"><img src="https://raw.githubusercontent.com/SinaXhpm/Echoes/master/Echoes.Android/Resources/mipmap-xhdpi/icon.png" alt="Echoes — free, open-source network toolkit and developer tools for Windows, macOS, Linux and Android" width="64" align="left" /></a>
+### Echoes — 23 network and developer tools in one app
 
-**[Echoes](https://github.com/SinaXhpm/Echoes)** is a [free, open-source network toolkit for Windows, macOS, Linux and Android](https://github.com/SinaXhpm/Echoes) with **20 network and developer tools in one app**: the things you would run one by one (ping, traceroute, nmap, curl, dig, whois, PuTTY, netcat, a speed-test site, the Cloudflare dashboard) behind one simple window. No account, no ads, no telemetry. MIT licensed.
+<a href="https://echoes.sinaxhpm.com"><img src="docs/also/echoes.webp" width="720" alt="Echoes: the Doctor checking a site step by step (DNS, connection, TLS, HTTPS), next to the list of tools" /></a>
 
-<br clear="left" />
+A Doctor that says in one sentence why a site won't open, plus ping, traceroute, a speed test, a port scanner, DNS, cURL, SSH and file sharing with any browser. Free and open source for Windows, macOS, Linux, Android, iPhone and iPad.
 
-- **Diagnose** — a **connection doctor** that says in one sentence why a site won't open (DNS tampering, SNI filtering, a blocked IP, a filter page, or down for everyone), **ping, TCP ping, traceroute and MTR** (loss per hop, no admin rights needed), an **internet speed test** with a bufferbloat grade, a **TCP/UDP port scanner** with service and version detection (an nmap alternative), **check host** from servers around the world, and **network info** with a Wi-Fi analyzer, ARP neighbours, open ports and the routing table
-- **DNS and web** — **DNS lookup** over UDP, DNS over HTTPS and DNS over TLS with resolver comparison and an email (SPF, DKIM, DMARC) check, **WHOIS / RDAP**, a **cURL / HTTP client** that imports curl commands (a Postman alternative), an **SSL/TLS certificate inspector**, **IP and GeoIP lookup**, a **Cloudflare manager** with dynamic DNS, and a **Telegram Bot API tester**
-- **Servers and connections** — an **SSH client** (terminal, SFTP, port forwarding, server health), a **TCP / UDP / WebSocket tool** (a netcat alternative), **LAN file sharing and chat** in any browser with a QR code plus a webhook catcher, a **SOCKS5 + HTTP proxy server** with a **proxy checker**, and an **uptime monitor** with Telegram alerts and certificate and domain expiry warnings
-- **Workspace** — **String Lab** (Base64, hashes, JWT, JSON ↔ YAML / CSV, regex, subnet / CIDR calculator, cron, UUID and password generators), **encrypted notes**, and **history with one encrypted backup file**
-- **Built with** C# · .NET · Avalonia UI · Native AOT — self-contained native apps for Windows, macOS (Intel and Apple Silicon), Linux and Android 6.0+, with nothing extra to install, dark and light themes, and secrets encrypted on your device
+[Website](https://echoes.sinaxhpm.com) · [GitHub](https://github.com/SinaXhpm/Echoes) · [Download](https://github.com/SinaXhpm/Echoes/releases/latest)
 
-[Echoes on GitHub](https://github.com/SinaXhpm/Echoes) · [Download Echoes for Windows, macOS, Linux and Android](https://github.com/SinaXhpm/Echoes/releases) · [More projects by Sina Xhpm](https://sinaxhpm.com)
+### Captun — a smart hotspot
+
+<a href="https://captun.sinaxhpm.com"><img src="docs/also/captun.webp" width="720" alt="Captun: the helm that starts sharing over a Wi-Fi hotspot or USB, and the way out for connected devices" /></a>
+
+Share your computer's internet, VPN or proxy with phones, TVs and consoles over Wi-Fi, a cable or USB, and decide where each device's traffic goes. For Windows and Linux; in development, no release yet.
+
+[Website](https://captun.sinaxhpm.com) · [Source code](https://github.com/SinaXhpm/captun)
 
 ---
 

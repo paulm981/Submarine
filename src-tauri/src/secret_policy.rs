@@ -15,7 +15,9 @@
 //!   use, or pointing it at another host.
 //! - Only the first password question of a keyboard-interactive exchange is
 //!   offered for saving (`kbi_round`), and only for the login name the server
-//!   has saved (`may_save_for_login`).
+//!   has saved (`may_save_for_login`). The password in hand answering that
+//!   question by itself counts as it, and an exchange started over after a
+//!   wrong password is a new one (`kbi_restart`).
 //! - E5: a shared profile never opens by itself on Windows (quick unlock's
 //!   "open automatically", the original project's #275): anyone using that
 //!   Windows account would get every member's saved logins. It can't be turned
@@ -97,11 +99,26 @@ pub fn may_save_now(conn: &Connection, server_id: i32, fingerprint: u64, vnc: bo
 /// second answer saved over the first, into a saved login other servers use
 /// too. `asked` is the exchange's own: whether a password question came
 /// already.
+///
+/// The password in hand (the saved one, or the one the password method turned
+/// down, the original project's #417) answering the server's password question
+/// by itself is that question too: `kbi_round(true, ..)`, whose first value
+/// says whether that answer may still be saved. Otherwise a second password
+/// question would count as the first, offer the tick, and have its answer
+/// saved over the first.
 pub fn kbi_round(password_question: bool, asked: &mut bool) -> (bool, bool) {
     let first = password_question && !*asked;
     let again = password_question && *asked;
     *asked |= password_question;
     (first, again)
+}
+
+/// The keyboard-interactive exchange starts over, after the server turned a
+/// password down (the original project's #417 asks for it again, up to three
+/// times): the next password question is the first of a new exchange, so it
+/// offers the tick again.
+pub fn kbi_restart(asked: &mut bool) {
+    *asked = false;
 }
 
 /// Whether a password typed for this login may be saved: only for the login
@@ -242,6 +259,41 @@ mod tests {
         assert_eq!(kbi_round(true, &mut asked), (false, true));
     }
 
+    /// The steps `run_keyboard_interactive` takes, on one exchange's `asked`.
+    #[test]
+    fn a_retry_after_a_wrong_password_offers_the_tick() {
+        let mut asked = false;
+        // The user's password: offered. The server turns it down.
+        assert_eq!(kbi_round(true, &mut asked), (true, false));
+        kbi_restart(&mut asked);
+        // Asked again: offered again, and nothing kept is dropped.
+        assert_eq!(kbi_round(true, &mut asked), (true, false));
+        // The code after it: no tick.
+        assert_eq!(kbi_round(false, &mut asked), (false, false));
+    }
+
+    #[test]
+    fn a_retry_after_the_password_in_hand_was_turned_down_offers_the_tick() {
+        let mut asked = false;
+        // The saved or handed-over password answered by itself, and was turned down.
+        assert!(kbi_round(true, &mut asked).0);
+        kbi_restart(&mut asked);
+        // The user is asked: the tick.
+        assert_eq!(kbi_round(true, &mut asked), (true, false));
+    }
+
+    #[test]
+    fn after_an_auto_answer_a_second_password_question_gets_no_tick() {
+        let mut asked = false;
+        // A code first, then the password in hand answers the password
+        // question: still the first, so a ticked handed-over one may be saved.
+        assert_eq!(kbi_round(false, &mut asked), (false, false));
+        assert!(kbi_round(true, &mut asked).0, "the auto-answer is the first password question");
+        // A second, different password ("Enter your Okta password"): no tick,
+        // and the first answer isn't saved either.
+        assert_eq!(kbi_round(true, &mut asked), (false, true));
+    }
+
     #[test]
     fn a_password_is_saved_only_for_the_saved_login_name() {
         assert!(may_save_for_login(false, "root"));
@@ -366,7 +418,8 @@ mod tests {
             ("secret_policy::save_typed_password(conn, &to, password)", 1, "save_prompted_password"),
             ("secret_policy::note_terminal_server(&state, &session_id, &terminal_id)", 2, "open_terminal and telnet_open_terminal"),
             ("secret_policy::check_terminal_server(&ssh, &terminal_id, server_id)", 1, "type_saved_password"),
-            ("secret_policy::kbi_round(", 1, "run_keyboard_interactive"),
+            ("secret_policy::kbi_round(", 2, "run_keyboard_interactive: the auto-answer and the user's rounds"),
+            ("secret_policy::kbi_restart(", 2, "run_keyboard_interactive: both restarts of the exchange"),
             ("secret_policy::may_save_for_login(", 2, "login_hop and initiate_connection"),
             ("secret_policy::stop_opening_by_itself(", 1, "share_current_profile (E5)"),
         ] {
@@ -378,6 +431,39 @@ mod tests {
             ("secret_policy::SHARED_AUTO_OPEN", 1, "quick_unlock_enable (E5)"),
         ] {
             assert_eq!(quick_unlock.matches(hook).count(), times, "quick_unlock.rs should use `{hook}` {times}x, in {place}");
+        }
+        kbi_hooks_are_in_order(lib);
+    }
+
+    /// The "Save password" rule's hooks in `run_keyboard_interactive`, each in
+    /// its place: the auto-answer counts as the first password question before
+    /// the user's rounds are counted, and every restart of the exchange (each
+    /// `authenticate_keyboard_interactive_start` after the first) resets it just
+    /// before it.
+    fn kbi_hooks_are_in_order(lib: &str) {
+        const F: &str = "run_keyboard_interactive";
+        const RESTART: &str = "secret_policy::kbi_restart(&mut password_asked);";
+        crate::fork_hooks::assert_hooks(
+            "lib.rs",
+            lib,
+            &[(F, "secret_policy::kbi_round(", 2), (F, RESTART, 2)],
+        );
+        crate::fork_hooks::assert_in_order(
+            "lib.rs",
+            lib,
+            F,
+            &[
+                "let mut password_asked = false;",
+                "if secret_policy::kbi_round(true, &mut password_asked).0 && password.save {",
+                "secret_policy::kbi_round(lone_password, &mut password_asked);",
+            ],
+        );
+        let body = crate::fork_hooks::body_of(lib, F).expect("lib.rs has run_keyboard_interactive");
+        let parts: Vec<&str> = body.split("authenticate_keyboard_interactive_start").collect();
+        assert_eq!(parts.len(), 4, "`{F}` should start the exchange once and start it over in two places");
+        for (i, part) in parts.iter().enumerate() {
+            let want = usize::from(i != 0 && i != parts.len() - 1);
+            assert_eq!(part.matches(RESTART).count(), want, "in `{F}`, each restart of the exchange should reset `password_asked` just before it (part {i})");
         }
     }
 }

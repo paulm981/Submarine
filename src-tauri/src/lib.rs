@@ -49,8 +49,12 @@ mod known_hosts;
 mod rdp;
 mod quick_unlock;
 mod rdp_client;
+mod rdp_files;
+mod file_clipboard;
 mod rdp_share;
 mod term_filter;
+mod session_log;
+mod session_log_policy;
 mod vault_backup;
 mod folder_copy;
 mod ai;
@@ -81,8 +85,6 @@ mod sync_merge;
 mod secret_look;
 mod profile_create;
 mod clipboard_read;
-#[cfg(windows)]
-mod windows_clipboard;
 #[cfg(test)]
 mod fork_hooks;
 #[cfg(target_os = "android")]
@@ -245,7 +247,9 @@ enum ProfileLock {
 ///
 /// The lock is a held lock on `<name>.submarine.lock`, not the file's mere
 /// existence, so it can never be left behind: the system lets go of it when the
-/// process ends, however it ends.
+/// process ends, however it ends. That can take a while (a file still being
+/// written to a network folder holds it up), so on exit the lock goes as soon
+/// as the last save is done.
 fn lock_profile(state: &DbState, path: &Path) -> Result<ProfileLock, String> {
     let held_here = state.profile_lock.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE_LOCK")?
         .as_ref()
@@ -9379,9 +9383,11 @@ mod mirror_folder_guard_tests {
         std::fs::write(&file, b"x").unwrap();
         assert!(guard_mirror_folder(&dir.join("nope").to_string_lossy()).is_err());
         assert!(guard_mirror_folder(&file.to_string_lossy()).is_err());
-        // A real folder passes, and what comes back is its resolved path.
+        // A real folder passes, and what comes back is its resolved path, in
+        // the plain form (it shows in the mirror's log).
         let ok = guard_mirror_folder(&dir.to_string_lossy()).unwrap();
         assert!(std::path::Path::new(&ok).is_dir());
+        assert!(!ok.starts_with(r"\\?\"), "{ok}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10409,6 +10415,34 @@ fn secret_candidates(
     .collect()
 }
 
+/// A password the password method turned down on a server that also takes
+/// keyboard-interactive, for that to answer the server's password question with
+/// (see `authenticate_password_prompting`).
+struct KbiHandoff {
+    password: zeroize::Zeroizing<String>,
+    source: SecretSource,
+    /// Typed with "Save password" ticked.
+    save: bool,
+}
+
+impl KbiHandoff {
+    fn answer(&self) -> KbiPassword<'_> {
+        KbiPassword { value: self.password.as_str(), typed: self.source != SecretSource::Given, save: self.save }
+    }
+}
+
+/// The password a keyboard-interactive login has for the server's password
+/// question (see `is_password_prompt`): the saved one, or one the password
+/// method turned down (`KbiHandoff`).
+#[derive(Clone, Copy)]
+struct KbiPassword<'a> {
+    value: &'a str,
+    /// Typed by the user (else saved): only for the log's wording.
+    typed: bool,
+    /// Typed with "Save password" ticked: saved once the login with it worked.
+    save: bool,
+}
+
 /// Everything a connect-time secret prompt needs besides the SSH session: where
 /// to show it (the keyboard-interactive modal of `session_id`, answered under
 /// `nonce`) and where accepted secrets live (`cache`, under the tab's `base`
@@ -11228,6 +11262,18 @@ async fn resolve_login_user(
 /// password box. `Ok(false)` — password not offered, prompt cancelled or timed
 /// out, or prompts used up — leaves the caller's keyboard-interactive fallback
 /// to run exactly as before.
+///
+/// `handoff` is for a caller that goes on with keyboard-interactive. A server
+/// that asks for a one-time code after the password through PAM (Google
+/// Authenticator and the like) turns the password method down even for the
+/// right password: sshd gives the password to the code question too. It takes
+/// keyboard-interactive as well, which asks for the password and then the code
+/// (OpenSSH tries that method first, so it logs in there). So the first
+/// password turned down while the server offers keyboard-interactive isn't
+/// asked for again here: it goes into `handoff`, and this ends with
+/// `Ok(false)`, for the caller's keyboard-interactive to answer the server's
+/// password question with it. A wrong one is asked for again there.
+#[allow(clippy::too_many_arguments)]
 async fn authenticate_password_prompting<H: russh::client::Handler>(
     session: &mut russh::client::Handle<H>,
     user: &str,
@@ -11236,6 +11282,7 @@ async fn authenticate_password_prompting<H: russh::client::Handler>(
     saved_password: Option<zeroize::Zeroizing<String>>,
     slot: SecretSlot,
     ctx: &SecretPromptCtx<'_>,
+    mut handoff: Option<&mut Option<KbiHandoff>>,
 ) -> Result<bool, russh::Error> {
     let cached = cache_get_secret(ctx.cache, ctx.base, slot).await;
     let candidates = secret_candidates(override_password, cached, saved_password);
@@ -11357,6 +11404,20 @@ async fn authenticate_password_prompting<H: russh::client::Handler>(
                     cache_clear_secret(ctx.cache, ctx.base, slot).await;
                 }
                 password_offered = remaining_methods.contains(&russh::MethodKind::Password);
+                if let Some(handoff) = handoff.as_deref_mut() {
+                    if remaining_methods.contains(&russh::MethodKind::KeyboardInteractive) {
+                        ctx.log(
+                            if password_offered {
+                                "Password rejected. The server also takes keyboard-interactive, which can ask for a code after the password: trying that."
+                            } else {
+                                "The server takes the password through keyboard-interactive: trying that."
+                            },
+                            "info",
+                        );
+                        *handoff = Some(KbiHandoff { password, source, save: source == SecretSource::Prompt && save_typed });
+                        return Ok(false);
+                    }
+                }
                 rejected = true;
             }
         }
@@ -12364,9 +12425,11 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     // current (see ssh_manager::ConnectAttempt).
     attempt: &ssh_manager::ConnectAttempt,
     // The saved password, for a server that asks for it here rather than
-    // through the password method (#145): it answers the server's password
-    // question once, and only that (see is_password_prompt).
-    saved_password: Option<&str>,
+    // through the password method (#145), or the password that method turned
+    // down on a server that asks for a code after it (see KbiHandoff): it
+    // answers the server's password question once, and only that (see
+    // is_password_prompt).
+    saved_password: Option<KbiPassword<'_>>,
     // The saved server this login is for: the server's password question
     // offers "Save password", and a ticked answer is saved there once the
     // login worked (see save_prompted_password).
@@ -12410,7 +12473,8 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     // result once the server has actually asked us something.
     let mut asked_anything = false;
     // Not used yet; taken by its one answer.
-    let mut saved_password = saved_password.filter(|p| !p.is_empty());
+    let mut saved_password = saved_password.filter(|p| !p.value.is_empty());
+    let typed_in_hand = saved_password.is_some_and(|p| p.typed);
     let mut answered_with_saved = false;
     // Rounds the server asked nothing in: a server can go on with them for ever.
     let mut empty_rounds = 0u32;
@@ -12418,6 +12482,14 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     let mut to_save: Option<zeroize::Zeroizing<String>> = None;
     // The user was asked a password question already (secret_policy::kbi_round).
     let mut password_asked = false;
+    // The user's answers to the server's password question. One turned down
+    // is asked for again, up to MAX_SECRET_PROMPTS answers, as the password
+    // method's prompt is.
+    let mut password_answers = 0u32;
+    // The round the server just answered was the user's password.
+    let mut answered_password = false;
+    // The next password question says the last password was rejected.
+    let mut say_rejected = false;
 
     loop {
         match resp {
@@ -12433,13 +12505,19 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
             KeyboardInteractiveAuthResponse::Failure { .. } => {
                 if answered_with_saved {
                     if unasked.is_some() {
-                        log("The saved password was rejected.", "error");
+                        log(if typed_in_hand { "The password was rejected." } else { "The saved password was rejected." }, "error");
                         return Some(Ok(false));
                     }
-                    // The saved password was turned down. Start over and ask
-                    // the user, as without one.
+                    // The password in hand was turned down (so it isn't
+                    // saved). Start over and ask the user, as without one.
                     answered_with_saved = false;
-                    log("The saved password was rejected. Asking for it...", "error");
+                    to_save = None;
+                    say_rejected = true;
+                    secret_policy::kbi_restart(&mut password_asked);
+                    log(
+                        if typed_in_hand { "The password was rejected. Asking for it again..." } else { "The saved password was rejected. Asking for it..." },
+                        "error",
+                    );
                     resp = match session
                         .authenticate_keyboard_interactive_start(user.to_string(), None)
                         .await
@@ -12452,6 +12530,27 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
                 if !asked_anything {
                     // Server declined the method outright — not really offered.
                     return None;
+                }
+                if answered_password {
+                    if password_answers < MAX_SECRET_PROMPTS {
+                        // A mistyped password: start over and ask again.
+                        answered_password = false;
+                        to_save = None;
+                        *typed_password = None;
+                        say_rejected = true;
+                        secret_policy::kbi_restart(&mut password_asked);
+                        log("The password was rejected. Asking for it again...", "error");
+                        resp = match session
+                            .authenticate_keyboard_interactive_start(user.to_string(), None)
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => return Some(Err(e)),
+                        };
+                        continue;
+                    }
+                    log("Password rejected by server.", "error");
+                    return Some(Ok(false));
                 }
                 log("Verification code rejected by server.", "error");
                 return Some(Ok(false));
@@ -12479,16 +12578,28 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
                     continue;
                 }
                 // The server's own password question (PAM's "Password:"),
-                // asked here because it doesn't take the password method:
-                // the saved password answers it, as the password method
-                // would have sent it. Only once, so a wrong one ends up with
-                // the user, and never a code or anything else.
-                if prompts.len() == 1 && is_password_prompt(&prompts[0].prompt, prompts[0].echo) {
+                // asked here because it doesn't take the password method, or
+                // as the step before a code: the password in hand answers it,
+                // as the password method would have sent it. Only once, so a
+                // wrong one ends up with the user, and never a code or
+                // anything else.
+                let lone_password = prompts.len() == 1 && is_password_prompt(&prompts[0].prompt, prompts[0].echo);
+                if lone_password {
                     if let Some(password) = saved_password.take() {
-                        log("Answering the server's password prompt with the saved password...", "info");
+                        log(
+                            if password.typed {
+                                "Answering the server's password prompt with the password typed before..."
+                            } else {
+                                "Answering the server's password prompt with the saved password..."
+                            },
+                            "info",
+                        );
                         answered_with_saved = true;
+                        if secret_policy::kbi_round(true, &mut password_asked).0 && password.save {
+                            to_save = Some(zeroize::Zeroizing::new(password.value.to_string()));
+                        }
                         resp = match session
-                            .authenticate_keyboard_interactive_respond(vec![password.to_string()])
+                            .authenticate_keyboard_interactive_respond(vec![password.value.to_string()])
                             .await
                         {
                             Ok(r) => r,
@@ -12525,12 +12636,20 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
                     .map(|p| serde_json::json!({ "prompt": p.prompt, "echo": p.echo }))
                     .collect();
                 // Only the server's own password question offers the tick: never a code.
-                let password_like = prompts.len() == 1 && is_password_prompt(&prompts[0].prompt, prompts[0].echo);
-                let (offer, forget) = secret_policy::kbi_round(password_like, &mut password_asked);
+                let (offer, forget) = secret_policy::kbi_round(lone_password, &mut password_asked);
                 let password_question = save_to.is_some() && offer;
                 if forget {
                     to_save = None;
                 }
+                // After a rejected password, the question says so, as the
+                // password method's prompt does.
+                let instructions = if say_rejected && lone_password {
+                    say_rejected = false;
+                    let note = "The password was rejected. Please try again.";
+                    if instructions.trim().is_empty() { note.to_string() } else { format!("{note}\n{instructions}") }
+                } else {
+                    instructions
+                };
                 let mut payload = serde_json::json!({
                     "nonce": nonce,
                     "name": name,
@@ -12578,7 +12697,9 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
                         None
                     };
                 }
-                if prompts.len() == 1 && is_password_prompt(&prompts[0].prompt, prompts[0].echo) && !answers[0].is_empty() {
+                answered_password = lone_password && !answers[0].is_empty();
+                if answered_password {
+                    password_answers += 1;
                     *typed_password = Some(Zeroizing::new(answers[0].clone()));
                 }
 
@@ -14066,6 +14187,9 @@ async fn login_hop(
     // (#145). On a connection that can't ask (see `allow_prompt`) it's all
     // keyboard-interactive may send: a code it asks for ends the login there.
     let kbi_password = password.clone().map(Zeroizing::new);
+    // The password the password method turned down on a jump host that takes
+    // keyboard-interactive too (see KbiHandoff).
+    let mut handoff: Option<KbiHandoff> = None;
     let kbi_unasked = std::sync::atomic::AtomicBool::new(false);
     // The whole login has a deadline, as the monitor's has: a jump host that
     // took the connection and stops answering would otherwise hold this
@@ -14100,6 +14224,7 @@ async fn login_hop(
                 password.map(Zeroizing::new),
                 SecretSlot::JumpPassword,
                 &prompt_ctx,
+                Some(&mut handoff),
             )
             .await
         };
@@ -14112,6 +14237,10 @@ async fn login_hop(
         {
             // Within the login's deadline, and ended by the tab closing.
             let save_offer = prompt_ctx.save_offer().await;
+            let mut typed_password = None;
+            let in_hand = handoff.as_ref().map(KbiHandoff::answer).or_else(|| {
+                kbi_password.as_ref().map(|p| KbiPassword { value: p.as_str(), typed: false, save: false })
+            });
             if let Some(kbi_res) = prompt_ctx
                 .login_step(run_keyboard_interactive(
                     &mut session,
@@ -14121,15 +14250,23 @@ async fn login_hop(
                     &jump_nonce,
                     ctx.kbi_txs,
                     ctx.attempt,
-                    kbi_password.as_ref().map(|p| p.as_str()),
+                    in_hand,
                     save_offer,
                     (!ctx.allow_prompt).then_some(&kbi_unasked),
-                    &mut None,
+                    &mut typed_password,
                 ))
                 .await
                 .unwrap_or(Some(Err(russh::Error::ConnectionTimeout)))
             {
                 auth_res = kbi_res;
+            }
+            // Kept for reconnects once it worked, as the password method keeps a
+            // typed one: a code is still asked each time.
+            if matches!(auth_res, Ok(true)) {
+                let keep = typed_password.or_else(|| handoff.take().filter(|h| h.source != SecretSource::Given).map(|h| h.password));
+                if let Some(keep) = keep {
+                    cache_store_secret(ctx.cache, &base_id, SecretSlot::JumpPassword, keep).await;
+                }
             }
         }
         auth_res
@@ -15066,6 +15203,9 @@ async fn initiate_connection(
                 if kbi_password_only && kbi_password.is_none() {
                     kbi_password = cache_get_secret(&prompted_secrets_clone, &base_id, SecretSlot::Password).await;
                 }
+                // The password the password method turned down on a server
+                // that takes keyboard-interactive too (see KbiHandoff).
+                let mut handoff: Option<KbiHandoff> = None;
 
                 let mut auth_res = if login_cancelled {
                     // "Login as" was cancelled — nothing to try. The prompt set
@@ -15104,6 +15244,8 @@ async fn initiate_connection(
                             password.map(Zeroizing::new),
                             SecretSlot::Password,
                             &prompt_ctx,
+                            // Only when keyboard-interactive runs below.
+                            (allow_kbi || kbi_password_only).then_some(&mut handoff),
                         ))
                         .await
                         .unwrap_or(Err(russh::Error::ConnectionTimeout))
@@ -15131,6 +15273,11 @@ async fn initiate_connection(
                     // Within the login's deadline, and ended by the tab
                     // closing, as the other login steps are.
                     let save_offer = prompt_ctx.save_offer().await;
+                    // The password the password method turned down, else the
+                    // saved one.
+                    let in_hand = handoff.as_ref().map(KbiHandoff::answer).or_else(|| {
+                        kbi_password.as_ref().map(|p| KbiPassword { value: p.as_str(), typed: false, save: false })
+                    });
                     if let Some(kbi_res) = prompt_ctx
                         .login_step(run_keyboard_interactive(
                             &mut session,
@@ -15140,7 +15287,7 @@ async fn initiate_connection(
                             &connect_nonce,
                             &kbi_txs_clone,
                             &attempt,
-                            kbi_password.as_ref().map(|p| p.as_str()),
+                            in_hand,
                             save_offer,
                             (!allow_kbi).then_some(&kbi_unasked),
                             &mut typed_password,
@@ -15152,8 +15299,12 @@ async fn initiate_connection(
                     }
                     // Kept for the tab once it worked, like a password typed
                     // for the password method: a terminal's own login uses it.
-                    if let (Some(typed), Ok(true)) = (typed_password, &auth_res) {
-                        cache_store_secret(&prompted_secrets_clone, &base_id, SecretSlot::Password, typed).await;
+                    // So is one handed over that wasn't the saved one.
+                    if matches!(auth_res, Ok(true)) {
+                        let keep = typed_password.or_else(|| handoff.take().filter(|h| h.source != SecretSource::Given).map(|h| h.password));
+                        if let Some(keep) = keep {
+                            cache_store_secret(&prompted_secrets_clone, &base_id, SecretSlot::Password, keep).await;
+                        }
                     }
                 }
                 release_agent(&prompt_ctx).await;
@@ -16684,10 +16835,13 @@ async fn start_mirror(
     mirrors: tauri::State<'_, MirrorMap>,
     session_id: String,
     mut spec: mirror::MirrorSpec,
+    // The first sync alone, with no watcher after it.
+    once: Option<bool>,
 ) -> Result<String, String> {
-    spec.local = guard_mirror_folder(&spec.local)?;
+    let asked_local = spec.local.clone();
+    spec.local = guard_mirror_folder(&asked_local)?;
     let files = mirror_files(&ssh, &session_id).await?;
-    mirror::start(app, session_id, files, Arc::clone(&mirrors), spec).await
+    mirror::start(app, session_id, files, Arc::clone(&mirrors), spec, asked_local, once.unwrap_or(false)).await
 }
 
 #[tauri::command]
@@ -17643,6 +17797,10 @@ async fn rdp_builtin_open(
         if keyboard_layout != 0 {
             log(&format!("Keyboard layout told to the server: {keyboard_layout:08X}, this computer's default."), "info");
         }
+        // With the clipboard shared, files go through it too (on a computer:
+        // a phone's clipboard holds none); the server's come to a folder of
+        // this run's own.
+        let files_dir = session_rdpclip_dir(&session_id, generation).ok().filter(|_| cfg!(desktop) && clipboard == Some(true));
         let login = rdp_client::Login {
             host: host.clone(),
             username: login_user,
@@ -17653,6 +17811,7 @@ async fn rdp_builtin_open(
             allow_no_nla: allow_no_nla.unwrap_or(false),
             graphics,
             clipboard: clipboard.unwrap_or(false),
+            files_dir: files_dir.clone(),
             drive,
             keyboard_layout,
         };
@@ -17714,6 +17873,32 @@ async fn rdp_builtin_open(
                 }
             }
         };
+        // What becomes of the files the user copied on the server, for the
+        // tab. The ones here wait in rdp_files.rs for the tab to put them on
+        // this computer's clipboard (`rdp_builtin_files_to_clipboard`).
+        let remote_files = {
+            let (app, attempt, sid) = (app.clone(), attempt.clone(), session_id.clone());
+            move |note: rdp_files::Note| {
+                if !attempt.is_current_now() {
+                    return;
+                }
+                let said = match note {
+                    rdp_files::Note::Copied { set, files, bytes, offered } => {
+                        serde_json::json!({"kind": "copied", "set": set, "files": files, "bytes": bytes, "offered": offered})
+                    }
+                    rdp_files::Note::Progress { set, done, total } => serde_json::json!({"kind": "progress", "set": set, "done": done, "total": total}),
+                    rdp_files::Note::Ready { set, dir, top, files, bytes } => {
+                        rdp_files::ready(&sid, rdp_files::Ready { generation, set, dir, top });
+                        serde_json::json!({"kind": "ready", "set": set, "files": files, "bytes": bytes})
+                    }
+                    rdp_files::Note::Cleared { set } => {
+                        rdp_files::outdated(&sid, set);
+                        serde_json::json!({"kind": "cleared", "set": set})
+                    }
+                };
+                let _ = app.emit(&format!("rdp-files-{sid}"), said);
+            }
+        };
         // How the link is doing, for the tab's connection mark.
         let link = {
             let (app, attempt, sid) = (app.clone(), attempt.clone(), session_id.clone());
@@ -17723,7 +17908,20 @@ async fn rdp_builtin_open(
                 }
             }
         };
-        let run = tauri::async_runtime::spawn(rdp_client::run(stream, client_addr, login, verify, connected, notice, frame, remote_copy, link, flow, rx));
+        let run = tauri::async_runtime::spawn(rdp_client::run(
+            stream,
+            client_addr,
+            login,
+            verify,
+            connected,
+            notice,
+            frame,
+            remote_copy,
+            remote_files,
+            link,
+            flow,
+            rx,
+        ));
         let outcome = match run.await {
             Ok(r) => r,
             Err(_) => Err("The RDP session stopped on bad data from the server".into()),
@@ -17736,6 +17934,10 @@ async fn rdp_builtin_open(
         }
         drop(route);
         forget_screen_client(&clients, &session_id, generation).await;
+        // The server's files this run brought go, but a set on the clipboard.
+        if let Some(dir) = &files_dir {
+            rdp_files::ended(&session_id, generation, dir);
+        }
         if !attempt.is_current_now() {
             return;
         }
@@ -17781,6 +17983,79 @@ async fn rdp_builtin_paste(rdp_clients: tauri::State<'_, RdpClients>, session_id
         let _ = tx.send(rdp_client::Cmd::Paste(text, keys));
     }
     Ok(())
+}
+
+/// The files copied on this computer for the server's clipboard (the tab's
+/// paste, as with text), then the paste key the tab held back. False when no
+/// files are copied here: the tab sends the text instead.
+#[tauri::command]
+async fn rdp_builtin_paste_files(
+    app: tauri::AppHandle,
+    rdp_clients: tauri::State<'_, RdpClients>,
+    session_id: String,
+    keys: rdp_client::PasteKeys,
+) -> Result<bool, String> {
+    use tauri::Emitter;
+    let paths = file_clipboard::read(&app).await?;
+    if paths.is_empty() {
+        return Ok(false);
+    }
+    let walked = tokio::task::spawn_blocking(move || rdp_files::walk(&paths)).await.map_err(|e| e.to_string())??;
+    if walked.list.is_empty() {
+        return Err("None of the copied files can go to the server: they can't be read, or their names are too long or not allowed there.".into());
+    }
+    if walked.left_out > 0 {
+        let msg = format!(
+            "Left out of the paste: {} of the copied files and folders (they can't be read, or their names are too long or not allowed on the server).",
+            walked.left_out
+        );
+        let _ = app.emit(&format!("session-log-{session_id}"), serde_json::json!({"msg": msg, "type": "warning"}));
+    }
+    if let Some((_, tx)) = rdp_clients.lock().await.get(&session_id) {
+        let _ = tx.send(rdp_client::Cmd::PasteFiles(walked.list, std::sync::Arc::new(walked.files), keys));
+    }
+    Ok(true)
+}
+
+/// Bring the files the server copied (that set) here: the user asked, as they
+/// were too many bytes to come on their own.
+#[tauri::command]
+async fn rdp_builtin_fetch_files(rdp_clients: tauri::State<'_, RdpClients>, session_id: String, set: u64) -> Result<(), String> {
+    if let Some((_, tx)) = rdp_clients.lock().await.get(&session_id) {
+        let _ = tx.send(rdp_client::Cmd::FetchFiles(set));
+    }
+    Ok(())
+}
+
+/// Stop bringing the server's files (that set), or let them go once here:
+/// unless they are on this computer's clipboard, they are deleted.
+#[tauri::command]
+async fn rdp_builtin_stop_files(rdp_clients: tauri::State<'_, RdpClients>, session_id: String, set: u64) -> Result<(), String> {
+    if let Some((_, tx)) = rdp_clients.lock().await.get(&session_id) {
+        let _ = tx.send(rdp_client::Cmd::StopFiles(set));
+    }
+    Ok(())
+}
+
+/// A mark that changes whenever anything goes on this computer's clipboard
+/// (none where that can't be told). The tab takes it when the user copies
+/// files on the server, to tell later whether anything else was copied since.
+#[tauri::command]
+async fn rdp_builtin_files_mark(app: tauri::AppHandle) -> Result<Option<u64>, String> {
+    Ok(file_clipboard::change_mark(&app).await)
+}
+
+/// The server's files (that set, here now) on this computer's clipboard; when
+/// `mark` is given, only if nothing else was copied since it was taken. True
+/// when they went there.
+#[tauri::command]
+async fn rdp_builtin_files_to_clipboard(app: tauri::AppHandle, session_id: String, set: u64, mark: Option<u64>) -> Result<bool, String> {
+    if mark.is_some() && file_clipboard::change_mark(&app).await != mark {
+        return Ok(false);
+    }
+    let top = rdp_files::claim(&session_id, set).ok_or("These files are no longer here.")?;
+    file_clipboard::write(&app, top).await?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -18594,10 +18869,12 @@ async fn telnet_open_terminal(
     terminal_id: String,
     cols: u32,
     rows: u32,
+    session_log: Option<session_log::Request>,
     on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Result<(), String> {
     use crate::ssh_manager::{PtySize, TerminalCommand};
     let conn = telnet_pending.lock().await.remove(&session_id).ok_or("Not connected")?;
+    let log = start_session_log(&app, &terminal_id, session_log);
     let (tx, rx) = tokio::sync::mpsc::channel::<TerminalCommand>(32);
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(PtySize { cols, rows });
     // What the page has drawn: what it hasn't stays bounded (ssh_manager::Outflow).
@@ -18609,7 +18886,7 @@ async fn telnet_open_terminal(
     state.resize_txs.lock().await.insert(terminal_id.clone(), resize_tx);
     // The output goes to the page's channel, paced like an SSH terminal's
     // (term_output.rs).
-    tauri::async_runtime::spawn(telnet::run_pump(app, session_id, terminal_id, page, conn, on_output, rx, resize_rx));
+    tauri::async_runtime::spawn(telnet::run_pump(app, session_id, terminal_id, page, conn, log, on_output, rx, resize_rx));
     Ok(())
 }
 
@@ -19216,10 +19493,9 @@ async fn server_runs_login_shell(session_arc: &SessionHandleArc, shell: &str) ->
     )
 }
 
-// A command's arguments are what the page sends; there's no struct to group.
-#[allow(clippy::too_many_arguments)]
 #[tauri::command]
-async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>, session_id: String, terminal_id: String, cols: u32, rows: u32, use_local_shell: bool, on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>, session_id: String, terminal_id: String, cols: u32, rows: u32, use_local_shell: bool, session_log: Option<session_log::Request>, on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) -> Result<(), String> {
     use std::sync::Arc;
     use crate::ssh_manager::TerminalCommand;
 
@@ -19288,10 +19564,12 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
     // backpressure) live in ssh_manager::run_pty_pump — shared with the
     // docker exec terminal. The output goes to the page's channel, paced by
     // what it has drawn (ssh_manager::Outflow, term_output.rs).
+    let log = start_session_log(&app, &terminal_id, session_log);
     tauri::async_runtime::spawn(crate::ssh_manager::run_pty_pump(
         app.clone(),
         terminal_id.clone(),
         channel,
+        log,
         rx,
         resize_rx,
         on_output,
@@ -19299,6 +19577,51 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
     ));
 
     Ok(())
+}
+
+/// Starts a terminal's session log (session_log.rs) as the page asked: nothing
+/// for `None` or mode "off". `&H` and `&P` are the server's host and port in
+/// the profile. Whether the file opened, or why not, goes to the page as
+/// `terminal-log-{id}` (`path` or `error`); the terminal opens either way.
+pub(crate) fn start_session_log(app: &tauri::AppHandle, terminal_id: &str, req: Option<session_log::Request>) -> Option<session_log::SessionLog> {
+    use tauri::Emitter;
+    let req = req?;
+    let (host, port) = if req.server_id > 0 { server_host_port(&app.state::<DbState>(), req.server_id) } else { (String::new(), 0) };
+    let topic = format!("terminal-log-{}", terminal_id);
+    match session_log::target(&req, &host, port, chrono::Local::now()) {
+        Ok(None) => None,
+        Err(error) => {
+            let _ = app.emit(&topic, json!({ "error": error }));
+            None
+        }
+        Ok(Some(target)) => {
+            let app = app.clone();
+            Some(session_log::SessionLog::start(target, move |event| {
+                let payload = match event {
+                    session_log::Event::Opened(path) => json!({ "path": path.display().to_string() }),
+                    session_log::Event::Failed(error) => json!({ "error": error }),
+                };
+                let _ = app.emit(&topic, payload);
+            }))
+        }
+    }
+}
+
+/// A server's host and port in the open profile; empty and 0 if it isn't there.
+fn server_host_port(db: &DbState, server_id: i32) -> (String, u16) {
+    let Ok(guard) = db.conn.lock() else { return (String::new(), 0) };
+    let Some(conn) = guard.as_ref() else { return (String::new(), 0) };
+    conn.query_row("SELECT host, port FROM servers WHERE id = ?1", rusqlite::params![server_id], |row| {
+        Ok((row.get::<_, Option<String>>(0)?.unwrap_or_default(), row.get::<_, Option<i64>>(1)?.unwrap_or(0)))
+    })
+    .map(|(host, port)| (host, u16::try_from(port).unwrap_or(0)))
+    .unwrap_or((String::new(), 0))
+}
+
+/// The folder session logs go to when Settings names none (session_log.rs).
+#[tauri::command]
+fn session_log_default_folder() -> Option<String> {
+    session_log::default_folder().map(|p| p.display().to_string())
 }
 
 #[tauri::command]
@@ -23572,6 +23895,13 @@ fn session_drag_dir(session_id: &str) -> Result<std::path::PathBuf, String> {
     Ok(app_temp_root().join(format!("drag_{}", session_temp_name(session_id)?)))
 }
 
+/// A built-in RDP session run's dir for the files copied on the server
+/// (rdp_files.rs), under the unpredictable root. Generations only go up, so
+/// each run has its own.
+fn session_rdpclip_dir(session_id: &str, generation: u64) -> Result<std::path::PathBuf, String> {
+    Ok(app_temp_root().join(format!("rdpclip_{}_{generation}", session_temp_name(session_id)?)))
+}
+
 /// A session's part of its temp dirs' names: the session id as the frontend
 /// makes it (`session-<id>`, `session-quick-<ms>`, plus `::sftp` / `::fwd`
 /// for the dedicated connections), `::` spelled `__` since `:` can't be in a
@@ -25004,7 +25334,8 @@ fn guard_mirror_folder(local: &str) -> Result<String, String> {
     if !folder.is_dir() {
         return Err(format!("[MIRROR] The local folder isn't a folder: {local}"));
     }
-    Ok(folder.to_string_lossy().into_owned())
+    // It shows in the mirror's log: without `\\?\` in front where Windows allows.
+    Ok(display_path(&folder))
 }
 
 /// The system folders `check_local_path_policy` refuses, as lowercase paths
@@ -26250,21 +26581,32 @@ async fn monitor_resume_all(
     jump_gone::resume_skipped(&db_state, skipped)
 }
 
-/// The clipboard's text, for a paste. The Linux and Android frontends ask;
-/// the others read it in the page.
+/// The clipboard's text, for a paste. The Windows, Linux and Android
+/// frontends ask; macOS and iOS read it in the page (WebKit shows its own
+/// Paste button for each read).
 ///
 /// Android's WebView refuses the page's `navigator.clipboard` altogether, so
 /// there the app's own Android plugin reads the system clipboard.
+///
+/// WebView2 on Windows asks the user to allow or block the page's
+/// `navigator.clipboard.readText()`, and after a Block every right-click
+/// paste (and the RDP and VNC tabs' paste) said "Clipboard read denied". So
+/// on Windows the page asks here and the clipboard is read directly.
 ///
 /// WebKitGTK refuses the page's `navigator.clipboard.readText()` (#89). And
 /// where the webview reads the clipboard itself (a keyboard paste, or the
 /// page API once it is allowed), it crashes the whole app when nothing owns
 /// the clipboard (seen with WebKitGTK 2.54). So on Linux the page asks here
 /// and GTK is asked directly. A clipboard that is empty or holds no text
-/// gives an empty string. The fork reads it here on Windows and macOS too
-/// (clipboard_read.rs).
+/// gives an empty string.
+/// The fork reads it here on macOS too (clipboard_read.rs).
 #[tauri::command]
 async fn clipboard_read_text(app: tauri::AppHandle) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        let _ = app;
+        file_clipboard::read_text().await
+    }
     #[cfg(target_os = "linux")]
     {
         let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
@@ -26284,7 +26626,7 @@ async fn clipboard_read_text(app: tauri::AppHandle) -> Result<String, String> {
     {
         android_bridge::clipboard_read(&app).await
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
     {
         let _ = app;
         clipboard_read::read_text().await
@@ -26595,11 +26937,12 @@ pub fn run() {
             add_ssh_key, edit_ssh_key, delete_ssh_key,
             pick_ssh_key_file, read_ssh_key_file, import_ssh_key_file,
             initiate_connection, verify_fingerprint_response, submit_kbi_response, kbi_save_choice, disconnect_session, set_use_ssh_config, set_use_ssh_agent,
-            initiate_rdp, rdp_open_again, rdp_builtin_open, rdp_builtin_input, rdp_builtin_paste, rdp_builtin_resize, rdp_builtin_shown, rdp_builtin_close, rdp_share_drives,
+            initiate_rdp, rdp_open_again, rdp_builtin_open, rdp_builtin_input, rdp_builtin_paste, rdp_builtin_paste_files, rdp_builtin_fetch_files, rdp_builtin_stop_files, rdp_builtin_files_mark,
+            rdp_builtin_files_to_clipboard, rdp_builtin_resize, rdp_builtin_shown, rdp_builtin_close, rdp_share_drives,
             telnet_connect, telnet_open_terminal, ftp_connect, vnc_open, vnc_input, vnc_resize, vnc_paste, vnc_shown, screen_ack,
             start_tunnel, stop_tunnel, list_tunnels, restart_session_tunnels, persist_session_tunnels,
             list_tunnel_rules, remove_tunnel_rule, rename_tunnel_rule,
-            open_terminal, local_shell, write_terminal_data, type_saved_password, terminal_drawn, resize_terminal, close_terminal,
+            open_terminal, session_log_default_folder, local_shell, write_terminal_data, type_saved_password, terminal_drawn, resize_terminal, close_terminal,
             keep_session::keep_session_tab, keep_session::keep_session_open, keep_session::keep_session_state, keep_session::keep_session_list, keep_session::keep_session_end,
             local_term::list_local_shells, local_term::local_shell_set_default, local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
             local_term::local_terminal_open, local_term::local_terminal_write, local_term::local_windows_build, local_term::local_terminal_resize, local_term::local_terminal_close,
@@ -26678,11 +27021,20 @@ pub fn run() {
                 // What is only in memory goes to the vault: the commands typed
                 // since the last save (cmd_history_add doesn't save). With no
                 // profile open there is nothing to save, and this says so.
-                let _ = save_vault_internal(&_app.state::<DbState>());
+                let state = _app.state::<DbState>();
+                let _ = save_vault_internal(&state);
                 // And the assistant's store (chats, settings).
                 ai::save_on_exit();
                 // The decrypted copies this run staged go with it.
                 sweep_app_temp(true);
+                // Nothing writes the profile any more: the next start may open
+                // it now. Left to the end of the process, the lock stayed as
+                // long as a copy to a folder that doesn't answer (#400).
+                if let Ok(mut held) = state.profile_lock.lock() {
+                    held.take();
+                }
+                // The copy the last save started, so it isn't cut off.
+                folder_copy::wait_for_copies(std::time::Duration::from_secs(5));
             }
         });
 }

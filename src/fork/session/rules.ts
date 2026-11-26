@@ -83,7 +83,7 @@ export const termCloseLook = (compactTabs: boolean): { "data-no-tab-drag": boole
  *  buffer, its shell keeps running, and it's never remounted. `group/pane`
  *  shows a pane's "take out of the split" button on hover. */
 export const paneLook = (inSplit: boolean, inView: boolean, isFocused: boolean): { className?: string } => ({
-  className: `group/pane absolute ${inSplit ? 'min-w-0 min-h-0 border' : 'inset-0'} ${
+  className: `theme-dark group/pane absolute ${inSplit ? 'min-w-0 min-h-0 border' : 'inset-0'} ${
     inView ? 'opacity-100 z-10' : 'hidden'
   } ${inSplit ? (isFocused
     ? 'border-primary/40 shadow-[inset_0_0_0_1px_rgba(var(--primary),0.15)]'

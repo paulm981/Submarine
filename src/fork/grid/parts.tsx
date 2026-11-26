@@ -52,7 +52,7 @@ export const CardMenu = ({ menu, close, onOpenServer, onEditServer }: {
           onContextMenu={(e) => { e.preventDefault(); close(); }}
         />
         <div
-          className="fixed z-[9999] w-[200px] py-1 bg-[#15151a] border border-white/10 rounded-lg shadow-2xl text-[11.5px]"
+          className="fixed z-[9999] w-[200px] py-1 bg-shade-15151a border border-white/10 rounded-lg shadow-2xl text-[11.5px]"
           style={{ left: Math.min(menu.x, window.innerWidth - 220), top: Math.min(menu.y, window.innerHeight - 120) }}
         >
           {([

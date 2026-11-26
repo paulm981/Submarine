@@ -78,7 +78,7 @@ async fn terminal(session: &client::Handle<TestClient>, command: &str) -> Term {
             drawer.add(n as u64);
         }
     });
-    let pump = tokio::spawn(pty_pump(channel, rx, resize_rx, page, Vec::new(), move |buf: &mut Vec<u8>| {
+    let pump = tokio::spawn(pty_pump(channel, None, rx, resize_rx, page, Vec::new(), move |buf: &mut Vec<u8>| {
         let _ = out_tx.send(Instant::now());
         let _ = draw_tx.send(buf.len());
         buf.clear();

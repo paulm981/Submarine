@@ -135,9 +135,69 @@ const SOURCES = import.meta.glob<string>("/src/**/*.{ts,tsx}", { query: "?raw", 
 const STYLES = new Set(Object.keys(import.meta.glob("/src/**/*.css")));
 
 /** `src` without its comments: block ones, and those on a line of their own
- *  or after the code (" // …"). */
-const codeOf = (src: string): string =>
-  src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "").replace(/\s\/\/ .*$/gm, "");
+ *  or after the code (" // …"). A string is kept as it is, so a comment's
+ *  marks inside one ("db/*.sql", "https://…") don't start a comment. A
+ *  quoted string ends at its line's end, so an apostrophe in JSX text
+ *  (`Don't`) holds at most the rest of that line; a template literal runs
+ *  to its closing backtick, with the code in its `${…}` read as code. */
+const codeOf = (src: string): string => {
+  let out = "";
+  let i = 0;
+  let lineHasCode = false;
+  // For each template literal whose `${…}` is open: the brace depth at its `${`.
+  const open: number[] = [];
+  let depth = 0;
+  // A template literal's text from `i`: to its closing backtick, or into a `${`.
+  const template = () => {
+    while (i < src.length) {
+      const c = src[i];
+      if (c === "\\") { out += src.slice(i, i + 2); i += 2; continue; }
+      if (c === "`") { out += c; i++; return; }
+      if (c === "$" && src[i + 1] === "{") { out += "${"; i += 2; open.push(depth); depth++; return; }
+      out += c;
+      i++;
+    }
+  };
+  while (i < src.length) {
+    const c = src[i];
+    const next = src[i + 1];
+    if (c === "/" && next === "*") {
+      const end = src.indexOf("*/", i + 2);
+      i = end < 0 ? src.length : end + 2;
+      continue;
+    }
+    if (c === "/" && next === "/" && (!lineHasCode || (/\s/.test(src[i - 1] ?? "") && src[i + 2] === " "))) {
+      const end = src.indexOf("\n", i);
+      i = end < 0 ? src.length : end;
+      continue;
+    }
+    if (c === "\n") lineHasCode = false;
+    else if (!/\s/.test(c)) lineHasCode = true;
+    if (c === '"' || c === "'") {
+      let j = i + 1;
+      while (j < src.length && src[j] !== c && src[j] !== "\n") j += src[j] === "\\" ? 2 : 1;
+      if (src[j] === c) j++;
+      out += src.slice(i, j);
+      i = j;
+      continue;
+    }
+    if (c === "`") { out += c; i++; template(); continue; }
+    if (c === "{") depth++;
+    if (c === "}") {
+      depth--;
+      if (open.length > 0 && open[open.length - 1] === depth) {
+        open.pop();
+        out += c;
+        i++;
+        template();
+        continue;
+      }
+    }
+    out += c;
+    i++;
+  }
+  return out;
+};
 
 /** The modules `src` imports (`import … from`, `import "…"`, `import("…")`,
  *  `export … from`), leaving out comments. */
@@ -171,4 +231,37 @@ describe("the fork's hooks in the original project's files", () => {
       expect(used.filter((u) => !uses(src, u)), `fork hooks ${file} no longer has`).toEqual([]);
     });
   }
+});
+
+describe("codeOf, the comment stripper", () => {
+  it("keeps a string with a comment's marks in it, and the code after it", () => {
+    // The original project's mirror help text (#416) has "db/*.sql" in it.
+    const src = 'const help = t("With a / it starts at the folder (db/*.sql).");\nconst jumpRowRef = Fork.useFocusJump(isOpen);\nconst u = "https://example.com"; // a comment\n';
+    const code = codeOf(src);
+    expect(code).toContain('"With a / it starts at the folder (db/*.sql)."');
+    expect(code).toContain("Fork.useFocusJump(isOpen)");
+    expect(code).toContain('"https://example.com"');
+    expect(code).not.toContain("a comment");
+  });
+  it("still drops comments: block, on a line of their own, and after the code", () => {
+    const src = "/* Fork.gone(1) */\n  // Fork.gone(2)\nkeep(); // Fork.gone(3)\n/*\n Fork.gone(4)\n*/ after();\n";
+    const code = codeOf(src);
+    expect(code).not.toContain("Fork.gone");
+    expect(code).toContain("keep();");
+    expect(code).toContain("after();");
+  });
+  it("reads a template literal's ${…} as code, and its text as text", () => {
+    const src = "const a = `/* text ${Fork.kept(x) /* gone */} more */`; Fork.after();\nconst b = `x ${ { y: 1 }.y } // text`;\n";
+    const code = codeOf(src);
+    expect(code).toContain("`/* text ${Fork.kept(x) } more */`");
+    expect(code).not.toContain("gone");
+    expect(code).toContain("Fork.after();");
+    expect(code).toContain("// text`");
+  });
+  it("lets an apostrophe in JSX text hold only the rest of its line", () => {
+    const src = "<p>Don't /* a */ do it</p>\n/* Fork.gone() */ Fork.kept();\n";
+    const code = codeOf(src);
+    expect(code).not.toContain("Fork.gone");
+    expect(code).toContain("Fork.kept();");
+  });
 });

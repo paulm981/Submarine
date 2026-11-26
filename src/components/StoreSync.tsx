@@ -270,7 +270,7 @@ export function StoreRestoreModal({
         role="dialog"
         aria-modal="true"
         aria-label="Get a profile from your storage"
-        className="w-full max-w-md max-h-[90vh] flex flex-col bg-[#121214] border border-white/10 rounded-xl shadow-2xl"
+        className="w-full max-w-md max-h-[90vh] flex flex-col bg-shade-121214 border border-white/10 rounded-xl shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="shrink-0 px-4 py-3 border-b border-white/5 flex items-center justify-between">

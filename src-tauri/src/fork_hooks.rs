@@ -20,7 +20,7 @@
 /// more than one, the one at the top level of the file: a test's helper of
 /// the same name (the original project's `fn run` in a test module, #387)
 /// doesn't stand in for the app's own.
-fn body_of<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn body_of<'a>(src: &'a str, name: &str) -> Option<&'a str> {
     let mut first = None;
     let mut rest = src;
     while let Some((body, indented, after)) = next_body(rest, name) {

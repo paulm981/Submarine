@@ -704,7 +704,7 @@ export const SessionTree = ({
               }
             }}
             placeholder="Find a session or folder…"
-            className="w-full h-7 bg-[#1c1c21] border border-white/10 rounded-md pl-7 pr-2 text-[12px] text-zinc-100 outline-none focus:border-primary/50 placeholder:text-zinc-600"
+            className="w-full h-7 bg-shade-1c1c21 border border-white/10 rounded-md pl-7 pr-2 text-[12px] text-zinc-100 outline-none focus:border-primary/50 placeholder:text-zinc-600"
           />
         </div>
         {pickedCount > 1 && (
@@ -824,7 +824,7 @@ export const SessionTree = ({
       </div>
 
       {undo && (
-        <div className="shrink-0 m-2 mb-0 px-2.5 py-1.5 bg-[#15151a] border border-white/10 rounded-md text-zinc-300 text-[11px] flex items-center gap-2">
+        <div className="shrink-0 m-2 mb-0 px-2.5 py-1.5 bg-shade-15151a border border-white/10 rounded-md text-zinc-300 text-[11px] flex items-center gap-2">
           <span className="flex-1 truncate" title={undo.text}>{undo.text}</span>
           <button onClick={undoMove} className="shrink-0 px-2 h-6 rounded text-[10.5px] font-bold uppercase tracking-wider text-primary hover:bg-primary/15">Undo</button>
           <button onClick={() => setUndo(null)} className="shrink-0 text-zinc-500 hover:text-white"><X size={12} /></button>
@@ -841,7 +841,7 @@ export const SessionTree = ({
       {/* What a drag carries, and where it would land. */}
       {drag && createPortal(
         <div
-          className="fixed z-[9999] pointer-events-none px-2 py-1 rounded-md bg-[#15151a] border border-primary/40 text-[11px] text-zinc-100 shadow-2xl flex items-center gap-1.5"
+          className="fixed z-[9999] pointer-events-none px-2 py-1 rounded-md bg-shade-15151a border border-primary/40 text-[11px] text-zinc-100 shadow-2xl flex items-center gap-1.5"
           style={{ left: drag.x + 14, top: drag.y + 10 }}
         >
           <FolderInput size={12} className="text-primary" />
@@ -863,7 +863,7 @@ export const SessionTree = ({
           onContextMenu={(e) => { e.preventDefault(); setMenu(null); }}
         />
         <div
-          className="fixed z-[9999] w-[250px] py-1 bg-[#15151a] border border-white/10 rounded-lg shadow-2xl text-[11.5px]"
+          className="fixed z-[9999] w-[250px] py-1 bg-shade-15151a border border-white/10 rounded-lg shadow-2xl text-[11.5px]"
           style={{ left: Math.min(menu.x, window.innerWidth - 270), top: Math.min(menu.y, window.innerHeight - 360) }}
         >
           {menu.row === null ? (

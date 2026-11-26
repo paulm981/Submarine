@@ -238,7 +238,7 @@ const Menu = ({ x, y, word, path, sessionId, server, paste, close }: MenuProps) 
     : "Its folder isn't known: the shell hasn't said where it is, or it's on another host";
   return (
     <div data-file-menu role="menu" style={{ left, top }}
-      className="fixed z-[200] w-[250px] p-1 rounded-lg border border-white/10 bg-[#15151a] shadow-2xl">
+      className="fixed z-[200] w-[250px] p-1 rounded-lg border border-white/10 bg-shade-15151a shadow-2xl">
       <div className="px-2.5 pt-1 pb-1.5 text-[10.5px] font-mono text-zinc-500 truncate" title={path ?? word}>{path ?? word}</div>
       <button role="menuitem" className={item} onClick={() => { close(); paste(); }}>
         <ClipboardPaste size={12} className="text-zinc-400" /> Paste
