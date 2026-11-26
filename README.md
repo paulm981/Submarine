@@ -103,7 +103,7 @@
 - **Syntax highlighting**: errors, warnings, OK, addresses, links and dates colored in the output, with sets for shell scripts, network devices and SQL, a set per server, and rules of your own that sync with the profile.
 - **Fast output never freezes the window**: output is paced by what the screen has drawn, and floods of escape sequences that would lock it up are ignored.
 - **A Home view** of terminals on your own computer: PowerShell, Command Prompt, Git Bash and each WSL distribution by name on Windows (the default one marked); the login shell and every other installed shell on macOS and Linux.
-- The app's own dark right-click menus everywhere, and no right-click or F5 that reloads the app.
+- The app's own right-click menus everywhere, dark or light with the rest of the app, and no right-click or F5 that reloads the app.
 
 **Settings in categories**
 - Tabs across the top: General, Terminal, Servers & sessions, AI tools, Sync and Help. Settings opens on the one you used last. Each setting says what it does in one line, with the longer explanation behind **Learn more**.
@@ -298,6 +298,7 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 - **Change any shortcut** in Settings → Keyboard shortcuts, even keys the shell uses: Ctrl+C can be Copy, as in Windows Terminal (with a selection it copies; without one it still stops the program)
 - **Text size** — pinch a terminal, or Ctrl + wheel over it (⌘ + wheel on a Mac), or use the − and + keys on a phone's key bar; it's the size in Settings, so every terminal follows
 - **Color schemes** — Submarine's own plus Campbell, One Half, Solarized, Dracula, Nord, Tokyo Night, Catppuccin and Gruvbox (Settings › Terminal, with a live preview). A server can have **its own**, which syncs with it — e.g. a light scheme for production; a separate **interface font** for menus and panels (Settings › General)
+- **A light look** — pick a light background in Settings › General (or the Snow, Paper and Silver presets) and the whole interface turns light: tabs, panels, menus, dialogs and the session tree. Terminals and remote desktops keep their own colors, and so does what's drawn over a terminal
 - **Keep text readable** — text a program colors too close to the background is lifted to a 4.5:1 contrast, as in VS Code
 - **Syntax highlighting** — words and addresses colored in what the terminal shows (Settings › Terminal › Highlighting, with a live preview and a box to paste your own output into):
   - **Standard** (the default): errors and failures in red, warnings in yellow, OK and success in green, IP and MAC addresses, links, dates and times, and "Last login"
@@ -315,7 +316,7 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 ### SFTP file browser
 
 - Dual-pane (local on top, remote on bottom) with drag-and-drop between them
-- **Right-click the empty space** in a list for Refresh, New Folder, Select all and Copy folder path. Every right-click menu is the app's own, dark like the rest: text fields get Cut / Copy / Paste / Select all, selected text gets Copy, and the webview's menu (whose Reload would restart the whole app) never shows. F5 / Ctrl+R don't reload the app either
+- **Right-click the empty space** in a list for Refresh, New Folder, Select all and Copy folder path. Every right-click menu is the app's own, in the same look as the rest: text fields get Cut / Copy / Paste / Select all, selected text gets Copy, and the webview's menu (whose Reload would restart the whole app) never shows. F5 / Ctrl+R don't reload the app either
 - **Tabs or Split layout** — toggle between stacked tabs (one pane visible, more screen real-estate) and the classic split, persisted per device
 - **Per-pane filter input** — type to filter the listing live with an N/M counter, Esc to clear
 - **Multi-select with Ctrl/Shift-click** plus **Select-All button and Ctrl+A** for bulk download, move, or delete
@@ -340,7 +341,9 @@ Pick a local folder, pick a remote folder, and Submarine keeps them in sync.
 
 - **Two-way initial sync** that compares size and content hash, not just timestamps
 - **Live watcher** — every save, create, rename or delete on the local folder reaches the server
-- **Conflict resolution per mirror**: **Local wins** (default), **Remote wins** or **Newer wins**; **excludes** such as `node_modules` and `*.log`
+- **Conflict resolution per mirror**: **Local wins** (default), **Remote wins** or **Newer wins**
+- **Only some files**: **Only these** and **Skip these** patterns, such as `*.sql`, `db/`, `backups/**/*.sql` or a word anywhere in the path (up to 100 in each list); a skipped folder removed on your computer stays on the server
+- **One way, or once**: copy both ways, only up to the server, or only down from it (down runs once and never writes to the server); any mirror can **run once**, copying what the preview lists and stopping
 - **Soft delete** — removed files move to `.submarine-trash/` on the server
 - A mirrored folder that goes away deletes nothing on the server, and a dry-run preview calls out what would be overwritten before each start
 
