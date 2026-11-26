@@ -832,6 +832,7 @@ where
     // can freeze the page (term_filter.rs).
     let mut limiter = crate::term_filter::CsiLimiter::default();
     if !early.is_empty() {
+        if let Some(log) = log.as_mut() { log.write(&early) } // fork: logged too (session_log_policy.rs)
         limiter.filter(&early, &mut out_buf);
         flush(&mut out_buf);
     }

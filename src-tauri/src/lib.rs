@@ -54,6 +54,7 @@ mod file_clipboard;
 mod rdp_share;
 mod term_filter;
 mod session_log;
+mod session_log_policy;
 mod vault_backup;
 mod folder_copy;
 mod ai;

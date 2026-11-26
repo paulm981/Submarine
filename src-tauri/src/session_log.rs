@@ -120,6 +120,7 @@ pub fn target(req: &Request, host: &str, port: u16, now: chrono::DateTime<chrono
     };
     let name = if req.server_name.trim().is_empty() { host } else { req.server_name.trim() };
     let path = folder.join(file_name(pattern, name, host, port, now));
+    crate::session_log_policy::check_name(&folder, &path)?;
     let header = format!(
         "=== Submarine session log: {}, {} ===\n",
         if name.is_empty() { "terminal" } else { name },
@@ -240,9 +241,9 @@ impl Drop for SessionLog {
     }
 }
 
-fn open(target: &Target) -> std::io::Result<File> {
+fn open(target: &Target) -> std::io::Result<crate::session_log_policy::Capped<File>> {
     if let Some(parent) = target.path.parent() {
-        fs::create_dir_all(parent)?;
+        crate::session_log_policy::owner_only_dir(fs::DirBuilder::new().recursive(true)).create(parent)?;
     }
     let mut options = OpenOptions::new();
     options.create(true);
@@ -251,7 +252,7 @@ fn open(target: &Target) -> std::io::Result<File> {
     } else {
         options.write(true).truncate(true);
     }
-    options.open(&target.path)
+    crate::session_log_policy::open(&mut options, &target.path)
 }
 
 fn skipped_note(bytes: usize) -> String {
