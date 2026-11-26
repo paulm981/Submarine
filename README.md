@@ -277,7 +277,7 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 ### Login methods
 
 - Passwords, key files and pasted keys (OpenSSH, PEM, PKCS#8 and SEC1 formats; RSA, ECDSA including P-521, Ed25519), with or without a passphrase
-- Keyboard-interactive and two-factor prompts, with the saved password filled in where the server asks for it
+- Keyboard-interactive and two-factor prompts, with the saved or typed password filled in where the server asks for it, so a server that asks for a one-time code after the password (Google Authenticator through PAM) asks you only for the code; a wrong password is asked for again, up to three times
 - **ssh-agent**: keys from Pageant, the Windows OpenSSH agent (and agents that use its pipe, such as 1Password), `SSH_AUTH_SOCK` or the `IdentityAgent` named in your config; smartcards and hardware keys work through it. A per-device switch turns it off.
 - **OpenSSH and Teleport certificates** from `~/.ssh/config`, with the CA keys in your `known_hosts` trusted
 - A **blank username** is asked for when you connect; a missing password or passphrase is asked for too
