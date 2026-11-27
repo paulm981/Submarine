@@ -342,6 +342,13 @@ struct SharedServer {
     /// "Allow everything here until this AI tab closes": as level 3, for
     /// this AI tab only. In memory only, and gone when this goes.
     allow_all: bool,
+    /// "Allow non-root for 15 min": non-root commands run without asking
+    /// until this deadline; root and always-ask rules still ask. In memory
+    /// only.
+    #[serde(skip)]
+    allow_non_root_until: Option<Instant>,
+    /// Minutes remaining on `allow_non_root_until`, filled in by `snapshot`.
+    allow_non_root_mins: Option<u64>,
     /// Its level now, for the tab's marker: filled in by `snapshot`.
     level: u8,
     /// At "Run commands that only read", whether they run by themselves
@@ -355,6 +362,18 @@ struct SharedServer {
     /// The tool root goes through there, once known (sudo or dzdo): filled
     /// in by `snapshot`.
     root_via: Option<&'static str>,
+}
+
+impl SharedServer {
+    fn non_root_active(&self) -> bool {
+        !self.allow_all && self.allow_non_root_until.is_some_and(|u| u > Instant::now())
+    }
+
+    fn non_root_mins_left(&self) -> Option<u64> {
+        let until = self.allow_non_root_until?;
+        let left = until.checked_duration_since(Instant::now())?;
+        (!left.is_zero()).then(|| left.as_secs().div_ceil(60))
+    }
 }
 
 struct Tab {
@@ -400,12 +419,19 @@ struct PendingView {
     asked_at: String,
     /// The saved server it's for, whose lists "Always allow" adds to.
     server_id: Option<i64>,
+    /// The folder this saved server sits in, if any, for promoting a rule
+    /// to the folder on the card (#291).
+    folder_id: Option<i64>,
+    folder_name: Option<String>,
     /// The always-ask rule that made it wait, if one did.
     ask_rule: Option<String>,
     /// "Always allow this command here" is offered: it's one simple command
     /// (trust::is_simple), on a saved server, that doesn't ask for root and
     /// no always-ask rule caught.
     can_allow_always: bool,
+    /// Whether this waiting request is a non-root read-only command
+    /// (read_only::only_reads) eligible for batch read-only approval (#291).
+    is_read_only: bool,
     /// Why it asks when the server's settings would otherwise not: they
     /// couldn't be read, or a change to them waits for your OK.
     note: Option<String>,
@@ -516,7 +542,7 @@ fn running_on(s: &Shared, tab_id: &str, session_id: &str) -> usize {
 
 /// What `early_decision` found.
 struct Early {
-    looked_up: Option<(Option<i64>, bool)>,
+    looked_up: Option<(Option<i64>, bool, bool)>,
     root_cmd: bool,
     opens_shell: bool,
     policy: Option<trust::Policy>,
@@ -1197,6 +1223,8 @@ impl AiState {
             user,
             server_id,
             allow_all: false,
+            allow_non_root_until: None,
+            allow_non_root_mins: None,
             level: trust::ASK_EVERY_TIME,
             reads_alone: false,
             root: None,
@@ -1368,21 +1396,16 @@ impl AiState {
     /// always-ask list catches. What else is waiting there now runs too,
     /// unless an always-ask rule made it wait.
     fn allow_session(&self, id: u64, password: Option<Zeroizing<String>>) -> Result<(), String> {
-        let (others, label, server) = {
+        let (tab_id, session_id, label, server) = {
             let mut s = self.lock();
             let p = s.pending.iter().find(|p| p.view.id == id).ok_or("That request isn't waiting any more.")?;
             let (tab_id, session_id) = (p.view.tab_id.clone(), p.view.session_id.clone());
-            let others: Vec<(u64, String, Option<i64>, bool, bool)> = s
-                .pending
-                .iter()
-                .filter(|o| o.view.id != id && o.view.tab_id == tab_id && o.view.session_id == session_id && o.view.ask_rule.is_none())
-                .map(|o| (o.view.id, o.view.command.clone(), o.view.server_id, o.view.as_root, o.view.copy.is_some()))
-                .collect();
             let tab = s.tabs.iter_mut().find(|t| t.id == tab_id).ok_or("That AI tab isn't open any more.")?;
             let label = tab.label.clone();
             let shared = tab.servers.iter_mut().find(|x| x.session_id == session_id).ok_or("That server isn't shared with the AI any more.")?;
             shared.allow_all = true;
-            (others, label, shared.name.clone())
+            shared.allow_non_root_until = None;
+            (tab_id, session_id, label, shared.name.clone())
         };
         let mut e = audit::Entry::new("allow_everything", &label);
         e.server = Some(server);
@@ -1393,14 +1416,7 @@ impl AiState {
         // Each as it would be decided now (an always-ask rule added since
         // it was asked still holds it). One as root runs with what this AI
         // tab has for root there, or asks for the password again.
-        for (other, command, server_id, as_root, is_copy) in others {
-            let p = (self.0.policy)(server_id);
-            // A copy's `command` is only its summary: it's decided as a copy.
-            let d = if is_copy { copy::decision(&p, true) } else { trust::decide_parsed(&p, true, &trust::Parsed::new(&command), as_root) };
-            if let Some(by) = d.approved_by() {
-                let _ = self.answer(other, Answer::Allow { by, password: None });
-            }
-        }
+        self.approve_waiting_for(&tab_id, &session_id, id, true, false);
         result
     }
 
@@ -1543,6 +1559,108 @@ impl AiState {
         group_answer(&results)
     }
 
+    /// Approve other waiting requests on `(tab_id, session_id)` that the
+    /// server's current temporary grant now allows (skipping any held by an
+    /// always-ask rule).
+    fn approve_waiting_for(&self, tab_id: &str, session_id: &str, skip_id: u64, allow_all: bool, allow_non_root: bool) {
+        let others: Vec<(u64, String, Option<i64>, bool, bool)> = {
+            let s = self.lock();
+            s.pending
+                .iter()
+                .filter(|o| o.view.id != skip_id && o.view.tab_id == tab_id && o.view.session_id == session_id && o.view.ask_rule.is_none())
+                .map(|o| (o.view.id, o.view.command.clone(), o.view.server_id, o.view.as_root, o.view.copy.is_some()))
+                .collect()
+        };
+        for (other, command, server_id, as_root, is_copy) in others {
+            let p = (self.0.policy)(server_id);
+            let d = if is_copy {
+                copy::decision(&p, allow_all)
+            } else {
+                trust::decide_parsed_with_temp(&p, allow_all, allow_non_root, &trust::Parsed::new(&command), as_root)
+            };
+            if let Some(by) = d.approved_by() {
+                let _ = self.answer(other, Answer::Allow { by, password: None });
+            }
+        }
+    }
+
+    /// "Allow non-root here for N min": this non-root request is allowed,
+    /// and non-root commands on this server run without asking for `minutes`
+    /// (clamped 1..=60), while root and always-ask rules still ask (#291).
+    fn allow_non_root(&self, id: u64, minutes: u64) -> Result<(), String> {
+        let mins = minutes.clamp(1, 60);
+        let (tab_id, session_id, label, server) = {
+            let mut s = self.lock();
+            let p = s.pending.iter().find(|p| p.view.id == id).ok_or("That request isn't waiting any more.")?;
+            if p.view.root || p.view.as_root || p.view.copy.is_some() {
+                return Err("Temporary non-root approval only applies to non-root commands.".into());
+            }
+            let (tab_id, session_id) = (p.view.tab_id.clone(), p.view.session_id.clone());
+            let tab = s.tabs.iter_mut().find(|t| t.id == tab_id).ok_or("That AI tab isn't open any more.")?;
+            let label = tab.label.clone();
+            let shared = tab.servers.iter_mut().find(|x| x.session_id == session_id).ok_or("That server isn't shared with the AI any more.")?;
+            shared.allow_non_root_until = Some(Instant::now() + Duration::from_secs(mins * 60));
+            (tab_id, session_id, label, shared.name.clone())
+        };
+        let mut e = audit::Entry::new("allow_non_root", &label);
+        e.server = Some(server);
+        e.by = Some(BY_YOU);
+        e.note = Some(format!("allow non-root here for {mins} min"));
+        self.audit(e);
+        let result = self.answer(id, Answer::Allow { by: BY_YOU.into(), password: None });
+        self.approve_waiting_for(&tab_id, &session_id, id, false, true);
+        result
+    }
+
+    /// Same as `allow_non_root` across all servers of a `run_on_servers`
+    /// group request.
+    fn allow_non_root_group(&self, group: u64, minutes: u64) -> Result<(), String> {
+        let members = self.group_members(group);
+        if members.is_empty() {
+            return Err("That request isn't waiting any more.".into());
+        }
+        let failed: Vec<String> = members.into_iter().filter_map(|id| self.allow_non_root(id, minutes).err()).collect();
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(failed.join(" "))
+        }
+    }
+
+    /// Approve every queued non-root read-only request named in `ids` (#291).
+    /// Re-verifies each request under lock so a stale or non-read-only id
+    /// can never slip through.
+    fn allow_all_read_only(&self, ids: Vec<u64>) -> Result<usize, String> {
+        let mut seen = Vec::with_capacity(ids.len().min(50));
+        for id in ids.into_iter().take(50) {
+            if !seen.contains(&id) {
+                seen.push(id);
+            }
+        }
+        let eligible: Vec<u64> = {
+            let s = self.lock();
+            seen.into_iter()
+                .filter(|id| {
+                    s.pending.iter().any(|p| {
+                        p.view.id == *id
+                            && p.view.is_read_only
+                            && !p.view.root
+                            && !p.view.as_root
+                            && p.view.copy.is_none()
+                            && p.view.ask_rule.is_none()
+                    })
+                })
+                .collect()
+        };
+        let mut allowed = 0;
+        for id in eligible {
+            if self.answer(id, Answer::Allow { by: BY_YOU.into(), password: None }).is_ok() {
+                allowed += 1;
+            }
+        }
+        Ok(allowed)
+    }
+
     /// "Allow everything here" ends for the shared servers `which` picks,
     /// in every AI tab. Returns how many it was on for.
     fn end_allow_all(&self, which: impl Fn(&SharedServer) -> bool, why: &str) -> usize {
@@ -1556,8 +1674,9 @@ impl AiState {
             let mut s = self.lock();
             for t in s.tabs.iter_mut() {
                 let tab_id = t.id.clone();
-                for x in t.servers.iter_mut().filter(|x| x.allow_all && which(&tab_id, x)) {
+                for x in t.servers.iter_mut().filter(|x| (x.allow_all || x.non_root_active()) && which(&tab_id, x)) {
                     x.allow_all = false;
+                    x.allow_non_root_until = None;
                     ended.push((t.label.clone(), x.name.clone()));
                 }
             }
@@ -1624,6 +1743,7 @@ impl AiState {
                         .servers
                         .iter()
                         .map(|x| SharedServer {
+                            allow_non_root_mins: if x.allow_all { None } else { x.non_root_mins_left() },
                             level: level_of(x.server_id).0,
                             reads_alone: level_of(x.server_id).1,
                             root_via: x.root.as_ref().map(|k| k.0.tool),
@@ -1767,7 +1887,7 @@ impl AiState {
     /// The names are the user's, not a server's, so they're not tagged as
     /// server output.
     async fn list_shared(&self, tab_id: &str) -> ToolResult {
-        let shared: Vec<(String, Option<i64>, bool)> = {
+        let shared: Vec<(String, Option<i64>, bool, bool)> = {
             let s = self.lock();
             let Some(tab) = s.tabs.iter().find(|t| t.id == tab_id) else {
                 return ToolResult::err("This AI tab's access has ended.");
@@ -1777,19 +1897,19 @@ impl AiState {
                     "No servers are shared with you yet. Ask the user to open the server's tab in Submarine and click Share with AI on its toolbar.",
                 );
             }
-            tab.servers.iter().map(|x| (x.name.clone(), x.server_id, x.allow_all)).collect()
+            tab.servers.iter().map(|x| (x.name.clone(), x.server_id, x.allow_all, x.non_root_active())).collect()
         };
         // Each saved server's settings read once, as early_decision reads
         // them: off the async workers, as the vault has a lock of its own.
         // Should that fail, every server asks.
         let requests: Vec<(trust::Requests, Option<String>)> = {
             let lookup = self.0.policy.clone();
-            let each: Vec<(Option<i64>, bool)> = shared.iter().map(|(_, id, all)| (*id, *all)).collect();
+            let each: Vec<(Option<i64>, bool, bool)> = shared.iter().map(|(_, id, all, nr)| (*id, *all, *nr)).collect();
             let n = each.len();
             tokio::task::spawn_blocking(move || {
                 let mut read: Vec<(Option<i64>, trust::Policy)> = Vec::new();
                 each.into_iter()
-                    .map(|(id, allow_all)| {
+                    .map(|(id, allow_all, allow_non_root)| {
                         let at = match read.iter().position(|(i, _)| *i == id) {
                             Some(at) => at,
                             None => {
@@ -1797,14 +1917,14 @@ impl AiState {
                                 read.len() - 1
                             }
                         };
-                        (trust::Requests::of(&read[at].1, allow_all), read[at].1.os.clone().filter(|os| trust::is_os_id(os)))
+                        (trust::Requests::of_share(&read[at].1, allow_all, allow_non_root), read[at].1.os.clone().filter(|os| trust::is_os_id(os)))
                     })
                     .collect()
             })
             .await
             .unwrap_or_else(|_| vec![(trust::Requests::AskEachTime, None); n])
         };
-        let servers = shared.iter().zip(requests).map(|((name, _, _), (r, os))| ListedServer { name, os, requests: r.phrase() }).collect();
+        let servers = shared.iter().zip(requests).map(|((name, _, _, _), (r, os))| ListedServer { name, os, requests: r.phrase() }).collect();
         let copy_into = self.pull_folders().iter().map(|p| p.to_string_lossy().into_owned()).collect();
         let listed = Listed {
             servers,
@@ -1864,7 +1984,11 @@ impl AiState {
         // its own) and checked again under it.
         let looked_up = {
             let s = self.lock();
-            s.tabs.iter().find(|t| t.id == tab_id).and_then(|t| t.servers.iter().find(|x| x.name == server)).map(|x| (x.server_id, x.allow_all))
+            s.tabs
+                .iter()
+                .find(|t| t.id == tab_id)
+                .and_then(|t| t.servers.iter().find(|x| x.name == server))
+                .map(|x| (x.server_id, x.allow_all, x.non_root_active()))
         };
         // The command read once, the settings read and the decision made,
         // outside the lock and off the async workers (the vault has a lock
@@ -1875,9 +1999,11 @@ impl AiState {
             let cmd = command.to_string();
             tokio::task::spawn_blocking(move || {
                 let parsed = (cmd.len() <= MAX_COMMAND && !cmd.contains('\0')).then(|| trust::Parsed::new(&cmd));
-                let policy = looked_up.map(|(id, _)| lookup(id));
+                let policy = looked_up.map(|(id, _, _)| lookup(id));
                 let early = match (&policy, &parsed, looked_up) {
-                    (Some(p), Some(c), Some((_, allow_all))) => trust::decide_parsed(p, allow_all, c, as_root),
+                    (Some(p), Some(c), Some((_, allow_all, allow_non_root))) => {
+                        trust::decide_parsed_with_temp(p, allow_all, allow_non_root, c, as_root)
+                    }
                     _ => trust::Decision::Ask { rule: None },
                 };
                 (parsed.as_ref().is_some_and(|p| p.root), parsed.as_ref().is_some_and(|p| p.opens_shell()), policy, early)
@@ -2000,7 +2126,11 @@ impl AiState {
             // Whether it waits for you (trust.rs), decided for this same
             // share as it is now (not one shared again meanwhile, or whose
             // "allow everything" changed): else it asks.
-            let decision = if looked_up == Some((found.server_id, found.allow_all)) { early } else { trust::Decision::Ask { rule: None } };
+            let decision = if looked_up == Some((found.server_id, found.allow_all, found.non_root_active())) {
+                early
+            } else {
+                trust::Decision::Ask { rule: None }
+            };
             // Another server of the same request asks, so this one does too.
             let held_for_group = group.is_some_and(|g| g.ask) && decision.approved_by().is_some();
             let decision = if held_for_group { trust::Decision::Ask { rule: None } } else { decision };
@@ -2032,6 +2162,13 @@ impl AiState {
                 trust::Decision::Ask { rule } => rule.clone(),
                 _ => None,
             };
+            let folder = policy.as_ref().and_then(|p| p.folder.clone());
+            let is_read_only = !login_root
+                && !root_cmd
+                && !as_root
+                && ask_rule.is_none()
+                && policy.as_ref().is_some_and(|p| p.force_ask.is_none() && p.reads_alone())
+                && read_only::only_reads(command);
             // Its card, as it's shown now or if it comes back to ask for the
             // root password.
             let card = PendingView {
@@ -2050,12 +2187,15 @@ impl AiState {
                 timeout_secs: if follows { follow::LIFE.as_secs() } else { timeout.unwrap_or(DEFAULT_TIMEOUT) },
                 asked_at: now(),
                 server_id: found.server_id,
+                folder_id: folder.as_ref().map(|(id, _)| *id),
+                folder_name: folder.map(|(_, name)| name),
                 can_allow_always: found.server_id.is_some()
                     && ask_rule.is_none()
                     && !root_cmd
                     && !as_root
                     && policy.as_ref().is_some_and(|p| p.force_ask.is_none())
                     && trust::is_simple_on(command, policy.as_ref().is_some_and(|p| p.windows)),
+                is_read_only,
                 note: policy
                     .as_ref()
                     .and_then(|p| p.force_ask.clone())
@@ -2799,6 +2939,25 @@ pub async fn ai_allow_session(state: tauri::State<'_, AiState>, id: u64, passwor
     state.allow_session(id, password)
 }
 
+/// "Allow non-root here for 15 min": non-root commands run without asking
+/// for `minutes` (default 15, 1..=60), while root and always-ask rules
+/// still ask (#291). Works for a single request (`id`) or a group (`group`).
+#[tauri::command]
+pub async fn ai_allow_non_root(state: tauri::State<'_, AiState>, id: Option<u64>, group: Option<u64>, minutes: Option<u64>) -> Result<(), String> {
+    let mins = minutes.unwrap_or(15);
+    match (group, id) {
+        (Some(g), _) => state.allow_non_root_group(g, mins),
+        (None, Some(i)) => state.allow_non_root(i, mins),
+        (None, None) => Err("No request was chosen.".into()),
+    }
+}
+
+/// Approve every waiting non-root read-only request named in `ids` (#291).
+#[tauri::command]
+pub async fn ai_allow_all_read_only(state: tauri::State<'_, AiState>, ids: Vec<u64>) -> Result<usize, String> {
+    state.allow_all_read_only(ids)
+}
+
 // ---------------------------------------------------------------------------
 // Approval levels and rules (trust.rs): changed only from here, by you
 // ---------------------------------------------------------------------------
@@ -2831,9 +2990,10 @@ fn check_runner(pattern: &str, confirmed: Option<bool>) -> Result<(), String> {
 }
 
 /// "Always allow this command here", from the card: `pattern` (the command,
-/// or it with ` *` for any arguments) goes on the server's allow list, and
-/// this request is allowed. A server still at "Ask every time" goes to "Run
-/// my allowed commands", or the rule would do nothing; the card says so.
+/// or it with ` *` for any arguments) goes on the server's (or its folder's,
+/// when `scope == "folder"`) allow list, and this request is allowed. A
+/// server/folder still at "Ask every time" goes to "Run my allowed commands",
+/// or the rule would do nothing; the card says so.
 #[tauri::command]
 pub async fn ai_allow_always(
     state: tauri::State<'_, AiState>,
@@ -2841,6 +3001,7 @@ pub async fn ai_allow_always(
     id: u64,
     pattern: String,
     confirm_runner: Option<bool>,
+    scope: Option<String>,
 ) -> Result<(), String> {
     let p = state.pending_view(id)?;
     check_runner(&pattern, confirm_runner)?;
@@ -2852,13 +3013,24 @@ pub async fn ai_allow_always(
     if !trust::allow_matches(&pattern, &p.command) {
         return Err("That rule doesn't match this command.".into());
     }
+    let to_folder = scope.as_deref() == Some("folder");
     let (raised, what) = with_vault(&db, |conn| {
-        let pattern = trust::add_rule(conn, "server", server_id, "allow", &pattern)?;
-        let raised = trust::policy_for(conn, Some(server_id)).level == trust::ASK_EVERY_TIME;
-        if raised {
-            trust::set_level(conn, "server", server_id, Some(trust::ALLOWED_COMMANDS))?;
+        if to_folder {
+            let (folder_id, _) = trust::server_folder(conn, server_id).ok_or("This server isn't in a folder.")?;
+            let pattern = trust::add_rule(conn, "folder", folder_id, "allow", &pattern)?;
+            let raised = trust::folder_effective_level(conn, folder_id)? == trust::ASK_EVERY_TIME;
+            if raised {
+                trust::set_level(conn, "folder", folder_id, Some(trust::ALLOWED_COMMANDS))?;
+            }
+            Ok((raised, format!("{}: always allow `{pattern}`", trust::describe(conn, "folder", folder_id))))
+        } else {
+            let pattern = trust::add_rule(conn, "server", server_id, "allow", &pattern)?;
+            let raised = trust::policy_for(conn, Some(server_id)).level == trust::ASK_EVERY_TIME;
+            if raised {
+                trust::set_level(conn, "server", server_id, Some(trust::ALLOWED_COMMANDS))?;
+            }
+            Ok((raised, format!("{}: always allow `{pattern}`", trust::describe(conn, "server", server_id))))
         }
-        Ok((raised, format!("{}: always allow `{pattern}`", trust::describe(conn, "server", server_id))))
     })?;
     crate::save_vault_internal(&db)?;
     state.log_setting(if raised { format!("{what}; level set to {}", LEVEL_NAMES[1]) } else { what });
@@ -2938,6 +3110,36 @@ pub async fn ai_trust_add_rule(
     state.log_setting(what);
     state.changed();
     Ok(pattern)
+}
+
+/// Add a batch of starter allow rules in one save (#291).
+#[tauri::command]
+pub async fn ai_trust_add_rules(
+    state: tauri::State<'_, AiState>,
+    db: tauri::State<'_, crate::DbState>,
+    scope: String,
+    id: i64,
+    patterns: Vec<String>,
+) -> Result<Vec<String>, String> {
+    if patterns.len() > 50 {
+        return Err("Too many rules in one batch.".into());
+    }
+    for p in &patterns {
+        check_runner(p, None)?;
+    }
+    let (added, what) = with_vault(&db, |conn| {
+        let added = trust::add_rules(conn, &scope, id, "allow", &patterns)?;
+        let what = (!added.is_empty()).then(|| format!("{}: added {} starter rule(s) ({})", trust::describe(conn, &scope, id), added.len(), added.join(", ")));
+        Ok((added, what))
+    })?;
+    if !added.is_empty() {
+        crate::save_vault_internal(&db)?;
+        if let Some(w) = what {
+            state.log_setting(w);
+        }
+        state.changed();
+    }
+    Ok(added)
 }
 
 #[tauri::command]
