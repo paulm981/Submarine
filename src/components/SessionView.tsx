@@ -31,6 +31,8 @@ import * as Fork from "../fork/session";
 import { ErrorBoundary } from "../ui/ErrorBoundary";
 import { parseObjectList } from "../util/serverJson";
 import { tk, tn, tx, useT } from "../i18n";
+import NotConnected from "./NotConnected";
+import { useWaitToConnect } from "../hooks/useWaitToConnect";
 
 // What the shell-config push commands answer (mirror.rs' ShellSync* types).
 type ShellSyncShells = { remote_shell: string; local_shell: string; shell_mismatch: boolean };
@@ -165,7 +167,7 @@ const SepToggle = ({ on, onToggle, status, hint, onReconnect }: {
               ? { top: guideAt.bottom + 6 }
               : { bottom: window.innerHeight - guideAt.top + 6 }),
           }}
-          className="fixed z-[9999] pointer-events-none bg-[#15151a] border border-white/10 rounded-lg shadow-2xl px-3 py-2 text-[11px] leading-snug text-zinc-300"
+          className="fixed z-[9999] pointer-events-none bg-shade-15151a border border-white/10 rounded-lg shadow-2xl px-3 py-2 text-[11px] leading-snug text-zinc-300"
         >
           <div className="mb-1 text-[11px] font-semibold text-zinc-100">{t("Dedicated session")}</div>
           <p>{hint}</p>
@@ -416,8 +418,11 @@ function writeFollow(on: boolean) {
 // from the server's (DesktopApp's tabNames). `profile`: the unlocked
 // profile's name, for what is kept per server on this device. `sessionShown`:
 // this session is on screen, not behind another one or another view.
-const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onStatusChange, chromeless = false, onTerminalsChange, isActiveView = false, shown: sessionShown = true, onPromptChange, compactTabs = false }: any) => {
+const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onStatusChange, chromeless = false, onTerminalsChange, onSessionTitle, isActiveView = false, shown: sessionShown = true, onPromptChange, compactTabs = false }: any) => {
   const t = useT();
+  // A tab opened at startup without connecting waits for Connect: the tab
+  // shows it as 'idle', and its own status stays 'connecting' until then.
+  const { waiting, connectNow } = useWaitToConnect(session);
   const [status, setStatus] = useState<'connecting' | 'connected' | 'failed' | 'disconnected'>('connecting');
 
   // Bubble every status change up to the parent so the session-tab strip
@@ -426,9 +431,9 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // wiring we already do here.
   useEffect(() => {
     if (typeof onStatusChange === "function") {
-      onStatusChange(session?.id, status);
+      onStatusChange(session?.id, waiting ? 'idle' : status);
     }
-  }, [status, session?.id, onStatusChange]);
+  }, [status, waiting, session?.id, onStatusChange]);
   const [disconnectReason, setDisconnectReason] = useState<string>("");
   const jumpGone = Fork.useJumpGone(session.serverId, () => reconnect(), (msg) => pushLog({ msg, type: 'error' }));
   const [logs, setLogs] = useState<{ msg: string, type: string, time?: string }[]>([]);
@@ -760,6 +765,8 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   useEffect(() => {
     if (activeTab !== aiTermId) setUserTab(activeTab);
   }, [activeTab, aiTermId]);
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
   const aiFeed = useMemo(() => createFeed(), []);
   // Known by session: a run of this server's chat on the AI page shows here too.
   useEffect(() => registerFeed(session.id, aiFeed), [session.id, aiFeed]);
@@ -797,6 +804,32 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
     termFoldersRef.current.set(terminalId, next);
     if (followRef.current) setFolderTick((n) => n + 1);
   }, []);
+  // The title a program in a terminal set itself (OSC 0/2, #391), by
+  // terminal id, cleaned by TerminalView (util/terminalTitle). Each terminal's
+  // tab shows its own after its name; only the ACTIVE terminal's reaches the
+  // session tab (via onSessionTitle), so a background terminal's title waits
+  // until its tab is selected. An empty title clears the entry: none was set,
+  // Settings turned titles off, or the terminal closed.
+  const oscTitlesRef = useRef(new Map<string, string>());
+  // Bump to re-render the nested tab bar when any terminal's title
+  // changes, so every split pane's tab shows its own live title
+  // (not just the active terminal's, which reaches the session tab
+  // via onSessionTitle). Mirrors the folderTick pattern above.
+  const [, setTitlesTick] = useState(0);
+  const onTerminalTitle = useCallback((terminalId: string, title: string) => {
+    if ((oscTitlesRef.current.get(terminalId) ?? "") === title) return;
+    if (title) oscTitlesRef.current.set(terminalId, title);
+    else oscTitlesRef.current.delete(terminalId);
+    setTitlesTick((n) => n + 1);
+    if (terminalId === activeTabRef.current) onSessionTitle?.(session.id, title);
+  }, [onSessionTitle, session.id]);
+  // The session tab follows the active terminal's title: switching
+  // terminals re-reports the newly active one's title ("" when it set none).
+  useEffect(() => {
+    if (typeof onSessionTitle === "function") {
+      onSessionTitle(session.id, oscTitlesRef.current.get(activeTab) ?? "");
+    }
+  }, [activeTab, session.id, onSessionTitle]);
   // What the SFTP panel follows: the active terminal's folder, null while its
   // shell hasn't said, undefined while Follow is off.
   const followFolder = follow ? (termFoldersRef.current.get(activeTab) ?? null) : undefined;
@@ -1238,6 +1271,8 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   };
 
   useEffect(() => {
+    // Opened at startup without connecting: nothing starts until Connect.
+    if (waiting) return;
     if (initiatedRef.current) return;
     initiatedRef.current = true;
 
@@ -1472,7 +1507,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           if (session.serverUuid) window.dispatchEvent(new CustomEvent<AiLevelDetail>(AI_LEVEL_EVENT, { detail: { serverUuid: session.serverUuid } }));
         });
     };
-  }, [session.id, session.serverId]);
+  }, [session.id, session.serverId, waiting]);
 
   const scheduleReconnect = (attempt: number) => {
     if (reconnectTimerRef.current) {
@@ -1546,11 +1581,14 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // round-tripping through React props — keeps DesktopApp's tab UI decoupled
   // from SessionView's reconnect lifecycle.
   useEffect(() => {
+    // While the tab waits to be connected, its menu's Connect starts the
+    // first connect instead (hooks/useWaitToConnect).
+    if (waiting) return;
     const onReconnect = () => reconnect();
     const evt = `session-reconnect-${session.id}`;
     window.addEventListener(evt, onReconnect);
     return () => window.removeEventListener(evt, onReconnect);
-  }, [session.id, customPassword]);
+  }, [session.id, customPassword, waiting]);
 
   // Reconnecting turned off in Settings stops a countdown that is running, at
   // once rather than when it ends.
@@ -1719,7 +1757,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
       type="password"
       aria-label={t("Password")}
       placeholder={t("Try another password — press Enter to reconnect")}
-      className="h-8 w-full bg-[#1a1a1e] rounded-lg px-3 text-xs text-white border border-white/10 outline-none focus:border-primary/50"
+      className="h-8 w-full bg-shade-1a1a1e rounded-lg px-3 text-xs text-white border border-white/10 outline-none focus:border-primary/50"
       value={customPassword}
       onChange={e => setCustomPassword(e.target.value)}
       onKeyDown={e => {
@@ -1742,11 +1780,14 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
   // included, so once the session has been up it must never run: whatever a
   // reconnect does, the terminals, their scrollback and the SFTP state stay,
   // behind a slim banner.
+  if (waiting) {
+    return <NotConnected name={displayName || session.serverName} onConnect={connectNow} onClose={onClose} />;
+  }
   if (!everConnected && (status === 'connecting' || status === 'failed')) {
     const retryWaiting = reconnectAttempt > 0 && nextReconnectAt !== null;
     const retryIn = <SecondsLeft until={nextReconnectAt ?? 0} />;
     return (
-      <div className="relative flex-1 flex flex-col p-4 sm:p-8 bg-[#0a0a0c] text-white overflow-hidden">
+      <div className="relative flex-1 flex flex-col p-4 sm:p-8 bg-shade-0a0a0c text-white overflow-hidden">
         <div className="max-w-2xl w-full mx-auto flex-1 flex flex-col min-h-0">
           {/* Header: status chip + server name on the left, actions on the
               right — one row at every width. The name is regular-case text
@@ -1848,7 +1889,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               const el = e.currentTarget;
               logFollowRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 32;
             }}
-            className="flex-1 min-h-0 bg-[#121214] border border-white/5 rounded-2xl p-4 font-mono overflow-y-auto overscroll-contain custom-scrollbar shadow-inner relative select-text cursor-text"
+            className="flex-1 min-h-0 bg-shade-121214 border border-white/5 rounded-2xl p-4 font-mono overflow-y-auto overscroll-contain custom-scrollbar shadow-inner relative select-text cursor-text"
             style={{ WebkitOverflowScrolling: 'touch', fontSize: logFontSize, fontFamily: logFontFamily, lineHeight: 1.5 }}
           >
             {logs.map((l, i) => (
@@ -1892,7 +1933,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           full chrome and 2-3 sessions side-by-side would fight for
           vertical space with duplicate toolbars. */}
       {!chromeless && (
-      <div inert={shellSyncOpen ? "" : undefined} className="h-12 border-b border-white/5 bg-[#141417] flex items-center px-2 sm:px-4 shrink-0 justify-between gap-1">
+      <div inert={shellSyncOpen ? "" : undefined} className="h-12 border-b border-white/5 bg-shade-141417 flex items-center px-2 sm:px-4 shrink-0 justify-between gap-1">
         <div
           className="flex items-center gap-1 overflow-x-auto no-scrollbar flex-1 mr-1 sm:mr-4 mask-fade-right"
           {...Fork.stripLook(compactTabs)}
@@ -1904,6 +1945,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           // a softer accent, so the pairing is obvious at a glance.
           const isFocusedHalf = activeTab === term.id;
           const isSplitPartner = !!(splitTerminals.includes(term.id) && !isFocusedHalf);
+          const programTitle = oscTitlesRef.current.get(term.id);
           return (
           <div key={term.id} className="group relative flex items-center"
             {...Fork.termTabProps(termDrag, term.id)}
@@ -1918,7 +1960,10 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                 // a tool pane / another input) — issue #51.
                 requestTerminalFocus();
               }}
-              title={term.container ? t("Container: {name}", { name: term.container.name }) : undefined}
+              title={[
+                term.container ? t("Container: {name}", { name: term.container.name }) : "",
+                programTitle ?? "",
+              ].filter(Boolean).join("\n") || undefined}
               className={`h-10 sm:h-8 px-3 sm:px-4 ${terminals.length > 1 ? 'pr-8 sm:pr-8' : ''} rounded-lg flex items-center gap-2 text-[12px] font-semibold transition-all ${
                 isFocusedHalf
                   ? 'bg-primary/10 text-primary border border-primary/20 shadow-inner'
@@ -1926,9 +1971,15 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                     ? 'bg-primary/[0.04] text-primary/70 border border-primary/10'
                     : 'text-zinc-300 bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/20 hover:text-white'
               } ${term.container ? 'ring-1 ring-sky-400/30' : ''} ${term.ai && aiFull ? 'ring-1 ring-rose-500/60' : ''}`}
-              {...Fork.termTabLook(term, compactTabs, isFocusedHalf, isSplitPartner, terminals.length, aiFull)}
+              {...Fork.termTabLook(term, compactTabs, isFocusedHalf, isSplitPartner, terminals.length, aiFull, programTitle)}
             >
               <Fork.TermTabLabel t={term} compactTabs={compactTabs} aiFullTitle={term.ai && aiFull ? t("{title} · Full access", { title: term.title }) : undefined} />
+              {/* After the name, cut when long; the tooltip has all of it. */}
+              {programTitle && (
+                <span className="min-w-0 max-w-[12rem] truncate font-normal opacity-70">
+                  · <bdi>{programTitle}</bdi>
+                </span>
+              )}
               {isSplitPartner && (
                 <SplitSquareHorizontal size={10} className="text-primary/60" />
               )}
@@ -2098,7 +2149,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
               else if (e.key === 'Tab') { e.preventDefault(); closePlusMenu(); }
             }}
             style={{ left: Math.min(plusMenu.x, window.innerWidth - 260), top: Math.min(plusMenu.y, window.innerHeight - 220) }}
-            className="fixed z-[9999] w-[240px] bg-[#15151a] border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
+            className="fixed z-[9999] w-[240px] bg-shade-15151a border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
           >
             {!isCompact && (
               <>
@@ -2207,7 +2258,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
           />
           <div
             style={{ left: Math.min(termMenu.x, window.innerWidth - 240), top: Math.min(termMenu.y, window.innerHeight - 120) }}
-            className="fixed z-[9999] w-[220px] bg-[#15151a] border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
+            className="fixed z-[9999] w-[220px] bg-shade-15151a border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
           >
             {termRename === termMenu.termId ? (
               <RenameInput
@@ -2251,7 +2302,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
             role="menu"
             aria-label={t("Panel position")}
             style={{ left: Math.max(8, Math.min(dockMenu.x - 210, window.innerWidth - 218)), top: Math.min(dockMenu.y, window.innerHeight - 170) }}
-            className="fixed z-[9999] w-[210px] bg-[#15151a] border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
+            className="fixed z-[9999] w-[210px] bg-shade-15151a border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
           >
             <div className="px-3 pt-1 pb-1.5 text-[11px] font-semibold text-zinc-500">{t("Panel position")}</div>
             {DOCK_OPTIONS.map(({ id, label, Icon }) => (
@@ -2389,7 +2440,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
         ref={mainAreaRef}
         // Behind the push dialog: Tab can't reach the terminal under it.
         inert={shellSyncOpen ? "" : undefined}
-        className={`flex-1 flex overflow-hidden relative bg-[#09090b] ${toolAlone ? "" : DOCK_FLEX[toolDock]}`}
+        className={`flex-1 flex overflow-hidden relative bg-shade-09090b ${toolAlone ? "" : DOCK_FLEX[toolDock]}`}
       >
         {/* Left Panel: Active Terminals.
             With a tool open in a compact window, or made full screen, hide
@@ -2429,7 +2480,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                 style={inSplit ? paneBox(panes[slot], splitOrientation) : undefined}
                 onMouseDown={inSplit ? () => setActiveTab(term.id) : undefined}
                 onTouchStart={inSplit ? () => setActiveTab(term.id) : undefined}
-                className={`absolute ${
+                className={`theme-dark absolute ${
                   inSplit
                     ? `z-10 border ${
                         isFocused
@@ -2464,6 +2515,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                   ownLogin={term.ownLogin}
                   quickAuth={session.quickAuth}
                   onFolder={term.container ? undefined : onTerminalFolder}
+                  onTitle={onTerminalTitle}
                   onClose={() => closeTerminal(term.id)}
                   onNewTerminal={openNewTerminal}
                 />
@@ -2587,7 +2639,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
                 ? { height: `${toolPanelHeight}px`, maxHeight: `calc(100% - ${MIN_TERMINAL_HEIGHT + 4}px)` }
                 : { width: `${activeTool === 'ai' ? aiPanelWidth : toolPanelWidth}px`, maxWidth: `calc(100% - ${MIN_TERMINAL_WIDTH + 4}px)` })
             : undefined}
-          className={`${activeTool ? (toolAlone ? 'flex-1 min-w-0' : 'shrink-0') : 'hidden'} bg-[#121214]/95 flex flex-col ${dockTopBottom && !toolAlone ? 'w-full' : 'h-full'} overflow-hidden ${activeTool ? 'animate-in slide-in-from-right duration-300' : ''}`}
+          className={`${activeTool ? (toolAlone ? 'flex-1 min-w-0' : 'shrink-0') : 'hidden'} bg-shade-121214/95 flex flex-col ${dockTopBottom && !toolAlone ? 'w-full' : 'h-full'} overflow-hidden ${activeTool ? 'animate-in slide-in-from-right duration-300' : ''}`}
         >
           {activeTool === 'sftp' && (
             <div className="flex-1 flex flex-col overflow-hidden">
@@ -2750,7 +2802,7 @@ const SessionViewImpl = ({ session, profile, displayName, onClose, addLog, onSta
             <div
               ref={shellSyncPanelRef}
               tabIndex={-1}
-              className="max-w-xl w-full mt-6 sm:mt-12 bg-[#121215] border border-white/10 rounded-2xl shadow-2xl overflow-hidden outline-none"
+              className="max-w-xl w-full mt-6 sm:mt-12 bg-shade-121215 border border-white/10 rounded-2xl shadow-2xl overflow-hidden outline-none"
             >
               <div className="px-5 py-4 border-b border-white/5 flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2 min-w-0">

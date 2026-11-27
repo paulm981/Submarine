@@ -13,6 +13,12 @@ import { CUSTOM_SCHEME, DEFAULT_SCHEME, schemeById } from "../../src/ui/terminal
 import { CUSTOM_THEME_ID, readScheme } from "../../src/util/terminalTheme";
 import { CLOSE_TAB_ASKING, closeTabAsking } from "../../src/fork/session/split";
 import { appHotkey } from "../../src/ui/terminalDock";
+import { mayBeShortcut, RESERVED_KEYS } from "../../src/fork/keys";
+import { TITLE_RAW_MAX, titleTooLong } from "../../src/fork/terminal/rules";
+import { cleanTerminalTitle, TITLE_MAX } from "../../src/util/terminalTitle";
+import {
+  comboOf, comboText, defaultShortcuts, isWebviewEditKey, parseCombo, resetShortcuts, setShortcuts, SHORTCUT_ACTIONS, shortcutFor, usableCombo,
+} from "../../src/util/shortcuts";
 
 describe("hasVisibleText", () => {
   it("ignores control codes: colours, a title change, cursor moves", () => {
@@ -227,13 +233,14 @@ describe("Ctrl+Shift+W on a tab's last terminal (#275)", () => {
   });
 });
 
+// The files' text, read by Vite (as fork-hooks.test.ts does).
+const sources = import.meta.glob<string>(["/src/components/TerminalView.tsx", "/src/components/ShortcutSettings.tsx", "/src/fork/desktop/hooks.ts", "/src/fork/terminal/mount.ts"], { query: "?raw", import: "default", eager: true });
+const source = (path: string): string => sources[path] ?? "";
+
 describe("Ctrl+Shift+K clears, Ctrl+Shift+J jumps to a tab (#275)", () => {
   const key = (code: string, mods: { ctrl?: boolean; shift?: boolean; meta?: boolean; alt?: boolean } = {}) => ({
     code, ctrlKey: !!mods.ctrl, shiftKey: !!mods.shift, metaKey: !!mods.meta, altKey: !!mods.alt,
   }) as KeyboardEvent;
-  // The files' text, read by Vite (as fork-hooks.test.ts does).
-  const sources = import.meta.glob<string>(["/src/components/TerminalView.tsx", "/src/fork/desktop/hooks.ts"], { query: "?raw", import: "default", eager: true });
-  const source = (path: string): string => sources[path] ?? "";
 
   it("takes Ctrl+Shift+J for the jump, and leaves Ctrl+Shift+K to the terminal", () => {
     expect(appHotkey(key("KeyJ", { ctrl: true, shift: true }))).toBe("jump");
@@ -247,11 +254,161 @@ describe("Ctrl+Shift+K clears, Ctrl+Shift+J jumps to a tab (#275)", () => {
   it("has one handler for each: the terminal's clear on K, the fork's jump on J", () => {
     const terminal = source("/src/components/TerminalView.tsx");
     const tabKeys = source("/src/fork/desktop/hooks.ts");
-    // The original project's Ctrl+Shift listener clears on K, and does nothing on J.
-    expect(terminal).toMatch(/e\.keyCode === 75\) \{\s*e\.preventDefault\(\);\s*if \(!e\.repeat\) clearTerminal\(terminalId\);/);
+    // The original project's shortcuts table (#374) clears on K (Ctrl+Shift+K,
+    // ⇧⌘K on a Mac, as #277 had it), in the terminal's runShortcut, and has no J.
+    expect(defaultShortcuts("clear").map(comboText)).toContain("Ctrl+Shift+K");
+    expect(terminal).toMatch(/case 'clear':\s*if \(first\) clearTerminal\(terminalId\);/);
     expect(terminal).not.toMatch(/keyCode === 74|"KeyJ"|'KeyJ'/);
     // The jump goes only by appHotkey: no key of its own here.
     expect(tabKeys).toContain("const k = appHotkey(e);");
     expect(tabKeys).not.toMatch(/KeyK|KeyJ|keyCode === 7[45]/);
+  });
+});
+
+// The original project's shortcuts table (#374) and the fork's keys beside it.
+describe("the shortcuts table and the fork's keys", () => {
+  const ev = (key: string, code: string, keyCode: number, m: { ctrl?: boolean; alt?: boolean; shift?: boolean; meta?: boolean } = {}) => ({
+    key, code, keyCode, isComposing: false, repeat: false,
+    ctrlKey: !!m.ctrl, altKey: !!m.alt, shiftKey: !!m.shift, metaKey: !!m.meta,
+    getModifierState: () => false,
+  }) as unknown as KeyboardEvent;
+
+  // Keys of every kind the table knows, with every set of modifiers.
+  const KEYS: [string, string, number][] = [
+    ...Array.from({ length: 26 }, (_, i) => [String.fromCharCode(97 + i), `Key${String.fromCharCode(65 + i)}`, 65 + i] as [string, string, number]),
+    ...Array.from({ length: 10 }, (_, i) => [String(i), `Digit${i}`, 48 + i] as [string, string, number]),
+    ...Array.from({ length: 24 }, (_, i) => [`F${i + 1}`, `F${i + 1}`, 112 + i] as [string, string, number]),
+    ["+", "Equal", 187], ["=", "Equal", 187], ["-", "Minus", 189], ["/", "Slash", 191], ["[", "BracketLeft", 219],
+    [" ", "Space", 32], ["Tab", "Tab", 9], ["Enter", "Enter", 13], ["Backspace", "Backspace", 8], ["Insert", "Insert", 45],
+    ["Delete", "Delete", 46], ["ArrowUp", "ArrowUp", 38], ["Home", "Home", 36], ["PageDown", "PageDown", 34],
+    ["Escape", "Escape", 27], ["Shift", "ShiftLeft", 16], ["Control", "ControlLeft", 17],
+  ];
+  const MODS = Array.from({ length: 16 }, (_, i) => ({ ctrl: !!(i & 1), alt: !!(i & 2), shift: !!(i & 4), meta: !!(i & 8) }));
+
+  // What runShortcut acts on: a key set for an action (with a shell that has
+  // ended, the close and new keys without Shift too), or a key the webview
+  // would copy or paste with by itself.
+  const used = (e: KeyboardEvent): boolean => {
+    const c = comboOf(e);
+    return !!c && (!!shortcutFor(c, SHORTCUT_ACTIONS, ["closeTerminal", "newTerminal"]) || isWebviewEditKey(c));
+  };
+  const everyUsedKeyGetsPast = () => {
+    for (const [key, code, keyCode] of KEYS) {
+      for (const m of MODS) {
+        const e = ev(key, code, keyCode, m);
+        if (used(e)) expect(mayBeShortcut(e), `${comboText(comboOf(e)!)}`).toBe(true);
+      }
+    }
+  };
+
+  it("lets every key the table acts on past the early return for plain typing", () => {
+    everyUsedKeyGetsPast();
+  });
+
+  it("lets Alt and F-keys past only while the table has such a key", () => {
+    // The table keeps its changes in localStorage, which Node doesn't have.
+    const kept = new Map<string, string>();
+    const was = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      value: { getItem: (k: string) => kept.get(k) ?? null, setItem: (k: string, v: string) => { kept.set(k, v); }, removeItem: (k: string) => { kept.delete(k); } },
+    });
+    try {
+      // By default none: Option typing @ or [ on a Mac, readline's Alt+B and
+      // mc's F5 go straight on, as before the table.
+      expect(mayBeShortcut(ev("@", "KeyL", 76, { alt: true }))).toBe(false);
+      expect(mayBeShortcut(ev("b", "KeyB", 66, { alt: true }))).toBe(false);
+      expect(mayBeShortcut(ev("F5", "F5", 116))).toBe(false);
+      // Set one of each, and they get to the table.
+      setShortcuts("nextTab", [parseCombo("Alt+B")!, parseCombo("F5")!]);
+      setShortcuts("closeTerminal", [parseCombo("Alt+Shift+W")!]);
+      expect(mayBeShortcut(ev("b", "KeyB", 66, { alt: true }))).toBe(true);
+      expect(mayBeShortcut(ev("F5", "F5", 116))).toBe(true);
+      everyUsedKeyGetsPast();
+      // Back to the defaults: back to going straight on.
+      resetShortcuts();
+      expect(mayBeShortcut(ev("b", "KeyB", 66, { alt: true }))).toBe(false);
+      expect(mayBeShortcut(ev("F5", "F5", 116))).toBe(false);
+    } finally {
+      resetShortcuts();
+      if (was) Object.defineProperty(globalThis, "localStorage", was);
+      else delete (globalThis as { localStorage?: unknown }).localStorage;
+    }
+  });
+
+  it("stops plain typing at the early return: letters, digits, Shift, Enter, Backspace, the arrows", () => {
+    const typed = KEYS.filter(([key]) => key !== "Insert");
+    for (const [key, code, keyCode] of typed) {
+      expect(mayBeShortcut(ev(key, code, keyCode)), key).toBe(false);
+      expect(mayBeShortcut(ev(key.toUpperCase(), code, keyCode, { shift: true })), `Shift+${key}`).toBe(false);
+    }
+    // A capital F is a letter, not an F-key.
+    expect(mayBeShortcut(ev("F", "KeyF", 70, { shift: true }))).toBe(false);
+    // With Ctrl or ⌘ any key may be one, as may Insert (a paste key).
+    expect(mayBeShortcut(ev("c", "KeyC", 67, { ctrl: true }))).toBe(true);
+    expect(mayBeShortcut(ev("v", "KeyV", 86, { meta: true }))).toBe(true);
+    expect(mayBeShortcut(ev("Insert", "Insert", 45, { shift: true }))).toBe(true);
+    expect(mayBeShortcut(ev("Insert", "Insert", 45))).toBe(true);
+    // A browser's autofill sends a keydown with no key: no shortcut, no error.
+    expect(mayBeShortcut({ ctrlKey: false, altKey: false, metaKey: false } as KeyboardEvent)).toBe(false);
+  });
+
+  it("returns early before the table is looked up, in the terminal and in the window", () => {
+    const terminal = source("/src/components/TerminalView.tsx");
+    const at = terminal.indexOf("term.attachCustomKeyEventHandler((ev) => {");
+    expect(at).toBeGreaterThanOrEqual(0);
+    const handler = terminal.slice(at);
+    const gate = handler.indexOf("if (!Fork.mayBeShortcut(ev)) return true;");
+    expect(gate, "the terminal's early return for plain typing is gone").toBeGreaterThanOrEqual(0);
+    expect(gate).toBeLessThan(handler.indexOf("runShortcut(ev)"));
+    // Nothing before it looks the key up or makes anything: the app's own keys
+    // (behind their own Ctrl check) and the held-key repeats only.
+    expect(handler.slice(0, gate)).not.toMatch(/comboOf|shortcutFor|matchShortcut|runShortcut/);
+  });
+
+  it("keeps Ctrl+Shift+W, Ctrl+Shift+K and Ctrl+Shift+Plus as the fork had them (#277)", () => {
+    const keys = (a: Parameters<typeof defaultShortcuts>[0]) => defaultShortcuts(a).map(comboText);
+    expect(keys("closeTerminal")).toContain("Ctrl+Shift+W");
+    expect(keys("clear")).toContain("Ctrl+Shift+K");
+    expect(keys("newTerminal")).toContain("Ctrl+Shift+Plus");
+  });
+
+  it("keeps the fork's Ctrl+Shift+J, Ctrl+Shift+L and Ctrl+Shift+P out of the table", () => {
+    // Each is a key the table could take, so it has to be refused by name.
+    for (const text of RESERVED_KEYS) {
+      const c = parseCombo(text);
+      expect(c && usableCombo(c), text).toBe(true);
+      expect(comboText(c!)).toBe(text);
+    }
+    expect(RESERVED_KEYS).toEqual(expect.arrayContaining(["Ctrl+Shift+J", "Ctrl+Shift+L", "Ctrl+Shift+P", "Shift+Meta+P"]));
+    // No action has one by default.
+    for (const a of SHORTCUT_ACTIONS) {
+      for (const k of defaultShortcuts(a).map(comboText)) expect(RESERVED_KEYS, `${a}: ${k}`).not.toContain(k);
+    }
+    // The table refuses them as it refuses the system's keys (ShortcutSettings).
+    const settings = source("/src/components/ShortcutSettings.tsx");
+    expect(settings).toContain("SYSTEM_KEYS.push(...RESERVED_KEYS);");
+    expect(settings).toContain("if (SYSTEM_KEYS.includes(comboText(combo))) {");
+    // And the keys still do what they did.
+    expect(appHotkey({ code: "KeyJ", ctrlKey: true, shiftKey: true, altKey: false, metaKey: false } as KeyboardEvent)).toBe("jump");
+  });
+});
+
+// Their #393 shows a program's title (OSC 0 and 2) on the tab. It comes from
+// the server: their cleaning takes out what can't be seen and cuts it, and the
+// fork refuses one too long to be real before xterm sets it.
+describe("a program's title", () => {
+  it("is refused past TITLE_RAW_MAX, before xterm sets it, for OSC 0 and 2", () => {
+    expect(titleTooLong("x".repeat(TITLE_RAW_MAX))).toBe(false);
+    expect(titleTooLong("x".repeat(TITLE_RAW_MAX + 1))).toBe(true);
+    const mount = source("/src/fork/terminal/mount.ts");
+    expect(mount).toContain("for (const ident of [0, 2]) term.parser.registerOscHandler(ident, titleTooLong);");
+  });
+
+  it("shows as one line of text, without hidden or right-to-left characters, cut at TITLE_MAX", () => {
+    expect(cleanTerminalTitle("web\u202e10-bew\u200b\x1b[31m\n  ~/logs")).toBe("web10-bew[31m ~/logs");
+    const long = cleanTerminalTitle("y".repeat(TITLE_RAW_MAX));
+    expect(Array.from(long)).toHaveLength(TITLE_MAX);
+    expect(long.endsWith("…")).toBe(true);
   });
 });

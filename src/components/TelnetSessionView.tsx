@@ -6,6 +6,8 @@ import { AuthPrompts } from "./AuthPrompts";
 import TerminalView from "./TerminalView";
 import { readUseSshAgent } from "../util/sshAgent";
 import { tk, useT } from "../i18n";
+import NotConnected from "./NotConnected";
+import { useWaitToConnect } from "../hooks/useWaitToConnect";
 
 // A telnet server's tab (#179). It connects — straight to the server, or
 // through the node's SSH server, asking that server's host-key and login
@@ -19,8 +21,11 @@ type Status = "connecting" | "connected" | "failed" | "disconnected";
 
 const NOT_ENCRYPTED = tk("Telnet isn't encrypted: what is typed here, passwords too, crosses the network as plain text.");
 
-export default function TelnetSessionView({ session, displayName, onClose, onStatusChange, isActiveView = false, onScreen = true, onPromptChange }: any) {
+export default function TelnetSessionView({ session, displayName, onClose, onStatusChange, isActiveView = false, onScreen = true, onPromptChange, onSessionTitle }: any) {
   const t = useT();
+  // A tab opened at startup without connecting waits for Connect: the tab
+  // shows it as "idle", and the status here stays "connecting" until then.
+  const { waiting, connectNow } = useWaitToConnect(session);
   const [status, setStatus] = useState<Status>("connecting");
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [reason, setReason] = useState("");
@@ -45,7 +50,7 @@ export default function TelnetSessionView({ session, displayName, onClose, onSta
   const generationRef = useRef<number | null>(null);
   const promptWaiting = !!(fingerprintPrompt || kbiPrompt);
 
-  useEffect(() => { onStatusChange?.(session.id, status); }, [onStatusChange, session.id, status]);
+  useEffect(() => { onStatusChange?.(session.id, waiting ? "idle" : status); }, [onStatusChange, session.id, status, waiting]);
   useEffect(() => { onPromptChange?.(session.id, promptWaiting); }, [onPromptChange, session.id, promptWaiting]);
   useEffect(() => () => onPromptChange?.(session.id, false), [onPromptChange, session.id]);
   useEffect(() => {
@@ -76,6 +81,8 @@ export default function TelnetSessionView({ session, displayName, onClose, onSta
   // Listen first, then connect: a result that comes back at once must find
   // its listener (see #167).
   useEffect(() => {
+    // Opened at startup without connecting: nothing starts until Connect.
+    if (waiting) return;
     let cancelled = false;
     const id = session.id;
     const subs = Promise.all([
@@ -142,7 +149,7 @@ export default function TelnetSessionView({ session, displayName, onClose, onSta
       subs.then((fns) => fns.forEach((f) => f()));
       invoke("disconnect_session", { sessionId: id }).catch(console.error);
     };
-  }, [session.id, terminalId, connect, pushLog]);
+  }, [session.id, terminalId, connect, pushLog, waiting]);
 
   const handleFingerprintResponse = async (accepted: boolean) => {
     const nonce = fingerprintPrompt?.nonce;
@@ -159,6 +166,7 @@ export default function TelnetSessionView({ session, displayName, onClose, onSta
   };
 
   const name = displayName || session.serverName;
+  if (waiting) return <NotConnected name={name} onConnect={connectNow} onClose={onClose} />;
   const working = status === "connecting";
   const broken = status === "failed" || status === "disconnected";
   const statusText = working
@@ -173,7 +181,7 @@ export default function TelnetSessionView({ session, displayName, onClose, onSta
 
   const logList = (
     <div
-      className="flex-1 min-h-0 bg-[#121214] border border-white/5 rounded-2xl p-4 font-mono text-[12px] overflow-y-auto overscroll-contain custom-scrollbar select-text cursor-text"
+      className="flex-1 min-h-0 bg-shade-121214 border border-white/5 rounded-2xl p-4 font-mono text-[12px] overflow-y-auto overscroll-contain custom-scrollbar select-text cursor-text"
       style={{ WebkitOverflowScrolling: "touch", lineHeight: 1.5 }}
     >
       {logs.map((l, i) => (
@@ -189,8 +197,8 @@ export default function TelnetSessionView({ session, displayName, onClose, onSta
   );
 
   return (
-    <div className="relative flex-1 flex flex-col min-h-0 bg-[#0a0a0c] text-white overflow-hidden" data-telnet-status={status}>
-      <div className="h-10 shrink-0 flex items-center gap-2 px-3 border-b border-white/5 bg-[#141417]">
+    <div className="relative flex-1 flex flex-col min-h-0 bg-shade-0a0a0c text-white overflow-hidden" data-telnet-status={status}>
+      <div className="h-10 shrink-0 flex items-center gap-2 px-3 border-b border-white/5 bg-shade-141417">
         <span className={`shrink-0 ${broken ? "text-red-400" : "text-primary"}`} aria-hidden="true">
           {working ? <Loader2 size={14} className="animate-spin-brief" /> : broken ? <AlertTriangle size={14} /> : <TerminalSquare size={14} />}
         </span>
@@ -246,14 +254,15 @@ export default function TelnetSessionView({ session, displayName, onClose, onSta
             connectionEpoch={epoch}
             serverId={session.serverId}
             serverName={session.serverName}
+            onTitle={(_tid, title) => onSessionTitle?.(session.id, title)}
           />
           {broken && reason && (
-            <div className="absolute left-3 right-3 top-3 z-20 px-3 py-2 rounded-lg border border-red-500/20 bg-[#1a0f10]/95 text-[12px] text-red-300/90 break-words">
+            <div className="absolute left-3 right-3 top-3 z-20 px-3 py-2 rounded-lg border border-red-500/20 bg-shade-1a0f10/95 text-[12px] text-red-300/90 break-words">
               {reason}
             </div>
           )}
           {showLog && (
-            <div className="absolute inset-0 z-30 flex flex-col p-3 sm:p-4 bg-[#0a0a0c]/95">
+            <div className="absolute inset-0 z-30 flex flex-col p-3 sm:p-4 bg-shade-0a0a0c/95">
               {logList}
             </div>
           )}

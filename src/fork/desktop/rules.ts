@@ -25,6 +25,18 @@ export type DesktopSession = {
   id: string; serverId: number; serverName: string; serverUuid?: string | null;
   protocol?: ServerProtocol; host?: string; port?: number; mirrors?: string;
   runOnConnect?: string; runOnConnectEvery?: boolean; runOnConnectHeld?: boolean; quickAuth?: QuickAuth | null;
+  /** Opened with the profile, not connected (their #394, "At startup: Open
+   *  the tab"): it waits for Connect. */
+  openOnly?: boolean;
+};
+
+/** The tabs of `servers` that opened with the profile and still wait to be
+ *  connected (their #394: status "idle"). Opening such a server from the
+ *  session tree, Broadcast or the AI's Share connects its tab, as their
+ *  openServer does for one opened from the Servers list. */
+export const waitingTabs = (servers: readonly { id: number }[], sessions: readonly DesktopSession[], statuses: Record<string, string>): string[] => {
+  const ids = new Set(servers.map((s) => `session-${s.id}`));
+  return sessions.filter((s) => ids.has(s.id) && s.openOnly && statuses[s.id] === "idle").map((s) => s.id);
 };
 
 /** The tab for a saved server, as opening it makes it: its kind as
@@ -63,6 +75,12 @@ export const wouldEnd = (ssh: number, local: number): { what: string; many: bool
   return { what: parts.join(" and "), many: ssh + local > 1 };
 };
 
+/** The server tabs closing the window or locking would end: not one that
+ *  opened with the profile and still waits for Connect (their #394,
+ *  "idle"), which has no connection to end. */
+export const endingTabs = (sessions: readonly { id: string }[], statuses: Record<string, string>): number =>
+  sessions.filter((s) => statuses[s.id] !== "idle").length;
+
 /** A tab's right-click menu closes the tabs other than it, after it, the
  *  disconnected ones, or every one. */
 export type CloseWhich = "others" | "right" | "dead" | "all";
@@ -88,22 +106,6 @@ export const closeCounts = (tabs: string[], targetId: string, statuses: Record<s
     all: tabs.length,
   };
 };
-
-/** Ctrl+Tab (1) and Ctrl+Shift+Tab (-1) through the title bar's tabs, left
- *  to right and round: the tab they go to, or null when there are none.
- *  From a view that isn't a tab (Settings, the vault…) they go to the first
- *  or the last. */
-export const stepTab = (order: string[], current: string, dir: 1 | -1): string | null => {
-  if (order.length === 0) return null;
-  const at = order.indexOf(current);
-  return order[at < 0 ? (dir > 0 ? 0 : order.length - 1) : (at + dir + order.length) % order.length];
-};
-
-/** A key typed inside a remote desktop (RDP or VNC): the original project
- *  marks its screen `data-remote-keys` (#339), and the app's own shortcuts
- *  leave those keys to the remote. */
-export const inRemoteDesktop = (target: EventTarget | null): boolean =>
-  !!(target as Element | null)?.closest?.("[data-remote-keys]");
 
 /** The thin line after a title-bar tab, as the original project draws it
  *  between its classic tabs (#339): between two tabs where neither is the

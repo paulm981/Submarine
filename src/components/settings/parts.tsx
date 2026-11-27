@@ -19,7 +19,7 @@ export function SettingsSection({ icon: Icon, title, children }: {
   );
 }
 
-export const CARD = "bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl";
+export const CARD = "bg-shade-121215 border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl";
 
 export function Switch({ on, label, onToggle, disabled }: {
   on: boolean;
@@ -36,7 +36,7 @@ export function Switch({ on, label, onToggle, disabled }: {
       onClick={onToggle}
       className={`relative shrink-0 w-11 h-6 rounded-full transition-colors disabled:opacity-40 ${on ? "bg-primary" : "bg-zinc-700"}`}
     >
-      <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${on ? "left-[22px]" : "left-0.5"}`} />
+      <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-knob transition-all ${on ? "left-[22px]" : "left-0.5"}`} />
     </button>
   );
 }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type MutableRefObject, useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { TreeItems } from "../../components/SessionTree";
@@ -8,6 +8,7 @@ import { useConfirm } from "../../ui/confirm";
 import { normalizeRules, onSlowRule, setCustomRules, setServerHighlights } from "../../ui/highlight";
 import { reorderById, useTabDrag } from "../../ui/tabDrag";
 import { appHotkey } from "../../ui/terminalDock";
+import { setTabStepOrder } from "../keys";
 import { setServerSchemes } from "../../ui/terminalThemes";
 import { OPEN_SERVER } from "../../util/ai";
 import { HOME_HERE } from "../terminal/here";
@@ -19,7 +20,7 @@ import { readRdpOptions, writeRdpOptions } from "../../util/rdpOptions";
 import { readSessionKeep, writeSessionKeep } from "../../util/sessionKeep";
 import { serverProtocol } from "../../util/serverProtocol";
 import {
-  type CloseWhich, type DesktopSession, HAS_HOME, START_VIEW, inRemoteDesktop, osChecksDue, sessionFor, stepTab, tabsToClose,
+  type CloseWhich, type DesktopSession, HAS_HOME, START_VIEW, endingTabs, osChecksDue, sessionFor, tabsToClose, waitingTabs, wouldEnd,
 } from "./rules";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -160,6 +161,17 @@ export const useOsBadges = (o: {
   }, [o.statuses, o.sessions, o.servers, o.detectOs]);
 };
 
+/** What closing the window or locking would end (`wouldEnd`), read when it's
+ *  asked, from DesktopApp's refs and the tabs' statuses now: a tab waiting
+ *  for Connect (their #394) doesn't count, so it never brings the question. */
+export const useWouldEnd = (
+  sessions: MutableRefObject<{ id: string }[]>, statuses: Record<string, string>, homeShells: MutableRefObject<number>,
+) => {
+  const statusesRef = useRef(statuses);
+  statusesRef.current = statuses;
+  return useCallback(() => wouldEnd(endingTabs(sessions.current, statusesRef.current), homeShells.current), [sessions, homeShells]);
+};
+
 /** Closing tabs: one connected session asks first, unless that's turned off
  *  in Settings › Servers, or with "Don't ask again" right in the prompt
  *  (`askCloseSession`). `closeSessions` closes several (All tabs ▾), always
@@ -242,19 +254,17 @@ export const useCloseSessions = <S extends { id: string }, T extends { confirmCl
   return { askCloseSession, closeSessions, closeTabs };
 };
 
-/** The keys for moving between tabs: Ctrl+Shift+J opens All tabs ▾ to jump
+/** The keys for moving between tabs. Ctrl+Shift+J opens All tabs ▾ to jump
  *  by name (its search is focused; Ctrl+Shift+K is the original project's
- *  Clear terminal, #294); Ctrl+Tab / Ctrl+Shift+Tab step through
- *  the title bar left to right: Home, Broadcast's tab while it's on, then the server tabs (stepTab).
- *  preventDefault keeps the webview from doing anything of its own with
- *  Ctrl+Tab. Inside a remote desktop (`data-remote-keys`, the original
- *  project's #339) Ctrl+Tab is the remote's own, so it's left alone there.
+ *  Clear terminal, #294). Next tab and Previous tab (Ctrl+Tab and
+ *  Ctrl+Shift+Tab by default) are the original project's, in their shortcuts
+ *  table (#374): their handler in DesktopApp steps through the title bar left
+ *  to right, Home, Broadcast's tab while it's on, then the server tabs, from
+ *  the order kept here (setTabStepOrder, fork/keys' tabStepList). So one
+ *  press moves one tab, and only their handler moves it.
  *  Returns whether All tabs ▾ is open, and the tabs in the strip's order
  *  (for its dividers, tabDivider). */
-export const useTabKeys = (o: {
-  isUnlocked: boolean; sessions: { id: string }[]; activeView: string;
-  mergedSessionIds: string[]; setMergedSessionIds: (ids: string[]) => void; setActiveView: (v: string) => void;
-}) => {
+export const useTabKeys = (o: { isUnlocked: boolean; sessions: { id: string }[] }) => {
   const [allTabsOpen, setAllTabsOpen] = useState(false);
   // The tabs as the strip shows them: Broadcast's servers folded into its tab (#224).
   const bc = useBroadcast();
@@ -263,29 +273,18 @@ export const useTabKeys = (o: {
     ...(broadcastLive(bc) ? ["wall"] : []),
     ...shownTabs(o.sessions, bc).map(s => s.id),
   ];
-  // Set anew each render, so they go by the tabs and the split as they are.
-  const stepTabRef = useRef((_dir: 1 | -1) => {});
-  stepTabRef.current = (dir) => {
-    const next = stepTab(order, o.activeView, dir);
-    if (next === null) return;
-    // Leaves a split the way a plain click on a tab does: only for a tab
-    // that isn't part of it.
-    if (!o.mergedSessionIds.includes(next)) o.setMergedSessionIds([]);
-    o.setActiveView(next);
-  };
+  setTabStepOrder(order);
   const canJumpRef = useRef(false);
   canJumpRef.current = o.isUnlocked && o.sessions.length > 0;
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const k = appHotkey(e);
-      if (k !== "jump" && k !== "next" && k !== "prev") return;
-      if (k !== "jump" && inRemoteDesktop(e.target)) return;
+      if (k !== "jump") return;
       e.preventDefault();
-      if (e.repeat && k === "jump") return;
+      if (e.repeat) return;
       // Not under a dialog: what it asks about is the view as it is.
       if (document.querySelector('[aria-modal="true"]')) return;
-      if (k === "jump") { if (canJumpRef.current) setAllTabsOpen(true); }
-      else stepTabRef.current(k === "next" ? 1 : -1);
+      if (canJumpRef.current) setAllTabsOpen(true);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -457,6 +456,8 @@ export const useSessionTree = (o: {
       return [...prev, ...fresh];
     });
     o.setActiveView(`session-${list[0].id}`);
+    // A tab that opened with the profile and waits connects now (their #394).
+    for (const sid of waitingTabs(list, o.sessions, o.statuses)) window.dispatchEvent(new CustomEvent(`session-reconnect-${sid}`));
     return list;
   };
   // Broadcast to a folder, or the servers picked (#218): open them, and tick

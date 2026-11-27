@@ -16,8 +16,26 @@
 
 /// The text of `fn name` in `src`, from its `fn` line to its closing brace
 /// (the first line after it that is the `fn` line's indent and `}`, as
-/// rustfmt writes it). None when there is no such function.
-fn body_of<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+/// rustfmt writes it). None when there is no such function. Where there's
+/// more than one, the one at the top level of the file: a test's helper of
+/// the same name (the original project's `fn run` in a test module, #387)
+/// doesn't stand in for the app's own.
+pub(crate) fn body_of<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+    let mut first = None;
+    let mut rest = src;
+    while let Some((body, indented, after)) = next_body(rest, name) {
+        if !indented {
+            return Some(body);
+        }
+        first = first.or(Some(body));
+        rest = after;
+    }
+    first
+}
+
+/// The first `fn name` in `src` (body_of): its text, whether it's indented,
+/// and the text after it.
+fn next_body<'a>(src: &'a str, name: &str) -> Option<(&'a str, bool, &'a str)> {
     let mut offset = 0;
     let mut start: Option<(usize, String)> = None;
     for line in src.split_inclusive('\n') {
@@ -32,14 +50,14 @@ fn body_of<'a>(src: &'a str, name: &str) -> Option<&'a str> {
                 if after_fn.is_some_and(|rest| rest.strip_prefix(name).is_some_and(|r| r.starts_with(['(', '<']))) {
                     // A body on the same line: `fn d() {}`.
                     if code.ends_with('}') {
-                        return Some(line);
+                        return Some((line, !indent.is_empty(), &src[offset + line.len()..]));
                     }
                     start = Some((offset, indent.to_string()));
                 }
             }
             Some((from, indent)) => {
                 if text == format!("{indent}}}") {
-                    return Some(&src[*from..offset + line.len()]);
+                    return Some((&src[*from..offset + line.len()], !indent.is_empty(), &src[offset + line.len()..]));
                 }
             }
         }
@@ -67,6 +85,21 @@ pub(crate) fn assert_hooks(file: &str, src: &str, hooks: &[(&str, &str, usize)])
         }
     }
     assert!(missing.is_empty(), "a fork hook was lost or moved (FORK.md, \"Keeping up with the original project\"):\n{}", missing.join("\n"));
+}
+
+/// Assert that `function` in `src`, the text of `file`, has each of `steps`
+/// once, in this order: for a hook whose place matters, not only that it's
+/// there (Live Edit's watcher registers after the fork's "already watching"
+/// return, #283).
+pub(crate) fn assert_in_order(file: &str, src: &str, function: &str, steps: &[&str]) {
+    let body = body_of(src, function).unwrap_or_else(|| panic!("{file} has no `fn {function}` any more"));
+    let mut from = 0;
+    for step in steps {
+        assert_eq!(body.matches(step).count(), 1, "`{function}` in {file} should have `{step}` once");
+        let at = body.find(step).unwrap_or_default();
+        assert!(at >= from, "a fork hook was moved: in `{function}` ({file}), `{step}` should come after the steps before it: {steps:?}");
+        from = at;
+    }
 }
 
 /// The `CREATE TABLE` statement a new vault makes `table` with (lib.rs,
@@ -98,6 +131,18 @@ mod tests {
         assert!(body_of("fn ab() {\n}\n", "a").is_none());
     }
 
+    /// A test's helper of the same name, earlier in the file, doesn't stand
+    /// in for the function at the top level; with none there, the first.
+    #[test]
+    fn the_top_level_function_comes_first() {
+        let src = "mod tests {\r\n    fn run(x: u8) {\r\n        helper();\r\n    }\r\n}\r\n\r\npub fn run() {\r\n    hook(1);\r\n    hook(2);\r\n}\r\n";
+        let body = body_of(src, "run").unwrap();
+        assert_eq!((body.matches("hook(").count(), body.matches("helper(").count()), (2, 0));
+        assert_eq!(body_of(src, "run").unwrap(), "pub fn run() {\r\n    hook(1);\r\n    hook(2);\r\n}\r\n");
+        let only_indented = "impl S {\n    fn c(&self) {\n        hook(4);\n    }\n    fn c2() {}\n}\n";
+        assert_eq!(body_of(only_indented, "c").unwrap().matches("hook(").count(), 1);
+    }
+
     #[test]
     fn the_app_tables_come_from_lib_rs() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -119,6 +164,13 @@ mod tests {
         assert_hooks("monitor.rs", include_str!("monitor.rs"), &[("", "mod jump_host_tests;", 1)]);
         assert_hooks("docker.rs", include_str!("docker.rs"), &[("", "mod cmd_tests;", 1)]);
         assert_hooks("about.rs", include_str!("about.rs"), &[("", "    mod fork;", 1)]);
+    }
+
+    #[test]
+    fn steps_out_of_order_are_named() {
+        assert_in_order("x.rs", SRC, "b", &["hook(2)", "hook(3)"]);
+        assert!(std::panic::catch_unwind(|| assert_in_order("x.rs", SRC, "b", &["hook(3)", "hook(2)"])).is_err());
+        assert!(std::panic::catch_unwind(|| assert_in_order("x.rs", SRC, "b", &["hook(2)", "hook(4)"])).is_err());
     }
 
     #[test]

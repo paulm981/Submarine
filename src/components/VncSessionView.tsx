@@ -12,6 +12,8 @@ import { VNC_PRESETS, readVncOptions, vncNeedsReconnect, writeVncOptions, type V
 import { type PasteKeys, pasteKeysOf, readLocalClipboard, takeServerCopy } from "../util/rdpClipboard";
 import { scancodeFor } from "../util/scancodes";
 import { useT, tk } from "../i18n";
+import NotConnected from "./NotConnected";
+import { useWaitToConnect } from "../hooks/useWaitToConnect";
 import { copyText } from "../util/clipboard";
 
 // A VNC server's tab: the server's screen in the tab itself (vnc_client.rs),
@@ -30,6 +32,9 @@ const NOT_ENCRYPTED = tk("VNC isn't encrypted: the screen and what is typed cros
 // `shown`: the tab is on screen (alone, or in a split), not behind another view.
 export default function VncSessionView({ session, displayName, onClose, onStatusChange, isActiveView = false, shown = true, onPromptChange }: any) {
   const t = useT();
+  // A tab opened at startup without connecting waits for Connect: the tab
+  // shows it as "idle", and the status here stays "connecting" until then.
+  const { waiting, connectNow } = useWaitToConnect(session);
   const [status, setStatus] = useState<Status>("connecting");
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [reason, setReason] = useState("");
@@ -66,7 +71,7 @@ export default function VncSessionView({ session, displayName, onClose, onStatus
   const kbiFirstInputRef = useRef<HTMLInputElement | null>(null);
   const promptWaiting = !!(fingerprintPrompt || kbiPrompt);
 
-  useEffect(() => { onStatusChange?.(session.id, status); }, [onStatusChange, session.id, status]);
+  useEffect(() => { onStatusChange?.(session.id, waiting ? "idle" : status); }, [onStatusChange, session.id, status, waiting]);
   useEffect(() => { onPromptChange?.(session.id, promptWaiting); }, [onPromptChange, session.id, promptWaiting]);
   useEffect(() => () => onPromptChange?.(session.id, false), [onPromptChange, session.id]);
   useEffect(() => {
@@ -115,6 +120,8 @@ export default function VncSessionView({ session, displayName, onClose, onStatus
   // Listen first, then connect: a result that comes back at once must find
   // its listener (see #167).
   useEffect(() => {
+    // Opened at startup without connecting: nothing starts until Connect.
+    if (waiting) return;
     let cancelled = false;
     const id = session.id;
     const subs = Promise.all([
@@ -190,7 +197,7 @@ export default function VncSessionView({ session, displayName, onClose, onStatus
       subs.then((fns) => fns.forEach((f) => f()));
       invoke("disconnect_session", { sessionId: id }).catch(console.error);
     };
-  }, [session.id, connect, pushLog, t]);
+  }, [session.id, connect, pushLog, t, waiting]);
 
   const handleFingerprintResponse = async (accepted: boolean) => {
     const nonce = fingerprintPrompt?.nonce;
@@ -282,6 +289,7 @@ export default function VncSessionView({ session, displayName, onClose, onStatus
   }, [status]);
 
   const name = displayName || session.serverName;
+  if (waiting) return <NotConnected name={name} onConnect={connectNow} onClose={onClose} />;
   const working = status === "connecting";
   const broken = status === "failed" || status === "disconnected";
   const connected = status === "connected";
@@ -291,10 +299,10 @@ export default function VncSessionView({ session, displayName, onClose, onStatus
     : null;
 
   return (
-    <div data-vnc-status={status} className="relative flex-1 flex flex-col bg-[#0a0a0c] text-white overflow-hidden">
+    <div data-vnc-status={status} className="relative flex-1 flex flex-col bg-shade-0a0a0c text-white overflow-hidden">
       {/* The labels show by the bar's own width, not the window's: in a split
           view the tab is a part of the window. */}
-      <div className="shrink-0 h-9 px-2 sm:px-3 flex items-center gap-2 border-b border-white/5 bg-[#141417] [container-type:inline-size]">
+      <div className="shrink-0 h-9 px-2 sm:px-3 flex items-center gap-2 border-b border-white/5 bg-shade-141417 [container-type:inline-size]">
         <span className={`shrink-0 ${broken ? "text-red-400" : "text-primary"}`} aria-hidden="true">
           {working ? <Loader2 size={14} className="animate-spin-brief" /> : broken ? <AlertTriangle size={14} /> : <MonitorSmartphone size={14} />}
         </span>
@@ -396,11 +404,11 @@ export default function VncSessionView({ session, displayName, onClose, onStatus
           scale={opts.resolution}
         />
         {(!connected || showLog) && (
-          <div className="absolute inset-0 z-10 flex flex-col p-4 sm:p-8 bg-[#0a0a0c]/90">
+          <div className="absolute inset-0 z-10 flex flex-col p-4 sm:p-8 bg-shade-0a0a0c/90">
             <div className="max-w-2xl w-full mx-auto flex-1 flex flex-col min-h-0">
               {broken && reason && <p className="mb-3 sm:mb-4 text-[12.5px] text-red-300/90 break-words">{reason}</p>}
               <div
-                className="flex-1 min-h-0 bg-[#121214] border border-white/5 rounded-2xl p-4 font-mono text-[12px] overflow-y-auto overscroll-contain custom-scrollbar select-text cursor-text"
+                className="flex-1 min-h-0 bg-shade-121214 border border-white/5 rounded-2xl p-4 font-mono text-[12px] overflow-y-auto overscroll-contain custom-scrollbar select-text cursor-text"
                 style={{ WebkitOverflowScrolling: "touch", lineHeight: 1.5 }}
               >
                 {logs.map((l, i) => (

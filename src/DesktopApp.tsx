@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, Suspense } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -6,52 +6,47 @@ import {
   Plus, X, RefreshCw, Terminal, Key, Trash2,
   ArrowLeftRight, Shield, User, Cpu, TerminalSquare, List, Edit2,
   StickyNote, Search, Square, Copy, ChevronLeft, ChevronRight, MoreVertical, Radio,
-  ChevronDown, Columns, LayoutGrid, Pin, PinOff, Server
+  ChevronDown, Columns, LayoutGrid, Pin, PinOff, Server, Lock, Tag
 } from "lucide-react";
 import { useBroadcast } from "./ui/broadcast";
 
 import ProfileSelectPage from "./components/ProfileSelectPage";
 import logoUrl from "./assets/logo-ui.png";
 import PasswordField from "./components/PasswordField";
-import QuickConnectModal, { QuickAuth } from "./components/QuickConnectModal";
+import type { QuickAuth } from "./components/QuickConnectModal";
+import { fromWorkspace, loadWorkspace, workspaceNow } from "./workspaceLoader";
+import SecretTextarea from "./components/SecretTextarea";
+import { splitTags, tagsProblem } from "./util/commandTags";
 import { useConfirm, useTextPrompt } from "./ui/confirm";
 import { useSlideOverFocus } from "./ui/slideOverFocus";
 import { RenameInput } from "./ui/renameInput";
 import { forgetServerBookmarks } from "./util/sftpBookmarks";
 import { useIsNarrow } from "./hooks/useViewport";
 import { IS_MOBILE } from "./util/platform";
-import { FONT_FAMILY_KEY, FONT_SIZE_KEY, readFontFamily, readFontSize } from "./util/terminalFont";
+import { FONT_FAMILY_KEY, FONT_SIZE_KEY, FONT_SIZE_REQUEST, readFontFamily, readFontSize, requestedFontSize } from "./util/terminalFont";
 import { UI_FONT_FAMILY_KEY, applyFonts, readUiFontFamily } from "./util/uiFont";
+import { BG_COLOR_KEY, PRIMARY_COLOR_KEY, applyTheme, readBackgroundColor, readPrimaryColor } from "./util/appTheme";
 import { SCROLLBACK_KEY, readScrollback } from "./util/terminalScrollback";
 import { USE_LOCAL_SHELL_KEY, readUseLocalShell } from "./util/terminalShell";
+import { SHOW_TERMINAL_TITLES_KEY, readShowTerminalTitles } from "./util/terminalTitle";
 import { USE_SSH_AGENT_KEY, readUseSshAgent } from "./util/sshAgent";
+import { type LogChoice, forgetServerLogChoice, readServerLogChoice, writeServerLogChoice } from "./util/sessionLog";
 import { AUTO_RECONNECT_KEY, DEFAULT_SESSION_KEEP, SEND_KEEPALIVES_KEY, forgetSessionKeep, readAutoReconnectDefault, readSendKeepalivesDefault, readSessionKeep, writeSessionKeep } from "./util/sessionKeep";
 import { USE_SSH_CONFIG_KEY, readUseSshConfig } from "./util/sshConfig";
+import { UPDATE_BETA_KEY, readUpdateBeta } from "./util/updateChannel";
 import { DEFAULT_RDP_OPTIONS, forgetRdpOptions, readRdpOptions, writeRdpOptions } from "./util/rdpOptions";
 import { DEFAULT_VNC_OPTIONS, forgetVncOptions, readVncOptions, writeVncOptions } from "./util/vncOptions";
 import { Sidebar } from "./components/Sidebar";
-import { NodeGrid } from "./components/NodeGrid";
 import * as Fork from "./fork/desktop";
 import { OpenServerMenu } from "./components/OpenServerMenu";
+import { APP_SHORTCUTS, matchShortcut } from "./util/shortcuts";
 import { accentOf } from "./util/serverLook";
 import { folderTree } from "./util/folderTree";
 import { CommandScope, describeScope, parseCommandScope, scopeToJson } from "./util/commandScope";
 import CommandScopePicker from "./components/CommandScopePicker";
 import type { HeldDeletion } from "./components/HeldDeletions";
-import AddNodePanel from "./components/AddNodePanel";
-import TerminalView from "./components/TerminalView";
-import SettingsPanel from "./components/SettingsPanel";
-import ProfilePanel from "./components/ProfilePanel";
-import { SessionView } from "./components/SessionView";
-import RdpSessionView from "./components/RdpSessionView";
-import TelnetSessionView from "./components/TelnetSessionView";
-import FtpSessionView from "./components/FtpSessionView";
 import { isFtp, serverProtocol, type ServerProtocol } from "./util/serverProtocol";
-import VncSessionView from "./components/VncSessionView";
-import MonitoringPanel from "./components/MonitoringPanel";
-import { AiPage } from "./components/ai/AiPage";
-import { AgentsPanel } from "./components/agents/AgentsPanel";
-import { clearUrlCache } from "./components/ai/markdownParse";
+import { startupChoice } from "./util/startupChoice";
 import { ai, errText, AI_OPEN_EVENT, AI_OPEN_SERVER_EVENT, type AiOpenServerDetail } from "./util/aiApi";
 import { clearAiFocus, clearFeeds, requestAiFocus } from "./util/aiEvents";
 import { ErrorBoundary, Guarded } from "./ui/ErrorBoundary";
@@ -59,6 +54,23 @@ import { FormError, unsavedQuestion, useUnsavedGuard } from "./ui/slideOverForm"
 import { normalizeMirror, normalizeTunnel, parseObjectList } from "./util/serverJson";
 import { tk, tn, tx, useT } from "./i18n";
 import { joinSentences } from "./util/sentences";
+
+// The unlocked app is a chunk of its own (workspace.ts); these stand in for its
+// components and render them directly once it is loaded.
+const QuickConnectModal = fromWorkspace("QuickConnectModal");
+const NodeGrid = fromWorkspace("NodeGrid");
+const AddNodePanel = fromWorkspace("AddNodePanel");
+const TerminalView = fromWorkspace("TerminalView");
+const SettingsPanel = fromWorkspace("SettingsPanel");
+const ProfilePanel = fromWorkspace("ProfilePanel");
+const SessionView = fromWorkspace("SessionView");
+const RdpSessionView = fromWorkspace("RdpSessionView");
+const TelnetSessionView = fromWorkspace("TelnetSessionView");
+const FtpSessionView = fromWorkspace("FtpSessionView");
+const VncSessionView = fromWorkspace("VncSessionView");
+const MonitoringPanel = fromWorkspace("MonitoringPanel");
+const AiPage = fromWorkspace("AiPage");
+const AgentsPanel = fromWorkspace("AgentsPanel");
 
 const appWindow = getCurrentWindow();
 
@@ -87,15 +99,35 @@ const SESSION_STATUS: Record<string, string> = {
 // `host` and `port`: as the tab was opened (Fork.DesktopSession).
 // `serverUuid` is the saved server's sync id, which keys this device's own
 // per-server settings (the Shell button, see util/shellSync.ts).
-type Session = { id: string; serverId: number; serverName: string; serverUuid?: string | null; protocol?: ServerProtocol; host?: string; port?: number; mirrors?: string; runOnConnect?: string; runOnConnectEvery?: boolean; runOnConnectHeld?: boolean; quickAuth?: QuickAuth | null };
+// `openOnly`: opened when the profile was unlocked, without connecting (the
+// server's "At startup: Open the tab"); the tab waits for Connect
+// (hooks/useWaitToConnect).
+type Session = { id: string; serverId: number; serverName: string; serverUuid?: string | null; protocol?: ServerProtocol; host?: string; port?: number; mirrors?: string; runOnConnect?: string; runOnConnectEvery?: boolean; runOnConnectHeld?: boolean; quickAuth?: QuickAuth | null; openOnly?: boolean };
 const { START_VIEW, BOLD_BRIGHT_KEY, MIN_CONTRAST_KEY, readBoldBright, readMinContrast } = Fork;
 
-const hexToRgb = (hex: string) => {
-  const r = parseInt(hex.slice(1, 3), 16);
-  const g = parseInt(hex.slice(3, 5), 16);
-  const b = parseInt(hex.slice(5, 7), 16);
-  return `${r} ${g} ${b}`;
-};
+// A saved server's tab, as a click on it opens it.
+function sessionOf(server: any): Session {
+  return {
+    id: `session-${server.id}`,
+    serverId: server.id,
+    serverName: server.name,
+    protocol: serverProtocol(server.protocol),
+    host: server.host,
+    port: server.port,
+    // Pass the raw mirrors JSON through to SessionView so the
+    // MirrorsPanel can pre-populate "Saved on this node" without
+    // another round-trip to the backend.
+    mirrors: server.mirrors,
+    serverUuid: server.uuid ?? null,
+    // Commands to auto-run once on the first terminal (see SessionView).
+    runOnConnect: server.run_on_connect || "",
+    // And once into each new terminal of the tab (#256).
+    runOnConnectEvery: !!server.run_on_connect_every,
+    // Set or changed elsewhere, not allowed here yet: SessionView asks
+    // before typing them.
+    runOnConnectHeld: (server.held || []).includes("run_on_connect"),
+  };
+}
 
 function DesktopApp() {
   const t = useT();
@@ -132,6 +164,14 @@ function DesktopApp() {
   // lock: session ids come from each profile's server ids, so another
   // profile would reuse them.
   const [tabNames, setTabNames] = useState<Record<string, string>>({});
+  // The title a program in a terminal set itself (OSC 0/2, #391), by session
+  // id: the active terminal's, cleaned (util/terminalTitle). Shown on the tab
+  // after the name, and only there: lists, prompts and dialogs keep the
+  // server's own name. Dropped when the session closes and on lock, like
+  // tabNames: session ids come from each profile's server ids, so another
+  // profile would reuse them.
+  const [oscTitles, setOscTitles] = useState<Record<string, string>>({});
+  const clearOscTitle = (sid: string) => setOscTitles(prev => { const { [sid]: _, ...rest } = prev; return rest; });
   // The tab whose menu shows the name editor; gone with the menu.
   const [tabRename, setTabRename] = useState<string | null>(null);
   useEffect(() => { if (!tabMenu) setTabRename(null); }, [tabMenu]);
@@ -193,6 +233,21 @@ function DesktopApp() {
       const next = prev.filter(i => i.sessionId !== sid || terms.some(t => t.id === i.terminalId));
       return next.length === prev.length ? prev : next;
     });
+  }, []);
+  // A session's active terminal set (or cleared) its own title (OSC 0/2,
+  // #391). Stable identity matters: SessionView memoises on prop equality,
+  // same reasoning as handleTerminalsChange above. An unchanged title is a
+  // no-op so a program that re-sends its title doesn't re-render the app.
+  const handleSessionTitle = useCallback((sid: string, title: string) => {
+    if (title) {
+      setOscTitles(prev => (prev[sid] === title ? prev : { ...prev, [sid]: title }));
+    } else {
+      setOscTitles(prev => {
+        if (!(sid in prev)) return prev;
+        const { [sid]: _, ...rest } = prev;
+        return rest;
+      });
+    }
   }, []);
   const wallHasTerminal = (terminalId: string) => wallItems.some(i => i.terminalId === terminalId);
   const pinTerminalToWall = (sid: string, terminalId: string) => {
@@ -304,7 +359,7 @@ function DesktopApp() {
   const [logs, setLogs] = useState<{ msg: string, type: string, time: string }[]>([]);
   const [isCommandPanelOpen, setIsCommandPanelOpen] = useState(false);
   // `scope`: which servers it's for (util/commandScope); null for all of them.
-  const [editCommandData, setEditCommandData] = useState<{ id: number | null, title: string, content: string, scope: CommandScope | null }>({ id: null, title: "", content: "", scope: null });
+  const [editCommandData, setEditCommandData] = useState<{ id: number | null, title: string, content: string, scope: CommandScope | null, is_secret: boolean, tags: string }>({ id: null, title: "", content: "", scope: null, is_secret: false, tags: "" });
 
   const [notes, setNotes] = useState<any[]>([]);
   const [isNotePanelOpen, setIsNotePanelOpen] = useState(false);
@@ -341,6 +396,8 @@ function DesktopApp() {
     rdpOptions: { ...DEFAULT_RDP_OPTIONS },
     // An SSH server's keepalives and reconnecting on this device (util/sessionKeep).
     sessionKeep: { ...DEFAULT_SESSION_KEEP },
+    // An SSH or telnet server's session log on this device (util/sessionLog).
+    logChoice: "default",
     // A VNC server's speed and quality on this device (util/vncOptions).
     vncOptions: { ...DEFAULT_VNC_OPTIONS },
     name: "", host: "", port: 22, username: "", password: "",
@@ -350,8 +407,11 @@ function DesktopApp() {
     authType: "custom_pass", credentialId: "", folderId: "", keyId: "",
     proxyType: "none", proxyHost: "", proxyPort: 1080,
     tunnels: [] as { local: string, remote: string, type: string, name?: string, stopped?: boolean }[],
+    // At startup: autostart = open the tab and connect (SSH servers only);
+    // autoOpen = open the tab without connecting (any kind of server).
     autostart: false,
-    mirrors: [] as { local: string, remote: string, soft_delete: boolean, excludes: string[], conflict_resolution: string }[],
+    autoOpen: false,
+    mirrors: [] as { local: string, remote: string, soft_delete: boolean, excludes: string[], includes: string[], direction: string, conflict_resolution: string }[],
     color: null as string | null,
     // Free-form per-node description / runbook text. Lives on the server row
     // in the encrypted vault. Empty string by default — the textarea in the
@@ -468,8 +528,8 @@ function DesktopApp() {
     return () => clearTimeout(t);
   }, [isKeyPanelOpen]);
   const [appSettings, setAppSettings] = useState({
-    primaryColor: localStorage.getItem('submarine-primary-color') || '#60a5fa',
-    backgroundColor: localStorage.getItem('submarine-bg-color') || '#0a0a0c',
+    primaryColor: readPrimaryColor(),
+    backgroundColor: readBackgroundColor(),
     terminalFontSize: readFontSize(),
     // '' = the built-in cross-platform monospace stack (see util/terminalFont).
     terminalFontFamily: readFontFamily(),
@@ -482,6 +542,9 @@ function DesktopApp() {
     // Off by default: terminals start the remote account's own shell, same
     // as before this setting existed. See util/terminalShell.
     useLocalShell: readUseLocalShell(),
+    // On by default: tabs show the title a program sets after their name. See
+    // util/terminalTitle.
+    showTerminalTitles: readShowTerminalTitles(),
     // On by default: logins may use keys from an ssh-agent on this computer.
     // See util/sshAgent.
     useSshAgent: readUseSshAgent(),
@@ -498,16 +561,16 @@ function DesktopApp() {
     // "pull collaborators' changes" timer — your own edits still push ~6s after
     // you stop typing regardless of this.
     syncIntervalMin: Math.max(1, parseInt(localStorage.getItem('submarine-sync-interval-min') || '5', 10) || 5),
+    // Off by default: the update notice tells about full releases only. See
+    // util/updateChannel.
+    updateBeta: readUpdateBeta(),
     ...Fork.readForkSettings(),
   });
 
   useEffect(() => {
-    const rgb = hexToRgb(appSettings.primaryColor);
-    document.documentElement.style.setProperty('--primary', rgb);
-    document.documentElement.style.setProperty('--primary-hex', appSettings.primaryColor);
-    document.documentElement.style.setProperty('--background', appSettings.backgroundColor);
-    localStorage.setItem('submarine-primary-color', appSettings.primaryColor);
-    localStorage.setItem('submarine-bg-color', appSettings.backgroundColor);
+    applyTheme(appSettings.primaryColor, appSettings.backgroundColor);
+    localStorage.setItem(PRIMARY_COLOR_KEY, appSettings.primaryColor);
+    localStorage.setItem(BG_COLOR_KEY, appSettings.backgroundColor);
     localStorage.setItem(FONT_SIZE_KEY, appSettings.terminalFontSize.toString());
     localStorage.setItem(FONT_FAMILY_KEY, appSettings.terminalFontFamily);
     localStorage.setItem(UI_FONT_FAMILY_KEY, appSettings.uiFontFamily);
@@ -515,6 +578,7 @@ function DesktopApp() {
     localStorage.setItem(BOLD_BRIGHT_KEY, appSettings.terminalBoldBright ? 'on' : 'off');
     localStorage.setItem(MIN_CONTRAST_KEY, appSettings.terminalMinContrast ? 'on' : 'off');
     localStorage.setItem(USE_LOCAL_SHELL_KEY, appSettings.useLocalShell ? 'on' : 'off');
+    localStorage.setItem(SHOW_TERMINAL_TITLES_KEY, appSettings.showTerminalTitles === false ? 'off' : 'on');
     localStorage.setItem(USE_SSH_AGENT_KEY, appSettings.useSshAgent ? 'on' : 'off');
     // Monitoring reads it at each connect, in the background. A phone or
     // tablet has no ssh-agent (see readUseSshAgentForMonitor).
@@ -525,6 +589,7 @@ function DesktopApp() {
     invoke("set_use_ssh_config", { enabled: appSettings.useSshConfig }).catch(() => {});
     localStorage.setItem('submarine-auto-sync', appSettings.autoSync ? 'on' : 'off');
     localStorage.setItem('submarine-sync-interval-min', String(appSettings.syncIntervalMin));
+    localStorage.setItem(UPDATE_BETA_KEY, appSettings.updateBeta ? 'on' : 'off');
     Fork.writeForkSettings(appSettings);
     // Tell already-mounted terminals to re-fit with the new font size / face.
     // Without this dispatch the listener in TerminalView is dead code and
@@ -533,6 +598,19 @@ function DesktopApp() {
   }, [appSettings]);
 
   Fork.useServerLooks(servers);
+  // A pinch on a terminal and the key bar's text-size keys (util/terminalFont).
+  useEffect(() => {
+    const onRequest = (e: Event) => {
+      const request = (e as CustomEvent).detail;
+      setAppSettings((s) => {
+        const size = requestedFontSize(s.terminalFontSize, request);
+        return size === s.terminalFontSize ? s : { ...s, terminalFontSize: size };
+      });
+    };
+    window.addEventListener(FONT_SIZE_REQUEST, onRequest);
+    return () => window.removeEventListener(FONT_SIZE_REQUEST, onRequest);
+  }, []);
+
   // The interface font and the font for text in columns (util/uiFont): set on
   // the page only when one of the two faces changes, since a change restyles
   // every element.
@@ -561,6 +639,7 @@ function DesktopApp() {
         setSessions(prev => prev.filter(s => s.id !== sessId));
         setSessionStatuses(prev => { const { [sessId]: _, ...rest } = prev; return rest; });
         clearTabName(sessId);
+        clearOscTitle(sessId);
         setActiveView(prev => (prev === sessId ? START_VIEW : prev));
         // Purge the closing session from broadcast state so a stale id doesn't
         // linger in the target set (would let a user re-enable broadcast and
@@ -673,6 +752,17 @@ function DesktopApp() {
       refreshNotes(),
     ]);
   };
+
+  // The session Library panel can add/edit commands and notes while this
+  // grid is hidden, and this grid otherwise only loads them at unlock.
+  // Reload both lists when the Library view is opened so it never shows
+  // a stale copy of what the panel just added.
+  useEffect(() => {
+    if (activeView === "library") { refreshCommands(); refreshNotes(); }
+    // refreshCommands/refreshNotes are plain functions (new each render);
+    // listing them would re-fire on every render. They read no state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeView]);
 
   // What a shared profile waits on the user for: a new key, as a fingerprint
   // (until it's accepted a sync only pulls, see note_share_key), a grant the
@@ -892,6 +982,7 @@ function DesktopApp() {
     if (s.uuid) {
       forgetRdpOptions(s.uuid);
       forgetSessionKeep(s.uuid);
+      forgetServerLogChoice(s.uuid);
       forgetVncOptions(s.uuid);
     }
   };
@@ -949,44 +1040,45 @@ function DesktopApp() {
     invoke<{ signed_in: boolean; email: string | null }>("cloud_status")
       .then((s) => invoke("set_editor_label", { label: s.signed_in && s.email ? s.email : "" }))
       .catch(() => {});
-    // Autostart sweep: load servers directly (refreshAll is also doing this
+    // Startup sweep: load servers directly (refreshAll is also doing this
     // in parallel, but its state update is async and we can't read `servers`
-    // back here without a stale-closure race), pick the ones flagged
-    // autostart, and stage them all into the sessions tab strip in one
-    // setSessions call. The user lands focused on the first autostart node;
-    // each new SessionView component then kicks off its own connect on mount.
+    // back here without a stale-closure race), pick the ones set to open at
+    // startup ("At startup" in the server form), and stage them all into the
+    // sessions tab strip in one setSessions call, in the list's order. Each
+    // new view then kicks off its own connect on mount, or waits for Connect
+    // when it opens only. The user lands on the first one that connects,
+    // else on the first one opened.
     try {
       const list = await invoke<any[]>("get_servers");
       // Autostart someone else switched on in a shared profile waits for
       // this device's OK (Servers → Review) instead of connecting by itself.
       const isHeld = (s: any) => (s.held || []).includes("autostart");
-      const waiting = list.filter((s) => s.autostart && isHeld(s));
+      // And a server someone else moved waits for it before its tab opens:
+      // Connect in that tab wouldn't ask about the new address, as opening
+      // the server by hand does.
+      const isMoved = (s: any) => (s.held || []).some((i: string) => i.startsWith("moved:"));
+      // Open and connect: only SSH servers start by themselves (an RDP server
+      // would open an app).
+      const connects = (s: any) => !!s.autostart && !isHeld(s) && (s.protocol ?? "ssh") === "ssh";
+      // Open the tab, not connected: any kind of server.
+      const opensOnly = (s: any) => !connects(s) && !!s.auto_open && !isMoved(s);
+      const waiting = list.filter((s) => (s.autostart && isHeld(s)) || (s.auto_open && !connects(s) && isMoved(s)));
       if (waiting.length > 0) {
         addLog(t("Autostart: {names} waiting for your OK (Servers → Review).", { names: waiting.map((s) => s.name).join(", ") }), "info");
       }
-      // Only SSH servers start by themselves (an RDP server would open an app).
-      const toStart = list.filter((s) => s.autostart && !isHeld(s) && (s.protocol ?? "ssh") === "ssh");
-      if (toStart.length === 0) return;
-      const newSessions = toStart.map((s) => ({
-        id: `session-${s.id}`,
-        serverId: s.id,
-        serverName: s.name,
-        host: s.host,
-        port: s.port,
-        mirrors: s.mirrors,
-        serverUuid: s.uuid ?? null,
-        // As when it's opened by hand (openServer).
-        runOnConnect: s.run_on_connect || "",
-        runOnConnectEvery: !!s.run_on_connect_every,
-        runOnConnectHeld: (s.held || []).includes("run_on_connect"),
-      }));
-      setSessions((prev: any[]) => {
+      const toOpen = list.filter((s) => connects(s) || opensOnly(s));
+      if (toOpen.length === 0) return;
+      const newSessions: Session[] = toOpen.map((s) => (opensOnly(s) ? { ...sessionOf(s), openOnly: true } : sessionOf(s)));
+      setSessions((prev: Session[]) => {
         const seen = new Set(prev.map((p) => p.id));
         const fresh = newSessions.filter((n) => !seen.has(n.id));
         return [...prev, ...fresh];
       });
-      setActiveView(newSessions[0].id);
-      addLog(tn(newSessions.length, "Autostart: opened {count} node.", "Autostart: opened {count} nodes."), "info");
+      setActiveView((newSessions.find((s) => !s.openOnly) ?? newSessions[0]).id);
+      const started = newSessions.filter((s) => !s.openOnly).length;
+      const opened = newSessions.length - started;
+      if (started > 0) addLog(tn(started, "Autostart: opened {count} node.", "Autostart: opened {count} nodes."), "info");
+      if (opened > 0) addLog(tn(opened, "Opened {count} tab without connecting.", "Opened {count} tabs without connecting."), "info");
     } catch (e) {
       addLog(`AUTOSTART_LOAD_FAILED: ${e}`, "error");
     }
@@ -994,6 +1086,23 @@ function DesktopApp() {
 
   const confirm = useConfirm();
   const textPrompt = useTextPrompt();
+  // The unlocked app's chunk (workspace.ts): fetched once the picker is up
+  // and the page is idle, so it is in by the time a password is typed. The
+  // slide-overs that stay mounted render once it is in (`workspaceIn`, also
+  // when it came in another way, after a load here failed).
+  const [workspaceReady, setWorkspaceReady] = useState(() => workspaceNow() !== null);
+  useEffect(() => {
+    let alive = true;
+    const go = () => { loadWorkspace().then(() => { if (alive) setWorkspaceReady(true); }, () => {}); };
+    // Safari's WebView (iOS) has no requestIdleCallback.
+    const idle = typeof window.requestIdleCallback === "function";
+    const id = idle ? window.requestIdleCallback(go, { timeout: 1500 }) : window.setTimeout(go, 300);
+    return () => {
+      alive = false;
+      if (idle) window.cancelIdleCallback(id); else window.clearTimeout(id);
+    };
+  }, []);
+  const workspaceIn = workspaceReady || workspaceNow() !== null;
 
   Fork.useLiveEditKept(addLog);
   // A shared profile's grant changed while sharing was locked, so the sync
@@ -1029,7 +1138,7 @@ function DesktopApp() {
   const sessionsRef = useRef(sessions);
   useEffect(() => { sessionsRef.current = sessions; }, [sessions]);
   const homeShellsRef = useRef(0); // Home's terminals (Fork.HomeView)
-  const wouldEnd = () => Fork.wouldEnd(sessionsRef.current.length, homeShellsRef.current);
+  const wouldEnd = Fork.useWouldEnd(sessionsRef, sessionStatuses, homeShellsRef); // a tab waiting for Connect ends nothing
 
   // Intercept BOTH the in-app X button (which calls appWindow.close()) AND
   // OS-level closes (Alt+F4, taskbar context-menu close, system shutdown).
@@ -1164,13 +1273,14 @@ function DesktopApp() {
     // still streaming checks its links again.
     clearAiFocus();
     clearFeeds();
-    clearUrlCache();
+    workspaceNow()?.clearUrlCache();
     // Reset all client state so the picker starts fresh — no stale
     // servers/credentials/sessions leaking across profile contexts.
     setIsUnlocked(false);
     setActiveProfile(null);
     setSessions([]);
     setTabNames({});
+    setOscTitles({});
     setActiveView(START_VIEW);
     setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setCommands([]); setNotes([]);
     // The next profile numbers its servers from 1 too, so anything kept by
@@ -1210,26 +1320,11 @@ function DesktopApp() {
         if (!ok) return false;
         await allowHeld(server.id, [moved]);
       }
-      setSessions((prev: Session[]) => prev.some((s) => s.id === sessionId) ? prev : [...prev, {
-        id: sessionId,
-        serverId: server.id,
-        serverName: server.name,
-        protocol: serverProtocol(server.protocol),
-        host: server.host,
-        port: server.port,
-        // Pass the raw mirrors JSON through to SessionView so the
-        // MirrorsPanel can pre-populate "Saved on this node" without
-        // another round-trip to the backend.
-        mirrors: server.mirrors,
-        serverUuid: server.uuid ?? null,
-        // Commands to auto-run once on the first terminal (see SessionView).
-        runOnConnect: server.run_on_connect || "",
-        // And once into each new terminal of the tab (#256).
-        runOnConnectEvery: !!server.run_on_connect_every,
-        // Set or changed elsewhere, not allowed here yet: SessionView asks
-        // before typing them.
-        runOnConnectHeld: (server.held || []).includes("run_on_connect"),
-      }]);
+      setSessions((prev: Session[]) => prev.some((s) => s.id === sessionId) ? prev : [...prev, sessionOf(server)]);
+    } else if (existing.openOnly && sessionStatuses[sessionId] === "idle") {
+      // Its tab opened at startup and waits: opening the server connects it,
+      // as Connect in the tab does (hooks/useWaitToConnect).
+      window.dispatchEvent(new CustomEvent(`session-reconnect-${sessionId}`));
     }
 
     setActiveView(sessionId);
@@ -1240,7 +1335,7 @@ function DesktopApp() {
     sessions, statuses: sessionStatuses, confirmClose: appSettings.confirmCloseSession, setAppSettings, clearTabName, setSessions,
     setSessionStatuses, setMergedSessionIds, broadcast, unpinSessionFromWall, setActiveView,
   });
-  const [allTabsOpen, setAllTabsOpen, titleTabs] = Fork.useTabKeys({ isUnlocked, sessions, activeView, mergedSessionIds, setMergedSessionIds, setActiveView });
+  const [allTabsOpen, setAllTabsOpen, titleTabs] = Fork.useTabKeys({ isUnlocked, sessions });
   Fork.useBroadcastWall({ broadcast, frontTerminals: sessionActiveTerm, wallItems, setWallItems, activeView, setActiveView });
 
   // The AI page's ways out: "All chats" shows it, and "Open the server" opens
@@ -1361,6 +1456,7 @@ function DesktopApp() {
       protocol: serverProtocol(server.protocol),
       rdpOptions: readRdpOptions(server.uuid),
       sessionKeep: readSessionKeep(server.uuid),
+      logChoice: readServerLogChoice(server.uuid),
       vncOptions: readVncOptions(server.uuid),
       name: server.name || "",
       host: server.host || "",
@@ -1377,6 +1473,7 @@ function DesktopApp() {
       proxyPort: server.proxy_port || 1080,
       tunnels: parseObjectList(server.tunnels).map(normalizeTunnel),
       autostart: !!server.autostart,
+      autoOpen: !!server.auto_open,
       mirrors: parseObjectList(server.mirrors).map(normalizeMirror),
       color: server.color ?? null,
       notes: server.notes || "",
@@ -1419,12 +1516,35 @@ function DesktopApp() {
       setFormError(t("Tick at least one server or folder, or choose All servers."));
       return;
     }
+    // In the user's language, before the backend refuses them in English.
+    const tagsWrong = tagsProblem(editCommandData.tags);
+    if (tagsWrong) {
+      setFormError(tagsWrong);
+      return;
+    }
     try {
+      // Tauri's #[tauri::command] macro exposes Rust snake_case params as
+      // camelCase arg keys, so the key here is `isSecret`, not `is_secret`
+      // (same as the existing `deleteThem` in resolve_held_deletions). The
+      // value stays the snake_case `is_secret` field, which is what
+      // get_commands returns. Do not "fix" the key back to snake_case —
+      // that breaks the save with "missing required key isSecret".
       if (editCommandData.id) {
+        // Title/content only: the secret flag and tags go through their
+        // own call, and only when they changed here — so this form can't
+        // undo a flag or tags set in the session panel since it opened.
+        // The secret/tags call runs FIRST: it validates the tags and
+        // refuses a bad one, so a bad tag stops the save before the
+        // title/content are written.
+        const orig = commands.find((c) => c.id === editCommandData.id);
+        const secretChanged = !orig || !!orig.is_secret !== editCommandData.is_secret || (orig.tags || "") !== editCommandData.tags;
+        if (secretChanged) {
+          await invoke("set_command_secret_tags", { id: editCommandData.id, isSecret: editCommandData.is_secret, tags: editCommandData.tags || null });
+        }
         await invoke("edit_command", { id: editCommandData.id, title: editCommandData.title, content: editCommandData.content });
         await invoke("set_command_scope", { id: editCommandData.id, scope: scopeToJson(scope) });
       } else {
-        await invoke("add_command", { title: editCommandData.title, content: editCommandData.content, scope: scopeToJson(scope) });
+        await invoke("add_command", { title: editCommandData.title, content: editCommandData.content, scope: scopeToJson(scope), isSecret: editCommandData.is_secret, tags: editCommandData.tags || null });
       }
       closeCommandPanel();
       refreshCommands();
@@ -1558,6 +1678,49 @@ function DesktopApp() {
   // again", and back to Home.
   const closeTab = async (sid: string, ask: boolean) => { await closeSessions([sid], ask); };
 
+  // The shortcuts that work anywhere in the window (util/shortcuts; Settings →
+  // Keyboard shortcuts): open a server (the + after the last tab), and the
+  // next or the previous tab (Ctrl+Tab and Ctrl+Shift+Tab by default; a
+  // terminal gets Ctrl+Tab as a plain Tab, so the shell loses nothing). In the
+  // capture phase, before a terminal turns the keys into input. Left alone:
+  // keys in a remote desktop, which are the remote's own (switching its
+  // windows, say), keys while a dialog is open, and the keys Settings is
+  // taking for a shortcut. In the open-a-server menu, its key closes it (see
+  // OpenServerMenu).
+  const orderedSessionsRef = useRef(orderedSessions);
+  orderedSessionsRef.current = orderedSessions;
+  const activeViewRef = useRef(activeView);
+  activeViewRef.current = activeView;
+  const openServerButton = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!Fork.mayBeShortcut(e)) return; // fork: plain typing goes straight on
+      const action = matchShortcut(e, APP_SHORTCUTS);
+      if (!action) return;
+      if ((e.target as HTMLElement | null)?.closest?.("[data-remote-keys], [data-shortcut-recorder], [data-open-server-menu]")) return;
+      if (document.querySelector('[aria-modal="true"]')) return;
+      if (action === "openServer") {
+        const plus = openServerButton.current;
+        if (!plus) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (!e.repeat) setOpenServerAnchor(plus);
+        return;
+      }
+      const list = Fork.tabStepList(orderedSessionsRef.current); // fork: Home, Broadcast's tab, then the servers
+      if (list.length === 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const at = list.findIndex((s) => s.id === activeViewRef.current);
+      const step = action === "previousTab" ? -1 : 1;
+      const next = list[at < 0 ? (step > 0 ? 0 : list.length - 1) : (at + step + list.length) % list.length];
+      setMergedSessionIds((prev) => (prev.includes(next.id) ? prev : []));
+      setActiveView(next.id);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, []);
+
   // Render helper, NOT a component — it is invoked as `{TitleBar()}` below,
   // never as `<TitleBar />`. Rendering it as a JSX element would give it a
   // fresh function identity on every DesktopApp render, so React would treat
@@ -1582,7 +1745,7 @@ function DesktopApp() {
         if (IS_MOBILE || target.closest('.no-drag')) return;
         toggleMaximize();
       }}
-      className="h-10 bg-[#08080a] flex items-center justify-between px-3 select-none shrink-0 z-50 drag absolute top-0 left-0 right-0"
+      className="h-10 bg-shade-08080a flex items-center justify-between px-3 select-none shrink-0 z-50 drag absolute top-0 left-0 right-0"
     >
       {/* The bar's bottom edge, drawn under the tabs: the open tab covers it
           and joins the session's toolbar below. */}
@@ -1653,7 +1816,7 @@ function DesktopApp() {
                 <div className="fixed inset-0 z-[60]" onClick={() => setMobileSessionPickerOpen(false)} />
                 <div
                   role="listbox"
-                  className="absolute z-[70] top-8 left-0 right-0 bg-[#15151a] border border-white/10 rounded-xl shadow-2xl p-1.5 max-h-[60vh] overflow-y-auto custom-scrollbar"
+                  className="absolute z-[70] top-8 left-0 right-0 bg-shade-15151a border border-white/10 rounded-xl shadow-2xl p-1.5 max-h-[60vh] overflow-y-auto custom-scrollbar"
                 >
                   {orderedSessions.map(s => {
                     const st = sessionStatuses[s.id] ?? 'connecting';
@@ -1803,6 +1966,7 @@ function DesktopApp() {
             st === "connecting"   ? t("Connecting…") :
             st === "failed"       ? t("Connection failed") :
             st === "disconnected" ? t("Disconnected") :
+            st === "idle"         ? t("Not connected") :
                                     st;
           // Broadcast indicator: small orange dot next to the status dot when
           // this session is in the target set AND broadcast is armed. Kept
@@ -1812,6 +1976,10 @@ function DesktopApp() {
           const isMergedTab = mergedSessionIds.includes(s.id);
           const compact = appSettings.compactTabs; // narrower tabs, long names cut short
           const drag = sessionDrag.tabMark(s.id);
+          // The program's title after the name (#391). The name comes first
+          // and stays whole, so a title can't pass for another server.
+          const programTitle = oscTitles[s.id];
+          const fullLabel = programTitle ? `${tabLabel(s)} · ${programTitle}` : tabLabel(s);
           // The open tab joins the session's toolbar below it, with a line in
           // the server's own colour on top. A thin line parts two tabs where
           // neither is the open one.
@@ -1873,10 +2041,10 @@ function DesktopApp() {
               // wheel-to-horizontal scroll above), so wider tabs just mean
               // more scrolling — they never hide the name behind an ellipsis.
               // `whitespace-nowrap` keeps long names on a single line.
-              title={isMergedTab ? t("{name} · split beside current view (Ctrl-click to unpair)", { name: tabLabel(s) }) : tabLabel(s)}
+              title={isMergedTab ? t("{name} · split beside current view (Ctrl-click to unpair)", { name: fullLabel }) : fullLabel}
               className={`group no-drag relative flex items-center gap-2 h-[33px] ${compact ? Fork.COMPACT_TAB_PAD : 'pl-3 pr-1.5'} rounded-t-lg cursor-pointer shrink-0 transition-colors ${
                 active
-                  ? 'z-10 bg-[#141417] text-zinc-100 border-x border-t border-white/10'
+                  ? 'z-10 bg-shade-141417 text-zinc-100 border-x border-t border-white/10'
                   : isMergedTab
                     ? 'text-primary/90 bg-primary/[0.06] hover:bg-primary/10'
                     : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]'
@@ -1915,6 +2083,12 @@ function DesktopApp() {
                 className={`text-[11.5px] font-semibold whitespace-nowrap tracking-tight rounded outline-none focus-visible:ring-2 focus-visible:ring-primary/60 ${compact ? Fork.COMPACT_TAB_NAME : ''}`}
               >
                 {tabLabel(s)}
+                {/* A long title is cut here; the tooltip has all of it. */}
+                {programTitle && (
+                  <span className="inline-block max-w-[16rem] truncate align-bottom ml-1 font-normal opacity-70">
+                    · <bdi>{programTitle}</bdi>
+                  </span>
+                )}
               </button>
               {/* Mobile-only actions trigger. On phone we surface the same
                   tabMenu (Reconnect / Disconnect / Close) here since there
@@ -1961,7 +2135,7 @@ function DesktopApp() {
           onClick={() => scrollTabs(-1)}
           title={t("Show the tabs to the left")}
           aria-label={t("Show the tabs to the left")}
-          className="no-drag absolute left-0 bottom-0 z-20 h-[33px] w-8 flex items-center justify-start pl-1 text-zinc-300 hover:text-white bg-gradient-to-r from-[#08080a] via-[#08080a]/90 to-transparent"
+          className="no-drag absolute left-0 bottom-0 z-20 h-[33px] w-8 flex items-center justify-start pl-1 text-zinc-300 hover:text-white bg-gradient-to-r from-shade-08080a via-shade-08080a/90 to-transparent"
         >
           <ChevronLeft size={15} />
         </button>
@@ -1972,7 +2146,7 @@ function DesktopApp() {
           onClick={() => scrollTabs(1)}
           title={t("Show the tabs to the right")}
           aria-label={t("Show the tabs to the right")}
-          className="no-drag absolute right-0 bottom-0 z-20 h-[33px] w-8 flex items-center justify-end pr-1 text-zinc-300 hover:text-white bg-gradient-to-l from-[#08080a] via-[#08080a]/90 to-transparent"
+          className="no-drag absolute right-0 bottom-0 z-20 h-[33px] w-8 flex items-center justify-end pr-1 text-zinc-300 hover:text-white bg-gradient-to-l from-shade-08080a via-shade-08080a/90 to-transparent"
         >
           <ChevronRight size={15} />
         </button>
@@ -1982,6 +2156,7 @@ function DesktopApp() {
           going back to the Servers page. */}
       {isUnlocked && (
         <button
+          ref={openServerButton}
           type="button"
           // A click leaves the focus where it was (a terminal, say): the
           // menu gives it back there when Escape closes it.
@@ -2093,7 +2268,7 @@ function DesktopApp() {
                 className="fixed inset-0 z-[60]"
                 onClick={() => setBroadcastMenuOpen(false)}
               />
-              <div className="absolute z-[70] top-full mt-1 right-0 w-[280px] bg-[#15151a] border border-white/10 rounded-lg shadow-2xl p-2 text-[11px]">
+              <div className="absolute z-[70] top-full mt-1 right-0 w-[280px] bg-shade-15151a border border-white/10 rounded-lg shadow-2xl p-2 text-[11px]">
                 <div className="flex items-center justify-between mb-2 px-1">
                   <label className="flex items-center gap-2 cursor-pointer select-none">
                     <input
@@ -2160,6 +2335,7 @@ function DesktopApp() {
                         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                           st === "connected" ? "bg-emerald-400" :
                           st === "connecting" ? "bg-amber-400" :
+                          st === "idle" ? "bg-zinc-500" :
                           "bg-rose-500"
                         }`} />
                         <span className="truncate text-[11px] font-medium text-zinc-200 flex-1">
@@ -2220,7 +2396,7 @@ function DesktopApp() {
         <>
           <div className="fixed inset-0 z-[60]" onClick={() => { setTabMenu(null); setTabRename(null); }} onContextMenu={(e) => { e.preventDefault(); setTabMenu(null); setTabRename(null); }} />
           <div
-            className="fixed z-[70] bg-[#15151a] border border-white/10 rounded-md shadow-2xl py-1 min-w-[240px] text-[11px] no-drag overflow-y-auto custom-scrollbar"
+            className="fixed z-[70] bg-shade-15151a border border-white/10 rounded-md shadow-2xl py-1 min-w-[240px] text-[11px] no-drag overflow-y-auto custom-scrollbar"
             style={Fork.tabMenuStyle(tabMenu.x, tabMenu.y, window.innerWidth, window.innerHeight)}
           >
             {/* The tab's name. The editor opens inside this menu: Enter
@@ -2255,20 +2431,24 @@ function DesktopApp() {
               >{t("Edit server")}</button>
             )}
             <Fork.TabMoveItems sessions={sessions} targetId={targetId} setSessions={setSessions} onDone={() => setTabMenu(null)} /><Fork.BulkTabItems targetId={targetId} sessions={sessions} statuses={sessionStatuses} onDone={() => setTabMenu(null)} />
+            {/* A tab that hasn't connected yet (opened at startup, or an RDP
+                tab on a phone) connects; there's nothing to disconnect. */}
             <button
               className="w-full text-left px-3 py-1.5 hover:bg-primary/15 hover:text-primary text-zinc-200 flex items-center gap-2"
               onClick={() => {
                 window.dispatchEvent(new CustomEvent(`session-reconnect-${targetId}`));
                 setTabMenu(null);
               }}
-            >{t("Reconnect")}</button>
-            <button
-              className="w-full text-left px-3 py-1.5 hover:bg-white/10 text-zinc-200"
-              onClick={() => {
-                invoke("disconnect_session", { sessionId: targetId }).catch(console.error);
-                setTabMenu(null);
-              }}
-            >{t("Disconnect")}</button>
+            >{sessionStatuses[targetId] === "idle" ? t("Connect") : t("Reconnect")}</button>
+            {sessionStatuses[targetId] !== "idle" && (
+              <button
+                className="w-full text-left px-3 py-1.5 hover:bg-white/10 text-zinc-200"
+                onClick={() => {
+                  invoke("disconnect_session", { sessionId: targetId }).catch(console.error);
+                  setTabMenu(null);
+                }}
+              >{t("Disconnect")}</button>
+            )}
 
             {/* Pin/Unpin the session's currently-active terminal to
                 the Wall — one-click convenience so users don't have to
@@ -2369,6 +2549,7 @@ function DesktopApp() {
                         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                           st === "connected" ? "bg-emerald-400" :
                           st === "connecting" ? "bg-amber-400" :
+                          st === "idle" ? "bg-zinc-500" :
                           "bg-rose-500"
                         }`} />
                         <span className="truncate text-[11px] font-medium text-zinc-200 flex-1">
@@ -2412,6 +2593,7 @@ function DesktopApp() {
         // renders at the bottom while staying first in DOM order — keyboard
         // tab-order stays intuitive and <main> grabs the full screen width
         // (terminal gains the ~50px the vertical rail used to eat).
+        <Suspense fallback={null}>
         <div inert={overlayOpen ? "" : undefined} className={`flex-1 flex ${isMobile ? 'flex-col-reverse' : ''} overflow-hidden pt-10`}>
           <Sidebar activeTab={activeView.startsWith('session-') ? 'nodes' : activeView} setActiveTab={setActiveView} isMobile={isMobile} onLogout={handleLogout} profileName={activeProfile} syncing={cloudSyncing} agentsOn={agentsState.enabled} agentsWaiting={agentsState.waiting} hasHome={Fork.HAS_HOME}
             treeOpen={tree.open} onToggleTree={isMobile ? undefined : () => tree.setOpen((v) => !v)} />
@@ -2550,7 +2732,7 @@ function DesktopApp() {
                         <div className="col-span-full py-10 text-center text-zinc-600 text-[14px] italic border border-dashed border-white/5 rounded-2xl">{t("Nothing here yet.")}</div>
                       ) : (
                         credentials.map(c => (
-                          <div key={c.id} className="bg-[#16161a] border border-white/5 rounded-xl p-3 group relative hover:border-primary/30 transition-all">
+                          <div key={c.id} className="bg-shade-16161a border border-white/5 rounded-xl p-3 group relative hover:border-primary/30 transition-all">
                             <div className="flex justify-between items-start mb-1">
                               <h4 className="text-[14px] font-bold text-zinc-100 truncate pr-8">{c.name}</h4>
                               <div className="flex items-center gap-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-has-[:focus-visible]:opacity-100 transition-opacity absolute right-3 top-3">
@@ -2595,7 +2777,7 @@ function DesktopApp() {
                         <div className="col-span-full py-10 text-center text-zinc-600 text-[14px] italic border border-dashed border-white/5 rounded-2xl">{t("No keys saved yet.")}</div>
                       ) : (
                         sshKeys.map((k: any) => (
-                          <div key={k.id} className="bg-[#16161a] border border-white/5 rounded-xl p-3 group relative hover:border-primary/30 transition-all">
+                          <div key={k.id} className="bg-shade-16161a border border-white/5 rounded-xl p-3 group relative hover:border-primary/30 transition-all">
                             <div className="flex justify-between items-start mb-1">
                               <h4 className="text-[14px] font-bold text-zinc-100 truncate pr-8">{k.name}</h4>
                               <div className="flex items-center gap-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-has-[:focus-visible]:opacity-100 transition-opacity absolute right-3 top-3">
@@ -2733,7 +2915,7 @@ function DesktopApp() {
                               merged tile drops from ~48 px (full chrome)
                               to ~28 px (slim header). */}
                           {isVisible && isTiled && !isFocused && (
-                            <div className="h-7 shrink-0 flex items-center gap-2 px-2 border-b border-white/5 bg-[#111114] text-[10.5px]">
+                            <div className="h-7 shrink-0 flex items-center gap-2 px-2 border-b border-white/5 bg-shade-111114 text-[10.5px]">
                               <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                                 (sessionStatuses[sess.id] ?? 'connecting') === 'connected' ? 'bg-emerald-400' :
                                 (sessionStatuses[sess.id] ?? 'connecting') === 'connecting' ? 'bg-amber-400' :
@@ -2764,6 +2946,7 @@ function DesktopApp() {
                             onReset={() => {
                               setSessions(prev => prev.filter(s => s.id !== sess.id));
                               clearTabName(sess.id);
+                              clearOscTitle(sess.id);
                               if (activeView === sess.id) setActiveView(START_VIEW);
                             }}
                           >
@@ -2807,6 +2990,7 @@ function DesktopApp() {
                                 isActiveView={isFocused}
                                 onScreen={onScreen}
                                 onPromptChange={handlePromptChange}
+                                onSessionTitle={handleSessionTitle}
                               />
                             ) : (
                             <SessionView
@@ -2817,6 +3001,7 @@ function DesktopApp() {
                               addLog={addLog}
                               onStatusChange={handleSessionStatus}
                               onTerminalsChange={handleTerminalsChange}
+                              onSessionTitle={handleSessionTitle}
                               chromeless={isVisible && isTiled && !isFocused}
                               isActiveView={isFocused}
                               shown={isVisible && viewIsSession}
@@ -2841,12 +3026,12 @@ function DesktopApp() {
                 PTY ownership stay with the primary xterm in the
                 session tab. */}
             {activeView === "wall" && (
-              <div className="absolute inset-0 flex flex-col overflow-hidden bg-[#0a0a0d]">
+              <div className="absolute inset-0 flex flex-col overflow-hidden bg-shade-0a0a0d">
                 {/* Toolbar: cols and rows selectors + Add + Clear. Rows
                     default to as many as the tiles need; a number fits
                     that many on screen. On a narrow screen the selectors
                     scroll sideways. */}
-                <div className="h-10 shrink-0 border-b border-white/5 bg-[#111114] flex items-center gap-2 px-3">
+                <div className="h-10 shrink-0 border-b border-white/5 bg-shade-111114 flex items-center gap-2 px-3">
                   <LayoutGrid size={12} className="text-primary/70 shrink-0" />
                   <span className="text-[11px] font-semibold text-zinc-400 shrink-0">
                     {wallItems.length > 0 ? t("Wall · {count}", { count: wallItems.length }) : t("Wall")}
@@ -2937,17 +3122,18 @@ function DesktopApp() {
                         const dotTone =
                           st === 'connected'    ? 'bg-emerald-400' :
                           st === 'connecting'   ? 'bg-amber-400 animate-pulse-brief' :
+                          st === 'idle'         ? 'bg-zinc-500' :
                                                   'bg-rose-500';
                         return (
                           <div
                             key={item.id}
-                            className="flex flex-col overflow-hidden border border-white/10 rounded-md bg-[#09090b] shadow-[0_2px_10px_rgba(0,0,0,0.4)] hover:border-primary/30 transition-colors"
+                            className="flex flex-col overflow-hidden border border-white/10 rounded-md bg-shade-09090b shadow-[0_2px_10px_rgba(0,0,0,0.4)] hover:border-primary/30 transition-colors"
                           >
                             {/* Slim tile header — server + terminal
                                 title, quick-jump into the session,
                                 unpin. Terminal body below owns focus
                                 so keystrokes go to xterm directly. */}
-                            <div className="h-7 shrink-0 flex items-center gap-2 px-2 border-b border-white/5 bg-[#141418] text-[10.5px] select-none">
+                            <div className="h-7 shrink-0 flex items-center gap-2 px-2 border-b border-white/5 bg-shade-141418 text-[10.5px] select-none">
                               <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotTone}`} />
                               <span className="font-semibold text-zinc-200 truncate">
                                 {tabLabel(sess)}
@@ -3013,7 +3199,7 @@ function DesktopApp() {
                 {wallPickerOpen && (
                   <>
                     <div className="fixed inset-0 z-[65]" onClick={() => setWallPickerOpen(false)} />
-                    <div className="absolute top-12 right-3 z-[66] w-80 max-h-[70vh] bg-[#15151a] border border-white/10 rounded-xl shadow-2xl p-2 flex flex-col">
+                    <div className="absolute top-12 right-3 z-[66] w-80 max-h-[70vh] bg-shade-15151a border border-white/10 rounded-xl shadow-2xl p-2 flex flex-col">
                       <div className="px-2 pb-2 flex items-center justify-between shrink-0">
                         <span className="text-[11px] font-semibold text-zinc-500">
                           {t("Pin terminals")}
@@ -3040,6 +3226,7 @@ function DesktopApp() {
                                   <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                                     st === 'connected' ? 'bg-emerald-400' :
                                     st === 'connecting' ? 'bg-amber-400' :
+                                    st === 'idle' ? 'bg-zinc-500' :
                                     'bg-rose-500'
                                   }`} />
                                   <span className="text-[11px] font-bold text-zinc-200 truncate flex-1">
@@ -3109,7 +3296,8 @@ function DesktopApp() {
               const filteredCommands = q
                 ? commands.filter(c =>
                     (c.title || "").toLowerCase().includes(q) ||
-                    (c.content || "").toLowerCase().includes(q))
+                    (c.content || "").toLowerCase().includes(q) ||
+                    (c.tags || "").toLowerCase().includes(q))
                 : commands;
               const filteredNotes = q
                 ? notes.filter(n =>
@@ -3120,7 +3308,7 @@ function DesktopApp() {
               const addLabel = onCommandsTab ? t("Add command") : t("Add note");
               const openAdd = () => {
                 if (onCommandsTab) {
-                  setEditCommandData({ id: null, title: "", content: "", scope: null });
+                  setEditCommandData({ id: null, title: "", content: "", scope: null, is_secret: false, tags: "" });
                   setIsCommandPanelOpen(true);
                 } else {
                   setEditNoteData({ id: null, title: "", body: "" });
@@ -3206,11 +3394,14 @@ function DesktopApp() {
                         </div>
                       ) : (
                         filteredCommands.map(cmd => (
-                          <div key={cmd.id} className="bg-[#16161a] border border-white/5 rounded-2xl p-4 flex flex-col group relative overflow-hidden shadow-inner h-[150px]">
+                          <div key={cmd.id} className="bg-shade-16161a border border-white/5 rounded-2xl p-4 flex flex-col group relative overflow-hidden shadow-inner h-[150px]">
                             <div className="flex justify-between items-start mb-2">
-                              <h3 className="text-[16px] font-bold text-primary tracking-tight truncate flex-1">{cmd.title}</h3>
+                              <h3 className="text-[16px] font-bold text-primary tracking-tight truncate flex-1 flex items-center gap-1.5">
+                                {cmd.is_secret && <Lock size={13} className="text-amber-400 shrink-0" />}
+                                <span className="truncate">{cmd.title}</span>
+                              </h3>
                               <div className="flex items-center gap-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-has-[:focus-visible]:opacity-100 transition-opacity">
-                                <button aria-label={t("Edit {name}", { name: cmd.title })} onClick={() => { setEditCommandData({ id: cmd.id, title: cmd.title, content: cmd.content, scope: parseCommandScope(cmd.scope) }); setIsCommandPanelOpen(true); }} className="text-zinc-500 hover:text-white transition-colors"><Edit2 size={14} /></button>
+                                <button aria-label={t("Edit {name}", { name: cmd.title })} onClick={() => { setEditCommandData({ id: cmd.id, title: cmd.title, content: cmd.content, scope: parseCommandScope(cmd.scope), is_secret: !!cmd.is_secret, tags: cmd.tags || "" }); setIsCommandPanelOpen(true); }} className="text-zinc-500 hover:text-white transition-colors"><Edit2 size={14} /></button>
                                 <button aria-label={t("Delete {name}", { name: cmd.title })} onClick={async () => {
                                   const ok = await confirm({ title: t("Delete command?"), message: t("“{name}” will be removed.", { name: cmd.title }), destructive: true });
                                   if (!ok) return;
@@ -3219,8 +3410,17 @@ function DesktopApp() {
                               </div>
                             </div>
                             <div className="bg-black/30 rounded-xl p-3 border border-white/5 flex-1 relative group-hover:border-primary/20 transition-colors overflow-hidden">
-                              <pre className="text-[12px] text-zinc-400 font-mono whitespace-pre-wrap leading-relaxed line-clamp-3">{cmd.content}</pre>
+                              <pre className="text-[12px] text-zinc-400 font-mono whitespace-pre-wrap leading-relaxed line-clamp-3">{cmd.is_secret ? "••••••" : cmd.content}</pre>
                             </div>
+                            {cmd.tags && (
+                              <div className="mt-2 flex flex-wrap gap-1">
+                                {splitTags(cmd.tags).map((tag) => (
+                                  <span key={tag} className="inline-flex items-center gap-0.5 h-4 px-1.5 rounded-full bg-white/5 border border-white/10 text-[9px] font-semibold text-zinc-400">
+                                    <Tag size={8} /> {tag}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
                             {parseCommandScope(cmd.scope) && (
                               <div className="mt-2 flex items-center gap-1.5 text-[11px] text-zinc-400 min-w-0" data-command-scope>
                                 <Server size={11} className="shrink-0 text-zinc-500" />
@@ -3239,7 +3439,7 @@ function DesktopApp() {
                         </div>
                       ) : (
                         filteredNotes.map(n => (
-                          <div key={n.id} className="bg-[#16161a] border border-white/5 rounded-2xl p-4 flex flex-col group relative overflow-hidden shadow-inner h-[170px]">
+                          <div key={n.id} className="bg-shade-16161a border border-white/5 rounded-2xl p-4 flex flex-col group relative overflow-hidden shadow-inner h-[170px]">
                             <div className="flex justify-between items-start mb-2 gap-2">
                               <h3 className="text-[15px] font-bold text-primary tracking-tight truncate flex-1">{n.title || t("Untitled")}</h3>
                               <div className="flex items-center gap-2 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-has-[:focus-visible]:opacity-100 transition-opacity shrink-0">
@@ -3384,10 +3584,12 @@ function DesktopApp() {
           <Fork.PingPanel /><Fork.BulkTransfer sessions={sessions} statuses={sessionStatuses} />
           <Fork.DesktopAiPanel open={aiOpen} onClose={() => setAiOpen(false)} sessions={sessions} setActiveView={setActiveView} />
         </div>
+        </Suspense>
       )}
 
       <Fork.AiTrustModal />
 
+      {workspaceIn && (
       <ErrorBoundary overlay label={t("Server form")} onReset={() => { setIsPanelOpen(false); setFormError(""); }}>
       <AddNodePanel
         isOpen={isPanelOpen} onClose={() => { setIsPanelOpen(false); setFormError(""); setFocusJumpVia(false); }}
@@ -3516,6 +3718,14 @@ function DesktopApp() {
             } catch (e) {
               addLog(`SAVE_JUMP_HOST_FAILED: ${e}`, "error");
             }
+            // At startup: open the tab without connecting, for any kind of
+            // server (util/startupChoice; autostart went with the rest above).
+            try {
+              const sshServer = !isRdp && !isTelnet && !isVnc && !ftpServer;
+              await invoke("set_server_auto_open", { id: savedId, value: startupChoice(newNode, sshServer) === "open", persist: false });
+            } catch (e) {
+              addLog(`SAVE_AUTO_OPEN_FAILED: ${e}`, "error");
+            }
             // SSH, RDP, telnet, VNC or FTP: the same separate-write pattern.
             try {
               await invoke("set_server_protocol", { id: savedId, value: isRdp ? "rdp" : isTelnet ? "telnet" : isVnc ? "vnc" : ftpServer ? newNode.protocol : null, persist: false });
@@ -3545,6 +3755,15 @@ function DesktopApp() {
                 if (uuid) writeSessionKeep(uuid, newNode.sessionKeep || DEFAULT_SESSION_KEEP);
               } catch (e) {
                 addLog(`SAVE_SESSION_KEEP_FAILED: ${e}`, "error");
+              }
+            }
+            // An SSH or telnet server's session log: the same, this device's own.
+            if (!isRdp && !isVnc && !ftpServer) {
+              try {
+                const uuid = (await invoke<any[]>("get_servers")).find((s) => s.id === savedId)?.uuid;
+                if (uuid) writeServerLogChoice(uuid, (newNode.logChoice || "default") as LogChoice);
+              } catch (e) {
+                addLog(`SAVE_SESSION_LOG_FAILED: ${e}`, "error");
               }
             }
             // A VNC server's speed and quality: the same, this device's own.
@@ -3590,7 +3809,9 @@ function DesktopApp() {
         onImported={bumpSync}
       />
       </ErrorBoundary>
+      )}
 
+      {workspaceIn && (
       <ErrorBoundary overlay label={t("Quick connect")} onReset={() => setIsQuickConnectOpen(false)}>
         <QuickConnectModal
           isOpen={isQuickConnectOpen}
@@ -3598,13 +3819,14 @@ function DesktopApp() {
           onConnect={openQuickConnect}
         />
       </ErrorBoundary>
+      )}
 
 
       {/* The slide-overs stay mounted while closed (to slide out): inert
           then, so Tab can't reach their fields. */}
       <ErrorBoundary overlay label={t("Command form")} onReset={() => setIsCommandPanelOpen(false)}><Guarded render={() => (
       <div inert={isCommandPanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isCommandPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} {...commandForm.backdropProps}>
-        <div ref={commandPanelRef} tabIndex={-1} className={`w-full max-w-[400px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isCommandPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
+        <div ref={commandPanelRef} tabIndex={-1} className={`w-full max-w-[400px] bg-shade-09090b border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isCommandPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
             <h2 className="text-[15px] font-bold text-white tracking-tight flex items-center gap-2">
               <TerminalSquare size={18} className="text-primary" />
@@ -3620,9 +3842,49 @@ function DesktopApp() {
               <label className="text-[12px] font-bold text-zinc-400 ml-1">{t("Title")}</label>
               <input type="text" className="w-full h-10 bg-black rounded-lg px-3 text-[13px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner" placeholder={t("e.g. Update packages")} value={editCommandData.title} onChange={e => setEditCommandData({ ...editCommandData, title: e.target.value })} />
             </div>
+            {/* Standard vs Secret: a secret's
+                content is masked in the Library (eye toggle to reveal). */}
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                aria-pressed={!editCommandData.is_secret}
+                onClick={() => setEditCommandData({ ...editCommandData, is_secret: false })}
+                className={`h-10 rounded-lg border text-[12px] font-bold flex items-center justify-center gap-1.5 transition-all ${!editCommandData.is_secret ? "bg-primary/15 text-primary border-primary/40" : "bg-black border-white/10 text-zinc-400 hover:text-white"}`}
+              >
+                {t("Standard")}
+              </button>
+              <button
+                type="button"
+                aria-pressed={editCommandData.is_secret}
+                onClick={() => setEditCommandData({ ...editCommandData, is_secret: true })}
+                className={`h-10 rounded-lg border text-[12px] font-bold flex items-center justify-center gap-1.5 transition-all ${editCommandData.is_secret ? "bg-amber-500/15 text-amber-300 border-amber-500/40" : "bg-black border-white/10 text-zinc-400 hover:text-white"}`}
+                title={t("Secret commands are masked in the list")}
+              >
+                <Lock size={13} /> {t("Secret")}
+              </button>
+            </div>
             <div className="space-y-1.5 flex-1 flex flex-col h-64">
-              <label className="text-[12px] font-bold text-zinc-400 ml-1">{t("Command")}</label>
-              <textarea className="w-full flex-1 bg-black rounded-lg p-3 text-[13px] text-zinc-300 font-mono border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner custom-scrollbar resize-none" placeholder="sudo apt update && sudo apt upgrade -y" value={editCommandData.content} onChange={e => setEditCommandData({ ...editCommandData, content: e.target.value })} />
+              <label className="text-[12px] font-bold text-zinc-400 ml-1">{editCommandData.is_secret ? t("Secret command") : t("Command")}</label>
+              {editCommandData.is_secret ? (
+                <SecretTextarea
+                  // A new secret starts readable so the user can see what
+                  // they type; an existing one starts masked. The key
+                  // remounts the field when switching commands so the
+                  // default applies per command, not per panel open.
+                  key={editCommandData.id ?? "new"}
+                  defaultShow={editCommandData.id === null}
+                  value={editCommandData.content}
+                  onChange={(v) => setEditCommandData({ ...editCommandData, content: v })}
+                  placeholder={t("Secret command — it runs in the shell and stays in its history")}
+                  className="w-full flex-1 bg-black rounded-lg p-3 text-[13px] text-zinc-300 font-mono border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner custom-scrollbar resize-none"
+                />
+              ) : (
+                <textarea className="w-full flex-1 bg-black rounded-lg p-3 text-[13px] text-zinc-300 font-mono border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner custom-scrollbar resize-none" placeholder="sudo apt update && sudo apt upgrade -y" value={editCommandData.content} onChange={e => setEditCommandData({ ...editCommandData, content: e.target.value })} />
+              )}
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-[12px] font-bold text-zinc-400 ml-1">{t("Tags")}</label>
+              <input type="text" className="w-full h-10 bg-black rounded-lg px-3 text-[13px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner" placeholder={t("docker, sysadmin, ubuntu, maintenance")} value={editCommandData.tags} onChange={e => setEditCommandData({ ...editCommandData, tags: e.target.value })} />
             </div>
             {/* Remounted per command opened, so it starts from that command's choice. */}
             <CommandScopePicker
@@ -3647,7 +3909,7 @@ function DesktopApp() {
 
       <ErrorBoundary overlay label={t("Note form")} onReset={() => setIsNotePanelOpen(false)}><Guarded render={() => (
       <div inert={isNotePanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isNotePanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} {...noteForm.backdropProps}>
-        <div ref={notePanelRef} tabIndex={-1} className={`w-full max-w-[480px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isNotePanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
+        <div ref={notePanelRef} tabIndex={-1} className={`w-full max-w-[480px] bg-shade-09090b border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isNotePanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
             <h2 className="text-[15px] font-bold text-white tracking-tight flex items-center gap-2">
               <StickyNote size={18} className="text-primary" />
@@ -3682,7 +3944,7 @@ function DesktopApp() {
 
       <ErrorBoundary overlay label={t("Login form")} onReset={() => setIsCredPanelOpen(false)}><Guarded render={() => (
       <div inert={isCredPanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isCredPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} {...credForm.backdropProps}>
-        <div ref={credPanelRef} tabIndex={-1} className={`w-full max-w-[400px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isCredPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
+        <div ref={credPanelRef} tabIndex={-1} className={`w-full max-w-[400px] bg-shade-09090b border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isCredPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
             <h2 className="text-[15px] font-bold text-white tracking-tight flex items-center gap-2">
               <Shield size={18} className="text-primary" />
@@ -3710,8 +3972,8 @@ function DesktopApp() {
                   value={editCredData.auth_type || "password"}
                   onChange={e => setEditCredData({ ...editCredData, auth_type: e.target.value })}
                 >
-                  <option value="password" className="bg-[#121215] text-primary">{t("Password")}</option>
-                  <option value="key" className="bg-[#121215] text-primary">{t("SSH key")}</option>
+                  <option value="password" className="bg-shade-121215 text-primary">{t("Password")}</option>
+                  <option value="key" className="bg-shade-121215 text-primary">{t("SSH key")}</option>
                 </select>
               </div>
             </div>
@@ -3755,7 +4017,7 @@ function DesktopApp() {
 
       <ErrorBoundary overlay label={t("Key form")} onReset={() => setIsKeyPanelOpen(false)}><Guarded render={() => (
       <div inert={isKeyPanelOpen ? undefined : ""} className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isKeyPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} {...keyForm.backdropProps}>
-        <div ref={keyPanelRef} tabIndex={-1} className={`w-full max-w-[450px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isKeyPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
+        <div ref={keyPanelRef} tabIndex={-1} className={`w-full max-w-[450px] bg-shade-09090b border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col outline-none ${isKeyPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
             <h2 className="text-[15px] font-bold text-white tracking-tight flex items-center gap-2">
               <Key size={18} className="text-primary" />

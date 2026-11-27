@@ -28,7 +28,10 @@ const OVERRIDES: { file: string; spread: string; upstream: string[] }[] = [
     file: "src/components/SessionView.tsx",
     spread: "Fork.termTabLook",
     upstream: [
-      'title={term.container ? t("Container: {name}", { name: term.container.name }) : undefined}',
+      "title={[",
+      'term.container ? t("Container: {name}", { name: term.container.name }) : "",',
+      'programTitle ?? "",',
+      '].filter(Boolean).join("\\n") || undefined}',
       "className={`h-10 sm:h-8 px-3 sm:px-4 ${terminals.length > 1 ? 'pr-8 sm:pr-8' : ''} rounded-lg flex items-center gap-2 text-[12px] font-semibold transition-all ${",
       "isFocusedHalf",
       "? 'bg-primary/10 text-primary border border-primary/20 shadow-inner'",
@@ -49,7 +52,7 @@ const OVERRIDES: { file: string; spread: string; upstream: string[] }[] = [
     file: "src/components/SessionView.tsx",
     spread: "Fork.paneLook",
     upstream: [
-      "className={`absolute ${",
+      "className={`theme-dark absolute ${",
       "inSplit",
       "? `z-10 border ${",
       "isFocused",

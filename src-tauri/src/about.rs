@@ -61,12 +61,23 @@ pub fn in_flatpak() -> bool {
     std::path::Path::new("/.flatpak-info").exists()
 }
 
-/// Static info bundled with the binary. Version comes from CARGO_PKG_VERSION
-/// which Cargo + tauri-action set from the git tag during release builds.
+/// The version this build was released as. The release workflow stamps the
+/// git tag into Cargo.toml, but a Windows build gets numbers only (0.5.0 for
+/// v0.5.0-beta.6: the .msi needs that), so the workflow also sets the full tag
+/// as SUBMARINE_RELEASE_VERSION while building. Without it a Windows beta
+/// couldn't tell beta.6 from beta.7, or from the release.
+pub fn running_version() -> &'static str {
+    match option_env!("SUBMARINE_RELEASE_VERSION") {
+        Some(v) if !v.trim().is_empty() => v.trim(),
+        _ => VERSION, // the fork's: build.rs's whole version, on a build from source too
+    }
+}
+
+/// Static info bundled with the binary: the version from running_version.
 #[tauri::command]
 pub fn app_info() -> AppInfo {
     AppInfo {
-        version: VERSION.to_string(),
+        version: running_version().to_string(),
         updates: updates(),
         github_repo_url: format!("https://github.com/{}", GITHUB_REPO),
         github_releases_url: format!("https://github.com/{}/releases", GITHUB_REPO),
@@ -88,10 +99,10 @@ pub struct UpdateInfo {
     /// Latest release tag on GitHub, with "v" stripped to match `current`.
     /// `None` if the API call failed or no release exists.
     pub latest: Option<String>,
-    /// True when the newest published, non-prerelease release on GitHub is
-    /// newer than the running build (see `semver_greater`). Frontend uses
-    /// this to colour the banner (green = up-to-date, amber = update
-    /// available).
+    /// True when the highest published, non-prerelease release on GitHub is a
+    /// strictly newer semver than the running build (per-component NUMERIC
+    /// compare — see `semver_greater`). Frontend uses this to colour the
+    /// banner (green = up-to-date, amber = update available).
     pub has_update: bool,
     /// Direct link to the latest release page. Frontend shows an "Open
     /// release notes" button when has_update is true.
@@ -149,16 +160,18 @@ struct GhRelease {
 /// flag is date-based (and manually overridable), so a hotfix published on an
 /// old line could point it at a lower version than what's actually shipped.
 /// Instead we scan every published, non-prerelease release and pick the highest
-/// SEMVER ourselves, then compare that to `current`. Anonymous calls are rate-
+/// SEMVER ourselves, then compare that to `current`. With `include_beta` (the
+/// "Tell me about beta versions" setting) pre-releases count too. Anonymous calls are rate-
 /// limited to ~60/hour per IP — fine for an occasional check. The timeout is
 /// short so a hung connection can't leave the check spinning.
 ///
 /// `watch_upstream`: also count the original project's new commits — for
-/// whoever maintains the fork (Settings › Updates), the only one who can
-/// bring them in; everyone else is spared the notice and the call.
+/// whoever maintains the fork (Settings › Help › Fork releases), the only
+/// one who can bring them in; everyone else is spared the notice and the call.
 #[tauri::command]
-pub async fn check_for_updates(watch_upstream: Option<bool>) -> Result<UpdateInfo, String> {
-    let current = VERSION.to_string();
+pub async fn check_for_updates(include_beta: Option<bool>, watch_upstream: Option<bool>) -> Result<UpdateInfo, String> {
+    let current = running_version().to_string();
+    let include_beta = include_beta.unwrap_or(false);
     // The App Store's builds and a Flatpak: nothing is asked, nothing is offered.
     if !updates() {
         return Ok(UpdateInfo::none(current));
@@ -178,7 +191,7 @@ pub async fn check_for_updates(watch_upstream: Option<bool>) -> Result<UpdateInf
     // check waits for the slowest request rather than all of them in turn.
     let watch_upstream = watch_upstream.unwrap_or(false);
     let (info, (main_ahead, upstream_ahead)) =
-        tokio::join!(latest_release(&client, &url, current), commit_counts(&client, watch_upstream));
+        tokio::join!(latest_release(&client, &url, current, include_beta), commit_counts(&client, watch_upstream));
     let mut info = info?;
     if !BUILD_COMMIT.is_empty() {
         info.main_ahead = main_ahead;
@@ -201,7 +214,7 @@ pub async fn check_for_updates(watch_upstream: Option<bool>) -> Result<UpdateInf
 
 /// The highest published release on `url` (GITHUB_REPO's releases), and
 /// whether it beats `current`.
-async fn latest_release(client: &reqwest::Client, url: &str, current: String) -> Result<UpdateInfo, String> {
+async fn latest_release(client: &reqwest::Client, url: &str, current: String, include_beta: bool) -> Result<UpdateInfo, String> {
     let resp = client
         .get(url)
         .header("Accept", "application/vnd.github+json")
@@ -224,7 +237,7 @@ async fn latest_release(client: &reqwest::Client, url: &str, current: String) ->
     let bytes = crate::cloud::read_capped(resp, 8 * 1024 * 1024).await.map_err(|e| format!("[UPDATE] {}", e))?;
     let releases: Vec<GhRelease> = serde_json::from_slice(&bytes).map_err(|e| format!("[UPDATE] BAD_JSON: {}", e))?;
 
-    Ok(match newest_release(releases) {
+    Ok(match newest_release(releases, include_beta) {
         None => UpdateInfo::none(current),
         Some((latest_clean, html_url)) => UpdateInfo {
             has_update: semver_greater(&latest_clean, &current),
@@ -235,18 +248,24 @@ async fn latest_release(client: &reqwest::Client, url: &str, current: String) ->
     })
 }
 
-/// The highest published, non-prerelease version, without its "v", and its
-/// page. Drafts are only visible with auth (we're anonymous) but we skip them
-/// defensively all the same. The old "Latest build" release (tag
-/// latest-main) is a pre-release, so it never counts.
-fn newest_release(releases: Vec<GhRelease>) -> Option<(String, String)> {
-    let mut best: Option<(String, String)> = None;
+/// The highest published version, without its "v", and its page:
+/// pre-releases only with include_beta. Drafts are only visible with auth
+/// (we're anonymous) but we skip them defensively all the same. The old
+/// "Latest build" release (tag latest-main) is a pre-release, so it never
+/// counts with include_beta off, and sorts below every numbered one with it
+/// on.
+fn newest_release(releases: Vec<GhRelease>, include_beta: bool) -> Option<(String, String)> {
+    let mut best: Option<(String, String)> = None; // (clean_version, html_url)
     for r in releases {
-        if r.draft || r.prerelease || r.tag_name.is_empty() {
+        if r.draft || (r.prerelease && !include_beta) || r.tag_name.is_empty() {
             continue;
         }
         let clean = r.tag_name.strip_prefix('v').unwrap_or(&r.tag_name).to_string();
-        if best.as_ref().is_none_or(|(cur_best, _)| semver_greater(&clean, cur_best)) {
+        let wins = match &best {
+            None => true,
+            Some((cur_best, _)) => semver_greater(&clean, cur_best),
+        };
+        if wins {
             best = Some((clean, r.html_url));
         }
     }
@@ -257,27 +276,61 @@ fn newest_release(releases: Vec<GhRelease>) -> Option<(String, String)> {
 mod commit_counts;
 pub(crate) use commit_counts::*;
 
-/// True when `a > b` under dotted-number compare: "0.2.0" > "0.1.5",
-/// "1.0.0" > "0.9.9". The fork's releases of a version come after it, in
-/// order: "0.3.8" < "0.3.8-fork.1" < "0.3.8-fork.2" < "0.3.9". Any other
-/// suffix, like "-beta", sorts EQUAL to its base — preferring stable over
-/// pre.
+/// True when version `a` is newer than `b`, by semver's order: the numbers
+/// part by part, then a release above its own pre-releases (0.5.0 above
+/// 0.5.0-beta.6), and pre-release parts as numbers when both are (beta.10
+/// above beta.9). Build metadata (+...) doesn't count. Comparing the numbers
+/// only, as before, made 0.5.0 and 0.5.0-beta.6 equal: someone on a beta was
+/// never told about its release.
 fn semver_greater(a: &str, b: &str) -> bool {
-    let parse = |s: &str| -> (Vec<u64>, u64) {
-        let (base, suffix) = s.split_once(['-', '+']).unwrap_or((s, ""));
-        let parts = base.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect();
-        let fork = suffix.strip_prefix("fork.").and_then(|n| n.parse().ok()).unwrap_or(0);
-        (parts, fork)
+    semver_cmp(a, b) == std::cmp::Ordering::Greater
+}
+
+fn semver_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    let split = |s: &str| -> (Vec<u64>, Option<Vec<String>>) {
+        let s = s.trim();
+        let s = s.split('+').next().unwrap_or(s);
+        let (core, pre) = match s.split_once('-') {
+            Some((core, pre)) => (core, Some(pre.split('.').map(str::to_string).collect())),
+            None => (s, None),
+        };
+        (core.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect(), pre)
     };
-    let ((aa, a_fork), (bb, b_fork)) = (parse(a), parse(b));
-    for i in 0..aa.len().max(bb.len()) {
-        let av = aa.get(i).copied().unwrap_or(0);
-        let bv = bb.get(i).copied().unwrap_or(0);
-        if av != bv {
-            return av > bv;
+    let (an, ap) = split(a);
+    let (bn, bp) = split(b);
+    for i in 0..an.len().max(bn.len()) {
+        let o = an.get(i).copied().unwrap_or(0).cmp(&bn.get(i).copied().unwrap_or(0));
+        if o != Equal {
+            return o;
         }
     }
-    a_fork > b_fork
+    if let Some(o) = fork_release_order(ap.as_deref(), bp.as_deref()) { return o; } // the fork's -fork.N (commit_counts.rs)
+    match (ap, bp) {
+        (None, None) => Equal,
+        (None, Some(_)) => Greater,
+        (Some(_), None) => Less,
+        (Some(ap), Some(bp)) => {
+            for i in 0..ap.len().max(bp.len()) {
+                let o = match (ap.get(i), bp.get(i)) {
+                    (None, None) => Equal,
+                    (None, Some(_)) => Less,
+                    (Some(_), None) => Greater,
+                    (Some(x), Some(y)) => match (x.parse::<u64>(), y.parse::<u64>()) {
+                        (Ok(x), Ok(y)) => x.cmp(&y),
+                        // A number sorts below a word (beta.1 < beta.rc).
+                        (Ok(_), Err(_)) => Less,
+                        (Err(_), Ok(_)) => Greater,
+                        (Err(_), Err(_)) => x.cmp(y),
+                    },
+                };
+                if o != Equal {
+                    return o;
+                }
+            }
+            Equal
+        }
+    }
 }
 
 /// Open a URL in the user's default browser. URL must be http(s) — we
@@ -325,9 +378,36 @@ fn checked_url(url: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::checked_url;
+    use super::{checked_url, semver_greater};
     // The fork's own tests of this, in a file of their own (#136).
     mod fork;
+
+    #[test]
+    fn versions_compare_as_semver_says() {
+        // Numbers part by part.
+        assert!(semver_greater("0.5.1", "0.5.0"));
+        assert!(semver_greater("0.10.0", "0.9.9"));
+        assert!(semver_greater("1.0.0", "0.99.99"));
+        assert!(!semver_greater("0.5.0", "0.5.0"));
+        assert!(!semver_greater("0.3.8", "0.5.0"));
+        // A release is newer than its own betas, and a beta of the next one is
+        // newer than the release before it.
+        assert!(semver_greater("0.5.0", "0.5.0-beta.6"));
+        assert!(!semver_greater("0.5.0-beta.6", "0.5.0"));
+        assert!(semver_greater("0.5.1-beta.1", "0.5.0"));
+        assert!(!semver_greater("0.5.0-beta.6", "0.5.1"));
+        // Beta numbers as numbers.
+        assert!(semver_greater("0.5.0-beta.10", "0.5.0-beta.9"));
+        assert!(semver_greater("0.5.0-beta.7", "0.5.0-beta.6"));
+        assert!(!semver_greater("0.5.0-beta.6", "0.5.0-beta.6"));
+        // Words in order, a number below a word, a longer list above its start.
+        assert!(semver_greater("0.5.0-rc.1", "0.5.0-beta.9"));
+        assert!(semver_greater("0.5.0-beta.rc", "0.5.0-beta.1"));
+        assert!(semver_greater("0.5.0-beta.6.1", "0.5.0-beta.6"));
+        // Build metadata doesn't count.
+        assert!(!semver_greater("0.5.0+build.7", "0.5.0"));
+        assert!(semver_greater("0.5.0+x", "0.5.0-beta.1"));
+    }
 
     #[test]
     fn only_a_parsed_web_address_opens() {

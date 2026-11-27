@@ -170,7 +170,7 @@
         {
           "id": "commands",
           "title": "Komutlar ve notlar",
-          "text": "Sık çalıştırdığınız komutları saklayın; bir terminale yapıştırın ya da orada çalıştırın."
+          "text": "Sık çalıştırdığınız komutları saklayın; bir terminale yapıştırın ya da orada çalıştırın. Gizli bir komut siz gösterene kadar gizli kalır; etiketler de komutları düzenli tutar."
         },
         {
           "id": "phone",
@@ -197,7 +197,8 @@
             "Terminalde görünenleri Ctrl+Shift+F ile, yazdığınız komutları Ctrl+Shift+R ile arayın (Mac'te Cmd+Shift). Shift'siz Ctrl+F ve Ctrl+R kabuğa (shell) bırakılır.",
             "Kendi girişiyle ve kendine ait bir bağlantı üzerinden açılan bir terminal için + düğmesine sağ tıklayın: bir kerelik ya da o sunucu için her zaman.",
             "Ctrl+Shift+K terminali temizler, Ctrl+Shift+W kapatır; terminale Ctrl+Shift+tıklamak ise aynı sunucu için bir terminal daha açar (Mac'te Cmd+Shift).",
-            "24 bit renk (true color), {scrollback} satırlık geri kaydırma, renk şemaları ve Nerd Fonts."
+            "24 bit renk (true color), {scrollback} satırlık geri kaydırma, renk şemaları ve Nerd Fonts.",
+            "<em>Ayarlar → Klavye kısayolları</em> bölümünde her kısayolu değiştirebilirsiniz, kabuğun kullandığı tuşları bile: Windows Terminal'de olduğu gibi Ctrl+C kopyalayabilir."
           ],
           "alt": "Wall görünümü: tek pencerede yan yana üç sunucu"
         },
@@ -252,7 +253,8 @@
           "points": [
             "AES-256-GCM; anahtar, parolanızdan Argon2id ile türetilir. Parola hiçbir zaman saklanmaz.",
             "Kilidi Windows Hello ile ya da Android'de parmak izinizle açın. Bu özellik siz etkinleştirene kadar kapalıdır.",
-            "Profili kilitlemek tüm bağlantıları kapatır; henüz giriş aşamasında olanları bile."
+            "Profili kilitlemek tüm bağlantıları kapatır; henüz giriş aşamasında olanları bile.",
+            "Bilgisayarda profil sayfasında <strong>Bir klasörde kopya</strong> bulunur: her değişiklikten sonra şifreli profil, seçtiğiniz bir klasöre de kaydedilir; örneğin OneDrive ya da Dropbox içindeki bir klasöre."
           ],
           "alt": "Şifreli profilde kayıtlı kimlik bilgileri ve SSH anahtarları"
         },
@@ -263,7 +265,8 @@
           "points": [
             "Ctrl, Alt, Shift, Esc, Tab, ok tuşları ve | ~ / - için tuş çubuğu olan bir terminal. Ctrl ya da Alt'a bir kez dokunursanız bir sonraki tuşa uygulanır, iki kez dokunursanız açık kalır.",
             "Dosya aktarımı, tüneller ve yapay zekâ asistanı.",
-            "Dokunma, yakınlaştırma, ortak pano, bağlantı göstergesi ve hız seçenekleriyle uzak masaüstleri. Telefon, bir RDP sunucusuyla dosya paylaşmaz."
+            "Dokunma, yakınlaştırma, ortak pano, bağlantı göstergesi ve hız seçenekleriyle uzak masaüstleri. Telefon, bir RDP sunucusuyla dosya paylaşmaz.",
+            "Android'de klavyeli kılıf ya da USB veya Bluetooth klavye, terminale bilgisayardaki gibi yazar."
           ],
           "alt": "Android telefonda Submarine: tuş çubuklu bir SSH terminali"
         }
@@ -406,7 +409,7 @@
           "detail": "Android 7.0 ve üzeri · .apk"
         }
       ],
-      "betaNote": "Bu sayfa, son testleri süren 0.5 sürümünü anlatır. 0.5 yayımlanana kadar İndir düğmeleri, yayımlanmış son sürüm olan 0.3.8'i verir. 0.5'ün betası <a href=\"{releasesUrl}\">GitHub</a>'da ön sürüm olarak, iPhone, iPad ve Mac içinse <a href=\"https://testflight.apple.com/join/TmefAPrY\">TestFlight</a>'ta sunulur. 0.3.8 sürümünde terminal, dosya aktarımı, tüneller, izleme ve eşitleme vardır; ancak uzak masaüstleri, Telnet, Windows Hello ve parmak iziyle kilit açma, SSH ajanları, klasör karşılaştırma ve 0.5'ün getirdiği diğer yenilikler yoktur. 0.5'ten itibaren Windows için taşınabilir bir .zip de sunulur.",
+      "betaNote": "İndir düğmeleri, <a href=\"{releasesUrl}\">GitHub</a>'daki en son sürümü açar. iPhone, iPad ve Mac için Submarine ayrıca <a href=\"https://testflight.apple.com/join/TmefAPrY\">TestFlight</a>'ta sunulur.",
       "verifyTitle": "İndirdiğiniz dosyayı doğrulayın",
       "verify": [
         "0.5 sürümünden itibaren her sürümde, indirilebilen her dosyanın sağlama toplamını içeren bir SHA256SUMS dosyası bulunur.",

@@ -235,6 +235,13 @@ impl<H: Handler + 'static> Lease<H> {
     pub(crate) fn login_id(&self) -> u64 {
         self.id
     }
+
+    /// One more lease on the same login, for something that holds a tab's
+    /// route a while longer (Ping, ping.rs). None when the pool no longer
+    /// has the login.
+    pub(crate) fn again(&self) -> Option<Lease<H>> {
+        self.pool.upgrade()?.lease_again(self)
+    }
 }
 
 impl<H: Handler + 'static> Drop for Lease<H> {

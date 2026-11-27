@@ -113,9 +113,8 @@ export const useTerminal = ({
 
   // What the AI side pane moves beside a server tab (terminalDock): the div
   // xterm draws into, and over it this terminal's search box, Saved password
-  // button and toast, so they go with it. The ref is for long-lived handlers,
-  // the state to render the overlays into it (TerminalOverlay).
-  const dockElRef = useRef<HTMLDivElement | null>(null);
+  // button and toast, so they go with it: the state to render the overlays
+  // into it (TerminalOverlay).
   const [dockEl, setDockEl] = useState<HTMLDivElement | null>(null);
 
   // Takes or gives up a GPU context as the terminal comes on screen or goes
@@ -143,7 +142,7 @@ export const useTerminal = ({
 
   return {
     sessionId, terminalId, local, attachOnly, serverId, serverName, commands, write, outputRef, highlightRef, outputChannel, resetHighlight,
-    readyWatchRef, stopReadyWatch, shellReady, watchForShellReady, rootInvoke, dockElRef, dockEl, setDockEl,
+    readyWatchRef, stopReadyWatch, shellReady, watchForShellReady, rootInvoke, dockEl, setDockEl,
     gpuUpdateRef, dockedRef, lookingNow, onScreen,
   };
 };

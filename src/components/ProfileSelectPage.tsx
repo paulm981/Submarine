@@ -11,6 +11,7 @@ import { CloudConfigView, hostOf } from "./SyncServerSetting";
 import logoUrl from "../assets/logo-ui.png";
 import { IS_ANDROID, IS_IOS, IS_MOBILE } from "../util/platform";
 import { PRIVACY_URL } from "../util/links";
+import { readUpdateBeta } from "../util/updateChannel";
 import { openFeedback } from "./Feedback";
 import { useTextPrompt, useConfirm } from "../ui/confirm";
 import { forgetProfileBookmarks } from "../util/sftpBookmarks";
@@ -57,18 +58,33 @@ interface UpdateInfo {
 // Whether the check found anything to announce.
 const hasNews = (u: UpdateInfo) => (u.has_update && !!u.latest) || (u.main_ahead ?? 0) > 0 || (u.upstream_ahead ?? 0) > 0;
 const changes = (n: number) => `${n} new change${n === 1 ? "" : "s"}`;
-// The silent check's answer, kept for the rest of this run of the app: the
-// picker comes back on every lock, and each check is up to three
-// unauthenticated GitHub calls out of the 60 an hour an office's shared
-// address gets.
-// Kept with the setting it was asked with, so turning that on asks again.
-let silentCheck: { watching: boolean; answer: Promise<UpdateInfo> } | null = null;
-// Settings › Updates: also say when the original project has changes the
-// fork lacks — for whoever maintains the fork. Read here because this page
-// shows before the app's settings are loaded.
+// Settings › Help › Fork releases: also say when the original project has
+// changes the fork lacks — for whoever maintains the fork. Read here
+// because this page shows before the app's settings are loaded.
 const watchUpstream = () => {
   try { return localStorage.getItem("submarine-watch-upstream") === "on"; } catch { return false; }
 };
+
+// The silent check's answer, kept until the app is closed: this page mounts
+// again on every Lock, and each check downloads GitHub's list of releases and
+// counts against GitHub's limit for anonymous requests (60 an hour per
+// address). A check that failed is asked again on the next visit. The
+// footer's "Check for updates" always asks, and its answer is kept too. An
+// answer is for one beta setting (Settings → Updates): with the other one the
+// next visit asks again. The fork keys it by Watch the original project too.
+let keptUpdateCheck: { includeBeta: boolean; watching: boolean; answer: Promise<UpdateInfo | null> } | null = null;
+function silentUpdateCheck(includeBeta: boolean): Promise<UpdateInfo | null> {
+  const watching = watchUpstream();
+  if (keptUpdateCheck && keptUpdateCheck.includeBeta === includeBeta && keptUpdateCheck.watching === watching) return keptUpdateCheck.answer;
+  const answer: Promise<UpdateInfo | null> = invoke<UpdateInfo>("check_for_updates", { includeBeta, watchUpstream: watching }).catch(() => {
+    if (keptUpdateCheck?.answer === answer) keptUpdateCheck = null;
+    return null;
+  });
+  keptUpdateCheck = { includeBeta, watching, answer };
+  return answer;
+}
+const keepUpdateCheck = (includeBeta: boolean, watching: boolean, u: UpdateInfo) => { keptUpdateCheck = { includeBeta, watching, answer: Promise.resolve(u) }; };
+
 // The running version and the project's GitHub page (backend: about::app_info).
 // `commit`: the build's commit, short, when known; `build`: the fork's build
 // number, when known (about::app_info). `updates` is false in the App
@@ -326,19 +342,15 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
 
   useEffect(() => { refreshCloud(); }, [refreshCloud]);
 
-  // Check GitHub for a newer release or newer commits once per run of the
-  // app (this page mounts on launch and on every return to the picker; the
-  // later mounts reuse the first answer). Best-effort and silent: the
-  // fetch+compare happens in Rust (about::check_for_updates), and any
-  // failure — offline, rate-limited, no releases — simply shows nothing.
+  // Check GitHub for a newer release (this page mounts on launch and on every
+  // return to the picker; silentUpdateCheck asks once while the app runs).
+  // Best-effort and silent: the fetch+semver-compare happens in Rust
+  // (about::check_for_updates), and any failure — offline, rate-limited, no
+  // releases — simply shows nothing.
   useEffect(() => {
-    const watching = watchUpstream();
-    if (silentCheck?.watching !== watching) {
-      silentCheck = { watching, answer: invoke<UpdateInfo>("check_for_updates", { watchUpstream: watching }) };
-    }
-    silentCheck.answer
-      .then((u) => { if (hasNews(u)) setUpdate(u); })
-      .catch(() => { silentCheck = null; });
+    let mounted = true;
+    void silentUpdateCheck(readUpdateBeta()).then((u) => { if (mounted && u && hasNews(u)) setUpdate(u); });
+    return () => { mounted = false; };
   }, []);
 
   // A link that can't be opened (no browser / URL handler on this device)
@@ -366,7 +378,10 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     if (check === "checking") return;
     setCheck("checking");
     try {
-      const u = await invoke<UpdateInfo>("check_for_updates", { watchUpstream: watchUpstream() });
+      const includeBeta = readUpdateBeta();
+      const watching = watchUpstream();
+      const u = await invoke<UpdateInfo>("check_for_updates", { includeBeta, watchUpstream: watching });
+      keepUpdateCheck(includeBeta, watching, u);
       if (hasNews(u)) {
         setUpdate(u);
         setCheck("idle");
@@ -1512,7 +1527,7 @@ const RowMenu = ({ label, items, place, onClose }: {
         aria-label={label}
         onKeyDown={onKeyDown}
         style={pos ?? { left: -9999, top: -9999 }}
-        className="fixed z-[9999] min-w-[220px] rounded-xl border border-white/10 bg-[#141418] p-1 shadow-2xl shadow-black/60"
+        className="fixed z-[9999] min-w-[220px] rounded-xl border border-white/10 bg-shade-141418 p-1 shadow-2xl shadow-black/60"
       >
         {items.map((it, i) => (
           <Fragment key={it.label}>

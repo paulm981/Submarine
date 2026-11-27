@@ -31,7 +31,7 @@ const COMPACT: Record<TabTone, { on: string; off: string }> = {
 /// caller adds its own width or padding.
 export const titleTabClass = ({ active }: { active: boolean }): string =>
   `relative flex items-center h-[33px] rounded-t-lg cursor-pointer shrink-0 transition-colors ${
-    active ? "z-10 bg-[#141417] text-zinc-100 border-x border-t border-white/10" : "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]"
+    active ? "z-10 bg-shade-141417 text-zinc-100 border-x border-t border-white/10" : "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]"
   }`;
 
 /// Inside a fork's title-bar tab: the open one's line on top (`color`), and

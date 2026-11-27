@@ -48,11 +48,14 @@ export const stripLook = (compactTabs: boolean): { className?: string } => ({
 });
 
 /** A terminal tab's button: its whole name as the hover title (compact tabs
- *  cut it), and the compact look (Settings). */
+ *  cut it), then the title a program set (their #393, cleaned by
+ *  util/terminalTitle) on a line of its own, and the compact look (Settings).
+ *  The fork's tab names are in capitals; the program's title after them (in
+ *  their <bdi>) keeps its own case, as a path or a file name must. */
 export const termTabLook = (
-  t: SessionTerminal, compactTabs: boolean, isFocusedHalf: boolean, isSplitPartner: boolean, count: number, aiFull = false,
+  t: SessionTerminal, compactTabs: boolean, isFocusedHalf: boolean, isSplitPartner: boolean, count: number, aiFull = false, programTitle?: string,
 ): { title?: string; className?: string } => ({
-  title: t.container ? `${t.title} · Container: ${t.container.name}` : t.title,
+  title: [t.container ? `${t.title} · Container: ${t.container.name}` : t.title, programTitle].filter(Boolean).join("\n"),
   className: `h-10 sm:h-8 ${compactTabs
     ? `${COMPACT_TAB_PAD} ${count > 1 ? 'pr-6' : ''} gap-1.5 text-[10px] ${
         compactTermTabClass(isFocusedHalf, isSplitPartner ? "merged" : "primary")
@@ -64,7 +67,7 @@ export const termTabLook = (
             ? 'bg-primary/[0.04] text-primary/70 border border-primary/10'
             : 'text-zinc-300 bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/20 hover:text-white'
       }`
-  } flex items-center font-bold uppercase tracking-wider transition-all ${t.container ? 'ring-1 ring-sky-400/30' : ''} ${t.ai && aiFull ? 'ring-1 ring-rose-500/60' : ''}`,
+  } flex items-center font-bold uppercase tracking-wider [&_bdi]:normal-case [&_bdi]:tracking-normal transition-all ${t.container ? 'ring-1 ring-sky-400/30' : ''} ${t.ai && aiFull ? 'ring-1 ring-rose-500/60' : ''}`,
 });
 
 /** A terminal tab's close button: never starts a drag (ui/tabDrag), and
@@ -80,7 +83,7 @@ export const termCloseLook = (compactTabs: boolean): { "data-no-tab-drag": boole
  *  buffer, its shell keeps running, and it's never remounted. `group/pane`
  *  shows a pane's "take out of the split" button on hover. */
 export const paneLook = (inSplit: boolean, inView: boolean, isFocused: boolean): { className?: string } => ({
-  className: `group/pane absolute ${inSplit ? 'min-w-0 min-h-0 border' : 'inset-0'} ${
+  className: `theme-dark group/pane absolute ${inSplit ? 'min-w-0 min-h-0 border' : 'inset-0'} ${
     inView ? 'opacity-100 z-10' : 'hidden'
   } ${inSplit ? (isFocused
     ? 'border-primary/40 shadow-[inset_0_0_0_1px_rgba(var(--primary),0.15)]'

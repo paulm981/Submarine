@@ -2,11 +2,11 @@
 //! (SSH's, or the one its protocol uses) take a connection yet, while it
 //! reboots, say.
 //!
-//! One check per call, no task left behind: the panel asks every couple of
-//! seconds while it's open and stops asking when it closes. A check is a plain
-//! TCP connect, so it needs no privileges (ICMP would) and works where ping is
-//! blocked. Nothing is sent and nobody logs in: the connection is closed as
-//! soon as it's made.
+//! One check per call, no task left behind (but the hold below): the panel
+//! asks every couple of seconds while it's open and stops asking when it
+//! closes. A check is a plain TCP connect, so it needs no privileges (ICMP
+//! would) and works where ping is blocked. Nothing is sent and nobody logs
+//! in: the connection is closed as soon as it's made.
 //!
 //! A server behind a saved jump host is checked from the jump host, over a
 //! connection Submarine already has to it (the route of a tab on another
@@ -16,14 +16,26 @@
 //! server is in flight at a time, and none holds a lock other tabs need. Without one, the check says so instead of logging in
 //! anywhere. A server reached through a proxy or a ProxyCommand isn't checked
 //! from here either: a connect from here wouldn't go the way its logins do.
+//!
+//! A tab's route through a jump host closes when the tab's connection drops
+//! (the original project's #388). So a server that reboots, and whose own tab
+//! was the only one through that jump host, couldn't be checked any more.
+//! Ping keeps its own hold on the route it last checked through (`Holds`),
+//! the way the route itself holds its jump host logins: a reference to each
+//! connection, and a lease on each login shared with other tabs
+//! (jump_pool.rs). The hold lasts `HOLD_FOR` past the last check, so it goes
+//! soon after the panel closes, and goes at once when the profile is locked.
+//! It's never used in another profile.
 
 use crate::diagnose::Reach;
+use crate::jump_pool::Lease;
 use crate::ssh_manager::{ClientHandler, SshState};
 use crate::{ConfigTarget, ConnectRoute, DbState};
-use russh::client::Handle;
+use russh::client::{Handle, Handler};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 /// How long one check waits for an answer.
@@ -226,21 +238,152 @@ async fn open_on_tab(
     })
 }
 
+/// How long Ping keeps its hold on a jump host after its last check through
+/// it. The panel checks every 2 s, and every 30 s once the server answers
+/// (PingPanel.tsx): a little more than that, so a server that goes down
+/// between two checks is still checked through it.
+const HOLD_FOR: Duration = Duration::from_secs(45);
+
+/// Ping's own hold on a jump host's route: its connections, the jump host's
+/// last, and a lease on each login it shares with other tabs.
+struct Hold<H: Handler + 'static> {
+    /// The profile it was taken in (DbState::generation_now): a server id is
+    /// another server in the next profile, so it's never used there.
+    opened: u64,
+    /// Which hold this is, for the task that lets it go (`let_go_when_idle`).
+    serial: u64,
+    handles: Vec<Arc<Handle<H>>>,
+    _leases: Vec<Lease<H>>,
+    until: tokio::time::Instant,
+}
+
+/// Ping's holds, one per jump host (its saved server's id).
+pub(crate) struct Holds<H: Handler + 'static> {
+    map: std::sync::Mutex<HashMap<i32, Hold<H>>>,
+    serial: AtomicU64,
+}
+
+/// The app's holds, on routes of SSH tabs.
+static HOLDS: LazyLock<Arc<Holds<ClientHandler>>> = LazyLock::new(Holds::new);
+
+/// The profile closed (`SshState::forget_fork_sessions`): every hold goes,
+/// and with it the connections and logins only Ping still used.
+pub(crate) fn let_go_all() {
+    HOLDS.clear();
+}
+
+impl<H: Handler + 'static> Holds<H> {
+    fn new() -> Arc<Self> {
+        Arc::new(Holds { map: std::sync::Mutex::new(HashMap::new()), serial: AtomicU64::new(0) })
+    }
+
+    /// Hold `handles` (a route through `jump_id`, the jump host's
+    /// connection last) and a new lease on each of `leases`, for HOLD_FOR
+    /// from now, and return the jump host's connection. The route held
+    /// already is only renewed. A route in another profile replaces it.
+    fn hold(self: &Arc<Self>, jump_id: i32, opened: u64, handles: &[Arc<Handle<H>>], leases: &[Lease<H>]) -> Option<Arc<Handle<H>>> {
+        let last = Arc::clone(handles.last()?);
+        let until = tokio::time::Instant::now() + HOLD_FOR;
+        let renewed = self.map.lock().ok().is_some_and(|mut map| match map.get_mut(&jump_id) {
+            Some(h) if h.opened == opened && h.handles.last().is_some_and(|l| Arc::ptr_eq(l, &last)) => {
+                h.until = until;
+                true
+            }
+            _ => false,
+        });
+        if renewed {
+            return Some(last);
+        }
+        // Taken outside the holds' lock: a lease takes the pool's.
+        let leases: Vec<Lease<H>> = leases.iter().filter_map(Lease::again).collect();
+        let (replaced, serial) = {
+            let Ok(mut map) = self.map.lock() else { return Some(last) };
+            let serial = match map.get(&jump_id) {
+                Some(h) => h.serial,
+                None => self.serial.fetch_add(1, Ordering::Relaxed) + 1,
+            };
+            let hold = Hold { opened, serial, handles: handles.to_vec(), _leases: leases, until };
+            (map.insert(jump_id, hold), serial)
+        };
+        // The one it replaces is let go outside the lock (its leases lock
+        // the pool); its task goes on for this one.
+        match replaced {
+            Some(old) => drop(old),
+            None => self.let_go_when_idle(jump_id, serial),
+        }
+        Some(last)
+    }
+
+    /// The jump host's connection Ping holds for `jump_id` in this profile,
+    /// renewed for HOLD_FOR: the route it checked through before, which may
+    /// have closed for its tab since. None when there's none, or it closed.
+    fn held(&self, jump_id: i32, opened: u64) -> Option<Arc<Handle<H>>> {
+        let gone = {
+            let mut map = self.map.lock().ok()?;
+            let h = map.get_mut(&jump_id)?;
+            match h.handles.last() {
+                Some(last) if h.opened == opened && !last.is_closed() => {
+                    h.until = tokio::time::Instant::now() + HOLD_FOR;
+                    return Some(Arc::clone(last));
+                }
+                _ => map.remove(&jump_id),
+            }
+        };
+        drop(gone);
+        None
+    }
+
+    /// Lets the hold numbered `serial` go once it hasn't been used for
+    /// HOLD_FOR: one task per jump host held, which ends with its hold.
+    fn let_go_when_idle(self: &Arc<Self>, jump_id: i32, serial: u64) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+        let me = Arc::clone(self);
+        rt.spawn(async move {
+            loop {
+                let until = {
+                    let Ok(map) = me.map.lock() else { return };
+                    match map.get(&jump_id) {
+                        Some(h) if h.serial == serial => h.until,
+                        _ => return,
+                    }
+                };
+                tokio::time::sleep_until(until).await;
+                let gone = {
+                    let Ok(mut map) = me.map.lock() else { return };
+                    let idle = map.get(&jump_id).is_some_and(|h| h.serial == serial && h.until <= tokio::time::Instant::now());
+                    if idle { map.remove(&jump_id) } else { None }
+                };
+                if gone.is_some() {
+                    drop(gone);
+                    return;
+                }
+            }
+        });
+    }
+
+    fn clear(&self) {
+        let gone = self.map.lock().map(|mut map| std::mem::take(&mut *map)).unwrap_or_default();
+        drop(gone);
+    }
+}
+
 /// Check `host:port` from jump host `jump_id`, over a connection Submarine
 /// already has to it: None when there's none. A route a tab behind it opened
-/// is used first (only one that went through this jump host), then a tab on
-/// the jump host itself. No lock is held while the channel opens.
-async fn check_through_jump(ssh: &SshState, server_id: i32, jump_id: i32, host: &str, port: u16) -> Option<Through> {
+/// is used first (only one that went through this jump host), held by Ping
+/// for its next checks; then the route Ping held from before, whose tab's
+/// connection may have dropped since (the server rebooting); then a tab on
+/// the jump host itself. No lock is held while the channel opens. `opened`:
+/// the open profile (DbState::generation_now).
+async fn check_through_jump(ssh: &SshState, opened: u64, server_id: i32, jump_id: i32, host: &str, port: u16) -> Option<Through> {
     let route = {
         let routes = ssh.jump_connections.lock().await;
         routes
             .values()
             .filter(|r| r.jump_id == Some(jump_id))
-            .filter_map(|r| r.handles.last())
-            .find(|h| !h.is_closed())
-            .cloned()
+            .find(|r| r.handles.last().is_some_and(|h| !h.is_closed()))
+            .and_then(|r| HOLDS.hold(jump_id, opened, &r.handles, &r.leases))
     };
-    if let Some(via) = route {
+    if let Some(via) = route.or_else(|| HOLDS.held(jump_id, opened)) {
         return Some(open_shared(server_id, via, host, port, CHECK_TIMEOUT).await);
     }
     let sessions: Vec<String> =
@@ -288,7 +431,7 @@ pub async fn ping_server(
         ConnectRoute::Direct => from_reach(port, crate::diagnose::reach(&target.host, port, CHECK_TIMEOUT).await),
         ConnectRoute::Jump(jump_id) => {
             let through = s.jump_name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "its jump host".into());
-            match check_through_jump(&ssh, server_id, jump_id, &target.host, port).await {
+            match check_through_jump(&ssh, db.generation_now(), server_id, jump_id, &target.host, port).await {
                 Some(Through::Answers(ms)) => PingReply::Answers { port, ms, through: Some(through) },
                 Some(Through::NoAnswer(why)) => PingReply::NoAnswer { port, why, through: Some(through) },
                 Some(Through::NotYet) => PingReply::NoAnswer { port, why: Some("no answer yet".into()), through: Some(through) },
@@ -390,6 +533,97 @@ mod tests {
         assert_eq!(open_shared(-2, Arc::clone(&stalled), "target", 22, Duration::from_millis(50)).await, Through::NotYet);
         // The task holds its own reference to the connection, not a lock.
         assert!(Arc::strong_count(&stalled) >= 2);
+    }
+
+    /// A Lock lets Ping's holds go: teardown_profile calls
+    /// forget_fork_sessions (checked in root_state.rs), which calls this.
+    #[test]
+    fn a_lock_lets_the_holds_go() {
+        crate::fork_hooks::assert_hooks(
+            "root_state.rs",
+            include_str!("ssh_manager/root_state.rs"),
+            &[("forget_fork_sessions", "crate::ping::let_go_all()", 1)],
+        );
+    }
+
+    /// A login a tab shares with others (jump_pool.rs), made in `pool`, and
+    /// its key.
+    async fn shared_login(
+        pool: &Arc<crate::jump_pool::Pool<crate::ssh_test_server::TestClient>>,
+        jump: &Arc<Handle<crate::ssh_test_server::TestClient>>,
+    ) -> (crate::jump_pool::Key, Lease<crate::ssh_test_server::TestClient>) {
+        use crate::jump_pool::{digest, Acquired, Key, Via};
+        let key = Key::new(Via::Direct, "bastion:22".into(), "alice".into(), "jump5".into(), digest(&[b"pw"]));
+        let gens = Arc::new(tokio::sync::Mutex::new(HashMap::from([("session-1".to_string(), 1)])));
+        let attempt = crate::ssh_manager::ConnectAttempt::new(gens, "session-1".into(), 1);
+        let Ok(Acquired::Create(reservation)) = pool.acquire(key.clone(), "session-1", &attempt, 8, || {}).await else {
+            panic!("the first tab makes the login")
+        };
+        let lease = reservation.ready(Arc::clone(jump), None, None).expect("the pool keeps it");
+        (key, lease)
+    }
+
+    /// The server behind the jump host reboots, and its tab was the only one
+    /// through it: the tab's route closes with its connection (#388), but
+    /// Ping's hold keeps the jump host's connection, and its share of the
+    /// login, so the server is still checked through it. Never in another
+    /// profile.
+    #[tokio::test]
+    async fn a_route_ping_held_still_checks_after_its_tab_dropped() {
+        use crate::ssh_test_server::{connect, TestServer};
+        let jump = Arc::new(connect(TestServer::default(), |_| {}, russh::client::Config::default()).await.unwrap());
+        let pool = crate::jump_pool::Pool::new();
+        let (key, route_lease) = shared_login(&pool, &jump).await;
+        let holds = Holds::new();
+        // A check through the tab's route holds it.
+        let via = holds.hold(5, 1, &[Arc::clone(&jump)], std::slice::from_ref(&route_lease)).unwrap();
+        assert!(Arc::ptr_eq(&via, &jump));
+        assert_eq!(pool.census(&key), vec![2], "Ping has a share of the login, beside the tab's");
+        // The next check through the same route only renews it.
+        holds.hold(5, 1, &[Arc::clone(&jump)], std::slice::from_ref(&route_lease)).unwrap();
+        assert_eq!(pool.census(&key), vec![2]);
+        // The tab's connection drops: its route goes, with its lease.
+        drop((via, route_lease));
+        let alive = Arc::downgrade(&jump);
+        drop(jump);
+        assert_eq!(pool.census(&key), vec![1], "the login stays shared, Ping still uses it");
+        let held = holds.held(5, 1).expect("Ping still holds the route");
+        assert!(!held.is_closed());
+        assert!(matches!(open_shared(-3, held, "target", 22, CHECK_TIMEOUT).await, Through::Answers(_)));
+        // Another profile never uses it, and it goes.
+        assert!(holds.held(5, 2).is_none());
+        assert!(holds.held(5, 1).is_none());
+        assert_eq!(pool.census(&key), vec![0]);
+        // The pool's own reference lingers (LINGER) for a tab that comes back.
+        assert!(alive.upgrade().is_some());
+    }
+
+    /// The hold lasts HOLD_FOR past the last check, renewed by each, so it
+    /// goes soon after the panel closes; a Lock lets every hold go at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_hold_goes_when_ping_stops_and_at_a_lock() {
+        use crate::ssh_test_server::{connect, TestServer};
+        let jump = Arc::new(connect(TestServer::default(), |_| {}, russh::client::Config::default()).await.unwrap());
+        let alive = Arc::downgrade(&jump);
+        let holds = Holds::new();
+        holds.hold(5, 1, &[jump], &[]).unwrap();
+        tokio::time::sleep(HOLD_FOR - Duration::from_secs(15)).await;
+        assert!(holds.held(5, 1).is_some(), "a check renews it");
+        tokio::time::sleep(HOLD_FOR - Duration::from_secs(5)).await;
+        assert!(holds.map.lock().unwrap().contains_key(&5), "still held: checked less than HOLD_FOR ago");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(holds.map.lock().unwrap().is_empty(), "let go once not checked for HOLD_FOR");
+        assert!(alive.upgrade().is_none(), "and its connection with it");
+        // A Lock.
+        let jump = Arc::new(connect(TestServer::default(), |_| {}, russh::client::Config::default()).await.unwrap());
+        let alive = Arc::downgrade(&jump);
+        holds.hold(7, 1, &[jump], &[]).unwrap();
+        holds.clear();
+        assert!(alive.upgrade().is_none());
+        assert!(holds.held(7, 1).is_none());
     }
 
     #[tokio::test]

@@ -25,13 +25,32 @@ use tokio::task::AbortHandle;
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024; // 4 MB cap for logs
 
 // State for active streaming sessions (live logs, etc.) keyed by a
-// frontend-generated stream id so the user can stop them individually.
+// frontend-generated stream id so the user can stop them individually, with
+// the session each one reads from.
 #[derive(Default)]
 pub struct DockerStreams {
-    pub streams: Arc<TokioMutex<HashMap<String, AbortHandle>>>,
+    pub streams: Arc<TokioMutex<HashMap<String, (String, AbortHandle)>>>,
 }
 impl DockerStreams {
     pub fn new() -> Self { Self::default() }
+
+    /// Ends the session's streams: a stream holds its own channel, which
+    /// kept the connection up after a Disconnect, with `docker logs -f`
+    /// running on the server and its lines still coming in.
+    pub async fn stop_for_session(&self, session_id: &str) {
+        self.streams.lock().await.retain(|_, (sid, h)| {
+            let mine = sid == session_id;
+            if mine { h.abort(); }
+            !mine
+        });
+    }
+
+    /// Ends every stream: the profile closes.
+    pub async fn stop_all(&self) {
+        for (_, (_, h)) in self.streams.lock().await.drain() {
+            h.abort();
+        }
+    }
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -749,7 +768,7 @@ pub async fn ssh_docker_logs_start(
         .streams
         .lock()
         .await
-        .insert(stream_id, handle.abort_handle());
+        .insert(stream_id, (session_id, handle.abort_handle()));
     // Started (the page tells this from a cancelled password prompt, which
     // is null).
     Ok(true)
@@ -760,7 +779,7 @@ pub async fn ssh_docker_logs_stop(
     streams: tauri::State<'_, DockerStreams>,
     stream_id: String,
 ) -> Result<(), String> {
-    if let Some(h) = streams.streams.lock().await.remove(&stream_id) {
+    if let Some((_, h)) = streams.streams.lock().await.remove(&stream_id) {
         h.abort();
     }
     Ok(())
@@ -792,8 +811,8 @@ fn container_terminal_command(container: &str, use_sudo: bool) -> String {
 // pipeline (output over the page's channel, term_output.rs, + write/resize/close commands)
 // the regular shell terminal uses, so xterm.js on the frontend works
 // without any branch — just a different exec target.
-#[allow(clippy::too_many_arguments)]
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn open_container_terminal(
     app: tauri::AppHandle,
     state: tauri::State<'_, SshState>,
@@ -803,6 +822,7 @@ pub async fn open_container_terminal(
     cols: u32,
     rows: u32,
     use_sudo: bool,
+    session_log: Option<crate::session_log::Request>,
     password: Option<String>,
     on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Result<(), String> {
@@ -886,10 +906,12 @@ pub async fn open_container_terminal(
     // What the container's shell wrote while the password prompt was
     // looked for (root_channel) comes first, through the pump's own filter
     // (term_filter.rs), so a sequence split across the two is cut down too.
+    let log = crate::start_session_log(&app, &terminal_id, session_log);
     tauri::async_runtime::spawn(crate::ssh_manager::run_pty_pump(
         app.clone(),
         terminal_id.clone(),
         channel,
+        log,
         rx,
         resize_rx,
         on_output,
@@ -897,6 +919,33 @@ pub async fn open_container_terminal(
     ));
 
     Ok(())
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::DockerStreams;
+
+    // A tab's Disconnect ends its own log streams and no other tab's; the
+    // profile closing ends them all.
+    #[tokio::test]
+    async fn streams_end_with_their_session() {
+        let streams = DockerStreams::new();
+        let forever = || tokio::spawn(async { std::future::pending::<()>().await });
+        let (a, b, c) = (forever(), forever(), forever());
+        {
+            let mut map = streams.streams.lock().await;
+            map.insert("s-a".into(), ("session-1".into(), a.abort_handle()));
+            map.insert("s-b".into(), ("session-10".into(), b.abort_handle()));
+            map.insert("s-c".into(), ("session-1".into(), c.abort_handle()));
+        }
+        streams.stop_for_session("session-1").await;
+        assert!(a.await.unwrap_err().is_cancelled());
+        assert!(c.await.unwrap_err().is_cancelled());
+        assert_eq!(streams.streams.lock().await.keys().cloned().collect::<Vec<String>>(), vec!["s-b".to_string()]);
+        streams.stop_all().await;
+        assert!(b.await.unwrap_err().is_cancelled());
+        assert!(streams.streams.lock().await.is_empty());
+    }
 }
 
 #[cfg(test)]

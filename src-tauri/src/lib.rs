@@ -49,8 +49,12 @@ mod known_hosts;
 mod rdp;
 mod quick_unlock;
 mod rdp_client;
+mod rdp_files;
+mod file_clipboard;
 mod rdp_share;
 mod term_filter;
+mod session_log;
+mod session_log_policy;
 mod vault_backup;
 mod folder_copy;
 mod ai;
@@ -80,8 +84,6 @@ mod vault_schema;
 mod sync_merge;
 mod profile_create;
 mod clipboard_read;
-#[cfg(windows)]
-mod windows_clipboard;
 #[cfg(test)]
 mod fork_hooks;
 #[cfg(target_os = "android")]
@@ -244,7 +246,9 @@ enum ProfileLock {
 ///
 /// The lock is a held lock on `<name>.submarine.lock`, not the file's mere
 /// existence, so it can never be left behind: the system lets go of it when the
-/// process ends, however it ends.
+/// process ends, however it ends. That can take a while (a file still being
+/// written to a network folder holds it up), so on exit the lock goes as soon
+/// as the last save is done.
 fn lock_profile(state: &DbState, path: &Path) -> Result<ProfileLock, String> {
     let held_here = state.profile_lock.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE_LOCK")?
         .as_ref()
@@ -1050,7 +1054,7 @@ const ENTITIES: &[EntitySpec] = &[
     EntitySpec { table: "credentials", cols: &["name", "auth_type", "username", "password", "edited_by"], fks: &[Fk { key: "key_uuid", col: "key_id", ref_table: "ssh_keys", required: false }] },
     EntitySpec {
         table: "servers",
-        cols: &["name", "host", "port", "username", "password", "proxy_type", "proxy_host", "proxy_port", "tunnels", "auth_type", "autostart", "mirrors", "color", "notes", "run_on_connect", "run_on_connect_every", "terminal_theme", "highlight", "protocol", "position", "edited_by"],
+        cols: &["name", "host", "port", "username", "password", "proxy_type", "proxy_host", "proxy_port", "tunnels", "auth_type", "autostart", "auto_open", "mirrors", "color", "notes", "run_on_connect", "run_on_connect_every", "terminal_theme", "highlight", "protocol", "position", "edited_by"],
         fks: &[
             Fk { key: "credential_uuid", col: "credential_id", ref_table: "credentials", required: false },
             Fk { key: "folder_uuid", col: "folder_id", ref_table: "folders", required: false },
@@ -1064,7 +1068,7 @@ const ENTITIES: &[EntitySpec] = &[
         cols: &["name", "host", "port", "username", "notes", "edited_by"],
         fks: &[Fk { key: "folder_uuid", col: "folder_id", ref_table: "folders", required: false }],
     },
-    EntitySpec { table: "commands", cols: &["title", "content", "edited_by", "scope"], fks: &[] },
+    EntitySpec { table: "commands", cols: &["title", "content", "edited_by", "scope", "is_secret", "tags"], fks: &[] },
     EntitySpec { table: "notes", cols: &["title", "body", "edited_by"], fks: &[] },
     // The user's own highlight rules (highlight.rs).
     EntitySpec {
@@ -1122,8 +1126,9 @@ fn col_kind(table: &str, col: &str) -> ColKind {
         | ("highlight_rules", "pattern" | "kind" | "color") => ColKind::RequiredText,
         ("servers" | "rdp_links", "port") => ColKind::Int32,
         ("servers", "proxy_port") => ColKind::OptionalInt32,
-        ("servers", "autostart" | "position" | "run_on_connect_every") => ColKind::OptionalInt,
+        ("servers", "autostart" | "auto_open" | "position" | "run_on_connect_every") => ColKind::OptionalInt,
         ("highlight_rules", "match_case" | "bold" | "underline" | "enabled" | "position") => ColKind::OptionalInt,
+        ("commands", "is_secret") => ColKind::OptionalInt,
         ("servers", "tunnels" | "mirrors") => ColKind::ObjectList,
         _ => ColKind::Text,
     }
@@ -4234,8 +4239,8 @@ mod sync_engine_tests {
             "CREATE TABLE folders(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, parent_id INTEGER, color TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE ssh_keys(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, public_key TEXT, private_key TEXT, passphrase TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE credentials(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, auth_type TEXT, username TEXT, password TEXT, key_id INTEGER, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT{});
-             CREATE TABLE servers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT, key_id INTEGER, autostart INTEGER, mirrors TEXT, color TEXT, notes TEXT, run_on_connect TEXT, run_on_connect_every INTEGER, jump_host_id INTEGER, protocol TEXT, position INTEGER NOT NULL DEFAULT 0, terminal_theme TEXT, highlight TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT{});
-             CREATE TABLE commands(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT, scope TEXT);
+             CREATE TABLE servers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT, proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT, key_id INTEGER, autostart INTEGER, auto_open INTEGER, mirrors TEXT, color TEXT, notes TEXT, run_on_connect TEXT, run_on_connect_every INTEGER, jump_host_id INTEGER, protocol TEXT, position INTEGER NOT NULL DEFAULT 0, terminal_theme TEXT, highlight TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT{});
+             CREATE TABLE commands(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT, scope TEXT, is_secret INTEGER, tags TEXT);
              CREATE TABLE notes(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE monitor_configs(node_id INTEGER PRIMARY KEY, enabled_metrics TEXT, custom_metrics TEXT, paused INTEGER, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT{});
              CREATE TABLE rdp_links(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 3389, username TEXT NOT NULL DEFAULT '', folder_id INTEGER, notes TEXT NOT NULL DEFAULT '', uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);",
@@ -4851,6 +4856,130 @@ mod sync_engine_tests {
         apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
         let every: Option<i64> = b.query_row("SELECT run_on_connect_every FROM servers WHERE name='db'", [], |r| r.get(0)).unwrap();
         assert_eq!(every, None);
+    }
+
+    // "At startup: Open the tab" syncs, and a peer from before it (no key)
+    // editing the server doesn't turn it off; one that has it can.
+    #[test]
+    fn auto_open_syncs_and_an_older_peers_edit_keeps_it() {
+        let (a, _ha) = device("A");
+        a.execute("INSERT INTO servers(name, host, port, auto_open) VALUES('web', 'h', 22, 1)", []).unwrap();
+        let (b, hb) = device("B");
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let got = |c: &Connection, name: &str| -> Option<i64> {
+            c.query_row("SELECT auto_open FROM servers WHERE name=?1", [name], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(got(&b, "web"), Some(1), "it syncs");
+
+        // An older peer edits the server: its record has no auto_open.
+        a.execute("UPDATE servers SET host='h2' WHERE name='web'", []).unwrap();
+        let ahead = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 60_000;
+        let mut recs = collect_local_records(&a, &KEY, "").unwrap();
+        for r in recs.iter_mut().filter(|r| r.entity_type == "servers") {
+            let mut obj: serde_json::Value = serde_json::from_slice(&decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap()).unwrap();
+            assert!(obj.as_object_mut().unwrap().remove("auto_open").is_some(), "a current peer always sends the key");
+            r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
+            r.updated_at = format!("{ahead:015}:00000:zzz");
+        }
+        apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+        let host: String = b.query_row("SELECT host FROM servers WHERE name='web'", [], |r| r.get(0)).unwrap();
+        assert_eq!(host, "h2", "the edit applies");
+        assert_eq!(got(&b, "web"), Some(1), "and the server keeps it");
+
+        // A current peer turns it off.
+        a.execute("UPDATE servers SET auto_open=0 WHERE name='web'", []).unwrap();
+        let later = ahead + 60_000;
+        let mut recs = collect_local_records(&a, &KEY, "").unwrap();
+        for r in recs.iter_mut().filter(|r| r.entity_type == "servers") {
+            r.updated_at = format!("{later:015}:00000:zzz");
+        }
+        apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+        assert_eq!(got(&b, "web"), Some(0), "off from a current peer is off");
+
+        // A server new to this device, from an older peer, lands with it off.
+        let (c, _hc) = device("C");
+        c.execute("INSERT INTO servers(name, host, port) VALUES('db', 'h3', 22)", []).unwrap();
+        let mut recs = collect_local_records(&c, &KEY, "").unwrap();
+        for r in recs.iter_mut().filter(|r| r.entity_type == "servers") {
+            let mut obj: serde_json::Value = serde_json::from_slice(&decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap()).unwrap();
+            obj.as_object_mut().unwrap().remove("auto_open");
+            r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
+        }
+        apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+        assert_eq!(got(&b, "db"), None);
+
+        // A value that isn't a number is refused, as for autostart.
+        let mut recs = collect_local_records(&a, &KEY, "").unwrap();
+        let later2 = later + 60_000;
+        for r in recs.iter_mut().filter(|r| r.entity_type == "servers") {
+            let mut obj: serde_json::Value = serde_json::from_slice(&decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap()).unwrap();
+            obj.as_object_mut().unwrap().insert("auto_open".into(), json!("yes"));
+            r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
+            r.updated_at = format!("{later2:015}:00000:zzz");
+        }
+        let _ = apply_remote_records(&b, &KEY, &recs, &hb);
+        assert_eq!(got(&b, "web"), Some(0), "the bad record didn't land");
+    }
+
+    #[test]
+    fn command_secret_and_tags_sync_and_an_older_peers_edit_keeps_them() {
+        // A current peer syncs a secret, tagged command.
+        let (a, _ha) = device("A");
+        a.execute(
+            "INSERT INTO commands(title, content, is_secret, tags) VALUES('deploy', 'kubectl rollout restart deploy/api', 1, 'k8s, prod')",
+            [],
+        )
+        .unwrap();
+        let (b, hb) = device("B");
+        apply_remote_records(&b, &KEY, &collect_local_records(&a, &KEY, "").unwrap(), &hb).unwrap();
+        let got = |c: &Connection| -> (Option<i64>, Option<String>) {
+            c.query_row("SELECT is_secret, tags FROM commands WHERE content='kubectl rollout restart deploy/api'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+        };
+        assert_eq!(got(&b), (Some(1), Some("k8s, prod".to_string())), "they sync");
+
+        // An older peer edits the title. Its record omits both keys,
+        // so the secret flag and tags must survive on B.
+        a.execute("UPDATE commands SET title='deploy api' WHERE title='deploy'", []).unwrap();
+        let ahead = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 60_000;
+        let mut recs = collect_local_records(&a, &KEY, "").unwrap();
+        for r in recs.iter_mut().filter(|r| r.entity_type == "commands") {
+            let mut obj: serde_json::Value = serde_json::from_slice(&decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap()).unwrap();
+            let o = obj.as_object_mut().unwrap();
+            assert!(o.remove("is_secret").is_some(), "a current peer always sends the key");
+            assert!(o.remove("tags").is_some(), "a current peer always sends the key");
+            r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
+            r.updated_at = format!("{ahead:015}:00000:zzz");
+        }
+        apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+        let title: String = b.query_row("SELECT title FROM commands WHERE content='kubectl rollout restart deploy/api'", [], |r| r.get(0)).unwrap();
+        assert_eq!(title, "deploy api", "the edit applies");
+        assert_eq!(got(&b), (Some(1), Some("k8s, prod".to_string())), "and the secret flag and tags are kept");
+
+        // A current peer clears both.
+        a.execute("UPDATE commands SET is_secret=0, tags=NULL WHERE title='deploy api'", []).unwrap();
+        let later = ahead + 60_000;
+        let mut recs = collect_local_records(&a, &KEY, "").unwrap();
+        for r in recs.iter_mut().filter(|r| r.entity_type == "commands") {
+            r.updated_at = format!("{later:015}:00000:zzz");
+        }
+        apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+        assert_eq!(got(&b), (Some(0), None), "clearing from a current peer clears them");
+
+        // And a command new to this device, from an older peer, lands
+        // with both empty (NULL = not secret, no tags).
+        let (c, _hc) = device("C");
+        c.execute("INSERT INTO commands(title, content) VALUES('logs', 'kubectl logs -f deploy/api')", []).unwrap();
+        let mut recs = collect_local_records(&c, &KEY, "").unwrap();
+        for r in recs.iter_mut().filter(|r| r.entity_type == "commands") {
+            let mut obj: serde_json::Value = serde_json::from_slice(&decrypt_entity(r.blob.as_deref().unwrap(), &KEY).unwrap()).unwrap();
+            let o = obj.as_object_mut().unwrap();
+            o.remove("is_secret");
+            o.remove("tags");
+            r.blob = Some(encrypt_entity(&serde_json::to_vec(&obj).unwrap(), &KEY).unwrap());
+        }
+        apply_remote_records(&b, &KEY, &recs, &hb).unwrap();
+        let fresh: (Option<i64>, Option<String>) = b.query_row("SELECT is_secret, tags FROM commands WHERE title='logs'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(fresh, (None, None));
     }
 
     #[test]
@@ -6376,6 +6505,7 @@ async fn select_profile(
 /// `known_hosts` writes they triggered to the NEXT profile's DB.
 #[tauri::command]
 async fn close_profile(
+    app: tauri::AppHandle,
     state: tauri::State<'_, DbState>,
     ssh: tauri::State<'_, SshState>,
     monitor_map: tauri::State<'_, MonitorMap>,
@@ -6384,7 +6514,7 @@ async fn close_profile(
 ) -> Result<(), String> {
     quick_unlock::profile_closed();
     let opened = state.generation_now();
-    teardown_profile(&state, &ssh, &monitor_map, &cloud, &ai, opened).await?;
+    teardown_profile(&app, &state, &ssh, &monitor_map, &cloud, &ai, opened).await?;
     // Here and not in the teardown: after a reload the name may be the one
     // the new page has just picked.
     *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE")? = None;
@@ -6407,6 +6537,8 @@ async fn close_after_reload(app: tauri::AppHandle, _closing: tokio::sync::OwnedM
     };
     let ssh = app.state::<SshState>();
     let mut sessions: Vec<String> = ssh.connections.lock().await.keys().cloned().collect();
+    // FTP tabs too: their mirrors and live edits stop with them.
+    sessions.extend(ssh.ftp_sessions.lock().await.keys().cloned());
     sessions.extend(app.state::<rdp::RdpSessions>().lock().await.keys().cloned());
     sessions.extend(app.state::<vnc_client::VncClients>().lock().await.keys().cloned());
     sessions.extend(app.state::<RdpClients>().lock().await.keys().cloned());
@@ -6421,7 +6553,7 @@ async fn close_after_reload(app: tauri::AppHandle, _closing: tokio::sync::OwnedM
     let monitor_map = app.state::<MonitorMap>();
     let cloud = app.state::<std::sync::Arc<cloud::CloudState>>();
     let ai = app.state::<ai_tabs::AiState>();
-    let teardown = teardown_profile(&db, &ssh, &monitor_map, &cloud, &ai, opened);
+    let teardown = teardown_profile(&app, &db, &ssh, &monitor_map, &cloud, &ai, opened);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), teardown).await;
 }
 
@@ -6448,6 +6580,7 @@ pub(crate) async fn any_connection_open(app: &tauri::AppHandle) -> bool {
 /// What closing a profile takes down, see `close_profile`. `opened` is the
 /// generation of the profile that closes.
 async fn teardown_profile(
+    app: &tauri::AppHandle,
     state: &DbState,
     ssh: &SshState,
     monitor_map: &MonitorMap,
@@ -6500,6 +6633,14 @@ async fn teardown_profile(
     for flag in ssh.transfer_cancels.lock().await.values() {
         flag.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // So does what else runs on its own beside the tabs, each holding its
+    // connection open: folder mirrors (an FTP tab's went on syncing after a
+    // reload), live-edit watchers and Docker's live logs. A tab's Disconnect
+    // stops its own; after a reload, or a tab whose Disconnect didn't finish
+    // in time, this is what does.
+    mirror::stop_all(app.state::<MirrorMap>().inner()).await;
+    ssh.live_edits.lock().await.clear();
+    app.state::<docker::DockerStreams>().stop_all().await;
 
     // 2b. Collect every active session id, then run the standard
     // disconnect path for each one. This frees tunnel listener sockets,
@@ -6554,6 +6695,12 @@ async fn teardown_profile(
     ssh.ftp_sessions.lock().await.clear();
     ssh.connections.lock().await.clear();
     ssh.jump_connections.lock().await.clear();
+    // The forwarding rules each tab replays when it connects again. A tab is
+    // `session-<server id>`, and the next profile's servers are numbered from
+    // 1 too: a list left here (a tab whose connection had dropped, so a
+    // reload didn't disconnect it) was replayed on that profile's server of
+    // the same number, with this profile's forwards.
+    ssh.session_tunnel_specs.lock().await.clear();
     ssh.fp_txs.lock().await.clear();
     ssh.kbi_txs.lock().await.clear();
 
@@ -7532,6 +7679,19 @@ async fn setup_master_db_with(
             // Which servers a command is for (#22): JSON of server and folder
             // uuids, NULL for all servers (normalize_command_scope). Synced.
             "ALTER TABLE commands ADD COLUMN scope TEXT",
+            // Secret commands + tags: `is_secret` masks the content in the
+            // UI (eye toggle to reveal); `tags` is a comma-separated list
+            // for filtering (normalize_command_tags). Both synced; NULL
+            // is the safe default (not secret, no tags). `is_secret`
+            // stays nullable so a record from a peer that never sent
+            // it still lands (see apply_entity).
+            "ALTER TABLE commands ADD COLUMN is_secret INTEGER",
+            "ALTER TABLE commands ADD COLUMN tags TEXT",
+            // 1: the server's tab opens, not connected, when the profile is
+            // unlocked ("At startup: Open the tab"). NULL or 0 = it doesn't;
+            // `autostart` (open and connect) comes first. Synced; nullable so
+            // a record from an older peer still lands.
+            "ALTER TABLE servers ADD COLUMN auto_open INTEGER",
         ] {
             if let Err(e) = conn.execute(stmt, []) {
                 let s = e.to_string();
@@ -7578,8 +7738,8 @@ async fn setup_master_db_with(
             "CREATE TABLE folders (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, parent_id INTEGER, color TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE ssh_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, public_key TEXT, private_key TEXT, passphrase TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE credentials (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, auth_type TEXT, username TEXT, password TEXT, key_id INTEGER, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT, FOREIGN KEY(key_id) REFERENCES ssh_keys(id));
-             CREATE TABLE servers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT DEFAULT 'none', proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT DEFAULT 'vault', key_id INTEGER, autostart INTEGER NOT NULL DEFAULT 0, mirrors TEXT NOT NULL DEFAULT '[]', color TEXT, notes TEXT NOT NULL DEFAULT '', run_on_connect TEXT NOT NULL DEFAULT '', run_on_connect_every INTEGER, jump_host_id INTEGER, protocol TEXT, position INTEGER NOT NULL DEFAULT 0, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT, FOREIGN KEY(folder_id) REFERENCES folders(id));
-             CREATE TABLE commands (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT, scope TEXT);
+             CREATE TABLE servers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT DEFAULT 'none', proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT DEFAULT 'vault', key_id INTEGER, autostart INTEGER NOT NULL DEFAULT 0, mirrors TEXT NOT NULL DEFAULT '[]', color TEXT, notes TEXT NOT NULL DEFAULT '', run_on_connect TEXT NOT NULL DEFAULT '', run_on_connect_every INTEGER, jump_host_id INTEGER, protocol TEXT, position INTEGER NOT NULL DEFAULT 0, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT, auto_open INTEGER, FOREIGN KEY(folder_id) REFERENCES folders(id));
+             CREATE TABLE commands (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT, scope TEXT, is_secret INTEGER, tags TEXT);
              CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT);
              CREATE TABLE known_hosts (id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT, port INTEGER, fingerprint TEXT, key_type TEXT);
              CREATE TABLE monitor_configs (node_id INTEGER PRIMARY KEY, enabled_metrics TEXT NOT NULL DEFAULT '[\"cpu\",\"mem\",\"disk\",\"load\"]', custom_metrics TEXT NOT NULL DEFAULT '[]', paused INTEGER NOT NULL DEFAULT 1, uuid TEXT, updated_at TEXT, deleted INTEGER NOT NULL DEFAULT 0, edited_by TEXT, FOREIGN KEY(node_id) REFERENCES servers(id) ON DELETE CASCADE);
@@ -8739,6 +8899,23 @@ async fn set_server_notes(state: tauri::State<'_, DbState>, id: i32, notes: Stri
 /// own command (like set_server_notes) so it doesn't have to be threaded
 /// through add_server / edit_server's positional parameter lists. `every`
 /// left out keeps what the server has.
+/// "At startup: Open the tab" (`auto_open`): the server's tab opens, not
+/// connected, when the profile is unlocked. Its own write, like the
+/// on-connect commands, so add_server and edit_server keep their arguments.
+#[tauri::command]
+async fn set_server_auto_open(state: tauri::State<'_, DbState>, id: i32, value: bool, persist: Option<bool>) -> Result<(), String> {
+    let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+    let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+    // Written only when it changes: every write stamps the server for sync.
+    conn.execute(
+        "UPDATE servers SET auto_open=?1 WHERE id=?2 AND COALESCE(auto_open, 0) != ?1",
+        rusqlite::params![i64::from(value), id],
+    ).map_err(|e| format!("[DATABASE] SERVER_AUTO_OPEN_FAILED: {}", e))?;
+    drop(conn_guard);
+    save_unless_batched(&state, persist)?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn set_server_run_on_connect(state: tauri::State<'_, DbState>, id: i32, value: String, every: Option<bool>, persist: Option<bool>) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
@@ -8873,7 +9050,7 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
     // ORDER BY (position, id): `position` is the manual drag-to-reorder rank
     // (default 0 for never-reordered rows), and id breaks ties so the order is
     // stable and, before any reorder, identical to the old rowid order.
-    let mut stmt = conn.prepare("SELECT id, name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, updated_at, edited_by, position, os, terminal_theme, uuid, highlight, protocol, run_on_connect_every FROM servers ORDER BY position, id")
+    let mut stmt = conn.prepare("SELECT id, name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, updated_at, edited_by, position, os, terminal_theme, uuid, highlight, protocol, run_on_connect_every, auto_open FROM servers ORDER BY position, id")
         .map_err(|e| format!("[DATABASE] PREPARE_FAILED: {}", e))?;
 
     let rows = stmt.query_map([], |row| {
@@ -8900,6 +9077,9 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
             "run_on_connect": row.get::<_, Option<String>>(18)?.unwrap_or_default(),
             // The commands go into every new terminal too, not only the first (#256).
             "run_on_connect_every": row.get::<_, Option<i64>>(28)?.unwrap_or(0) != 0,
+            // Its tab opens, not connected, when the profile is unlocked
+            // (autostart, which also connects, comes first).
+            "auto_open": row.get::<_, Option<i64>>(29)?.unwrap_or(0) != 0,
             "jump_host_id": row.get::<_, Option<i32>>(19)?,
             // Attribution: HLC stamp (encodes last-edit time) + who last edited.
             "updated_at": row.get::<_, Option<String>>(20)?,
@@ -9201,9 +9381,11 @@ mod mirror_folder_guard_tests {
         std::fs::write(&file, b"x").unwrap();
         assert!(guard_mirror_folder(&dir.join("nope").to_string_lossy()).is_err());
         assert!(guard_mirror_folder(&file.to_string_lossy()).is_err());
-        // A real folder passes, and what comes back is its resolved path.
+        // A real folder passes, and what comes back is its resolved path, in
+        // the plain form (it shows in the mirror's log).
         let ok = guard_mirror_folder(&dir.to_string_lossy()).unwrap();
         assert!(std::path::Path::new(&ok).is_dir());
+        assert!(!ok.starts_with(r"\\?\"), "{ok}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9281,6 +9463,39 @@ fn normalize_command_scope(scope: Option<&str>) -> Result<Option<String>, String
     Ok(Some(json!({ "servers": servers, "folders": folders }).to_string()))
 }
 
+/// A command's tags, as kept in `commands.tags`: a comma-separated list,
+/// `None` for no tags. Checked and rewritten in one form: each tag is
+/// trimmed, empties are dropped, repeats (case-insensitive) collapse to
+/// the first spelling. At most 20 tags, each at most 32 chars.
+fn normalize_command_tags(tags: Option<&str>) -> Result<Option<String>, String> {
+    const MAX_TAGS: usize = 20;
+    const MAX_LEN: usize = 32;
+    let Some(text) = tags.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.split(',') {
+        let tag = raw.trim();
+        if tag.is_empty() {
+            continue;
+        }
+        if tag.chars().count() > MAX_LEN {
+            return Err("Tags must be 32 characters or fewer".into());
+        }
+        if out.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+            continue;
+        }
+        out.push(tag.to_string());
+    }
+    if out.len() > MAX_TAGS {
+        return Err("At most 20 tags".into());
+    }
+    if out.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(out.join(", ")))
+}
+
 #[cfg(test)]
 mod hostile_server_loop_tests {
     use super::http_connect_host_ok;
@@ -9332,15 +9547,43 @@ mod command_scope_tests {
     }
 }
 
+#[cfg(test)]
+mod command_tags_tests {
+    use super::normalize_command_tags as n;
+
+    #[test]
+    fn empty_is_none() {
+        assert_eq!(n(None).unwrap(), None);
+        assert_eq!(n(Some("")).unwrap(), None);
+        assert_eq!(n(Some("  , , ")).unwrap(), None);
+    }
+
+    #[test]
+    fn trimmed_deduped_joined() {
+        assert_eq!(
+            n(Some("docker, sysadmin, docker, Ubuntu")).unwrap().as_deref(),
+            Some("docker, sysadmin, Ubuntu"),
+        );
+    }
+
+    #[test]
+    fn limits_are_refused() {
+        assert!(n(Some(&"a".repeat(33))).is_err());
+        let many: Vec<String> = (0..21).map(|i| format!("t{i}")).collect();
+        assert!(n(Some(&many.join(","))).is_err());
+    }
+}
+
 #[tauri::command]
-async fn add_command(state: tauri::State<'_, DbState>, title: String, content: String, scope: Option<String>) -> Result<(), String> {
+async fn add_command(state: tauri::State<'_, DbState>, title: String, content: String, scope: Option<String>, is_secret: bool, tags: Option<String>) -> Result<(), String> {
     let scope = normalize_command_scope(scope.as_deref())?;
+    let tags = normalize_command_tags(tags.as_deref())?;
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
 
     conn.execute(
-        "INSERT INTO commands (title, content, scope) VALUES (?1, ?2, ?3)",
-        rusqlite::params![title, content, scope],
+        "INSERT INTO commands (title, content, scope, is_secret, tags) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![title, content, scope, is_secret, tags],
     ).map_err(|e| format!("[DATABASE] COMMAND_INSERT_FAILED: {}", e))?;
     
     drop(conn_guard);
@@ -9348,6 +9591,11 @@ async fn add_command(state: tauri::State<'_, DbState>, title: String, content: S
     Ok(())
 }
 
+/// Renames / rewords a command. It deliberately does NOT touch
+/// `is_secret` or `tags`: those go through set_command_secret_tags,
+/// so an edit from a list loaded before a secret flag or tags
+/// changed elsewhere can't undo them (the session panel loads its
+/// list once).
 #[tauri::command]
 async fn edit_command(state: tauri::State<'_, DbState>, id: i32, title: String, content: String) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
@@ -9383,6 +9631,27 @@ async fn set_command_scope(state: tauri::State<'_, DbState>, id: i32, scope: Opt
     Ok(())
 }
 
+/// Sets a command's secret flag and tags, and nothing else (see
+/// set_command_scope). Apart from edit_command, so that an edit of
+/// the title or the command (the session's Library edits those)
+/// leaves them as they are. An unchanged pair doesn't touch the
+/// row, so it isn't synced again.
+#[tauri::command]
+async fn set_command_secret_tags(state: tauri::State<'_, DbState>, id: i32, is_secret: bool, tags: Option<String>) -> Result<(), String> {
+    let tags = normalize_command_tags(tags.as_deref())?;
+    let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+    let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+    let changed = conn.execute(
+        "UPDATE commands SET is_secret=?1, tags=?2 WHERE id=?3 AND (is_secret IS NOT ?1 OR tags IS NOT ?2)",
+        rusqlite::params![is_secret, tags, id],
+    ).map_err(|e| format!("[DATABASE] COMMAND_UPDATE_FAILED: {}", e))?;
+    drop(conn_guard);
+    if changed > 0 {
+        save_vault_internal(&state)?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn delete_command(state: tauri::State<'_, DbState>, id: i32) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
@@ -9402,7 +9671,7 @@ async fn delete_command(state: tauri::State<'_, DbState>, id: i32) -> Result<(),
 async fn get_commands(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-    let mut stmt = conn.prepare("SELECT id, title, content, scope FROM commands").map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare("SELECT id, title, content, scope, is_secret, tags FROM commands").map_err(|e| e.to_string())?;
 
     let rows = stmt.query_map([], |row| {
         Ok(json!({
@@ -9411,7 +9680,11 @@ async fn get_commands(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json
             "content": row.get::<_, String>(2)?,
             // As a synced peer sent it: the frontend reads it defensively
             // (util/commandScope), so a broken one counts as all servers.
-            "scope": row.get::<_, Option<String>>(3)?
+            "scope": row.get::<_, Option<String>>(3)?,
+            // A NULL or out-of-range value from a peer must not fail
+            // the whole list (same shape as run_on_connect_every).
+            "is_secret": row.get::<_, Option<i64>>(4)?.unwrap_or(0) != 0,
+            "tags": row.get::<_, Option<String>>(5)?
         }))
     }).map_err(|e| e.to_string())?;
     
@@ -10138,6 +10411,34 @@ fn secret_candidates(
     .into_iter()
     .filter_map(|(secret, source)| secret.filter(|s| !s.is_empty()).map(|s| (s, source)))
     .collect()
+}
+
+/// A password the password method turned down on a server that also takes
+/// keyboard-interactive, for that to answer the server's password question with
+/// (see `authenticate_password_prompting`).
+struct KbiHandoff {
+    password: zeroize::Zeroizing<String>,
+    source: SecretSource,
+    /// Typed with "Save password" ticked.
+    save: bool,
+}
+
+impl KbiHandoff {
+    fn answer(&self) -> KbiPassword<'_> {
+        KbiPassword { value: self.password.as_str(), typed: self.source != SecretSource::Given, save: self.save }
+    }
+}
+
+/// The password a keyboard-interactive login has for the server's password
+/// question (see `is_password_prompt`): the saved one, or one the password
+/// method turned down (`KbiHandoff`).
+#[derive(Clone, Copy)]
+struct KbiPassword<'a> {
+    value: &'a str,
+    /// Typed by the user (else saved): only for the log's wording.
+    typed: bool,
+    /// Typed with "Save password" ticked: saved once the login with it worked.
+    save: bool,
 }
 
 /// Everything a connect-time secret prompt needs besides the SSH session: where
@@ -10959,6 +11260,18 @@ async fn resolve_login_user(
 /// password box. `Ok(false)` — password not offered, prompt cancelled or timed
 /// out, or prompts used up — leaves the caller's keyboard-interactive fallback
 /// to run exactly as before.
+///
+/// `handoff` is for a caller that goes on with keyboard-interactive. A server
+/// that asks for a one-time code after the password through PAM (Google
+/// Authenticator and the like) turns the password method down even for the
+/// right password: sshd gives the password to the code question too. It takes
+/// keyboard-interactive as well, which asks for the password and then the code
+/// (OpenSSH tries that method first, so it logs in there). So the first
+/// password turned down while the server offers keyboard-interactive isn't
+/// asked for again here: it goes into `handoff`, and this ends with
+/// `Ok(false)`, for the caller's keyboard-interactive to answer the server's
+/// password question with it. A wrong one is asked for again there.
+#[allow(clippy::too_many_arguments)]
 async fn authenticate_password_prompting<H: russh::client::Handler>(
     session: &mut russh::client::Handle<H>,
     user: &str,
@@ -10967,6 +11280,7 @@ async fn authenticate_password_prompting<H: russh::client::Handler>(
     saved_password: Option<zeroize::Zeroizing<String>>,
     slot: SecretSlot,
     ctx: &SecretPromptCtx<'_>,
+    mut handoff: Option<&mut Option<KbiHandoff>>,
 ) -> Result<bool, russh::Error> {
     let cached = cache_get_secret(ctx.cache, ctx.base, slot).await;
     let candidates = secret_candidates(override_password, cached, saved_password);
@@ -11088,6 +11402,20 @@ async fn authenticate_password_prompting<H: russh::client::Handler>(
                     cache_clear_secret(ctx.cache, ctx.base, slot).await;
                 }
                 password_offered = remaining_methods.contains(&russh::MethodKind::Password);
+                if let Some(handoff) = handoff.as_deref_mut() {
+                    if remaining_methods.contains(&russh::MethodKind::KeyboardInteractive) {
+                        ctx.log(
+                            if password_offered {
+                                "Password rejected. The server also takes keyboard-interactive, which can ask for a code after the password: trying that."
+                            } else {
+                                "The server takes the password through keyboard-interactive: trying that."
+                            },
+                            "info",
+                        );
+                        *handoff = Some(KbiHandoff { password, source, save: source == SecretSource::Prompt && save_typed });
+                        return Ok(false);
+                    }
+                }
                 rejected = true;
             }
         }
@@ -12095,9 +12423,11 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     // current (see ssh_manager::ConnectAttempt).
     attempt: &ssh_manager::ConnectAttempt,
     // The saved password, for a server that asks for it here rather than
-    // through the password method (#145): it answers the server's password
-    // question once, and only that (see is_password_prompt).
-    saved_password: Option<&str>,
+    // through the password method (#145), or the password that method turned
+    // down on a server that asks for a code after it (see KbiHandoff): it
+    // answers the server's password question once, and only that (see
+    // is_password_prompt).
+    saved_password: Option<KbiPassword<'_>>,
     // The saved server this login is for: the server's password question
     // offers "Save password", and a ticked answer is saved there once the
     // login worked (see save_prompted_password).
@@ -12141,7 +12471,8 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     // result once the server has actually asked us something.
     let mut asked_anything = false;
     // Not used yet; taken by its one answer.
-    let mut saved_password = saved_password.filter(|p| !p.is_empty());
+    let mut saved_password = saved_password.filter(|p| !p.value.is_empty());
+    let typed_in_hand = saved_password.is_some_and(|p| p.typed);
     let mut answered_with_saved = false;
     // Rounds the server asked nothing in: a server can go on with them for ever.
     let mut empty_rounds = 0u32;
@@ -12149,6 +12480,14 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     let mut to_save: Option<zeroize::Zeroizing<String>> = None;
     // The user was asked a password question already (secret_policy::kbi_round).
     let mut password_asked = false;
+    // The user's answers to the server's password question. One turned down
+    // is asked for again, up to MAX_SECRET_PROMPTS answers, as the password
+    // method's prompt is.
+    let mut password_answers = 0u32;
+    // The round the server just answered was the user's password.
+    let mut answered_password = false;
+    // The next password question says the last password was rejected.
+    let mut say_rejected = false;
 
     loop {
         match resp {
@@ -12164,13 +12503,19 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
             KeyboardInteractiveAuthResponse::Failure { .. } => {
                 if answered_with_saved {
                     if unasked.is_some() {
-                        log("The saved password was rejected.", "error");
+                        log(if typed_in_hand { "The password was rejected." } else { "The saved password was rejected." }, "error");
                         return Some(Ok(false));
                     }
-                    // The saved password was turned down. Start over and ask
-                    // the user, as without one.
+                    // The password in hand was turned down (so it isn't
+                    // saved). Start over and ask the user, as without one.
                     answered_with_saved = false;
-                    log("The saved password was rejected. Asking for it...", "error");
+                    to_save = None;
+                    say_rejected = true;
+                    secret_policy::kbi_restart(&mut password_asked);
+                    log(
+                        if typed_in_hand { "The password was rejected. Asking for it again..." } else { "The saved password was rejected. Asking for it..." },
+                        "error",
+                    );
                     resp = match session
                         .authenticate_keyboard_interactive_start(user.to_string(), None)
                         .await
@@ -12183,6 +12528,27 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
                 if !asked_anything {
                     // Server declined the method outright — not really offered.
                     return None;
+                }
+                if answered_password {
+                    if password_answers < MAX_SECRET_PROMPTS {
+                        // A mistyped password: start over and ask again.
+                        answered_password = false;
+                        to_save = None;
+                        *typed_password = None;
+                        say_rejected = true;
+                        secret_policy::kbi_restart(&mut password_asked);
+                        log("The password was rejected. Asking for it again...", "error");
+                        resp = match session
+                            .authenticate_keyboard_interactive_start(user.to_string(), None)
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => return Some(Err(e)),
+                        };
+                        continue;
+                    }
+                    log("Password rejected by server.", "error");
+                    return Some(Ok(false));
                 }
                 log("Verification code rejected by server.", "error");
                 return Some(Ok(false));
@@ -12210,16 +12576,28 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
                     continue;
                 }
                 // The server's own password question (PAM's "Password:"),
-                // asked here because it doesn't take the password method:
-                // the saved password answers it, as the password method
-                // would have sent it. Only once, so a wrong one ends up with
-                // the user, and never a code or anything else.
-                if prompts.len() == 1 && is_password_prompt(&prompts[0].prompt, prompts[0].echo) {
+                // asked here because it doesn't take the password method, or
+                // as the step before a code: the password in hand answers it,
+                // as the password method would have sent it. Only once, so a
+                // wrong one ends up with the user, and never a code or
+                // anything else.
+                let lone_password = prompts.len() == 1 && is_password_prompt(&prompts[0].prompt, prompts[0].echo);
+                if lone_password {
                     if let Some(password) = saved_password.take() {
-                        log("Answering the server's password prompt with the saved password...", "info");
+                        log(
+                            if password.typed {
+                                "Answering the server's password prompt with the password typed before..."
+                            } else {
+                                "Answering the server's password prompt with the saved password..."
+                            },
+                            "info",
+                        );
                         answered_with_saved = true;
+                        if secret_policy::kbi_round(true, &mut password_asked).0 && password.save {
+                            to_save = Some(zeroize::Zeroizing::new(password.value.to_string()));
+                        }
                         resp = match session
-                            .authenticate_keyboard_interactive_respond(vec![password.to_string()])
+                            .authenticate_keyboard_interactive_respond(vec![password.value.to_string()])
                             .await
                         {
                             Ok(r) => r,
@@ -12256,12 +12634,20 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
                     .map(|p| serde_json::json!({ "prompt": p.prompt, "echo": p.echo }))
                     .collect();
                 // Only the server's own password question offers the tick: never a code.
-                let password_like = prompts.len() == 1 && is_password_prompt(&prompts[0].prompt, prompts[0].echo);
-                let (offer, forget) = secret_policy::kbi_round(password_like, &mut password_asked);
+                let (offer, forget) = secret_policy::kbi_round(lone_password, &mut password_asked);
                 let password_question = save_to.is_some() && offer;
                 if forget {
                     to_save = None;
                 }
+                // After a rejected password, the question says so, as the
+                // password method's prompt does.
+                let instructions = if say_rejected && lone_password {
+                    say_rejected = false;
+                    let note = "The password was rejected. Please try again.";
+                    if instructions.trim().is_empty() { note.to_string() } else { format!("{note}\n{instructions}") }
+                } else {
+                    instructions
+                };
                 let mut payload = serde_json::json!({
                     "nonce": nonce,
                     "name": name,
@@ -12309,7 +12695,9 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
                         None
                     };
                 }
-                if prompts.len() == 1 && is_password_prompt(&prompts[0].prompt, prompts[0].echo) && !answers[0].is_empty() {
+                answered_password = lone_password && !answers[0].is_empty();
+                if answered_password {
+                    password_answers += 1;
                     *typed_password = Some(Zeroizing::new(answers[0].clone()));
                 }
 
@@ -13797,6 +14185,9 @@ async fn login_hop(
     // (#145). On a connection that can't ask (see `allow_prompt`) it's all
     // keyboard-interactive may send: a code it asks for ends the login there.
     let kbi_password = password.clone().map(Zeroizing::new);
+    // The password the password method turned down on a jump host that takes
+    // keyboard-interactive too (see KbiHandoff).
+    let mut handoff: Option<KbiHandoff> = None;
     let kbi_unasked = std::sync::atomic::AtomicBool::new(false);
     // The whole login has a deadline, as the monitor's has: a jump host that
     // took the connection and stops answering would otherwise hold this
@@ -13831,6 +14222,7 @@ async fn login_hop(
                 password.map(Zeroizing::new),
                 SecretSlot::JumpPassword,
                 &prompt_ctx,
+                Some(&mut handoff),
             )
             .await
         };
@@ -13843,6 +14235,10 @@ async fn login_hop(
         {
             // Within the login's deadline, and ended by the tab closing.
             let save_offer = prompt_ctx.save_offer().await;
+            let mut typed_password = None;
+            let in_hand = handoff.as_ref().map(KbiHandoff::answer).or_else(|| {
+                kbi_password.as_ref().map(|p| KbiPassword { value: p.as_str(), typed: false, save: false })
+            });
             if let Some(kbi_res) = prompt_ctx
                 .login_step(run_keyboard_interactive(
                     &mut session,
@@ -13852,15 +14248,23 @@ async fn login_hop(
                     &jump_nonce,
                     ctx.kbi_txs,
                     ctx.attempt,
-                    kbi_password.as_ref().map(|p| p.as_str()),
+                    in_hand,
                     save_offer,
                     (!ctx.allow_prompt).then_some(&kbi_unasked),
-                    &mut None,
+                    &mut typed_password,
                 ))
                 .await
                 .unwrap_or(Some(Err(russh::Error::ConnectionTimeout)))
             {
                 auth_res = kbi_res;
+            }
+            // Kept for reconnects once it worked, as the password method keeps a
+            // typed one: a code is still asked each time.
+            if matches!(auth_res, Ok(true)) {
+                let keep = typed_password.or_else(|| handoff.take().filter(|h| h.source != SecretSource::Given).map(|h| h.password));
+                if let Some(keep) = keep {
+                    cache_store_secret(ctx.cache, &base_id, SecretSlot::JumpPassword, keep).await;
+                }
             }
         }
         auth_res
@@ -14797,6 +15201,9 @@ async fn initiate_connection(
                 if kbi_password_only && kbi_password.is_none() {
                     kbi_password = cache_get_secret(&prompted_secrets_clone, &base_id, SecretSlot::Password).await;
                 }
+                // The password the password method turned down on a server
+                // that takes keyboard-interactive too (see KbiHandoff).
+                let mut handoff: Option<KbiHandoff> = None;
 
                 let mut auth_res = if login_cancelled {
                     // "Login as" was cancelled — nothing to try. The prompt set
@@ -14835,6 +15242,8 @@ async fn initiate_connection(
                             password.map(Zeroizing::new),
                             SecretSlot::Password,
                             &prompt_ctx,
+                            // Only when keyboard-interactive runs below.
+                            (allow_kbi || kbi_password_only).then_some(&mut handoff),
                         ))
                         .await
                         .unwrap_or(Err(russh::Error::ConnectionTimeout))
@@ -14862,6 +15271,11 @@ async fn initiate_connection(
                     // Within the login's deadline, and ended by the tab
                     // closing, as the other login steps are.
                     let save_offer = prompt_ctx.save_offer().await;
+                    // The password the password method turned down, else the
+                    // saved one.
+                    let in_hand = handoff.as_ref().map(KbiHandoff::answer).or_else(|| {
+                        kbi_password.as_ref().map(|p| KbiPassword { value: p.as_str(), typed: false, save: false })
+                    });
                     if let Some(kbi_res) = prompt_ctx
                         .login_step(run_keyboard_interactive(
                             &mut session,
@@ -14871,7 +15285,7 @@ async fn initiate_connection(
                             &connect_nonce,
                             &kbi_txs_clone,
                             &attempt,
-                            kbi_password.as_ref().map(|p| p.as_str()),
+                            in_hand,
                             save_offer,
                             (!allow_kbi).then_some(&kbi_unasked),
                             &mut typed_password,
@@ -14883,8 +15297,12 @@ async fn initiate_connection(
                     }
                     // Kept for the tab once it worked, like a password typed
                     // for the password method: a terminal's own login uses it.
-                    if let (Some(typed), Ok(true)) = (typed_password, &auth_res) {
-                        cache_store_secret(&prompted_secrets_clone, &base_id, SecretSlot::Password, typed).await;
+                    // So is one handed over that wasn't the saved one.
+                    if matches!(auth_res, Ok(true)) {
+                        let keep = typed_password.or_else(|| handoff.take().filter(|h| h.source != SecretSource::Given).map(|h| h.password));
+                        if let Some(keep) = keep {
+                            cache_store_secret(&prompted_secrets_clone, &base_id, SecretSlot::Password, keep).await;
+                        }
                     }
                 }
                 release_agent(&prompt_ctx).await;
@@ -15107,6 +15525,7 @@ async fn initiate_connection(
                         let state_gen_w = Arc::clone(&state_session_generation);
                         let state_tunnels_w = Arc::clone(&state_tunnels);
                         let state_mirrors_w: MirrorMap = mirrors_owned.clone();
+                        let state_jump_w = Arc::clone(&state_jump_connections);
                         // Captured so the watcher can periodically re-attempt a
                         // configured tunnel that failed to bind while the session
                         // stays alive (see the retry block in the loop below).
@@ -15350,6 +15769,18 @@ async fn initiate_connection(
                                         match conns.get(&sid_w) {
                                             Some(cur) if Arc::ptr_eq(cur, &handle_arc) => { conns.remove(&sid_w); }
                                             _ => break, // superseded by a fresh connection — leave it be
+                                        }
+                                    }
+                                    // The jump hosts (ProxyJump) it went through
+                                    // close with it: their connections stayed
+                                    // open, for nothing, until the tab was
+                                    // disconnected or reconnected. A reconnect
+                                    // opens its own; one already under way has
+                                    // a newer generation, and its jump hosts stay.
+                                    {
+                                        let g = state_gen_w.lock().await;
+                                        if g.get(&sid_w).copied().unwrap_or(0) == my_gen {
+                                            state_jump_w.lock().await.remove(&sid_w);
                                         }
                                     }
                                     // Close the SFTP session too, not just
@@ -16402,10 +16833,13 @@ async fn start_mirror(
     mirrors: tauri::State<'_, MirrorMap>,
     session_id: String,
     mut spec: mirror::MirrorSpec,
+    // The first sync alone, with no watcher after it.
+    once: Option<bool>,
 ) -> Result<String, String> {
-    spec.local = guard_mirror_folder(&spec.local)?;
+    let asked_local = spec.local.clone();
+    spec.local = guard_mirror_folder(&asked_local)?;
     let files = mirror_files(&ssh, &session_id).await?;
-    mirror::start(app, session_id, files, Arc::clone(&mirrors), spec).await
+    mirror::start(app, session_id, files, Arc::clone(&mirrors), spec, asked_local, once.unwrap_or(false)).await
 }
 
 #[tauri::command]
@@ -17361,6 +17795,10 @@ async fn rdp_builtin_open(
         if keyboard_layout != 0 {
             log(&format!("Keyboard layout told to the server: {keyboard_layout:08X}, this computer's default."), "info");
         }
+        // With the clipboard shared, files go through it too (on a computer:
+        // a phone's clipboard holds none); the server's come to a folder of
+        // this run's own.
+        let files_dir = session_rdpclip_dir(&session_id, generation).ok().filter(|_| cfg!(desktop) && clipboard == Some(true));
         let login = rdp_client::Login {
             host: host.clone(),
             username: login_user,
@@ -17371,6 +17809,7 @@ async fn rdp_builtin_open(
             allow_no_nla: allow_no_nla.unwrap_or(false),
             graphics,
             clipboard: clipboard.unwrap_or(false),
+            files_dir: files_dir.clone(),
             drive,
             keyboard_layout,
         };
@@ -17432,6 +17871,32 @@ async fn rdp_builtin_open(
                 }
             }
         };
+        // What becomes of the files the user copied on the server, for the
+        // tab. The ones here wait in rdp_files.rs for the tab to put them on
+        // this computer's clipboard (`rdp_builtin_files_to_clipboard`).
+        let remote_files = {
+            let (app, attempt, sid) = (app.clone(), attempt.clone(), session_id.clone());
+            move |note: rdp_files::Note| {
+                if !attempt.is_current_now() {
+                    return;
+                }
+                let said = match note {
+                    rdp_files::Note::Copied { set, files, bytes, offered } => {
+                        serde_json::json!({"kind": "copied", "set": set, "files": files, "bytes": bytes, "offered": offered})
+                    }
+                    rdp_files::Note::Progress { set, done, total } => serde_json::json!({"kind": "progress", "set": set, "done": done, "total": total}),
+                    rdp_files::Note::Ready { set, dir, top, files, bytes } => {
+                        rdp_files::ready(&sid, rdp_files::Ready { generation, set, dir, top });
+                        serde_json::json!({"kind": "ready", "set": set, "files": files, "bytes": bytes})
+                    }
+                    rdp_files::Note::Cleared { set } => {
+                        rdp_files::outdated(&sid, set);
+                        serde_json::json!({"kind": "cleared", "set": set})
+                    }
+                };
+                let _ = app.emit(&format!("rdp-files-{sid}"), said);
+            }
+        };
         // How the link is doing, for the tab's connection mark.
         let link = {
             let (app, attempt, sid) = (app.clone(), attempt.clone(), session_id.clone());
@@ -17441,7 +17906,20 @@ async fn rdp_builtin_open(
                 }
             }
         };
-        let run = tauri::async_runtime::spawn(rdp_client::run(stream, client_addr, login, verify, connected, notice, frame, remote_copy, link, flow, rx));
+        let run = tauri::async_runtime::spawn(rdp_client::run(
+            stream,
+            client_addr,
+            login,
+            verify,
+            connected,
+            notice,
+            frame,
+            remote_copy,
+            remote_files,
+            link,
+            flow,
+            rx,
+        ));
         let outcome = match run.await {
             Ok(r) => r,
             Err(_) => Err("The RDP session stopped on bad data from the server".into()),
@@ -17454,6 +17932,10 @@ async fn rdp_builtin_open(
         }
         drop(route);
         forget_screen_client(&clients, &session_id, generation).await;
+        // The server's files this run brought go, but a set on the clipboard.
+        if let Some(dir) = &files_dir {
+            rdp_files::ended(&session_id, generation, dir);
+        }
         if !attempt.is_current_now() {
             return;
         }
@@ -17499,6 +17981,79 @@ async fn rdp_builtin_paste(rdp_clients: tauri::State<'_, RdpClients>, session_id
         let _ = tx.send(rdp_client::Cmd::Paste(text, keys));
     }
     Ok(())
+}
+
+/// The files copied on this computer for the server's clipboard (the tab's
+/// paste, as with text), then the paste key the tab held back. False when no
+/// files are copied here: the tab sends the text instead.
+#[tauri::command]
+async fn rdp_builtin_paste_files(
+    app: tauri::AppHandle,
+    rdp_clients: tauri::State<'_, RdpClients>,
+    session_id: String,
+    keys: rdp_client::PasteKeys,
+) -> Result<bool, String> {
+    use tauri::Emitter;
+    let paths = file_clipboard::read(&app).await?;
+    if paths.is_empty() {
+        return Ok(false);
+    }
+    let walked = tokio::task::spawn_blocking(move || rdp_files::walk(&paths)).await.map_err(|e| e.to_string())??;
+    if walked.list.is_empty() {
+        return Err("None of the copied files can go to the server: they can't be read, or their names are too long or not allowed there.".into());
+    }
+    if walked.left_out > 0 {
+        let msg = format!(
+            "Left out of the paste: {} of the copied files and folders (they can't be read, or their names are too long or not allowed on the server).",
+            walked.left_out
+        );
+        let _ = app.emit(&format!("session-log-{session_id}"), serde_json::json!({"msg": msg, "type": "warning"}));
+    }
+    if let Some((_, tx)) = rdp_clients.lock().await.get(&session_id) {
+        let _ = tx.send(rdp_client::Cmd::PasteFiles(walked.list, std::sync::Arc::new(walked.files), keys));
+    }
+    Ok(true)
+}
+
+/// Bring the files the server copied (that set) here: the user asked, as they
+/// were too many bytes to come on their own.
+#[tauri::command]
+async fn rdp_builtin_fetch_files(rdp_clients: tauri::State<'_, RdpClients>, session_id: String, set: u64) -> Result<(), String> {
+    if let Some((_, tx)) = rdp_clients.lock().await.get(&session_id) {
+        let _ = tx.send(rdp_client::Cmd::FetchFiles(set));
+    }
+    Ok(())
+}
+
+/// Stop bringing the server's files (that set), or let them go once here:
+/// unless they are on this computer's clipboard, they are deleted.
+#[tauri::command]
+async fn rdp_builtin_stop_files(rdp_clients: tauri::State<'_, RdpClients>, session_id: String, set: u64) -> Result<(), String> {
+    if let Some((_, tx)) = rdp_clients.lock().await.get(&session_id) {
+        let _ = tx.send(rdp_client::Cmd::StopFiles(set));
+    }
+    Ok(())
+}
+
+/// A mark that changes whenever anything goes on this computer's clipboard
+/// (none where that can't be told). The tab takes it when the user copies
+/// files on the server, to tell later whether anything else was copied since.
+#[tauri::command]
+async fn rdp_builtin_files_mark(app: tauri::AppHandle) -> Result<Option<u64>, String> {
+    Ok(file_clipboard::change_mark(&app).await)
+}
+
+/// The server's files (that set, here now) on this computer's clipboard; when
+/// `mark` is given, only if nothing else was copied since it was taken. True
+/// when they went there.
+#[tauri::command]
+async fn rdp_builtin_files_to_clipboard(app: tauri::AppHandle, session_id: String, set: u64, mark: Option<u64>) -> Result<bool, String> {
+    if mark.is_some() && file_clipboard::change_mark(&app).await != mark {
+        return Ok(false);
+    }
+    let top = rdp_files::claim(&session_id, set).ok_or("These files are no longer here.")?;
+    file_clipboard::write(&app, top).await?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -18312,10 +18867,12 @@ async fn telnet_open_terminal(
     terminal_id: String,
     cols: u32,
     rows: u32,
+    session_log: Option<session_log::Request>,
     on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Result<(), String> {
     use crate::ssh_manager::{PtySize, TerminalCommand};
     let conn = telnet_pending.lock().await.remove(&session_id).ok_or("Not connected")?;
+    let log = start_session_log(&app, &terminal_id, session_log);
     let (tx, rx) = tokio::sync::mpsc::channel::<TerminalCommand>(32);
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(PtySize { cols, rows });
     // What the page has drawn: what it hasn't stays bounded (ssh_manager::Outflow).
@@ -18327,7 +18884,7 @@ async fn telnet_open_terminal(
     state.resize_txs.lock().await.insert(terminal_id.clone(), resize_tx);
     // The output goes to the page's channel, paced like an SSH terminal's
     // (term_output.rs).
-    tauri::async_runtime::spawn(telnet::run_pump(app, session_id, terminal_id, page, conn, on_output, rx, resize_rx));
+    tauri::async_runtime::spawn(telnet::run_pump(app, session_id, terminal_id, page, conn, log, on_output, rx, resize_rx));
     Ok(())
 }
 
@@ -18789,6 +19346,12 @@ async fn disconnect_session(
     // Running transfers hold their own SFTP session, so dropping the cached one
     // below wouldn't reach them.
     cancel_session_transfers(state.inner(), &session_id).await;
+    // Docker's live logs and the live-edit watchers end with the tab too. A
+    // log stream holds a channel of its own, which kept the connection up
+    // after the Disconnect, `docker logs -f` running on the server.
+    app.state::<docker::DockerStreams>().stop_for_session(&session_id).await;
+    let live_edit_prefix = ssh_manager::live_edit_key(&session_id, "");
+    state.live_edits.lock().await.retain(|key, _| !key.starts_with(&live_edit_prefix));
     // Drop SFTP first so the channel it holds is freed before we tear down the
     // underlying SSH handle. The tab is gone, so is its root (sudo) mode and
     // the in-memory sudo password.
@@ -18928,10 +19491,9 @@ async fn server_runs_login_shell(session_arc: &SessionHandleArc, shell: &str) ->
     )
 }
 
-// A command's arguments are what the page sends; there's no struct to group.
-#[allow(clippy::too_many_arguments)]
 #[tauri::command]
-async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>, session_id: String, terminal_id: String, cols: u32, rows: u32, use_local_shell: bool, on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>, session_id: String, terminal_id: String, cols: u32, rows: u32, use_local_shell: bool, session_log: Option<session_log::Request>, on_output: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) -> Result<(), String> {
     use std::sync::Arc;
     use crate::ssh_manager::TerminalCommand;
 
@@ -19000,10 +19562,12 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
     // backpressure) live in ssh_manager::run_pty_pump — shared with the
     // docker exec terminal. The output goes to the page's channel, paced by
     // what it has drawn (ssh_manager::Outflow, term_output.rs).
+    let log = start_session_log(&app, &terminal_id, session_log);
     tauri::async_runtime::spawn(crate::ssh_manager::run_pty_pump(
         app.clone(),
         terminal_id.clone(),
         channel,
+        log,
         rx,
         resize_rx,
         on_output,
@@ -19011,6 +19575,51 @@ async fn open_terminal(app: tauri::AppHandle, state: tauri::State<'_, SshState>,
     ));
 
     Ok(())
+}
+
+/// Starts a terminal's session log (session_log.rs) as the page asked: nothing
+/// for `None` or mode "off". `&H` and `&P` are the server's host and port in
+/// the profile. Whether the file opened, or why not, goes to the page as
+/// `terminal-log-{id}` (`path` or `error`); the terminal opens either way.
+pub(crate) fn start_session_log(app: &tauri::AppHandle, terminal_id: &str, req: Option<session_log::Request>) -> Option<session_log::SessionLog> {
+    use tauri::Emitter;
+    let req = req?;
+    let (host, port) = if req.server_id > 0 { server_host_port(&app.state::<DbState>(), req.server_id) } else { (String::new(), 0) };
+    let topic = format!("terminal-log-{}", terminal_id);
+    match session_log::target(&req, &host, port, chrono::Local::now()) {
+        Ok(None) => None,
+        Err(error) => {
+            let _ = app.emit(&topic, json!({ "error": error }));
+            None
+        }
+        Ok(Some(target)) => {
+            let app = app.clone();
+            Some(session_log::SessionLog::start(target, move |event| {
+                let payload = match event {
+                    session_log::Event::Opened(path) => json!({ "path": path.display().to_string() }),
+                    session_log::Event::Failed(error) => json!({ "error": error }),
+                };
+                let _ = app.emit(&topic, payload);
+            }))
+        }
+    }
+}
+
+/// A server's host and port in the open profile; empty and 0 if it isn't there.
+fn server_host_port(db: &DbState, server_id: i32) -> (String, u16) {
+    let Ok(guard) = db.conn.lock() else { return (String::new(), 0) };
+    let Some(conn) = guard.as_ref() else { return (String::new(), 0) };
+    conn.query_row("SELECT host, port FROM servers WHERE id = ?1", rusqlite::params![server_id], |row| {
+        Ok((row.get::<_, Option<String>>(0)?.unwrap_or_default(), row.get::<_, Option<i64>>(1)?.unwrap_or(0)))
+    })
+    .map(|(host, port)| (host, u16::try_from(port).unwrap_or(0)))
+    .unwrap_or((String::new(), 0))
+}
+
+/// The folder session logs go to when Settings names none (session_log.rs).
+#[tauri::command]
+fn session_log_default_folder() -> Option<String> {
+    session_log::default_folder().map(|p| p.display().to_string())
 }
 
 #[tauri::command]
@@ -19100,7 +19709,8 @@ async fn close_terminal(state: tauri::State<'_, SshState>, terminal_id: String) 
 // upfront mega-probe. Splitting the scripts keeps each round-trip small
 // (≤200 ms typical) and lets a failing section never block the others.
 const INFO_SCRIPT_OVERVIEW: &str = r#"echo __SUB_INFO_OV_SEP__
-hostname 2>/dev/null
+# OpenWrt has no `hostname`; `uname -n` is the same name.
+hostname 2>/dev/null || uname -n 2>/dev/null
 echo __SUB_INFO_OV_SEP__
 ( . /etc/os-release 2>/dev/null && printf "%s" "$PRETTY_NAME" ) || cat /etc/issue 2>/dev/null
 printf "\n"
@@ -19109,13 +19719,15 @@ uname -srm 2>/dev/null
 echo __SUB_INFO_OV_SEP__
 uptime 2>/dev/null
 echo __SUB_INFO_OV_SEP__
-# Memory. procps `free -b` gives bytes + an `available` column; busybox `free`
-# ignores `-b` (prints KiB) and has no `available`, so fall back to the
-# universal /proc/meminfo (kB) with a format tag the frontend switches on.
-if F=$(free -b 2>/dev/null) && printf '%s' "$F" | grep -q '^Mem:'; then
-  printf 'MEMFMT:free-b\n'; printf '%s\n' "$F"
-else
+# Memory, from /proc/meminfo (kB) where there is one, with a format tag the
+# frontend switches on. It is what procps' `free` reads too. BusyBox's `free`
+# on OpenWrt ignores `-b` and prints KiB under the same header as procps'
+# bytes, so its figures can't be told apart. `free -b` stays for a system
+# without /proc/meminfo.
+if [ -r /proc/meminfo ]; then
   printf 'MEMFMT:meminfo\n'; cat /proc/meminfo 2>/dev/null
+elif F=$(free -b 2>/dev/null) && printf '%s' "$F" | grep -q '^Mem:'; then
+  printf 'MEMFMT:free-b\n'; printf '%s\n' "$F"
 fi
 echo __SUB_INFO_OV_SEP__
 # Disks. `-T` (fs-type column) + `-k` (1 KiB blocks) is GNU coreutils; busybox
@@ -19333,24 +19945,78 @@ fi
 
 // Process list for the Processes tab. First line is a format tag the frontend
 // switches on. Prefer the procps `-eo` custom format (Linux); fall back to
-// BSD-style `ps aux` for busybox / minimal userlands. Sorting + capping happen
-// client-side so the probe stays a single cheap snapshot suitable for a ~1s
-// auto-refresh.
+// BSD-style `ps aux` for minimal userlands. BusyBox's own `ps` (OpenWrt and
+// other routers, #386; Alpine) takes no `-eo` and has no %CPU column: on
+// OpenWrt it refuses `aux`, and on Alpine it takes `aux` and prints its own
+// PID USER TIME COMMAND, so `aux` counts only with a %CPU column. BusyBox's
+// `ps w` gives PID, USER and COMMAND (VSZ and STAT, or TIME, between them):
+// there CPU and memory come from /proc, in one awk over every process. %CPU is
+// the lifetime average, as procps' pcpu (utime+stime over the time since the
+// process started, in clock ticks of 100 a second); RSS is VmRSS (KiB), %MEM
+// that over MemTotal. Sorting + capping happen client-side so the probe stays
+// a single cheap snapshot suitable for a ~1s auto-refresh.
 const INFO_SCRIPT_PROCESSES: &str = r#"if ps -eo pid,user,pcpu,pmem,rss,comm >/dev/null 2>&1; then
   printf 'PSFMT:full\n'
   ps -eo pid,user,pcpu,pmem,rss,comm 2>/dev/null
-elif ps aux >/dev/null 2>&1; then
+elif A=$(ps aux 2>/dev/null) && printf '%s\n' "$A" | head -n 1 | grep -q '%CPU'; then
   printf 'PSFMT:aux\n'
-  ps aux 2>/dev/null
+  printf '%s\n' "$A"
+elif ps w >/dev/null 2>&1; then
+  printf 'PSFMT:busybox\n'
+  ps w 2>/dev/null
+  printf 'PSSTAT\n'
+  { echo "UP $(cut -d' ' -f1 /proc/uptime)"; grep '^MemTotal:' /proc/meminfo; cat /proc/[0-9]*/stat 2>/dev/null; grep -H '^VmRSS:' /proc/[0-9]*/status 2>/dev/null; } | awk -v hz=100 '
+    $1 == "UP" { up = $2; next }
+    $1 == "MemTotal:" { mt = $2; next }
+    /^\/proc\// { split($1, a, "/"); rss[a[3]] = $2; next }
+    /^[0-9]+ \(/ { pid = $1; l = $0; sub(/^.*\) /, "", l); split(l, f, " "); el = up - f[20] / hz; cpu[pid] = (el > 0) ? 100 * (f[12] + f[13]) / hz / el : 0 }
+    END { for (p in cpu) printf "%s %.1f %.1f %d\n", p, cpu[p], (mt > 0 ? 100 * rss[p] / mt : 0), rss[p] }
+  '
 else
   printf 'PSFMT:none\n'
   ps 2>/dev/null
 fi
 "#;
 
+// Services: systemd's running, failed and activating units; else OpenRC's
+// services (Alpine, Gentoo) or OpenWrt's init scripts (procd). For those two
+// a line is `name state boot`: the state in systemd's words (active,
+// inactive, failed, activating; `unknown` where procd won't tell this user),
+// and `enabled` for a service that starts at boot (an OpenRC runlevel other
+// than shutdown, an OpenWrt /etc/rc.d/S link). As systemd's list has the
+// running units, these have the services that run or start at boot: a
+// stopped one in no runlevel, or in shutdown only (killprocs, mount-ro), is
+// nothing to start or stop from here.
 const INFO_SCRIPT_SERVICES: &str = r#"if command -v systemctl >/dev/null 2>&1; then
   printf 'ENGINE:systemd\n'
   systemctl list-units --type=service --no-legend --plain --no-pager --state=running,failed,activating 2>/dev/null
+elif command -v rc-status >/dev/null 2>&1 && command -v rc-service >/dev/null 2>&1; then
+  printf 'ENGINE:openrc\n'
+  { rc-update show -v 2>/dev/null | sed 's/^/RL /'; rc-status -s -C 2>/dev/null; } | awk '
+    $1 == "RL" { for (i = 4; i <= NF; i++) if ($i != "shutdown") boot[$2] = 1; next }
+    $2 == "[" && $1 ~ /^[A-Za-z0-9._@-]+$/ { st[$1] = $3 }
+    END {
+      for (n in st) {
+        s = st[n]
+        a = (s == "started") ? "active" : ((s == "crashed" || s == "failed") ? "failed" : ((s == "starting" || s == "stopping") ? "activating" : "inactive"))
+        if (a != "inactive" || (n in boot)) printf "%s %s %s\n", n, a, ((n in boot) ? "enabled" : "disabled")
+      }
+    }'
+elif [ -f /etc/rc.common ] && [ -d /etc/init.d ]; then
+  printf 'ENGINE:procd\n'
+  J=$(ubus call service list 2>/dev/null) || J=
+  for f in /etc/init.d/*; do
+    n=${f##*/}
+    [ -f "$f" ] && [ -x "$f" ] || continue
+    case $n in ''|-*|*[!A-Za-z0-9._@-]*) continue ;; esac
+    b=disabled
+    for l in /etc/rc.d/S[0-9][0-9]"$n"; do [ -L "$l" ] && b=enabled; done
+    if [ -z "$J" ]; then a=unknown
+    elif jsonfilter -q -s "$J" -e "@['$n'].instances[*].running" 2>/dev/null | grep -q true; then a=active
+    else a=inactive; fi
+    [ "$a" != active ] && [ "$b" = disabled ] && continue
+    printf '%s %s %s\n' "$n" "$a" "$b"
+  done
 else
   printf 'ENGINE:none\n'
 fi
@@ -19382,6 +20048,19 @@ struct InfoSectionResult {
     exec_ms: u64,
 }
 
+// What the Info panel's scripts and commands start with: the sbin folders at
+// the end of PATH. sshd gives a normal user none on Debian
+// (/usr/local/bin:/usr/bin:/bin:/usr/games), and neither does Alpine's
+// Dropbear (/usr/bin:/bin). `iptables`, `nft` and `ufw` live there, on Alpine
+// `ip`, `ifconfig`, `route` and `rc-service` too: without them the panel said
+// a server had no firewall, or no network, where it could have read them or
+// asked `sudo -n`. At the end, the user's own programs still come first.
+const INFO_PATH: &str = "PATH=\"${PATH:-/usr/bin:/bin}:/usr/local/sbin:/usr/sbin:/sbin\"; export PATH\n";
+
+fn with_info_path(script: &str) -> String {
+    format!("{INFO_PATH}{script}")
+}
+
 // Run a script through a fresh exec channel on the live SSH session and
 // return everything it printed (up to a 1 MB cap). Stays read-only — the
 // callers in this module only invoke shell built-ins and inspection tools.
@@ -19406,7 +20085,7 @@ async fn run_info_script(
     let channel = shell_sftp::open_session_channel(&session_arc).await?;
     // Sending the script and reading what it prints share the time limit.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    remote_sh::run_script(&channel, script, deadline).await?;
+    remote_sh::run_script(&channel, &with_info_path(script), deadline).await?;
     let mut stream = channel.into_stream();
 
     // 1 MB cap — defends the UI against pathological output (e.g. a server
@@ -19498,6 +20177,48 @@ fn systemctl_command(sudo: bool, action: &str, unit: &str) -> String {
     format!("{}systemctl {} '{}' 2>&1; echo __SUB_EXITCODE:$?", if sudo { "sudo -n " } else { "" }, action, unit)
 }
 
+/// The service managers the Services tab works with (INFO_SCRIPT_SERVICES).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ServiceManager {
+    Systemd,
+    /// Alpine, Gentoo: `rc-service <name> <action>`.
+    OpenRc,
+    /// OpenWrt: the init script itself, `/etc/init.d/<name> <action>`.
+    Procd,
+}
+
+impl ServiceManager {
+    fn from_word(word: Option<&str>) -> Option<Self> {
+        match word.unwrap_or("systemd") {
+            "systemd" => Some(Self::Systemd),
+            "openrc" => Some(Self::OpenRc),
+            "procd" => Some(Self::Procd),
+            _ => None,
+        }
+    }
+}
+
+// An OpenRC service or an OpenWrt init script: a file name in /etc/init.d, so
+// no `/`, and no leading `-` or `.` (an option, `..`).
+fn is_safe_init_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('-')
+        && !name.starts_with('.')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@'))
+}
+
+/// The command line for a service action under `manager`, for a name its
+/// check let through (no quote: it goes in single quotes, as for systemctl).
+fn service_command(manager: ServiceManager, sudo: bool, action: &str, name: &str) -> String {
+    let sudo = if sudo { "sudo -n " } else { "" };
+    match manager {
+        ServiceManager::Systemd => systemctl_command(!sudo.is_empty(), action, name),
+        ServiceManager::OpenRc => format!("{sudo}rc-service '{name}' {action} 2>&1; echo __SUB_EXITCODE:$?"),
+        ServiceManager::Procd => format!("{sudo}/etc/init.d/'{name}' {action} 2>&1; echo __SUB_EXITCODE:$?"),
+    }
+}
+
 // Two-stage firewall probe (lazy detail fetch). The network section returns
 // a per-chain summary only; this command pulls the raw rules for one chain
 // on user expand. Wire cost stays proportional to what the user actually
@@ -19563,9 +20284,139 @@ async fn ssh_nft_chain(
     Ok(out)
 }
 
+#[cfg(all(test, unix))]
+mod info_script_tests {
+    use super::{with_info_path, INFO_SCRIPT_PROCESSES};
+    use std::io::Write;
+
+    /// `script` as the Info panel sends it, run by this machine's sh with
+    /// `path` as PATH; what it printed.
+    fn run(script: &str, path: &str) -> String {
+        let mut sh = std::process::Command::new("/bin/sh")
+            .arg("-s")
+            .env("PATH", path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        sh.stdin.take().unwrap().write_all(crate::remote_sh::whole(&with_info_path(script)).as_bytes()).unwrap();
+        String::from_utf8_lossy(&sh.wait_with_output().unwrap().stdout).into_owned()
+    }
+
+    // A normal user's PATH from Debian's sshd has no sbin folder, where
+    // iptables, nft and ufw are; the scripts get them, after the user's own.
+    #[test]
+    fn the_scripts_find_the_sbin_tools_after_the_users_own() {
+        assert_eq!(run("printf %s \"$PATH\"", "/usr/local/bin:/usr/bin:/bin:/usr/games"), "/usr/local/bin:/usr/bin:/bin:/usr/games:/usr/local/sbin:/usr/sbin:/sbin");
+    }
+
+    // Alpine's BusyBox takes `ps aux` and prints its own PID USER TIME COMMAND:
+    // that isn't the BSD layout, so the BusyBox branch reads it.
+    #[test]
+    fn a_ps_aux_without_a_cpu_column_is_read_as_busyboxs() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = std::env::temp_dir().join(format!("sub-ps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bin);
+        std::fs::create_dir_all(&bin).unwrap();
+        let ps = bin.join("ps");
+        std::fs::write(
+            &ps,
+            "#!/bin/sh\ncase \"$1\" in -eo) echo \"ps: bad -o argument 'pcpu'\" >&2; exit 1;; esac\nprintf 'PID   USER     TIME  COMMAND\\n    1 root      0:08 /sbin/init\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let out = run(INFO_SCRIPT_PROCESSES, &path);
+        let _ = std::fs::remove_dir_all(&bin);
+        assert_eq!(out.lines().next(), Some("PSFMT:busybox"), "{out}");
+        assert!(out.lines().any(|l| l.trim() == "1 root      0:08 /sbin/init"), "{out}");
+        assert!(out.lines().any(|l| l == "PSSTAT"), "{out}");
+    }
+
+    // OpenRC (Alpine): every service's state from rc-status and its runlevels
+    // from rc-update, one line each for those that run or start at boot.
+    #[test]
+    fn openrc_services_come_with_their_state_and_boot() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = std::env::temp_dir().join(format!("sub-openrc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bin);
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = |name: &str, body: &str| {
+            let p = bin.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        tool("rc-update", "printf '%s\\n' '              subdemo |      default' '            killprocs |                       shutdown' '                 sshd |      default' '                crond | ' '                local | '");
+        tool("rc-status", "printf '%s\\n' ' * Caching service dependencies ... [ ok ]' ' subdemo        [  started  ]' ' killprocs      [  stopped  ]' ' sshd           [  crashed  ]' ' crond          [  started 00:01:02 (0)  ]' ' local          [  stopped  ]' ' networking     [  starting  ]'");
+        tool("rc-service", "exit 0");
+        for real in ["sed", "awk"] {
+            let found = std::process::Command::new("/bin/sh").arg("-c").arg(format!("command -v {real}")).output().unwrap();
+            std::os::unix::fs::symlink(String::from_utf8_lossy(&found.stdout).trim(), bin.join(real)).unwrap();
+        }
+        let out = run(super::INFO_SCRIPT_SERVICES, &bin.display().to_string());
+        let _ = std::fs::remove_dir_all(&bin);
+        let mut lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.first(), Some(&"ENGINE:openrc"), "{out}");
+        lines.remove(0);
+        lines.sort_unstable();
+        assert_eq!(lines, ["crond active disabled", "networking activating disabled", "sshd failed enabled", "subdemo active enabled"], "{out}");
+    }
+
+    // procps' `ps aux` has its %CPU column and stays the `aux` branch.
+    #[test]
+    fn a_bsd_ps_aux_stays_aux() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = std::env::temp_dir().join(format!("sub-psaux-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bin);
+        std::fs::create_dir_all(&bin).unwrap();
+        let ps = bin.join("ps");
+        std::fs::write(
+            &ps,
+            "#!/bin/sh\ncase \"$1\" in -eo) exit 1;; esac\nprintf 'USER PID %%CPU %%MEM VSZ RSS TTY STAT START TIME COMMAND\\nroot 1 0.0 0.1 1000 900 ? Ss 10:00 0:01 /sbin/init\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let out = run(INFO_SCRIPT_PROCESSES, &path);
+        let _ = std::fs::remove_dir_all(&bin);
+        assert_eq!(out.lines().collect::<Vec<_>>(), ["PSFMT:aux", "USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND", "root 1 0.0 0.1 1000 900 ? Ss 10:00 0:01 /sbin/init"], "{out}");
+    }
+}
+
 #[cfg(test)]
 mod remote_ident_tests {
-    use super::{is_safe_fw_ident, is_safe_systemctl_unit, systemctl_command};
+    use super::{is_safe_fw_ident, is_safe_init_name, is_safe_systemctl_unit, service_command, sudo_missing, systemctl_command, ServiceManager};
+
+    #[test]
+    fn init_names_are_plain_file_names() {
+        for ok in ["sshd", "crond", "dnsmasq", "network", "openvpn.tun0", "getty@tty1", "s6-svscan", "php-fpm84"] {
+            assert!(is_safe_init_name(ok), "{ok:?} must be accepted");
+        }
+        let long = "a".repeat(129);
+        for bad in ["", "-x", "--help", ".", "..", ".hidden", "a/b", "../../bin/sh", "a b", "a'b", "a;b", "$(id)", long.as_str()] {
+            assert!(!is_safe_init_name(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn each_manager_gets_its_own_command_with_the_name_quoted() {
+        assert_eq!(service_command(ServiceManager::OpenRc, false, "restart", "sshd"), "rc-service 'sshd' restart 2>&1; echo __SUB_EXITCODE:$?");
+        assert_eq!(service_command(ServiceManager::Procd, true, "stop", "dnsmasq"), "sudo -n /etc/init.d/'dnsmasq' stop 2>&1; echo __SUB_EXITCODE:$?");
+        assert_eq!(service_command(ServiceManager::Systemd, true, "start", "nginx.service"), systemctl_command(true, "start", "nginx.service"));
+        assert_eq!(ServiceManager::from_word(None), Some(ServiceManager::Systemd));
+        assert_eq!(ServiceManager::from_word(Some("openrc")), Some(ServiceManager::OpenRc));
+        assert_eq!(ServiceManager::from_word(Some("procd")), Some(ServiceManager::Procd));
+        assert_eq!(ServiceManager::from_word(Some("runit")), None);
+    }
+
+    #[test]
+    fn a_server_without_sudo_is_told_apart() {
+        assert!(sudo_missing(127, "sh: 1: sudo: not found"));
+        assert!(sudo_missing(127, "/bin/sh: sudo: not found"));
+        assert!(!sudo_missing(1, "sudo: a password is required"));
+        assert!(!sudo_missing(1, "sudo: rc-service: command not found"));
+        assert!(!sudo_missing(127, "rc-service: service `x' not found"));
+    }
 
     #[test]
     fn fw_ident_rejects_leading_dash_flags() {
@@ -19670,7 +20521,7 @@ async fn run_exec_capture(
     };
     let channel = shell_sftp::open_session_channel(&session_arc).await?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    remote_sh::run_script(&channel, cmd, deadline).await?;
+    remote_sh::run_script(&channel, &with_info_path(cmd), deadline).await?;
     let mut stream = channel.into_stream();
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let read_fut = async {
@@ -19702,63 +20553,78 @@ fn parse_exit_marker(raw: &str) -> (i32, String) {
     }
 }
 
+/// Start, stop or restart a service (Services tab) under the server's service
+/// manager: systemd (`manager` left out), OpenRC or OpenWrt's procd, as the
+/// Services probe found it.
 #[tauri::command]
 async fn ssh_systemctl_action(
     state: tauri::State<'_, SshState>,
     session_id: String,
     unit: String,
     action: String,
+    manager: Option<String>,
     password: Option<String>,
 ) -> Result<SystemctlActionResult, String> {
+    let manager = ServiceManager::from_word(manager.as_deref()).ok_or("unknown service manager")?;
     // Locked allow-list. Anything not in this list is rejected outright
-    // — we never want to dispatch arbitrary subcommands from the UI.
-    let valid_action = matches!(action.as_str(), "start" | "stop" | "restart" | "reload" | "status");
+    // — we never want to dispatch arbitrary subcommands from the UI. OpenRC
+    // and OpenWrt's scripts have no `reload` or `status` of their own for
+    // every service.
+    let valid_action = match manager {
+        ServiceManager::Systemd => matches!(action.as_str(), "start" | "stop" | "restart" | "reload" | "status"),
+        ServiceManager::OpenRc | ServiceManager::Procd => matches!(action.as_str(), "start" | "stop" | "restart"),
+    };
     if !valid_action {
         return Err(format!("invalid action: {}", action));
     }
     // Reject hostile unit names. systemd unit names are restricted to
     // `[A-Za-z0-9:_.\\@-]+\.<suffix>` — adding any shell metachar here would
-    // otherwise let the caller smuggle in a command.
-    if !is_safe_systemctl_unit(&unit) {
+    // otherwise let the caller smuggle in a command. The other two take a
+    // file name in /etc/init.d.
+    let name_ok = match manager {
+        ServiceManager::Systemd => is_safe_systemctl_unit(&unit),
+        ServiceManager::OpenRc | ServiceManager::Procd => is_safe_init_name(&unit),
+    };
+    if !name_ok {
         return Err("invalid unit name".to_string());
     }
 
-    // Plain systemctl first (the user is root, or polkit allows it). On a
-    // permission error it runs as root (run_as_root: sudo or dzdo, asking for
-    // a password when they need one). A call with `password` is that second
-    // try, so it goes straight to root.
-    if password.is_none() {
-        let plain_cmd = sh_user_command(&systemctl_command(false, &action, &unit));
-        let raw1 = run_exec_capture(&state, &session_id, &plain_cmd, 30).await?;
-        let (code1, out1) = parse_exit_marker(&raw1);
-        let needs_root = code1 != 0 && (
-            out1.contains("Interactive authentication required")
-            || out1.contains("not authorized")
-            || out1.contains("polkit")
-            || out1.to_lowercase().contains("permission denied")
-            || out1.to_lowercase().contains("access denied")
-        );
-        if code1 == 0 || !needs_root {
-            return Ok(SystemctlActionResult {
-                success: code1 == 0,
-                exit_code: code1,
-                stdout: out1,
-                stderr: String::new(),
-                used_sudo: false,
-                root_tool: None,
-            });
-        }
-    }
-    let args = ["systemctl".to_string(), action, unit];
-    let (code, out, tool) = run_as_root(&state, &session_id, &args, password, 30).await?;
-    Ok(SystemctlActionResult {
-        success: code == 0,
-        exit_code: code,
-        stdout: out,
+    // Try plain systemctl first (works if user is root or has polkit rules).
+    // If that fails with permission-denied semantics, it runs as root
+    // (root_ssh: sudo or dzdo, with the password typed in Submarine when
+    // they want one).
+    let plain_cmd = sh_user_command(&service_command(manager, false, &action, &unit));
+    let raw1 = run_exec_capture(&state, &session_id, &plain_cmd, 30).await?;
+    let (code1, out1) = parse_exit_marker(&raw1);
+    let needs_sudo = code1 != 0 && (
+        out1.contains("Interactive authentication required")
+        || out1.contains("not authorized")
+        || out1.contains("polkit")
+        || out1.to_lowercase().contains("permission denied")
+        || out1.to_lowercase().contains("access denied")
+    );
+
+    let plain = SystemctlActionResult {
+        success: code1 == 0,
+        exit_code: code1,
+        stdout: out1,
         stderr: String::new(),
-        used_sudo: true,
-        root_tool: Some(tool.to_string()),
-    })
+        used_sudo: false,
+        root_tool: None,
+    };
+    if code1 == 0 || !needs_sudo {
+        return Ok(plain);
+    }
+
+    let args = service_root_args(manager, &action, &unit)?;
+    root_action_result(run_as_root(&state, &session_id, &args, password, 30).await, plain)
+}
+
+/// The `sudo -n` retry ended because there is no sudo: sh's "not found"
+/// (status 127) for it.
+#[cfg(test)] // The fork's root step says it: root_ssh::root_action_result.
+fn sudo_missing(code: i32, out: &str) -> bool {
+    code == 127 && out.contains("sudo") && out.to_lowercase().contains("not found")
 }
 
 /// Signal a process by PID (Ports / Processes tab "kill" action). Tries the
@@ -19783,37 +20649,29 @@ async fn ssh_kill_process(
         return Err(format!("invalid signal: {}", sig));
     }
 
-    // As ssh_systemctl_action: the user's own kill, then as root.
-    if password.is_none() {
-        let plain = sh_user_command(&format!("kill -{} {} 2>&1; echo __SUB_EXITCODE:$?", sig, pid));
-        let raw1 = run_exec_capture(&state, &session_id, &plain, 15).await?;
-        let (code1, out1) = parse_exit_marker(&raw1);
-        let low = out1.to_lowercase();
-        let needs_root = code1 != 0
-            && (low.contains("not permitted")
-                || low.contains("permission denied")
-                || low.contains("operation not permitted"));
-        if code1 == 0 || !needs_root {
-            return Ok(SystemctlActionResult {
-                success: code1 == 0,
-                exit_code: code1,
-                stdout: out1,
-                stderr: String::new(),
-                used_sudo: false,
-                root_tool: None,
-            });
-        }
-    }
-    let args = ["kill".to_string(), format!("-{}", sig), pid.to_string()];
-    let (code, out, tool) = run_as_root(&state, &session_id, &args, password, 15).await?;
-    Ok(SystemctlActionResult {
-        success: code == 0,
-        exit_code: code,
-        stdout: out,
+    let plain = sh_user_command(&format!("kill -{} {} 2>&1; echo __SUB_EXITCODE:$?", sig, pid));
+    let raw1 = run_exec_capture(&state, &session_id, &plain, 15).await?;
+    let (code1, out1) = parse_exit_marker(&raw1);
+    let low = out1.to_lowercase();
+    let needs_sudo = code1 != 0
+        && (low.contains("not permitted")
+            || low.contains("permission denied")
+            || low.contains("operation not permitted"));
+
+    let plain_result = SystemctlActionResult {
+        success: code1 == 0,
+        exit_code: code1,
+        stdout: out1,
         stderr: String::new(),
-        used_sudo: true,
-        root_tool: Some(tool.to_string()),
-    })
+        used_sudo: false,
+        root_tool: None,
+    };
+    if code1 == 0 || !needs_sudo {
+        return Ok(plain_result);
+    }
+
+    let args = ["kill".to_string(), format!("-{}", sig), pid.to_string()];
+    root_action_result(run_as_root(&state, &session_id, &args, password, 15).await, plain_result)
 }
 
 #[derive(serde::Serialize)]
@@ -20396,6 +21254,40 @@ mod owner_lookup_tests {
         assert!(out.lines().any(|l| l == "__SUB_OWNERS:OK"), "{out}");
         assert_eq!(parse_owners(&out, &[0, 3999999999]).len(), 1, "{out}");
     }
+
+    // Where neither `id` nor getent names a uid, as on OpenWrt (BusyBox's `id`
+    // takes a name only, and there is no getent), /etc/passwd itself does.
+    #[cfg(unix)]
+    #[test]
+    fn without_id_or_getent_the_names_come_from_etc_passwd() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let bin = std::env::temp_dir().join(format!("sub-owners-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bin);
+        std::fs::create_dir_all(&bin).unwrap();
+        let id = bin.join("id");
+        std::fs::write(&id, "#!/bin/sh\necho \"id: unknown user $2\" >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&id, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for tool in ["awk", "cut", "head"] {
+            let found = std::process::Command::new("/bin/sh").arg("-c").arg(format!("command -v {tool}")).output().unwrap();
+            std::os::unix::fs::symlink(String::from_utf8_lossy(&found.stdout).trim(), bin.join(tool)).unwrap();
+        }
+        let mut sh = std::process::Command::new("/bin/sh")
+            .arg("-s")
+            .env("PATH", &bin)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let script = remote_sh::whole(&remote_sh::with_args(&["0", "3999999999"], OWNER_LOOKUP_SCRIPT));
+        sh.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        let out = sh.wait_with_output().unwrap();
+        let _ = std::fs::remove_dir_all(&bin);
+        let out = String::from_utf8_lossy(&out.stdout);
+        assert!(out.lines().any(|l| l == "0\troot"), "{out}");
+        assert!(out.lines().any(|l| l == "__SUB_OWNERS:OK"), "{out}");
+        assert_eq!(parse_owners(&out, &[0, 3999999999]).len(), 1, "{out}");
+    }
 }
 
 #[cfg(test)]
@@ -20500,9 +21392,10 @@ struct SftpOwners {
 }
 
 // The names behind the uids of an SFTP listing, which carries numbers only:
-// each uid through `id -un`, else the passwd database. The uids come as
-// arguments (numbers); the script is fixed.
-const OWNER_LOOKUP_SCRIPT: &str = r#"for uid; do name=$(id -un "$uid" 2>/dev/null) || name=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1 | head -n 1); [ -n "$name" ] && printf "%s\t%s\n" "$uid" "$name"; done; echo __SUB_OWNERS:OK"#;
+// each uid through `id -un`, else the passwd database, else /etc/passwd itself.
+// BusyBox's `id` takes a name only ("unknown user 0"), and OpenWrt has no
+// `getent`. The uids come as arguments (numbers); the script is fixed.
+const OWNER_LOOKUP_SCRIPT: &str = r#"for uid; do name=$(id -un "$uid" 2>/dev/null) || name=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1 | head -n 1); [ -n "$name" ] || name=$(awk -F: -v u="$uid" '$3 == u { print $1; exit }' /etc/passwd 2>/dev/null); [ -n "$name" ] && printf "%s\t%s\n" "$uid" "$name"; done; echo __SUB_OWNERS:OK"#;
 
 // One lookup takes this many uids at most; a listing rarely has a handful.
 const OWNER_LOOKUP_MAX: usize = 256;
@@ -23000,6 +23893,13 @@ fn session_drag_dir(session_id: &str) -> Result<std::path::PathBuf, String> {
     Ok(app_temp_root().join(format!("drag_{}", session_temp_name(session_id)?)))
 }
 
+/// A built-in RDP session run's dir for the files copied on the server
+/// (rdp_files.rs), under the unpredictable root. Generations only go up, so
+/// each run has its own.
+fn session_rdpclip_dir(session_id: &str, generation: u64) -> Result<std::path::PathBuf, String> {
+    Ok(app_temp_root().join(format!("rdpclip_{}_{generation}", session_temp_name(session_id)?)))
+}
+
 /// A session's part of its temp dirs' names: the session id as the frontend
 /// makes it (`session-<id>`, `session-quick-<ms>`, plus `::sftp` / `::fwd`
 /// for the dedicated connections), `::` spelled `__` since `:` can't be in a
@@ -23269,6 +24169,13 @@ async fn sftp_open_remote_file(
         }
         return Ok(());
     }
+    // The file opened again: the copy is written anew below, and the watcher
+    // made for it the last time ends here, before it, or two watchers would
+    // upload each save. It goes without a word and leaves the copy alone.
+    let (end_tx, end_rx) = tokio::sync::oneshot::channel::<ssh_manager::LiveEditEnd>();
+    if let Some(old) = state.live_edits.lock().await.insert(ssh_manager::live_edit_key(&session_id, &remote_path), end_tx) {
+        let _ = old.send(ssh_manager::LiveEditEnd::Replaced);
+    }
     let forget_watcher = |path: &Path| {
         live_edit_watchers().lock().unwrap_or_else(|e| e.into_inner()).remove(path);
     };
@@ -23334,6 +24241,8 @@ async fn sftp_open_remote_file(
 
     // Spawn modification watcher task in background
     let connections_clone = Arc::clone(&state.connections);
+    // An FTP tab has no SSH connection: its saves go over its own FTP one.
+    let ftp_sessions_clone = Arc::clone(&state.ftp_sessions);
     let elevation_clone = Arc::clone(&state.sftp_elevation);
     let app_handle_clone = app_handle.clone();
     let session_id_clone = session_id.clone();
@@ -23353,6 +24262,7 @@ async fn sftp_open_remote_file(
         // Set when the watch is to end: whether it was idle for too long, and
         // whether opening the file again would undo why (end_live_edit_watch).
         let mut ended: Option<(bool, bool)> = None;
+        let mut end_rx = end_rx;
         loop {
             if let Some((idle_end, can_go_on)) = ended.take() {
                 match end_live_edit_watch(&app_handle_clone, &session_id_clone, &filename_clone, &temp_file_path_clone, idle_end, can_go_on) {
@@ -23364,6 +24274,15 @@ async fn sftp_open_remote_file(
             tokio::select! {
                 _ = wait => {
                     ended = Some((true, true));
+                    continue;
+                }
+                // Told to end: the file opened again (Replaced), or the tab
+                // disconnected or the profile closed (the entry dropped).
+                end = &mut end_rx => {
+                    // Replaced: the copy is the new watcher's now. Dropped: as
+                    // for a session gone (live_edit.rs), which ends the loop.
+                    if matches!(end, Ok(ssh_manager::LiveEditEnd::Replaced)) { break; }
+                    ended = Some((false, false));
                     continue;
                 }
                 maybe = tok_rx.recv() => {
@@ -23390,10 +24309,13 @@ async fn sftp_open_remote_file(
                     }
                     // Cheap pre-check: if the session is gone we exit the
                     // watcher entirely instead of looping and spamming
-                    // "Auto-sync failed" toasts on every subsequent save.
+                    // "Auto-sync failed" toasts on every subsequent save. An FTP
+                    // tab is in ftp_sessions, an SSH one in connections (one
+                    // lock at a time).
                     {
-                        let connections = connections_clone.lock().await;
-                        if !connections.contains_key(&session_id_clone) {
+                        let ftp_tab = ftp_sessions_clone.lock().await.contains_key(&session_id_clone);
+                        let ssh_tab = !ftp_tab && connections_clone.lock().await.contains_key(&session_id_clone);
+                        if !ftp_tab && !ssh_tab {
                             let _ = app_handle_clone.emit(
                                 &format!("sftp-sync-status-{}", session_id_clone),
                                 serde_json::json!({
@@ -23406,6 +24328,13 @@ async fn sftp_open_remote_file(
                         }
                     }
                     let upload_res = async {
+                    // An FTP tab: the file goes back over the tab's own FTP
+                    // connection, which serves its file pane (ftp_sftp.rs).
+                    let ftp = ftp_sessions_clone.lock().await.get(&session_id_clone).map(|live| Arc::clone(&live.sftp));
+                    let ssh_sftp;
+                    let sftp: &russh_sftp::client::SftpSession = match ftp.as_deref() {
+                        Some(ftp) => ftp,
+                        None => {
                     let session_arc = {
                         let connections = connections_clone.lock().await;
                         connections.get(&session_id_clone).map(|sess| Arc::clone(sess))
@@ -23423,10 +24352,14 @@ async fn sftp_open_remote_file(
                     // An elevated tab (file ops as root via sudo) must save
                     // back the same way, or root-owned files can't be written.
                     let elevation = elevation_clone.lock().await.get(&session_id_clone).cloned();
-                    let (sftp, _) = if let Some(elev) = elevation {
+                    ssh_sftp = if let Some(elev) = elevation {
                         open_elevated(&session_arc, &elev).await?
                     } else {
                         open_sftp(&session_arc).await?
+                    }
+                    .0;
+                    &ssh_sftp
+                        }
                     };
 
                     use russh_sftp::protocol::OpenFlags;
@@ -24399,7 +25332,8 @@ fn guard_mirror_folder(local: &str) -> Result<String, String> {
     if !folder.is_dir() {
         return Err(format!("[MIRROR] The local folder isn't a folder: {local}"));
     }
-    Ok(folder.to_string_lossy().into_owned())
+    // It shows in the mirror's log: without `\\?\` in front where Windows allows.
+    Ok(display_path(&folder))
 }
 
 /// The system folders `check_local_path_policy` refuses, as lowercase paths
@@ -25645,21 +26579,32 @@ async fn monitor_resume_all(
     jump_gone::resume_skipped(&db_state, skipped)
 }
 
-/// The clipboard's text, for a paste. The Linux and Android frontends ask;
-/// the others read it in the page.
+/// The clipboard's text, for a paste. The Windows, Linux and Android
+/// frontends ask; macOS and iOS read it in the page (WebKit shows its own
+/// Paste button for each read).
 ///
 /// Android's WebView refuses the page's `navigator.clipboard` altogether, so
 /// there the app's own Android plugin reads the system clipboard.
+///
+/// WebView2 on Windows asks the user to allow or block the page's
+/// `navigator.clipboard.readText()`, and after a Block every right-click
+/// paste (and the RDP and VNC tabs' paste) said "Clipboard read denied". So
+/// on Windows the page asks here and the clipboard is read directly.
 ///
 /// WebKitGTK refuses the page's `navigator.clipboard.readText()` (#89). And
 /// where the webview reads the clipboard itself (a keyboard paste, or the
 /// page API once it is allowed), it crashes the whole app when nothing owns
 /// the clipboard (seen with WebKitGTK 2.54). So on Linux the page asks here
 /// and GTK is asked directly. A clipboard that is empty or holds no text
-/// gives an empty string. The fork reads it here on Windows and macOS too
-/// (clipboard_read.rs).
+/// gives an empty string.
+/// The fork reads it here on macOS too (clipboard_read.rs).
 #[tauri::command]
 async fn clipboard_read_text(app: tauri::AppHandle) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        let _ = app;
+        file_clipboard::read_text().await
+    }
     #[cfg(target_os = "linux")]
     {
         let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
@@ -25679,7 +26624,7 @@ async fn clipboard_read_text(app: tauri::AppHandle) -> Result<String, String> {
     {
         android_bridge::clipboard_read(&app).await
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
     {
         let _ = app;
         clipboard_read::read_text().await
@@ -25699,6 +26644,23 @@ async fn clipboard_write_text(app: tauri::AppHandle, text: String) -> Result<(),
     {
         let _ = (app, text);
         Err("Writing the clipboard here is only for Android.".to_string())
+    }
+}
+
+/// Whether Android has a hardware keyboard in use (a keyboard cover, a USB or
+/// Bluetooth keyboard): a new terminal takes the focus then, as no on-screen
+/// keyboard comes up over it (TerminalView). False everywhere else, and when
+/// Android can't say.
+#[tauri::command]
+async fn hardware_keyboard_attached(app: tauri::AppHandle) -> bool {
+    #[cfg(target_os = "android")]
+    {
+        android_bridge::hardware_keyboard(&app).await.unwrap_or(false)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        false
     }
 }
 
@@ -25960,11 +26922,11 @@ pub fn run() {
             accept_share, import_shared_profile, restore_personal_profile, share_set_role, share_revoke, share_leave, share_delete,
             profile_share_status, stop_sharing, profile_sync_stats, share_key_state, accept_share_key, share_replace_key, held_deletions_list, resolve_held_deletions, cloud_resume_profile, profile_copies, restore_profile_copy, folder_copy_status, folder_copy_choose, folder_copy_stop, folder_copy_now,
             set_editor_label,
-            add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, allow_held, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_jump_host, set_server_protocol, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
+            add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, allow_held, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_auto_open, set_server_jump_host, set_server_protocol, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
             get_credentials, generate_ssh_key,
             add_folder, rename_folder, delete_folder, get_folders,
             tree_moves::move_servers, tree_moves::move_folder, tree_moves::delete_tree_items,
-            add_command, edit_command, set_command_scope, delete_command, get_commands,
+            add_command, edit_command, set_command_scope, set_command_secret_tags, delete_command, get_commands,
             cmd_history_add, cmd_history_list, cmd_history_clear,
             add_note, edit_note, delete_note, get_notes,
             mirror_dry_run, start_mirror, stop_mirror, list_mirrors, pick_local_directory,
@@ -25973,11 +26935,12 @@ pub fn run() {
             add_ssh_key, edit_ssh_key, delete_ssh_key,
             pick_ssh_key_file, read_ssh_key_file, import_ssh_key_file,
             initiate_connection, verify_fingerprint_response, submit_kbi_response, kbi_save_choice, disconnect_session, set_use_ssh_config, set_use_ssh_agent,
-            initiate_rdp, rdp_open_again, rdp_builtin_open, rdp_builtin_input, rdp_builtin_paste, rdp_builtin_resize, rdp_builtin_shown, rdp_builtin_close, rdp_share_drives,
+            initiate_rdp, rdp_open_again, rdp_builtin_open, rdp_builtin_input, rdp_builtin_paste, rdp_builtin_paste_files, rdp_builtin_fetch_files, rdp_builtin_stop_files, rdp_builtin_files_mark,
+            rdp_builtin_files_to_clipboard, rdp_builtin_resize, rdp_builtin_shown, rdp_builtin_close, rdp_share_drives,
             telnet_connect, telnet_open_terminal, ftp_connect, vnc_open, vnc_input, vnc_resize, vnc_paste, vnc_shown, screen_ack,
             start_tunnel, stop_tunnel, list_tunnels, restart_session_tunnels, persist_session_tunnels,
             list_tunnel_rules, remove_tunnel_rule, rename_tunnel_rule,
-            open_terminal, local_shell, write_terminal_data, type_saved_password, terminal_drawn, resize_terminal, close_terminal,
+            open_terminal, session_log_default_folder, local_shell, write_terminal_data, type_saved_password, terminal_drawn, resize_terminal, close_terminal,
             keep_session::keep_session_tab, keep_session::keep_session_open, keep_session::keep_session_state, keep_session::keep_session_list, keep_session::keep_session_end,
             local_term::list_local_shells, local_term::local_shell_set_default, local_term::local_shell_pick_custom, local_term::local_shell_clear_custom,
             local_term::local_terminal_open, local_term::local_terminal_write, local_term::local_windows_build, local_term::local_terminal_resize, local_term::local_terminal_close,
@@ -26028,7 +26991,8 @@ pub fn run() {
             multiexec::get_jump_login_limit, multiexec::set_jump_login_limit, multiexec::write_terminals_data, jump_pool::get_jump_sharing, jump_pool::set_jump_sharing, server_os::detect_server_os, approvals::keep_server_ssh, set_server_terminal_theme, set_server_highlight,
             fonts::list_system_fonts,
             clipboard_read_text,
-            clipboard_write_text
+            clipboard_write_text,
+            hardware_keyboard_attached
         ]);
 
     // Clear out live-edit / drag temp dirs a crashed earlier run left behind
@@ -26054,11 +27018,20 @@ pub fn run() {
                 // What is only in memory goes to the vault: the commands typed
                 // since the last save (cmd_history_add doesn't save). With no
                 // profile open there is nothing to save, and this says so.
-                let _ = save_vault_internal(&_app.state::<DbState>());
+                let state = _app.state::<DbState>();
+                let _ = save_vault_internal(&state);
                 // And the assistant's store (chats, settings).
                 ai::save_on_exit();
                 // The decrypted copies this run staged go with it.
                 sweep_app_temp(true);
+                // Nothing writes the profile any more: the next start may open
+                // it now. Left to the end of the process, the lock stayed as
+                // long as a copy to a folder that doesn't answer (#400).
+                if let Ok(mut held) = state.profile_lock.lock() {
+                    held.take();
+                }
+                // The copy the last save started, so it isn't cut off.
+                folder_copy::wait_for_copies(std::time::Duration::from_secs(5));
             }
         });
 }

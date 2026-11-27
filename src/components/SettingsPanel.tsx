@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, ArrowRight, X, KeyRound, EyeOff, ExternalLink, MessageSquare } from "lucide-react";
+import { Settings, Palette, RefreshCw, List, Cloud, Minus, Plus, ArrowRight, X, KeyRound, EyeOff, ExternalLink, MessageSquare, ArrowUpCircle } from "lucide-react";
 import { openFeedback } from "./Feedback";
 import {
   MAX_FONT_SIZE, MIN_FONT_SIZE, clampFontSize, fontFamilyCss,
@@ -13,6 +13,8 @@ import { invoke } from "@tauri-apps/api/core";
 import CopyValue from "./CopyValue";
 import { AiSettings } from "./ai/AiSettings";
 import { AgentSettings } from "./agents/AgentSettings";
+import { ShortcutSettings } from "./ShortcutSettings";
+import { useIsNarrow } from "../hooks/useViewport";
 import FontPicker from "./FontPicker";
 import { loadInstalledFonts } from "../util/systemFonts";
 import { MAX_SCROLLBACK, MIN_SCROLLBACK, clampScrollback } from "../util/terminalScrollback";
@@ -20,6 +22,9 @@ import { IS_ANDROID, IS_MOBILE } from "../util/platform";
 import { ForkSettings, InTab, SettingsTabBar, SshConfigNote, TERMINAL_RESET, TerminalColours, UiCustomizationExtras, useSettingsTab } from "./settings";
 import { LANGUAGES, languageSetting, setLanguageSetting, systemLanguage, tk, tx, useLanguage, useT } from "../i18n";
 import { translationIssueUrl } from "../util/links";
+import {
+  DEFAULT_LOG_FILE_NAME, LogMode, SessionLogDefaults, readSessionLogDefaults, writeSessionLogDefaults,
+} from "../util/sessionLog";
 
 // Where this install keeps its data (see src-tauri/src/portable.rs). `portable`
 // means a `submarine-data` folder next to the executable is in use; `warning`
@@ -45,7 +50,7 @@ function DefaultShellSetting({ settings, setSettings }: any) {
   if (!shell) return null;
   const name = shell.split("/").pop();
   return (
-    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 shadow-xl">
+    <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 shadow-xl">
       <div className="flex items-center justify-between gap-4">
         <div className="min-w-0">
           <div className="text-sm font-semibold text-zinc-100">{t("Use my default shell")}</div>
@@ -60,7 +65,150 @@ function DefaultShellSetting({ settings, setSettings }: any) {
           onClick={() => setSettings((s: any) => ({ ...s, useLocalShell: !s.useLocalShell }))}
           className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${settings.useLocalShell ? 'bg-primary' : 'bg-zinc-700'}`}
         >
-          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${settings.useLocalShell ? 'left-[22px]' : 'left-0.5'}`} />
+          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-knob transition-all ${settings.useLocalShell ? 'left-[22px]' : 'left-0.5'}`} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// "Session logs" (util/sessionLog, src-tauri/src/session_log.rs, #397): this
+// device's default. Off by default. Not on a phone or tablet.
+function SessionLogSettings() {
+  const t = useT();
+  const [log, setLog] = useState<SessionLogDefaults>(readSessionLogDefaults);
+  const [defaultFolder, setDefaultFolder] = useState("");
+  const [pickError, setPickError] = useState("");
+  useEffect(() => {
+    invoke<string | null>("session_log_default_folder").then((f) => setDefaultFolder(f || ""), () => {});
+  }, []);
+  const change = (next: Partial<SessionLogDefaults>) => {
+    const merged = { ...log, ...next };
+    setLog(merged);
+    writeSessionLogDefaults(merged);
+  };
+  const choose = async () => {
+    setPickError("");
+    try {
+      const folder = await invoke<string | null>("pick_local_directory");
+      if (folder) change({ folder });
+    } catch (e) {
+      setPickError(t("Couldn't open the folder picker: {error}", { error: String(e) }));
+    }
+  };
+  const field = "flex-1 min-w-0 bg-black/30 border border-white/10 rounded-lg px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-primary/50";
+  const off = log.mode === "off";
+  return (
+    <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 shadow-xl space-y-4">
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-zinc-100">{t("Session logs")}</div>
+          <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
+            {t("Write a terminal's output to a file while the session runs, so a dropped connection keeps what came before it. For SSH, container and telnet terminals. A server can have its own choice in its details.")}
+          </p>
+        </div>
+        <select
+          aria-label={t("Session logs")}
+          value={log.mode}
+          onChange={(e) => change({ mode: e.target.value as LogMode })}
+          className="shrink-0 h-9 bg-shade-1a1a1e rounded-lg px-2 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50"
+        >
+          <option value="off" className="bg-shade-1a1a1e">{t("Off")}</option>
+          <option value="text" className="bg-shade-1a1a1e">{t("Text only")}</option>
+          <option value="all" className="bg-shade-1a1a1e">{t("All output")}</option>
+        </select>
+      </div>
+      {!off && (
+        <p className="text-[12px] text-zinc-500 leading-relaxed">
+          {log.mode === "text"
+            ? t("Text only: what you'd read on the screen, without colours and other escape codes. Easy to read, search and paste into a ticket.")
+            : t("All output: everything the server sent, escape codes included. Shown with cat in a terminal, it looks as it did; in a text editor it's hard to read.")}
+        </p>
+      )}
+      <div className="space-y-1.5">
+        <label className="text-[11px] font-bold text-zinc-400" htmlFor="session-log-folder">{t("Folder")}</label>
+        <div className="flex items-center gap-2">
+          <input
+            id="session-log-folder"
+            type="text"
+            value={log.folder}
+            placeholder={defaultFolder}
+            onChange={(e) => change({ folder: e.target.value })}
+            spellCheck={false}
+            autoCapitalize="none"
+            autoCorrect="off"
+            className={field}
+          />
+          <button
+            type="button"
+            onClick={choose}
+            className="shrink-0 px-3 py-2 rounded-lg text-[12px] font-semibold text-zinc-300 bg-white/5 border border-white/10 hover:bg-white/10 transition-colors"
+          >
+            {t("Choose…")}
+          </button>
+        </div>
+        {pickError && <p className="text-[11px] text-rose-400">{pickError}</p>}
+      </div>
+      <div className="space-y-1.5">
+        <label className="text-[11px] font-bold text-zinc-400" htmlFor="session-log-file">{t("File name")}</label>
+        <input
+          id="session-log-file"
+          type="text"
+          value={log.fileName}
+          placeholder={DEFAULT_LOG_FILE_NAME}
+          onChange={(e) => change({ fileName: e.target.value })}
+          spellCheck={false}
+          autoCapitalize="none"
+          autoCorrect="off"
+          className={"w-full " + field}
+        />
+        <p className="text-[11px] text-zinc-500 leading-relaxed">
+          {t("&S is the server's name, &H its host and &P its port; &Y, &M and &D the date and &T the time the session opened. A / makes a folder.")}
+        </p>
+      </div>
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0">
+          <div className="text-[13px] font-semibold text-zinc-200">{t("Add to a log that exists")}</div>
+          <p className="text-[12px] text-zinc-500 leading-relaxed mt-0.5">{t("Off, a log with the same name is started again.")}</p>
+        </div>
+        <button
+          role="switch"
+          aria-checked={log.append}
+          aria-label={t("Add to a log that exists")}
+          onClick={() => change({ append: !log.append })}
+          className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${log.append ? 'bg-primary' : 'bg-zinc-700'}`}
+        >
+          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-knob transition-all ${log.append ? 'left-[22px]' : 'left-0.5'}`} />
+        </button>
+      </div>
+      <p className="text-[11px] text-zinc-500 leading-relaxed">
+        {t("Kept on this device only. A change applies to terminals opened after it.")}
+      </p>
+    </div>
+  );
+}
+
+// "Show program titles on tabs" (util/terminalTitle, #391). On by default.
+function ProgramTitlesSetting({ settings, setSettings }: any) {
+  const t = useT();
+  const on = settings.showTerminalTitles !== false;
+  return (
+    <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 shadow-xl">
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-zinc-100">{t("Show program titles on tabs")}</div>
+          <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
+            {t("A program on the server can give its terminal a title, such as the folder you're in or the file you're editing. Tabs show it after their name. Off, they show only the name.")}
+          </p>
+        </div>
+        <button
+          role="switch"
+          aria-checked={on}
+          aria-label={t("Show program titles on tabs")}
+          onClick={() => setSettings((s: any) => ({ ...s, showTerminalTitles: !(s.showTerminalTitles !== false) }))}
+          className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${on ? 'bg-primary' : 'bg-zinc-700'}`}
+        >
+          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-knob transition-all ${on ? 'left-[22px]' : 'left-0.5'}`} />
         </button>
       </div>
     </div>
@@ -83,7 +231,7 @@ function SessionKeepSettings({ settings, setSettings }: any) {
     },
   ];
   return (
-    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 shadow-xl space-y-5">
+    <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 shadow-xl space-y-5">
       {rows.map(({ field, title, text }) => {
         const on = settings[field] !== false;
         return (
@@ -99,7 +247,7 @@ function SessionKeepSettings({ settings, setSettings }: any) {
               onClick={() => setSettings((s: any) => ({ ...s, [field]: !(s[field] !== false) }))}
               className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${on ? 'bg-primary' : 'bg-zinc-700'}`}
             >
-              <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${on ? 'left-[22px]' : 'left-0.5'}`} />
+              <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-knob transition-all ${on ? 'left-[22px]' : 'left-0.5'}`} />
             </button>
           </div>
         );
@@ -116,7 +264,7 @@ function SshAgentSetting({ settings, setSettings }: any) {
   const t = useT();
   const on = settings.useSshAgent !== false;
   return (
-    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 shadow-xl">
+    <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 shadow-xl">
       <div className="flex items-center justify-between gap-4">
         <div className="min-w-0">
           <div className="text-sm font-semibold text-zinc-100">{t("Use keys from an ssh-agent")}</div>
@@ -131,7 +279,7 @@ function SshAgentSetting({ settings, setSettings }: any) {
           onClick={() => setSettings((s: any) => ({ ...s, useSshAgent: !(s.useSshAgent !== false) }))}
           className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${on ? 'bg-primary' : 'bg-zinc-700'}`}
         >
-          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${on ? 'left-[22px]' : 'left-0.5'}`} />
+          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-knob transition-all ${on ? 'left-[22px]' : 'left-0.5'}`} />
         </button>
       </div>
     </div>
@@ -143,7 +291,7 @@ function SshConfigSetting({ settings, setSettings }: any) {
   const t = useT();
   const on = settings.useSshConfig !== false;
   return (
-    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 shadow-xl">
+    <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 shadow-xl">
       <div className="flex items-center justify-between gap-4">
         <div className="min-w-0">
           <div className="text-sm font-semibold text-zinc-100">{t("Use settings from ~/.ssh/config")}</div>
@@ -158,7 +306,7 @@ function SshConfigSetting({ settings, setSettings }: any) {
           onClick={() => setSettings((s: any) => ({ ...s, useSshConfig: !(s.useSshConfig !== false) }))}
           className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${on ? 'bg-primary' : 'bg-zinc-700'}`}
         >
-          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${on ? 'left-[22px]' : 'left-0.5'}`} />
+          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-knob transition-all ${on ? 'left-[22px]' : 'left-0.5'}`} />
         </button>
       </div>
     </div>
@@ -181,7 +329,7 @@ function SecureScreenSetting() {
     invoke<boolean>("set_secure_screen", { enabled: !on }).then(setOn, (e) => setError(String(e)));
   };
   return (
-    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 shadow-xl">
+    <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 shadow-xl">
       <div className="flex items-center justify-between gap-4">
         <div className="min-w-0">
           <div className="text-sm font-semibold text-zinc-100">{t("Block screenshots")}</div>
@@ -198,7 +346,7 @@ function SecureScreenSetting() {
           onClick={toggle}
           className={`relative shrink-0 w-11 h-6 rounded-full transition-colors disabled:opacity-50 ${on ? 'bg-primary' : 'bg-zinc-700'}`}
         >
-          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${on ? 'left-[22px]' : 'left-0.5'}`} />
+          <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-knob transition-all ${on ? 'left-[22px]' : 'left-0.5'}`} />
         </button>
       </div>
     </div>
@@ -323,7 +471,7 @@ function TerminalFontSettings({ settings, setSettings }: any) {
   const previewFamily = fontFamilyCss(familyDraft);
 
   return (
-    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-6 shadow-xl">
+    <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 space-y-6 shadow-xl">
       {/* Font face */}
       <div className="space-y-2">
         <div className="flex justify-between items-center gap-2">
@@ -407,9 +555,9 @@ function TerminalFontSettings({ settings, setSettings }: any) {
       </div>
 
       {/* Live preview */}
-      <div className="rounded-xl bg-[#09090b] border border-white/5 px-3 py-2.5 overflow-x-auto custom-scrollbar">
+      <div className="rounded-xl bg-shade-09090b border border-white/5 px-3 py-2.5 overflow-x-auto custom-scrollbar">
         <pre
-          className="m-0 whitespace-pre text-[#e4e4e7] leading-snug"
+          className="m-0 whitespace-pre text-shade-e4e4e7 leading-snug"
           style={{ fontFamily: previewFamily, fontSize: Math.min(size, 28) }}
         >
           <span className="text-primary">user@server</span>:~$ ls -la{"\n"}0O 1lI | {"{}"} [] =&gt; ✓
@@ -439,7 +587,7 @@ function TerminalScrollbackSetting({ settings, setSettings }: any) {
     if (next !== lines) set(next);
   };
   return (
-    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-3 shadow-xl">
+    <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 space-y-3 shadow-xl">
       <div className="flex justify-between items-center gap-3">
         <label htmlFor="term-scrollback" className="text-[12px] font-semibold text-zinc-500">{t("Scrollback (lines)")}</label>
         <div className="flex items-center gap-1.5">
@@ -504,7 +652,7 @@ function ShellConfigSyncSettings({ servers }: { servers: any[] }) {
     .sort((a, b) => String(a.name).localeCompare(String(b.name)));
 
   return (
-    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 shadow-xl space-y-4">
+    <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 shadow-xl space-y-4">
       <div>
         <div className="text-sm font-semibold text-zinc-100">{t("Shell config sync")}</div>
         <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
@@ -610,7 +758,7 @@ function LanguageSetting() {
       .catch((e) => setLinkError(t("Couldn't open the link: {error}", { error: String(e) })));
   };
   return (
-    <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 shadow-xl">
+    <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 shadow-xl">
       <div className="flex items-center justify-between gap-4">
         <div className="min-w-0">
           <div className="text-sm font-semibold text-zinc-100">{t("Language")}</div>
@@ -658,6 +806,7 @@ function LanguageSetting() {
 
 const SettingsPanel = ({ settings, setSettings, onOpenLogs, onOpenAiChats, onOpenAgents, onHighlightRulesChanged, servers = [] }: any) => {
   const t = useT();
+  const narrow = useIsNarrow();
   const accentColors = [
     { name: tk('Light blue'), value: '#60a5fa' },
     { name: tk('Sky'), value: '#38bdf8' },
@@ -674,6 +823,10 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onOpenAiChats, onOpe
     { name: tk('Nord'), value: '#2e3440' },
     { name: tk('Dark gray'), value: '#1a1a1a' },
     { name: tk('Deep Space'), value: '#0d0d10' },
+    // A light background turns the whole interface light (util/appTheme).
+    { name: tk('Snow'), value: '#fafafa' },
+    { name: tk('Paper'), value: '#f5f5f4' },
+    { name: tk('Silver'), value: '#e4e4e7' },
   ];
 
   // Read-only storage summary from the backend: where data lives and whether
@@ -682,6 +835,12 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onOpenAiChats, onOpe
   const [tab, setTab] = useSettingsTab();
   useEffect(() => {
     invoke<StorageInfo>("get_storage_info").then(setStorage).catch(() => setStorage(null));
+  }, []);
+  // Updates: only in builds that look for them on GitHub (not the stores',
+  // not Flatpak: about::app_info).
+  const [updatesOn, setUpdatesOn] = useState(false);
+  useEffect(() => {
+    invoke<{ updates: boolean }>("app_info").then((i) => setUpdatesOn(!!i.updates)).catch(() => setUpdatesOn(false));
   }, []);
 
   return (
@@ -712,7 +871,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onOpenAiChats, onOpe
             <Palette size={14} /> {t("UI customization")}
           </div>
 
-          <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-8 shadow-xl">
+          <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 space-y-8 shadow-xl">
             {/* Accent Color */}
             <div className="space-y-4">
               <div className="flex justify-between items-center">
@@ -769,7 +928,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onOpenAiChats, onOpe
                   <button
                     key={c.value}
                     onClick={() => setSettings({ ...settings, backgroundColor: c.value })}
-                    className={`w-full aspect-square rounded-xl border-2 transition-all ${settings.backgroundColor === c.value ? 'border-white scale-110 shadow-lg' : 'border-transparent hover:scale-105'}`}
+                    className={`w-full aspect-square rounded-xl border-2 transition-all ${settings.backgroundColor === c.value ? 'border-white scale-110 shadow-lg' : 'border-white/10 hover:scale-105'}`}
                     style={{ backgroundColor: c.value }}
                     title={t(c.name)}
                   />
@@ -794,10 +953,17 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onOpenAiChats, onOpe
 
           <TerminalScrollbackSetting settings={settings} setSettings={setSettings} />
 
+          <ProgramTitlesSetting settings={settings} setSettings={setSettings} />
+
           <DefaultShellSetting settings={settings} setSettings={setSettings} />
+
+          {!IS_MOBILE && <SessionLogSettings />}
           
           <ShellConfigSyncSettings servers={servers} />
         </section>
+
+        {/* Not on a phone, which has no keyboard for them. A tablet may. */}
+        {!(IS_MOBILE && narrow) && <ShortcutSettings />}
 
         <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
           <div className="flex items-center gap-2 text-zinc-400 font-semibold text-xs">
@@ -845,7 +1011,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onOpenAiChats, onOpe
               <List size={14} /> {t("Activity log")}
             </div>
 
-            <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
+            <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
               <p className="text-sm text-zinc-400 leading-relaxed">
                 {t("Diagnostic timeline of what the app has been doing this session. Useful for confirming a connection actually failed or watching a transfer's progress in retrospect.")}
               </p>
@@ -864,7 +1030,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onOpenAiChats, onOpe
           <div className="flex items-center gap-2 text-zinc-400 font-semibold text-xs">
             <MessageSquare size={14} /> {t("Help & feedback")}
           </div>
-          <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
+          <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
             <p className="text-sm text-zinc-400 leading-relaxed">
               {t("Found a problem or have an idea? This opens a new issue on this fork's GitHub in your browser. Nothing is sent until you submit it there, and issues are public.")}
             </p>
@@ -884,7 +1050,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onOpenAiChats, onOpe
             <Cloud size={14} /> {t("Cloud sync")}
           </div>
 
-          <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
+          <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
             <div className="flex items-center justify-between gap-4">
               <div className="min-w-0">
                 <div className="text-sm font-semibold text-zinc-100">{t("Auto-sync")}</div>
@@ -899,7 +1065,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onOpenAiChats, onOpe
                 onClick={() => setSettings((s: any) => ({ ...s, autoSync: !(s.autoSync !== false) }))}
                 className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${settings.autoSync !== false ? 'bg-primary' : 'bg-zinc-700'}`}
               >
-                <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${settings.autoSync !== false ? 'left-[22px]' : 'left-0.5'}`} />
+                <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-knob transition-all ${settings.autoSync !== false ? 'left-[22px]' : 'left-0.5'}`} />
               </button>
             </div>
 
@@ -913,13 +1079,42 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onOpenAiChats, onOpe
           </div>
         </section>
 
+        {/* Updates Section */}
+        {updatesOn && (
+          <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
+            <div className="flex items-center gap-2 text-zinc-400 font-semibold text-xs">
+              <ArrowUpCircle size={14} /> {t("Updates")}
+            </div>
+
+            <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
+              <div className="flex items-center justify-between gap-4">
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold text-zinc-100">{t("Tell me about beta versions")}</div>
+                  <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
+                    {t("Betas are test builds of the next version and may still have rough edges. With this on, the notice on the profile list also tells you about them.")}
+                  </p>
+                </div>
+                <button
+                  role="switch"
+                  aria-label={t("Tell me about beta versions")}
+                  aria-checked={!!settings.updateBeta}
+                  onClick={() => setSettings((s: any) => ({ ...s, updateBeta: !s.updateBeta }))}
+                  className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${settings.updateBeta ? 'bg-primary' : 'bg-zinc-700'}`}
+                >
+                  <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-knob transition-all ${settings.updateBeta ? 'left-[22px]' : 'left-0.5'}`} />
+                </button>
+              </div>
+            </div>
+          </section>
+        )}
+
         {/* Maintenance Section */}
         <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
           <div className="flex items-center gap-2 text-zinc-400 font-semibold text-xs">
             <RefreshCw size={14} /> {t("Maintenance")}
           </div>
 
-          <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
+          <div className="bg-shade-121215 border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
             {storage && (
               <div className="space-y-1.5 pb-4 border-b border-white/5">
                 <div className="flex items-center gap-2">

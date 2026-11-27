@@ -119,8 +119,11 @@ jobs:
           # same binary further down (Tauri's bundler has no Arch backend).
           LINUX='{"platform":"ubuntu-22.04","os_name":"linux-x64","bundles":"deb,rpm,appimage","rust_target":"x86_64-unknown-linux-gnu"}'
           # macOS: Apple silicon only (an Intel Mac can't run it), as the
-          # .app (zipped) and a .dmg.
-          MAC='{"platform":"macos-latest","os_name":"macos-arm64","bundles":"app,dmg","rust_target":"aarch64-apple-darwin"}'
+          # .app (zipped) and a .dmg. rustup's llvm-tools: under Xcode 27,
+          # swift-rs uses its llvm-objcopy to make Tauri's Swift exports
+          # public again (the original project's #411). Harmless on older
+          # Xcode, so the build keeps working when macos-latest moves on.
+          MAC='{"platform":"macos-latest","os_name":"macos-arm64","bundles":"app,dmg","rust_target":"aarch64-apple-darwin","rust_components":"llvm-tools"}'
           MATRIX="[$WINDOWS,$LINUX]"
           PUBLISH="false"
           if [ -n "$MACOS_FOR" ]; then
@@ -247,6 +250,8 @@ jobs:
           # was the ref), and a commit SHA says nothing.
           toolchain: stable
           targets: ${{ matrix.rust_target }}
+          # llvm-tools on the Mac (see MAC above); empty elsewhere.
+          components: ${{ matrix.rust_components }}
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3

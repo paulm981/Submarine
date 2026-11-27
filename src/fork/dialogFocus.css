@@ -5,6 +5,6 @@
    looked like the one Enter would press (#273). A clear ring shows where the
    focus is, in every modal dialog; Tab moves it, and Enter presses that one. */
 [role="dialog"][aria-modal="true"] button:focus {
-  outline: 2px solid rgba(255, 255, 255, 0.9);
+  outline: 2px solid rgb(var(--c-white) / 0.9);
   outline-offset: 2px;
 }

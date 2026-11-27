@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { Cpu, X, Link2, ArrowLeftRight, Shield, ShieldAlert, Key, User, FolderPlus, Download, CheckSquare, Square, History, Plus, Copy, Play, FlaskConical } from "lucide-react";
+import { Cpu, X, Link2, ArrowLeft, ArrowLeftRight, ArrowRight, Shield, ShieldAlert, Key, User, FolderPlus, Download, CheckSquare, Square, History, Plus, Copy, Play, FlaskConical } from "lucide-react";
 import PasswordField from "./PasswordField";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
 import { useSlideOverFocus } from "../ui/slideOverFocus";
@@ -16,6 +16,7 @@ import { DEFAULT_VNC_OPTIONS, normalizeVncOptions, type VncOptions } from "../ut
 import { IS_MOBILE, IS_WINDOWS } from "../util/platform";
 import { TAG_COLOURS, customTagColour, pickerValue } from "../util/tagColours";
 import { USUAL_PORTS, isFtp, type FtpProtocol, type ServerProtocol } from "../util/serverProtocol";
+import { startupChoice, startupFields, type StartupChoice } from "../util/startupChoice";
 import { t, tn, tx, useT } from "../i18n";
 import { copyText } from "../util/clipboard";
 
@@ -35,6 +36,28 @@ function hlcTime(stamp?: string | null): Date | null {
   if (!stamp) return null;
   const ms = parseInt(String(stamp).split(":")[0], 10);
   return Number.isFinite(ms) && ms > 0 ? new Date(ms) : null;
+}
+
+// A mirror's patterns as one line, split at commas. The text is kept as typed:
+// made from the list on each key, a comma or space just typed was gone at once.
+function PatternListInput({ value, onChange, placeholder, title }: { value: string[]; onChange: (list: string[]) => void; placeholder: string; title: string }) {
+  const split = (text: string) => text.split(",").map((s) => s.trim()).filter(Boolean);
+  const [text, setText] = useState(() => value.join(", "));
+  // A list that changed elsewhere (a mirror above removed) shows as it is.
+  const joined = value.join("\n");
+  useEffect(() => {
+    if (split(text).join("\n") !== joined) setText(value.join(", "));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [joined]);
+  return (
+    <input
+      className="flex-1 min-w-0 h-6 bg-transparent rounded px-1 text-[10.5px] font-mono text-zinc-400 placeholder:text-zinc-700 outline-none"
+      placeholder={placeholder}
+      title={title}
+      value={text}
+      onChange={(e) => { setText(e.target.value); onChange(split(e.target.value)); }}
+    />
+  );
 }
 
 // Shape returned by the `parse_ssh_config` backend command. One entry per
@@ -67,6 +90,8 @@ type ImportedSshKey = {
 const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credentials, refreshCredentials, sshKeys, refreshSshKeys, folders, refreshFolders, refreshServers, servers, isEditMode, formError, isMobile, onImported, focusJump }: any) => {
   const t = useT();
   const jumpRowRef = Fork.useFocusJump(isOpen, focusJump);
+  // How a mirror's patterns are read (mirror.rs `Pattern`), as the Mirror panel says it.
+  const patternHelp = t("A name with * or ? is a pattern (*.sql, v?.txt). With a / it starts at the mirrored folder (db/*.sql), and a / at the end means folders only (cache/). Other text is found anywhere in the path.");
   const [isCreatingFolder, setIsCreatingFolder] = useState(false);
   // An RDP (issue #3), telnet (#179) or VNC server has a host, port, login
   // and maybe an SSH server to go through; the SSH-only parts of the form
@@ -467,13 +492,13 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 aria-label={t("Server type")}
                 value={isRdp ? "rdp" : isTelnet ? "telnet" : isVnc ? "vnc" : ftp ? "ftps" : "ssh"}
                 onChange={(e) => setProtocol(e.target.value as ServerProtocol)}
-                className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner"
+                className="w-full h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-shade-232328 transition-all shadow-inner"
               >
-                <option value="ssh" className="bg-[#1a1a1e] text-white">SSH</option>
-                <option value="rdp" className="bg-[#1a1a1e] text-white">{t("RDP (Remote Desktop)")}</option>
-                <option value="telnet" className="bg-[#1a1a1e] text-white">{t("Telnet (not encrypted)")}</option>
-                <option value="vnc" className="bg-[#1a1a1e] text-white">VNC</option>
-                <option value="ftps" className="bg-[#1a1a1e] text-white">{t("FTP or FTPS (files)")}</option>
+                <option value="ssh" className="bg-shade-1a1a1e text-white">SSH</option>
+                <option value="rdp" className="bg-shade-1a1a1e text-white">{t("RDP (Remote Desktop)")}</option>
+                <option value="telnet" className="bg-shade-1a1a1e text-white">{t("Telnet (not encrypted)")}</option>
+                <option value="vnc" className="bg-shade-1a1a1e text-white">VNC</option>
+                <option value="ftps" className="bg-shade-1a1a1e text-white">{t("FTP or FTPS (files)")}</option>
               </select>
               {ftp && (
                 <div className="space-y-1.5 pt-1">
@@ -482,11 +507,11 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                     id="ftp-security"
                     value={newNode.protocol}
                     onChange={(e) => setProtocol(e.target.value as FtpProtocol)}
-                    className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner"
+                    className="w-full h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-shade-232328 transition-all shadow-inner"
                   >
-                    <option value="ftps" className="bg-[#1a1a1e] text-white">{t("FTPS: TLS after connecting (usual)")}</option>
-                    <option value="ftps-implicit" className="bg-[#1a1a1e] text-white">{t("FTPS: TLS from the start (port 990)")}</option>
-                    <option value="ftp" className="bg-[#1a1a1e] text-white">{t("None: plain FTP (not encrypted)")}</option>
+                    <option value="ftps" className="bg-shade-1a1a1e text-white">{t("FTPS: TLS after connecting (usual)")}</option>
+                    <option value="ftps-implicit" className="bg-shade-1a1a1e text-white">{t("FTPS: TLS from the start (port 990)")}</option>
+                    <option value="ftp" className="bg-shade-1a1a1e text-white">{t("None: plain FTP (not encrypted)")}</option>
                   </select>
                   {newNode.protocol !== "ftp" && (
                     <p className="text-[10px] text-zinc-500 ml-1">{t("A certificate that no public authority vouches for is shown to you to check once, like an SSH host key.")}</p>
@@ -515,15 +540,15 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
 
             <div className="space-y-1.5">
               <label className="text-[11px] font-bold text-zinc-400 ml-1">{t("Name")}</label>
-              <input type="text" className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" placeholder={t("e.g. Work server")} value={newNode.name} onChange={e => setNewNode({ ...newNode, name: e.target.value })} />
+              <input type="text" className="w-full h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-shade-232328 transition-all shadow-inner" placeholder={t("e.g. Work server")} value={newNode.name} onChange={e => setNewNode({ ...newNode, name: e.target.value })} />
             </div>
 
             <div className="space-y-1.5">
               <label className="text-[11px] font-bold text-zinc-400 ml-1">{t("Folder")}</label>
               {!isCreatingFolder ? (
                 <div className="flex gap-2">
-                  <select className="flex-1 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" value={newNode.folderId} onChange={e => setNewNode({ ...newNode, folderId: e.target.value })}>
-                    <option value="" className="bg-[#1a1a1e] text-zinc-500">{t("-- Root --")}</option>
+                  <select className="flex-1 h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-shade-232328 transition-all shadow-inner" value={newNode.folderId} onChange={e => setNewNode({ ...newNode, folderId: e.target.value })}>
+                    <option value="" className="bg-shade-1a1a1e text-zinc-500">{t("-- Root --")}</option>
                     <Fork.FolderOptions folders={folders} />
                   </select>
                   <button aria-label={t("New folder")} onClick={() => setIsCreatingFolder(true)} className="w-9 h-9 bg-white/5 border border-white/10 rounded-lg text-primary hover:bg-white/10 transition-all flex items-center justify-center shrink-0">
@@ -532,7 +557,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 </div>
               ) : (
                 <div className="flex gap-2 animate-in fade-in">
-                  <input type="text" className="flex-1 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" placeholder={newNode.folderId ? t("New folder inside the one picked…") : t("Folder name…")} value={newFolderName} onChange={e => setNewFolderName(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleCreateFolder()} />
+                  <input type="text" className="flex-1 h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" placeholder={newNode.folderId ? t("New folder inside the one picked…") : t("Folder name…")} value={newFolderName} onChange={e => setNewFolderName(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleCreateFolder()} />
                   <button onClick={handleCreateFolder} className="h-9 px-3 bg-primary text-black font-bold text-[12px] rounded-lg hover:bg-primary transition-all">{t("Add")}</button>
                   <button aria-label={t("Cancel")} onClick={() => setIsCreatingFolder(false)} className="w-9 h-9 bg-white/5 text-zinc-400 rounded-lg hover:bg-white/10 transition-all flex justify-center items-center shrink-0"><X size={14} /></button>
                 </div>
@@ -583,11 +608,11 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
             <div className="grid grid-cols-4 gap-4">
               <div className="col-span-3 space-y-1.5">
                 <label className="text-[11px] font-bold text-zinc-400 ml-1">{t("Host")}</label>
-                <input type="text" className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" placeholder={t("192.168.1.1 or example.com")} value={newNode.host} onChange={e => setNewNode({ ...newNode, host: e.target.value })} />
+                <input type="text" className="w-full h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-shade-232328 transition-all shadow-inner" placeholder={t("192.168.1.1 or example.com")} value={newNode.host} onChange={e => setNewNode({ ...newNode, host: e.target.value })} />
               </div>
               <div className="space-y-1.5">
                 <label className="text-[11px] font-bold text-zinc-400 ml-1">{t("Port")}</label>
-                <input type="number" className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" value={newNode.port ?? ""} onChange={e => setNewNode({ ...newNode, port: e.target.value === "" ? "" : parseInt(e.target.value, 10) })} />
+                <input type="number" className="w-full h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-shade-232328 transition-all shadow-inner" value={newNode.port ?? ""} onChange={e => setNewNode({ ...newNode, port: e.target.value === "" ? "" : parseInt(e.target.value, 10) })} />
               </div>
             </div>
 
@@ -601,9 +626,9 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 value={newNode.authType}
                 onChange={(e) => setNewNode({ ...newNode, authType: e.target.value })}
               >
-                {!isVnc && <option value="vault" className="bg-[#121215] text-primary">{t("Use a saved login")}</option>}
-                <option value="custom_pass" className="bg-[#121215] text-primary">{t("Type a password")}</option>
-                {isSsh && <option value="custom_key" className="bg-[#121215] text-primary">{t("Use an SSH key")}</option>}
+                {!isVnc && <option value="vault" className="bg-shade-121215 text-primary">{t("Use a saved login")}</option>}
+                <option value="custom_pass" className="bg-shade-121215 text-primary">{t("Type a password")}</option>
+                {isSsh && <option value="custom_key" className="bg-shade-121215 text-primary">{t("Use an SSH key")}</option>}
               </select>
             </div>
 
@@ -613,9 +638,9 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 <div className="space-y-3 animate-in fade-in slide-in-from-top-1">
                   <div className="space-y-1.5">
                     <label className="text-[11px] font-bold text-zinc-400 ml-1">{t("Saved login")}</label>
-                    <select className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" value={newNode.credentialId} onChange={e => setNewNode({ ...newNode, credentialId: e.target.value })}>
-                      <option value="" className="bg-[#1a1a1e] text-zinc-500">{t("-- Pick one --")}</option>
-                      {credentials?.map((c: any) => <option key={c.id} value={c.id.toString()} className="bg-[#1a1a1e] text-zinc-300">{c.name} ({c.username})</option>)}
+                    <select className="w-full h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" value={newNode.credentialId} onChange={e => setNewNode({ ...newNode, credentialId: e.target.value })}>
+                      <option value="" className="bg-shade-1a1a1e text-zinc-500">{t("-- Pick one --")}</option>
+                      {credentials?.map((c: any) => <option key={c.id} value={c.id.toString()} className="bg-shade-1a1a1e text-zinc-300">{c.name} ({c.username})</option>)}
                     </select>
                   </div>
                   {selectedCred && (
@@ -634,7 +659,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               <div className="space-y-3 animate-in fade-in">
                 <div className="space-y-1.5">
                   <label className="text-[11px] font-bold text-zinc-400 ml-1">{t("Username")}</label>
-                  <input type="text" placeholder={t("Asked by the RDP app")} value={newNode.username || ""} onChange={e => setNewNode({ ...newNode, username: e.target.value })} autoCapitalize="none" autoCorrect="off" spellCheck={false} className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" />
+                  <input type="text" placeholder={t("Asked by the RDP app")} value={newNode.username || ""} onChange={e => setNewNode({ ...newNode, username: e.target.value })} autoCapitalize="none" autoCorrect="off" spellCheck={false} className="w-full h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" />
                   <p className="text-[10px] text-zinc-500 ml-1">{t("DOMAIN\\user works too.")}</p>
                 </div>
                 <div className="space-y-1.5">
@@ -642,7 +667,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                   <PasswordField
                     value={newNode.password || ""}
                     onChange={(v) => setNewNode({ ...newNode, password: v, password_dirty: true })}
-                    className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner"
+                    className="w-full h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner"
                     placeholder="••••••"
                   />
                   <p className="text-[10px] text-zinc-500 ml-1">{t("Leave empty to be asked when connecting. Remote Desktop Connection on Windows gets it too.")}</p>
@@ -654,14 +679,14 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               <div className="space-y-3 animate-in fade-in">
                 {!isVnc && <div className="space-y-1.5">
                   <label className="text-[11px] font-bold text-zinc-400 ml-1">{t("Username")}</label>
-                  <input type="text" placeholder={isTelnet ? t("For your reference") : ftp ? t("Empty: anonymous") : t("Ask when connecting")} value={newNode.username || ""} onChange={e => setNewNode({ ...newNode, username: e.target.value })} autoCapitalize="none" autoCorrect="off" spellCheck={false} className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" />
+                  <input type="text" placeholder={isTelnet ? t("For your reference") : ftp ? t("Empty: anonymous") : t("Ask when connecting")} value={newNode.username || ""} onChange={e => setNewNode({ ...newNode, username: e.target.value })} autoCapitalize="none" autoCorrect="off" spellCheck={false} className="w-full h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" />
                 </div>}
                 <div className="space-y-1.5">
                   <label className="text-[11px] font-bold text-zinc-400 ml-1">{isVnc ? t("VNC password") : t("Password")}</label>
                   <PasswordField
                     value={newNode.password || ""}
                     onChange={(v) => setNewNode({ ...newNode, password: v, password_dirty: true })}
-                    className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner"
+                    className="w-full h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner"
                     placeholder="••••••"
                   />
                   <Fork.HeldPasswordNote newNode={newNode} isTelnet={isTelnet} isVnc={isVnc} />
@@ -680,7 +705,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               <div className="space-y-3 animate-in fade-in">
                 <div className="space-y-1.5">
                   <label className="text-[11px] font-bold text-zinc-400 ml-1">{t("Username")}</label>
-                  <input type="text" placeholder={t("Ask when connecting")} value={newNode.username || ""} onChange={e => setNewNode({ ...newNode, username: e.target.value })} className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" />
+                  <input type="text" placeholder={t("Ask when connecting")} value={newNode.username || ""} onChange={e => setNewNode({ ...newNode, username: e.target.value })} className="w-full h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" />
                 </div>
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between ml-1">
@@ -711,9 +736,9 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                       </button>
                     </div>
                   </div>
-                  <select className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" value={newNode.keyId} onChange={e => setNewNode({ ...newNode, keyId: e.target.value })}>
-                    <option value="" className="bg-[#1a1a1e] text-zinc-500">{t("-- Pick a key --")}</option>
-                    {sshKeys?.map((k: any) => <option key={k.id} value={k.id.toString()} className="bg-[#1a1a1e] text-zinc-300">{k.name}</option>)}
+                  <select className="w-full h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" value={newNode.keyId} onChange={e => setNewNode({ ...newNode, keyId: e.target.value })}>
+                    <option value="" className="bg-shade-1a1a1e text-zinc-500">{t("-- Pick a key --")}</option>
+                    {sshKeys?.map((k: any) => <option key={k.id} value={k.id.toString()} className="bg-shade-1a1a1e text-zinc-300">{k.name}</option>)}
                   </select>
                   {keyBrowseNote && (
                     <div className="p-2 bg-white/5 border border-white/10 rounded-lg text-[11px] text-zinc-400 break-words">
@@ -751,23 +776,23 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
             <div className="flex justify-between items-center">
               <label className="text-[11px] font-bold text-zinc-400">{t("Proxy")}</label>
               <select className="bg-transparent text-[12px] font-bold text-zinc-300 outline-none cursor-pointer" value={newNode.proxyType} onChange={e => setNewNode({ ...newNode, proxyType: e.target.value })}>
-                <option value="none" className="bg-[#121215] text-zinc-400">{t("No proxy")}</option>
-                <option value="socks5" className="bg-[#121215] text-zinc-400">SOCKS5</option>
-                <option value="http" className="bg-[#121215] text-zinc-400">HTTP</option>
+                <option value="none" className="bg-shade-121215 text-zinc-400">{t("No proxy")}</option>
+                <option value="socks5" className="bg-shade-121215 text-zinc-400">SOCKS5</option>
+                <option value="http" className="bg-shade-121215 text-zinc-400">HTTP</option>
               </select>
             </div>
 
             {newNode.proxyType !== 'none' && (
               <div className="grid grid-cols-4 gap-3 animate-in fade-in">
                 <input
-                  className="col-span-3 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner"
+                  className="col-span-3 h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner"
                   placeholder={t("Proxy host")}
                   value={newNode.proxyHost || ""}
                   onChange={e => setNewNode({ ...newNode, proxyHost: e.target.value })}
                 />
                 <input
                   type="number"
-                  className="h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner"
+                  className="h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner"
                   placeholder={t("Port")}
                   value={newNode.proxyPort || ""}
                   onChange={e => setNewNode({ ...newNode, proxyPort: parseInt(e.target.value) || 0 })}
@@ -801,12 +826,12 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                       <label className="text-[11px] font-bold text-zinc-400 shrink-0">{t("Open in")}</label>
                       <select
                         aria-label={t("Open in")}
-                        className="flex-1 min-w-0 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner"
+                        className="flex-1 min-w-0 h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 focus:bg-shade-232328 transition-all shadow-inner"
                         value={o.app}
                         onChange={(e) => set({ app: e.target.value === "builtin" ? "builtin" : "system" })}
                       >
-                        <option value="system" className="bg-[#1a1a1e]">{t("This computer's RDP app")}</option>
-                        <option value="builtin" className="bg-[#1a1a1e]">{t("Submarine's tab (experimental)")}</option>
+                        <option value="system" className="bg-shade-1a1a1e">{t("This computer's RDP app")}</option>
+                        <option value="builtin" className="bg-shade-1a1a1e">{t("Submarine's tab (experimental)")}</option>
                       </select>
                     </div>
                   )}
@@ -864,7 +889,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                     <label className="text-[11px] font-bold text-zinc-400 shrink-0">{t("Window")}</label>
                     <select
                       aria-label={t("RDP window")}
-                      className="flex-1 min-w-0 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner"
+                      className="flex-1 min-w-0 h-9 bg-shade-1a1a1e rounded-lg px-3 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 focus:bg-shade-232328 transition-all shadow-inner"
                       value={o.fullScreen ? "full" : size}
                       onChange={(e) => {
                         const v = e.target.value;
@@ -873,11 +898,11 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                         set({ fullScreen: false, width, height });
                       }}
                     >
-                      <option value="full" className="bg-[#1a1a1e]">{t("Full screen")}</option>
+                      <option value="full" className="bg-shade-1a1a1e">{t("Full screen")}</option>
                       {RDP_WINDOW_SIZES.map(([w, h]) => (
-                        <option key={`${w}x${h}`} value={`${w}x${h}`} className="bg-[#1a1a1e]">{w} × {h}</option>
+                        <option key={`${w}x${h}`} value={`${w}x${h}`} className="bg-shade-1a1a1e">{w} × {h}</option>
                       ))}
-                      {!o.fullScreen && !known && <option value={size} className="bg-[#1a1a1e]">{o.width} × {o.height}</option>}
+                      {!o.fullScreen && !known && <option value={size} className="bg-shade-1a1a1e">{o.width} × {o.height}</option>}
                     </select>
                   </div>
                   <div className="flex items-center justify-between gap-3">
@@ -950,16 +975,16 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                   // back to idx for legacy rows that lack it; new rows
                   // always carry rid so deletions / reorders preserve
                   // each input's focus and cursor state.
-                  <div key={tun.rid ?? idx} className="p-2 bg-[#1a1a1e] rounded-lg border border-white/5 group transition-all hover:border-primary/30 space-y-1.5">
+                  <div key={tun.rid ?? idx} className="p-2 bg-shade-1a1a1e rounded-lg border border-white/5 group transition-all hover:border-primary/30 space-y-1.5">
                     <div className="flex items-center gap-2">
                       <select
                         className="bg-transparent text-[12px] font-semibold outline-none text-primary cursor-pointer pl-1"
                         value={tun.type}
                         onChange={e => updateTunnel(idx, 'type', e.target.value)}
                       >
-                        <option value="D" className="bg-[#1a1a1e] text-primary">{t("Dynamic")}</option>
-                        <option value="L" className="bg-[#1a1a1e] text-primary">{t("Local")}</option>
-                        <option value="R" className="bg-[#1a1a1e] text-primary">{t("Remote")}</option>
+                        <option value="D" className="bg-shade-1a1a1e text-primary">{t("Dynamic")}</option>
+                        <option value="L" className="bg-shade-1a1a1e text-primary">{t("Local")}</option>
+                        <option value="R" className="bg-shade-1a1a1e text-primary">{t("Remote")}</option>
                       </select>
 
                       <div className="h-4 w-px bg-white/10 mx-1" />
@@ -1023,10 +1048,10 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               </div>
             </div>
 
-            {/* Folder mirrors saved on this node — one-way local → remote
-                sync. Stored alongside tunnels so they roam with the vault.
-                Live management (start / stop / log) lives in the Mirror
-                panel inside an open session. */}
+            {/* Folder mirrors saved on this node — both ways or one way, of
+                every file or of the ones the patterns name. Stored alongside
+                tunnels so they roam with the vault. Live management (start /
+                stop / log) lives in the Mirror panel inside an open session. */}
             <div className="space-y-2.5">
               <div className="flex justify-between items-center">
                 <span className="text-[11px] font-bold text-zinc-400">{t("Folder mirrors")}</span>
@@ -1034,14 +1059,14 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                   type="button"
                   onClick={() => setNewNode({
                     ...newNode,
-                    mirrors: [...(newNode.mirrors || []), { local: "", remote: "", soft_delete: true, excludes: [], conflict_resolution: "local" }],
+                    mirrors: [...(newNode.mirrors || []), { local: "", remote: "", soft_delete: true, excludes: [], includes: [], direction: "both", conflict_resolution: "local" }],
                   })}
                   className="text-[11px] font-bold text-primary hover:text-primary transition-colors"
                 >{t("+ Add")}</button>
               </div>
               <div className="space-y-2">
                 {(newNode.mirrors || []).map((m: any, idx: number) => (
-                  <div key={idx} className="p-2.5 bg-[#1a1a1e] rounded-lg border border-white/5 group space-y-1.5">
+                  <div key={idx} className="p-2.5 bg-shade-1a1a1e rounded-lg border border-white/5 group space-y-1.5">
                     <div className="flex items-center gap-2">
                       <input
                         className="flex-1 min-w-0 h-7 bg-black/40 rounded px-2 text-[11.5px] font-mono text-zinc-200 border border-white/10 outline-none focus:border-primary/50"
@@ -1053,7 +1078,9 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                           setNewNode({ ...newNode, mirrors: next });
                         }}
                       />
-                      <ArrowLeftRight size={10} className="text-zinc-700 shrink-0 mx-1" />
+                      {m.direction === "download" ? <ArrowLeft size={10} className="text-zinc-700 shrink-0 mx-1" />
+                        : m.direction === "upload" ? <ArrowRight size={10} className="text-zinc-700 shrink-0 mx-1" />
+                        : <ArrowLeftRight size={10} className="text-zinc-700 shrink-0 mx-1" />}
                       <input
                         className="flex-1 min-w-0 h-7 bg-black/40 rounded px-2 text-[11.5px] font-mono text-zinc-200 border border-white/10 outline-none focus:border-primary/50"
                         placeholder="/remote/path"
@@ -1072,42 +1099,73 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                         <X size={12} />
                       </button>
                     </div>
-                    <div className="flex items-center gap-3 pl-1">
-                      <label className="flex items-center gap-1.5 text-[10.5px] text-zinc-400 select-none cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={m.soft_delete !== false}
-                          onChange={(e) => {
-                            const next = [...newNode.mirrors];
-                            next[idx] = { ...next[idx], soft_delete: e.target.checked };
-                            setNewNode({ ...newNode, mirrors: next });
-                          }}
-                          className="accent-primary"
-                        />
-                        <span>{t("Soft delete")}</span>
-                      </label>
+                    <div className="flex items-center gap-3 pl-1 flex-wrap">
                       <select
-                        value={m.conflict_resolution || "local"}
+                        value={m.direction || "both"}
                         onChange={(e) => {
                           const next = [...newNode.mirrors];
-                          next[idx] = { ...next[idx], conflict_resolution: e.target.value };
+                          next[idx] = { ...next[idx], direction: e.target.value };
                           setNewNode({ ...newNode, mirrors: next });
                         }}
-                        title={t("Initial-sync conflict resolution: which side overwrites when a file exists on both with different content. Files missing on one side always copy across.")}
+                        aria-label={t("Direction")}
                         className="h-6 px-1.5 bg-black/30 border border-white/10 rounded text-[10.5px] text-zinc-300 outline-none focus:border-primary/40"
                       >
-                        <option value="local">{t("Local wins")}</option>
-                        <option value="remote">{t("Remote wins")}</option>
-                        <option value="newer">{t("Newer wins")}</option>
+                        <option value="both">{t("Both ways")}</option>
+                        <option value="download">{t("Server → this device (once)")}</option>
+                        <option value="upload">{t("This device → server")}</option>
                       </select>
-                      <input
-                        className="flex-1 min-w-0 h-6 bg-transparent rounded px-1 text-[10.5px] font-mono text-zinc-400 placeholder:text-zinc-700 outline-none"
-                        placeholder={t("Excludes: .git, node_modules, *.swp")}
-                        value={(m.excludes || []).join(", ")}
-                        onChange={(e) => {
-                          const parts = e.target.value.split(",").map((s) => s.trim()).filter(Boolean);
+                      {/* One way, the side it copies from wins. */}
+                      {(m.direction || "both") === "both" && (
+                        <select
+                          value={m.conflict_resolution || "local"}
+                          onChange={(e) => {
+                            const next = [...newNode.mirrors];
+                            next[idx] = { ...next[idx], conflict_resolution: e.target.value };
+                            setNewNode({ ...newNode, mirrors: next });
+                          }}
+                          title={t("Initial-sync conflict resolution: which side overwrites when a file exists on both with different content. Files missing on one side always copy across.")}
+                          className="h-6 px-1.5 bg-black/30 border border-white/10 rounded text-[10.5px] text-zinc-300 outline-none focus:border-primary/40"
+                        >
+                          <option value="local">{t("Local wins")}</option>
+                          <option value="remote">{t("Remote wins")}</option>
+                          <option value="newer">{t("Newer wins")}</option>
+                        </select>
+                      )}
+                      {/* Only the live mirror deletes: one from the server runs once. */}
+                      {m.direction !== "download" && (
+                        <label className="flex items-center gap-1.5 text-[10.5px] text-zinc-400 select-none cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={m.soft_delete !== false}
+                            onChange={(e) => {
+                              const next = [...newNode.mirrors];
+                              next[idx] = { ...next[idx], soft_delete: e.target.checked };
+                              setNewNode({ ...newNode, mirrors: next });
+                            }}
+                            className="accent-primary"
+                          />
+                          <span>{t("Soft delete")}</span>
+                        </label>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2 pl-1">
+                      <PatternListInput
+                        value={m.includes || []}
+                        placeholder={t("Only these: *.sql, db/ (empty: every file)")}
+                        title={patternHelp}
+                        onChange={(list) => {
                           const next = [...newNode.mirrors];
-                          next[idx] = { ...next[idx], excludes: parts };
+                          next[idx] = { ...next[idx], includes: list };
+                          setNewNode({ ...newNode, mirrors: next });
+                        }}
+                      />
+                      <PatternListInput
+                        value={m.excludes || []}
+                        placeholder={t("Skip these: *.log, cache/, build")}
+                        title={patternHelp}
+                        onChange={(list) => {
+                          const next = [...newNode.mirrors];
+                          next[idx] = { ...next[idx], excludes: list };
                           setNewNode({ ...newNode, mirrors: next });
                         }}
                       />
@@ -1117,35 +1175,47 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               </div>
             </div>
 
-            {/* Autostart toggle — when on, the node opens a session and
-                connects automatically right after the user unlocks the
-                profile. Useful for the one or two servers you always have
-                a shell on. */}
-            <div className="flex items-center justify-between gap-3 pt-1">
-              <div className="min-w-0">
-                <div className="text-[11px] font-bold text-zinc-300">{t("Autostart")}</div>
-                <div className="text-[10.5px] text-zinc-500 leading-snug">
-                  {t("Open + connect this node automatically when the app launches.")}
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => setNewNode({ ...newNode, autostart: !newNode.autostart })}
-                role="switch"
-                aria-label={t("Autostart")}
-                aria-checked={!!newNode.autostart}
-                className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${
-                  newNode.autostart ? "bg-primary" : "bg-white/10"
-                }`}
-              >
-                <span
-                  className={`absolute top-0.5 left-0.5 w-5 h-5 bg-zinc-100 rounded-full shadow transition-transform ${
-                    newNode.autostart ? "translate-x-5" : "translate-x-0"
-                  }`}
-                />
-              </button>
-            </div>
             </>)}
+
+            {/* At startup: what this server's tab does when the profile is
+                unlocked (util/startupChoice). Open and connect is for SSH
+                servers, as autostart always was; any kind of server can open
+                its tab without connecting, to connect from it later. */}
+            {(() => {
+              const choice = startupChoice(newNode, isSsh);
+              const options: { value: StartupChoice; label: string }[] = [
+                { value: "off", label: t("Don't open") },
+                { value: "open", label: t("Open the tab") },
+                ...(isSsh ? [{ value: "connect" as const, label: t("Open and connect") }] : []),
+              ];
+              return (
+                <div className="space-y-1.5 pt-1">
+                  <div className="text-[11px] font-bold text-zinc-300">{t("At startup")}</div>
+                  <div role="group" aria-label={t("At startup")} className="flex gap-0.5 p-0.5 rounded-lg border border-white/10 bg-shade-1a1a1e">
+                    {options.map((o) => (
+                      <button
+                        key={o.value}
+                        type="button"
+                        aria-pressed={choice === o.value}
+                        onClick={() => setNewNode({ ...newNode, ...startupFields(o.value) })}
+                        className={`flex-1 min-w-0 min-h-10 sm:min-h-8 px-2 py-1 rounded-md text-[11px] font-semibold leading-tight transition-colors outline-none focus-visible:ring-2 focus-visible:ring-primary/60 ${
+                          choice === o.value ? "bg-primary/15 text-primary" : "text-zinc-400 hover:text-zinc-200 hover:bg-white/5"
+                        }`}
+                      >
+                        {o.label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="text-[10.5px] text-zinc-500 leading-snug">
+                    {choice === "connect"
+                      ? t("Its tab opens and connects when you unlock the profile.")
+                      : choice === "open"
+                        ? t("Its tab opens when you unlock the profile, not connected. Connect from the tab when you need it.")
+                        : t("Nothing opens for this server when you unlock the profile.")}
+                  </div>
+                </div>
+              );
+            })()}
 
             {/* This device's own choice for this server, see util/sessionKeep. */}
             {isSsh && (
@@ -1158,17 +1228,38 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                     <label className="text-[11px] font-bold text-zinc-400 ml-1">{label}</label>
                     <select
                       aria-label={label}
-                      className="h-8 bg-[#1a1a1e] rounded-lg px-2 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50"
+                      className="h-8 bg-shade-1a1a1e rounded-lg px-2 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50"
                       value={(newNode.sessionKeep || DEFAULT_SESSION_KEEP)[field]}
                       onChange={(e) => setNewNode({ ...newNode, sessionKeep: { ...(newNode.sessionKeep || DEFAULT_SESSION_KEEP), [field]: e.target.value } })}
                     >
-                      <option value="default" className="bg-[#1a1a1e]">{t("As in Settings")}</option>
-                      <option value="on" className="bg-[#1a1a1e]">{t("On")}</option>
-                      <option value="off" className="bg-[#1a1a1e]">{t("Off")}</option>
+                      <option value="default" className="bg-shade-1a1a1e">{t("As in Settings")}</option>
+                      <option value="on" className="bg-shade-1a1a1e">{t("On")}</option>
+                      <option value="off" className="bg-shade-1a1a1e">{t("Off")}</option>
                     </select>
                   </div>
                 ))}
                 <p className="text-[10px] text-zinc-500 ml-1">{t("Kept on this device only. A keepalive change applies the next time a session connects.")}</p>
+              </div>
+            )}
+
+            {/* This device's session log choice for this server, see util/sessionLog. */}
+            {(isSsh || isTelnet) && !IS_MOBILE && (
+              <div className="space-y-2 pt-1">
+                <div className="flex items-center justify-between gap-3">
+                  <label className="text-[11px] font-bold text-zinc-400 ml-1">{t("Session log")}</label>
+                  <select
+                    aria-label={t("Session log")}
+                    className="h-8 bg-shade-1a1a1e rounded-lg px-2 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50"
+                    value={newNode.logChoice || "default"}
+                    onChange={(e) => setNewNode({ ...newNode, logChoice: e.target.value })}
+                  >
+                    <option value="default" className="bg-shade-1a1a1e">{t("As in Settings")}</option>
+                    <option value="off" className="bg-shade-1a1a1e">{t("Off")}</option>
+                    <option value="text" className="bg-shade-1a1a1e">{t("Text only")}</option>
+                    <option value="all" className="bg-shade-1a1a1e">{t("All output")}</option>
+                  </select>
+                </div>
+                <p className="text-[10px] text-zinc-500 ml-1">{t("Kept on this device only. Where logs go is in Settings.")}</p>
               </div>
             )}
 
@@ -1188,7 +1279,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 onChange={(e) => setNewNode({ ...newNode, notes: e.target.value })}
                 placeholder={t("e.g. Prod web. Reboot windows Sun 04:00 UTC. Deploy via `make ship`. Pager: @ops")}
                 rows={6}
-                className="w-full bg-[#1a1a1e] rounded-lg p-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner font-mono leading-relaxed resize-y"
+                className="w-full bg-shade-1a1a1e rounded-lg p-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-shade-232328 transition-all shadow-inner font-mono leading-relaxed resize-y"
               />
               {/* Attribution — who last changed this node and when. Populated by
                   the sync layer; most useful on shared / multi-device profiles. */}
@@ -1230,7 +1321,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 placeholder={t("e.g.\ncd /var/www\nsource .venv/bin/activate\ntail -f storage/logs/app.log")}
                 rows={4}
                 spellCheck={false}
-                className="w-full bg-[#1a1a1e] rounded-lg p-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner font-mono leading-relaxed resize-y"
+                className="w-full bg-shade-1a1a1e rounded-lg p-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-shade-232328 transition-all shadow-inner font-mono leading-relaxed resize-y"
               />
               <label className="flex items-center gap-1.5 ml-1 text-[10.5px] text-zinc-400 select-none cursor-pointer">
                 <input
@@ -1269,7 +1360,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
             aria-modal="true"
             aria-labelledby="ssh-import-title"
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-[520px] max-h-[80vh] flex flex-col bg-[#121214] border border-white/10 rounded-xl shadow-2xl animate-in zoom-in-95 fade-in duration-150"
+            className="w-full max-w-[520px] max-h-[80vh] flex flex-col bg-shade-121214 border border-white/10 rounded-xl shadow-2xl animate-in zoom-in-95 fade-in duration-150"
           >
             {/* Modal header */}
             <div className="flex items-center justify-between p-4 border-b border-white/5 shrink-0">
@@ -1404,7 +1495,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 <>
                   {/* Sticky select-all row so users can bulk-toggle a long
                       list without scrolling back up. */}
-                  <div className="sticky top-0 z-10 -mx-3 -mt-3 mb-2 px-4 py-2 bg-[#121214] border-b border-white/5 flex items-center justify-between">
+                  <div className="sticky top-0 z-10 -mx-3 -mt-3 mb-2 px-4 py-2 bg-shade-121214 border-b border-white/5 flex items-center justify-between">
                     <button
                       onClick={toggleSelectAll}
                       className="flex items-center gap-2 text-[11px] font-bold text-zinc-300 hover:text-white transition-colors"
@@ -1428,7 +1519,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                           className={`flex items-start gap-3 p-2.5 rounded-lg border cursor-pointer transition-all ${
                             isSel
                               ? "bg-primary/10 border-primary/40"
-                              : "bg-[#1a1a1e] border-white/5 hover:border-white/20"
+                              : "bg-shade-1a1a1e border-white/5 hover:border-white/20"
                           }`}
                         >
                           <input

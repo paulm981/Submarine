@@ -1,12 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
-import { IS_ANDROID, IS_LINUX } from "./platform";
-import { IS_MAC, IS_WINDOWS } from "./platform"; // fork
+import { IS_ANDROID, IS_LINUX, IS_WINDOWS } from "./platform";
+import { IS_MAC } from "./platform"; // fork
 
 // Copy and paste for the whole app. The page's own clipboard API
 // (navigator.clipboard) isn't usable everywhere:
 // - Android's WebView refuses it: a paste said "Clipboard read denied" and the
 //   copy buttons did nothing. There the app's Android plugin uses the system
 //   clipboard (lib.rs clipboard_read_text / clipboard_write_text).
+// - WebView2 on Windows asks the user to allow the page's read, and after a
+//   Block every paste said "Clipboard read denied": reads go through the
+//   backend.
 // - WebKitGTK on Linux refuses the page's read, and the webview's own read can
 //   crash the app on an empty clipboard (#89): reads go through the backend.
 // Elsewhere the page's API works.
@@ -20,7 +23,7 @@ export function copyText(text: string): Promise<void> {
 
 /** The clipboard's text ("" when it holds none). Rejects when it can't be read. */
 export function readClipboardText(): Promise<string> {
-  if (IS_ANDROID || IS_LINUX || IS_WINDOWS || IS_MAC) return invoke<string>("clipboard_read_text"); // fork: Windows and macOS too (FORK.md, Paste)
+  if (IS_ANDROID || IS_LINUX || IS_WINDOWS || IS_MAC) return invoke<string>("clipboard_read_text"); // fork: macOS too (FORK.md, Paste)
   if (!navigator.clipboard) return Promise.reject(new Error("No clipboard here"));
   return navigator.clipboard.readText();
 }

@@ -110,7 +110,7 @@ async fn measure_a_keys_echo_through_the_pump() {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Instant>();
     let page = Arc::new(PageDrawn::default());
     let drew = Arc::clone(&page);
-    let pump = tokio::spawn(pty_pump(channel, rx, resize_rx, page, Vec::new(), move |buf: &mut Vec<u8>| {
+    let pump = tokio::spawn(pty_pump(channel, None, rx, resize_rx, page, Vec::new(), move |buf: &mut Vec<u8>| {
         drew.add(buf.len() as u64);
         buf.clear();
         let _ = out_tx.send(Instant::now());

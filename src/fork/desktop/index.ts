@@ -9,6 +9,7 @@ export * from "./parts";
 export * from "./broadcastWall";
 export { BroadcastBar, BroadcastTab, BroadcastTileChips } from "./broadcastTiles";
 // Fork modules DesktopApp renders or reads directly, through the same import.
+export { mayBeShortcut, tabStepList } from "../keys";
 export { AiTrustModal } from "../../components/AiTrust";
 export { TerminalTurn } from "../terminal/turns";
 export { default as PingPanel } from "../../components/PingPanel";

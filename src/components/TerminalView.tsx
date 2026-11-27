@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { disposeTerminal } from '../util/xtermDispose';
 import { FitAddon } from '../fork/terminal';
@@ -6,24 +6,32 @@ import { SearchAddon, ISearchOptions } from '@xterm/addon-search';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import '@xterm/xterm/css/xterm.css';
-import { ClipboardPaste, KeyRound } from 'lucide-react';
+import { ClipboardPaste, Copy, KeyRound, TextSelect } from 'lucide-react';
 import { useIsNarrow } from '../hooks/useViewport';
 import { MobileKeyBar, ModifiersState, ModKey, SpecialKey } from './MobileKeyBar';
 import { useBroadcast } from '../ui/broadcast';
 import HistorySearchOverlay from './HistorySearchOverlay';
-import { DEFAULT_FONT_STACK, fontFamilyCss, readFontFamily, readFontSize } from '../util/terminalFont';
+import { DEFAULT_FONT_STACK, fontFamilyCss, keepInPinchRange, pinchFontSize, readFontFamily, readFontSize, requestFontSize } from '../util/terminalFont';
 import { readScrollback } from '../util/terminalScrollback';
 import { TERMINAL_CLEAR, TERMINAL_PASTE, clearTerminal, withoutPasteControls, type TerminalPaste } from '../util/pasteText';
 import * as Fork from '../fork/terminal';
 import { TERMINAL_READ, TERMINAL_READ_REPLY, type TerminalRead, type TerminalReadReply } from '../util/terminalRead';
 import { readUseLocalShell } from '../util/terminalShell';
+import { sessionLogRequest } from '../util/sessionLog';
 import { holdTerminalInput, writeTerminal } from '../util/terminalWrite';
 import { readUseSshAgent } from '../util/sshAgent';
 import { readSendKeepalives } from '../util/sessionKeep';
-import { IS_MOBILE, IS_LINUX, IS_ANDROID, IS_MAC } from '../util/platform';
+import { IS_MOBILE, IS_ANDROID, IS_IOS, IS_MAC } from '../util/platform';
+import {
+  TERMINAL_SHORTCUTS, comboOf, isWebviewEditKey, leftToWebview, matchShortcut, reachesTerminal, shortcutFor,
+  type ShortcutAction,
+} from '../util/shortcuts';
 import { lastInputWasTouch } from '../util/lastInput';
+import { allText, cellCount, isBefore, ordered, wordAt, type Cell, type CellRange } from '../util/touchSelect';
+import { hardwareKeyboardAttached } from '../util/hardwareKeyboard';
 import { useConfirm } from '../ui/confirm';
 import { parseOsc1337, parseOsc7, type ShellFolder } from '../util/shellFolder';
+import { titleReporter, type TitleReporter } from '../util/terminalTitle';
 import { tn, useT } from '../i18n';
 import { readClipboardText, copyText } from '../util/clipboard';
 
@@ -65,6 +73,11 @@ const RESET_INPUT_MODES = '\x1b[?9;1000;1002;1003;1004;1005;1006;1015;1016;2004l
 // them takes Shift or sits on another non-letter key gets the same, except that
 // the \ key without Shift stays ^\ (see attachCustomKeyEventHandler).
 const isUnderscoreKey = (key: string) => key === "-" || key === "/" || key === "_";
+
+// Once a terminal's shell has ended, the keys for these work without Shift as
+// well: Ctrl+W closes it then, as it closes a browser's tab (see runShortcut).
+const WITHOUT_SHIFT_ONCE_ENDED: readonly ShortcutAction[] = ['closeTerminal', 'newTerminal'];
+const FIND: readonly ShortcutAction[] = ['find'];
 
 // Shared search options — highlight all matches in yellow, the active
 // match in orange. `decorations` uses the marker overlay so the highlight
@@ -176,6 +189,50 @@ const CURSOR_BLINK_IDLE_MS = 10_000;
 // At the shell, a key starts a blink again that a program stopped, though not
 // more often than this (see markUsed).
 const BLINK_RESTART_MS = 1_000;
+// Selecting text by touch (#324): a finger held this long without moving is a
+// long press (Android's own wait is 400 to 500 ms), and it may drift this far
+// and still be a long press or a tap. A finger dragging the selection past the
+// top or bottom row scrolls a line this often.
+const LONG_PRESS_MS = 500;
+const TOUCH_SLOP_PX = 10;
+const SELECT_SCROLL_MS = 60;
+
+/** Where the touch selection's bar and handles go, in the pane (see longPress). */
+type TouchUi = {
+  /** The bar: x is its middle, y its bottom edge, or its top edge when below. */
+  menu: { x: number; y: number; below: boolean };
+  /** A selection is on: its handles, Copy and Select all show. Without one the bar only has Paste. */
+  copy: boolean;
+  /** Under the first cell's left edge and the last cell's right edge; null off the screen. */
+  start: TouchHandleAt | null;
+  end: TouchHandleAt | null;
+};
+/** A handle's corner; flip: it hangs to the other side, as it would leave the pane. */
+type TouchHandleAt = { x: number; y: number; flip: boolean };
+type TouchHandle = 'start' | 'end';
+/** How far a handle's 40 px box reaches past its corner, to the left (start) or the right (end). */
+const TOUCH_HANDLE_REACH = 28;
+const TOUCH_MENU_BUTTON = 'h-10 px-3 flex items-center gap-1.5 whitespace-nowrap text-[13px] font-semibold text-zinc-100 active:bg-zinc-700';
+type TouchSelectApi = {
+  grab: (which: TouchHandle) => void;
+  drag: (clientX: number, clientY: number, which: TouchHandle) => void;
+  drop: () => void;
+  copy: () => void;
+  paste: () => void;
+  selectAll: () => void;
+};
+
+// A pinch, by touch or on a trackpad, changes the text size at most this
+// often (see zoomTo), and only once the fingers have moved this much nearer or
+// apart.
+const ZOOM_EVERY_MS = 100;
+const PINCH_DEAD_ZONE = 0.05;
+// Ctrl + wheel (see onZoomWheel): a move at least this long is a mouse wheel's
+// notch, one size; shorter ones are a trackpad's, a size per WHEEL_PX_PER_SIZE
+// of them, and a pause this long ends their run.
+const WHEEL_NOTCH_PX = 30;
+const WHEEL_PX_PER_SIZE = 5;
+const WHEEL_RUN_GAP_MS = 150;
 
 const TerminalView = ({
   sessionId,
@@ -197,6 +254,7 @@ const TerminalView = ({
   ownLogin = false,
   quickAuth = null,
   onFolder,
+  onTitle,
   onClose,
   onNewTerminal,
   local, onShellReady, inView,
@@ -280,6 +338,11 @@ const TerminalView = ({
   /// util/shellFolder), for the SFTP panel's Follow (#245). Reported at
   /// every prompt; the parent keeps what changed.
   onFolder?: (terminalId: string, path: string, host: string) => void;
+  /// The title a program in this terminal set itself (OSC 0/2, #391), for
+  /// the tabs: cleaned, at most one report every TITLE_GAP_MS while it keeps
+  /// changing (util/terminalTitle), and "" when there is none, Settings turns
+  /// titles off, or this terminal goes.
+  onTitle?: (terminalId: string, title: string) => void;
   /// Closes the parent session tab.
   onClose?: () => void;
   /// Opens another terminal in the parent session.
@@ -510,6 +573,10 @@ const TerminalView = ({
   confirmRef.current = confirm;
   const onFolderRef = useRef(onFolder);
   onFolderRef.current = onFolder;
+  const onTitleRef = useRef(onTitle);
+  onTitleRef.current = onTitle;
+  // The program's title (util/terminalTitle), made with the xterm.
+  const titlesRef = useRef<TitleReporter | null>(null);
   // The terminal's input handler (what xterm's onData runs), for keys that
   // don't come from xterm itself — the mobile key bar's arrows and symbols.
   const inputRef = useRef<((data: string) => void) | null>(null);
@@ -629,6 +696,8 @@ const TerminalView = ({
     // what it asks is still answered.
     const reset = {};
     staleModesRef.current = reset;
+    // So does the title it set; the new shell may set its own.
+    titlesRef.current?.reset();
     term.write('\r\n\x1b[33m' + t('── reconnected ──') + '\x1b[0m\r\n' + RESET_INPUT_MODES, () => {
       if (staleModesRef.current === reset) staleModesRef.current = null;
     });
@@ -671,6 +740,7 @@ const TerminalView = ({
         terminalId,
         cols: term.cols || 80,
         rows: term.rows || 24,
+        sessionLog: logRequest(),
         onOutput: fork.outputChannel(),
       }).then(syncSize, e => failed(e, t('Reconnect failed: {error}', { error: String(e) })));
     } else if (ce) {
@@ -681,6 +751,7 @@ const TerminalView = ({
         cols: term.cols || 80,
         rows: term.rows || 24,
         useSudo: ce.useSudo,
+        sessionLog: logRequest(),
         onOutput: fork.outputChannel(),
       }, 'Open the container terminal').then(Fork.rootOpened(term, syncSize, () => releaseInput(false)),
         e => failed(e, t('Reconnect into container failed: {error}', { error: e instanceof Error ? e.message : String(e) })));
@@ -696,6 +767,7 @@ const TerminalView = ({
             cols: term.cols || 80,
             rows: term.rows || 24,
             useLocalShell: readUseLocalShell(),
+            sessionLog: logRequest(),
             onOutput: fork.outputChannel(),
           }).then(() => true);
         })
@@ -723,6 +795,24 @@ const TerminalView = ({
     return () => { off.then((f) => f()); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ownConn, ownLogin]);
+  // The session log, if Settings or the server's choice has one
+  // (util/sessionLog): read at each open, a reconnect included.
+  const logRequest = () => sessionLogRequest({ uuid: serverUuid, id: serverId, name: serverName });
+  // Where it goes, or why it couldn't start: said once in the terminal, the
+  // way the app's other notes there are. The terminal opens either way.
+  useEffect(() => {
+    if (attachOnly) return;
+    const off = listen(`terminal-log-${terminalId}`, (e: any) => {
+      const p = e.payload || {};
+      const note = p.error
+        ? "\r\n\x1b[33m" + t("── session log: {error} ──", { error: String(p.error) }) + "\x1b[0m"
+        : "\x1b[2m" + t("── logging this session to {path} ──", { path: String(p.path) }) + "\x1b[0m";
+      xtermRef.current?.write(note + "\r\n");
+    });
+    return () => { off.then((f) => f()); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [terminalId, attachOnly]);
+
   // The shell ended by itself (`exit`, Ctrl+D, its program quit): keys go
   // nowhere from here on, while everything else on screen still looks alive.
   // Not said for a connection that dropped: the banner and the badge do that.
@@ -742,7 +832,9 @@ const TerminalView = ({
   //   • a phone or tablet, or a tap last on a PC's touch screen — focusing
   //     xterm would bring up the on-screen keyboard unasked. A PC with a
   //     touch screen used with its mouse and keys still gets the focus
-  //     (lastInputWasTouch);
+  //     (lastInputWasTouch), and so does Android with a hardware keyboard
+  //     in use (a keyboard cover, a USB or Bluetooth one), which shows no
+  //     on-screen keyboard (hardwareKeyboardAttached);
   //   • a terminal whose SessionView isn't the frontmost server tab, or an
   //     attach-only Wall mirror (isActiveView=false) — never steal from the
   //     session the user is actually looking at;
@@ -756,7 +848,15 @@ const TerminalView = ({
   //   • a modal dialog is open — confirm / overwrite / text-prompt all carry
   //     aria-modal.
   const focusTerminal = () => {
+    if (IS_ANDROID) {
+      // The checks below run once Android has answered, on the state then.
+      void hardwareKeyboardAttached().then((attached) => { if (attached) focusNow(); });
+      return;
+    }
     if (IS_MOBILE || lastInputWasTouch()) return;
+    focusNow();
+  };
+  const focusNow = () => {
     if (!isActiveViewRef.current) return;
     if (disabledRef.current) return;
     const term = xtermRef.current;
@@ -822,50 +922,9 @@ const TerminalView = ({
     return () => cancelAnimationFrame(id);
   }, [focusSignal]);
 
-  // Ctrl+Shift+F / Cmd+Shift+F opens the search chip — but only when the
-  // user is focused inside this terminal's DOM subtree. Document-level
-  // listener is needed because xterm's textarea steals keyboard focus, so
-  // the wrapper never sees the keydown via bubbling within React's synthetic
-  // tree. Gate on `document.activeElement` so multiple terminals in tabs /
-  // split panes don't all pop their search chip on a single press.
-  //
-  // The same gate opens the command history overlay on Ctrl+Shift+R /
-  // Cmd+Shift+R. The plain combos stay the shell's: Ctrl+R is its
-  // reverse-i-search and Ctrl+F pages forward in less and vim. xterm turns
-  // those into ^R and ^F for the shell and stops them from bubbling, so they
-  // never reach here. A Ctrl+Shift combo gets no key from xterm and bubbles
-  // untouched. Matched by keyCode, the layout's F and R keys (the ones xterm
-  // goes by too), so Dvorak gets the same keys. The webview's own reload on
-  // Ctrl+Shift+R is cancelled app-wide (main.tsx). Ctrl+Shift+K / Cmd+Shift+K
-  // clears the terminal in the app (see clearLocalTerminal), the key other
-  // terminals use for it (WezTerm, Konsole, Warp).
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (!(e.ctrlKey || e.metaKey) || !e.shiftKey) return;
-      const wrapper = fork.dockElRef.current; // where the terminal is now: its tab, or the AI side pane
-      if (!wrapper) return;
-      const active = document.activeElement;
-      if (!(active instanceof Node) || !wrapper.contains(active)) return;
-      if (e.keyCode === 70) {
-        e.preventDefault();
-        setShowSearch(true);
-        // If already open, refocus the input so a second press selects the
-        // existing query for a quick overwrite.
-        requestAnimationFrame(() => {
-          searchInputRef.current?.focus();
-          searchInputRef.current?.select();
-        });
-      } else if (e.keyCode === 82 && !local) { // a local shell keeps Ctrl+R for its own reverse search
-        e.preventDefault();
-        setShowHistory(true);
-      } else if (e.keyCode === 75) {
-        e.preventDefault();
-        if (!e.repeat) clearTerminal(terminalId);
-      }
-    };
-    document.addEventListener('keydown', onKeyDown);
-    return () => document.removeEventListener('keydown', onKeyDown);
-  }, [terminalId]);
+  // The keys for the search chip, the command history and clearing the
+  // terminal are with the terminal's other shortcuts (runShortcut, where xterm
+  // is set up).
 
   // Close + clear search decorations. Refocuses xterm so the user's next
   // keystroke goes to the shell, not to nowhere.
@@ -899,18 +958,57 @@ const TerminalView = ({
     toastTimerRef.current = window.setTimeout(() => setToast(null), 1400);
   };
 
-  // A long press on a touch screen shows a Paste button by the finger (see
-  // onContextMenu), and only a tap on it pastes: people long-press on a
-  // phone to select or to look, and a pasted line that ends in a line break
-  // would run. Any other touch, key or scroll takes the button away.
-  const [pasteAt, setPasteAt] = useState<{ x: number; y: number } | null>(null);
-  const pasteClipboardRef = useRef<((toast: boolean) => Promise<void>) | null>(null);
+  // A long press on a touch screen (see longPress): on text it selects the
+  // word, with a handle at each end and a bar with Copy, Paste and Select
+  // all; on a blank cell the bar only has Paste. Only a tap on Paste pastes:
+  // people long-press on a phone to select or to look, and a pasted line that
+  // ends in a line break would run. The Paste-only bar goes with any other
+  // touch, key or scroll; a selection ends with a tap (see dismissTouch).
+  const [touchUi, setTouchUi] = useState<TouchUi | null>(null);
+  const touchSelectRef = useRef<TouchSelectApi | null>(null);
+  const touchMenuRef = useRef<HTMLDivElement | null>(null);
+  // The bar is kept inside the pane, measured, since its width depends on the language.
+  useLayoutEffect(() => {
+    const el = touchMenuRef.current;
+    const pane = el?.parentElement;
+    if (!touchUi || !el || !pane) return;
+    const room = Math.max(pane.clientWidth - el.offsetWidth - 8, 8);
+    el.style.left = `${Math.min(Math.max(touchUi.menu.x - el.offsetWidth / 2, 8), room)}px`;
+  }, [touchUi]);
+  // A handle follows its finger anywhere until it lifts, also once the
+  // handle has moved away from under it.
+  const grabHandle = (e: React.PointerEvent<HTMLDivElement>, which: TouchHandle, at: { x: number; y: number }) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const api = touchSelectRef.current;
+    const pane = e.currentTarget.parentElement?.getBoundingClientRect();
+    if (!api || !pane) return;
+    const dx = e.clientX - (pane.left + at.x);
+    const dy = e.clientY - (pane.top + at.y);
+    const id = e.pointerId;
+    api.grab(which);
+    const move = (ev: PointerEvent) => {
+      if (ev.pointerId !== id) return;
+      ev.preventDefault();
+      api.drag(ev.clientX - dx, ev.clientY - dy, which);
+    };
+    const up = (ev: PointerEvent) => {
+      if (ev.pointerId !== id) return;
+      window.removeEventListener('pointermove', move, true);
+      window.removeEventListener('pointerup', up, true);
+      window.removeEventListener('pointercancel', up, true);
+      api.drop();
+    };
+    window.addEventListener('pointermove', move, true);
+    window.addEventListener('pointerup', up, true);
+    window.addEventListener('pointercancel', up, true);
+  };
   useEffect(() => {
-    if (!pasteAt) return;
-    const hide = () => setPasteAt(null);
+    if (!touchUi || touchUi.copy) return;
+    const hide = () => setTouchUi(null);
     const timer = window.setTimeout(hide, 6000);
     const onDown = (e: PointerEvent) => {
-      if (!(e.target instanceof Element && e.target.closest('[data-paste-button]'))) hide();
+      if (!(e.target instanceof Element && e.target.closest('[data-touch-ui]'))) hide();
     };
     window.addEventListener('pointerdown', onDown, true);
     window.addEventListener('keydown', hide, true);
@@ -921,7 +1019,7 @@ const TerminalView = ({
       window.removeEventListener('keydown', hide, true);
       window.removeEventListener('wheel', hide, true);
     };
-  }, [pasteAt]);
+  }, [touchUi]);
 
   // The output ends in a password prompt (sudo, su, …): a button offers to
   // type a saved password there (#28). The next key typed or more output
@@ -1033,6 +1131,11 @@ const TerminalView = ({
     };
     term.parser.registerOscHandler(7, (data) => { folder(parseOsc7(data)); return true; });
     term.parser.registerOscHandler(1337, (data) => folder(parseOsc1337(data)));
+    // The title a program sets itself (OSC 0/2, #391): xterm reads the
+    // sequence; the parent shows the title on the tabs.
+    const titles = titleReporter((title) => onTitleRef.current?.(terminalId, title));
+    titlesRef.current = titles;
+    const titleDisposable = term.onTitleChange((title) => titles.set(title));
     term.open(terminalRef.current);
 
     // A scroll redraws the selection, and the DOM renderer draws every row for
@@ -1048,6 +1151,24 @@ const TerminalView = ({
         const now = !!start && !!end && (start[0] !== end[0] || start[1] !== end[1]);
         if (now || selected) redrawSelection(start, end, columnMode);
         selected = now;
+      };
+    }
+
+    // When xterm's scroll area gets shorter (`clear` erases the scrollback
+    // too), the browser moves the scroll position up to fit and tells xterm a
+    // frame later. If more output came in meanwhile, as with
+    // `clear; seq 1 400` on one line, xterm took that for the user scrolling
+    // up: the view stayed at the top and stopped following the output. That
+    // move comes from xterm, so it is ignored like the ones xterm makes
+    // itself. A private field: if it isn't there, xterm goes on as it was.
+    const viewport = (term as any)._core?.viewport;
+    if (typeof viewport?._innerRefresh === 'function' && typeof viewport._ignoreNextScrollEvent === 'boolean' && viewport._viewportElement) {
+      const syncViewport = viewport._innerRefresh.bind(viewport);
+      viewport._innerRefresh = () => {
+        const box: HTMLElement = viewport._viewportElement;
+        const before = box.scrollTop;
+        syncViewport();
+        if (!viewport._ignoreNextScrollEvent && box.scrollTop !== before) viewport._ignoreNextScrollEvent = true;
       };
     }
 
@@ -1156,6 +1277,7 @@ const TerminalView = ({
             terminalId,
             cols: term.cols || 80,
             rows: term.rows || 24,
+            sessionLog: logRequest(),
             onOutput: fork.outputChannel(),
           }).then(syncSize, e => {
             releaseInput(false);
@@ -1171,6 +1293,7 @@ const TerminalView = ({
             cols: term.cols || 80,
             rows: term.rows || 24,
             useSudo: containerExec.useSudo,
+            sessionLog: logRequest(),
             onOutput: fork.outputChannel(),
           }, 'Open the container terminal').then(Fork.rootOpened(term, syncSize, () => releaseInput(false)), e => {
             releaseInput(false);
@@ -1187,6 +1310,7 @@ const TerminalView = ({
               cols: term.cols || 80,
               rows: term.rows || 24,
               useLocalShell: readUseLocalShell(),
+              sessionLog: logRequest(),
               onOutput: fork.outputChannel(),
             }).then(() => true);
           }).then((opened) => {
@@ -1376,8 +1500,20 @@ const TerminalView = ({
     // is sent here, one for each, as the timer did. Inside a composition
     // nothing changes: the keydown still reaches xterm, and the word goes when
     // the composition ends.
+    //
+    // A hardware keyboard (a keyboard cover, a USB or Bluetooth one): a key
+    // typed with Shift or AltGr held comes as the modifier's own keydown, then
+    // the character, as text from the keyboard app or as a keydown of its own.
+    // xterm takes any keydown as "this key is mine" until a key comes up and
+    // drops text that comes in between; after AltGr it also leaves the next
+    // keydown to a keypress that never sends it. Capitals and symbols were
+    // lost. The modifier alone sends nothing in xterm, so xterm doesn't get it.
     let imeKeyHidden = false;
     const onAndroidKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === "Shift" || ev.key === "AltGraph") {
+        ev.stopPropagation();
+        return;
+      }
       imeKeyHidden = ev.keyCode === 229 && !ev.isComposing && !composingRef.current;
       if (imeKeyHidden) ev.stopPropagation();
     };
@@ -1430,10 +1566,11 @@ const TerminalView = ({
       }
       return lines.join('\n');
     };
+    // A selection that runs past the last line ends in empty rows: Select all
+    // takes the whole buffer, the blank rows under the prompt included.
+    const selectedText = () => buildSelectedText().replace(/\n+$/, '');
     const copySelectionIfAny = async () => {
-      // A selection that runs past the last line ends in empty rows: Ctrl+Shift+A
-      // takes the whole buffer, the blank rows under the prompt included.
-      const text = buildSelectedText().replace(/\n+$/, '');
+      const text = selectedText();
       // Selections of only blank padding (easy to grab when dragging across
       // a TUI screen) must neither clobber the clipboard with invisible
       // spaces nor toast a lie.
@@ -1561,9 +1698,10 @@ const TerminalView = ({
       }
       if (toast) notify(t('Pasted'));
     };
-    // The clipboard's text comes from util/clipboard: on Linux and Android the
-    // backend reads it, since WebKitGTK refuses the page's own read (#89) and
-    // can crash on an empty clipboard, and Android's WebView refuses it outright.
+    // The clipboard's text comes from util/clipboard: on Windows, Linux and
+    // Android the backend reads it, since WebView2 asks the user to allow the
+    // page's own read (and a Block stays), WebKitGTK refuses it (#89) and can
+    // crash on an empty clipboard, and Android's WebView refuses it outright.
     const pasteClipboard = async (toast: boolean) => {
       if (disabledRef.current) return;
       let text = '';
@@ -1571,7 +1709,6 @@ const TerminalView = ({
       catch (e) { notify(typeof e === 'string' ? e : t('Clipboard read denied'), 'err'); return; }
       await pasteText(text, toast);
     };
-    pasteClipboardRef.current = pasteClipboard;
     // Ctrl+V, Ctrl+Shift+V, Shift+Insert and a phone's paste menu would reach
     // xterm's own paste. They go through pasteText instead, like a right-click,
     // so control characters and the question about several lines apply to
@@ -1582,23 +1719,240 @@ const TerminalView = ({
       ev.stopImmediatePropagation();
       void pasteText(raw, false);
     };
+    // Selecting text by touch (#324). A long press on text selects its word
+    // and shows the bar and the handles; the finger, still down, or a handle
+    // then moves an end. A long press on a blank cell shows only Paste. A tap
+    // ends the selection. xterm selects only by mouse, so the cells go to
+    // term.select(); xterm keeps the selection (also as the scrollback is
+    // trimmed), and the handles are put where it says. The press is timed
+    // here: iOS sends no context menu for a touch. Where that comes first
+    // (Android, a Windows touch screen), it makes the same long press.
+    let pressTimer: number | undefined;
+    let pressFrom: { x: number; y: number } | null = null; // until the finger moves away or lifts
+    let pressed = false; // the timer made this touch's long press
+    let pressDone = false; // this touch made a long press, by the timer or a context menu
+    let pressWord: CellRange | null = null; // the long-pressed word, while its finger stays down
+    let tapFrom: { x: number; y: number } | null = null; // a touch that may be a tap ending the selection
+    let touchSelecting = false;
+    let touchUiKey = '';
+    let selectCols = term.cols;
+    let grabbed: Cell | null = null; // the end that stays while a handle moves
+    let scrollTimer: number | undefined;
+    let scrollStep = 0;
+    let scrollApply: (() => number) | null = null;
+    const cancelPress = () => {
+      window.clearTimeout(pressTimer);
+      pressTimer = undefined;
+    };
+    const stopSelectScroll = () => {
+      window.clearInterval(scrollTimer);
+      scrollTimer = undefined;
+      scrollStep = 0;
+      scrollApply = null;
+    };
+    const screenBox = () => {
+      const screen = term.element?.querySelector('.xterm-screen');
+      const pane = terminalRef.current?.parentElement;
+      if (!screen || !pane) return null;
+      const s = screen.getBoundingClientRect();
+      const cellW = s.width / term.cols;
+      const cellH = s.height / term.rows;
+      if (!(cellW > 0) || !(cellH > 0)) return null;
+      return { s, pane: pane.getBoundingClientRect(), cellW, cellH };
+    };
+    type ScreenBox = NonNullable<ReturnType<typeof screenBox>>;
+    const colAt = (box: ScreenBox, clientX: number) =>
+      Math.min(Math.max(Math.floor((clientX - box.s.left) / box.cellW), 0), term.cols - 1);
+    // The screen row under a point: below 0 above the screen, rows or more below it.
+    const rowAt = (box: ScreenBox, clientY: number) => Math.floor((clientY - box.s.top) / box.cellH);
+    const selectRange = (range: CellRange) => term.select(range.start.x, range.start.y, cellCount(range, term.cols));
+    const placeTouchUi = () => {
+      if (!touchSelecting) return;
+      const pos = term.getSelectionPosition();
+      const box = screenBox();
+      if (!pos || !box) return;
+      const top = term.buffer.active.viewportY;
+      const left = box.s.left - box.pane.left;
+      const up = box.s.top - box.pane.top;
+      // xterm's end is the column after the last cell. A handle at the
+      // pane's edge turns round, so it stays on the screen of a phone.
+      const handleAt = (which: TouchHandle, col: number, row: number): TouchHandleAt | null => {
+        if (row < top || row >= top + term.rows) return null;
+        const x = Math.round(left + col * box.cellW);
+        const flip = which === 'start' ? x - TOUCH_HANDLE_REACH < 0 : x + TOUCH_HANDLE_REACH > box.pane.width;
+        return { x, y: Math.round(up + (row - top + 1) * box.cellH), flip };
+      };
+      const start = handleAt('start', pos.start.x, pos.start.y);
+      const end = handleAt('end', pos.end.x, pos.end.y);
+      // The bar goes above the selection's first row on the screen, else
+      // under its last row and the handles, else at the top.
+      const firstRow = Math.min(Math.max(pos.start.y - top, 0), term.rows - 1);
+      const lastRow = Math.min(Math.max(pos.end.y - top, 0), term.rows - 1);
+      const above = up + firstRow * box.cellH - 8;
+      const under = up + (lastRow + 1) * box.cellH + 40;
+      const below = above < 52 && under + 48 <= box.pane.height;
+      const y = Math.round(below ? under : Math.max(above, 52));
+      const x = Math.round(start && end && pos.start.y === pos.end.y ? (start.x + end.x) / 2 : box.pane.width / 2);
+      const ui: TouchUi = { menu: { x, y, below }, copy: true, start, end };
+      const key = JSON.stringify(ui);
+      if (key === touchUiKey) return;
+      touchUiKey = key;
+      setTouchUi(ui);
+    };
+    const dismissTouch = (clear: boolean) => {
+      cancelPress();
+      stopSelectScroll();
+      pressWord = null;
+      tapFrom = null;
+      grabbed = null;
+      const was = touchSelecting;
+      touchSelecting = false;
+      touchUiKey = '';
+      setTouchUi(null);
+      if (clear && was) term.clearSelection();
+    };
+    const startTouchSelection = (range: CellRange) => {
+      touchSelecting = true;
+      selectCols = term.cols;
+      selectRange(range);
+      placeTouchUi();
+    };
+    const longPress = (clientX: number, clientY: number) => {
+      cancelPress();
+      pressFrom = null;
+      tapFrom = null;
+      const box = screenBox();
+      if (!box || pinched) return;
+      pressDone = true;
+      const row = Math.min(Math.max(rowAt(box, clientY), 0), term.rows - 1);
+      const at = { x: colAt(box, clientX), y: term.buffer.active.viewportY + row };
+      const word = wordAt(term.buffer.active, term.cols, at, term.options.wordSeparator);
+      if (word) {
+        pressWord = word;
+        startTouchSelection(word);
+        return;
+      }
+      if (touchSelecting) dismissTouch(true);
+      if (disabledRef.current) return;
+      // Above the finger.
+      touchUiKey = '';
+      setTouchUi({
+        menu: { x: clientX - box.pane.left, y: Math.max(clientY - box.pane.top, 64) - 12, below: false },
+        copy: false,
+        start: null,
+        end: null,
+      });
+    };
+    // A finger at a point moves an end of the selection (rangeFor makes the
+    // range from the cell under it). Above or below the screen, the
+    // scrollback scrolls a line at a time, and the selection follows.
+    const fingerTo = (clientX: number, clientY: number, rangeFor: (cell: Cell) => CellRange) => {
+      const apply = () => {
+        const box = screenBox();
+        if (!box) return 0;
+        const row = rowAt(box, clientY);
+        const shownRow = Math.min(Math.max(row, 0), term.rows - 1);
+        selectRange(rangeFor({ x: colAt(box, clientX), y: term.buffer.active.viewportY + shownRow }));
+        return row < 0 ? -1 : row >= term.rows ? 1 : 0;
+      };
+      scrollApply = apply;
+      const step = apply();
+      if (step === scrollStep) return;
+      window.clearInterval(scrollTimer);
+      scrollTimer = undefined;
+      scrollStep = step;
+      if (step) {
+        scrollTimer = window.setInterval(() => {
+          term.scrollLines(scrollStep);
+          scrollApply?.();
+        }, SELECT_SCROLL_MS);
+      }
+    };
+    // The finger still down after its long press: the selection runs from
+    // the word, kept whole, to the finger.
+    const moveFromWord = (clientX: number, clientY: number) => {
+      const word = pressWord;
+      if (!word) return;
+      fingerTo(clientX, clientY, (cell) => {
+        if (isBefore(cell, word.start)) return { start: cell, end: word.end };
+        if (isBefore(word.end, cell)) return { start: word.start, end: cell };
+        return word;
+      });
+    };
+    touchSelectRef.current = {
+      grab: (which) => {
+        const pos = term.getSelectionPosition();
+        if (!pos) return;
+        grabbed = which === 'start' ? { x: Math.max(pos.end.x - 1, 0), y: pos.end.y } : pos.start;
+      },
+      drag: (clientX, clientY, which) => {
+        const fixed = grabbed;
+        const box = screenBox();
+        if (!fixed || !box) return;
+        // A handle hangs under the corner of its cell: the cell is half a
+        // cell up from that corner, and toward the selection.
+        const x = clientX + ((which === 'start' ? 1 : -1) * box.cellW) / 2;
+        fingerTo(x, clientY - box.cellH / 2, (cell) => ordered(fixed, cell));
+      },
+      drop: () => {
+        grabbed = null;
+        stopSelectScroll();
+      },
+      copy: () => {
+        // The text is read at once, before the selection goes.
+        void copySelectionIfAny();
+        dismissTouch(true);
+      },
+      paste: () => {
+        dismissTouch(true);
+        void pasteClipboard(true);
+      },
+      selectAll: () => {
+        const range = allText(term.buffer.active, term.cols);
+        if (range) startTouchSelection(range);
+      },
+    };
+    // Typing (xterm drops the selection on input), a click elsewhere or a
+    // new width ends it; scrolling and new output move the handles.
+    const touchSelectionDisposable = term.onSelectionChange(() => {
+      if (!touchSelecting) return;
+      if (term.hasSelection()) placeTouchUi();
+      else dismissTouch(false);
+    });
+    const touchRenderDisposable = term.onRender(() => placeTouchUi());
+    const touchResizeDisposable = term.onResize(() => {
+      if (touchSelecting && term.cols !== selectCols) dismissTouch(true);
+    });
+    // A touch on the terminal is a tap or a swipe, which its touchend tells
+    // (onTouchEnd). Anything else outside the bar and the handles ends the
+    // selection mode; a mouse's click in the terminal clears the selection
+    // as it always does.
+    const onTouchUiPointerDown = (ev: PointerEvent) => {
+      if (!touchSelecting) return;
+      const target = ev.target instanceof Element ? ev.target : null;
+      if (target?.closest('[data-touch-ui]')) return;
+      if (ev.pointerType === 'touch' && target && terminalRef.current?.contains(target)) return;
+      dismissTouch(false);
+    };
+    window.addEventListener('pointerdown', onTouchUiPointerDown, true);
+
     // Right-click → paste. preventDefault swallows the platform context menu
     // so the user gets the terminal-style behavior they asked for. A long
-    // press on a touch screen comes as a context menu too: it only shows the
-    // Paste button there (see pasteAt).
+    // press on a touch screen comes as a context menu too: it makes the long
+    // press (see longPress), unless the timer already did. That one stops
+    // here, before xterm's own handler: it moves xterm's text field under the
+    // finger and focuses it, which brought a phone's keyboard up over the
+    // selection.
     let lastPointerType = '';
     const onPointerDown = (ev: PointerEvent) => { lastPointerType = ev.pointerType; };
     const onContextMenu = (ev: MouseEvent) => {
       ev.preventDefault();
       const touch = IS_MOBILE || lastPointerType === 'touch' || (ev as PointerEvent).pointerType === 'touch';
-      const pane = terminalRef.current?.parentElement?.getBoundingClientRect();
-      if (touch && pane) {
-        if (disabledRef.current) return;
-        // Kept inside the pane: the button is drawn above the finger.
-        setPasteAt({
-          x: Math.min(Math.max(ev.clientX - pane.left, 64), Math.max(pane.width - 64, 64)),
-          y: Math.max(ev.clientY - pane.top, 64),
-        });
+      if (touch) {
+        ev.stopPropagation();
+        const timed = pressed;
+        pressed = false;
+        if (!timed && !pinched) longPress(ev.clientX, ev.clientY);
         return;
       }
       // A program that takes the mouse got this click from xterm (mc selects a
@@ -1619,13 +1973,143 @@ const TerminalView = ({
     // A second finger ends the swipe.
     let swipeY: number | null = null;
     let swipeRest = 0;
+    // The text size by a pinch, Ctrl + wheel or a trackpad (#372): the saved
+    // size of Settings → Terminal configuration (util/terminalFont), so every
+    // terminal follows. A pinch's sizes go out in whole steps, at most every
+    // ZOOM_EVERY_MS, since each one refits the terminals and resizes them on
+    // the server too; its last one goes out when it ends.
+    let zoomSize = 0;
+    let zoomSent = 0;
+    let zoomTimer: number | undefined;
+    const sendZoom = () => {
+      if (zoomSize === zoomSent) return;
+      zoomSent = zoomSize;
+      requestFontSize({ size: zoomSize });
+    };
+    const zoomTick = () => {
+      zoomTimer = undefined;
+      if (zoomSize === zoomSent) return;
+      sendZoom();
+      zoomTimer = window.setTimeout(zoomTick, ZOOM_EVERY_MS);
+    };
+    const zoomFrom = (size: number) => { zoomSize = zoomSent = size; };
+    const zoomTo = (size: number) => {
+      if (size === zoomSize) return;
+      zoomSize = size;
+      if (zoomTimer === undefined) zoomTick();
+    };
+    const zoomDone = () => {
+      if (zoomTimer !== undefined) window.clearTimeout(zoomTimer);
+      zoomTimer = undefined;
+      sendZoom();
+    };
+    // Two fingers that pinch. From the second finger until the last one is
+    // up, xterm gets no moves (it would scroll), nor does the webview (it would
+    // zoom the page), and the finger left doesn't swipe.
+    let pinch: { apart: number; size: number; moved: boolean } | null = null;
+    let pinched = false;
+    const fingersApart = (t: TouchList) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+    const endPinch = () => {
+      if (!pinch) return;
+      pinch = null;
+      zoomDone();
+    };
+    // xterm draws each row as an element of its own, and new output, a
+    // selection or a new size makes them anew. A finger's moves and its lift
+    // go on to the element it landed on, also once that has left the page,
+    // and then nothing above it hears them: a pinch would stop at its first
+    // step, a long press would never hear its lift. So the elements under the
+    // fingers are listened to as well, for the events that no longer come
+    // through the terminal.
+    const fingerTargets = new Set<EventTarget>();
+    const outside = (ev: Event) => !terminalRef.current?.contains(ev.target as Node);
+    const onLostMove = (ev: Event) => { if (outside(ev)) onTouchMove(ev as TouchEvent); };
+    const onLostEnd = (ev: Event) => { if (outside(ev)) onTouchEnd(ev as TouchEvent); };
+    const followFingers = (touches: TouchList) => {
+      for (let i = 0; i < touches.length; i++) {
+        const el = touches[i].target;
+        if (fingerTargets.has(el)) continue;
+        fingerTargets.add(el);
+        el.addEventListener('touchmove', onLostMove, { passive: false });
+        el.addEventListener('touchend', onLostEnd);
+        el.addEventListener('touchcancel', onLostEnd);
+      }
+    };
+    const unfollowFingers = () => {
+      fingerTargets.forEach((el) => {
+        el.removeEventListener('touchmove', onLostMove);
+        el.removeEventListener('touchend', onLostEnd);
+        el.removeEventListener('touchcancel', onLostEnd);
+      });
+      fingerTargets.clear();
+    };
     const onTouchStart = (ev: TouchEvent) => {
+      cancelPress();
+      // A first finger: what came before is over, also if its lift was lost.
+      if (ev.touches.length === 1) {
+        endPinch();
+        pinched = false;
+        unfollowFingers();
+        followFingers(ev.touches);
+        const finger = ev.touches[0];
+        pressed = false;
+        pressDone = false;
+        pressWord = null;
+        pressFrom = { x: finger.clientX, y: finger.clientY };
+        tapFrom = touchSelecting ? pressFrom : null;
+        pressTimer = window.setTimeout(() => {
+          if (!pressFrom) return;
+          pressed = true;
+          longPress(pressFrom.x, pressFrom.y);
+        }, LONG_PRESS_MS);
+      } else {
+        // More fingers: no long press, no tap, and no drag of the selection.
+        pressFrom = null;
+        pressWord = null;
+        tapFrom = null;
+        stopSelectScroll();
+      }
+      if (ev.touches.length === 2) {
+        pinched = true;
+        swipeY = null;
+        followFingers(ev.touches);
+        pinch = { apart: Math.max(fingersApart(ev.touches), 1), size: readFontSize(), moved: false };
+        zoomFrom(pinch.size);
+        return;
+      }
+      // A third finger ends the pinch.
+      endPinch();
+      if (pinched) return;
       swipeRest = 0;
       swipeY = ev.touches.length === 1 && (programHasMouse() || term.buffer.active.type === 'alternate')
         ? ev.touches[0].clientY
         : null;
     };
     const onTouchMove = (ev: TouchEvent) => {
+      const first = ev.touches[0];
+      if (pressFrom && first && Math.hypot(first.clientX - pressFrom.x, first.clientY - pressFrom.y) > TOUCH_SLOP_PX) {
+        cancelPress();
+        pressFrom = null;
+        tapFrom = null;
+      }
+      // The long press's finger moves the selection; xterm doesn't scroll.
+      if (pressWord && first && ev.touches.length === 1) {
+        if (ev.cancelable) ev.preventDefault();
+        ev.stopPropagation();
+        moveFromWord(first.clientX, first.clientY);
+        return;
+      }
+      if (pinched) {
+        if (ev.cancelable) ev.preventDefault();
+        ev.stopPropagation();
+        if (!pinch || ev.touches.length !== 2) return;
+        const scale = fingersApart(ev.touches) / pinch.apart;
+        // Two fingers that land and rest change nothing.
+        if (!pinch.moved && Math.abs(scale - 1) < PINCH_DEAD_ZONE) return;
+        pinch.moved = true;
+        zoomTo(pinchFontSize(pinch.size, scale));
+        return;
+      }
       if (swipeY === null) return;
       const screen = term.element?.querySelector('.xterm-screen');
       if (ev.touches.length !== 1 || !screen) {
@@ -1653,7 +2137,75 @@ const TerminalView = ({
         }));
       }
     };
-    const onTouchEnd = () => { swipeY = null; };
+    const onTouchEnd = (ev: TouchEvent) => {
+      cancelPress();
+      pressFrom = null;
+      // The lift of a long press is no tap: no click, which would clear the
+      // selection and bring up the keyboard.
+      if (pressDone && ev.type === 'touchend' && ev.cancelable) ev.preventDefault();
+      if (ev.touches.length === 0) pressDone = false;
+      if (pressWord) {
+        pressWord = null;
+        stopSelectScroll();
+      }
+      // A tap, not a swipe (a cancelled touch is the browser's scroll).
+      if (tapFrom && ev.type === 'touchend' && ev.touches.length === 0) dismissTouch(true);
+      tapFrom = null;
+      swipeY = null;
+      if (ev.touches.length < 2) endPinch();
+      if (ev.touches.length === 0) {
+        pinched = false;
+        unfollowFingers();
+      }
+    };
+    // A Mac's trackpad pinch comes as WebKit's gesture events, with the scale
+    // since it began. iOS sends them too, beside the touches the pinch above
+    // follows, so there they are only cancelled (they'd zoom the page).
+    let gesture: { size: number; moved: boolean } | null = null;
+    const onGestureStart = (ev: Event) => {
+      ev.preventDefault();
+      if (IS_IOS || pinched) return;
+      gesture = { size: readFontSize(), moved: false };
+      zoomFrom(gesture.size);
+    };
+    const onGestureChange = (ev: Event) => {
+      ev.preventDefault();
+      const scale = (ev as Event & { scale?: unknown }).scale;
+      if (!gesture || typeof scale !== 'number') return;
+      if (!gesture.moved && Math.abs(scale - 1) < PINCH_DEAD_ZONE) return;
+      gesture.moved = true;
+      zoomTo(pinchFontSize(gesture.size, scale));
+    };
+    const onGestureEnd = (ev: Event) => {
+      ev.preventDefault();
+      if (!gesture) return;
+      gesture = null;
+      zoomDone();
+    };
+    // Ctrl + wheel over the terminal, as in Windows Terminal (⌘ + wheel on a
+    // Mac as well), instead of a scroll. A mouse wheel's notch is one size. A
+    // trackpad's pinch on Windows comes as a run of short Ctrl + wheel moves:
+    // that follows the fingers like a pinch, from the size the run began at.
+    let wheelRun: { size: number; px: number; at: number } | null = null;
+    const onZoomWheel = (ev: WheelEvent) => {
+      if (!(ev.ctrlKey || (IS_MAC && ev.metaKey)) || !ev.deltaY) return;
+      if (ev.cancelable) ev.preventDefault();
+      ev.stopPropagation();
+      if (gesture) return;
+      if (ev.deltaMode !== WheelEvent.DOM_DELTA_PIXEL || Math.abs(ev.deltaY) >= WHEEL_NOTCH_PX) {
+        wheelRun = null;
+        requestFontSize({ step: ev.deltaY < 0 ? 1 : -1 });
+        return;
+      }
+      const now = performance.now();
+      if (!wheelRun || now - wheelRun.at > WHEEL_RUN_GAP_MS) {
+        wheelRun = { size: readFontSize(), px: 0, at: now };
+        zoomFrom(wheelRun.size);
+      }
+      wheelRun.at = now;
+      wheelRun.px += ev.deltaY;
+      zoomTo(keepInPinchRange(wheelRun.size, wheelRun.size - wheelRun.px / WHEEL_PX_PER_SIZE));
+    };
     // A key held down while the focus moved here (Enter on a panel's close
     // button) goes on repeating into the terminal. It wasn't pressed for the
     // shell, so its repeats are dropped until a key goes down here. Keys an
@@ -1662,89 +2214,95 @@ const TerminalView = ({
     let noKeySinceFocus = false;
     const onTextareaFocus = () => { noKeySinceFocus = true; };
     term.textarea?.addEventListener('focus', onTextareaFocus);
-    // Ctrl+Shift+A / Ctrl+Shift+C / Ctrl+Shift+V — Warp/GNOME-Terminal-style
-    // select-all / copy / paste, deliberately on the SHIFTED combo so plain
-    // Ctrl+A (start of line) and Ctrl+C (SIGINT) keep going straight to the
-    // remote shell untouched, exactly as every readline/zle user expects.
-    // xterm.js only allows one attachCustomKeyEventHandler at a time, so all
-    // three live in this single handler rather than three separate calls.
+    // The terminal's shortcuts (util/shortcuts; Settings → Keyboard
+    // shortcuts): another terminal, close it, the search chip, the command
+    // history, clear, copy, paste, select all. Taken here, before xterm turns
+    // a key into input, so a key the shell uses can be set as well (Ctrl+C to
+    // copy, say). Only the terminal with the keyboard sees its keys, so split
+    // panes and tabs don't all act on one press. Returns false for keys used
+    // here, true for keys left to the webview's own copy or paste, and
+    // undefined for any other key.
+    //
+    // By default they're Ctrl+Shift combinations (⌘ on a Mac), which xterm
+    // gives the program nothing for, so plain Ctrl+A (start of line), Ctrl+C
+    // (SIGINT), Ctrl+R (reverse-i-search) and Ctrl+F (a page forward in less
+    // and vim) keep going to it. Once the shell has ended, the keys to close
+    // the terminal and open another work without Shift too. The webview's own
+    // reload on Ctrl+Shift+R is cancelled app-wide (main.tsx). Clear is the
+    // key other terminals use for it (WezTerm, Konsole, Warp).
+    const runShortcut = (ev: KeyboardEvent): boolean | undefined => {
+      const combo = comboOf(ev);
+      if (!combo) return undefined;
+      const action = shortcutFor(combo, TERMINAL_SHORTCUTS, shellEndedRef.current ? WITHOUT_SHIFT_ONCE_ENDED : []);
+      if (!action) {
+        // A key the webview copies or pastes with by itself, which isn't set
+        // for that: it does nothing here.
+        if (isWebviewEditKey(combo)) {
+          ev.preventDefault();
+          return false;
+        }
+        return undefined;
+      }
+      if (leftToWebview(action, combo)) return true;
+      const first = !ev.repeat;
+      switch (action) {
+        case 'closeTerminal':
+          if (first) onCloseRef.current?.();
+          break;
+        case 'newTerminal':
+          if (first) onNewTerminalRef.current?.();
+          break;
+        case 'find':
+          setShowSearch(true);
+          // If already open, refocus the input so a second press selects the
+          // existing query for a quick overwrite.
+          requestAnimationFrame(() => {
+            searchInputRef.current?.focus();
+            searchInputRef.current?.select();
+          });
+          break;
+        case 'history':
+          if (local) return undefined; // fork: a local shell keeps no history, and keeps the key
+          setShowHistory(true);
+          break;
+        case 'clear':
+          if (first) clearTerminal(terminalId);
+          break;
+        case 'selectAll':
+          if (first) term.selectAll();
+          break;
+        case 'copy':
+          // With nothing selected, keys the program would get go on to it:
+          // Ctrl+C set to copy still stops a program, as in Windows Terminal.
+          // After a copy on such keys the selection goes, so the next press
+          // reaches the program again.
+          if (!selectedText().trim()) {
+            if (reachesTerminal(combo)) return true;
+          } else if (first) {
+            void copySelectionIfAny();
+            if (reachesTerminal(combo)) term.clearSelection();
+          }
+          break;
+        case 'paste':
+          // The clipboard's text, through the same checks as a right-click's.
+          if (first) void pasteClipboard(false);
+          break;
+      }
+      ev.preventDefault();
+      return false;
+    };
     term.attachCustomKeyEventHandler((ev) => {
-      if (Fork.appHotkey(ev)) return false; // the app's own shortcuts (a tab, the AI side pane)
+      if (Fork.appHotkey(ev)) return false; // the app's own shortcuts (jump to a tab, the AI side pane)
       // A held key's repeats (see noKeySinceFocus).
       if (ev.type === 'keydown' && !ev.repeat) noKeySinceFocus = false;
       if (noKeySinceFocus && ev.repeat && !ev.isComposing && ev.keyCode !== 229) {
         ev.preventDefault();
         return false;
       }
-      const primaryModifier = ev.ctrlKey || ev.metaKey;
-      if (!primaryModifier && ev.key !== 'Insert') return true; // fork: plain typing goes straight on (none below is for it)
-
-      // Ctrl+Shift+W always closes the current terminal tab.
-      // Plain Ctrl+W does so only after its shell has ended; while the shell
-      // is running, ^W remains available to readline and other applications.
-      if (
-        ev.type === 'keydown' &&
-        !ev.repeat &&
-        primaryModifier &&
-        !ev.altKey &&
-        ev.code === 'KeyW' &&
-        (ev.shiftKey || shellEndedRef.current)
-      ) {
-        ev.preventDefault();
-        onCloseRef.current?.();
-        return false;
-      }
-      // Ctrl+Shift+Plus opens another terminal while the shell is running.
-      // Once the shell has ended, Ctrl+Plus works as well.
-      //
-      // Matched by the key's character, so only the plus key counts: "+" itself,
-      // the keypad's plus, the US "=/+" key unshifted (Ctrl+= once the shell has
-      // ended), and the German plus key with Shift, which gives "*". A key in
-      // the same place on another layout ("]" or "}" on a US keyboard) doesn't.
-      const isPlusKey =
-        ev.key === '+' ||
-        ev.code === 'NumpadAdd' ||
-        (ev.code === 'Equal' && ev.key === '=') ||
-        (ev.code === 'BracketRight' && ev.key === '*');
-
-      if (
-        ev.type === 'keydown' &&
-        !ev.repeat &&
-        primaryModifier &&
-        !ev.altKey &&
-        isPlusKey &&
-        (ev.shiftKey || shellEndedRef.current)
-      ) {
-        ev.preventDefault();
-        onNewTerminalRef.current?.();
-        return false;
-      }
-      const noOtherMods = !ev.altKey && !ev.metaKey && ev.ctrlKey && ev.shiftKey;
-      if (noOtherMods && ev.code === 'KeyA') {
-        if (ev.type === 'keydown' && !ev.repeat) term.selectAll();
-        ev.preventDefault();
-        return false;
-      }
-      if (noOtherMods && ev.code === 'KeyC') {
-        if (ev.type === 'keydown' && !ev.repeat) void copySelectionIfAny();
-        ev.preventDefault();
-        return false;
-      }
-      // Linux only: paste. Elsewhere the webview's own Ctrl+Shift+V /
-      // Shift+Insert already reaches xterm's built-in paste handling, but
-      // WebKitGTK's own clipboard read is the one that crashes on an empty
-      // clipboard (#89), so it's taken over here and routed through the
-      // same path as a right-click instead.
-      if (IS_LINUX) {
-        const isPasteKey = !ev.altKey && !ev.metaKey && (
-          (ev.ctrlKey && ev.shiftKey && ev.code === 'KeyV') ||
-          (ev.shiftKey && !ev.ctrlKey && ev.key === 'Insert')
-        );
-        if (isPasteKey) {
-          ev.preventDefault();
-          if (ev.type === 'keydown' && !ev.repeat) void pasteClipboard(false);
-          return false;
-        }
+      if (!Fork.mayBeShortcut(ev)) return true; // fork: plain typing goes straight on (none below is for it)
+      if (ev.type === 'keydown') {
+        const used = runShortcut(ev);
+        if (used !== undefined) return used;
       }
       // ^_ (see isUnderscoreKey). No Alt or Meta: those combinations aren't ^_,
       // and with Ctrl+Alt the layout may be typing the character. No letter key:
@@ -1777,7 +2335,7 @@ const TerminalView = ({
     document.addEventListener('mouseup', onDocMouseUp, true);
     window.addEventListener('blur', onWindowBlur);
     terminalRef.current.addEventListener('pointerdown', onPointerDown, true);
-    terminalRef.current.addEventListener('contextmenu', onContextMenu);
+    terminalRef.current.addEventListener('contextmenu', onContextMenu, true);
     terminalRef.current.addEventListener('paste', onPasteEvent, true);
     // Before xterm's own touch handlers too; touchmove can't be passive, it
     // keeps the swipe from scrolling the page.
@@ -1785,6 +2343,11 @@ const TerminalView = ({
     terminalRef.current.addEventListener('touchmove', onTouchMove, { capture: true, passive: false });
     terminalRef.current.addEventListener('touchend', onTouchEnd, true);
     terminalRef.current.addEventListener('touchcancel', onTouchEnd, true);
+    terminalRef.current.addEventListener('gesturestart', onGestureStart, { capture: true, passive: false });
+    terminalRef.current.addEventListener('gesturechange', onGestureChange, { capture: true, passive: false });
+    terminalRef.current.addEventListener('gestureend', onGestureEnd, { capture: true, passive: false });
+    // Before xterm's own wheel handler, which would scroll.
+    terminalRef.current.addEventListener('wheel', onZoomWheel, { capture: true, passive: false });
     // A paste from outside the terminal (see TERMINAL_PASTE). Text only to be
     // pasted (the Library's Paste, the AI's Insert) was asked about as a
     // paste; where each of its lines would run as it lands, that is asked
@@ -1924,6 +2487,8 @@ const TerminalView = ({
     // Handle Settings Change — font size and face apply live to open terminals.
     let fontDisposed = false;
     const handleSettingsChange = () => {
+      // Program titles on or off.
+      titles.refresh();
       // So does the scrollback; fewer lines than the terminal holds drops the
       // oldest ones.
       const scrollback = readScrollback();
@@ -2013,6 +2578,9 @@ const TerminalView = ({
       window.removeEventListener('submarine-settings-changed', handleSettingsChange);
       resizeObserver.disconnect();
       onDataDisposable.dispose();
+      titleDisposable.dispose();
+      titlesRef.current = null;
+      if (titles.dispose()) onTitleRef.current?.(terminalId, "");
       term.textarea?.removeEventListener("compositionupdate", onCompositionUpdate);
       term.textarea?.removeEventListener("compositionend", onCompositionEnd);
       term.element?.removeEventListener("keydown", onAndroidKeyDown, true);
@@ -2020,6 +2588,13 @@ const TerminalView = ({
       term.textarea?.removeEventListener('focus', onTextareaFocus);
       if (inputRef.current === handleData) inputRef.current = null;
       onResizeDisposable.dispose();
+      cancelPress();
+      stopSelectScroll();
+      touchSelectionDisposable.dispose();
+      touchRenderDisposable.dispose();
+      touchResizeDisposable.dispose();
+      window.removeEventListener('pointerdown', onTouchUiPointerDown, true);
+      touchSelectRef.current = null;
       // Gone before its shell was asked for: none is opened.
       window.clearTimeout(openTimer);
       window.clearTimeout(sizeTimer);
@@ -2028,13 +2603,19 @@ const TerminalView = ({
         container.removeEventListener('mousedown', onNewTerminalClick, true);
         container.removeEventListener('mousedown', onMouseDown, true);
         container.removeEventListener('pointerdown', onPointerDown, true);
-        container.removeEventListener('contextmenu', onContextMenu);
+        container.removeEventListener('contextmenu', onContextMenu, true);
         container.removeEventListener('paste', onPasteEvent, true);
         container.removeEventListener('touchstart', onTouchStart, true);
         container.removeEventListener('touchmove', onTouchMove, true);
         container.removeEventListener('touchend', onTouchEnd, true);
         container.removeEventListener('touchcancel', onTouchEnd, true);
+        container.removeEventListener('gesturestart', onGestureStart, true);
+        container.removeEventListener('gesturechange', onGestureChange, true);
+        container.removeEventListener('gestureend', onGestureEnd, true);
+        container.removeEventListener('wheel', onZoomWheel, true);
       }
+      if (zoomTimer !== undefined) window.clearTimeout(zoomTimer);
+      unfollowFingers();
       document.removeEventListener('mouseup', onDocMouseUp, true);
       window.removeEventListener('blur', onWindowBlur);
       window.removeEventListener(TERMINAL_PASTE, onPasteRequest);
@@ -2095,27 +2676,67 @@ const TerminalView = ({
     // pane (between xterm and the system soft keyboard). On desktop the bar
     // isn't rendered at all, so the xterm child claims the full height as
     // before.
-    <div className="h-full w-full p-2 pr-2 pb-0 relative flex flex-col" style={{ background: termBg }}>
+    <div className="theme-dark h-full w-full p-2 pr-2 pb-0 relative flex flex-col" style={{ background: termBg }}>
       <div
         ref={terminalRef}
         className="flex-1 min-h-0 w-full overflow-hidden select-text"
       />
       <Fork.TerminalOverlay el={fork.dockEl}>
-      {/* The long press's Paste button (see pasteAt). Pressing it doesn't
-          take the focus, so the soft keyboard stays up. */}
-      {pasteAt && !disabled && (
-        <button
-          type="button"
-          data-paste-button
+      {/* The long press's handles and bar (see touchUi). Pressing them
+          doesn't take the focus, so the soft keyboard stays up. A handle's
+          box is a 40 px touch area; the drop in it points at its cell's
+          corner. tabIndex makes the box a tap target for the browser's touch
+          adjustment, which otherwise gives a finger on it to the terminal
+          or a button nearby (its mousedown is cancelled: no focus). */}
+      {touchUi && (['start', 'end'] as const).map((which) => {
+        const at = touchUi[which];
+        if (!at) return null;
+        const hangsLeft = (which === 'start') !== at.flip;
+        return (
+          <div
+            key={which}
+            data-touch-ui
+            data-touch-handle={which}
+            tabIndex={-1}
+            aria-hidden="true"
+            onPointerDown={(e) => grabHandle(e, which, at)}
+            onMouseDown={(e) => e.preventDefault()}
+            style={{ left: at.x - (hangsLeft ? TOUCH_HANDLE_REACH : 40 - TOUCH_HANDLE_REACH), top: at.y - 4, touchAction: 'none' }}
+            className="absolute z-30 w-10 h-10 outline-none"
+          >
+            <span className={`absolute left-3 top-1 w-4 h-4 bg-primary rounded-full ${hangsLeft ? 'rounded-tr-none' : 'rounded-tl-none'}`} />
+          </div>
+        );
+      })}
+      {touchUi && (touchUi.copy || !disabled) && (
+        <div
+          ref={touchMenuRef}
+          data-touch-ui
+          role="toolbar"
           onPointerDown={(e) => e.preventDefault()}
           onMouseDown={(e) => e.preventDefault()}
-          onClick={() => { setPasteAt(null); void pasteClipboardRef.current?.(true); }}
-          style={{ left: pasteAt.x, top: pasteAt.y }}
-          className="absolute z-30 -translate-x-1/2 -translate-y-full -mt-3 h-10 px-4 flex items-center gap-1.5 rounded-lg bg-zinc-800 border border-white/15 shadow-xl text-[13px] font-semibold text-zinc-100 active:bg-zinc-700"
+          style={{ left: touchUi.menu.x, top: touchUi.menu.y }}
+          className={`absolute z-30 max-w-[calc(100%-16px)] flex items-center divide-x divide-white/10 rounded-lg bg-zinc-800 border border-white/15 shadow-xl overflow-hidden ${touchUi.menu.below ? '' : '-translate-y-full'}`}
         >
-          <ClipboardPaste size={15} className="text-primary shrink-0" />
-          {t('Paste')}
-        </button>
+          {touchUi.copy && (
+            <button type="button" data-touch-copy onClick={() => touchSelectRef.current?.copy()} className={TOUCH_MENU_BUTTON}>
+              <Copy size={15} className="text-primary shrink-0" />
+              {t('Copy')}
+            </button>
+          )}
+          {!disabled && (
+            <button type="button" data-paste-button onClick={() => touchSelectRef.current?.paste()} className={TOUCH_MENU_BUTTON}>
+              <ClipboardPaste size={15} className="text-primary shrink-0" />
+              {t('Paste')}
+            </button>
+          )}
+          {touchUi.copy && (
+            <button type="button" data-touch-select-all onClick={() => touchSelectRef.current?.selectAll()} className={TOUCH_MENU_BUTTON}>
+              <TextSelect size={15} className="text-primary shrink-0" />
+              {t('Select all')}
+            </button>
+          )}
+        </div>
       )}
       {/* Search chip — floats above xterm; positioned inside the outer
           flex column so it never displaces the terminal grid. Absolute
@@ -2129,9 +2750,8 @@ const TerminalView = ({
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
-              // Stop keys from leaking to the document listener
-              // (Ctrl+Shift+F reopen loop) and to xterm's textarea (which
-              // would type into the shell).
+              // Keys typed here stay here (stopPropagation below): none of
+              // them may reach the page's other key handlers.
               if (e.key === 'Escape') {
                 e.preventDefault();
                 setQuery('');
@@ -2139,9 +2759,8 @@ const TerminalView = ({
               } else if (e.key === 'Enter') {
                 e.preventDefault();
                 runFind(e.shiftKey ? 'prev' : 'next');
-              } else if ((e.ctrlKey || e.metaKey) && e.keyCode === 70) {
-                // Swallow so the outer document handler doesn't re-fire
-                // (which would just refocus us — harmless but noisy).
+              } else if (matchShortcut(e.nativeEvent, FIND)) {
+                // The find key again: select the query to type over it.
                 e.preventDefault();
                 (e.currentTarget as HTMLInputElement).select();
               }
@@ -2276,13 +2895,13 @@ const TerminalView = ({
       {disabled && (
         <div className="absolute top-2 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
           {reconnecting ? (
-            <span className="whitespace-nowrap px-2.5 py-1 rounded text-[11.5px] font-mono border bg-[#2c1f0b] border-amber-500/30 text-amber-200 shadow-lg flex items-center gap-1.5">
+            <span className="whitespace-nowrap px-2.5 py-1 rounded text-[11.5px] font-mono border bg-shade-2c1f0b border-amber-500/30 text-amber-200 shadow-lg flex items-center gap-1.5">
               <span className="w-1.5 h-1.5 rounded-full bg-amber-300 animate-pulse-brief" aria-hidden="true" />
               <span className="sm:hidden">{t('Reconnecting…')}</span>
               <span className="hidden sm:inline">{t('Reconnecting… buffer is read-only')}</span>
             </span>
           ) : (
-            <span className="whitespace-nowrap px-2.5 py-1 rounded text-[11.5px] font-mono border bg-[#2c1117] border-rose-500/30 text-rose-300 shadow-lg">
+            <span className="whitespace-nowrap px-2.5 py-1 rounded text-[11.5px] font-mono border bg-shade-2c1117 border-rose-500/30 text-rose-300 shadow-lg">
               <span className="sm:hidden">{t('Read-only')}</span>
               <span className="hidden sm:inline">{t('Disconnected — buffer is read-only')}</span>
             </span>

@@ -275,7 +275,7 @@ export const HomePane = ({ visible, onLiveShells }: { visible: boolean; onLiveSh
           />
           <div
             style={{ left: Math.min(menu.x, window.innerWidth - 280), top: menu.y }}
-            className="fixed z-[9999] w-[260px] max-h-[70vh] overflow-y-auto custom-scrollbar bg-[#15151a] border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
+            className="fixed z-[9999] w-[260px] max-h-[70vh] overflow-y-auto custom-scrollbar bg-shade-15151a border border-white/10 rounded-lg shadow-2xl py-1 text-[11.5px]"
           >
             {shells && (() => {
               const groups = shellGroups(shells);

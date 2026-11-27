@@ -124,7 +124,7 @@ const PingCard = ({ target }: { target: PingTarget }) => {
     : `Not answering since ${clock(since)}`;
 
   return (
-    <div className="bg-[#15151a] border border-white/10 rounded-xl shadow-2xl overflow-hidden">
+    <div className="bg-shade-15151a border border-white/10 rounded-xl shadow-2xl overflow-hidden">
       <div className="flex items-center gap-2 px-3 pt-2.5 pb-1.5">
         <span className={`shrink-0 h-2 w-2 rounded-full ${level ? TONE_DOT[LEVEL_TONE[level]] : "bg-zinc-600"} ${level && !stopped ? "animate-pulse-brief" : ""}`} />
         <div className="min-w-0 flex-1">

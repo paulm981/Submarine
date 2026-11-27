@@ -1,27 +1,18 @@
 //! The clipboard's text for a paste into the terminal (a right-click), where
-//! the page can't read it itself, on Windows and macOS (lib.rs,
-//! clipboard_read_text, reads it on Linux). The desktop frontends all ask;
-//! Android reads it in the page.
-//!
-//! On Windows the page's read is WebView2's to allow, behind a permission
-//! prompt: blocked or dismissed once, every right-click paste failed with
-//! "Clipboard read denied". The Win32 clipboard is read directly instead
-//! (windows_clipboard.rs).
+//! the page can't read it itself, on macOS (lib.rs, clipboard_read_text,
+//! reads it on Windows, Linux and Android). The desktop frontends all ask.
 //!
 //! On macOS, WKWebView refuses the page's read outright ("Clipboard read
 //! denied"), so `pbpaste` reads the general pasteboard.
 //!
+//! Windows was read here too until the original project read it in the
+//! backend itself (their #418, file_clipboard.rs): the fork uses theirs.
+//!
 //! A clipboard that is empty or holds no text gives an empty string.
 
-/// The clipboard's text, on a system other than Linux.
-#[cfg(not(target_os = "linux"))]
+/// The clipboard's text, on a system other than Windows, Linux and Android.
+#[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
 pub(crate) async fn read_text() -> Result<String, String> {
-    #[cfg(windows)]
-    {
-        tokio::task::spawn_blocking(crate::windows_clipboard::windows_clipboard_text)
-            .await
-            .map_err(|e| e.to_string())?
-    }
     #[cfg(target_os = "macos")]
     {
         let read = tokio::process::Command::new("/usr/bin/pbpaste")
@@ -40,9 +31,9 @@ pub(crate) async fn read_text() -> Result<String, String> {
             Err(_) => Err("The clipboard did not answer.".to_string()),
         }
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(target_os = "macos"))]
     {
-        Err("Reading the clipboard here is only for Linux, Windows and macOS.".to_string())
+        Err("Reading the clipboard here is only for Windows, Linux, Android and macOS.".to_string())
     }
 }
 

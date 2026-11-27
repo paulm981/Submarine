@@ -117,7 +117,7 @@ export default function LicensesDialog({ onClose }: { onClose: () => void }) {
         aria-modal="true"
         aria-labelledby="licenses-title"
         onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-[640px] h-[85vh] flex flex-col bg-[#121214] border border-white/10 rounded-xl shadow-2xl"
+        className="w-full max-w-[640px] h-[85vh] flex flex-col bg-shade-121214 border border-white/10 rounded-xl shadow-2xl"
       >
         <div className="flex items-center justify-between gap-3 p-4 border-b border-white/5 shrink-0">
           <div className="flex items-center gap-2 min-w-0">
