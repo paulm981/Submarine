@@ -193,15 +193,32 @@ fn anything_that_changes_things_asks() {
 #[test]
 fn programs_that_can_run_or_write_while_looking_ask() {
     asks(&[
-        "sed -n 1,10p /etc/hosts",
         "sed 's/a/b/e' /etc/hosts",
+        "sed -i 's/a/b/' /tmp/x",
+        "sed -n 'w /tmp/x' /etc/hosts",
+        "sed -n '1,10e id' /etc/hosts",
+        "sed -e '1,10p' /etc/hosts",
+        "sed -n -f /tmp/script /etc/hosts",
         "awk '{print $1}' /etc/hosts",
-        "git status",
-        "git log -1",
+        "git -c core.fsmonitor=id status",
+        "git --config-env=a=b status",
+        "git --exec-path=/tmp status",
+        "git --git-dir=/tmp/g status",
+        "git diff --output=/tmp/out",
+        "git diff --ext-diff",
+        "git checkout main",
+        "git commit -m x",
+        "git branch new-branch",
+        "git branch -D old-branch",
         "less /etc/hosts",
         "more /etc/hosts",
         "man ls",
-        "jq . /tmp/x.json",
+        "jq 'env' /tmp/x.json",
+        "jq '.a | ENV' /tmp/x.json",
+        "jq -f /tmp/filter.jq /tmp/x.json",
+        "jq --slurpfile f /etc/passwd .",
+        "jq --rawfile f /etc/passwd .",
+        "jq --argfile f /etc/passwd .",
         "env",
         "printenv",
         "xargs rm",
@@ -445,4 +462,70 @@ fn nothing_reaches_out_or_attaches_a_disk() {
         "journalctl --ima=/x.img",
     ]);
     runs(&["getent passwd", "getent group docker", "getent services ssh", "rpm -qa", "rpm -qi bash", "journalctl -u nginx --root=/mnt"]);
+}
+
+#[test]
+fn chains_and_stderr_redirects_run_only_when_every_part_reads() {
+    runs(&[
+        "systemctl status nginx && journalctl -u nginx -n 20 --no-pager",
+        "uname -a && uptime && df -h && free -m",
+        "find /etc -name '*.conf' 2>/dev/null | head -n 20",
+        "find /etc -name '*.conf' 2> /dev/null",
+        "systemctl status nginx 2>&1 | grep -i active",
+        "crontab -l 2>/dev/null",
+        "zgrep -i error /var/log/syslog.1.gz",
+        "docker compose ps",
+        "docker compose -f /srv/app/compose.yml logs --tail 50 web",
+        "docker-compose ps",
+    ]);
+    asks(&[
+        "ls && rm x",
+        "ls &&& ls",
+        "ls & ls",
+        "&& ls",
+        "ls &&",
+        "2>/dev/null",
+        "2>/dev/null | ls",
+        "ls 2>/tmp/out",
+        "ls >/dev/null",
+        "ls 1>/dev/null",
+        "ls 2>&2",
+        "ls foo2>/dev/null",
+        "cat /etc/shadow 2>/dev/null",
+        "cat /dev/watchdog 2>/dev/null",
+        "docker compose config",
+        "docker compose exec web sh",
+        "docker compose --env-file /srv/.env ps",
+    ]);
+}
+
+#[test]
+fn safe_sed_jq_and_git_inspection_run() {
+    runs(&[
+        "sed -n 1,10p /etc/hosts",
+        "sed -n '20,50p' /var/log/syslog",
+        "sed -n '10p' /etc/nginx/nginx.conf",
+        "sed -n '100,$p' /var/log/syslog",
+        "cat /var/log/syslog | sed -n '1,20p'",
+        "jq . /tmp/x.json",
+        "jq -r '.items[].name' /tmp/x.json",
+        "jq -c '.environment' /tmp/x.json",
+        "cat /tmp/x.json | jq -r '.version'",
+        "git status",
+        "git status -s",
+        "git log -n 10 --oneline",
+        "git diff --stat",
+        "git show --stat HEAD",
+        "git -C /srv/app status",
+        "git --no-pager log -5",
+        "git rev-parse --abbrev-ref HEAD",
+        "git branch --show-current",
+        "git branch -a",
+    ]);
+    asks(&[
+        "jq . /srv/.env",
+        "jq . /etc/shadow",
+        "sed -n 1,10p /etc/shadow",
+        "git -C /srv/app show HEAD:.env",
+    ]);
 }
