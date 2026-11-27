@@ -244,7 +244,7 @@ fn random_commands_run_only_when_every_part_reads() {
             continue;
         }
         ran += 1;
-        assert!(joins.iter().all(|j| *j == " | "), "a separator ran: {cmd:?}");
+        assert!(joins.iter().all(|j| *j == " | " || *j == " && "), "a separator ran: {cmd:?}");
         for stage in &parts {
             let (program, args) = (stage[0], &stage[1..]);
             let has = |list: &[&str]| args.iter().any(|a| list.contains(a));

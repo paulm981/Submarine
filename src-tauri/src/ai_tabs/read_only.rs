@@ -5,12 +5,13 @@
 //!   program in it is on the list below, with only the words that keep it
 //!   reading. Anything not on the list asks: a program that's missing costs
 //!   a click, one that's wrongly on it could change a server.
-//! - **One plain pipeline.** Plain words, single or double quotes, and `|`
-//!   between programs. Anything else a shell would read as more (`;`, `&`,
-//!   `>`, `<`, `$`, backticks, brackets, braces, `\`, `#`, `!`, `^`, a tab
-//!   or a newline) makes it ask, and so does `NAME=value` first or a program
-//!   named by its path (`./ls`). Inside single quotes anything printable but
-//!   `\` (fish reads it there); inside double quotes nothing a shell expands.
+//! - **Plain pipelines and `&&` chains.** Plain words, single or double
+//!   quotes, `|`, `&&`, and `2>/dev/null` or `2>&1`. Anything else a shell
+//!   would read as more (`;`, single `&`, `||`, `>`, `<`, `$`, backticks,
+//!   brackets, braces, `\`, `#`, `!`, `^`, a tab or a newline) makes it ask,
+//!   and so does `NAME=value` first or a program named by its path (`./ls`).
+//!   Inside single quotes anything printable but `\` (fish reads it there);
+//!   inside double quotes nothing a shell expands.
 //! - **Globs only where they can't turn into an option.** A word with an
 //!   unquoted `*`, `?` or `[` must not start with one of them or with `-`:
 //!   `/var/log/*.log` runs, `*.log` asks, as a file named `-delete` would
@@ -19,11 +20,13 @@
 //!   a word that could be the start of a long option that changes things
 //!   counts as that option (`long_is`).
 //! - **Left off on purpose,** as they can run a program or write while they
-//!   look as if they read: `sed` (its `e` and `w`), `awk` (`system()`), `git`
-//!   (a repository's config can run a program on `git status`), `less` and
-//!   `man` (a shell), `jq` (`$ENV`), `env`, `xargs`, `watch`, `timeout`,
-//!   `tee`. And everything that reaches out: `curl`, `wget`, `nc`, `ssh`,
-//!   `ping`, `dig`, `nslookup` (a hostname can carry data out).
+//!   look as if they read: `awk` (`system()`), `less` and `man` (a shell),
+//!   `env`, `xargs`, `watch`, `timeout`, `tee`. `sed` runs only with `-n` and
+//!   a line-range print script (`1,50p`), `jq` only without `env` or file
+//!   reads, and `git` only for read-only status/log/diff/show/branch
+//!   without `-c` or hook/pager overrides. Everything that reaches out asks:
+//!   `curl`, `wget`, `nc`, `ssh`, `ping`, `dig`, `nslookup` (a hostname can
+//!   carry data out).
 //! - **Devices ask** (`reaches_a_device`): opening one can do something,
 //!   reading or not. `/dev/watchdog` reboots the server unless it's closed
 //!   just so, and reading `/proc/kmsg` takes the kernel's messages away.
@@ -37,7 +40,7 @@
 
 /// The longest command looked at, in bytes: a longer one asks.
 static MAX_LEN: usize = 2048;
-/// The most programs in one pipeline.
+/// The most programs in one pipeline or `&&` chain.
 static MAX_STAGES: usize = 8;
 
 /// One word, as the shell will pass it.
@@ -58,8 +61,12 @@ pub(crate) fn only_reads(command: &str) -> bool {
     }
 }
 
-/// The pipeline's programs and their words; None when it's more than one
-/// plain pipeline, or isn't plain enough to read for sure.
+fn is_redir_boundary(rest: &str) -> bool {
+    rest.is_empty() || rest.starts_with([' ', '|', '&'])
+}
+
+/// The command's stages (split by `|` and `&&`) and their words; None when
+/// it uses anything else or isn't plain enough to read for sure.
 pub(crate) fn pipeline(command: &str) -> Option<Vec<Vec<Word>>> {
     if command.len() > MAX_LEN || !command.chars().all(|c| c == ' ' || c.is_ascii_graphic()) {
         return None;
@@ -67,34 +74,79 @@ pub(crate) fn pipeline(command: &str) -> Option<Vec<Vec<Word>>> {
     let mut stages: Vec<Vec<Word>> = Vec::new();
     let mut stage: Vec<Word> = Vec::new();
     let mut word: Option<Word> = None;
-    let mut chars = command.chars();
-    while let Some(c) = chars.next() {
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &command[i..];
+        if word.is_none() {
+            let skip = if rest.starts_with("2>/dev/null") && is_redir_boundary(&rest["2>/dev/null".len()..]) {
+                Some("2>/dev/null".len())
+            } else if rest.starts_with("2> /dev/null") && is_redir_boundary(&rest["2> /dev/null".len()..]) {
+                Some("2> /dev/null".len())
+            } else if rest.starts_with("2>&1") && is_redir_boundary(&rest["2>&1".len()..]) {
+                Some("2>&1".len())
+            } else {
+                None
+            };
+            if let Some(n) = skip {
+                i += n;
+                continue;
+            }
+        }
+        let c = bytes[i] as char;
         match c {
-            ' ' => stage.extend(word.take()),
+            ' ' => {
+                stage.extend(word.take());
+                i += 1;
+            }
             '|' => {
                 stage.extend(word.take());
                 if stage.is_empty() {
                     return None;
                 }
                 stages.push(std::mem::take(&mut stage));
+                i += 1;
+            }
+            '&' => {
+                if !rest.starts_with("&&") || rest.starts_with("&&&") {
+                    return None;
+                }
+                stage.extend(word.take());
+                if stage.is_empty() {
+                    return None;
+                }
+                stages.push(std::mem::take(&mut stage));
+                i += 2;
             }
             '\'' => {
                 let w = word.get_or_insert_with(empty);
+                i += 1;
                 loop {
-                    match chars.next()? {
+                    if i >= bytes.len() {
+                        return None;
+                    }
+                    let q = bytes[i] as char;
+                    i += 1;
+                    match q {
                         '\'' => break,
                         '\\' => return None,
-                        q => w.text.push(q),
+                        _ => w.text.push(q),
                     }
                 }
             }
             '"' => {
                 let w = word.get_or_insert_with(empty);
+                i += 1;
                 loop {
-                    match chars.next()? {
+                    if i >= bytes.len() {
+                        return None;
+                    }
+                    let q = bytes[i] as char;
+                    i += 1;
+                    match q {
                         '"' => break,
                         '$' | '`' | '\\' | '!' => return None,
-                        q => w.text.push(q),
+                        _ => w.text.push(q),
                     }
                 }
             }
@@ -103,8 +155,12 @@ pub(crate) fn pipeline(command: &str) -> Option<Vec<Vec<Word>>> {
                 // `]` alone expands nothing.
                 w.glob |= c != ']';
                 w.text.push(c);
+                i += 1;
             }
-            c if c.is_ascii_alphanumeric() || "-_./:=,+@%~".contains(c) => word.get_or_insert_with(empty).text.push(c),
+            c if c.is_ascii_alphanumeric() || "-_./:=,+@%~".contains(c) => {
+                word.get_or_insert_with(empty).text.push(c);
+                i += 1;
+            }
             _ => return None,
         }
     }
@@ -130,12 +186,13 @@ fn stage_reads(words: &[Word]) -> bool {
     match program.text.as_str() {
         // Nothing they're given makes them write or run anything.
         "cat" | "tac" | "head" | "tail" | "wc" | "nl" | "cut" | "tr" | "paste" | "join" | "comm" | "fold" | "fmt" | "expand" | "column"
-        | "zcat" | "ls" | "stat" | "du" | "df" | "free" | "uptime" | "w" | "who" | "whoami" | "id" | "groups" | "uname" | "nproc" | "arch"
-        | "ps" | "pgrep" | "pidof" | "lsblk" | "lscpu" | "lsmem" | "lspci" | "lsusb" | "lsof" | "lsmod" | "modinfo" | "findmnt" | "netstat" | "vmstat"
-        | "iostat" | "mpstat" | "last" | "which" | "readlink" | "realpath" | "basename" | "dirname" | "pwd" | "md5sum" | "sha1sum"
-        | "sha256sum" | "sha512sum" | "b2sum" | "cksum" | "strings" | "od" | "hexdump" | "diff" | "cmp" | "dpkg-query" | "getconf" | "locale" => true,
+        | "zcat" | "bzcat" | "xzcat" | "ls" | "stat" | "du" | "df" | "free" | "uptime" | "w" | "who" | "whoami" | "id" | "groups" | "uname"
+        | "hostid" | "domainname" | "nproc" | "arch" | "ps" | "pgrep" | "pidof" | "lsblk" | "lscpu" | "lsmem" | "lspci" | "lsusb" | "lsof"
+        | "lsmod" | "lsns" | "modinfo" | "findmnt" | "netstat" | "vmstat" | "iostat" | "mpstat" | "last" | "which" | "readlink" | "realpath"
+        | "basename" | "dirname" | "pwd" | "md5sum" | "sha1sum" | "sha256sum" | "sha512sum" | "b2sum" | "cksum" | "strings" | "od" | "hexdump"
+        | "diff" | "cmp" | "dpkg-query" | "getconf" | "locale" | "getenforce" | "sestatus" | "aa-status" => true,
         // `-D read` reads the devices `-r` comes across.
-        "grep" | "egrep" | "fgrep" => !short_has(args, "D") && !long_is(args, &["--devices"]),
+        "grep" | "egrep" | "fgrep" | "zgrep" | "zegrep" | "zfgrep" => !short_has(args, "D") && !long_is(args, &["--devices"]),
         // `uniq IN OUT` writes OUT, `-` (stdin) and what follows `--`
         // counting as files (`uniq - /etc/passwd`).
         "uniq" => operands(args).count() <= 1,
@@ -157,6 +214,10 @@ fn stage_reads(words: &[Word]) -> bool {
         "journalctl" => !long_is(args, JOURNALCTL_CHANGES),
         "ip" => ip_shows(args),
         "docker" | "podman" => docker_shows(args),
+        "docker-compose" => compose_shows(args),
+        "sed" => sed_prints(args),
+        "jq" => jq_reads(args),
+        "git" => git_reads(args),
         "dpkg" => {
             args.first().is_some_and(|w| DPKG_SHOWS.contains(&w.text.as_str())) && args[1..].iter().all(|w| !w.text.starts_with('-'))
         }
@@ -314,6 +375,152 @@ fn docker_shows(args: &[Word]) -> bool {
         Some("image") => second(&["ls", "list", "inspect", "history"]),
         Some("network" | "volume") => second(&["ls", "list", "inspect"]),
         Some("system") => second(&["df"]),
+        Some("compose") => compose_shows(&args[1..]),
+        _ => false,
+    }
+}
+
+/// `docker compose` / `docker-compose` showing status or logs: skips
+/// `-f`/`-p`/`--project-directory`/`--profile` before the subcommand,
+/// refuses `--env-file`, and allows only read-only subcommands.
+fn compose_shows(args: &[Word]) -> bool {
+    static SHOWS: &[&str] = &["ps", "logs", "ls", "images", "top", "version"];
+    let mut i = 0;
+    while i < args.len() {
+        let t = args[i].text.as_str();
+        if !t.starts_with('-') {
+            return SHOWS.contains(&t);
+        }
+        if matches!(t, "-f" | "--file" | "-p" | "--project-name" | "--project-directory" | "--profile") {
+            i += 2;
+            continue;
+        }
+        if t.starts_with("--file=") || t.starts_with("--project-name=") || t.starts_with("--project-directory=") || t.starts_with("--profile=") {
+            i += 1;
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+/// `sed -n <range>p [file...]`: prints lines without `-i`, `-e`, `-f`,
+/// `e` or `w`. Only plain line-number ranges (`20p`, `1,50p`, `10,$p`)
+/// pass, so no command can run or write.
+fn sed_prints(args: &[Word]) -> bool {
+    let mut quiet = false;
+    let mut script: Option<&str> = None;
+    for w in args {
+        let t = w.text.as_str();
+        if script.is_none() && t.starts_with('-') && t != "-" {
+            if matches!(t, "-n" | "--quiet" | "--silent") {
+                quiet = true;
+            } else if !matches!(t, "-E" | "-r" | "--regexp-extended" | "--posix" | "-u" | "--unbuffered") {
+                return false;
+            }
+        } else if script.is_none() {
+            script = Some(t);
+        } else if t.starts_with('-') && t != "-" {
+            return false;
+        }
+    }
+    quiet && script.is_some_and(is_sed_line_print)
+}
+
+fn is_sed_line_print(s: &str) -> bool {
+    let Some(body) = s.strip_suffix('p') else { return false };
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    match body.split_once(',') {
+        None => digits(body),
+        Some((start, end)) => digits(start) && (digits(end) || end == "$"),
+    }
+}
+
+/// `jq [flags] <filter> [file...]`: refuses file/module loaders (`-f`,
+/// `-L`, `--argfile`, `--slurpfile`, `--rawfile`) and builtins that read
+/// process environment or stdin (`env`, `ENV`, `input`, `inputs`, `debug`).
+fn jq_reads(args: &[Word]) -> bool {
+    if short_has(args, "fL") || long_is(args, &["--from-file", "--argfile", "--slurpfile", "--rawfile", "--args", "--jsonargs"]) {
+        return false;
+    }
+    let mut i = 0;
+    let mut filter: Option<&str> = None;
+    while i < args.len() {
+        let t = args[i].text.as_str();
+        if filter.is_none() && t.starts_with('-') && t != "-" {
+            if t == "--indent" {
+                i += 2;
+                continue;
+            }
+            if matches!(t, "--arg" | "--argjson") {
+                i += 3;
+                continue;
+            }
+            let safe_long = matches!(
+                t,
+                "--raw-output"
+                    | "--compact-output"
+                    | "--exit-status"
+                    | "--slurp"
+                    | "--sort-keys"
+                    | "--raw-input"
+                    | "--null-input"
+                    | "--monochrome-output"
+                    | "--color-output"
+                    | "--ascii-output"
+                    | "--join-output"
+                    | "--tab"
+            );
+            let safe_short = !t.starts_with("--") && t.len() > 1 && t[1..].chars().all(|c| "rcesSRnMCaj".contains(c));
+            if !safe_long && !safe_short {
+                return false;
+            }
+            i += 1;
+        } else if filter.is_none() {
+            filter = Some(t);
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    let Some(f) = filter else { return false };
+    !f.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|ident| matches!(ident, "env" | "ENV" | "debug" | "halt" | "halt_error" | "input" | "inputs"))
+}
+
+/// `git` read-only inspection (`status`, `log`, `diff`, `show`,
+/// `rev-parse`, `describe`, and read-only `branch` flags), with `-c`,
+/// `--config-env`, `--exec-path`, `--git-dir`, `--work-tree`, `--output`
+/// and `--ext-diff` refused.
+fn git_reads(args: &[Word]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let t = args[i].text.as_str();
+        if !t.starts_with('-') {
+            break;
+        }
+        if t == "-C" {
+            if args.get(i + 1).is_none_or(|w| w.text.starts_with('-')) {
+                return false;
+            }
+            i += 2;
+            continue;
+        }
+        if matches!(t, "--no-pager" | "--literal-pathspecs" | "--no-optional-locks") {
+            i += 1;
+            continue;
+        }
+        return false;
+    }
+    let Some((sub, rest)) = args[i..].split_first() else { return false };
+    if long_is(rest, &["--output", "--ext-diff", "--textconv", "--exec", "--upload-pack", "--receive-pack"]) {
+        return false;
+    }
+    match sub.text.as_str() {
+        "status" | "log" | "diff" | "show" | "rev-parse" | "describe" => true,
+        "branch" => rest.iter().all(|w| {
+            matches!(w.text.as_str(), "--show-current" | "--list" | "-a" | "--all" | "-r" | "--remotes" | "-v" | "-vv" | "--verbose" | "--no-color" | "--color")
+        }),
         _ => false,
     }
 }
@@ -349,7 +556,8 @@ fn reaches_a_device(w: &Word) -> bool {
 }
 
 /// Whether a word names a file or folder that usually holds secrets: one
-/// of its parts, split at `/` and `=` (`--file=~/.env`), in any case.
+/// of its parts, split at `/`, `=` (`--file=~/.env`) and `:` (`HEAD:.env`),
+/// in any case.
 #[cfg(test)]
 fn names_secret(word: &str) -> bool {
     secret_in(word, false)
@@ -389,7 +597,7 @@ fn secret_in(word: &str, glob: bool) -> bool {
     static ENDS: &[&str] = &[".pem", ".key", "_key", ".p12", ".pfx", ".kdbx", ".jks", ".keystore"];
     static STARTS: &[&str] = &[".env.", "id_", "shadow"];
     let word = word.to_ascii_lowercase();
-    word.split(['/', '=']).any(|part| {
+    word.split(['/', '=', ':']).any(|part| {
         if glob && part.contains(['*', '?', '[']) {
             return glob_could_name_secret(part, NAMES, ENDS);
         }

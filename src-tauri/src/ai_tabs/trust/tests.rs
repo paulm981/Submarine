@@ -946,7 +946,7 @@ fn at_the_read_only_level_what_only_reads_runs_and_the_rest_asks() {
     assert_eq!(Decision::ReadOnly.approved_by().as_deref(), Some("level: only reads"));
     // An allow rule still runs what it allows.
     assert_eq!(decide(&p, false, "apt update"), Decision::Rule("apt update".into()));
-    for cmd in ["systemctl restart nginx", "rm /tmp/x", "ls > /tmp/x", "cat .env", "curl example.com", "sed -n 1p x"] {
+    for cmd in ["systemctl restart nginx", "rm /tmp/x", "ls > /tmp/x", "cat .env", "curl example.com", "sed -i s/a/b/ x"] {
         assert_eq!(decide(&p, false, cmd), ask(), "{cmd}");
     }
     // Root asks, however it's asked for: a command that runs on its own
