@@ -21,7 +21,7 @@ Every line the fork changes inside one of the original project's files can confl
 
 ## How we work
 
-- **Start from the plan.** What's done and what's next is in [#163](https://github.com/paulm981/Submarine/issues/163)'s latest comment; read it first, and update it when a batch of work ends.
+- **Start from the plan (multi-agent safe).** Both Claude Code and Antigravity work from the same source of truth (`CLAUDE.md`, [AGENTS.md](AGENTS.md), and [#163](https://github.com/paulm981/Submarine/issues/163)). Before starting: read [#163](https://github.com/paulm981/Submarine/issues/163)'s latest comment, check open pull requests and issues, pass `-R paulm981/Submarine` to `gh` whenever `upstream` (`SinaXhpm/submarine`) is configured as a remote, and claim the issue with a brief comment so two agents never collide on the same work. Update [#163](https://github.com/paulm981/Submarine/issues/163) when a batch of work ends.
 - **What the owner cares about most:**
   - terminal typing and output as fast as they can be: never slower, for any feature;
   - the AI (Claude Code, Codex) working well, with as few approval prompts as safety allows;
@@ -68,8 +68,11 @@ Every change is held to these, in review and in the code itself:
 
 ## Before pushing
 
-- Rust, in `src-tauri`: `cargo test --locked` and `cargo clippy --locked --lib` with no more warnings than `.github/clippy-warnings` allows. The tests need a stand-in page: `mkdir -p dist && [ -f dist/index.html ] || echo '<!doctype html><title>Submarine</title>' > dist/index.html`.
-- Frontend: `npm run typecheck` and `npm run build`.
+When GitHub Actions does not trigger on a pull request (e.g. billing/credit pause), passing all of these locally serves as the merge gate:
+
+- Rust, in `src-tauri`: `cargo test --locked -j 2` and `cargo +1.97.0 clippy --locked --lib` with no more warnings than `.github/clippy-warnings` allows. The tests need a stand-in page: `mkdir -p dist && [ -f dist/index.html ] || echo '<!doctype html><title>Submarine</title>' > dist/index.html`.
+- Frontend: `npm run typecheck`, `npm run build`, and `npm --prefix tools/test test`.
+- Upstream footprint: `bash scripts/upstream-footprint.sh` (verify no unnecessary growth in upstream files).
 - `src-tauri/src/lib.rs` keeps CRLF line endings on every line, as the original project has it: `grep -c $'\r$'` must equal `wc -l`. An editor or tool that writes LF there makes every line conflict at the next merge.
 - Syncing with the original project: FORK.md's "Keeping up with the original project".
 - The pull request template's checklist, including saying plainly when something wasn't tried in the app.
