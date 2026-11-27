@@ -2,7 +2,7 @@
 // then npm --prefix tools/test test (type check, then vitest).
 
 import { describe, expect, it } from "vitest";
-import { AI_LEVELS, aiMarker, cardsOf, heldMay, loosestShare, copyCard, followLimit, followSoFar, levelTitle, passwordAsk, pickFrom, runnerWarning, serverTarget, sharedWith, trustTargetFor, waitingFor, type AiCopy, type AiPending, type AiServer, type AiServerAsk, type AiServerCandidate, type AiSnapshot } from "../../src/util/ai";
+import { AI_LEVELS, AI_STARTER_PACKS, aiMarker, cardsOf, heldMay, loosestShare, copyCard, followLimit, followSoFar, levelTitle, passwordAsk, pickFrom, runnerWarning, serverTarget, sharedWith, suggestPattern, trustTargetFor, waitingFor, type AiCopy, type AiPending, type AiServer, type AiServerAsk, type AiServerCandidate, type AiSnapshot } from "../../src/util/ai";
 
 const pending = (id: number, group: { id: number; size: number } | null = null): AiPending => ({
   id, tab_id: "t", tab_label: "AI", session_id: `s${id}`, server: `srv${id}`, user: null, command: "uptime",
@@ -250,5 +250,37 @@ describe("the password a card as root asks for (#232)", () => {
       }
     }
     expect(AI_LEVELS.map((l) => l.text).join(" ").toLowerCase()).not.toContain("root password");
+  });
+});
+
+describe("approval fatigue helpers (#291)", () => {
+  it("suggests clean wildcard patterns for common diagnostic prefixes, never runners", () => {
+    expect(suggestPattern("systemctl status nginx")).toBe("systemctl status *");
+    expect(suggestPattern("docker-compose logs --tail 50 web")).toBe("docker-compose logs *");
+    expect(suggestPattern("journalctl -u nginx -n 20")).toBe("journalctl *");
+    expect(suggestPattern("uptime")).toBeNull();
+    expect(suggestPattern("bash -c id")).toBeNull();
+    expect(suggestPattern("docker compose logs --tail 50 web")).toBeNull();
+    expect(suggestPattern("systemctl status nginx && rm -rf /")).toBeNull();
+    expect(suggestPattern("docker logs *")).toBeNull();
+  });
+
+  it("starter rule packs never trigger runnerWarning", () => {
+    expect(AI_STARTER_PACKS.length).toBeGreaterThanOrEqual(3);
+    for (const pack of AI_STARTER_PACKS) {
+      for (const p of pack.patterns) {
+        expect(runnerWarning(p), p).toBeNull();
+      }
+    }
+  });
+
+  it("shows non-root timer in marker and ranks it above read-only but below allow_all", () => {
+    expect(aiMarker({ level: 1, allow_all: false, allow_non_root_mins: 15 })).toBe("AI: non-root allowed (15m)");
+    expect(aiMarker({ level: 1, allow_all: true, allow_non_root_mins: 15 })).toBe("AI: runs without asking");
+    const ro = { level: 4, allow_all: false };
+    const nr = { level: 1, allow_all: false, allow_non_root_mins: 12 };
+    const all = { level: 1, allow_all: true };
+    expect(loosestShare([ro, nr])).toEqual(nr);
+    expect(loosestShare([nr, all])).toEqual(all);
   });
 });

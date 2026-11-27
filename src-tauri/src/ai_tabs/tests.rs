@@ -277,7 +277,7 @@ fn names_stay_unique_within_an_ai_tab() {
     let mut servers = Vec::new();
     for _ in 0..3 {
         let name = unique_name(&servers, "web");
-        servers.push(SharedServer { session_id: name.clone(), name, user: None, server_id: None, allow_all: false, level: 1, reads_alone: false, root: None, root_via: None });
+        servers.push(SharedServer { session_id: name.clone(), name, user: None, server_id: None, allow_all: false, allow_non_root_until: None, allow_non_root_mins: None, level: 1, reads_alone: false, root: None, root_via: None });
     }
     let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, ["web", "web (2)", "web (3)"]);
@@ -2236,4 +2236,67 @@ fn the_helper_and_the_agent_bridge_answer_to_arguments_of_their_own() {
     // What Home's Claude Code starts the helper with.
     let config = claude::mcp_config(std::path::Path::new("/opt/submarine"));
     assert_eq!(config["mcpServers"][tools::SERVER]["args"], serde_json::json!(["--mcp"]));
+}
+
+#[tokio::test]
+async fn temporary_non_root_runs_non_root_only_and_is_cleared_by_end() {
+    let exec: Executor = Arc::new(|_, _, _, _| Box::pin(async { Ok(exec::Exec { output: b"ok\n".to_vec(), exit_status: Some(0), ..exec::Exec::default() }) }));
+    let s = AiState::with(exec, no_root(), Box::new(|| {}), None, Arc::new(|_| trust::Policy { ask: vec!["reboot".into()], os: Some("debian".into()), ..Default::default() }), Box::new(|| {}));
+    s.turn_on().unwrap();
+    s.start_tab("local-1", "Claude").unwrap();
+    s.share_as("local-1", "sess-1", "xyz", Some("deploy".into()), Some(1)).unwrap();
+
+    // First non-root command asks; granting 15 min non-root approves it.
+    let (h1, p1) = ask_for(&s, "systemctl restart nginx").await;
+    assert!(!p1.root);
+    s.allow_non_root(p1.id, 15).unwrap();
+    assert!(!h1.await.unwrap().is_error);
+    assert!(s.snapshot().tabs[0].servers[0].allow_non_root_mins.is_some());
+
+    // Subsequent non-root commands run without asking.
+    let (_c, cancel) = watch::channel(false);
+    let r2 = s.run_command("local-1", "xyz", "touch /tmp/ok", None, false, cancel.clone()).await;
+    assert!(!r2.is_error, "{}", r2.text);
+
+    // Root commands and always-ask rules still ask!
+    let (h_root, p_root) = ask_for(&s, "sudo id").await;
+    assert!(p_root.root);
+    assert!(s.allow_non_root(p_root.id, 15).is_err());
+    s.decide(p_root.id, false).unwrap();
+    assert!(h_root.await.unwrap().is_error);
+
+    let (h_ask, p_ask) = ask_for(&s, "reboot").await;
+    assert_eq!(p_ask.ask_rule.as_deref(), Some("reboot"));
+    s.decide(p_ask.id, false).unwrap();
+    assert!(h_ask.await.unwrap().is_error);
+
+    // Ending temporary grant restores asking.
+    assert_eq!(s.end_allow_all_in("local-1", "sess-1"), 1);
+    assert!(s.snapshot().tabs[0].servers[0].allow_non_root_mins.is_none());
+    let (h3, p3) = ask_for(&s, "systemctl restart nginx").await;
+    s.decide(p3.id, false).unwrap();
+    assert!(h3.await.unwrap().is_error);
+}
+
+#[tokio::test]
+async fn batch_allow_all_read_only_only_approves_read_only_requests() {
+    let exec: Executor = Arc::new(|_, _, _, _| Box::pin(async { Ok(exec::Exec { output: b"ok\n".to_vec(), exit_status: Some(0), ..exec::Exec::default() }) }));
+    let s = AiState::with(exec, no_root(), Box::new(|| {}), None, Arc::new(|_| trust::Policy { os: Some("debian".into()), ..Default::default() }), Box::new(|| {}));
+    s.turn_on().unwrap();
+    s.start_tab("local-1", "Claude").unwrap();
+    s.share_as("local-1", "sess-1", "xyz", Some("deploy".into()), Some(1)).unwrap();
+
+    let (h_ro, p_ro) = ask_for(&s, "uptime").await;
+    let (h_wr, p_wr) = ask_for(&s, "rm /tmp/x").await;
+    assert!(p_ro.is_read_only);
+    assert!(!p_wr.is_read_only);
+
+    // Passing both ids only allows the read-only one; the mutating one stays waiting.
+    let n = s.allow_all_read_only(vec![p_ro.id, p_wr.id, 99999]).unwrap();
+    assert_eq!(n, 1);
+    assert!(!h_ro.await.unwrap().is_error);
+    assert_eq!(s.snapshot().pending.len(), 1);
+    assert_eq!(s.snapshot().pending[0].id, p_wr.id);
+    s.decide(p_wr.id, false).unwrap();
+    assert!(h_wr.await.unwrap().is_error);
 }

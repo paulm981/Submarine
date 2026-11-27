@@ -14,6 +14,8 @@ export interface AiServer {
   server_id: number | null;
   /// "Allow everything here until this AI tab closes" is on.
   allow_all: boolean;
+  /// Minutes remaining on "Allow non-root for 15 min", if active.
+  allow_non_root_mins?: number | null;
   /// Its approval level now (1, 2, 4 or 3).
   level: number;
   /// At "Run commands that only read" (4), whether they run by themselves
@@ -47,10 +49,15 @@ export interface AiPending {
   password: "none" | "optional" | "needed" | "wrong";
   timeout_secs: number; asked_at: string;
   server_id: number | null;
+  /// The folder this saved server sits in, if any (#291).
+  folder_id?: number | null;
+  folder_name?: string | null;
   /// The always-ask rule that made it wait, if one did.
   ask_rule: string | null;
   /// "Always allow this command here" is offered for it.
   can_allow_always: boolean;
+  /// Eligible for one-click batch read-only approval (#291).
+  is_read_only?: boolean;
   /// Why it asks where the server's settings otherwise wouldn't: they
   /// couldn't be read, or a change to them waits for your OK.
   note: string | null;
@@ -322,14 +329,16 @@ export const levelTitle = (level: number) => AI_LEVELS.find((l) => l.level === l
 
 /// What a shared server's tab and the AI pane say about it: nothing at
 /// "Ask every time".
-export const aiMarker = (s: Pick<AiServer, "level" | "allow_all" | "reads_alone">): string | null =>
+export const aiMarker = (s: Pick<AiServer, "level" | "allow_all" | "allow_non_root_mins" | "reads_alone">): string | null =>
   s.allow_all || s.level === 3
     ? "AI: runs without asking"
-    : s.level === READ_ONLY_LEVEL && s.reads_alone
-      ? "AI: read-only commands run"
-      : s.level === 2 || s.level === READ_ONLY_LEVEL
-        ? "AI: allowed commands run"
-        : null;
+    : s.allow_non_root_mins
+      ? `AI: non-root allowed (${s.allow_non_root_mins}m)`
+      : s.level === READ_ONLY_LEVEL && s.reads_alone
+        ? "AI: read-only commands run"
+        : s.level === 2 || s.level === READ_ONLY_LEVEL
+          ? "AI: allowed commands run"
+          : null;
 
 /// What a teammate's move held for your OK lets the AI do here, for Waiting
 /// for your OK (HeldReview.tsx; src-tauri/src/ai_tabs/trust.rs, HeldPolicy).
@@ -346,12 +355,12 @@ export const heldMay = (move: { level: number; allow: number; change?: string })
 
 /// How much a share lets the AI run without asking: higher is more. A
 /// level it doesn't know counts as "Ask every time".
-const looseness = (s: Pick<AiServer, "level" | "allow_all">): number =>
-  s.allow_all ? 4 : Math.max(0, AI_LEVELS.findIndex((l) => l.level === s.level));
+const looseness = (s: Pick<AiServer, "level" | "allow_all" | "allow_non_root_mins">): number =>
+  s.allow_all ? 5 : s.allow_non_root_mins ? 4 : Math.max(0, AI_LEVELS.findIndex((l) => l.level === s.level));
 
 /// Of a server's shares with AI tabs, the one that lets the AI run the most
 /// without asking; null when none runs anything without asking.
-export const loosestShare = <T extends Pick<AiServer, "level" | "allow_all">>(shares: T[]): T | null =>
+export const loosestShare = <T extends Pick<AiServer, "level" | "allow_all" | "allow_non_root_mins">>(shares: T[]): T | null =>
   shares.reduce<T | null>((best, s) => (looseness(s) > (best ? looseness(best) : 0) ? s : best), null);
 
 /// What the editor is for: a saved server, a folder, or every server.
@@ -398,3 +407,55 @@ export const runnerWarning = (pattern: string): string | null => {
   const runs = [word, base, stem].some((f) => RUNNERS.some((r) => f === r || (r === "python" && f.startsWith(r))));
   return runs ? `\`${p}\` lets the AI run any command, as root too where sudo needs no password.` : null;
 };
+
+/// Safe prefixes that suggest `<prefix> *` under "Always allow…" (#291).
+/// Never includes runners like `docker`, `git`, `find`, `sed`, or `kubectl`
+/// at the top level.
+const SUGGESTED_PREFIXES = [
+  "systemctl status",
+  "systemctl show",
+  "systemctl is-active",
+  "systemctl is-enabled",
+  "systemctl cat",
+  "journalctl",
+  "docker-compose ps",
+  "docker-compose logs",
+  "ss",
+  "ip",
+];
+
+/// Suggests a reusable wildcard rule for `command` (e.g. `systemctl status *`),
+/// or null if the exact command is already best or unsafe to generalize.
+export const suggestPattern = (command: string): string | null => {
+  const trimmed = command.trim();
+  if (!trimmed || /[;&|`$><(){}\r\n\\*]/.test(trimmed)) return null;
+  const tokens = trimmed.split(/\s+/);
+  for (const prefix of SUGGESTED_PREFIXES) {
+    const parts = prefix.split(" ");
+    if (tokens.length > parts.length && parts.every((p, i) => tokens[i] === p)) {
+      const candidate = `${prefix} *`;
+      return runnerWarning(candidate) ? null : candidate;
+    }
+  }
+  return null;
+};
+
+/// One-click starter allow-rule packs for folders and servers (#291).
+/// Every rule passes `check_runner(..., None)` cleanly.
+export const AI_STARTER_PACKS: { id: string; label: string; patterns: string[] }[] = [
+  {
+    id: "systemd",
+    label: "System & Logs",
+    patterns: ["uptime", "df -h", "free -m", "ps aux", "systemctl status *", "journalctl -n *"],
+  },
+  {
+    id: "docker",
+    label: "Docker",
+    patterns: ["docker ps", "docker stats --no-stream", "docker compose ps", "docker-compose ps *", "docker-compose logs *"],
+  },
+  {
+    id: "network",
+    label: "Network",
+    patterns: ["ss -tlnp", "ip addr", "ip route", "ping -c 1 *"],
+  },
+];

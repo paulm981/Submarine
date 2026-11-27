@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ShieldAlert, ShieldCheck, Trash2, X } from "lucide-react";
-import { AI_LEVELS, AiTrustTarget, closeAiTrust, levelTitle, runnerWarning, useAiTrustTarget } from "../util/ai";
+import { AI_LEVELS, AI_STARTER_PACKS, AiTrustTarget, closeAiTrust, levelTitle, runnerWarning, useAiTrustTarget } from "../util/ai";
 
 // How much the AI may run without asking (#115, src-tauri/src/ai_tabs/trust.rs):
 // the level and the two lists of a server, a folder or every server. Kept on
@@ -73,6 +73,11 @@ const RuleList = ({ kind, rules, target, inherited, onChange }: {
     invoke("ai_trust_remove_rule", { id }).then(onChange, (e) => setError(errText(e)));
   };
   const own = rules.filter((r) => r.kind === kind);
+  const addPack = (patterns: string[]) => {
+    setError(null);
+    invoke<string[]>("ai_trust_add_rules", { scope: target.scope, id: target.id, patterns })
+      .then((added) => { if (added.length > 0) onChange(); }, (e) => setError(errText(e)));
+  };
   return (
     <div className="space-y-1.5">
       <div className="text-[11px] font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-1.5">
@@ -114,6 +119,26 @@ const RuleList = ({ kind, rules, target, inherited, onChange }: {
           {confirming ? "Yes, add it" : "Add"}
         </button>
       </div>
+      {kind === "allow" && (
+        <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+          <span className="text-[10.5px] text-zinc-500">Starter rules:</span>
+          {AI_STARTER_PACKS.map((pack) => {
+            const missing = pack.patterns.filter((pat) => !own.some((r) => r.pattern === pat));
+            return (
+              <button
+                key={pack.id}
+                type="button"
+                disabled={missing.length === 0}
+                onClick={() => addPack(missing)}
+                title={pack.patterns.join(", ")}
+                className="h-6 px-2 rounded-md border border-white/10 bg-white/[0.03] text-[10.5px] text-zinc-300 hover:border-primary/40 hover:text-white disabled:opacity-40"
+              >
+                + {pack.label}{missing.length > 0 && missing.length < pack.patterns.length ? ` (${missing.length})` : ""}
+              </button>
+            );
+          })}
+        </div>
+      )}
       {runner ? (
         <p className="text-[11px] text-red-300 font-semibold leading-snug">{runner}{confirming ? " Click “Yes, add it” to add it anyway." : ""}</p>
       ) : kind === "allow" && draft.trim().endsWith("*") && <p className="text-[11px] text-amber-300 leading-snug">{WILDCARD_WARNING}</p>}

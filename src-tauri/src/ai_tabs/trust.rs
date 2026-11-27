@@ -797,6 +797,9 @@ pub(crate) enum Decision {
     /// It runs now: the server is at "Run commands that only read", and it
     /// only reads (read_only.rs).
     ReadOnly,
+    /// It runs now: non-root commands allowed temporarily for this AI tab
+    /// and server.
+    TemporaryNonRoot,
     /// It runs now: you allowed everything on this server until the AI tab
     /// closes.
     Session,
@@ -811,6 +814,7 @@ impl Decision {
             Decision::Rule(r) => Some(format!("rule: {r}")),
             Decision::Anything => Some("level: run anything".into()),
             Decision::ReadOnly => Some("level: only reads".into()),
+            Decision::TemporaryNonRoot => Some("session: non-root".into()),
             Decision::Session => Some("session: allow everything".into()),
         }
     }
@@ -853,7 +857,21 @@ pub(crate) fn decide_as(policy: &Policy, session_allow: bool, command: &str, as_
 /// a password you typed for it here, or none where the server asks for
 /// none. Where the server wants a password this AI tab doesn't have, the
 /// card asks you for it (mod.rs): nothing here ever supplies one.
+#[cfg(test)]
 pub(crate) fn decide_parsed(policy: &Policy, session_allow: bool, command: &Parsed, as_root: bool) -> Decision {
+    decide_parsed_with_temp(policy, session_allow, false, command, as_root)
+}
+
+/// Like `decide_parsed`, also considering a temporary non-root grant
+/// (`allow_non_root`), which still asks for anything as root or matching
+/// an always-ask rule.
+pub(crate) fn decide_parsed_with_temp(
+    policy: &Policy,
+    session_allow: bool,
+    allow_non_root: bool,
+    command: &Parsed,
+    as_root: bool,
+) -> Decision {
     if let Some(rule) = policy.ask.iter().find(|r| ask_matches_parsed(r, command)) {
         return Decision::Ask { rule: Some(rule.clone()) };
     }
@@ -867,12 +885,17 @@ pub(crate) fn decide_parsed(policy: &Policy, session_allow: bool, command: &Pars
     if level == Level::Anything {
         return Decision::Anything;
     }
-    if level >= Level::AllowedCommands && !command.root && !as_root {
-        if let Some(rule) = policy.allow.iter().find(|r| allow_matches_on(r, &command.command, policy.windows)) {
-            return Decision::Rule(rule.clone());
+    if !command.root && !as_root {
+        if allow_non_root {
+            return Decision::TemporaryNonRoot;
         }
-        if level == Level::ReadOnly && policy.reads_alone() && super::read_only::only_reads(&command.command) {
-            return Decision::ReadOnly;
+        if level >= Level::AllowedCommands {
+            if let Some(rule) = policy.allow.iter().find(|r| allow_matches_on(r, &command.command, policy.windows)) {
+                return Decision::Rule(rule.clone());
+            }
+            if level == Level::ReadOnly && policy.reads_alone() && super::read_only::only_reads(&command.command) {
+                return Decision::ReadOnly;
+            }
         }
     }
     Decision::Ask { rule: None }
@@ -891,15 +914,23 @@ pub(crate) enum Requests {
     AskEachTime,
     AllowedCommands,
     ReadOnly,
+    NonRootTemporary,
     Anything,
 }
 
 impl Requests {
+    #[cfg(test)]
     pub(crate) fn of(policy: &Policy, allow_all: bool) -> Requests {
+        Requests::of_share(policy, allow_all, false)
+    }
+
+    pub(crate) fn of_share(policy: &Policy, allow_all: bool, allow_non_root: bool) -> Requests {
         if policy.force_ask.is_some() {
             Requests::AskEachTime
         } else if allow_all || Level::of(policy.level) == Level::Anything {
             Requests::Anything
+        } else if allow_non_root {
+            Requests::NonRootTemporary
         } else if Level::of(policy.level) == Level::ReadOnly && policy.reads_alone() {
             Requests::ReadOnly
         } else if Level::of(policy.level) >= Level::AllowedCommands && !policy.allow.is_empty() {
@@ -915,6 +946,7 @@ impl Requests {
             Requests::AskEachTime => "asks the user each time",
             Requests::AllowedCommands => "runs the user's allowed commands, asks for the rest",
             Requests::ReadOnly => "runs commands that only read and the user's allowed commands, asks for the rest",
+            Requests::NonRootTemporary => "runs non-root commands without asking (temporary), asks for root",
             Requests::Anything => "runs anything",
         }
     }
@@ -1119,6 +1151,9 @@ pub(crate) struct Policy {
     /// The OS the server reported (server_os.rs: an ID such as `ubuntu` or
     /// `windows`), for list_shared; None when it isn't known.
     pub os: Option<String>,
+    /// The folder this server sits in `(id, name)`, if any, for offering
+    /// folder-level rule promotion on an approval card.
+    pub folder: Option<(i64, String)>,
 }
 
 /// What the card says when the settings can't be read.
@@ -1144,7 +1179,7 @@ impl Policy {
 impl Default for Policy {
     /// Ask every time: what holds when nothing can be read.
     fn default() -> Self {
-        Policy { level: ASK_EVERY_TIME, allow: Vec::new(), ask: Vec::new(), windows: false, force_ask: None, os: None }
+        Policy { level: ASK_EVERY_TIME, allow: Vec::new(), ask: Vec::new(), windows: false, force_ask: None, os: None, folder: None }
     }
 }
 
@@ -1172,6 +1207,18 @@ fn level_of(conn: &Connection, scope: &str, id: i64) -> rusqlite::Result<Option<
     conn.query_row("SELECT level FROM ai_levels WHERE scope = ?1 AND scope_id = ?2", params![scope, id], |r| r.get(0)).optional()
 }
 
+/// The folder `server_id` sits in, `(id, name)`, if it sits in one.
+pub(crate) fn server_folder(conn: &Connection, server_id: i64) -> Option<(i64, String)> {
+    conn.query_row(
+        "SELECT f.id, f.name FROM servers s JOIN folders f ON f.id = s.folder_id WHERE s.id = ?1",
+        [server_id],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
 fn try_policy(conn: &Connection, server_id: Option<i64>) -> rusqlite::Result<Policy> {
     let mut p = Policy::default();
     let mut level = None;
@@ -1190,6 +1237,7 @@ fn try_policy(conn: &Connection, server_id: Option<i64>) -> rusqlite::Result<Pol
     let os = server_id.and_then(|id| conn.query_row("SELECT os FROM servers WHERE id = ?1", [id], |r| r.get::<_, Option<String>>(0)).ok().flatten());
     p.windows = os.as_deref() == Some("windows");
     p.os = os.filter(|os| is_os_id(os));
+    p.folder = server_id.and_then(|id| server_folder(conn, id));
     Ok(p)
 }
 
@@ -1652,6 +1700,49 @@ pub(crate) fn add_rule(conn: &Connection, scope: &str, id: i64, kind: &str, patt
     conn.execute("INSERT OR IGNORE INTO ai_rules (scope, scope_id, kind, pattern) VALUES (?1, ?2, ?3, ?4)", params![scope, id, kind, pattern])
         .map_err(db("AI_RULE_ADD"))?;
     Ok(pattern)
+}
+
+/// Add a batch of rules at once (starter presets): validates each rule,
+/// skips duplicates already in this list, and returns only the newly added
+/// patterns.
+pub(crate) fn add_rules(conn: &Connection, scope: &str, id: i64, kind: &str, patterns: &[String]) -> Result<Vec<String>, String> {
+    check_target(conn, scope, id)?;
+    let id = if scope == "default" { 0 } else { id };
+    let mut checked = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        checked.push(check_rule(kind, p)?);
+    }
+    let mut added = Vec::new();
+    for pattern in checked {
+        let already: bool = conn
+            .query_row(
+                "SELECT 1 FROM ai_rules WHERE scope = ?1 AND scope_id = ?2 AND kind = ?3 AND pattern = ?4",
+                params![scope, id, kind, &pattern],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(db("AI_RULE_ADD"))?
+            .is_some();
+        if already {
+            continue;
+        }
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ai_rules WHERE scope = ?1 AND scope_id = ?2 AND kind = ?3", params![scope, id, kind], |r| r.get(0))
+            .map_err(db("AI_RULE_ADD"))?;
+        if n >= MAX_RULES {
+            return Err(format!("A list holds up to {MAX_RULES} rules."));
+        }
+        conn.execute("INSERT OR IGNORE INTO ai_rules (scope, scope_id, kind, pattern) VALUES (?1, ?2, ?3, ?4)", params![scope, id, kind, &pattern])
+            .map_err(db("AI_RULE_ADD"))?;
+        added.push(pattern);
+    }
+    Ok(added)
+}
+
+/// Effective level of a folder (its own, an ancestor folder's, or default).
+pub(crate) fn folder_effective_level(conn: &Connection, folder_id: i64) -> Result<u8, String> {
+    let v = scope_view(conn, "folder", folder_id)?;
+    Ok(v.own_level.unwrap_or(v.inherited_level))
 }
 
 /// Remove a rule; returns what it was, for the audit log.

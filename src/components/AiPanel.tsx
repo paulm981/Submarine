@@ -1,7 +1,7 @@
 import { ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Bot, Check, ChevronDown, ChevronRight, Loader2, ShieldAlert, Square, X, Zap } from "lucide-react";
-import { AiDone, AiPending, AiRunning, AiServerAsk, AiServerCandidate, AiSnapshot, cardsOf, openServerTab, pickFrom, serverTarget, copyCard, followLimit, followSoFar, passwordAsk, runnerWarning, STEERED_BY_OUTPUT } from "../util/ai";
+import { Bot, Check, ChevronDown, ChevronRight, Clock, Loader2, ShieldAlert, Square, X, Zap } from "lucide-react";
+import { AiDone, AiPending, AiRunning, AiServerAsk, AiServerCandidate, AiSnapshot, cardsOf, openServerTab, pickFrom, serverTarget, copyCard, followLimit, followSoFar, passwordAsk, runnerWarning, suggestPattern, STEERED_BY_OUTPUT } from "../util/ai";
 import { formatBytes } from "../fork/bulk/plan";
 import { HIDDEN_CONTROLS } from "../util/fileName";
 import { WILDCARD_WARNING } from "./AiTrust";
@@ -259,7 +259,10 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
   // to deny with.
   const [extra, setExtra] = useState<"rule" | "note" | null>(null);
   const [rule, setRule] = useState(p.command.trim());
+  const [ruleScope, setRuleScope] = useState<"server" | "folder">("server");
   const [note, setNote] = useState("");
+  const suggested = suggestPattern(p.command);
+  const hasFolder = p.folder_id != null && !!p.folder_name;
   // The login's password for a request as root (#120, #232): typed here,
   // sent only with Allow, to the app, which hands it to dzdo's or sudo's own
   // prompt.
@@ -284,6 +287,7 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
   const { down, accept } = useSettledClicks(ref);
   const loginIsRoot = p.user === "root";
   const many = members && members.length > 1 ? members : null;
+  const anyRoot = many ? many.some((m) => m.root || m.as_root) : (p.root || p.as_root);
   // "Try one first" on a command for several servers: its first server
   // alone, the rest left waiting. Not for a copy, nor where a root password
   // would be typed on the card.
@@ -478,8 +482,39 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
         )}
         {extra === "rule" && (
           <div className="w-full space-y-1.5 rounded-lg border border-white/10 bg-black/20 p-2">
-            <div className="text-[10.5px] text-zinc-400">Always allow on {p.server}:</div>
+            <div className="flex flex-wrap items-center justify-between gap-1.5">
+              <div className="text-[10.5px] text-zinc-400">
+                Always allow on {hasFolder && ruleScope === "folder" ? `folder “${p.folder_name}”` : p.server}:
+              </div>
+              {hasFolder && (
+                <div className="inline-flex rounded-md border border-white/10 overflow-hidden text-[10px]">
+                  <NoFocusButton
+                    onPick={() => setRuleScope("server")}
+                    className={`px-1.5 py-0.5 ${ruleScope === "server" ? "bg-primary/20 text-primary font-semibold" : "text-zinc-400 hover:text-white"}`}
+                  >
+                    This server
+                  </NoFocusButton>
+                  <NoFocusButton
+                    onPick={() => setRuleScope("folder")}
+                    className={`px-1.5 py-0.5 border-l border-white/10 ${ruleScope === "folder" ? "bg-primary/20 text-primary font-semibold" : "text-zinc-400 hover:text-white"}`}
+                  >
+                    Folder
+                  </NoFocusButton>
+                </div>
+              )}
+            </div>
             <input value={rule} onChange={(e) => setRule(e.target.value)} onKeyDown={fieldKeys} spellCheck={false} aria-label="The command to always allow" className={field} />
+            {suggested && suggested !== rule.trim() && (
+              <div className="flex items-center gap-1.5 text-[10px] text-zinc-400">
+                <span>Pattern:</span>
+                <NoFocusButton
+                  onPick={() => setRule(suggested)}
+                  className="px-1.5 py-0.5 rounded border border-primary/30 bg-primary/10 text-primary font-mono hover:bg-primary/20"
+                >
+                  {suggested}
+                </NoFocusButton>
+              </div>
+            )}
             <p className="text-[10.5px] text-zinc-500 leading-snug">
               Exactly this command. End it with <code>&nbsp;*</code> to allow any arguments.
               {level < 2 && " This server asks every time now: saving also sets it to “Run my allowed commands, ask for the rest”."}
@@ -497,7 +532,7 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
                   if (globAsRule) return;
                   if (runner && confirmed !== rule) { setConfirmed(rule); confirmedAt.current = performance.now(); return; }
                   if (runner && performance.now() - confirmedAt.current < SETTLE_MS) return;
-                  act("ai_allow_always", { id: p.id, pattern: rule, confirmRunner: !!runner });
+                  act("ai_allow_always", { id: p.id, pattern: rule, confirmRunner: !!runner, scope: hasFolder ? ruleScope : "server" });
                 }}
                 onDown={down}
                 accept={accept}
@@ -510,6 +545,19 @@ export const PendingCard = ({ p, members, level, decide, act, onGoToServer }: {
               </NoFocusButton>
             </div>
           </div>
+        )}
+        {!p.copy && !anyRoot && (
+          <NoFocusButton
+            onPick={() => act("ai_allow_non_root", many && p.group ? { group: p.group.id, minutes: 15 } : { id: p.id, minutes: 15 })}
+            onDown={down}
+            accept={accept}
+            title={(many
+              ? "Runs this and subsequent non-root commands on these servers for 15 minutes without asking. Root requests and your always-ask list still ask."
+              : "Runs this and subsequent non-root commands on this server for 15 minutes without asking. Root requests and your always-ask list still ask.") + " " + STEERED_BY_OUTPUT}
+            className={`${link} flex items-center gap-1`}
+          >
+            <Clock size={11} className="shrink-0" /> {many ? `Allow non-root on these ${many.length} servers for 15 min` : "Allow non-root here for 15 min"}
+          </NoFocusButton>
         )}
         <NoFocusButton
           onPick={() => {
@@ -725,7 +773,7 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
                     {t.servers.map((s) => (
                       <span key={s.session_id} className="inline-flex items-center gap-0.5">
                         <NoFocusButton onPick={() => onGoToServer(s.session_id)} className="text-zinc-300 hover:text-white hover:underline">{s.name}</NoFocusButton>
-                        {s.allow_all && (
+                        {s.allow_all ? (
                           <NoFocusButton
                             onPick={() => run("ai_end_allow_all", { tabId: t.id, sessionId: s.session_id })}
                             title={`Everything is allowed on ${s.name} until ${t.label} closes. Click to end it.`}
@@ -733,7 +781,15 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
                           >
                             · end allow everything
                           </NoFocusButton>
-                        )}
+                        ) : s.allow_non_root_mins ? (
+                          <NoFocusButton
+                            onPick={() => run("ai_end_allow_all", { tabId: t.id, sessionId: s.session_id })}
+                            title={`Non-root commands are allowed on ${s.name} for about ${s.allow_non_root_mins} min. Click to end it.`}
+                            className="text-[10px] text-emerald-300 hover:text-red-300 hover:underline"
+                          >
+                            · non-root {s.allow_non_root_mins}m · end
+                          </NoFocusButton>
+                        ) : null}
                         <NoFocusButton
                           onPick={() => run("ai_unshare", { sessionId: s.session_id, tabId: t.id })}
                           title={`Stop sharing ${s.name} with ${t.label}`}
@@ -759,19 +815,39 @@ export const AiPanel = ({ snap, onClose, onGoToServer }: { snap: AiSnapshot; onC
 
         {/* Waiting for you. */}
         {(snap.server_asks ?? []).map((a) => <ServerAskCard key={a.id} a={a} act={run} />)}
-        {cardsOf(snap.pending).map(({ p, members }) => (
-          <PendingCard
-            key={`${p.id}:${p.asked_at}`}
-            p={p}
-            members={members}
-            level={levelOf(snap, p.tab_id, p.session_id)}
-            decide={(allow, note, password) => members.length > 1 && p.group
-              ? run("ai_decide_group", { group: p.group.id, allow, note: note ?? null })
-              : run("ai_tab_decide", { id: p.id, allow, note: note ?? null, password: password || null })}
-            act={run}
-            onGoToServer={onGoToServer}
-          />
-        ))}
+        {(() => {
+          const cards = cardsOf(snap.pending);
+          const roCards = cards.filter(({ members }) => members.every((m) => m.is_read_only));
+          const roIds = roCards.flatMap(({ members }) => members.map((m) => m.id));
+          return (
+            <>
+              {roCards.length >= 2 && (
+                <div className="mx-2 mt-2 flex items-center justify-between gap-2 rounded-lg border border-emerald-400/30 bg-emerald-400/[0.06] px-2.5 py-1.5">
+                  <span className="text-[11px] text-emerald-200">{roCards.length} read-only requests waiting</span>
+                  <NoFocusButton
+                    onPick={() => run("ai_allow_all_read_only", { ids: roIds })}
+                    className="h-6 px-2.5 rounded bg-emerald-500/20 border border-emerald-400/40 text-emerald-200 text-[10.5px] font-bold uppercase tracking-wider hover:bg-emerald-500 hover:text-zinc-950 flex items-center gap-1"
+                  >
+                    <Check size={11} /> Allow all {roCards.length} read-only
+                  </NoFocusButton>
+                </div>
+              )}
+              {cards.map(({ p, members }) => (
+                <PendingCard
+                  key={`${p.id}:${p.asked_at}`}
+                  p={p}
+                  members={members}
+                  level={levelOf(snap, p.tab_id, p.session_id)}
+                  decide={(allow, note, password) => members.length > 1 && p.group
+                    ? run("ai_decide_group", { group: p.group.id, allow, note: note ?? null })
+                    : run("ai_tab_decide", { id: p.id, allow, note: note ?? null, password: password || null })}
+                  act={run}
+                  onGoToServer={onGoToServer}
+                />
+              ))}
+            </>
+          );
+        })()}
 
         {/* Running now. */}
         {snap.running.map((r) => r.follow ? <FollowRow key={r.id} r={r} act={run} /> : (
