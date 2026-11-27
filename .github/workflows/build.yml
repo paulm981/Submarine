@@ -2,14 +2,20 @@ name: Build
 
 # Builds Submarine's installers on GitHub's runners (Windows, macOS, Linux):
 #
-#   • Every push to main (a merged pull request) → a release of the fork,
-#     tagged with the original project's version and the fork's count:
-#     v0.4.0-fork.1, v0.4.0-fork.2, …, then v0.4.1-fork.1 once 0.4.1 is in
-#     (the version job). Its installers have the same names in every
-#     release, so a link to releases/latest/download/<name> always gets the
-#     newest. The app shows its version and says when there's a newer one.
-#   • Run workflow (Actions tab) → builds the version typed in, as a test;
-#     nothing is published.
+#   • Run workflow (Actions tab, from main) with "Publish a fork release"
+#     checked (the default) → builds Windows and Linux and publishes the
+#     next release, tagged with the original project's version and the
+#     fork's count: v0.5.0-fork.1, v0.5.0-fork.2, …, then v0.5.1-fork.1
+#     once 0.5.1 is in (the version job), and rolls all queued
+#     changelog.d/ entries into CHANGELOG.md. Its installers have the same
+#     names in every release, so a link to releases/latest/download/<name>
+#     always gets the newest.
+#   • Uncheck "Publish a fork release" → builds the version typed in, as a
+#     test; nothing is published.
+#
+# Merging pull requests to main does NOT trigger a release build, so sync
+# steps and fixes can land without burning Actions minutes until you're
+# ready to cut a release.
 #
 # Android is built only when the repository variable BUILD_ANDROID is
 # "true" and the signing secrets are set (see the android job).
@@ -21,24 +27,19 @@ name: Build
 # release (the mac-release job). Only a release with its Windows installer
 # gets one.
 on:
-  push:
-    branches: [main]
-    # A change to the docs alone isn't a new release, nor is one to the pull
-    # request checks alone.
-    paths-ignore:
-      - "**/*.md"
-      - "LICENSE"
-      - "docs/**"
-      - "tools/screenshots/**"
-      - ".github/workflows/check.yml"
   workflow_dispatch:
     inputs:
-      version:
-        description: "Version to build as a test (e.g. v0.0.1-test; at least 0.0.1, the lowest an Android package may have); nothing is published"
+      publish:
+        description: "Publish a fork release from main (uncheck for a test build only)"
+        type: boolean
         required: true
+        default: true
+      version:
+        description: "Test version when Publish is unchecked (e.g. v0.0.1-test; at least 0.0.1)"
+        required: false
         default: "v0.0.1-test"
       macos_for:
-        description: "Or: add the Mac build to this release (its tag, e.g. v0.4.0-fork.19). The version above is then not used."
+        description: "Or: add the Mac build to this release (its tag, e.g. v0.4.0-fork.19). Ignores Publish and Version."
         required: false
         default: ""
 
@@ -82,6 +83,7 @@ jobs:
       matrix: ${{ steps.pick.outputs.matrix }}
       ref: ${{ steps.pick.outputs.ref }}
       mac_only: ${{ steps.pick.outputs.mac_only }}
+      publish: ${{ steps.pick.outputs.publish }}
     steps:
       # All of history, for the tags. Nothing here pushes.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -97,9 +99,10 @@ jobs:
         # otherwise run as part of this step. Either way the result is checked
         # against a version shape before it's used.
         env:
-          EVENT_NAME: ${{ github.event_name }}
+          INPUT_PUBLISH: ${{ github.event.inputs.publish }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
           MACOS_FOR: ${{ github.event.inputs.macos_for }}
+          GITHUB_REF_NAME_ENV: ${{ github.ref }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
@@ -119,7 +122,8 @@ jobs:
           # .app (zipped) and a .dmg.
           MAC='{"platform":"macos-latest","os_name":"macos-arm64","bundles":"app,dmg","rust_target":"aarch64-apple-darwin"}'
           MATRIX="[$WINDOWS,$LINUX]"
-          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$MACOS_FOR" ]; then
+          PUBLISH="false"
+          if [ -n "$MACOS_FOR" ]; then
             if ! printf '%s' "$MACOS_FOR" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-fork\.[0-9]+$'; then
               echo "::error::Not one of the fork's release tags: $MACOS_FOR"
               exit 1
@@ -133,9 +137,11 @@ jobs:
             MATRIX="[$MAC]"
             echo "ref=refs/tags/$MACOS_FOR" >> "$GITHUB_OUTPUT"
             echo "mac_only=true" >> "$GITHUB_OUTPUT"
-          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            RAW="$INPUT_VERSION"
-          else
+          elif [ "$INPUT_PUBLISH" = "true" ]; then
+            if [ "$GITHUB_REF_NAME_ENV" != "refs/heads/main" ]; then
+              echo "::error::Releases can only be published from main (got $GITHUB_REF_NAME_ENV). Uncheck 'Publish a fork release' for a test build."
+              exit 1
+            fi
             BASE="$(node -p "require('./src-tauri/tauri.conf.json').version")"
             if ! printf '%s' "$BASE" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
               echo "::error::Unexpected version in tauri.conf.json: $BASE"
@@ -143,6 +149,9 @@ jobs:
             fi
             LAST="$(git tag -l "v$BASE-fork.*" | sed "s/^v$BASE-fork\.//" | grep -E '^[0-9]+$' | sort -n | tail -1 || true)"
             RAW="v$BASE-fork.$(( ${LAST:-0} + 1 ))"
+            PUBLISH="true"
+          else
+            RAW="$INPUT_VERSION"
           fi
           if ! printf '%s' "$RAW" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]+)?$'; then
             echo "Refusing an unexpected version string: $RAW" >&2
@@ -152,7 +161,8 @@ jobs:
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
-          echo "This run's version: $VERSION"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "This run's version: $VERSION (publish=$PUBLISH)"
 
   build:
     needs: version
@@ -742,15 +752,16 @@ jobs:
 
   # Publishes this run's release: the installers under names that are the
   # same in every release (so releases/latest/download/<name> always gets
-  # the newest), with notes on installing them. Only for a push to main; a
-  # manual run publishes nothing. Also when another platform's build failed:
-  # the Windows build still goes out. Never without it (see "Name the files").
+  # the newest), with notes on installing them. Runs only when triggered
+  # from main with "Publish a fork release" checked. Also when another
+  # platform's build failed: the Windows build still goes out. Never
+  # without it (see "Name the files").
   release:
     needs: [version, build, android-sign]
     runs-on: ubuntu-latest
     if: >-
-      !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'
-      && needs.version.result == 'success'
+      !cancelled() && needs.version.outputs.publish == 'true'
+      && github.ref == 'refs/heads/main' && needs.version.result == 'success'
     # Only this job writes: it publishes the release, and signs where its
     # files came from (an OIDC token for Sigstore, and the attestation store).
     permissions:
