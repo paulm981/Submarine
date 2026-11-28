@@ -80,6 +80,7 @@ mod server_look; use server_look::*;
 mod clone_server; use clone_server::*;
 mod keep_session;
 mod bulk_pick;
+mod secret_cmd_review;
 mod vault_schema;
 mod sync_merge;
 mod profile_create;
@@ -9669,30 +9670,10 @@ async fn delete_command(state: tauri::State<'_, DbState>, id: i32) -> Result<(),
 
 #[tauri::command]
 async fn get_commands(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+    let my_node = state.hlc.lock().ok().and_then(|g| g.as_ref().map(|h| h.node_id().to_string()));
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-    let mut stmt = conn.prepare("SELECT id, title, content, scope, is_secret, tags FROM commands").map_err(|e| e.to_string())?;
-
-    let rows = stmt.query_map([], |row| {
-        Ok(json!({
-            "id": row.get::<_, i32>(0)?,
-            "title": row.get::<_, String>(1)?,
-            "content": row.get::<_, String>(2)?,
-            // As a synced peer sent it: the frontend reads it defensively
-            // (util/commandScope), so a broken one counts as all servers.
-            "scope": row.get::<_, Option<String>>(3)?,
-            // A NULL or out-of-range value from a peer must not fail
-            // the whole list (same shape as run_on_connect_every).
-            "is_secret": row.get::<_, Option<i64>>(4)?.unwrap_or(0) != 0,
-            "tags": row.get::<_, Option<String>>(5)?
-        }))
-    }).map_err(|e| e.to_string())?;
-    
-    let mut list = Vec::new();
-    for r in rows {
-        list.push(r.map_err(|e| format!("[DATABASE] ROW_FETCH_FAILED: {}", e))?);
-    }
-    Ok(list)
+    secret_cmd_review::list_commands(conn, my_node.as_deref())
 }
 
 // ───────────────────────── Command History ─────────────────────────

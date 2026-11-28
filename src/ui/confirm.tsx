@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { AlertTriangle, X } from "lucide-react";
 import { visibleName } from "../util/fileName";
 import { useT } from "../i18n";
+import { isConfirmOkLocked } from "../fork/secretCmdReview";
 
 // Focus trap for our modal portals. When a prompt opens (`openId` is its id,
 // null while that kind of prompt is closed), remember the element that had
@@ -94,6 +95,10 @@ export interface ConfirmOptions {
   /** Hidden text the user can reveal inside the dialog (a secret command
    *  about to run): the message stays hidden until they ask to see it. */
   revealableText?: string;
+  /** Keep OK/Run disabled until revealableText is shown (#286). */
+  revealBeforeOk?: boolean;
+  /** Who changed the secret command and when (#286). */
+  changedNotice?: string;
 }
 
 type Resolver = (value: boolean) => void;
@@ -176,7 +181,8 @@ const UNSAVED_POINTER_GRACE_MS = 300;
 const sameConfirm = (a: ConfirmOptions, b: ConfirmOptions) =>
   a.title === b.title && a.message === b.message && a.okLabel === b.okLabel &&
   a.cancelLabel === b.cancelLabel && !!a.destructive === !!b.destructive &&
-  a.revealableText === b.revealableText;
+  a.revealableText === b.revealableText && !!a.revealBeforeOk === !!b.revealBeforeOk &&
+  a.changedNotice === b.changedNotice;
 
 // A dialog comes up under the pointer of the click that asked for it, so the
 // second click of a double-click lands on the dialog: beside it, or on one of
@@ -295,7 +301,10 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
     return true;
   };
 
+  const confirmLocked = state ? isConfirmOkLocked(state.opts, confirmRevealed) : false;
+
   const close = (value: boolean) => {
+    if (value && confirmLocked) return;
     if (state && advance(state)) {
       if (value && dontAsk) state.opts.dontAskAgain?.();
       state.resolve(value);
@@ -510,6 +519,11 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
             </div>
             {/* Scrolls: a Library command is shown whole, however long it is,
                 and the buttons have to stay on screen. */}
+            {state.opts.changedNotice && (
+              <p className="mb-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-200 leading-snug">
+                {state.opts.changedNotice}
+              </p>
+            )}
             {state.opts.revealableText && (
               <button
                 type="button"
@@ -537,8 +551,11 @@ export const ConfirmProvider = ({ children }: { children: React.ReactNode }) => 
                 {state.opts.cancelLabel || t("Cancel")}
               </button>
               <button onClick={() => close(true)}
+                      disabled={confirmLocked}
                       data-default-focus={state.opts.safeDefault ? undefined : true}
                       className={`px-3 h-10 sm:h-8 rounded text-[12px] font-semibold border ${
+                        confirmLocked ? "opacity-40 cursor-not-allowed pointer-events-none " : ""
+                      }${
                         state.opts.destructive
                           ? "bg-rose-500/15 border-rose-500/40 text-rose-300 hover:bg-rose-500/25"
                           : "bg-primary/15 border-primary/40 text-primary hover:bg-primary/25"

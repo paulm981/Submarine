@@ -116,6 +116,11 @@ impl Hlc {
         });
     }
 
+    /// This device's own HLC node id.
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
     /// Extract the physical-ms component from a stamp (for seeding / `observe`).
     pub fn phys_of(stamp: &str) -> u64 {
         stamp.split(':').next().and_then(|s| s.parse().ok()).unwrap_or(0)

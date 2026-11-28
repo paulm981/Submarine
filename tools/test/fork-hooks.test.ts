@@ -116,8 +116,10 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
   },
   // Report this reply goes to the fork's GitHub, with the fork's words.
   { file: "src/components/ai/ChatPanel.tsx", imports: ["../../fork/feedback"], uses: ["...REPORT_REPLY_CONFIRM"] },
+  { file: "src/components/CmdsPanel.tsx", imports: ["../fork/secretCmdReview"], uses: ["secretReviewOf"] },
   { file: "src/main.tsx", imports: ["./util/diagnostics", "./util/nativeMenus", "./util/plainTyping", "./fork/dialogFocus.css"] },
-  { file: "src/ui/confirm.tsx", imports: ["../util/fileName"] },
+  { file: "src/ui/confirm.tsx", imports: ["../util/fileName", "../fork/secretCmdReview"], uses: ["isConfirmOkLocked", "disabled={confirmLocked"] },
+  { file: "src/util/pasteText.ts", imports: ["../fork/secretCmdReview"], uses: ["secretConfirmExtras"] },
 ];
 
 // Every source file's text, by its path from the repository root ("/src/…"):
