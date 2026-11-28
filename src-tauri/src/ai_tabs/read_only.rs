@@ -492,6 +492,10 @@ fn jq_reads(args: &[Word]) -> bool {
 /// `rev-parse`, `describe`, and read-only `branch` flags), with `-c`,
 /// `--config-env`, `--exec-path`, `--git-dir`, `--work-tree`, `--output`
 /// and `--ext-diff` refused.
+/// Safe read-only `git` commands (#290, #302). `status`, `diff`, `log`, `show`,
+/// and `describe --dirty/--broken` are excluded because a repository's own
+/// `.git/config` or `.gitattributes` can configure `core.fsmonitor`,
+/// `diff.external`, `textconv`, or `gpg.program` to execute programs.
 fn git_reads(args: &[Word]) -> bool {
     let mut i = 0;
     while i < args.len() {
@@ -517,7 +521,8 @@ fn git_reads(args: &[Word]) -> bool {
         return false;
     }
     match sub.text.as_str() {
-        "status" | "log" | "diff" | "show" | "rev-parse" | "describe" => true,
+        "rev-parse" => true,
+        "describe" => !long_is(rest, &["--dirty", "--broken"]),
         "branch" => rest.iter().all(|w| {
             matches!(w.text.as_str(), "--show-current" | "--list" | "-a" | "--all" | "-r" | "--remotes" | "-v" | "-vv" | "--verbose" | "--no-color" | "--color")
         }),

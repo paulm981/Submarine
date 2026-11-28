@@ -511,6 +511,14 @@ fn safe_sed_jq_and_git_inspection_run() {
         "jq -r '.items[].name' /tmp/x.json",
         "jq -c '.environment' /tmp/x.json",
         "cat /tmp/x.json | jq -r '.version'",
+        "git rev-parse --abbrev-ref HEAD",
+        "git -C /srv/app rev-parse HEAD",
+        "git describe --tags --always",
+        "git branch --show-current",
+        "git branch -a",
+        "git branch -vv",
+    ]);
+    asks(&[
         "git status",
         "git status -s",
         "git log -n 10 --oneline",
@@ -518,11 +526,10 @@ fn safe_sed_jq_and_git_inspection_run() {
         "git show --stat HEAD",
         "git -C /srv/app status",
         "git --no-pager log -5",
-        "git rev-parse --abbrev-ref HEAD",
-        "git branch --show-current",
-        "git branch -a",
-    ]);
-    asks(&[
+        "git describe --dirty",
+        "git describe --broken",
+        "git describe --dirt",
+        "git describe --brok",
         "jq . /srv/.env",
         "jq . /etc/shadow",
         "sed -n 1,10p /etc/shadow",
