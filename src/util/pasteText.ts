@@ -1,6 +1,7 @@
 import { t } from "../i18n";
 import type { ConfirmOptions } from "../ui/confirm";
 import { inspect, stripHidden } from "./hiddenChars";
+import { secretConfirmExtras, type SecretReviewInfo } from "../fork/secretCmdReview";
 
 // What of a paste may reach the program in the terminal. A paste is text the
 // user didn't type: from a page, a chat, a document. Left whole, it can carry
@@ -49,6 +50,8 @@ export interface WriteToTerminal {
   /** A secret (Library) command: the confirm dialog hides its content
       unless the user asks to show it there, and a run always asks first. */
   secret?: boolean;
+  /** Provenance when someone else changed a secret Library command (#286). */
+  secretReview?: SecretReviewInfo;
 }
 
 /**
@@ -68,7 +71,7 @@ export interface WriteToTerminal {
  * terminal asks once more there (TerminalView). True when the text was sent
  * to the terminal.
  */
-export async function writeToTerminal({ terminalId, text, enter, cut = false, confirm, secret = false }: WriteToTerminal): Promise<boolean> {
+export async function writeToTerminal({ terminalId, text, enter, cut = false, confirm, secret = false, secretReview }: WriteToTerminal): Promise<boolean> {
   if (!terminalId) return false;
   // A loop, not /\n+$/: that regex retries from every line break of a long
   // run that isn't at the end, and a reply can hold 200,000 of them.
@@ -92,6 +95,7 @@ export async function writeToTerminal({ terminalId, text, enter, cut = false, co
       revealableText: secret ? clean : undefined,
       okLabel: enter ? t("Run") : t("Paste"),
       safeDefault: true,
+      ...(secret && enter ? secretConfirmExtras(secretReview) : {}),
     });
     if (!ok) return false;
   }

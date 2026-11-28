@@ -9,6 +9,7 @@ import { splitTags, tagKey, tagsProblem } from "../util/commandTags";
 import { serverRowChanged } from "../util/serverJson";
 import { useT } from "../i18n";
 import { copyText } from "../util/clipboard";
+import { secretReviewOf, type SecretReviewInfo } from "../fork/secretCmdReview";
 
 // Side panel that opens from a terminal session and surfaces *both* the
 // user's saved Quick Commands and their Notes. Two patterns for editing:
@@ -31,7 +32,7 @@ import { copyText } from "../util/clipboard";
 // `scope`: which servers it's for (util/commandScope), as stored.
 // `is_secret`: masked in the list (eye toggle to reveal in the editor);
 // `tags`: comma-separated list, for filtering.
-interface CommandItem { id: number; title: string; content: string; scope?: string | null; is_secret?: boolean; tags?: string | null; }
+interface CommandItem { id: number; title: string; content: string; scope?: string | null; is_secret?: boolean; tags?: string | null; changed_by_other?: boolean; edited_by?: string | null; updated_at?: string | null; }
 interface NoteItem { id: number; title: string; body: string; }
 type Tab = "commands" | "notes" | "node";
 
@@ -368,8 +369,12 @@ export const CmdsPanel = ({ activeTab, onClose, headerActions, serverId, serverN
   // was cut short there. `secret` hides the content in the confirm dialog
   // (revealable there) and always asks before a run — and a secret has no
   // Paste button, Run only.
-  const toTerminal = (text: string, execute: boolean, cut = false, secret = false) =>
-    void writeToTerminal({ terminalId: activeTab, text, enter: execute, cut, confirm, secret });
+  const pendingReviewRef = useRef<SecretReviewInfo | undefined>(undefined);
+  const toTerminal = (text: string, execute: boolean, cut = false, secret = false) => {
+    const secretReview = execute && secret ? pendingReviewRef.current : undefined;
+    pendingReviewRef.current = undefined;
+    void writeToTerminal({ terminalId: activeTab, text, enter: execute, cut, confirm, secret, secretReview });
+  };
 
   const copyToClipboard = async (text: string) => {
     try { await copyText(text); }
@@ -826,7 +831,7 @@ export const CmdsPanel = ({ activeTab, onClose, headerActions, serverId, serverN
                       </div>
                       <div className="flex gap-1.5 mt-2">
                         <button
-                          onClick={(e) => toTerminal(c.content, true, cutOnCard(e.currentTarget), !!c.is_secret)}
+                          onClick={(e) => { pendingReviewRef.current = c.is_secret ? secretReviewOf(c) : undefined; toTerminal(c.content, true, cutOnCard(e.currentTarget), !!c.is_secret); }}
                           className="flex-1 h-7 rounded-lg bg-primary/10 text-primary border border-primary/20 hover:bg-primary hover:text-zinc-950 hover:border-primary flex items-center justify-center gap-1.5 text-[10px] font-bold transition-all"
                           title={t("Run in active terminal (writes + Enter)")}
                         >
