@@ -4,6 +4,9 @@
 
 use super::*;
 
+#[path = "fuzz.rs"]
+mod fuzz;
+
 #[test]
 fn a_startup_command_comes_back_as_it_was_typed() {
     let text = export(&[session(
