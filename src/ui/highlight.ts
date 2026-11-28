@@ -20,6 +20,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { RE2JS } from "../fork/vendor/re2js/index.js";
+import { HIGHLIGHT_KEY, HIGHLIGHT_NONE, HIGHLIGHT_MINE, DEFAULT_HIGHLIGHT, HIGHLIGHT_SET_IDS, readHighlightId } from "./highlightPrefs";
+export { HIGHLIGHT_KEY, HIGHLIGHT_NONE, HIGHLIGHT_MINE, DEFAULT_HIGHLIGHT, HIGHLIGHT_SET_IDS, readHighlightId };
 
 export type HighlightColor =
   | "red" | "green" | "yellow" | "blue" | "magenta" | "cyan"
@@ -258,10 +260,6 @@ const SQL_RULES: readonly SetRule[] = [
   },
   { pattern: String.raw`\b\d{1,20}(?:\.\d{1,20})?\b`, style: { color: "yellow" } },
 ];
-
-export const HIGHLIGHT_NONE = "none";
-export const HIGHLIGHT_MINE = "mine";
-export const DEFAULT_HIGHLIGHT = "standard";
 
 export const HIGHLIGHT_SETS: readonly HighlightSet[] = [
   { id: HIGHLIGHT_NONE, name: "None", description: "No highlighting.", rules: [] },
@@ -1202,18 +1200,6 @@ function wrap(text: string, style: HighlightStyle, at: Plain, grays: ReadonlySet
 }
 
 // ── Choices ─────────────────────────────────────────────────────────────────
-
-export const HIGHLIGHT_KEY = "submarine-terminal-highlight";
-
-/** This device's set (Settings › Terminal). */
-export function readHighlightId(): string {
-  try {
-    const id = localStorage.getItem(HIGHLIGHT_KEY) || DEFAULT_HIGHLIGHT;
-    return setById.has(id) ? id : DEFAULT_HIGHLIGHT;
-  } catch {
-    return DEFAULT_HIGHLIGHT;
-  }
-}
 
 // Each saved server's own set and the user's rules, kept current by
 // DesktopApp (from the server list, and get_highlight_rules); a terminal

@@ -5,7 +5,7 @@ import type { TreeItems } from "../../components/SessionTree";
 import { useBroadcast } from "../../ui/broadcast";
 import { broadcastLive, shownTabs } from "./broadcastWall";
 import { useConfirm } from "../../ui/confirm";
-import { normalizeRules, onSlowRule, setCustomRules, setServerHighlights } from "../../ui/highlight";
+import { loadForkWorkspace } from "./lazy";
 import { reorderById, useTabDrag } from "../../ui/tabDrag";
 import { appHotkey } from "../../ui/terminalDock";
 import { setTabStepOrder } from "../keys";
@@ -38,8 +38,14 @@ type SetList<T> = (f: (prev: T[]) => T[]) => void;
 export const useServerLooks = (servers: any[]) => {
   useEffect(() => {
     const schemes = setServerSchemes(servers);
-    const highlights = setServerHighlights(servers);
-    if (schemes || highlights) window.dispatchEvent(new CustomEvent('submarine-settings-changed'));
+    if (schemes) window.dispatchEvent(new CustomEvent('submarine-settings-changed'));
+    let active = true;
+    void import("../../ui/highlight").then(({ setServerHighlights }) => {
+      if (active && setServerHighlights(servers)) {
+        window.dispatchEvent(new CustomEvent('submarine-settings-changed'));
+      }
+    }).catch(() => {});
+    return () => { active = false; };
   }, [servers]);
 };
 
@@ -49,17 +55,26 @@ export const useServerLooks = (servers: any[]) => {
 export const useHighlightRules = (addLog: AddLog) => {
   const refreshHighlightRules = useCallback(async () => {
     try {
-      if (setCustomRules(normalizeRules(await invoke("highlight_rules_list")))) {
+      const [{ normalizeRules, setCustomRules }, raw] = await Promise.all([
+        import("../../ui/highlight"),
+        invoke("highlight_rules_list"),
+      ]);
+      if (setCustomRules(normalizeRules(raw))) {
         window.dispatchEvent(new CustomEvent('submarine-settings-changed'));
       }
     } catch (e) { addLog(`SYNC_HIGHLIGHT_RULES: ${e}`, "error"); }
   }, [addLog]);
   useEffect(() => {
-    onSlowRule((label) => {
-      const msg = `The highlight rule "${label}" was too slow on this output, so it's off until Submarine restarts.`;
-      addLog(msg, "warn");
-      logLine("warn", `[highlight] ${msg}`);
-    });
+    let active = true;
+    void import("../../ui/highlight").then(({ onSlowRule }) => {
+      if (!active) return;
+      onSlowRule((label) => {
+        const msg = `The highlight rule "${label}" was too slow on this output, so it's off until Submarine restarts.`;
+        addLog(msg, "warn");
+        logLine("warn", `[highlight] ${msg}`);
+      });
+    }).catch(() => {});
+    return () => { active = false; };
   }, [addLog]);
   return refreshHighlightRules;
 };
@@ -116,9 +131,18 @@ export const useTabStrip = <S extends { id: string }>(setSessions: SetList<S>) =
 
 /** Live Edit copies with changes that were never uploaded, kept when their
  *  session ended or the profile was locked (keep_unsent_edits in lib.rs):
- *  the log says where, and a prompt offers the folder. */
+ *  the log says where, and a prompt offers the folder.
+ *  Also schedules idle preload of the unlocked fork chunk (#285). */
 export const useLiveEditKept = (addLog: AddLog) => {
   const confirm = useConfirm();
+  useEffect(() => {
+    const go = () => { void loadForkWorkspace().catch(() => {}); };
+    const idle = typeof window.requestIdleCallback === "function";
+    const id = idle ? window.requestIdleCallback(go, { timeout: 1500 }) : window.setTimeout(go, 300);
+    return () => {
+      if (idle) window.cancelIdleCallback(id); else window.clearTimeout(id);
+    };
+  }, []);
   useEffect(() => {
     const unlisten = listen<{ folder: string; files: string[] }>("live-edit-kept", async (e) => {
       const { folder, files } = e.payload;

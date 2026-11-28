@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { CUSTOM_SCHEME_KEY, GPU_KEY, SCHEME_KEY, readGpu, readSchemeId } from "../../ui/terminalThemes";
-import { HIGHLIGHT_KEY, readHighlightId } from "../../ui/highlight";
+import { HIGHLIGHT_KEY, readHighlightId } from "../../ui/highlightPrefs";
 import { PING_SOUND_KEY, readPingSound } from "../../ui/ping";
 import { INFO_FONT_SIZE_KEY, readInfoFontSize } from "../../util/infoFont";
 
