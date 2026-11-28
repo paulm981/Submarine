@@ -23,8 +23,11 @@
 //!   look as if they read: `awk` (`system()`), `less` and `man` (a shell),
 //!   `env`, `xargs`, `watch`, `timeout`, `tee`. `sed` runs only with `-n` and
 //!   a line-range print script (`1,50p`), `jq` only without `env` or file
-//!   reads, and `git` only for read-only status/log/diff/show/branch
-//!   without `-c` or hook/pager overrides. Everything that reaches out asks:
+//!   reads, and `git` only for `rev-parse`, `describe` and listing
+//!   `branch`, without `-c`. `git status`, `diff`, `log` and `show` ask: a
+//!   repository's own config can run a program on them (`core.fsmonitor`,
+//!   `diff.external`, a `textconv` driver, `gpg.program`; #302), and `-c`
+//!   on the command line has nothing to do with it. Everything that reaches out asks:
 //!   `curl`, `wget`, `nc`, `ssh`, `ping`, `dig`, `nslookup` (a hostname can
 //!   carry data out).
 //! - **Devices ask** (`reaches_a_device`): opening one can do something,
@@ -488,10 +491,13 @@ fn jq_reads(args: &[Word]) -> bool {
         .any(|ident| matches!(ident, "env" | "ENV" | "debug" | "halt" | "halt_error" | "input" | "inputs"))
 }
 
-/// `git` read-only inspection (`status`, `log`, `diff`, `show`,
-/// `rev-parse`, `describe`, and read-only `branch` flags), with `-c`,
-/// `--config-env`, `--exec-path`, `--git-dir`, `--work-tree`, `--output`
-/// and `--ext-diff` refused.
+/// `git` showing where it is: `rev-parse`, `describe` (without `--dirty`
+/// or `--broken`, which look at the work tree) and read-only `branch`
+/// flags, with `-c`, `--config-env`, `--exec-path`, `--git-dir`,
+/// `--work-tree`, `--output` and `--ext-diff` refused. `status`, `diff`,
+/// `log` and `show` ask: a repository's own config or `.gitattributes` can
+/// make them run a program (#302). None of these starts a pager: the AI's
+/// commands have no terminal (exec.rs).
 fn git_reads(args: &[Word]) -> bool {
     let mut i = 0;
     while i < args.len() {
@@ -517,7 +523,8 @@ fn git_reads(args: &[Word]) -> bool {
         return false;
     }
     match sub.text.as_str() {
-        "status" | "log" | "diff" | "show" | "rev-parse" | "describe" => true,
+        "rev-parse" => true,
+        "describe" => !long_is(rest, &["--dirty", "--broken"]),
         "branch" => rest.iter().all(|w| {
             matches!(w.text.as_str(), "--show-current" | "--list" | "-a" | "--all" | "-r" | "--remotes" | "-v" | "-vv" | "--verbose" | "--no-color" | "--color")
         }),
