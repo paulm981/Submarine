@@ -555,12 +555,19 @@ pub enum App {
     /// macOS: whatever opens `.rdp` files (Windows App).
     MacOpen,
     Remmina(PathBuf),
+    /// Remmina from Flathub, started by `flatpak` (this program).
+    RemminaFlatpak(PathBuf),
     FreeRdp(PathBuf),
 }
 
+/// Remmina's app id on Flathub, also the name of the script Flatpak makes to
+/// run it.
+const REMMINA_FLATPAK: &str = "org.remmina.Remmina";
+
 /// The RDP app this system has. Linux and the other Unixes: Remmina first
-/// (it asks for the password in a window), else FreeRDP's SDL client (a
-/// window too), else its X11 client. `find` looks a program up on PATH.
+/// (it asks for the password in a window), the system's own before the one
+/// from Flathub, else FreeRDP's SDL client (a window too), else its X11
+/// client. `find` looks a program up (`find_program`).
 pub fn pick_app(find: impl Fn(&str) -> Option<PathBuf>) -> Result<App, String> {
     if cfg!(target_os = "windows") {
         let root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
@@ -574,6 +581,11 @@ pub fn pick_app(find: impl Fn(&str) -> Option<PathBuf>) -> Result<App, String> {
     }
     if let Some(program) = find("remmina") {
         return Ok(App::Remmina(program));
+    }
+    // Flatpak's script shows it is there, but can't hand it a file: `flatpak`
+    // itself starts it.
+    if let Some(flatpak) = find(REMMINA_FLATPAK).and_then(|_| find("flatpak")) {
+        return Ok(App::RemminaFlatpak(flatpak));
     }
     ["sdl-freerdp3", "sdl-freerdp", "xfreerdp3", "xfreerdp"]
         .into_iter()
@@ -612,6 +624,7 @@ pub struct Launcher {
 /// (the saved one, if any); the other apps ask for it.
 pub fn prepare(app: App, session_id: &str, address: &str, user: &str, options: &RdpOptions, password: Option<&str>) -> Result<Launcher, String> {
     let path_arg = |p: &PathBuf| p.to_string_lossy().into_owned();
+    let flatpak = matches!(app, App::RemminaFlatpak(_));
     Ok(match app {
         App::Mstsc(program) => {
             // Without it when it can't be protected: the app then asks.
@@ -627,10 +640,19 @@ pub fn prepare(app: App, session_id: &str, address: &str, user: &str, options: &
             let file = write_file(session_id, "rdp", &rdp_file(address, user, options, None))?;
             Launcher { name: "the app that opens .rdp files", program: PathBuf::from("/usr/bin/open"), args: vec![path_arg(&file)], tracked: false, file: Some(file), secret: false }
         }
-        App::Remmina(program) => {
+        App::Remmina(program) | App::RemminaFlatpak(program) => {
             let home = crate::ssh_config::home_dir().map(PathBuf::from);
             let file = write_file(session_id, "remmina", &remmina_file(address, user, options, home.as_deref()))?;
-            Launcher { name: "Remmina", program, args: vec!["-c".into(), path_arg(&file)], tracked: false, file: Some(file), secret: false }
+            let file_arg = path_arg(&file);
+            let args = if flatpak {
+                // A Flatpak sees only some folders (Remmina: the home folder,
+                // not the temp one). A file named between `@@` marks that it
+                // can't see, `flatpak run` hands it through the document portal.
+                ["run", "--file-forwarding", REMMINA_FLATPAK, "-c", "@@", file_arg.as_str(), "@@"].map(String::from).into()
+            } else {
+                vec!["-c".into(), file_arg]
+            };
+            Launcher { name: "Remmina", program, args, tracked: false, file: Some(file), secret: false }
         }
         App::FreeRdp(program) => Launcher { name: "FreeRDP", program, args: freerdp_args(address, user, options), tracked: true, file: None, secret: false },
     })
@@ -653,6 +675,24 @@ pub fn last_words(stderr: &str, n: usize) -> Vec<String> {
             said.chars().take(300).collect()
         })
         .collect()
+}
+
+/// A program on PATH, else a Flatpak app's script, named by its app id: few
+/// systems put the folders with these scripts on PATH.
+pub fn find_program(program: &str) -> Option<PathBuf> {
+    find_on_path(program).or_else(|| {
+        let data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+        flatpak_bin_dirs(data_home, crate::ssh_config::home_dir().map(PathBuf::from)).into_iter().map(|dir| dir.join(program)).find(|p| is_executable(p))
+    })
+}
+
+/// Where Flatpak keeps a script that runs each app it installed: the user's
+/// own installation (in XDG_DATA_HOME, else ~/.local/share), then the
+/// system's, the order `flatpak run` looks in.
+fn flatpak_bin_dirs(data_home: Option<PathBuf>, home: Option<PathBuf>) -> Vec<PathBuf> {
+    let data_home = data_home.filter(|d| !d.as_os_str().is_empty()).or_else(|| home.map(|h| h.join(".local").join("share")));
+    let user = data_home.map(|d| d.join("flatpak"));
+    user.into_iter().chain([PathBuf::from("/var/lib/flatpak")]).map(|base| base.join("exports").join("bin")).collect()
 }
 
 /// A program on PATH, as a shell would find it.
@@ -951,9 +991,19 @@ mod tests {
         let only = |want: &'static str| move |p: &str| (p == want).then(|| PathBuf::from(format!("/usr/bin/{p}")));
         assert_eq!(pick_app(only("remmina")), Ok(App::Remmina("/usr/bin/remmina".into())));
         assert_eq!(pick_app(only("xfreerdp3")), Ok(App::FreeRdp("/usr/bin/xfreerdp3".into())));
-        // Remmina first when both are there; FreeRDP's SDL client before its X11 one.
+        // Remmina from Flathub: its script and `flatpak` to start it.
+        let flathub = |p: &str| matches!(p, "org.remmina.Remmina" | "flatpak").then(|| PathBuf::from(format!("/usr/bin/{p}")));
+        assert_eq!(pick_app(flathub), Ok(App::RemminaFlatpak("/usr/bin/flatpak".into())));
+        assert!(pick_app(only("org.remmina.Remmina")).is_err(), "no flatpak to start it");
+        assert!(pick_app(only("flatpak")).is_err(), "flatpak, no Remmina");
+        // Remmina first when both are there, the system's before Flathub's;
+        // FreeRDP's SDL client before its X11 one.
         let both = |p: &str| matches!(p, "remmina" | "xfreerdp3").then(|| PathBuf::from(p));
         assert_eq!(pick_app(both), Ok(App::Remmina("remmina".into())));
+        let remminas = |p: &str| matches!(p, "remmina" | "org.remmina.Remmina" | "flatpak").then(|| PathBuf::from(p));
+        assert_eq!(pick_app(remminas), Ok(App::Remmina("remmina".into())));
+        let flathub_freerdp = |p: &str| matches!(p, "org.remmina.Remmina" | "flatpak" | "sdl-freerdp3").then(|| PathBuf::from(p));
+        assert_eq!(pick_app(flathub_freerdp), Ok(App::RemminaFlatpak("flatpak".into())));
         let freerdps = |p: &str| matches!(p, "sdl-freerdp3" | "xfreerdp3").then(|| PathBuf::from(p));
         assert_eq!(pick_app(freerdps), Ok(App::FreeRdp("sdl-freerdp3".into())));
         // FreeRDP needs no file; Remmina gets a profile, tracked or not.
@@ -967,6 +1017,27 @@ mod tests {
         assert_eq!((r.name, r.tracked, r.args[0].as_str()), ("Remmina", false, "-c"));
         assert!(file.to_string_lossy().ends_with(".remmina") && std::fs::read_to_string(&file).unwrap().starts_with("[remmina]\n"));
         let _ = std::fs::remove_file(file);
+        // Remmina from Flathub gets the same profile, between the marks that
+        // hand it into its sandbox.
+        let fp = prepare(App::RemminaFlatpak("/usr/bin/flatpak".into()), "session-rdp-prep-fp", "h:1", "u", &RdpOptions::default(), Some("pw")).unwrap();
+        let file = fp.file.clone().unwrap();
+        assert_eq!(fp.program, Path::new("/usr/bin/flatpak"));
+        assert_eq!(fp.args, ["run", "--file-forwarding", "org.remmina.Remmina", "-c", "@@", &*file.to_string_lossy(), "@@"]);
+        assert_eq!((fp.name, fp.tracked, fp.secret), ("Remmina", false, false));
+        assert!(std::fs::read_to_string(&file).unwrap().starts_with("[remmina]\n"));
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn flatpak_apps_are_looked_for_where_flatpak_keeps_their_scripts() {
+        let system = Path::new("/var/lib/flatpak/exports/bin");
+        let home = || Some(PathBuf::from("/home/a"));
+        assert_eq!(flatpak_bin_dirs(None, home()), [Path::new("/home/a/.local/share/flatpak/exports/bin"), system]);
+        assert_eq!(flatpak_bin_dirs(Some("/data".into()), home()), [Path::new("/data/flatpak/exports/bin"), system]);
+        // An empty XDG_DATA_HOME counts as none; without a home, only the
+        // system's installation is left.
+        assert_eq!(flatpak_bin_dirs(Some("".into()), home()), [Path::new("/home/a/.local/share/flatpak/exports/bin"), system]);
+        assert_eq!(flatpak_bin_dirs(None, None), [system]);
     }
 
     #[test]

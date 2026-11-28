@@ -17311,7 +17311,7 @@ async fn initiate_rdp(
         let address = session.address.clone();
         session.login = login_key;
         let saved = password.as_deref().map(String::as_str);
-        let launched = rdp::pick_app(rdp::find_on_path).and_then(|app| rdp::prepare(app, &session_id, &address, &user, &options, saved));
+        let launched = rdp::pick_app(rdp::find_program).and_then(|app| rdp::prepare(app, &session_id, &address, &user, &options, saved));
         let launcher = match launched {
             Ok(l) => {
                 session.file = l.file.clone();
@@ -18316,7 +18316,7 @@ async fn rdp_open_again(
         }
         let saved = password.as_deref().map(String::as_str);
         // Written again: another copy of the app may have cleared old files.
-        let launcher = rdp::prepare(rdp::pick_app(rdp::find_on_path)?, &session_id, &session.address, &session.username, &session.options, saved)?;
+        let launcher = rdp::prepare(rdp::pick_app(rdp::find_program)?, &session_id, &session.address, &session.username, &session.options, saved)?;
         // A different app may need a different file: the old one goes.
         if let Some(new) = &launcher.file {
             if session.file.as_ref() != Some(new) {
