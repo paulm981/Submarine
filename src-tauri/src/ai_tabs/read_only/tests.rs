@@ -511,21 +511,40 @@ fn safe_sed_jq_and_git_inspection_run() {
         "jq -r '.items[].name' /tmp/x.json",
         "jq -c '.environment' /tmp/x.json",
         "cat /tmp/x.json | jq -r '.version'",
-        "git status",
-        "git status -s",
-        "git log -n 10 --oneline",
-        "git diff --stat",
-        "git show --stat HEAD",
-        "git -C /srv/app status",
-        "git --no-pager log -5",
         "git rev-parse --abbrev-ref HEAD",
+        "git -C /srv/app rev-parse HEAD",
+        "git describe --tags",
         "git branch --show-current",
         "git branch -a",
+        "git --no-pager branch -vv",
     ]);
     asks(&[
         "jq . /srv/.env",
         "jq . /etc/shadow",
         "sed -n 1,10p /etc/shadow",
         "git -C /srv/app show HEAD:.env",
+    ]);
+}
+
+/// A repository's own config can make these run a program (#302): tried
+/// with git 2.43, a planted `core.fsmonitor` ran on `status`,
+/// `diff.external` on `diff`, a `textconv` driver on `show`; `gpg.program`
+/// runs on `log` for a signed commit.
+#[test]
+fn git_that_a_repository_can_make_run_a_program_asks() {
+    asks(&[
+        "git status",
+        "git status -s",
+        "git -C /srv/app status",
+        "git diff --stat",
+        "git diff",
+        "git log -n 10 --oneline",
+        "git --no-pager log -5",
+        "git show --stat HEAD",
+        "git show",
+        "git describe --dirty",
+        "git describe --tags --broken",
+        "git describe --dir",
+        "git rev-parse HEAD && git status",
     ]);
 }
