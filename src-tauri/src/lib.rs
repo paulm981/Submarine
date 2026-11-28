@@ -7833,6 +7833,7 @@ async fn setup_master_db_with(
     // What a shared profile's synced data would run by itself waits here for
     // this device's OK (see approvals.rs).
     approvals::create_schema(&conn)?;
+    secret_cmd_review::create_schema(&conn)?;
     create_share_pins(&conn)?;
     needs_resave |= rdp_links::move_into_servers(&conn)? > 0; // RDP links are RDP servers now (#42, rdp_links.rs)
 
@@ -9674,6 +9675,19 @@ async fn get_commands(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
     secret_cmd_review::list_commands(conn, my_node.as_deref())
+}
+
+#[tauri::command]
+async fn secret_cmd_reviewed(state: tauri::State<'_, DbState>, id: i64, ran_text: String) -> Result<bool, String> {
+    let cleared = {
+        let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+        let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+        secret_cmd_review::mark_reviewed(conn, id, &ran_text)?
+    };
+    if cleared {
+        save_vault_internal(&state)?;
+    }
+    Ok(cleared)
 }
 
 // ───────────────────────── Command History ─────────────────────────
@@ -26907,7 +26921,7 @@ pub fn run() {
             get_credentials, generate_ssh_key,
             add_folder, rename_folder, delete_folder, get_folders,
             tree_moves::move_servers, tree_moves::move_folder, tree_moves::delete_tree_items,
-            add_command, edit_command, set_command_scope, set_command_secret_tags, delete_command, get_commands,
+            add_command, edit_command, set_command_scope, set_command_secret_tags, delete_command, get_commands, secret_cmd_reviewed,
             cmd_history_add, cmd_history_list, cmd_history_clear,
             add_note, edit_note, delete_note, get_notes,
             mirror_dry_run, start_mirror, stop_mirror, list_mirrors, pick_local_directory,

@@ -373,7 +373,11 @@ export const CmdsPanel = ({ activeTab, onClose, headerActions, serverId, serverN
   const toTerminal = (text: string, execute: boolean, cut = false, secret = false) => {
     const secretReview = execute && secret ? pendingReviewRef.current : undefined;
     pendingReviewRef.current = undefined;
-    void writeToTerminal({ terminalId: activeTab, text, enter: execute, cut, confirm, secret, secretReview });
+    void writeToTerminal({ terminalId: activeTab, text, enter: execute, cut, confirm, secret, secretReview }).then((sent) => {
+      if (sent && secretReview?.changedByOther) {
+        invoke<CommandItem[]>("get_commands").then((rows) => setCommands(rows || []), () => {});
+      }
+    });
   };
 
   const copyToClipboard = async (text: string) => {

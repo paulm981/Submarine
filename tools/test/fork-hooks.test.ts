@@ -119,7 +119,7 @@ const HOOKS: { file: string; imports: string[]; uses?: string[] }[] = [
   { file: "src/components/CmdsPanel.tsx", imports: ["../fork/secretCmdReview"], uses: ["secretReviewOf"] },
   { file: "src/main.tsx", imports: ["./util/diagnostics", "./util/nativeMenus", "./util/plainTyping", "./fork/dialogFocus.css"] },
   { file: "src/ui/confirm.tsx", imports: ["../util/fileName", "../fork/secretCmdReview"], uses: ["isConfirmOkLocked", "disabled={confirmLocked"] },
-  { file: "src/util/pasteText.ts", imports: ["../fork/secretCmdReview"], uses: ["secretConfirmExtras"] },
+  { file: "src/util/pasteText.ts", imports: ["../fork/secretCmdReview"], uses: ["secretConfirmExtras", "markSecretCommandReviewed"] },
 ];
 
 // Every source file's text, by its path from the repository root ("/src/…"):

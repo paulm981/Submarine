@@ -1,7 +1,7 @@
 import { t } from "../i18n";
 import type { ConfirmOptions } from "../ui/confirm";
 import { inspect, stripHidden } from "./hiddenChars";
-import { secretConfirmExtras, type SecretReviewInfo } from "../fork/secretCmdReview";
+import { markSecretCommandReviewed, secretConfirmExtras, type SecretReviewInfo } from "../fork/secretCmdReview";
 
 // What of a paste may reach the program in the terminal. A paste is text the
 // user didn't type: from a page, a chat, a document. Left whole, it can carry
@@ -100,5 +100,8 @@ export async function writeToTerminal({ terminalId, text, enter, cut = false, co
     if (!ok) return false;
   }
   pasteIntoTerminal({ terminalId, text: clean, enter });
+  if (secret && enter && secretReview?.changedByOther) {
+    await markSecretCommandReviewed(secretReview, clean);
+  }
   return true;
 }

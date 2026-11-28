@@ -1,12 +1,15 @@
+import { invoke } from "@tauri-apps/api/core";
 import { t } from "../i18n";
 
 export interface SecretCommandMeta {
+  id?: number;
   changed_by_other?: boolean;
   edited_by?: string | null;
   updated_at?: string | null;
 }
 
 export interface SecretReviewInfo {
+  id?: number;
   changedByOther: boolean;
   editedBy?: string | null;
   updatedAt?: string | null;
@@ -16,6 +19,7 @@ export interface SecretReviewInfo {
 export function secretReviewOf(c: SecretCommandMeta): SecretReviewInfo | undefined {
   if (!c.changed_by_other) return undefined;
   return {
+    ...(typeof c.id === "number" ? { id: c.id } : {}),
     changedByOther: true,
     editedBy: c.edited_by ?? null,
     updatedAt: c.updated_at ?? null,
@@ -63,4 +67,17 @@ export function secretConfirmExtras(review?: SecretReviewInfo): { revealBeforeOk
 /** True while OK/Run must remain disabled until Show command is pressed (#286). */
 export function isConfirmOkLocked(opts: { revealBeforeOk?: boolean }, revealed: boolean): boolean {
   return !!(opts.revealBeforeOk && !revealed);
+}
+
+/** Clear the device-local sync review flag after running a revealed command (#304). */
+export async function markSecretCommandReviewed(
+  review: SecretReviewInfo | undefined,
+  ranText: string
+): Promise<boolean> {
+  if (!review?.changedByOther || typeof review.id !== "number" || !ranText) return false;
+  try {
+    return await invoke<boolean>("secret_cmd_reviewed", { id: review.id, ranText });
+  } catch {
+    return false;
+  }
 }

