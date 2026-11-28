@@ -2,17 +2,21 @@ import { useEffect, useState } from "react";
 import type { Dispatch, MutableRefObject, SetStateAction } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Bot, Home, List } from "lucide-react";
-import AiPanel from "../../components/AiPanel";
-import AiSidePane, { AiPaneButton, type AiPaneView } from "../../components/AiSidePane";
-import AllTabsMenu from "../../components/AllTabsMenu";
-import HomePane from "../../components/HomePane";
-import { SessionTree } from "../../components/SessionTree";
+import type { AiPaneView } from "../../components/AiSidePane";
+import { fromForkWorkspace } from "./lazy";
 import { useAiPane } from "../../ui/aiPane";
 import { TitleTabEdges, titleTabClass } from "../../ui/tabStyle";
 import { reorderById } from "../../ui/tabDrag";
 import { aiMarker, cardsOf, loosestShare, openAiTrust, sharedWith, trustTargetFor, useAi } from "../../util/ai";
 import { type CloseWhich, HAS_HOME, closeCounts } from "./rules";
 import type { SessionTreeState } from "./hooks";
+
+const AiPanel = fromForkWorkspace("AiPanel");
+const AiSidePane = fromForkWorkspace("AiSidePane");
+const AiPaneButton = fromForkWorkspace("AiPaneButton");
+const AllTabsMenu = fromForkWorkspace("AllTabsMenu");
+const HomePane = fromForkWorkspace("HomePane");
+const SessionTree = fromForkWorkspace("SessionTree");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The fork's pieces of the main window, each rendered by DesktopApp in one
